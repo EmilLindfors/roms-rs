@@ -1,0 +1,7 @@
+*.pdf
+*.gz
+*.png
+*.data*
+target
+data
+output

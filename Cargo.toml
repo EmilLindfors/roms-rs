@@ -1,0 +1,73 @@
+[package]
+name = "dg-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Discontinuous Galerkin methods in Rust"
+license = "MIT"
+
+[features]
+default = []
+parallel = ["rayon"]
+netcdf = ["dep:netcdf", "dep:chrono"]
+simd = ["pulp"]
+
+[dependencies]
+faer = "0.23"
+thiserror = "2.0"
+rayon = { version = "1.10", optional = true }
+netcdf = { version = "0.10", optional = true }
+chrono = { version = "0.4", optional = true }
+pulp = { version = "0.18", optional = true }
+
+# Geographic data I/O
+tiff = "0.9"           # GeoTIFF reading (pure Rust)
+shapefile = "0.6"      # ESRI shapefile reading
+geo = "0.28"           # Geometric types and algorithms
+
+[dev-dependencies]
+approx = "0.5"
+tempfile = "3.10"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "rhs_swe_2d"
+path = "benches/rhs_swe_2d_bench.rs"
+harness = false
+
+[[bench]]
+name = "rhs_computation_bench"
+path = "benches/rhs_computation_bench.rs"
+harness = false
+
+[[bench]]
+name = "flux_bench"
+path = "benches/flux_bench.rs"
+harness = false
+
+[[bench]]
+name = "limiter_bench"
+path = "benches/limiter_bench.rs"
+harness = false
+
+[[bench]]
+name = "time_stepping_bench"
+path = "benches/time_stepping_bench.rs"
+harness = false
+
+[[bench]]
+name = "source_term_bench"
+path = "benches/source_term_bench.rs"
+harness = false
+
+# Profiling profile: release optimizations with debug symbols for flamegraph
+[profile.profiling]
+inherits = "release"
+debug = true
+
+# Release profile with better debug info for profiling when needed
+[profile.release]
+debug = 1  # Line tables only (minimal overhead)
+
+[[example]]
+name = "advection_1d"
+path = "examples/advection_1d.rs"
