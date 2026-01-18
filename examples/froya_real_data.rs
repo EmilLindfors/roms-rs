@@ -54,7 +54,13 @@ use dg_rs::source::{
     DragCoefficient, ManningFriction2D, WindStress2D,
 };
 use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
+use dg_rs::types::{Depth, ElementIndex};
 use dg_rs::{SWEFluxType2D, SWEState2D};
+
+/// Helper for typed element indices
+fn k(idx: usize) -> ElementIndex {
+    ElementIndex::new(idx)
+}
 
 // ============================================================================
 // Physical Parameters
@@ -449,10 +455,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut max_rhs_h = 0.0_f64;
         let mut max_rhs_hu = 0.0_f64;
         let mut max_rhs_hv = 0.0_f64;
-        for k in 0..state.n_elements {
-            if !land_mask.is_wet(k) { continue; }
+        for ki in 0..state.n_elements {
+            if !land_mask.is_wet(ki) { continue; }
             for i in 0..state.n_nodes {
-                let rhs_state = rhs_test.get_state(k, i);
+                let rhs_state = rhs_test.get_state(k(ki), i);
                 max_rhs_h = max_rhs_h.max(rhs_state.h.abs());
                 max_rhs_hu = max_rhs_hu.max(rhs_state.hu.abs());
                 max_rhs_hv = max_rhs_hv.max(rhs_state.hv.abs());
@@ -549,8 +555,8 @@ fn tag_boundaries(mesh: &mut Mesh2D, x_min: f64, _y_min: f64, _x_max: f64, y_max
     for edge in mesh.edges.iter_mut() {
         if edge.is_boundary() {
             let (v0, v1) = edge.vertices;
-            let (x0, y0) = mesh.vertices[v0];
-            let (x1, y1) = mesh.vertices[v1];
+            let [x0, y0] = mesh.vertices[v0];
+            let [x1, y1] = mesh.vertices[v1];
             let x_mid = (x0 + x1) / 2.0;
             let y_mid = (y0 + y1) / 2.0;
 
@@ -581,15 +587,15 @@ fn create_initial_state(
     // Water surface at mean sea level (η = 0)
     let eta = 0.0;
 
-    for k in 0..mesh.n_elements {
+    for ki in 0..mesh.n_elements {
         for i in 0..ops.n_nodes {
-            let b = bathymetry.get(k, i);
+            let b = bathymetry.get(k(ki), i);
 
             // h = η - B for lake-at-rest
             // h must be positive, so dry cells get H_MIN
             let h = (eta - b).max(H_MIN);
 
-            swe.set_state(k, i, SWEState2D::from_primitives(h, 0.0, 0.0));
+            swe.set_state(k(ki), i, SWEState2D::from_primitives(h, 0.0, 0.0));
         }
     }
 
@@ -607,17 +613,17 @@ fn print_diagnostics(t: f64, state: &SWESolution2D, land_mask: &LandMask2D) {
     let mut u_max = 0.0_f64;
     let mut v_max = 0.0_f64;
 
-    for k in 0..state.n_elements {
-        if !land_mask.is_wet(k) {
+    for ki in 0..state.n_elements {
+        if !land_mask.is_wet(ki) {
             continue;
         }
 
         for i in 0..state.n_nodes {
-            let s = state.get_state(k, i);
+            let s = state.get_state(k(ki), i);
             h_min = h_min.min(s.h);
             h_max = h_max.max(s.h);
 
-            let (u, v) = s.velocity_simple(H_MIN);
+            let (u, v) = s.velocity_simple(Depth::new(H_MIN));
             u_max = u_max.max(u.abs());
             v_max = v_max.max(v.abs());
         }
@@ -640,19 +646,19 @@ fn print_final_diagnostics(state: &SWESolution2D, land_mask: &LandMask2D) {
     let mut v_max = 0.0_f64;
     let mut count = 0;
 
-    for k in 0..state.n_elements {
-        if !land_mask.is_wet(k) {
+    for ki in 0..state.n_elements {
+        if !land_mask.is_wet(ki) {
             continue;
         }
 
         for i in 0..state.n_nodes {
-            let s = state.get_state(k, i);
+            let s = state.get_state(k(ki), i);
             h_min = h_min.min(s.h);
             h_max = h_max.max(s.h);
             h_sum += s.h;
             count += 1;
 
-            let (u, v) = s.velocity_simple(H_MIN);
+            let (u, v) = s.velocity_simple(Depth::new(H_MIN));
             u_max = u_max.max(u.abs());
             v_max = v_max.max(v.abs());
         }
@@ -805,11 +811,11 @@ fn create_netcdf_mesh_info(
     let mut lat_coords = Vec::with_capacity(n_total);
     let mut lon_coords = Vec::with_capacity(n_total);
 
-    for k in 0..mesh.n_elements {
+    for ki in 0..mesh.n_elements {
         for i in 0..ops.n_nodes {
             let r = ops.nodes_r[i];
             let s = ops.nodes_s[i];
-            let (x, y) = mesh.reference_to_physical(k, r, s);
+            let [x, y] = mesh.reference_to_physical(k(ki), r, s);
             x_coords.push(x);
             y_coords.push(y);
             let (lat, lon) = projection.xy_to_geo(x, y);
@@ -834,15 +840,15 @@ fn extract_solution_data(
     let mut u_data = Vec::with_capacity(n_total);
     let mut v_data = Vec::with_capacity(n_total);
 
-    for k in 0..state.n_elements {
+    for ki in 0..state.n_elements {
         for i in 0..state.n_nodes {
-            let s = state.get_state(k, i);
-            let b = bathymetry.get(k, i);
+            let st = state.get_state(k(ki), i);
+            let b = bathymetry.get(k(ki), i);
 
-            h_data.push(s.h);
-            eta_data.push(s.h + b);  // η = h + B
+            h_data.push(st.h);
+            eta_data.push(st.h + b);  // η = h + B
 
-            let (u, v) = s.velocity_simple(H_MIN);
+            let (u, v) = st.velocity_simple(Depth::new(H_MIN));
             u_data.push(u);
             v_data.push(v);
         }

@@ -24,6 +24,7 @@
 //! ```
 
 use crate::solver::SWESolution2D;
+use crate::types::ElementIndex;
 
 /// Thresholds for stability monitoring.
 #[derive(Debug, Clone, Copy)]
@@ -291,13 +292,14 @@ impl StabilityMonitor {
         let mut found_blow_up = false;
 
         // Scan solution for issues
-        for k in 0..q.n_elements {
+        for k in ElementIndex::iter(q.n_elements) {
+            let ki = k.as_usize();
             for i in 0..q.n_nodes {
                 let state = q.get_state(k, i);
 
                 // Check for non-finite values
                 if !state.h.is_finite() || !state.hu.is_finite() || !state.hv.is_finite() {
-                    warnings.push(StabilityWarning::NonFiniteValue { element: k, node: i });
+                    warnings.push(StabilityWarning::NonFiniteValue { element: ki, node: i });
                     found_blow_up = true;
                     continue;
                 }
@@ -309,7 +311,7 @@ impl StabilityMonitor {
                 // Check depth thresholds
                 if state.h > self.thresholds.max_depth {
                     warnings.push(StabilityWarning::DepthExceedsMax {
-                        element: k,
+                        element: ki,
                         node: i,
                         value: state.h,
                         threshold: self.thresholds.max_depth,
@@ -317,7 +319,7 @@ impl StabilityMonitor {
                 }
                 if state.h < self.thresholds.min_depth {
                     warnings.push(StabilityWarning::DepthBelowMin {
-                        element: k,
+                        element: ki,
                         node: i,
                         value: state.h,
                         threshold: self.thresholds.min_depth,
@@ -333,7 +335,7 @@ impl StabilityMonitor {
 
                     if vel > self.thresholds.max_velocity {
                         warnings.push(StabilityWarning::VelocityExceedsMax {
-                            element: k,
+                            element: ki,
                             node: i,
                             value: vel,
                             threshold: self.thresholds.max_velocity,
@@ -478,10 +480,11 @@ impl StabilityMonitor {
 mod tests {
     use super::*;
     use crate::solver::SWEState2D;
+    use crate::types::ElementIndex;
 
     fn make_solution(n_elements: usize, n_nodes: usize, h: f64, hu: f64, hv: f64) -> SWESolution2D {
         let mut q = SWESolution2D::new(n_elements, n_nodes);
-        for k in 0..n_elements {
+        for k in ElementIndex::iter(n_elements) {
             for i in 0..n_nodes {
                 q.set_state(k, i, SWEState2D::new(h, hu, hv));
             }

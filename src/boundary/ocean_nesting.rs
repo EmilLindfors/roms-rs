@@ -33,6 +33,7 @@
 use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
 use crate::io::{CoordinateProjection, OceanModelReader, OceanState};
 use crate::solver::SWEState2D;
+use crate::types::Depth;
 use std::sync::Arc;
 
 /// Ocean model nesting boundary condition.
@@ -200,7 +201,7 @@ impl<P: CoordinateProjection + Send + Sync> SWEBoundaryCondition2D for OceanNest
 
         // Flather blending mode
         let h_ext = state_ext.h.max(self.h_min);
-        let (u_ext, v_ext) = state_ext.velocity_simple(self.h_min);
+        let (u_ext, v_ext) = state_ext.velocity_simple(Depth::new(self.h_min));
 
         // Normal and tangential velocities (external)
         let un_ext = u_ext * nx + v_ext * ny;

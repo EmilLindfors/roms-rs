@@ -25,6 +25,7 @@
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::types::ElementIndex;
 use crate::solver::{
     KuzminParameter2D, SWE2DRhsConfig, SWESolution2D, SWEState2D, TVBParameter2D,
     Tracer2DRhsConfig, TracerBoundaryCondition2D, TracerBounds, TracerSolution2D, TracerState,
@@ -61,7 +62,7 @@ impl CoupledState2D {
         salinity: f64,
     ) -> Self {
         let mut swe = SWESolution2D::new(n_elements, n_nodes);
-        for k in 0..n_elements {
+        for k in ElementIndex::iter(n_elements) {
             for i in 0..n_nodes {
                 swe.set_state(k, i, SWEState2D::from_primitives(h, u, v));
             }
@@ -298,7 +299,7 @@ where
     SweBc: SWEBoundaryCondition2D,
     TracerBc: TracerBoundaryCondition2D,
 {
-    let h_min = swe_config.equation.h_min;
+    let h_min = swe_config.equation.h_min.meters();
 
     // Compute tracer gradients for baroclinic term
     let (d_t_dx, d_t_dy, d_s_dx, d_s_dy) =
@@ -308,13 +309,14 @@ where
     let mut swe_rhs = compute_rhs_swe_2d(&state.swe, mesh, ops, geom, swe_config, time);
 
     // Add baroclinic source term
-    for k in 0..mesh.n_elements {
+    for k in ElementIndex::iter(mesh.n_elements) {
+        let ki = k.as_usize();
         for i in 0..ops.n_nodes {
             let swe_state = state.swe.get_state(k, i);
             let tracers = state.tracers.get_concentrations(k, i, swe_state.h, h_min);
 
             // Get tracer gradients at this node
-            let grad_idx = k * ops.n_nodes + i;
+            let grad_idx = ki * ops.n_nodes + i;
             let tracer_grads = (
                 d_t_dx[grad_idx],
                 d_t_dy[grad_idx],
@@ -673,8 +675,9 @@ where
 /// Compute total mass in the coupled system.
 pub fn total_mass(state: &CoupledState2D, ops: &DGOperators2D, geom: &GeometricFactors2D) -> f64 {
     let mut mass = 0.0;
-    for k in 0..state.swe.n_elements {
-        let j = geom.det_j[k];
+    for k in ElementIndex::iter(state.swe.n_elements) {
+        let ki = k.as_usize();
+        let j = geom.det_j[ki];
         for (i, &w) in ops.weights.iter().enumerate() {
             let h = state.swe.get_var(k, i, 0);
             mass += w * h * j;
@@ -698,6 +701,11 @@ mod tests {
     use crate::boundary::Reflective2D;
     use crate::equations::ShallowWater2D;
     use crate::solver::{ExtrapolationTracerBC, Tracer2DRhsConfig};
+    use crate::types::ElementIndex;
+
+    fn k(idx: usize) -> ElementIndex {
+        ElementIndex::new(idx)
+    }
 
     const G: f64 = 9.81;
     const H_MIN: f64 = 1e-6;
@@ -721,10 +729,10 @@ mod tests {
         assert_eq!(state.tracers.n_elements, n_elem);
 
         // Check values
-        let swe = state.swe.get_state(0, 0);
+        let swe = state.swe.get_state(k(0), 0);
         assert!((swe.h - 10.0).abs() < TOL);
 
-        let tracers = state.tracers.get_concentrations(0, 0, 10.0, H_MIN);
+        let tracers = state.tracers.get_concentrations(k(0), 0, 10.0, H_MIN);
         assert!((tracers.temperature - 8.0).abs() < TOL);
         assert!((tracers.salinity - 34.0).abs() < TOL);
     }
@@ -749,9 +757,9 @@ mod tests {
         // Check RHS is approximately zero
         let max_swe = rhs.swe.max_abs();
         let mut max_tracer: f64 = 0.0;
-        for k in 0..mesh.n_elements {
+        for elem in ElementIndex::iter(mesh.n_elements) {
             for i in 0..ops.n_nodes {
-                let t = rhs.tracers.get_conservative(k, i);
+                let t = rhs.tracers.get_conservative(elem, i);
                 max_tracer = max_tracer.max(t.h_t.abs()).max(t.h_s.abs());
             }
         }
@@ -804,15 +812,15 @@ mod tests {
             CoupledState2D::uniform(mesh.n_elements, ops.n_nodes, 10.0, 1.0, 0.0, 8.0, 34.0);
 
         // Add perturbation to tracers
-        for k in 0..mesh.n_elements {
+        for elem in ElementIndex::iter(mesh.n_elements) {
             for i in 0..ops.n_nodes {
                 let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-                let (x, _y) = mesh.reference_to_physical(k, r, s);
+                let [x, _y] = mesh.reference_to_physical(elem, r, s);
                 let t_perturb = 0.5 * (2.0 * std::f64::consts::PI * x).sin();
-                let h = state.swe.get_state(k, i).h;
-                let cons = state.tracers.get_conservative(k, i);
+                let h = state.swe.get_state(elem, i).h;
+                let cons = state.tracers.get_conservative(elem, i);
                 state.tracers.set_conservative(
-                    k,
+                    elem,
                     i,
                     crate::solver::ConservativeTracerState::new(cons.h_t + h * t_perturb, cons.h_s),
                 );
@@ -827,10 +835,11 @@ mod tests {
         // Integrate tracer RHS - should be zero for conservation
         let mut integral_h_t = 0.0;
         let mut integral_h_s = 0.0;
-        for k in 0..mesh.n_elements {
-            let j = geom.det_j[k];
+        for elem in ElementIndex::iter(mesh.n_elements) {
+            let ki = elem.as_usize();
+            let j = geom.det_j[ki];
             for (i, &w) in ops.weights.iter().enumerate() {
-                let t = rhs.tracers.get_conservative(k, i);
+                let t = rhs.tracers.get_conservative(elem, i);
                 integral_h_t += w * t.h_t * j;
                 integral_h_s += w * t.h_s * j;
             }

@@ -6,10 +6,17 @@ description = "Discontinuous Galerkin methods in Rust"
 license = "MIT"
 
 [features]
-default = []
+default = ["parallel", "simd"]
 parallel = ["rayon"]
 netcdf = ["dep:netcdf", "dep:chrono"]
 simd = ["pulp"]
+
+# Burn GPU acceleration features
+burn = ["dep:burn"]
+burn-cuda = ["burn", "burn/cuda", "dep:burn-cuda"]   # NVIDIA CUDA backend (primary target)
+burn-wgpu = ["burn", "burn/wgpu", "dep:burn-wgpu"]   # Portable GPU backend (Vulkan/DX12/Metal)
+burn-ndarray = ["burn", "burn/ndarray", "dep:burn-ndarray"]  # CPU backend for testing
+gpu = ["burn-cuda"]                      # Default GPU = CUDA
 
 [dependencies]
 faer = "0.23"
@@ -18,6 +25,11 @@ rayon = { version = "1.10", optional = true }
 netcdf = { version = "0.10", optional = true }
 chrono = { version = "0.4", optional = true }
 pulp = { version = "0.18", optional = true }
+burn = { version = "0.20", optional = true, default-features = false }
+burn-ndarray = { version = "0.20", optional = true }
+# Disable fusion feature to support f64 precision (fusion only supports f32)
+burn-cuda = { version = "0.20", optional = true, default-features = false }
+burn-wgpu = { version = "0.20", optional = true, default-features = false }
 
 # Geographic data I/O
 tiff = "0.9"           # GeoTIFF reading (pure Rust)

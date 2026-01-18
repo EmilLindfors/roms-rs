@@ -19,6 +19,11 @@ use dg_rs::time::{
     CoupledRhs2D, CoupledState2D, CoupledTimeConfig, compute_dt_coupled,
     run_coupled_simulation_limited, total_tracer,
 };
+use dg_rs::types::ElementIndex;
+
+fn k(idx: usize) -> ElementIndex {
+    ElementIndex::new(idx)
+}
 
 const G: f64 = 9.81;
 const H_MIN: f64 = 1e-6;
@@ -73,10 +78,10 @@ fn test_tracer_conservation_periodic() {
     );
 
     // Set up non-uniform initial tracer distribution (Gaussian blob)
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         for i in 0..n_nodes {
             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-            let (x, y) = mesh.reference_to_physical(k, r, s);
+            let [x, y] = mesh.reference_to_physical(k(ki), r, s);
 
             // Gaussian temperature perturbation centered at (0.5, 0.5)
             let dx = x - 0.5;
@@ -86,10 +91,10 @@ fn test_tracer_conservation_periodic() {
 
             state
                 .swe
-                .set_state(k, i, SWEState2D::from_primitives(h, u, v));
+                .set_state(k(ki), i, SWEState2D::from_primitives(h, u, v));
             state
                 .tracers
-                .set_from_concentrations(k, i, h, TracerState::new(t, s_tracer));
+                .set_from_concentrations(k(ki), i, h, TracerState::new(t, s_tracer));
         }
     }
 
@@ -178,10 +183,10 @@ fn test_limiter_prevents_oscillations() {
     );
 
     // Create sharp gradient: cold fresh water on left, warm salty on right
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         for i in 0..n_nodes {
             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-            let (x, _y) = mesh.reference_to_physical(k, r, s);
+            let [x, _y] = mesh.reference_to_physical(k(ki), r, s);
 
             // Sharp discontinuity at x = 0.5
             let (t, sal) = if x < 0.5 {
@@ -196,10 +201,10 @@ fn test_limiter_prevents_oscillations() {
 
             state
                 .swe
-                .set_state(k, i, SWEState2D::from_primitives(h, u, v));
+                .set_state(k(ki), i, SWEState2D::from_primitives(h, u, v));
             state
                 .tracers
-                .set_from_concentrations(k, i, h, TracerState::new(t, sal));
+                .set_from_concentrations(k(ki), i, h, TracerState::new(t, sal));
         }
     }
 
@@ -218,15 +223,15 @@ fn test_limiter_prevents_oscillations() {
     );
 
     // Check that all values are within physical bounds after limiting
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         for i in 0..n_nodes {
-            let h_node = state.swe.get_state(k, i).h;
-            let tracer = state.tracers.get_concentrations(k, i, h_node, H_MIN);
+            let h_node = state.swe.get_state(k(ki), i).h;
+            let tracer = state.tracers.get_concentrations(k(ki), i, h_node, H_MIN);
 
             assert!(
                 tracer.temperature >= bounds.t_min && tracer.temperature <= bounds.t_max,
                 "Temperature out of bounds at element {}, node {}: T={}",
-                k,
+                ki,
                 i,
                 tracer.temperature
             );
@@ -234,7 +239,7 @@ fn test_limiter_prevents_oscillations() {
             assert!(
                 tracer.salinity >= bounds.s_min && tracer.salinity <= bounds.s_max,
                 "Salinity out of bounds at element {}, node {}: S={}",
-                k,
+                ki,
                 i,
                 tracer.salinity
             );
@@ -261,7 +266,7 @@ fn test_limiter_preserves_cell_average() {
 
     // Create solution with values that will trigger limiting
     // Some nodes outside bounds, but average inside
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         for i in 0..n_nodes {
             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
 
@@ -272,21 +277,21 @@ fn test_limiter_preserves_cell_average() {
 
             state
                 .swe
-                .set_state(k, i, SWEState2D::from_primitives(h, 0.0, 0.0));
+                .set_state(k(ki), i, SWEState2D::from_primitives(h, 0.0, 0.0));
             state
                 .tracers
-                .set_from_concentrations(k, i, h, TracerState::new(t, sal));
+                .set_from_concentrations(k(ki), i, h, TracerState::new(t, sal));
         }
     }
 
     // Compute cell averages before limiting
     let mut avg_before = Vec::with_capacity(n_elements);
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         let mut sum_h_t = 0.0;
         let mut sum_h_s = 0.0;
         let mut sum_w = 0.0;
         for (i, &w) in ops.weights.iter().enumerate() {
-            let cons = state.tracers.get_conservative(k, i);
+            let cons = state.tracers.get_conservative(k(ki), i);
             sum_h_t += w * cons.h_t;
             sum_h_s += w * cons.h_s;
             sum_w += w * h;
@@ -309,11 +314,11 @@ fn test_limiter_preserves_cell_average() {
     );
 
     // Compute cell averages after limiting
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         let mut sum_h_t = 0.0;
         let mut sum_w = 0.0;
         for (i, &w) in ops.weights.iter().enumerate() {
-            let cons = state.tracers.get_conservative(k, i);
+            let cons = state.tracers.get_conservative(k(ki), i);
             sum_h_t += w * cons.h_t;
             sum_w += w * h;
         }
@@ -321,12 +326,12 @@ fn test_limiter_preserves_cell_average() {
 
         // Cell average should be preserved (within tolerance)
         // Note: TVB limiter may change averages slightly, so use looser tolerance
-        let diff = (avg_t_after - avg_before[k].0).abs();
+        let diff = (avg_t_after - avg_before[ki].0).abs();
         assert!(
             diff < 1.0, // Allow some change from TVB limiter
             "Cell average changed too much at element {}: before={}, after={}, diff={}",
-            k,
-            avg_before[k].0,
+            ki,
+            avg_before[ki].0,
             avg_t_after,
             diff
         );
@@ -355,10 +360,10 @@ fn test_coupled_simulation_stability_with_limiters() {
         TracerSolution2D::new(n_elements, n_nodes),
     );
 
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         for i in 0..n_nodes {
             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-            let (x, y) = mesh.reference_to_physical(k, r, s);
+            let [x, y] = mesh.reference_to_physical(k(ki), r, s);
 
             // Sharp front
             let t = if x + y < 1.0 { 5.0 } else { 15.0 };
@@ -369,10 +374,10 @@ fn test_coupled_simulation_stability_with_limiters() {
 
             state
                 .swe
-                .set_state(k, i, SWEState2D::from_primitives(h, u, v));
+                .set_state(k(ki), i, SWEState2D::from_primitives(h, u, v));
             state
                 .tracers
-                .set_from_concentrations(k, i, h, TracerState::new(t, sal));
+                .set_from_concentrations(k(ki), i, h, TracerState::new(t, sal));
         }
     }
 
@@ -477,20 +482,20 @@ fn test_no_limiter_produces_oscillations() {
     );
 
     // Sharp discontinuity - will cause Gibbs oscillations
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         for i in 0..n_nodes {
             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-            let (x, _y) = mesh.reference_to_physical(k, r, s);
+            let [x, _y] = mesh.reference_to_physical(k(ki), r, s);
 
             let t = if x < 0.5 { 0.0 } else { 30.0 }; // Sharp jump
             let sal = if x < 0.5 { 0.0 } else { 40.0 }; // Sharp jump
 
             state
                 .swe
-                .set_state(k, i, SWEState2D::from_primitives(h, 0.5, 0.0));
+                .set_state(k(ki), i, SWEState2D::from_primitives(h, 0.5, 0.0));
             state
                 .tracers
-                .set_from_concentrations(k, i, h, TracerState::new(t, sal));
+                .set_from_concentrations(k(ki), i, h, TracerState::new(t, sal));
         }
     }
 

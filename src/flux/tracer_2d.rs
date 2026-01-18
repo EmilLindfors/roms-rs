@@ -15,6 +15,7 @@
 //! At element interfaces, we need a numerical flux for hC·**u**·**n**.
 
 use crate::solver::{ConservativeTracerState, SWEState2D};
+use crate::types::Depth;
 
 /// Upwind flux for tracer transport.
 ///
@@ -43,6 +44,7 @@ pub fn upwind_tracer_flux(
     h_min: f64,
 ) -> ConservativeTracerState {
     let (nx, ny) = normal;
+    let h_min = Depth::new(h_min);
 
     // Compute velocities
     let (u_int, v_int) = swe_int.velocity_simple(h_min);
@@ -83,6 +85,7 @@ pub fn central_tracer_flux(
     h_min: f64,
 ) -> ConservativeTracerState {
     let (nx, ny) = normal;
+    let h_min = Depth::new(h_min);
 
     let (u_int, v_int) = swe_int.velocity_simple(h_min);
     let (u_ext, v_ext) = swe_ext.velocity_simple(h_min);
@@ -114,6 +117,7 @@ pub fn lax_friedrichs_tracer_flux(
     g: f64,
 ) -> ConservativeTracerState {
     let (nx, ny) = normal;
+    let h_min = Depth::new(h_min);
 
     let (u_int, v_int) = swe_int.velocity_simple(h_min);
     let (u_ext, v_ext) = swe_ext.velocity_simple(h_min);
@@ -152,10 +156,11 @@ pub fn roe_tracer_flux(
     h_min: f64,
 ) -> ConservativeTracerState {
     let (nx, ny) = normal;
+    let h_min = Depth::new(h_min);
 
     // Compute Roe-averaged velocity
-    let h_int = swe_int.h.max(h_min);
-    let h_ext = swe_ext.h.max(h_min);
+    let h_int = swe_int.h.max(h_min.meters());
+    let h_ext = swe_ext.h.max(h_min.meters());
 
     let sqrt_h_int = h_int.sqrt();
     let sqrt_h_ext = h_ext.sqrt();

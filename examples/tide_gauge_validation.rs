@@ -29,7 +29,13 @@ use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d, swe_positivity_limiter_2d};
 use dg_rs::source::CoriolisSource2D;
+use dg_rs::types::ElementIndex;
 use dg_rs::SWEFluxType2D;
+
+/// Helper for typed element indices
+fn k(idx: usize) -> ElementIndex {
+    ElementIndex::new(idx)
+}
 
 // ============================================================================
 // Physical Constants
@@ -537,15 +543,15 @@ fn extract_surface_elevation(
     h0: f64,
 ) -> f64 {
     // Find element containing point (simple search)
-    for k in 0..mesh.n_elements {
-        let (x0, y0) = mesh.reference_to_physical(k, -1.0, -1.0);
-        let (x1, y1) = mesh.reference_to_physical(k, 1.0, 1.0);
+    for ki in 0..mesh.n_elements {
+        let [x0, y0] = mesh.reference_to_physical(k(ki), -1.0, -1.0);
+        let [x1, y1] = mesh.reference_to_physical(k(ki), 1.0, 1.0);
 
         if x >= x0.min(x1) && x <= x0.max(x1) && y >= y0.min(y1) && y <= y0.max(y1) {
             // Found element - get average h
             let mut h_sum = 0.0;
             for i in 0..ops.n_nodes {
-                h_sum += q.get_state(k, i).h;
+                h_sum += q.get_state(k(ki), i).h;
             }
             let h_avg = h_sum / ops.n_nodes as f64;
             return h_avg - h0; // Return surface elevation (h - h0)
@@ -555,7 +561,7 @@ fn extract_surface_elevation(
     // Fallback: use first element
     let mut h_sum = 0.0;
     for i in 0..ops.n_nodes {
-        h_sum += q.get_state(0, i).h;
+        h_sum += q.get_state(k(0), i).h;
     }
     h_sum / ops.n_nodes as f64 - h0
 }

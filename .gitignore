@@ -1,7 +1,8 @@
 *.pdf
 *.gz
 *.png
-*.data*
+*.data
 target
-data
+data/*
 output
+perf.data.old

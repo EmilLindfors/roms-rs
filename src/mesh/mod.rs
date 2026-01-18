@@ -1,24 +1,44 @@
-//! Mesh representation.
+//! Mesh representation for DG discretizations.
 //!
-//! Provides mesh data structures for DG discretizations:
-//! - 1D mesh with element connectivity
-//! - 2D mesh for quadrilateral elements with edge-based connectivity
-//! - Bathymetry storage for shallow water (1D and 2D)
-//! - Land masking for wet/dry cell classification
-//! - Gmsh mesh file I/O
+//! This module provides mesh data structures organized into submodules:
+//!
+//! # Submodules
+//!
+//! - [`core`]: Core mesh implementations (Mesh1D, Mesh2D, builders)
+//! - [`traits`]: Abstract traits for dimension-independent operations
+//! - [`data`]: Mesh-associated data (bathymetry, land masks, boundary tags)
+//! - [`io`]: Mesh file I/O (Gmsh format)
+//!
+//! # Mesh Traits
+//!
+//! The [`traits`] module provides abstract interfaces for mesh operations:
+//! - [`Point`]: Coordinate type abstraction for 1D, 2D, 3D
+//! - [`MeshTopology`]: Element and face connectivity
+//! - [`MeshGeometry`]: Coordinate mappings and Jacobians
+//! - [`MeshGeometryExt`]: Face normals and surface Jacobians (2D/3D)
+//! - [`MeshCFL`]: CFL time step computation
+//!
+//! These traits enable generic code that works across mesh dimensions.
 
-mod bathymetry;
-mod bathymetry_2d;
-mod boundary_tags;
-pub mod gmsh;
-mod land_mask;
-mod mesh1d;
-mod mesh2d;
+pub mod core;
+pub mod data;
+pub mod io;
+pub mod traits;
 
-pub use bathymetry::{Bathymetry1D, profiles as bathymetry_profiles};
-pub use bathymetry_2d::{Bathymetry2D, profiles as bathymetry_profiles_2d};
-pub use boundary_tags::BoundaryTag;
-pub use gmsh::{GmshError, read_gmsh_mesh, write_gmsh_mesh};
-pub use land_mask::{LandMask2D, LandMaskStatistics};
-pub use mesh1d::{BoundaryFace, Mesh1D};
-pub use mesh2d::{Edge, ElementFace, Mesh2D};
+// Re-export core mesh types
+pub use core::{BoundaryFace, BoundaryConfig, Edge, ElementFace, Mesh1D, Mesh2D, Mesh2DBuilder};
+
+// Re-export data types
+pub use data::{
+    bathymetry_profiles, bathymetry_profiles_2d, Bathymetry1D, Bathymetry2D, BoundaryTag,
+    LandMask2D, LandMaskStatistics,
+};
+
+// Re-export I/O types
+pub use io::{read_gmsh_mesh, write_gmsh_mesh, GmshError};
+
+// Re-export trait types
+pub use traits::{
+    FaceConnection, Mesh1DGeometry, Mesh2DGeometry, MeshCFL, MeshGeometry, MeshGeometryExt,
+    MeshGPUData, MeshIter, MeshTopology, Neighbor, Point,
+};

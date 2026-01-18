@@ -46,6 +46,7 @@ use crate::boundary::bathymetry_validation::warn_once_if_misconfigured;
 use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
 use crate::io::BoundaryTimeSeries;
 use crate::solver::SWEState2D;
+use crate::types::Depth;
 
 /// Nesting boundary condition from parent model.
 ///
@@ -162,7 +163,7 @@ impl SWEBoundaryCondition2D for NestingBC2D {
 
         // External (parent) quantities
         let h_ext = state_ext.h.max(self.h_min);
-        let (u_ext, v_ext) = state_ext.velocity_simple(self.h_min);
+        let (u_ext, v_ext) = state_ext.velocity_simple(Depth::new(self.h_min));
         let un_ext = u_ext * nx + v_ext * ny;
         let ut_ext = -u_ext * ny + v_ext * nx;
         let eta_ext = h_ext + ctx.bathymetry;

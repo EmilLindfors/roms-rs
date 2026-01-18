@@ -23,6 +23,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::solver::SWEState2D;
+use crate::types::Depth;
 
 /// Error type for time series file parsing.
 #[derive(Debug, Error)]
@@ -222,7 +223,7 @@ impl BoundaryTimeSeries {
     /// Uses velocity desingularization for shallow depths.
     pub fn interpolate_primitives(&self, t: f64, h_min: f64) -> (f64, f64, f64) {
         let state = self.interpolate(t);
-        let (u, v) = state.velocity_simple(h_min);
+        let (u, v) = state.velocity_simple(Depth::new(h_min));
         (state.h, u, v)
     }
 

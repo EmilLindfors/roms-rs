@@ -24,6 +24,12 @@ use crate::solver::{
     apply_swe_limiters_2d, apply_swe_limiters_kuzmin_2d,
     apply_wet_dry_correction_all, swe_positivity_limiter_2d,
 };
+#[cfg(feature = "parallel")]
+use crate::solver::{
+    apply_swe_limiters_kuzmin_2d_parallel, apply_wet_dry_correction_all_parallel,
+    swe_positivity_limiter_2d_parallel,
+};
+use crate::types::Depth;
 
 /// Type of limiter to use for 2D SWE.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -122,13 +128,13 @@ impl SWE2DTimeConfig {
     /// - Velocity capping (default 20 m/s)
     /// - Smooth momentum damping in shallow areas
     pub fn with_wet_dry_treatment(mut self) -> Self {
-        self.wet_dry = Some(WetDryConfig::new(self.h_min, self.g));
+        self.wet_dry = Some(WetDryConfig::new(Depth::new(self.h_min), self.g));
         self
     }
 
     /// Enable improved wetting/drying with custom maximum velocity.
     pub fn with_wet_dry_treatment_custom(mut self, max_velocity: f64) -> Self {
-        self.wet_dry = Some(WetDryConfig::new(self.h_min, self.g)
+        self.wet_dry = Some(WetDryConfig::new(Depth::new(self.h_min), self.g)
             .with_max_velocity(max_velocity));
         self
     }
@@ -142,6 +148,23 @@ fn apply_configured_limiter(
     config: &SWE2DTimeConfig,
 ) {
     // Apply slope/positivity limiters first
+    // Use parallel versions when the feature is enabled
+    #[cfg(feature = "parallel")]
+    match config.limiter_type {
+        SWELimiterType::None => {}
+        SWELimiterType::Tvb => {
+            // TVB not yet parallelized, use serial version
+            apply_swe_limiters_2d(swe, mesh, ops, &config.tvb, config.h_min);
+        }
+        SWELimiterType::Kuzmin => {
+            apply_swe_limiters_kuzmin_2d_parallel(swe, mesh, ops, &config.kuzmin, config.h_min);
+        }
+        SWELimiterType::PositivityOnly => {
+            swe_positivity_limiter_2d_parallel(swe, ops, config.h_min);
+        }
+    }
+
+    #[cfg(not(feature = "parallel"))]
     match config.limiter_type {
         SWELimiterType::None => {}
         SWELimiterType::Tvb => {
@@ -157,6 +180,10 @@ fn apply_configured_limiter(
 
     // Apply wet/dry treatment (velocity capping, thin-layer damping)
     if let Some(ref wet_dry) = config.wet_dry {
+        #[cfg(feature = "parallel")]
+        apply_wet_dry_correction_all_parallel(swe, wet_dry);
+
+        #[cfg(not(feature = "parallel"))]
         apply_wet_dry_correction_all(swe, wet_dry);
     }
 }

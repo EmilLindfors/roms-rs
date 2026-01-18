@@ -26,7 +26,7 @@ use dg_rs::solver::{
     UpwindTracerBC, compute_rhs_swe_2d, compute_rhs_tracer_2d,
 };
 // Parallel imports (only beneficial for meshes with 1000+ elements)
-use dg_rs::source::tracer_source_2d::{
+use dg_rs::source::tracer::{
     CombinedTracerSource2D, RiverTracerSource, SurfaceHeatFlux, gaussian_river_localization,
 };
 use dg_rs::source::{BathymetrySource2D, CombinedSource2D, CoriolisSource2D, ManningFriction2D};
@@ -34,9 +34,14 @@ use dg_rs::time::{
     CoupledRhs2D, CoupledState2D, CoupledTimeConfig, compute_dt_coupled,
     run_coupled_simulation_limited,
 };
+use dg_rs::types::{Depth, ElementIndex};
 use dg_rs::{SWEFluxType2D, SWEState2D};
 #[cfg(feature = "parallel")]
-use dg_rs::{compute_rhs_swe_2d_parallel, compute_rhs_tracer_2d_parallel};
+use dg_rs::compute_rhs_tracer_2d_parallel;
+#[cfg(all(feature = "parallel", not(feature = "simd")))]
+use dg_rs::compute_rhs_swe_2d_parallel;
+#[cfg(all(feature = "parallel", feature = "simd"))]
+use dg_rs::compute_rhs_swe_2d_parallel_simd;
 
 // ============================================================================
 // Physical Parameters
@@ -77,6 +82,11 @@ const ATLANTIC_SALINITY: f64 = 35.0;
 
 /// Surface heat flux in summer (W/m²)
 const HEAT_FLUX: f64 = 100.0;
+
+/// Helper for typed element indices
+fn k(idx: usize) -> ElementIndex {
+    ElementIndex::new(idx)
+}
 
 // ============================================================================
 // Domain Configuration
@@ -268,7 +278,23 @@ fn main() {
             .with_diffusivity(KAPPA)
             .with_source_terms(&tracer_sources);
 
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", feature = "simd"))]
+        if use_parallel {
+            let swe_rhs =
+                compute_rhs_swe_2d_parallel_simd(&state.swe, &mesh, &ops, &geom, &swe_config, time);
+            let tracer_rhs = compute_rhs_tracer_2d_parallel(
+                &state.tracers,
+                &state.swe,
+                &mesh,
+                &ops,
+                &geom,
+                &tracer_config,
+                time,
+            );
+            return CoupledRhs2D::new(swe_rhs, tracer_rhs);
+        }
+
+        #[cfg(all(feature = "parallel", not(feature = "simd")))]
         if use_parallel {
             let swe_rhs =
                 compute_rhs_swe_2d_parallel(&state.swe, &mesh, &ops, &geom, &swe_config, time);
@@ -372,8 +398,8 @@ fn create_fjord_mesh() -> Mesh2D {
         if edge.is_boundary() {
             // Get edge vertex coordinates
             let (v0, v1) = edge.vertices;
-            let y0 = mesh.vertices[v0].1;
-            let y1 = mesh.vertices[v1].1;
+            let y0 = mesh.vertices[v0][1];
+            let y1 = mesh.vertices[v1][1];
             let y_center = 0.5 * (y0 + y1);
 
             // If edge is at y = L_Y, tag as Open
@@ -404,20 +430,20 @@ fn create_initial_state(n_elements: usize, n_nodes: usize, mesh: &Mesh2D) -> Cou
     let mut swe = SWESolution2D::new(n_elements, n_nodes);
     let mut tracers = TracerSolution2D::new(n_elements, n_nodes);
 
-    for k in 0..n_elements {
+    for ki in 0..n_elements {
         // Get element center
-        let elem = &mesh.elements[k];
-        let y_center: f64 = elem.iter().map(|&v| mesh.vertices[v].1).sum::<f64>() / 4.0;
+        let elem = &mesh.elements[ki];
+        let y_center: f64 = elem.iter().map(|&v| mesh.vertices[v][1]).sum::<f64>() / 4.0;
 
         // Depth varies with bathymetry
         let b = -H_MEAN * (0.8 + 0.4 * y_center / L_Y);
         let h = -b;
 
         for i in 0..n_nodes {
-            swe.set_state(k, i, SWEState2D::from_primitives(h, 0.0, 0.0));
+            swe.set_state(k(ki), i, SWEState2D::from_primitives(h, 0.0, 0.0));
 
             let tracer = TracerState::new(ATLANTIC_TEMPERATURE, ATLANTIC_SALINITY);
-            tracers.set_from_concentrations(k, i, h, tracer);
+            tracers.set_from_concentrations(k(ki), i, h, tracer);
         }
     }
 
@@ -454,10 +480,10 @@ fn velocity_max(swe: &SWESolution2D) -> (f64, f64) {
     let mut u_max = 0.0_f64;
     let mut v_max = 0.0_f64;
 
-    for k in 0..swe.n_elements {
+    for ki in 0..swe.n_elements {
         for i in 0..swe.n_nodes {
-            let state = swe.get_state(k, i);
-            let (u, v) = state.velocity_simple(H_MIN);
+            let state = swe.get_state(k(ki), i);
+            let (u, v) = state.velocity_simple(Depth::new(H_MIN));
             u_max = u_max.max(u.abs());
             v_max = v_max.max(v.abs());
         }
@@ -491,10 +517,10 @@ fn print_final_diagnostics(state: &CoupledState2D) {
     // Check for freshwater influence
     let mut fresh_nodes = 0;
     let total_nodes = state.tracers.n_elements * state.tracers.n_nodes;
-    for k in 0..state.tracers.n_elements {
+    for ki in 0..state.tracers.n_elements {
         for i in 0..state.tracers.n_nodes {
-            let h = state.swe.get_state(k, i).h;
-            let tracer = state.tracers.get_concentrations(k, i, h, H_MIN);
+            let h = state.swe.get_state(k(ki), i).h;
+            let tracer = state.tracers.get_concentrations(k(ki), i, h, H_MIN);
             if tracer.salinity < 30.0 {
                 fresh_nodes += 1;
             }

@@ -14,6 +14,7 @@
 
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
+use crate::types::Depth;
 
 use super::bathymetry_validation::warn_once_if_misconfigured;
 
@@ -95,7 +96,7 @@ impl BCContext2D {
 
     /// Interior velocity components (u, v).
     pub fn interior_velocity(&self) -> (f64, f64) {
-        self.interior_state.velocity_simple(self.h_min)
+        self.interior_state.velocity_simple(Depth::new(self.h_min))
     }
 
     /// Normal velocity component: u·n = u*nx + v*ny

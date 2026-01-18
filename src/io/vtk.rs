@@ -35,6 +35,7 @@ use thiserror::Error;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::DGOperators2D;
 use crate::solver::{SWESolution2D, SWEState2D, TracerSolution2D};
+use crate::types::{Depth, ElementIndex};
 
 /// Error type for VTK operations.
 #[derive(Debug, Error)]
@@ -50,8 +51,8 @@ pub enum VtkError {
 
 /// Internal mesh representation for VTK output.
 struct VtkMesh {
-    /// Physical coordinates of all points (x, y).
-    points: Vec<(f64, f64)>,
+    /// Physical coordinates of all points [x, y].
+    points: Vec<[f64; 2]>,
     /// Sub-cell connectivity (4 point indices per quad).
     cells: Vec<[usize; 4]>,
     /// Original DG element index for each sub-cell.
@@ -69,15 +70,16 @@ fn build_vtk_mesh(mesh: &Mesh2D, ops: &DGOperators2D) -> VtkMesh {
     let mut cells = Vec::with_capacity(n_elements * n_subcells_per_elem);
     let mut element_ids = Vec::with_capacity(n_elements * n_subcells_per_elem);
 
-    for k in 0..n_elements {
-        let base_point = k * n_nodes;
+    for k in ElementIndex::iter(n_elements) {
+        let ki = k.as_usize();
+        let base_point = ki * n_nodes;
 
         // Compute physical coordinates for all nodes in this element
         for i in 0..n_nodes {
             let r = ops.nodes_r[i];
             let s = ops.nodes_s[i];
-            let (x, y) = mesh.reference_to_physical(k, r, s);
-            points.push((x, y));
+            let [x, y] = mesh.reference_to_physical(k, r, s);
+            points.push([x, y]);
         }
 
         // Create sub-cells from adjacent nodes
@@ -97,7 +99,7 @@ fn build_vtk_mesh(mesh: &Mesh2D, ops: &DGOperators2D) -> VtkMesh {
                 let v2 = base_point + (j + 1) * n_1d + i + 1;
                 let v3 = base_point + (j + 1) * n_1d + i;
                 cells.push([v0, v1, v2, v3]);
-                element_ids.push(k);
+                element_ids.push(ki);
             }
         }
     }
@@ -263,7 +265,7 @@ impl<W: Write> VtkWriter<W> {
         Ok(())
     }
 
-    fn write_points(&mut self, points: &[(f64, f64)]) -> std::io::Result<()> {
+    fn write_points(&mut self, points: &[[f64; 2]]) -> std::io::Result<()> {
         self.start_element("Points", &[])?;
 
         self.write_indent()?;
@@ -274,7 +276,7 @@ impl<W: Write> VtkWriter<W> {
 
         self.indent += 1;
         self.write_indent()?;
-        for (i, &(x, y)) in points.iter().enumerate() {
+        for (i, &[x, y]) in points.iter().enumerate() {
             write!(self.writer, "{:.10e} {:.10e} 0.0", x, y)?;
             if i < points.len() - 1 {
                 write!(self.writer, " ")?;
@@ -351,6 +353,7 @@ pub fn write_vtk_swe(
     let vtk_mesh = build_vtk_mesh(mesh, ops);
     let file = File::create(path)?;
     let mut writer = VtkWriter::new(file);
+    let h_min = Depth::new(h_min);
 
     let n_points = vtk_mesh.points.len();
     let n_cells = vtk_mesh.cells.len();
@@ -388,7 +391,7 @@ pub fn write_vtk_swe(
         Vec::new()
     };
 
-    for k in 0..mesh.n_elements {
+    for k in ElementIndex::iter(mesh.n_elements) {
         for i in 0..ops.n_nodes {
             let h = solution.get_var(k, i, 0);
             let hu = solution.get_var(k, i, 1);
@@ -404,7 +407,7 @@ pub fn write_vtk_swe(
             speed_data.push(speed);
 
             if let Some(bathy) = bathymetry {
-                let b = bathy.data[k * ops.n_nodes + i];
+                let b = bathy.data[k.as_usize() * ops.n_nodes + i];
                 bathy_data.push(b);
                 eta_data.push(h + b); // Surface elevation = depth + bathymetry
             }
@@ -455,6 +458,7 @@ pub fn write_vtk_coupled(
     let vtk_mesh = build_vtk_mesh(mesh, ops);
     let file = File::create(path)?;
     let mut writer = VtkWriter::new(file);
+    let h_min = Depth::new(h_min);
 
     let n_points = vtk_mesh.points.len();
     let n_cells = vtk_mesh.cells.len();
@@ -494,7 +498,7 @@ pub fn write_vtk_coupled(
         Vec::new()
     };
 
-    for k in 0..mesh.n_elements {
+    for k in ElementIndex::iter(mesh.n_elements) {
         for i in 0..ops.n_nodes {
             // SWE state
             let h = swe.get_var(k, i, 0);
@@ -511,12 +515,12 @@ pub fn write_vtk_coupled(
             speed_data.push(speed);
 
             // Tracer state (convert from conservative to concentrations)
-            let tracer_state = tracers.get_concentrations(k, i, h, h_min);
+            let tracer_state = tracers.get_concentrations(k, i, h, h_min.meters());
             temp_data.push(tracer_state.temperature);
             sal_data.push(tracer_state.salinity);
 
             if let Some(bathy) = bathymetry {
-                let b = bathy.data[k * ops.n_nodes + i];
+                let b = bathy.data[k.as_usize() * ops.n_nodes + i];
                 bathy_data.push(b);
                 eta_data.push(h + b);
             }
@@ -633,11 +637,11 @@ mod tests {
         let has_origin = vtk_mesh
             .points
             .iter()
-            .any(|&(x, y)| x.abs() < 1e-10 && y.abs() < 1e-10);
+            .any(|&[x, y]| x.abs() < 1e-10 && y.abs() < 1e-10);
         let has_corner = vtk_mesh
             .points
             .iter()
-            .any(|&(x, y)| (x - 1.0).abs() < 1e-10 && (y - 1.0).abs() < 1e-10);
+            .any(|&[x, y]| (x - 1.0).abs() < 1e-10 && (y - 1.0).abs() < 1e-10);
 
         assert!(has_origin, "Should have point at origin");
         assert!(has_corner, "Should have point at (1,1)");

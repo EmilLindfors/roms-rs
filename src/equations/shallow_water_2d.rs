@@ -28,6 +28,7 @@
 //! - Coriolis effects are significant for mesoscale circulation
 
 use crate::solver::SWEState2D;
+use crate::types::Depth;
 
 /// 2D Shallow Water Equations with optional Coriolis.
 ///
@@ -52,7 +53,7 @@ pub struct ShallowWater2D {
     /// Gravitational acceleration (default 9.81 m/s²)
     pub g: f64,
     /// Minimum depth for wet/dry treatment (default 1e-6 m)
-    pub h_min: f64,
+    pub h_min: Depth,
     /// Coriolis parameter f₀ for f-plane (s⁻¹)
     pub f0: f64,
     /// Beta-plane parameter β = ∂f/∂y (m⁻¹ s⁻¹)
@@ -62,11 +63,14 @@ pub struct ShallowWater2D {
 }
 
 impl ShallowWater2D {
+    /// Default minimum depth (1e-6 m)
+    const DEFAULT_H_MIN: f64 = 1e-6;
+
     /// Create 2D shallow water equations with gravity only (no Coriolis).
     pub fn new(g: f64) -> Self {
         Self {
             g,
-            h_min: 1e-6,
+            h_min: Depth::new(Self::DEFAULT_H_MIN),
             f0: 0.0,
             beta: 0.0,
             y0: 0.0,
@@ -74,7 +78,7 @@ impl ShallowWater2D {
     }
 
     /// Create with custom minimum depth threshold.
-    pub fn with_h_min(g: f64, h_min: f64) -> Self {
+    pub fn with_h_min(g: f64, h_min: Depth) -> Self {
         Self {
             g,
             h_min,
@@ -92,7 +96,7 @@ impl ShallowWater2D {
     pub fn with_coriolis(g: f64, f: f64) -> Self {
         Self {
             g,
-            h_min: 1e-6,
+            h_min: Depth::new(Self::DEFAULT_H_MIN),
             f0: f,
             beta: 0.0,
             y0: 0.0,
@@ -109,7 +113,7 @@ impl ShallowWater2D {
     pub fn with_beta_plane(g: f64, f0: f64, beta: f64, y0: f64) -> Self {
         Self {
             g,
-            h_min: 1e-6,
+            h_min: Depth::new(Self::DEFAULT_H_MIN),
             f0,
             beta,
             y0,
@@ -180,7 +184,7 @@ impl ShallowWater2D {
         let hu = state.hu;
         let hv = state.hv;
 
-        if h <= self.h_min {
+        if h <= self.h_min.meters() {
             return SWEState2D::zero();
         }
 
@@ -201,7 +205,7 @@ impl ShallowWater2D {
         let hu = state.hu;
         let hv = state.hv;
 
-        if h <= self.h_min {
+        if h <= self.h_min.meters() {
             return SWEState2D::zero();
         }
 
@@ -252,7 +256,7 @@ impl ShallowWater2D {
     ///
     /// λ_max = |u| + c where |u| = sqrt(u² + v²) and c = sqrt(gh)
     pub fn max_wave_speed(&self, state: &SWEState2D) -> f64 {
-        if state.h <= self.h_min {
+        if state.h <= self.h_min.meters() {
             return 0.0;
         }
 
@@ -267,7 +271,7 @@ impl ShallowWater2D {
     ///
     /// λ_n = |u·n| + c where u·n = u*nx + v*ny
     pub fn max_wave_speed_normal(&self, state: &SWEState2D, normal: (f64, f64)) -> f64 {
-        if state.h <= self.h_min {
+        if state.h <= self.h_min.meters() {
             return 0.0;
         }
 
@@ -288,7 +292,7 @@ impl ShallowWater2D {
     ///
     /// where u·n = u*nx + v*ny and c = sqrt(gh).
     pub fn eigenvalues_normal(&self, state: &SWEState2D, normal: (f64, f64)) -> [f64; 3] {
-        if state.h <= self.h_min {
+        if state.h <= self.h_min.meters() {
             return [0.0, 0.0, 0.0];
         }
 
@@ -345,7 +349,7 @@ impl ShallowWater2D {
             state.h = 0.0;
             state.hu = 0.0;
             state.hv = 0.0;
-        } else if state.h < self.h_min {
+        } else if state.h < self.h_min.meters() {
             // Nearly dry cell - zero out velocities to prevent spurious flow
             state.hu = 0.0;
             state.hv = 0.0;
@@ -369,7 +373,7 @@ mod tests {
     fn test_creation() {
         let swe = ShallowWater2D::standard();
         assert!((swe.g - 9.81).abs() < TOL);
-        assert!((swe.h_min - 1e-6).abs() < TOL);
+        assert!((swe.h_min.meters() - 1e-6).abs() < TOL);
         assert!((swe.f0 - 0.0).abs() < TOL);
     }
 

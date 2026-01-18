@@ -20,10 +20,14 @@ pub mod flux;
 pub mod io;
 pub mod mesh;
 pub mod operators;
+pub mod physics;
 pub mod polynomial;
+pub mod simulation;
 pub mod solver;
 pub mod source;
 pub mod time;
+pub mod types;
+pub mod vertical;
 
 // Re-export main types for convenience
 // 1D types
@@ -61,7 +65,7 @@ pub use boundary::{
 #[cfg(feature = "netcdf")]
 pub use boundary::OceanNestingBC2D;
 pub use equations::Advection2D;
-pub use mesh::{BoundaryTag, Mesh2D};
+pub use mesh::{BoundaryConfig, BoundaryTag, Mesh2D, Mesh2DBuilder};
 pub use operators::{DGOperators2D, GeometricFactors2D};
 pub use solver::{
     AdvectionBoundaryCondition2D,
@@ -114,6 +118,18 @@ pub use solver::{
 pub use solver::{compute_rhs_swe_2d_parallel, compute_rhs_tracer_2d_parallel};
 #[cfg(feature = "simd")]
 pub use solver::compute_rhs_swe_2d_simd;
+#[cfg(all(feature = "parallel", feature = "simd"))]
+pub use solver::compute_rhs_swe_2d_parallel_simd;
+
+// Burn GPU acceleration exports
+#[cfg(feature = "burn")]
+pub use solver::burn::{
+    BurnConnectivity, BurnError, BurnOperators2D, BurnSWESolution2D,
+    compute_rhs_swe_2d_burn, hll_flux_batched, roe_flux_batched,
+    rhs::{BurnGeometricFactors2D, BurnRhsConfig},
+};
+#[cfg(feature = "burn")]
+pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};
 pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
     HydrostaticReconstruction2D, P_STANDARD, RectangularBoundary, SourceContext2D, SourceTerm2D,
@@ -166,3 +182,20 @@ pub use io::{
 
 // Mesh types (additional exports)
 pub use mesh::{LandMask2D, LandMaskStatistics};
+
+// Physics module types
+pub use physics::{PhysicsBuilder, PhysicsConfig, PhysicsModule, PhysicsModuleInfo, SWEPhysics2DBuilder};
+
+// Simulation runner types
+pub use simulation::{Simulation, SimulationConfig, SimulationResult};
+
+// Vertical coordinate types (for 3D)
+pub use vertical::{
+    DoubleTanhStretching, SigmaGrid, SongHaidvogelStretching, Stretching, UniformStretching,
+};
+
+// Strongly-typed domain types
+pub use types::{
+    Bounds2D, Depth, ElementIndex, Elevation, FaceIndex, LevelIndex, NodeIndex, PhysicalZ,
+    Resolution2D, Sigma, SideBoundaries,
+};

@@ -9,6 +9,7 @@
 //! where (rx, ry, sx, sy) are the entries of the inverse Jacobian matrix.
 
 use crate::mesh::Mesh2D;
+use crate::types::ElementIndex;
 
 /// Geometric factors for 2D elements.
 ///
@@ -67,7 +68,7 @@ impl GeometricFactors2D {
         let mut surface_j = Vec::with_capacity(n_elements);
         let mut normals = Vec::with_capacity(n_elements);
 
-        for k in 0..n_elements {
+        for k in ElementIndex::iter(n_elements) {
             let verts = mesh.element_vertices(k);
 
             // Compute Jacobian for this element
@@ -155,12 +156,12 @@ struct ElementJacobian {
 /// x_r = (x1 - x0 + x2 - x3) / 4
 /// x_s = (x3 - x0 + x2 - x1) / 4
 fn compute_element_jacobian(
-    verts: &[(f64, f64); 4],
+    verts: &[[f64; 2]; 4],
 ) -> (ElementJacobian, [f64; 4], [(f64, f64); 4]) {
-    let (x0, y0) = verts[0];
-    let (x1, y1) = verts[1];
-    let (x2, y2) = verts[2];
-    let (x3, y3) = verts[3];
+    let [x0, y0] = verts[0];
+    let [x1, y1] = verts[1];
+    let [x2, y2] = verts[2];
+    let [x3, y3] = verts[3];
 
     // Jacobian entries: J = [[x_r, x_s], [y_r, y_s]]
     // For affine elements (parallelograms), these are constant

@@ -8,6 +8,7 @@
 use crate::mesh::Mesh1D;
 use crate::operators::DGOperators1D;
 use crate::solver::{SWESolution, TVBParameter, apply_swe_limiters};
+use crate::types::ElementIndex;
 
 /// Configuration for SWE time integration.
 #[derive(Clone, Debug)]
@@ -220,8 +221,9 @@ where
 pub fn total_mass(q: &SWESolution, mesh: &Mesh1D, ops: &DGOperators1D) -> f64 {
     let mut mass = 0.0;
 
-    for k in 0..q.n_elements {
-        let jac = mesh.jacobian(k);
+    for k in ElementIndex::iter(q.n_elements) {
+        let ki = k.as_usize();
+        let jac = mesh.jacobian(ki);
 
         for i in 0..ops.n_nodes {
             let h = q.get(k, i)[0];
@@ -237,8 +239,9 @@ pub fn total_mass(q: &SWESolution, mesh: &Mesh1D, ops: &DGOperators1D) -> f64 {
 pub fn total_momentum(q: &SWESolution, mesh: &Mesh1D, ops: &DGOperators1D) -> f64 {
     let mut momentum = 0.0;
 
-    for k in 0..q.n_elements {
-        let jac = mesh.jacobian(k);
+    for k in ElementIndex::iter(q.n_elements) {
+        let ki = k.as_usize();
+        let jac = mesh.jacobian(ki);
 
         for i in 0..ops.n_nodes {
             let hu = q.get(k, i)[1];
@@ -255,8 +258,9 @@ pub fn total_energy(q: &SWESolution, mesh: &Mesh1D, ops: &DGOperators1D, g: f64)
     let h_min = 1e-10;
     let mut energy = 0.0;
 
-    for k in 0..q.n_elements {
-        let jac = mesh.jacobian(k);
+    for k in ElementIndex::iter(q.n_elements) {
+        let ki = k.as_usize();
+        let jac = mesh.jacobian(ki);
 
         for i in 0..ops.n_nodes {
             let [h, hu] = q.get(k, i);
@@ -277,6 +281,10 @@ pub fn total_energy(q: &SWESolution, mesh: &Mesh1D, ops: &DGOperators1D, g: f64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn k(idx: usize) -> ElementIndex {
+        ElementIndex::new(idx)
+    }
 
     fn setup() -> (Mesh1D, DGOperators1D) {
         let mesh = Mesh1D::uniform(0.0, 1.0, 10);
@@ -299,9 +307,9 @@ mod tests {
 
         // Still water initial condition
         let mut q = SWESolution::new(10, 4);
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                q.set(k, i, [2.0, 0.0]); // h=2, hu=0
+                q.set(k(ki), i, [2.0, 0.0]); // h=2, hu=0
             }
         }
 
@@ -313,9 +321,9 @@ mod tests {
         ssp_rk3_swe_step(&mut q, rhs_fn, 0.01, &mesh, &ops, &config);
 
         // Should remain unchanged
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                let [h, hu] = q.get(k, i);
+                let [h, hu] = q.get(k(ki), i);
                 assert!((h - 2.0).abs() < 1e-12);
                 assert!(hu.abs() < 1e-12);
             }
@@ -334,10 +342,10 @@ mod tests {
 
         // Create solution with some oscillations
         let mut q = SWESolution::new(10, 4);
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
                 let h = 1.0 + 0.5 * ops.nodes[i]; // Varies within element
-                q.set(k, i, [h, 0.0]);
+                q.set(k(ki), i, [h, 0.0]);
             }
         }
 
@@ -347,9 +355,9 @@ mod tests {
         ssp_rk3_swe_step(&mut q, rhs_fn, 0.01, &mesh, &ops, &config);
 
         // All depths should be positive
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                let h = q.get(k, i)[0];
+                let h = q.get(k(ki), i)[0];
                 assert!(h >= 0.0, "Depth should be non-negative");
             }
         }
@@ -361,11 +369,11 @@ mod tests {
 
         // Create varying solution
         let mut q = SWESolution::new(10, 4);
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                let x = mesh.reference_to_physical(k, ops.nodes[i]);
+                let x = mesh.reference_to_physical(ki, ops.nodes[i]);
                 let h = 1.0 + 0.3 * (2.0 * std::f64::consts::PI * x).sin();
-                q.set(k, i, [h, h * 0.5]);
+                q.set(k(ki), i, [h, h * 0.5]);
             }
         }
 
@@ -386,9 +394,9 @@ mod tests {
 
         // Still water: only potential energy
         let mut q = SWESolution::new(10, 4);
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                q.set(k, i, [2.0, 0.0]); // h=2, u=0
+                q.set(k(ki), i, [2.0, 0.0]); // h=2, u=0
             }
         }
 
@@ -410,9 +418,9 @@ mod tests {
 
         // Still water
         let mut q = SWESolution::new(10, 4);
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                q.set(k, i, [2.0, 0.0]);
+                q.set(k(ki), i, [2.0, 0.0]);
             }
         }
 
@@ -439,9 +447,9 @@ mod tests {
         );
 
         // Solution should be unchanged
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                let [h, hu] = q.get(k, i);
+                let [h, hu] = q.get(k(ki), i);
                 assert!((h - 2.0).abs() < 1e-12);
                 assert!(hu.abs() < 1e-12);
             }
@@ -454,9 +462,9 @@ mod tests {
         let config = SWETimeConfig::without_limiters(0.5);
 
         let mut q = SWESolution::new(10, 4);
-        for k in 0..10 {
+        for ki in 0..10 {
             for i in 0..4 {
-                q.set(k, i, [1.0, 0.0]);
+                q.set(k(ki), i, [1.0, 0.0]);
             }
         }
 

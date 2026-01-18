@@ -11,7 +11,12 @@ use dg_rs::{
     SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
     source::{CombinedSource2D, CoriolisSource2D, SpongeLayer2D},
 };
+use dg_rs::types::ElementIndex;
 use std::f64::consts::PI;
+
+fn k(idx: usize) -> ElementIndex {
+    ElementIndex::new(idx)
+}
 
 const G: f64 = 9.81;
 
@@ -126,8 +131,8 @@ fn test_standing_wave_period() {
 
     let h0 = 10.0; // Mean depth
     let amplitude = 0.1;
-    let k = 2.0 * PI / lx; // Wave number
-    let omega = k * (G * h0).sqrt(); // Analytical frequency
+    let wave_k = 2.0 * PI / lx; // Wave number
+    let omega = wave_k * (G * h0).sqrt(); // Analytical frequency
     let period = 2.0 * PI / omega;
 
     let equation = ShallowWater2D::new(G);
@@ -139,7 +144,7 @@ fn test_standing_wave_period() {
     q.set_from_functions(
         &mesh,
         &ops,
-        |x, _y| h0 + amplitude * (k * x).cos(),
+        |x, _y| h0 + amplitude * (wave_k * x).cos(),
         |_, _| 0.0,
         |_, _| 0.0,
     );
@@ -161,7 +166,7 @@ fn test_standing_wave_period() {
         time += dt;
 
         // Sample elevation at center
-        let eta = q.get_state(center_elem, ops.n_nodes / 2).h - h0;
+        let eta = q.get_state(k(center_elem), ops.n_nodes / 2).h - h0;
 
         // Detect peaks (for period measurement)
         if searching_peak && eta < last_eta && last_eta > 0.0 {
@@ -260,9 +265,9 @@ fn test_geostrophic_balance() {
 
     // Velocity should remain close to geostrophic
     let mut max_v_deviation: f64 = 0.0;
-    for k in 0..mesh.n_elements {
+    for ki in 0..mesh.n_elements {
         for i in 0..ops.n_nodes {
-            let state = q.get_state(k, i);
+            let state = q.get_state(k(ki), i);
             let v = state.hv / state.h;
             max_v_deviation = max_v_deviation.max((v - v_geo).abs());
         }
@@ -355,16 +360,16 @@ fn test_sponge_layer_absorption() {
     let mut energy_no_sponge = 0.0;
     let mut energy_with_sponge = 0.0;
 
-    for k in 0..mesh.n_elements {
-        let j = geom.det_j[k];
+    for ki in 0..mesh.n_elements {
+        let j = geom.det_j[ki];
         for (i, &w) in ops.weights.iter().enumerate() {
             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-            let (x, _y) = mesh.reference_to_physical(k, r, s);
+            let [x, _y] = mesh.reference_to_physical(k(ki), r, s);
 
             // Only count energy in right half (where sponge is)
             if x > lx / 2.0 {
-                let state_no = q_no_sponge.get_state(k, i);
-                let state_with = q_with_sponge.get_state(k, i);
+                let state_no = q_no_sponge.get_state(k(ki), i);
+                let state_with = q_with_sponge.get_state(k(ki), i);
 
                 // Perturbation energy: (h - h0)²
                 energy_no_sponge += w * (state_no.h - h0).powi(2) * j;

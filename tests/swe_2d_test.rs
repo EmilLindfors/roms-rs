@@ -10,6 +10,11 @@ use dg_rs::{
     DGOperators2D, GeometricFactors2D, Mesh2D, Reflective2D, SWE2DRhsConfig, SWEFluxType2D,
     SWESolution2D, SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
 };
+use dg_rs::types::ElementIndex;
+
+fn k(idx: usize) -> ElementIndex {
+    ElementIndex::new(idx)
+}
 
 const G: f64 = 10.0;
 
@@ -61,9 +66,9 @@ fn test_lake_at_rest() {
 
     // Initialize: h = 5.0, u = v = 0
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-    for k in 0..mesh.n_elements {
+    for ki in 0..mesh.n_elements {
         for i in 0..ops.n_nodes {
-            q.set_state(k, i, SWEState2D::new(5.0, 0.0, 0.0));
+            q.set_state(k(ki), i, SWEState2D::new(5.0, 0.0, 0.0));
         }
     }
 
@@ -311,7 +316,7 @@ fn test_coriolis_effect() {
     let expected_hv_source = -f * h * u;
 
     // Check that the hv difference is approximately the expected source
-    let diff_hv = rhs_with.get_var(0, 0, 2) - rhs_without.get_var(0, 0, 2);
+    let diff_hv = rhs_with.get_var(k(0), 0, 2) - rhs_without.get_var(k(0), 0, 2);
     assert!(
         (diff_hv - expected_hv_source).abs() < 1e-8,
         "Coriolis hv source: got {:.2e}, expected {:.2e}",
