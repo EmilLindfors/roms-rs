@@ -33,14 +33,10 @@ use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d};
 use dg_rs::solver::compute_dt_swe_2d_parallel;
 
 // RHS functions based on enabled features
-#[cfg(not(any(feature = "parallel", feature = "simd")))]
+#[cfg(not(all(feature = "parallel", feature = "simd")))]
 use dg_rs::solver::compute_rhs_swe_2d;
-#[cfg(all(feature = "simd", not(feature = "parallel")))]
-use dg_rs::solver::compute_rhs_swe_2d_simd;
-#[cfg(all(feature = "parallel", not(feature = "simd")))]
-use dg_rs::solver::compute_rhs_swe_2d_parallel;
 #[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::solver::compute_rhs_swe_2d_parallel_simd;
+use dg_rs::solver::compute_rhs_swe_2d_parallel;
 use dg_rs::source::{CombinedSource2D, CoriolisSource2D, ManningFriction2D};
 use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 use dg_rs::types::{Depth, ElementIndex};
@@ -267,17 +263,9 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
             // Use the best available implementation
             #[cfg(all(feature = "parallel", feature = "simd"))]
             {
-                compute_rhs_swe_2d_parallel_simd(s, &mesh, &ops, &geom, &config, time)
-            }
-            #[cfg(all(feature = "parallel", not(feature = "simd")))]
-            {
                 compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time)
             }
-            #[cfg(all(feature = "simd", not(feature = "parallel")))]
-            {
-                compute_rhs_swe_2d_simd(s, &mesh, &ops, &geom, &config, time)
-            }
-            #[cfg(not(any(feature = "parallel", feature = "simd")))]
+            #[cfg(not(all(feature = "parallel", feature = "simd")))]
             {
                 compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time)
             }

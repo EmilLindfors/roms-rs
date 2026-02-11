@@ -1,0 +1,38 @@
+# Cargo build configuration for dg-rs
+# Based on: https://nnethercote.github.io/perf-book/build-configuration.html
+#
+# This enables native CPU optimizations (AVX2/AVX-512) for maximum performance.
+# The resulting binary will only run on CPUs with the same or newer instruction sets.
+
+[build]
+# Use all available CPU cores for parallel compilation
+jobs = -1
+
+# Linux x86_64 - most common target for HPC
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+# Windows x86_64
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native"]
+
+# macOS x86_64 (Intel Macs)
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+# macOS ARM64 (Apple Silicon)
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
+
+# Linux ARM64 (e.g., AWS Graviton)
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[alias]
+# Quick aliases for common build configurations
+br = "build --release"
+rr = "run --release"
+bench-rhs = "bench --bench rhs_computation_bench --features parallel,simd"
+bench-all = "bench --features parallel,simd"
+profile = "build --profile profiling --features parallel,simd"
+test-all = "test --features parallel,simd"

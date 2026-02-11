@@ -19,12 +19,8 @@ use dg_rs::SWEFluxType2D;
 
 // Use the best available RHS function based on enabled features
 #[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::solver::compute_rhs_swe_2d_parallel_simd;
-#[cfg(all(feature = "parallel", not(feature = "simd")))]
 use dg_rs::solver::compute_rhs_swe_2d_parallel;
-#[cfg(all(feature = "simd", not(feature = "parallel")))]
-use dg_rs::solver::compute_rhs_swe_2d_simd;
-#[cfg(not(any(feature = "parallel", feature = "simd")))]
+#[cfg(not(all(feature = "parallel", feature = "simd")))]
 use dg_rs::solver::compute_rhs_swe_2d;
 
 #[cfg(feature = "parallel")]
@@ -102,12 +98,8 @@ fn main() {
 
         let t0 = Instant::now();
         #[cfg(all(feature = "parallel", feature = "simd"))]
-        let _rhs = compute_rhs_swe_2d_parallel_simd(&state, &mesh, &ops, &geom, &config, 0.0);
-        #[cfg(all(feature = "parallel", not(feature = "simd")))]
         let _rhs = compute_rhs_swe_2d_parallel(&state, &mesh, &ops, &geom, &config, 0.0);
-        #[cfg(all(feature = "simd", not(feature = "parallel")))]
-        let _rhs = compute_rhs_swe_2d_simd(&state, &mesh, &ops, &geom, &config, 0.0);
-        #[cfg(not(any(feature = "parallel", feature = "simd")))]
+        #[cfg(not(all(feature = "parallel", feature = "simd")))]
         let _rhs = compute_rhs_swe_2d(&state, &mesh, &ops, &geom, &config, 0.0);
         println!("  RHS {}: {:?}", i, t0.elapsed());
     }
@@ -127,12 +119,8 @@ fn main() {
                 .with_well_balanced(true);
 
             #[cfg(all(feature = "parallel", feature = "simd"))]
-            { compute_rhs_swe_2d_parallel_simd(s, &mesh, &ops, &geom, &config, time) }
-            #[cfg(all(feature = "parallel", not(feature = "simd")))]
             { compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time) }
-            #[cfg(all(feature = "simd", not(feature = "parallel")))]
-            { compute_rhs_swe_2d_simd(s, &mesh, &ops, &geom, &config, time) }
-            #[cfg(not(any(feature = "parallel", feature = "simd")))]
+            #[cfg(not(all(feature = "parallel", feature = "simd")))]
             { compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time) }
         };
 

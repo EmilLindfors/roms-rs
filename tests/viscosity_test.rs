@@ -22,7 +22,7 @@ fn ssp_rk3_step<BC: dg_rs::SWEBoundaryCondition2D>(
     dt: f64,
     time: f64,
 ) {
-    let n = q.data.len();
+    let n = q.data[0].len(); // total nodes per variable (SoA layout)
 
     // Stage 1
     let rhs1 = compute_rhs_swe_2d(q, mesh, ops, geom, config, time);
@@ -34,15 +34,19 @@ fn ssp_rk3_step<BC: dg_rs::SWEBoundaryCondition2D>(
     let rhs2 = compute_rhs_swe_2d(&u1, mesh, ops, geom, config, time + dt);
     u1.axpy(dt, &rhs2);
     let mut u2 = SWESolution2D::new(q.n_elements, q.n_nodes);
-    for i in 0..n {
-        u2.data[i] = 0.75 * q.data[i] + 0.25 * u1.data[i];
+    for var in 0..3 {
+        for i in 0..n {
+            u2.data[var][i] = 0.75 * q.data[var][i] + 0.25 * u1.data[var][i];
+        }
     }
 
     // Stage 3
     let rhs3 = compute_rhs_swe_2d(&u2, mesh, ops, geom, config, time + 0.5 * dt);
     u2.axpy(dt, &rhs3);
-    for i in 0..n {
-        q.data[i] = (1.0 / 3.0) * q.data[i] + (2.0 / 3.0) * u2.data[i];
+    for var in 0..3 {
+        for i in 0..n {
+            q.data[var][i] = (1.0 / 3.0) * q.data[var][i] + (2.0 / 3.0) * u2.data[var][i];
+        }
     }
 }
 
@@ -85,11 +89,11 @@ fn test_viscosity_exponential_decay() {
         |_x, _y| 0.0,
     );
 
-    // Measure initial amplitude
+    // Measure initial amplitude (SoA: data[1] = all hu values)
     let initial_max_hu = q
-        .data
-        .chunks(3)
-        .map(|c| c[1].abs())
+        .data[1]
+        .iter()
+        .map(|v| v.abs())
         .fold(0.0_f64, f64::max);
 
     // Time integration
@@ -110,11 +114,11 @@ fn test_viscosity_exponential_decay() {
         time += dt;
     }
 
-    // Measure final amplitude
+    // Measure final amplitude (SoA: data[1] = all hu values)
     let final_max_hu = q
-        .data
-        .chunks(3)
-        .map(|c| c[1].abs())
+        .data[1]
+        .iter()
+        .map(|v| v.abs())
         .fold(0.0_f64, f64::max);
 
     // Theoretical decay factor: exp(-ν·k²·T) = exp(-0.1·2·1.0) = exp(-0.2)
@@ -303,11 +307,13 @@ fn test_viscosity_parallel_consistency() {
     let rhs_serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
     let rhs_parallel = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, 0.0);
 
-    let max_diff = rhs_serial
-        .data
-        .iter()
-        .zip(rhs_parallel.data.iter())
-        .map(|(a, b)| (a - b).abs())
+    let max_diff = (0..3)
+        .flat_map(|var| {
+            rhs_serial.data[var]
+                .iter()
+                .zip(rhs_parallel.data[var].iter())
+                .map(|(a, b)| (a - b).abs())
+        })
         .fold(0.0_f64, f64::max);
 
     assert!(

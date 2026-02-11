@@ -1,46 +1,9 @@
 //! Standard limiter implementations and composition utilities.
 
 use super::super::state::SWESolution2D;
-use super::swe_2d::{swe_kuzmin_limiter_2d, swe_positivity_limiter_2d, swe_tvb_limiter_2d};
-use super::tracer_2d::{KuzminParameter2D, TVBParameter2D};
+use super::swe_2d::{swe_kuzmin_limiter_2d, swe_positivity_limiter_2d};
+use super::tracer_2d::KuzminParameter2D;
 use super::traits::{BoxedLimiter2D, Limiter2D, LimiterContext2D};
-
-/// TVB (Total Variation Bounded) slope limiter.
-///
-/// Limits slopes to prevent oscillations while maintaining high-order
-/// accuracy in smooth regions through the M parameter.
-#[derive(Clone, Debug)]
-pub struct TVBLimiter2D {
-    param: TVBParameter2D,
-}
-
-impl TVBLimiter2D {
-    /// Create a new TVB limiter with the given parameters.
-    pub fn new(param: TVBParameter2D) -> Self {
-        Self { param }
-    }
-
-    /// Create a TVB limiter with the given M parameter and reference length.
-    ///
-    /// # Arguments
-    /// * `m` - TVB parameter (typically 1-100; larger = less limiting)
-    /// * `l_ref` - Reference length scale (e.g., domain size or h_min)
-    pub fn with_params(m: f64, l_ref: f64) -> Self {
-        Self {
-            param: TVBParameter2D::new(m, l_ref),
-        }
-    }
-}
-
-impl Limiter2D for TVBLimiter2D {
-    fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
-        swe_tvb_limiter_2d(solution, ctx.mesh, ctx.ops, &self.param);
-    }
-
-    fn name(&self) -> &'static str {
-        "tvb"
-    }
-}
 
 /// Kuzmin vertex-based slope limiter.
 ///
@@ -206,14 +169,10 @@ pub enum StandardLimiter2D {
     /// No limiting
     #[default]
     None,
-    /// TVB slope limiter
-    Tvb(TVBParameter2D),
     /// Kuzmin vertex-based limiter
     Kuzmin(KuzminParameter2D),
     /// Positivity limiter only
     Positivity(f64),
-    /// TVB + positivity (common combination)
-    TvbWithPositivity { tvb: TVBParameter2D, h_min: f64 },
     /// Kuzmin + positivity (common combination)
     KuzminWithPositivity {
         kuzmin: KuzminParameter2D,
@@ -225,17 +184,10 @@ impl Limiter2D for StandardLimiter2D {
     fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
         match self {
             StandardLimiter2D::None => {}
-            StandardLimiter2D::Tvb(param) => {
-                swe_tvb_limiter_2d(solution, ctx.mesh, ctx.ops, param);
-            }
             StandardLimiter2D::Kuzmin(param) => {
                 swe_kuzmin_limiter_2d(solution, ctx.mesh, ctx.ops, param);
             }
             StandardLimiter2D::Positivity(h_min) => {
-                swe_positivity_limiter_2d(solution, ctx.ops, *h_min);
-            }
-            StandardLimiter2D::TvbWithPositivity { tvb, h_min } => {
-                swe_tvb_limiter_2d(solution, ctx.mesh, ctx.ops, tvb);
                 swe_positivity_limiter_2d(solution, ctx.ops, *h_min);
             }
             StandardLimiter2D::KuzminWithPositivity { kuzmin, h_min } => {
@@ -248,10 +200,8 @@ impl Limiter2D for StandardLimiter2D {
     fn name(&self) -> &'static str {
         match self {
             StandardLimiter2D::None => "none",
-            StandardLimiter2D::Tvb(_) => "tvb",
             StandardLimiter2D::Kuzmin(_) => "kuzmin",
             StandardLimiter2D::Positivity(_) => "positivity",
-            StandardLimiter2D::TvbWithPositivity { .. } => "tvb+positivity",
             StandardLimiter2D::KuzminWithPositivity { .. } => "kuzmin+positivity",
         }
     }
@@ -260,7 +210,6 @@ impl Limiter2D for StandardLimiter2D {
         matches!(
             self,
             StandardLimiter2D::Positivity(_)
-                | StandardLimiter2D::TvbWithPositivity { .. }
                 | StandardLimiter2D::KuzminWithPositivity { .. }
         )
     }
@@ -270,14 +219,8 @@ impl Limiter2D for StandardLimiter2D {
 pub fn create_limiter(limiter: StandardLimiter2D) -> BoxedLimiter2D {
     match limiter {
         StandardLimiter2D::None => Box::new(NoLimiter2D),
-        StandardLimiter2D::Tvb(param) => Box::new(TVBLimiter2D::new(param)),
         StandardLimiter2D::Kuzmin(param) => Box::new(KuzminLimiter2D::new(param)),
         StandardLimiter2D::Positivity(h_min) => Box::new(PositivityLimiter2D::new(h_min)),
-        StandardLimiter2D::TvbWithPositivity { tvb, h_min } => Box::new(
-            LimiterChain2D::new()
-                .then(TVBLimiter2D::new(tvb))
-                .then(PositivityLimiter2D::new(h_min)),
-        ),
         StandardLimiter2D::KuzminWithPositivity { kuzmin, h_min } => Box::new(
             LimiterChain2D::new()
                 .then(KuzminLimiter2D::new(kuzmin))
@@ -304,7 +247,6 @@ mod tests {
 
     #[test]
     fn test_limiter_names() {
-        assert_eq!(TVBLimiter2D::with_params(10.0, 0.1).name(), "tvb");
         assert_eq!(KuzminLimiter2D::strict().name(), "kuzmin");
         assert_eq!(PositivityLimiter2D::new(1e-6).name(), "positivity");
         assert_eq!(NoLimiter2D.name(), "none");
@@ -313,7 +255,7 @@ mod tests {
     #[test]
     fn test_limiter_chain() {
         let chain = LimiterChain2D::new()
-            .then(TVBLimiter2D::with_params(10.0, 0.1))
+            .then(KuzminLimiter2D::strict())
             .then(PositivityLimiter2D::new(1e-6));
 
         assert_eq!(chain.len(), 2);
@@ -333,12 +275,12 @@ mod tests {
         assert_eq!(pos.name(), "positivity");
         assert!(pos.preserves_positivity());
 
-        let tvb_pos = StandardLimiter2D::TvbWithPositivity {
-            tvb: TVBParameter2D::new(10.0, 0.1),
+        let kuzmin_pos = StandardLimiter2D::KuzminWithPositivity {
+            kuzmin: KuzminParameter2D::strict(),
             h_min: 1e-6,
         };
-        assert_eq!(tvb_pos.name(), "tvb+positivity");
-        assert!(tvb_pos.preserves_positivity());
+        assert_eq!(kuzmin_pos.name(), "kuzmin+positivity");
+        assert!(kuzmin_pos.preserves_positivity());
     }
 
     #[test]
@@ -376,8 +318,8 @@ mod tests {
         let boxed = create_limiter(StandardLimiter2D::None);
         assert_eq!(boxed.name(), "none");
 
-        let boxed = create_limiter(StandardLimiter2D::TvbWithPositivity {
-            tvb: TVBParameter2D::new(10.0, 0.1),
+        let boxed = create_limiter(StandardLimiter2D::KuzminWithPositivity {
+            kuzmin: KuzminParameter2D::strict(),
             h_min: 1e-6,
         });
         assert_eq!(boxed.name(), "chain");

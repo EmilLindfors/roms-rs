@@ -6,10 +6,14 @@ description = "Discontinuous Galerkin methods in Rust"
 license = "MIT"
 
 [features]
-default = ["parallel", "simd"]
+default = ["parallel", "simd", "netcdf", "mimalloc"]
 parallel = ["rayon"]
 netcdf = ["dep:netcdf", "dep:chrono"]
 simd = ["pulp"]
+
+# High-performance allocator (can improve performance 5-15%)
+# Use with: cargo build --release --features mimalloc
+mimalloc = ["dep:mimalloc"]
 
 # Burn GPU acceleration features
 burn = ["dep:burn"]
@@ -30,6 +34,9 @@ burn-ndarray = { version = "0.20", optional = true }
 # Disable fusion feature to support f64 precision (fusion only supports f32)
 burn-cuda = { version = "0.20", optional = true, default-features = false }
 burn-wgpu = { version = "0.20", optional = true, default-features = false }
+
+# High-performance allocator (alternative to system allocator)
+mimalloc = { version = "0.1", optional = true, default-features = false }
 
 # Geographic data I/O
 tiff = "0.9"           # GeoTIFF reading (pure Rust)
@@ -76,10 +83,26 @@ harness = false
 inherits = "release"
 debug = true
 
-# Release profile with better debug info for profiling when needed
+# Release profile: maximum performance for production
 [profile.release]
-debug = 1  # Line tables only (minimal overhead)
+opt-level = 3           # Maximum optimization
+lto = "fat"             # Full link-time optimization (slower compile, faster runtime)
+codegen-units = 1       # Single codegen unit for better optimization
+panic = "abort"         # Smaller binary, slightly faster (no unwinding)
+debug = 1               # Line tables only for stack traces
+
+# Release profile variant for faster compilation during development
+[profile.release-fast]
+inherits = "release"
+lto = "thin"            # Faster LTO
+codegen-units = 16      # Parallel codegen
+debug = 0               # No debug info
 
 [[example]]
 name = "advection_1d"
 path = "examples/advection_1d.rs"
+
+[[example]]
+name = "profile_gpu"
+path = "examples/profile_gpu.rs"
+required-features = ["burn"]

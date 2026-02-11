@@ -268,22 +268,17 @@ pub fn apply_wet_dry_correction_all(
     config: &WetDryConfig,
 ) {
     let n_elements = solution.n_elements;
-    let n_nodes = solution.n_nodes;
     let inv_range = config.inv_blend_range();
     let max_vel_sq = config.max_velocity * config.max_velocity;
 
     for k in ElementIndex::iter(n_elements) {
         // Fast path: check if element is fully wet (skip correction)
-        let mut min_h = f64::INFINITY;
-        let mut max_h = f64::NEG_INFINITY;
-        let elem_data = solution.element_data(k);
-
-        // Scan for min/max depth in element (stride of 3 for [h, hu, hv])
-        for i in 0..n_nodes {
-            let h = elem_data[i * 3];
-            min_h = min_h.min(h);
-            max_h = max_h.max(h);
-        }
+        let elem_h = solution.element_h(k);
+        let (min_h, max_h) = elem_h
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &h| {
+                (min.min(h), max.max(h))
+            });
 
         // If all nodes are fully wet and depths are non-negative, check velocity cap only
         if min_h >= config.h_thin.meters() {
@@ -294,13 +289,13 @@ pub fn apply_wet_dry_correction_all(
 
         // If all nodes are dry, zero out momentum
         if max_h <= config.h_min.meters() {
-            let elem_data = solution.element_data_mut(k);
-            for i in 0..n_nodes {
-                let base = i * 3;
-                elem_data[base] = elem_data[base].max(0.0); // h >= 0
-                elem_data[base + 1] = 0.0; // hu = 0
-                elem_data[base + 2] = 0.0; // hv = 0
+            // Ensure h >= 0
+            for h in solution.element_h_mut(k) {
+                *h = h.max(0.0);
             }
+            // Zero out momentum
+            solution.element_hu_mut(k).fill(0.0);
+            solution.element_hv_mut(k).fill(0.0);
             continue;
         }
 
@@ -318,17 +313,29 @@ fn apply_velocity_cap_element(
     max_vel_sq: f64,
 ) {
     let n_nodes = solution.n_nodes;
-    let elem_data = solution.element_data_mut(k);
+    let h_min = config.h_min.meters();
 
+    // Get slices for SoA access
+    let elem_h = solution.element_h(k);
+    let h_vals: Vec<f64> = elem_h.to_vec();
+
+    // Now we can get mutable access
+    let elem_hu = solution.element_hu_mut(k);
+    let hu_vals: Vec<f64> = elem_hu.to_vec();
+
+    let elem_hv = solution.element_hv_mut(k);
+    let hv_vals: Vec<f64> = elem_hv.to_vec();
+
+    // Reacquire mutable slices for writing
+    let elem_hu = solution.element_hu_mut(k);
     for i in 0..n_nodes {
-        let base = i * 3;
-        let h = elem_data[base];
-        let hu = elem_data[base + 1];
-        let hv = elem_data[base + 2];
-
-        if h <= config.h_min.meters() {
+        let h = h_vals[i];
+        if h <= h_min {
             continue;
         }
+
+        let hu = hu_vals[i];
+        let hv = hv_vals[i];
 
         // Compute velocity squared to check cap
         let h_inv = 1.0 / h;
@@ -338,8 +345,28 @@ fn apply_velocity_cap_element(
 
         if speed_sq > max_vel_sq {
             let scale = (max_vel_sq / speed_sq).sqrt();
-            elem_data[base + 1] = h * u * scale;
-            elem_data[base + 2] = h * v * scale;
+            elem_hu[i] = h * u * scale;
+        }
+    }
+
+    let elem_hv = solution.element_hv_mut(k);
+    for i in 0..n_nodes {
+        let h = h_vals[i];
+        if h <= h_min {
+            continue;
+        }
+
+        let hu = hu_vals[i];
+        let hv = hv_vals[i];
+
+        let h_inv = 1.0 / h;
+        let u = hu * h_inv;
+        let v = hv * h_inv;
+        let speed_sq = u * u + v * v;
+
+        if speed_sq > max_vel_sq {
+            let scale = (max_vel_sq / speed_sq).sqrt();
+            elem_hv[i] = h * v * scale;
         }
     }
 }
@@ -354,13 +381,22 @@ fn apply_wet_dry_correction_element_fused(
     max_vel_sq: f64,
 ) {
     let n_nodes = solution.n_nodes;
-    let elem_data = solution.element_data_mut(k);
+    let h_min = config.h_min.meters();
+
+    // Read current values (SoA)
+    let h_vals: Vec<f64> = solution.element_h(k).to_vec();
+    let hu_vals: Vec<f64> = solution.element_hu(k).to_vec();
+    let hv_vals: Vec<f64> = solution.element_hv(k).to_vec();
+
+    // Compute corrected values
+    let mut h_new = vec![0.0; n_nodes];
+    let mut hu_new = vec![0.0; n_nodes];
+    let mut hv_new = vec![0.0; n_nodes];
 
     for i in 0..n_nodes {
-        let base = i * 3;
-        let mut h = elem_data[base];
-        let mut hu = elem_data[base + 1];
-        let mut hv = elem_data[base + 2];
+        let mut h = h_vals[i];
+        let mut hu = hu_vals[i];
+        let mut hv = hv_vals[i];
 
         // Ensure non-negative depth
         h = h.max(0.0);
@@ -370,9 +406,9 @@ fn apply_wet_dry_correction_element_fused(
 
         if alpha <= 0.0 {
             // Dry: zero momentum
-            elem_data[base] = h;
-            elem_data[base + 1] = 0.0;
-            elem_data[base + 2] = 0.0;
+            h_new[i] = h;
+            hu_new[i] = 0.0;
+            hv_new[i] = 0.0;
             continue;
         }
 
@@ -383,7 +419,7 @@ fn apply_wet_dry_correction_element_fused(
         }
 
         // Apply velocity cap
-        if h > config.h_min.meters() {
+        if h > h_min {
             let h_inv = 1.0 / h;
             let u = hu * h_inv;
             let v = hv * h_inv;
@@ -396,15 +432,21 @@ fn apply_wet_dry_correction_element_fused(
             }
         }
 
-        elem_data[base] = h;
-        elem_data[base + 1] = hu;
-        elem_data[base + 2] = hv;
+        h_new[i] = h;
+        hu_new[i] = hu;
+        hv_new[i] = hv;
     }
+
+    // Write back corrected values
+    solution.element_h_mut(k).copy_from_slice(&h_new);
+    solution.element_hu_mut(k).copy_from_slice(&hu_new);
+    solution.element_hv_mut(k).copy_from_slice(&hv_new);
 }
 
 /// Parallel version of wet/dry correction using Rayon.
 ///
 /// Each element's correction is independent, making this embarrassingly parallel.
+/// Uses SoA layout: processes h, hu, hv arrays separately in parallel chunks.
 #[cfg(feature = "parallel")]
 pub fn apply_wet_dry_correction_all_parallel(
     solution: &mut crate::solver::SWESolution2D,
@@ -413,65 +455,73 @@ pub fn apply_wet_dry_correction_all_parallel(
     use rayon::prelude::*;
 
     let n_nodes = solution.n_nodes;
+    let n_elements = solution.n_elements;
     let inv_range = config.inv_blend_range();
     let max_vel_sq = config.max_velocity * config.max_velocity;
     let h_min = config.h_min.meters();
     let h_thin = config.h_thin.meters();
 
-    let chunk_size = n_nodes * 3;
-    solution.data
-        .par_chunks_mut(chunk_size)
-        .for_each(|elem_data| {
-            // Fast path: check if element is fully wet (skip correction)
-            let mut min_h = f64::INFINITY;
-            let mut max_h = f64::NEG_INFINITY;
+    // Process in chunks of elements (SoA layout)
+    // Copy data for parallel processing (SoA arrays are separate)
+    let h_chunks: Vec<f64> = solution.h_data().to_vec();
+    let hu_data: Vec<f64> = solution.hu_data().to_vec();
+    let hv_data: Vec<f64> = solution.hv_data().to_vec();
 
-            for i in 0..n_nodes {
-                let h = elem_data[i * 3];
-                min_h = min_h.min(h);
-                max_h = max_h.max(h);
-            }
+    // Parallel process elements
+    let results: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = (0..n_elements)
+        .into_par_iter()
+        .map(|k| {
+            let start = k * n_nodes;
+            let end = start + n_nodes;
+
+            let mut h_out = h_chunks[start..end].to_vec();
+            let mut hu_out = hu_data[start..end].to_vec();
+            let mut hv_out = hv_data[start..end].to_vec();
+
+            // Fast path: check if element is fully wet (skip correction)
+            let (min_h, max_h) = h_out
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &h| {
+                    (min.min(h), max.max(h))
+                });
 
             // Fully wet: only velocity cap needed
             if min_h >= h_thin {
                 for i in 0..n_nodes {
-                    let base = i * 3;
-                    let h = elem_data[base];
+                    let h = h_out[i];
                     if h <= h_min {
                         continue;
                     }
-                    let hu = elem_data[base + 1];
-                    let hv = elem_data[base + 2];
+                    let hu = hu_out[i];
+                    let hv = hv_out[i];
                     let h_inv = 1.0 / h;
                     let u = hu * h_inv;
                     let v = hv * h_inv;
                     let speed_sq = u * u + v * v;
                     if speed_sq > max_vel_sq {
                         let scale = (max_vel_sq / speed_sq).sqrt();
-                        elem_data[base + 1] = h * u * scale;
-                        elem_data[base + 2] = h * v * scale;
+                        hu_out[i] = h * u * scale;
+                        hv_out[i] = h * v * scale;
                     }
                 }
-                return;
+                return (h_out, hu_out, hv_out);
             }
 
             // Fully dry: zero momentum
             if max_h <= h_min {
                 for i in 0..n_nodes {
-                    let base = i * 3;
-                    elem_data[base] = elem_data[base].max(0.0);
-                    elem_data[base + 1] = 0.0;
-                    elem_data[base + 2] = 0.0;
+                    h_out[i] = h_out[i].max(0.0);
+                    hu_out[i] = 0.0;
+                    hv_out[i] = 0.0;
                 }
-                return;
+                return (h_out, hu_out, hv_out);
             }
 
             // Mixed wet/dry: full correction per-node
             for i in 0..n_nodes {
-                let base = i * 3;
-                let mut h = elem_data[base].max(0.0);
-                let mut hu = elem_data[base + 1];
-                let mut hv = elem_data[base + 2];
+                let mut h = h_out[i].max(0.0);
+                let mut hu = hu_out[i];
+                let mut hv = hv_out[i];
 
                 // Compute blending factor
                 let alpha = if h <= h_min {
@@ -484,9 +534,9 @@ pub fn apply_wet_dry_correction_all_parallel(
                 };
 
                 if alpha <= 0.0 {
-                    elem_data[base] = h;
-                    elem_data[base + 1] = 0.0;
-                    elem_data[base + 2] = 0.0;
+                    h_out[i] = h;
+                    hu_out[i] = 0.0;
+                    hv_out[i] = 0.0;
                     continue;
                 }
 
@@ -509,11 +559,56 @@ pub fn apply_wet_dry_correction_all_parallel(
                     }
                 }
 
-                elem_data[base] = h;
-                elem_data[base + 1] = hu;
-                elem_data[base + 2] = hv;
+                h_out[i] = h;
+                hu_out[i] = hu;
+                hv_out[i] = hv;
             }
-        });
+
+            (h_out, hu_out, hv_out)
+        })
+        .collect();
+
+    // Write results back (must borrow sequentially to avoid multiple mutable borrows)
+    // First collect into separate vecs
+    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results
+        .into_iter()
+        .map(|(h, hu, hv)| (h, hu, hv))
+        .fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
+                h_acc.push(h);
+                hu_acc.push(hu);
+                hv_acc.push(hv);
+                (h_acc, hu_acc, hv_acc)
+            },
+        );
+
+    // Write h
+    {
+        let h_data = solution.h_data_mut();
+        for (k, h_elem) in h_results.into_iter().enumerate() {
+            let start = k * n_nodes;
+            h_data[start..start + n_nodes].copy_from_slice(&h_elem);
+        }
+    }
+
+    // Write hu
+    {
+        let hu_data = solution.hu_data_mut();
+        for (k, hu_elem) in hu_results.into_iter().enumerate() {
+            let start = k * n_nodes;
+            hu_data[start..start + n_nodes].copy_from_slice(&hu_elem);
+        }
+    }
+
+    // Write hv
+    {
+        let hv_data = solution.hv_data_mut();
+        for (k, hv_elem) in hv_results.into_iter().enumerate() {
+            let start = k * n_nodes;
+            hv_data[start..start + n_nodes].copy_from_slice(&hv_elem);
+        }
+    }
 }
 
 #[cfg(test)]

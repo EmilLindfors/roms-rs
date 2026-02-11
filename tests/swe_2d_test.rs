@@ -28,8 +28,6 @@ fn ssp_rk3_swe_step<BC: dg_rs::SWEBoundaryCondition2D>(
     dt: f64,
     time: f64,
 ) {
-    let n = q.data.len();
-
     // Stage 1: u1 = u + dt * L(u)
     let rhs1 = compute_rhs_swe_2d(q, mesh, ops, geom, config, time);
     let mut u1 = SWESolution2D::new(q.n_elements, q.n_nodes);
@@ -40,16 +38,17 @@ fn ssp_rk3_swe_step<BC: dg_rs::SWEBoundaryCondition2D>(
     let rhs2 = compute_rhs_swe_2d(&u1, mesh, ops, geom, config, time + dt);
     u1.axpy(dt, &rhs2);
     let mut u2 = SWESolution2D::new(q.n_elements, q.n_nodes);
-    for i in 0..n {
-        u2.data[i] = 0.75 * q.data[i] + 0.25 * u1.data[i];
-    }
+    // u2 = 0.75 * q + 0.25 * u1 (using axpy twice)
+    u2.copy_from(q);
+    u2.scale(0.75);
+    u2.axpy(0.25, &u1);
 
     // Stage 3: u_new = 1/3 * u + 2/3 * (u2 + dt * L(u2))
     let rhs3 = compute_rhs_swe_2d(&u2, mesh, ops, geom, config, time + 0.5 * dt);
     u2.axpy(dt, &rhs3);
-    for i in 0..n {
-        q.data[i] = (1.0 / 3.0) * q.data[i] + (2.0 / 3.0) * u2.data[i];
-    }
+    // q = 1/3 * q + 2/3 * u2 (using scale and axpy)
+    q.scale(1.0 / 3.0);
+    q.axpy(2.0 / 3.0, &u2);
 }
 
 /// Test lake-at-rest: uniform depth, zero velocity.

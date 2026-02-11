@@ -9,9 +9,10 @@ use dg_rs::boundary::Reflective2D;
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::Mesh2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{compute_rhs_swe_2d, SWE2DRhsConfig, SystemSolution2D};
+use dg_rs::ElementIndex;
+use dg_rs::solver::{compute_rhs_swe_2d, SWE2DRhsConfig, SWESolution2D};
 
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_rhs_swe_2d_parallel;
 
 /// Setup a test problem with uniform flow.
@@ -23,13 +24,13 @@ fn setup_problem(
     Mesh2D,
     DGOperators2D,
     GeometricFactors2D,
-    SystemSolution2D<3>,
+    SWESolution2D,
     ShallowWater2D,
 ) {
     let mesh = Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 1000.0, nx, ny);
     let ops = DGOperators2D::new(order);
     let geom = GeometricFactors2D::compute(&mesh);
-    let mut q = SystemSolution2D::new(mesh.n_elements, ops.n_nodes);
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
 
     // Initialize with uniform flow
     let h0 = 10.0;
@@ -37,7 +38,7 @@ fn setup_problem(
     let v0 = 0.3;
     for k in 0..q.n_elements {
         for i in 0..ops.n_nodes {
-            q.set_state(k, i, dg_rs::solver::SWEState2D::new(h0, h0 * u0, h0 * v0));
+            q.set_state(ElementIndex::new(k), i, dg_rs::solver::SWEState2D::new(h0, h0 * u0, h0 * v0));
         }
     }
 
@@ -53,7 +54,8 @@ fn bench_rhs_mesh_size(c: &mut Criterion) {
 
     let order = 3; // P3 elements (16 nodes per element)
 
-    for (nx, ny) in [(4, 4), (8, 8), (16, 16), (32, 32)] {
+    // Include larger mesh sizes to test parallel scaling
+    for (nx, ny) in [(4, 4), (8, 8), (16, 16), (32, 32), (64, 64), (100, 100)] {
         let n_elements = nx * ny;
         let (mesh, ops, geom, q, equation) = setup_problem(nx, ny, order);
         let bc = Reflective2D::new();
@@ -76,7 +78,7 @@ fn bench_rhs_mesh_size(c: &mut Criterion) {
             },
         );
 
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", feature = "simd"))]
         group.bench_with_input(
             BenchmarkId::new("parallel", format!("{}x{}_{}", nx, ny, n_elements)),
             &n_elements,
