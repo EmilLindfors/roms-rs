@@ -806,6 +806,10 @@ pub enum OceanGridType {
 ///     println!("SSH: {:.3} m, Speed: {:.2} m/s", state.ssh, state.speed());
 /// }
 /// ```
+/// Cached cell lookup result: (j, i, fy, fx)
+#[cfg(feature = "netcdf")]
+type CellLookup = (usize, usize, f64, f64);
+
 #[cfg(feature = "netcdf")]
 pub struct OceanModelReader {
     /// Grid type
@@ -830,6 +834,13 @@ pub struct OceanModelReader {
     pub dims: (usize, usize),
     /// Bounding box (min_lon, min_lat, max_lon, max_lat)
     pub bbox: (f64, f64, f64, f64),
+    /// Cached 1D latitude array for regular grids (avoids allocation in find_cell)
+    lat_1d: Option<Vec<f64>>,
+    /// Cached 1D longitude array for regular grids (avoids allocation in find_cell)
+    lon_1d: Option<Vec<f64>>,
+    /// Cache for cell lookups (curvilinear grids): key = quantized (lon, lat), value = cell info
+    /// Uses interior mutability for thread-safe lazy initialization
+    cell_cache: std::sync::RwLock<std::collections::HashMap<(i32, i32), Option<CellLookup>>>,
 }
 
 #[cfg(feature = "netcdf")]
@@ -893,6 +904,50 @@ impl OceanModelReader {
         let temperature = Self::read_variable(&file, &["temperature", "temp", "sea_water_temperature"], n_time, n_y, n_x);
         let salinity = Self::read_variable(&file, &["salinity", "salt", "sea_water_salinity"], n_time, n_y, n_x);
 
+        // Check if 2D grid is actually regular (constant lat along rows, constant lon along columns)
+        // This is common for ocean models like NorKyst that store 2D lat/lon even for regular grids
+        let is_regular_2d = if grid_type == OceanGridType::Curvilinear && n_y > 0 && n_x > 0 {
+            let tol = 1e-6;
+            let mut regular = true;
+            // Check if latitude is constant along each row
+            'outer: for j in 0..n_y {
+                let lat_ref = lat[j][0];
+                for i in 1..n_x {
+                    if (lat[j][i] - lat_ref).abs() > tol {
+                        regular = false;
+                        break 'outer;
+                    }
+                }
+            }
+            // Check if longitude is constant along each column
+            if regular {
+                'outer2: for i in 0..n_x {
+                    let lon_ref = lon[0][i];
+                    for j in 1..n_y {
+                        if (lon[j][i] - lon_ref).abs() > tol {
+                            regular = false;
+                            break 'outer2;
+                        }
+                    }
+                }
+            }
+            regular
+        } else {
+            false
+        };
+
+        // Update grid_type if we detected a regular 2D grid
+        let grid_type = if is_regular_2d { OceanGridType::Regular } else { grid_type };
+
+        // Precompute 1D arrays for regular grids (avoids allocation in find_cell hot path)
+        let (lat_1d, lon_1d) = if (grid_type == OceanGridType::Regular || is_regular_2d) && n_y > 0 && n_x > 0 {
+            let lat_1d: Vec<f64> = (0..n_y).map(|j| lat[j][0]).collect();
+            let lon_1d: Vec<f64> = (0..n_x).map(|i| lon[0][i]).collect();
+            (Some(lat_1d), Some(lon_1d))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             grid_type,
             lat,
@@ -905,6 +960,9 @@ impl OceanModelReader {
             salinity,
             dims: (n_y, n_x),
             bbox,
+            lat_1d,
+            lon_1d,
+            cell_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1067,8 +1125,8 @@ impl OceanModelReader {
                 for t in 0..n_time {
                     for j in 0..n_y {
                         for i in 0..n_x {
-                            // depth=0 is surface
-                            let idx = t * n_depth * n_y * n_x + 0 * n_y * n_x + j * n_x + i;
+                            // depth=0 is surface, so depth index contributes 0 to offset
+                            let idx = t * n_depth * n_y * n_x + j * n_x + i;
                             if idx < flat.len() {
                                 result[t][j][i] = flat[idx];
                             }
@@ -1115,8 +1173,8 @@ impl OceanModelReader {
             return None;
         }
 
-        // Find grid cell containing the point
-        let (j0, i0, fy, fx) = self.find_cell(lon, lat)?;
+        // Find grid cell containing the point (uses cache for curvilinear grids)
+        let (j0, i0, fy, fx) = self.find_cell_cached(lon, lat)?;
 
         let j1 = (j0 + 1).min(self.dims.0 - 1);
         let i1 = (i0 + 1).min(self.dims.1 - 1);
@@ -1184,13 +1242,10 @@ impl OceanModelReader {
     fn find_cell(&self, target_lon: f64, target_lat: f64) -> Option<(usize, usize, f64, f64)> {
         let (n_y, n_x) = self.dims;
 
-        // For regular grids, use fast index lookup
-        if self.grid_type == OceanGridType::Regular && n_y > 0 && n_x > 0 {
-            let lat_1d: Vec<f64> = (0..n_y).map(|j| self.lat[j][0]).collect();
-            let lon_1d: Vec<f64> = (0..n_x).map(|i| self.lon[0][i]).collect();
-
-            let (j0, _j1, fy) = find_bracket(&lat_1d, target_lat)?;
-            let (i0, _i1, fx) = find_bracket(&lon_1d, target_lon)?;
+        // For regular grids, use cached 1D arrays for fast lookup (no allocation)
+        if let (Some(lat_1d), Some(lon_1d)) = (&self.lat_1d, &self.lon_1d) {
+            let (j0, _j1, fy) = find_bracket(lat_1d, target_lat)?;
+            let (i0, _i1, fx) = find_bracket(lon_1d, target_lon)?;
 
             return Some((j0, i0, fy, fx));
         }
@@ -1239,6 +1294,44 @@ impl OceanModelReader {
         }
 
         best_cell
+    }
+
+    /// Quantize coordinates to create cache key.
+    /// Uses ~1m resolution which is much finer than typical ocean grid spacing (~800m).
+    #[inline]
+    fn quantize_coords(lon: f64, lat: f64) -> (i32, i32) {
+        // 1e-5 degrees ≈ 1.1m at equator, ~0.6m at 60°N
+        const SCALE: f64 = 1e5;
+        ((lon * SCALE) as i32, (lat * SCALE) as i32)
+    }
+
+    /// Find grid cell with caching for repeated lookups.
+    /// Uses interior mutability for thread-safe lazy population of the cache.
+    fn find_cell_cached(&self, target_lon: f64, target_lat: f64) -> Option<CellLookup> {
+        // For regular grids, use the fast path (no caching needed)
+        if self.lat_1d.is_some() {
+            return self.find_cell(target_lon, target_lat);
+        }
+
+        // For curvilinear grids, use cache
+        let key = Self::quantize_coords(target_lon, target_lat);
+
+        // Try read lock first (common case: cache hit)
+        {
+            let cache = self.cell_cache.read().unwrap();
+            if let Some(&result) = cache.get(&key) {
+                return result;
+            }
+        }
+
+        // Cache miss - compute and store
+        let result = self.find_cell(target_lon, target_lat);
+        {
+            let mut cache = self.cell_cache.write().unwrap();
+            cache.insert(key, result);
+        }
+
+        result
     }
 
     /// Find time index and interpolation factor.

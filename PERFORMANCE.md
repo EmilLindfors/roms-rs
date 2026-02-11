@@ -180,3 +180,102 @@ Froya-Smola-Hitra real data simulation:
 - SIMD benefits appear at P4+ where faer GEMV outperforms scalar
 - Full physics: Coriolis, Manning friction, wind stress, pressure, well-balanced bathymetry
 - Kuzmin limiters applied after each RK stage
+
+### 2D SWE RHS Benchmarks (2026-01-18)
+
+After SoA refactoring and par_chunks_mut optimization:
+
+#### RHS Computation Time by Mesh Size
+
+| Mesh | Elements | serial | parallel_opt | adaptive | batched |
+|------|----------|--------|--------------|----------|---------|
+| 16x16 | 256 | 0.3ms | 1.3ms | 0.3ms | 1.3ms |
+| 32x32 | 1,024 | 1.2ms | 2.1ms | 1.3ms | 2.2ms |
+| 64x64 | 4,096 | 4.8ms | 2.2ms | 2.2ms | 3.2ms |
+| 100x100 | 10,000 | 11.9ms | 3.9ms | 3.9ms | 16.9ms |
+
+**Notes**:
+- `parallel_opt` = parallel + SIMD + per-thread workspace + direct output writes
+- `adaptive` dispatches to serial for <2000 elements, parallel_opt otherwise
+- `batched` uses faer GEMM for volume terms (slower due to surface term overhead)
+- Parallel overhead dominates at small mesh sizes (<2000 elements)
+
+#### Speedup vs Serial Baseline
+
+| Mesh | Elements | parallel_opt | Notes |
+|------|----------|--------------|-------|
+| 64x64 | 4,096 | 2.2x | Parallel starts to win |
+| 100x100 | 10,000 | 3.1x | Good parallel efficiency |
+
+#### Source Term Overhead (256 elements, P3)
+
+| Configuration | Time | Overhead vs baseline |
+|---------------|------|---------------------|
+| No sources | 112 µs | baseline |
+| + Coriolis | 126 µs | +13% |
+| + Bathymetry | 126 µs | +13% |
+| + Friction | 143 µs | +28% |
+| All sources | 157 µs | +40% |
+
+### Real-World Performance (2026-01-18)
+
+Frøya 65k element simulation with full physics:
+
+| Version | Wall Time | Improvement |
+|---------|-----------|-------------|
+| Before SoA refactor | ~2m 13s | baseline |
+| After SoA + par_chunks_mut | 1m 55s | **15% faster** |
+
+**Configuration**:
+- 65,536 elements, P3 order (15 nodes/element)
+- ~1M DOFs per variable
+- Kuzmin limiters, well-balanced bathymetry
+- Manning friction, Coriolis, wetting/drying
+- Ocean model nesting BC with interpolation
+
+### Large-Scale Benchmark (2026-01-20)
+
+Frøya 65k element simulation with full physics after TVB limiter consolidation:
+
+| Metric | Value |
+|--------|-------|
+| Elements | 65,025 (255×255) |
+| Polynomial order | P2 (9 nodes/element) |
+| Total DOFs | 1,755,675 |
+| Simulation time | 60 seconds |
+| Time steps | 919 |
+| Average dt | 0.07 s |
+| **Wall clock time** | **3:37 (217 s)** |
+| User time | 988.84 s |
+| System time | 380.16 s |
+| Peak memory | 257 MB |
+
+**Performance Metrics:**
+- **Steps/second**: 4.23
+- **DOF-updates/second**: 7.43 M
+- **Realtime ratio**: 0.28× (slower than realtime)
+- **Parallel efficiency**: ~4.5× (988s user / 217s wall)
+
+**Configuration:**
+- Features: `parallel`, `simd`, `netcdf`
+- Limiter: Kuzmin (vertex-based) + positivity
+- Physics: Coriolis, Manning friction, wind stress, pressure gradient
+- Well-balanced: Yes (cell-average bathymetry)
+- Wetting/drying: Yes (thin-layer blending)
+- BC: Ocean model nesting (NorKyst)
+
+**Analysis:**
+- At 4.23 steps/sec with dt=0.07s, each step takes ~237ms
+- SSP-RK3 = 3 RHS evaluations per step → ~79ms per RHS
+- Per-element RHS time: 79ms / 65k = ~1.2µs/element
+- Main costs: volume terms (Dr/Ds multiply), flux computation, limiters
+
+### Optimization History
+
+| Date | Change | Impact |
+|------|--------|--------|
+| 2026-01-20 | TVB limiter removal | Code cleanup, no perf change |
+| 2026-01-18 | SoA storage for SWESolution2D | Eliminated AoS↔SoA conversion |
+| 2026-01-18 | par_chunks_mut for parallel_opt | -24% at 100x100 (eliminated Vec collection) |
+| 2026-01-18 | Workspace buffers in batched | -25% to -39% for batched version |
+| 2026-01-18 | Overall real-world | **15% faster** (2m13s → 1m55s) |

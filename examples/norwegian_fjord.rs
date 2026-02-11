@@ -38,10 +38,8 @@ use dg_rs::types::{Depth, ElementIndex};
 use dg_rs::{SWEFluxType2D, SWEState2D};
 #[cfg(feature = "parallel")]
 use dg_rs::compute_rhs_tracer_2d_parallel;
-#[cfg(all(feature = "parallel", not(feature = "simd")))]
-use dg_rs::compute_rhs_swe_2d_parallel;
 #[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::compute_rhs_swe_2d_parallel_simd;
+use dg_rs::compute_rhs_swe_2d_parallel;
 
 // ============================================================================
 // Physical Parameters
@@ -281,22 +279,6 @@ fn main() {
         #[cfg(all(feature = "parallel", feature = "simd"))]
         if use_parallel {
             let swe_rhs =
-                compute_rhs_swe_2d_parallel_simd(&state.swe, &mesh, &ops, &geom, &swe_config, time);
-            let tracer_rhs = compute_rhs_tracer_2d_parallel(
-                &state.tracers,
-                &state.swe,
-                &mesh,
-                &ops,
-                &geom,
-                &tracer_config,
-                time,
-            );
-            return CoupledRhs2D::new(swe_rhs, tracer_rhs);
-        }
-
-        #[cfg(all(feature = "parallel", not(feature = "simd")))]
-        if use_parallel {
-            let swe_rhs =
                 compute_rhs_swe_2d_parallel(&state.swe, &mesh, &ops, &geom, &swe_config, time);
             let tracer_rhs = compute_rhs_tracer_2d_parallel(
                 &state.tracers,
@@ -310,7 +292,7 @@ fn main() {
             return CoupledRhs2D::new(swe_rhs, tracer_rhs);
         }
 
-        // Serial version (used when parallel disabled or mesh too small)
+        // Serial version (used when parallel+simd disabled or mesh too small)
         let swe_rhs = compute_rhs_swe_2d(&state.swe, &mesh, &ops, &geom, &swe_config, time);
         let tracer_rhs = compute_rhs_tracer_2d(
             &state.tracers,

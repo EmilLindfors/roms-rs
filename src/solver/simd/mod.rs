@@ -3,9 +3,14 @@
 //! - [`SWESoABuffer`]: Structure-of-arrays layout for SIMD operations
 //! - [`SIMDWorkspace`]: Workspace for SIMD-optimized RHS computation
 //! - Scalar and SIMD kernel functions
+//! - [`BatchedVolumeWorkspace`]: Batched GEMM for volume terms
 
+mod batched;
 mod buffers;
 mod kernels;
+
+// Batched GEMM volume computation
+pub use batched::{compute_volume_terms_batched, BatchedVolumeWorkspace};
 
 // SIMD data structures
 pub use buffers::{FaceWorkspace, SIMDWorkspace, SWESoABuffer};

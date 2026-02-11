@@ -4,7 +4,7 @@
 //! high-order accuracy in smooth regions.
 //!
 //! - [`Limiter2D`]: Trait for 2D slope limiters
-//! - [`TVBLimiter2D`], [`KuzminLimiter2D`]: Concrete implementations
+//! - [`KuzminLimiter2D`], [`PositivityLimiter2D`]: Concrete implementations
 //! - [`LimiterChain2D`]: Compose multiple limiters
 //! - [`StandardLimiter2D`]: Zero-cost dispatch enum
 
@@ -20,7 +20,7 @@ pub use traits::{BoxedLimiter2D, Limiter2D, LimiterContext2D};
 // Standard limiter types (chain, enum, factory)
 pub use standard::{
     KuzminLimiter2D, LimiterChain2D, NoLimiter2D, PositivityLimiter2D, StandardLimiter2D,
-    TVBLimiter2D, create_limiter,
+    create_limiter,
 };
 
 // 1D limiters
@@ -28,8 +28,8 @@ pub use limiters_1d::{TVBParameter, apply_swe_limiters, positivity_limiter, tvb_
 
 // 2D SWE limiters
 pub use swe_2d::{
-    apply_swe_limiters_2d, apply_swe_limiters_kuzmin_2d, swe_cell_averages_2d,
-    swe_kuzmin_limiter_2d, swe_positivity_limiter_2d, swe_tvb_limiter_2d,
+    apply_swe_limiters_kuzmin_2d, swe_cell_averages_2d,
+    swe_kuzmin_limiter_2d, swe_positivity_limiter_2d,
 };
 
 // Parallel 2D SWE limiters

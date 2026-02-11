@@ -47,8 +47,8 @@ use std::sync::Arc;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, LandMask2D, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d};
-#[cfg(feature = "simd")]
-use dg_rs::solver::compute_rhs_swe_2d_simd;
+#[cfg(all(feature = "parallel", feature = "simd"))]
+use dg_rs::solver::compute_rhs_swe_2d_parallel;
 use dg_rs::source::{
     AtmosphericPressure2D, BathymetrySource2D, CombinedSource2D, CoriolisSource2D,
     DragCoefficient, ManningFriction2D, WindStress2D,
@@ -131,20 +131,21 @@ const PRESSURE_DIRECTION: f64 = 225.0;
 const N_POLY: usize = 2;
 
 /// Number of elements in x-direction
-const NX: usize = 30;
+/// 255×255 = 65,025 elements for profiling at ~185m effective resolution
+const NX: usize = 255;
 
 /// Number of elements in y-direction
-const NY: usize = 20;
+const NY: usize = 255;
 
 // ============================================================================
 // Simulation Configuration
 // ============================================================================
 
-/// Simulation duration (s) - 30 minutes for quick testing
-const T_END: f64 = 0.5 * 3600.0;
+/// Simulation duration (s) - 60 seconds for profiling at 65k scale
+const T_END: f64 = 60.0;
 
-/// Output interval (s) - output every 5 minutes
-const OUTPUT_INTERVAL: f64 = 300.0;
+/// Output interval (s) - output at end only for profiling (60s total)
+const OUTPUT_INTERVAL: f64 = 60.0;
 
 /// Enable NetCDF output (requires --features netcdf)
 #[cfg(feature = "netcdf")]
@@ -488,15 +489,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let dt = dt.min(T_END - t);
 
         // RHS function with full physics and well-balanced scheme
+        // Uses adaptive dispatch: parallel for large meshes, serial SIMD for small
         let rhs_fn = |s: &SWESolution2D, time: f64| {
             let config = SWE2DRhsConfig::new(&equation, &bc)
                 .with_flux_type(SWEFluxType2D::Rusanov)
                 .with_source_terms(&sources)
                 .with_bathymetry(&bathymetry)
                 .with_well_balanced(true);  // Enable hydrostatic reconstruction
-            #[cfg(feature = "simd")]
-            { compute_rhs_swe_2d_simd(s, &mesh, &ops, &geom, &config, time) }
-            #[cfg(not(feature = "simd"))]
+            #[cfg(all(feature = "parallel", feature = "simd"))]
+            { compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time) }
+            #[cfg(not(all(feature = "parallel", feature = "simd")))]
             { compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time) }
         };
 
@@ -766,9 +768,9 @@ fn run_synthetic_simulation() -> Result<(), Box<dyn std::error::Error>> {
                 .with_source_terms(&sources)
                 .with_bathymetry(&bathymetry)
                 .with_well_balanced(true);  // Enable hydrostatic reconstruction
-            #[cfg(feature = "simd")]
-            { compute_rhs_swe_2d_simd(s, &mesh, &ops, &geom, &config, time) }
-            #[cfg(not(feature = "simd"))]
+            #[cfg(all(feature = "parallel", feature = "simd"))]
+            { compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time) }
+            #[cfg(not(all(feature = "parallel", feature = "simd")))]
             { compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time) }
         };
 

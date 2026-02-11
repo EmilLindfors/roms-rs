@@ -186,27 +186,109 @@ impl Mul<SWEState2D> for f64 {
 }
 
 /// Specialized solution for 2D SWE (3-variable system: h, hu, hv).
+///
+/// Uses Structure-of-Arrays (SoA) layout:
+/// - `data[0]`: All h (water depth) values
+/// - `data[1]`: All hu (x-momentum) values
+/// - `data[2]`: All hv (y-momentum) values
 pub type SWESolution2D = SystemSolution2D<3>;
+
+/// Variable indices for SWE equations.
+pub const SWE_VAR_H: usize = 0;
+pub const SWE_VAR_HU: usize = 1;
+pub const SWE_VAR_HV: usize = 2;
 
 impl SWESolution2D {
     /// Get SWE state at node i in element k.
     #[inline(always)]
     pub fn get_state(&self, k: ElementIndex, i: usize) -> SWEState2D {
-        let base = (k.as_usize() * self.n_nodes + i) * 3;
+        let idx = k.as_usize() * self.n_nodes + i;
         SWEState2D {
-            h: self.data[base],
-            hu: self.data[base + 1],
-            hv: self.data[base + 2],
+            h: self.data[SWE_VAR_H][idx],
+            hu: self.data[SWE_VAR_HU][idx],
+            hv: self.data[SWE_VAR_HV][idx],
         }
     }
 
     /// Set SWE state at node i in element k.
     #[inline(always)]
     pub fn set_state(&mut self, k: ElementIndex, i: usize, state: SWEState2D) {
-        let base = (k.as_usize() * self.n_nodes + i) * 3;
-        self.data[base] = state.h;
-        self.data[base + 1] = state.hu;
-        self.data[base + 2] = state.hv;
+        let idx = k.as_usize() * self.n_nodes + i;
+        self.data[SWE_VAR_H][idx] = state.h;
+        self.data[SWE_VAR_HU][idx] = state.hu;
+        self.data[SWE_VAR_HV][idx] = state.hv;
+    }
+
+    /// Get slice of h (water depth) values for element k.
+    #[inline(always)]
+    pub fn element_h(&self, k: ElementIndex) -> &[f64] {
+        self.element_var(k, SWE_VAR_H)
+    }
+
+    /// Get slice of hu (x-momentum) values for element k.
+    #[inline(always)]
+    pub fn element_hu(&self, k: ElementIndex) -> &[f64] {
+        self.element_var(k, SWE_VAR_HU)
+    }
+
+    /// Get slice of hv (y-momentum) values for element k.
+    #[inline(always)]
+    pub fn element_hv(&self, k: ElementIndex) -> &[f64] {
+        self.element_var(k, SWE_VAR_HV)
+    }
+
+    /// Get mutable slice of h (water depth) values for element k.
+    #[inline(always)]
+    pub fn element_h_mut(&mut self, k: ElementIndex) -> &mut [f64] {
+        self.element_var_mut(k, SWE_VAR_H)
+    }
+
+    /// Get mutable slice of hu (x-momentum) values for element k.
+    #[inline(always)]
+    pub fn element_hu_mut(&mut self, k: ElementIndex) -> &mut [f64] {
+        self.element_var_mut(k, SWE_VAR_HU)
+    }
+
+    /// Get mutable slice of hv (y-momentum) values for element k.
+    #[inline(always)]
+    pub fn element_hv_mut(&mut self, k: ElementIndex) -> &mut [f64] {
+        self.element_var_mut(k, SWE_VAR_HV)
+    }
+
+    /// Get slice of all h (water depth) values across all elements.
+    #[inline(always)]
+    pub fn h_data(&self) -> &[f64] {
+        self.var_data(SWE_VAR_H)
+    }
+
+    /// Get slice of all hu (x-momentum) values across all elements.
+    #[inline(always)]
+    pub fn hu_data(&self) -> &[f64] {
+        self.var_data(SWE_VAR_HU)
+    }
+
+    /// Get slice of all hv (y-momentum) values across all elements.
+    #[inline(always)]
+    pub fn hv_data(&self) -> &[f64] {
+        self.var_data(SWE_VAR_HV)
+    }
+
+    /// Get mutable slice of all h values across all elements.
+    #[inline(always)]
+    pub fn h_data_mut(&mut self) -> &mut [f64] {
+        self.var_data_mut(SWE_VAR_H)
+    }
+
+    /// Get mutable slice of all hu values across all elements.
+    #[inline(always)]
+    pub fn hu_data_mut(&mut self) -> &mut [f64] {
+        self.var_data_mut(SWE_VAR_HU)
+    }
+
+    /// Get mutable slice of all hv values across all elements.
+    #[inline(always)]
+    pub fn hv_data_mut(&mut self) -> &mut [f64] {
+        self.var_data_mut(SWE_VAR_HV)
     }
 
     /// Initialize from functions for h, u, and v.
@@ -501,7 +583,9 @@ mod tests {
         let n_nodes = 9; // (2+1)²
         let mut sol = SWESolution2D::new(n_elem, n_nodes);
 
-        assert_eq!(sol.data.len(), n_elem * n_nodes * 3);
+        // SoA layout: 3 arrays of n_elem * n_nodes each
+        assert_eq!(sol.data.len(), 3);
+        assert_eq!(sol.data[0].len(), n_elem * n_nodes);
 
         // Set and get values
         sol.set(k(0), 0, [1.0, 2.0, 3.0]);
@@ -525,15 +609,20 @@ mod tests {
         let mut a = SWESolution2D::new(n_elem, n_nodes);
         let mut b = SWESolution2D::new(n_elem, n_nodes);
 
-        for i in 0..a.data.len() {
-            a.data[i] = 1.0;
-            b.data[i] = 2.0;
+        // SoA layout: fill each variable array
+        for var in 0..3 {
+            for i in 0..a.data[var].len() {
+                a.data[var][i] = 1.0;
+                b.data[var][i] = 2.0;
+            }
         }
 
         a.axpy(0.5, &b); // a = a + 0.5 * b = 1 + 1 = 2
 
-        for &v in &a.data {
-            assert!((v - 2.0).abs() < 1e-14);
+        for var in 0..3 {
+            for &v in &a.data[var] {
+                assert!((v - 2.0).abs() < 1e-14);
+            }
         }
     }
 

@@ -11,6 +11,22 @@
 //! - Time integration (SSP-RK3)
 //! - Conservation law abstractions (advection, shallow water)
 //! - Harmonic analysis for tidal time series
+//!
+//! ## Performance Features
+//!
+//! Enable high-performance features with:
+//! ```bash
+//! cargo build --release --features "parallel,simd,mimalloc"
+//! ```
+//!
+//! - `parallel`: Multi-threaded RHS computation via Rayon
+//! - `simd`: SIMD-optimized kernels via Pulp (auto-detects AVX2/AVX-512)
+//! - `mimalloc`: High-performance allocator (5-15% speedup)
+
+// Use mimalloc as the global allocator when the feature is enabled
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod analysis;
 pub mod basis;
@@ -96,10 +112,8 @@ pub use solver::{
     compute_rhs_swe_2d,
     compute_rhs_tracer_2d,
     // SWE 2D limiters
-    apply_swe_limiters_2d,
     apply_swe_limiters_kuzmin_2d,
     swe_positivity_limiter_2d,
-    swe_tvb_limiter_2d,
     swe_kuzmin_limiter_2d,
     // Wetting/drying
     WetDryConfig,
@@ -115,11 +129,9 @@ pub use solver::{
     total_momentum_2d,
 };
 #[cfg(feature = "parallel")]
-pub use solver::{compute_rhs_swe_2d_parallel, compute_rhs_tracer_2d_parallel};
-#[cfg(feature = "simd")]
-pub use solver::compute_rhs_swe_2d_simd;
+pub use solver::compute_rhs_tracer_2d_parallel;
 #[cfg(all(feature = "parallel", feature = "simd"))]
-pub use solver::compute_rhs_swe_2d_parallel_simd;
+pub use solver::{compute_rhs_swe_2d_parallel, compute_dt_swe_2d_parallel};
 
 // Burn GPU acceleration exports
 #[cfg(feature = "burn")]

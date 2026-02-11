@@ -362,6 +362,141 @@ Testing with real Norwegian bathymetry (Froya-Smola-Hitra region) revealed that:
 
 ---
 
+## NEXT: 30×30m Froya Simulation (High Priority)
+
+**Goal**: Run a 30×30 meter resolution simulation of the Froya-Smola-Hitra area for accurate current calculations.
+
+**Estimated mesh size**: ~65,000 elements (59 km × 45 km at 30m resolution)
+
+### Current Status (2026-01-18)
+- [x] Major bottleneck fixed: Ocean BC cell lookup 42.9% → 0.38% (**113x speedup**)
+- [x] Adaptive parallel+SIMD dispatch working
+- [x] Release profile optimized for native CPU
+- [x] Attempted batched GEMM optimization (see below)
+
+### **COMPLETED: Native SoA Data Format** ✓
+
+**Status**: Refactoring complete (2026-01-18)
+
+`SWESolution2D` now uses native SoA storage with `data: [Vec<f64>; 3]` instead of interleaved AoS. This eliminates AoS↔SoA conversion overhead that was limiting batched GEMM performance.
+
+**Performance gains from SoA + direct writes**:
+- `parallel_opt` at 100x100: 5.5ms → 3.9ms (**29% faster**)
+- `adaptive` at 100x100: 4.9ms → 3.9ms (**20% faster**)
+- Real-world (Frøya 65k): ~2m13s → 1m55s (**15% faster**)
+
+### **COMPLETED: Consolidate Limiter Implementations** (2026-01-20)
+
+Removed dead code and redundant TVB limiter variants:
+
+**Removed**:
+- `swe_tvb_limiter_2d` - Unused TVB limiter for SWE
+- `apply_swe_limiters_2d` - Combined TVB+positivity (unused)
+- `minmod`, `minmod_tvb` helper functions
+- `TVBLimiter2D` struct and `StandardLimiter2D::Tvb*` variants
+- `SWELimiterType::Tvb` enum variant
+- TVB-related benchmarks and tests
+
+**Kept**:
+- `TVBParameter2D` - Still used for tracer limiters
+- Tracer TVB limiters (tracer transport still uses TVB)
+- Kuzmin limiter as the primary slope limiter for SWE
+
+**Lines removed**: ~200
+
+### **NEXT: Further RHS Consolidation**
+
+**Problem**: The codebase still has multiple RHS computation variants:
+1. `compute_rhs_swe_2d` - Serial baseline
+2. `compute_rhs_swe_2d_parallel` - Parallel + SIMD + per-thread workspace
+3. `compute_rhs_swe_2d_adaptive` - Dispatch based on mesh size
+
+**Remaining cleanup**:
+- [ ] Verify `adaptive` threshold (currently 2000 elements) is optimal for 65k mesh
+- [ ] Consider removing serial variant from public API (keep for testing only)
+- [ ] Profile to confirm parallel overhead at small mesh sizes
+
+### Performance Analysis (2026-01-20)
+
+**Current state** (65k elements, P2, 1.75M DOFs):
+- 4.23 steps/sec = 237ms per step
+- SSP-RK3 = 3 RHS per step → ~79ms per RHS
+- Per-element RHS: ~1.2µs
+- Realtime ratio: 0.28× (need ~3.5× speedup for realtime)
+
+**Where time is spent** (estimated breakdown):
+| Component | Per-step estimate | Notes |
+|-----------|------------------|-------|
+| RHS (3×) | ~180ms | Volume + surface + sources |
+| Limiters (3×) | ~45ms | Kuzmin + positivity after each stage |
+| Wetting/drying (3×) | ~10ms | Velocity capping, momentum damping |
+| Misc overhead | ~2ms | State copies, diagnostics |
+
+**Key bottleneck observations**:
+
+1. **P2 is SIMD-unfriendly**: At 9 nodes/element, matrix-vector products are too small for SIMD benefits. faer GEMV overhead exceeds computation time.
+
+2. **Kuzmin limiter overhead**: Vertex patch lookups and bounds computation for 65k elements × 3 stages = 195k limiter applications per step.
+
+3. **Memory bandwidth**: 1.75M DOFs × 3 vars × 8 bytes × 3 RHS = 126 MB/step. At 4.23 steps/sec = 533 MB/s just for solution. May be approaching memory bandwidth limits.
+
+4. **Parallel synchronization**: 988s user / 217s wall = 4.5× efficiency. Rayon overhead for small work items may limit scaling.
+
+### Priority Improvements
+
+**High Impact (potential 2-3× speedup):**
+
+1. **[ ] GPU port** (cudarc) - Expected 10-100× for 65k+ elements
+   - Batch all elements into single kernel
+   - Coalesced memory access
+   - 1.75M DOFs fits easily in GPU memory
+
+2. **[ ] Higher polynomial order** - Use P3 (16 nodes) or P4 (25 nodes)
+   - Better arithmetic intensity (more work per memory access)
+   - SIMD benefits kick in at P4+ (1.81× for diff_matrix)
+   - Fewer elements needed for same accuracy
+
+3. **[ ] Limiter optimization**
+   - Skip limiting for smooth elements (troubled cell detection)
+   - Vectorize vertex bounds computation
+   - Consider less aggressive limiting (every N steps?)
+
+**Medium Impact (potential 20-50% speedup):**
+
+4. **[ ] Element blocking for cache efficiency**
+   - Process 64-256 elements together
+   - Keep operator matrices in L2 cache
+   - Reduce memory traffic
+
+5. **[ ] Fused RHS + limiter pass**
+   - Single traversal instead of separate passes
+   - Better cache utilization
+
+6. **[ ] Profile-guided optimization**
+   - Fresh flamegraph on current code
+   - Identify actual hotspots vs estimated
+
+**Lower Priority:**
+
+7. **[ ] Flux vectorization** - Batch 4-8 faces for SIMD
+8. **[ ] Source term fusion** - Single loop for all sources
+9. **[ ] Memory layout tuning** - Ensure optimal alignment
+
+### Immediate Next Steps
+
+1. **[ ] Generate fresh flamegraph** for 65k simulation
+   ```bash
+   ./scripts/flamegraph.sh froya_real_data "netcdf parallel simd"
+   ```
+
+2. **[ ] Benchmark limiter cost** - Time RHS vs RHS+limiters separately
+
+3. **[ ] Test P3 performance** - Compare 65k P2 vs ~29k P3 (same DOF count)
+
+4. **[ ] Prototype GPU kernel** - Single element RHS on CUDA
+
+---
+
 ## Phase 4: Performance & Scalability
 
 Production-ready performance for operational use.
@@ -369,7 +504,7 @@ Production-ready performance for operational use.
 ### 4.1 CPU Optimization
 - [x] Rayon parallelization for 2D RHS (`compute_rhs_swe_2d_parallel`, `compute_rhs_tracer_2d_parallel`)
 - [x] `par_chunks_mut` pattern for efficient parallel writes (avoids allocation overhead)
-- [x] Automatic serial/parallel selection based on mesh size (threshold: 1000 elements)
+- [x] Automatic serial/parallel selection based on mesh size (threshold: 2000 elements)
 - [x] Profile hot paths with flamegraph (see `scripts/flamegraph.sh`)
 - [x] Profiling infrastructure: `scripts/flamegraph.sh`, `scripts/samply.sh`, `scripts/perf-stat.sh`
 - [x] `#[inline(always)]` on critical accessors (`get_state`, `set_state`, `SWEState2D` methods)
@@ -377,7 +512,16 @@ Production-ready performance for operational use.
 - [x] Fused wetting/drying passes with early-exit for wet/dry elements (-46% to -100%)
 - [x] Optimized hydrostatic reconstruction with ratio-based velocity preservation (-70%)
 - [x] Direct data access in cell averages and limiters (-60% state accessor overhead)
-- [ ] Cache-friendly data layout (SoA vs AoS)
+- [x] **Ocean model cell lookup cache** (2026-01-18) - **113x speedup** for curvilinear grid BCs
+  - Added `cell_cache: RwLock<HashMap>` to `OceanModelReader` for memoized lookups
+  - Quantized (lon, lat) keys with ~1m resolution
+  - Reduced ocean BC from 42.9% → 0.38% of total runtime
+- [x] **Adaptive parallel dispatch** (`compute_rhs_swe_2d_adaptive`) - auto-selects serial/parallel
+- [x] **ThreadWorkspace** for parallel RHS to avoid per-element allocations
+- [x] **Native CPU targeting** via `.cargo/config.toml` (`target-cpu=native`)
+- [x] **Release profile optimization**: `opt-level=3`, `lto="fat"`, `codegen-units=1`
+- [x] **mimalloc allocator** for 5-15% memory allocation speedup
+- [ ] Cache-friendly data layout (SoA vs AoS) for volume terms
 - [ ] Load balancing for parallel mesh
 
 ### 4.2 SIMD Optimization ✓

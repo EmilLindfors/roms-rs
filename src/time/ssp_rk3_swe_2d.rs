@@ -19,10 +19,10 @@
 
 use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
+use crate::solver::{KuzminParameter2D, SWESolution2D, WetDryConfig};
+#[cfg(not(feature = "parallel"))]
 use crate::solver::{
-    KuzminParameter2D, SWESolution2D, TVBParameter2D, WetDryConfig,
-    apply_swe_limiters_2d, apply_swe_limiters_kuzmin_2d,
-    apply_wet_dry_correction_all, swe_positivity_limiter_2d,
+    apply_swe_limiters_kuzmin_2d, apply_wet_dry_correction_all, swe_positivity_limiter_2d,
 };
 #[cfg(feature = "parallel")]
 use crate::solver::{
@@ -36,8 +36,6 @@ use crate::types::Depth;
 pub enum SWELimiterType {
     /// No limiting (not recommended for production)
     None,
-    /// TVB slope limiter + positivity
-    Tvb,
     /// Kuzmin vertex-based limiter + positivity
     Kuzmin,
     /// Positivity only (no slope limiting)
@@ -61,8 +59,6 @@ pub struct SWE2DTimeConfig {
     pub h_min: f64,
     /// Type of limiter to apply
     pub limiter_type: SWELimiterType,
-    /// TVB parameter (if using TVB limiter)
-    pub tvb: TVBParameter2D,
     /// Kuzmin parameter (if using Kuzmin limiter)
     pub kuzmin: KuzminParameter2D,
     /// Wetting/drying configuration (None = disabled)
@@ -82,21 +78,9 @@ impl SWE2DTimeConfig {
             g,
             h_min,
             limiter_type: SWELimiterType::None,
-            tvb: TVBParameter2D::default(),
             kuzmin: KuzminParameter2D::default(),
             wet_dry: None,
         }
-    }
-
-    /// Enable TVB limiters with domain-size normalization.
-    ///
-    /// # Arguments
-    /// * `m` - TVB parameter (50-100 typically)
-    /// * `domain_size` - Reference length scale (e.g., domain diagonal)
-    pub fn with_tvb_limiters(mut self, m: f64, domain_size: f64) -> Self {
-        self.limiter_type = SWELimiterType::Tvb;
-        self.tvb = TVBParameter2D::with_domain_size(m, domain_size);
-        self
     }
 
     /// Enable Kuzmin vertex-based limiters.
@@ -152,10 +136,6 @@ fn apply_configured_limiter(
     #[cfg(feature = "parallel")]
     match config.limiter_type {
         SWELimiterType::None => {}
-        SWELimiterType::Tvb => {
-            // TVB not yet parallelized, use serial version
-            apply_swe_limiters_2d(swe, mesh, ops, &config.tvb, config.h_min);
-        }
         SWELimiterType::Kuzmin => {
             apply_swe_limiters_kuzmin_2d_parallel(swe, mesh, ops, &config.kuzmin, config.h_min);
         }
@@ -167,9 +147,6 @@ fn apply_configured_limiter(
     #[cfg(not(feature = "parallel"))]
     match config.limiter_type {
         SWELimiterType::None => {}
-        SWELimiterType::Tvb => {
-            apply_swe_limiters_2d(swe, mesh, ops, &config.tvb, config.h_min);
-        }
         SWELimiterType::Kuzmin => {
             apply_swe_limiters_kuzmin_2d(swe, mesh, ops, &config.kuzmin, config.h_min);
         }
@@ -313,14 +290,6 @@ mod tests {
         assert!((config.g - 9.81).abs() < 1e-10);
         assert!((config.h_min - 0.01).abs() < 1e-10);
         assert_eq!(config.limiter_type, SWELimiterType::None);
-    }
-
-    #[test]
-    fn test_swe_2d_time_config_with_tvb() {
-        let config = SWE2DTimeConfig::new(0.3, 9.81, 0.01)
-            .with_tvb_limiters(50.0, 10000.0);
-        assert_eq!(config.limiter_type, SWELimiterType::Tvb);
-        assert!((config.tvb.m - 50.0).abs() < 1e-10);
     }
 
     #[test]

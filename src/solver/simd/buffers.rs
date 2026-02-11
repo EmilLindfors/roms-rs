@@ -22,7 +22,6 @@
 //! simultaneously with packed f64 operations.
 
 use crate::solver::state::{SWESolution2D, SWEState2D};
-use crate::types::ElementIndex;
 
 /// SoA storage for all elements, optimized for SIMD operations.
 ///
@@ -68,81 +67,55 @@ impl SWESoABuffer {
         }
     }
 
-    /// Convert from existing AoS SWESolution2D.
+    /// Convert from SWESolution2D.
     ///
-    /// This performs a full copy, rearranging data from interleaved to
-    /// separated layout.
+    /// Note: Since SWESolution2D now uses SoA storage internally, this is
+    /// a simple slice copy rather than a layout transformation.
+    #[deprecated(
+        since = "0.2.0",
+        note = "SWESolution2D now uses native SoA storage. Access slices directly with h_data(), hu_data(), hv_data() instead."
+    )]
     pub fn from_aos(aos: &SWESolution2D) -> Self {
-        let total = aos.n_elements * aos.n_nodes;
-        let mut h = Vec::with_capacity(total);
-        let mut hu = Vec::with_capacity(total);
-        let mut hv = Vec::with_capacity(total);
-
-        for k in ElementIndex::iter(aos.n_elements) {
-            for i in 0..aos.n_nodes {
-                let state = aos.get_state(k, i);
-                h.push(state.h);
-                hu.push(state.hu);
-                hv.push(state.hv);
-            }
-        }
-
         Self {
-            h,
-            hu,
-            hv,
+            h: aos.h_data().to_vec(),
+            hu: aos.hu_data().to_vec(),
+            hv: aos.hv_data().to_vec(),
             n_elements: aos.n_elements,
             n_nodes: aos.n_nodes,
         }
     }
 
-    /// Convert back to AoS SWESolution2D.
+    /// Convert to SWESolution2D.
     ///
-    /// Creates a new solution with the data rearranged to interleaved layout.
+    /// Note: Since SWESolution2D now uses SoA storage internally, this is
+    /// a simple slice copy rather than a layout transformation.
+    #[deprecated(
+        since = "0.2.0",
+        note = "SWESolution2D now uses native SoA storage. Access slices directly with h_data(), hu_data(), hv_data() instead."
+    )]
     pub fn to_aos(&self) -> SWESolution2D {
         let mut aos = SWESolution2D::new(self.n_elements, self.n_nodes);
-        for k in ElementIndex::iter(self.n_elements) {
-            let ki = k.as_usize();
-            let base = ki * self.n_nodes;
-            for i in 0..self.n_nodes {
-                let idx = base + i;
-                aos.set_state(
-                    k,
-                    i,
-                    SWEState2D {
-                        h: self.h[idx],
-                        hu: self.hu[idx],
-                        hv: self.hv[idx],
-                    },
-                );
-            }
-        }
+        aos.h_data_mut().copy_from_slice(&self.h);
+        aos.hu_data_mut().copy_from_slice(&self.hu);
+        aos.hv_data_mut().copy_from_slice(&self.hv);
         aos
     }
 
-    /// Write SoA data back into an existing AoS solution.
+    /// Write SoA data back into an existing SWESolution2D.
     ///
-    /// More efficient than `to_aos()` when reusing existing storage.
+    /// Note: Since SWESolution2D now uses SoA storage internally, this is
+    /// a simple slice copy rather than a layout transformation.
+    #[deprecated(
+        since = "0.2.0",
+        note = "SWESolution2D now uses native SoA storage. Access slices directly with h_data_mut(), hu_data_mut(), hv_data_mut() instead."
+    )]
     pub fn write_to_aos(&self, aos: &mut SWESolution2D) {
         debug_assert_eq!(aos.n_elements, self.n_elements);
         debug_assert_eq!(aos.n_nodes, self.n_nodes);
 
-        for k in ElementIndex::iter(self.n_elements) {
-            let ki = k.as_usize();
-            let base = ki * self.n_nodes;
-            for i in 0..self.n_nodes {
-                let idx = base + i;
-                aos.set_state(
-                    k,
-                    i,
-                    SWEState2D {
-                        h: self.h[idx],
-                        hu: self.hu[idx],
-                        hv: self.hv[idx],
-                    },
-                );
-            }
-        }
+        aos.h_data_mut().copy_from_slice(&self.h);
+        aos.hu_data_mut().copy_from_slice(&self.hu);
+        aos.hv_data_mut().copy_from_slice(&self.hv);
     }
 
     /// Get the index for element k, node i.
@@ -446,6 +419,7 @@ impl FaceWorkspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ElementIndex;
 
     #[test]
     fn test_soa_buffer_new() {
@@ -471,8 +445,9 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn test_soa_aos_conversion() {
-        // Create AoS with known data
+        // Create SWESolution2D with known data
         let mut aos = SWESolution2D::new(2, 4);
         for k in ElementIndex::iter(2) {
             for i in 0..4 {
@@ -481,7 +456,7 @@ mod tests {
             }
         }
 
-        // Convert to SoA
+        // Convert to SoA (deprecated but still tested for backwards compatibility)
         let soa = SWESoABuffer::from_aos(&aos);
 
         // Verify all values match
@@ -495,7 +470,7 @@ mod tests {
             }
         }
 
-        // Convert back to AoS
+        // Convert back to SWESolution2D (deprecated but still tested)
         let aos2 = soa.to_aos();
 
         // Verify round-trip

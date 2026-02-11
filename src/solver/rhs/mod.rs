@@ -27,12 +27,8 @@ pub use advection_2d::{
 
 // 2D SWE
 pub use swe_2d::{SWE2DRhsConfig, compute_dt_swe_2d, compute_rhs_swe_2d};
-#[cfg(feature = "parallel")]
-pub use swe_2d::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
-#[cfg(feature = "simd")]
-pub use swe_2d::compute_rhs_swe_2d_simd;
 #[cfg(all(feature = "parallel", feature = "simd"))]
-pub use swe_2d::compute_rhs_swe_2d_parallel_simd;
+pub use swe_2d::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
 
 // 2D Tracer
 pub use tracer_2d::{

@@ -90,14 +90,11 @@ pub use limiters::{
     NoLimiter2D,
     PositivityLimiter2D,
     StandardLimiter2D,
-    TVBLimiter2D,
-    apply_swe_limiters_2d,
     apply_swe_limiters_kuzmin_2d,
     create_limiter,
     swe_cell_averages_2d,
     swe_kuzmin_limiter_2d,
     swe_positivity_limiter_2d,
-    swe_tvb_limiter_2d,
     // 2D Tracer limiters
     KuzminParameter2D,
     TVBParameter2D,
@@ -133,10 +130,7 @@ pub use simd::{
 pub use simd::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
 
 #[cfg(feature = "parallel")]
-pub use rhs::{
-    compute_dt_swe_2d_parallel, compute_rhs_parallel, compute_rhs_swe_2d_parallel,
-    compute_rhs_tracer_2d_parallel,
-};
+pub use rhs::{compute_rhs_parallel, compute_rhs_tracer_2d_parallel};
 
 #[cfg(feature = "parallel")]
 pub use limiters::{
@@ -144,8 +138,5 @@ pub use limiters::{
     swe_kuzmin_limiter_2d_parallel, swe_positivity_limiter_2d_parallel,
 };
 
-#[cfg(feature = "simd")]
-pub use rhs::compute_rhs_swe_2d_simd;
-
 #[cfg(all(feature = "parallel", feature = "simd"))]
-pub use rhs::compute_rhs_swe_2d_parallel_simd;
+pub use rhs::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
