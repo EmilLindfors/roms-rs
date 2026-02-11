@@ -13,6 +13,7 @@ mod bathymetry;
 mod coriolis;
 mod friction;
 mod tidal;
+pub mod viscosity;
 mod wind;
 
 pub use atmospheric::{AtmosphericPressure2D, P_STANDARD, RHO_WATER_PRESSURE};
@@ -20,4 +21,5 @@ pub use bathymetry::BathymetrySource2D;
 pub use coriolis::CoriolisSource2D;
 pub use friction::{ChezyFriction2D, ManningFriction2D, SpatiallyVaryingManning2D};
 pub use tidal::{TidalPotential, TidalPotentialConstituent};
+pub use viscosity::{HorizontalViscosity2D, ViscosityModel};
 pub use wind::{DragCoefficient, WindStress2D, RHO_AIR, RHO_WATER};

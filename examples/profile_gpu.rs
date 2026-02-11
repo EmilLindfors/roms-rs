@@ -21,8 +21,8 @@ use dg_rs::SWEState2D;
 use burn_cuda::{Cuda, CudaDevice};
 #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
 use burn_wgpu::{Wgpu, WgpuDevice};
-
-use burn::prelude::*;
+#[cfg(all(feature = "burn-ndarray", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
+use burn_ndarray::{NdArray, NdArrayDevice};
 
 fn k(idx: usize) -> ElementIndex {
     ElementIndex::new(idx)
@@ -36,11 +36,15 @@ fn main() {
     type B = Cuda<f64, i64>;
     #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
     type B = Wgpu<f64, i64, u32>;
+    #[cfg(all(feature = "burn-ndarray", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
+    type B = NdArray<f64>;
 
     #[cfg(feature = "burn-cuda")]
     let device = CudaDevice::default();
     #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
     let device = WgpuDevice::default();
+    #[cfg(all(feature = "burn-ndarray", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
+    let device = NdArrayDevice::default();
 
     // Smaller problem for faster iteration
     let order = 3;

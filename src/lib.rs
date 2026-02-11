@@ -90,6 +90,7 @@ pub use solver::{
     UpwindTracerBC,
     compute_dt_advection_2d,
     compute_dt_swe_2d,
+    compute_dt_viscosity,
     // Tracer transport
     compute_dt_tracer_2d,
     compute_rhs_advection_2d,
@@ -132,8 +133,9 @@ pub use solver::burn::{
 pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};
 pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
-    HydrostaticReconstruction2D, P_STANDARD, RectangularBoundary, SourceContext2D, SourceTerm2D,
-    SpongeLayer2D, SpongeProfile, TidalPotential, TidalPotentialConstituent, WindStress2D,
+    HorizontalViscosity2D, HydrostaticReconstruction2D, P_STANDARD, RectangularBoundary,
+    SourceContext2D, SourceTerm2D, SpongeLayer2D, SpongeProfile, TidalPotential,
+    TidalPotentialConstituent, ViscosityModel, WindStress2D,
 };
 pub use time::{
     CoupledRhs2D,
@@ -191,7 +193,8 @@ pub use simulation::{Simulation, SimulationConfig, SimulationResult};
 
 // Vertical coordinate types (for 3D)
 pub use vertical::{
-    DoubleTanhStretching, SigmaGrid, SongHaidvogelStretching, Stretching, UniformStretching,
+    DoubleTanhStretching, ROMSVstretching4, SigmaGrid, SongHaidvogelStretching, Stretching,
+    UniformStretching,
 };
 
 // Strongly-typed domain types

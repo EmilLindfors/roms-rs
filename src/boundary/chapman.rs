@@ -127,7 +127,9 @@ where
 
         // Chapman radiation coefficient
         // α = 1/(1 + c·dt/dx) blends between exterior (α=1) and interior (α=0)
-        let cfl = self.dt.map_or(1.0, |dt| c * dt / self.dx);
+        // Prefer dt from context (auto-communicated from time integrator),
+        // fall back to stored dt on the BC struct
+        let cfl = ctx.dt.or(self.dt).map_or(1.0, |dt| c * dt / self.dx);
         let alpha = 1.0 / (1.0 + cfl);
 
         // Radiation condition for elevation
@@ -262,7 +264,9 @@ where
         let c = (g * h_int.max(self.h_min)).sqrt();
 
         // Chapman for elevation
-        let cfl = self.dt.map_or(1.0, |dt| c * dt / self.dx);
+        // Prefer dt from context (auto-communicated from time integrator),
+        // fall back to stored dt on the BC struct
+        let cfl = ctx.dt.or(self.dt).map_or(1.0, |dt| c * dt / self.dx);
         let alpha = 1.0 / (1.0 + cfl);
         let eta_ghost = alpha * eta_ext + (1.0 - alpha) * eta_int;
         let h_ghost = (eta_ghost - ctx.bathymetry).max(self.h_min);

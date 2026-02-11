@@ -60,6 +60,7 @@ pub use rhs::{
     // 2D SWE
     SWE2DRhsConfig,
     compute_dt_swe_2d,
+    compute_dt_viscosity,
     compute_rhs_swe_2d,
     // 2D Tracer
     ExtrapolationTracerBC,

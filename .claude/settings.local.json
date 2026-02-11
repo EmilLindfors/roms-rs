@@ -1,0 +1,23 @@
+{
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cargo run:*)",
+      "WebSearch",
+      "Bash(if not exist \"C:\\\\Users\\\\EmilLindfors\\\\dev\\\\roms-rs\\\\reports\" mkdir \"C:\\\\Users\\\\EmilLindfors\\\\dev\\\\roms-rs\\\\reports\")",
+      "Bash(powershell -Command:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(Select-String -Pattern \"\\(test result|FAILED|test.*\\\\.\\\\.\\\\.\\)\")",
+      "Bash(findstr:*)",
+      "Bash(find:*)",
+      "Bash(Select-String -Pattern \"test result:|FAILED\")",
+      "Bash(cargo check:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

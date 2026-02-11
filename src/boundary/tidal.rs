@@ -333,10 +333,10 @@ impl InterpolatedTidalBC {
             return *self.elevations.last().unwrap();
         }
 
-        let mut i = 0;
-        while i < self.times.len() - 1 && self.times[i + 1] < t {
-            i += 1;
-        }
+        let i = self
+            .times
+            .binary_search_by(|t_i| t_i.partial_cmp(&t).unwrap())
+            .unwrap_or_else(|ins| ins.saturating_sub(1));
 
         // Linear interpolation
         let t0 = self.times[i];
@@ -548,5 +548,39 @@ mod tests {
 
         // Maximum derivative at midpoint: 6*0.5*(1-0.5)/10 = 0.15
         assert!((bc.ramp_derivative(5.0) - 0.15).abs() < TOL);
+    }
+
+    #[test]
+    fn test_interpolated_tidal_binary_search() {
+        // Dense time series to exercise binary search properly
+        let n = 1000;
+        let times: Vec<f64> = (0..n).map(|i| i as f64 * 0.1).collect();
+        let elevations: Vec<f64> = times.iter().map(|t| (t * 0.5).sin()).collect();
+        let bc = InterpolatedTidalBC::new(times, elevations, G);
+
+        // Test at exact grid points
+        assert!((bc.elevation(0.0) - 0.0).abs() < TOL);
+        assert!((bc.elevation(5.0) - (2.5_f64).sin()).abs() < TOL);
+
+        // Test interpolation at midpoints between grid nodes
+        for i in 0..n - 1 {
+            let t = i as f64 * 0.1 + 0.05;
+            let e0 = (i as f64 * 0.1 * 0.5).sin();
+            let e1 = ((i + 1) as f64 * 0.1 * 0.5).sin();
+            let expected = 0.5 * (e0 + e1); // midpoint linear interpolation
+            assert!(
+                (bc.elevation(t) - expected).abs() < 1e-8,
+                "Mismatch at t={}: got {}, expected {}",
+                t,
+                bc.elevation(t),
+                expected,
+            );
+        }
+
+        // Test clamping at boundaries
+        assert!((bc.elevation(-1.0) - 0.0).abs() < TOL);
+        assert!(
+            (bc.elevation(200.0) - ((n - 1) as f64 * 0.1 * 0.5).sin()).abs() < TOL
+        );
     }
 }

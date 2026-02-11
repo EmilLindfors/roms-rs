@@ -31,6 +31,14 @@ pub use crate::solver::limiters::tracer_2d::{KuzminParameter2D, TVBParameter2D};
 /// Computes the mass-weighted average of h, hu, hv in each element:
 /// avg_h = (∫ h * w dA) / (∫ w dA)
 ///
+/// # Affine element assumption
+///
+/// For affine elements (constant Jacobian per element), J cancels in the
+/// ratio ∫q dA / ∫dA, so this function uses quadrature weights directly
+/// without Jacobian weighting. This is exact for parallelogram meshes.
+/// For curved/non-affine elements, per-node Jacobian weighting would be
+/// required — see `GeometricFactors2D` for the affine assumption.
+///
 /// # Returns
 /// Vector of (avg_h, avg_hu, avg_hv) for each element.
 pub fn swe_cell_averages_2d(
@@ -508,6 +516,8 @@ pub fn apply_swe_limiters_kuzmin_2d(
 // ============================================================================
 
 /// Parallel version of cell averages computation using Rayon.
+///
+/// See [`swe_cell_averages_2d`] for the affine element assumption.
 #[cfg(feature = "parallel")]
 pub fn swe_cell_averages_2d_parallel(
     swe: &SWESolution2D,

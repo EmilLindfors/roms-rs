@@ -3,8 +3,11 @@
 //! For Gauss-Lobatto-Legendre nodes, the mass matrix is diagonal:
 //! M = diag(weights)
 //!
-//! This is because GLL quadrature is exact for polynomials up to degree 2N-1,
-//! and the product of two degree-N polynomials is at most degree 2N.
+//! With (N+1) GLL points, quadrature is exact for polynomials up to degree 2N-1.
+//! The product of two degree-N basis functions is degree 2N, so there is a
+//! degree-2N aliasing error. However, this aliasing is harmless for the mass
+//! matrix: it only affects the diagonal entries slightly without impacting
+//! stability or convergence of the DG scheme.
 
 use faer::Mat;
 

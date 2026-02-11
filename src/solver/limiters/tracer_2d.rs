@@ -128,6 +128,14 @@ impl Default for TVBParameter2D {
 /// Computes the mass-weighted average of T and S in each element:
 /// avg_C = (∫ hC dA) / (∫ h dA)
 ///
+/// # Affine element assumption
+///
+/// For affine elements (constant Jacobian per element), J cancels in the
+/// ratio ∫q dA / ∫dA, so this function uses quadrature weights directly
+/// without Jacobian weighting. This is exact for parallelogram meshes.
+/// For curved/non-affine elements, per-node Jacobian weighting would be
+/// required — see `GeometricFactors2D` for the affine assumption.
+///
 /// # Returns
 /// Vector of (avg_T, avg_S) for each element.
 pub fn tracer_cell_averages_2d(

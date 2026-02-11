@@ -110,5 +110,6 @@ mod stretching;
 
 pub use sigma::SigmaGrid;
 pub use stretching::{
-    DoubleTanhStretching, SongHaidvogelStretching, Stretching, UniformStretching,
+    DoubleTanhStretching, ROMSVstretching4, SongHaidvogelStretching, Stretching,
+    UniformStretching,
 };

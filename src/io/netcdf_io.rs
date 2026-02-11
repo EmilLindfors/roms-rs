@@ -793,6 +793,115 @@ pub enum OceanGridType {
 /// - Multiple time steps
 /// - SSH, currents, temperature, salinity
 ///
+/// Bucket grid spatial index for O(1) point-in-cell lookup on curvilinear grids.
+///
+/// The bounding box of the grid is divided into a regular grid of buckets.
+/// Each bucket stores the (j, i) indices of all curvilinear cells whose
+/// bounding box overlaps that bucket. Point queries then only search the
+/// cells in the relevant bucket, reducing lookup from O(n_y × n_x) to O(1)
+/// amortized.
+#[cfg(feature = "netcdf")]
+#[derive(Clone, Debug)]
+struct CurvilinearIndex {
+    /// Flat array of buckets, row-major [n_buckets_y][n_buckets_x]
+    buckets: Vec<Vec<(u32, u32)>>,
+    /// Number of buckets in longitude direction
+    n_buckets_x: usize,
+    /// Number of buckets in latitude direction
+    n_buckets_y: usize,
+    /// Minimum longitude of the grid
+    min_lon: f64,
+    /// Minimum latitude of the grid
+    min_lat: f64,
+    /// Longitude extent per bucket
+    bucket_width: f64,
+    /// Latitude extent per bucket
+    bucket_height: f64,
+}
+
+#[cfg(feature = "netcdf")]
+impl CurvilinearIndex {
+    /// Build a bucket grid from curvilinear lat/lon arrays.
+    fn build(lat: &[Vec<f64>], lon: &[Vec<f64>], bbox: (f64, f64, f64, f64)) -> Self {
+        let (min_lon, min_lat, max_lon, max_lat) = bbox;
+        let n_y = lat.len();
+        let n_x = if n_y > 0 { lat[0].len() } else { 0 };
+
+        // Choose bucket count: ~sqrt(n_cells) in each direction, clamped
+        let n_cells = (n_y.saturating_sub(1)) * (n_x.saturating_sub(1));
+        let side = (n_cells as f64).sqrt().ceil() as usize;
+        let n_buckets_x = side.max(1).min(1024);
+        let n_buckets_y = side.max(1).min(1024);
+
+        let lon_range = (max_lon - min_lon).max(1e-10);
+        let lat_range = (max_lat - min_lat).max(1e-10);
+        let bucket_width = lon_range / n_buckets_x as f64;
+        let bucket_height = lat_range / n_buckets_y as f64;
+
+        let mut buckets = vec![Vec::new(); n_buckets_x * n_buckets_y];
+
+        // Insert each cell into all overlapping buckets
+        for j in 0..n_y.saturating_sub(1) {
+            for i in 0..n_x.saturating_sub(1) {
+                let cell_lons = [lon[j][i], lon[j][i + 1], lon[j + 1][i], lon[j + 1][i + 1]];
+                let cell_lats = [lat[j][i], lat[j][i + 1], lat[j + 1][i], lat[j + 1][i + 1]];
+
+                // Skip cells with non-finite coords
+                if cell_lons.iter().any(|v| !v.is_finite())
+                    || cell_lats.iter().any(|v| !v.is_finite())
+                {
+                    continue;
+                }
+
+                let cell_min_lon = cell_lons.iter().copied().fold(f64::INFINITY, f64::min);
+                let cell_max_lon = cell_lons.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let cell_min_lat = cell_lats.iter().copied().fold(f64::INFINITY, f64::min);
+                let cell_max_lat = cell_lats.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+                // Bucket index range for this cell
+                let bx0 = ((cell_min_lon - min_lon) / bucket_width).floor() as isize;
+                let bx1 = ((cell_max_lon - min_lon) / bucket_width).floor() as isize;
+                let by0 = ((cell_min_lat - min_lat) / bucket_height).floor() as isize;
+                let by1 = ((cell_max_lat - min_lat) / bucket_height).floor() as isize;
+
+                let bx0 = (bx0.max(0) as usize).min(n_buckets_x - 1);
+                let bx1 = (bx1.max(0) as usize).min(n_buckets_x - 1);
+                let by0 = (by0.max(0) as usize).min(n_buckets_y - 1);
+                let by1 = (by1.max(0) as usize).min(n_buckets_y - 1);
+
+                for by in by0..=by1 {
+                    for bx in bx0..=bx1 {
+                        buckets[by * n_buckets_x + bx].push((j as u32, i as u32));
+                    }
+                }
+            }
+        }
+
+        Self {
+            buckets,
+            n_buckets_x,
+            n_buckets_y,
+            min_lon,
+            min_lat,
+            bucket_width,
+            bucket_height,
+        }
+    }
+
+    /// Get candidate cells for a given (lon, lat) query point.
+    fn candidates(&self, lon: f64, lat: f64) -> &[(u32, u32)] {
+        let bx = ((lon - self.min_lon) / self.bucket_width).floor() as isize;
+        let by = ((lat - self.min_lat) / self.bucket_height).floor() as isize;
+
+        if bx < 0 || by < 0 || bx >= self.n_buckets_x as isize || by >= self.n_buckets_y as isize {
+            return &[];
+        }
+
+        let idx = by as usize * self.n_buckets_x + bx as usize;
+        &self.buckets[idx]
+    }
+}
+
 /// # Example
 ///
 /// ```rust,ignore
@@ -830,6 +939,8 @@ pub struct OceanModelReader {
     pub dims: (usize, usize),
     /// Bounding box (min_lon, min_lat, max_lon, max_lat)
     pub bbox: (f64, f64, f64, f64),
+    /// Spatial index for fast curvilinear grid lookup (None for regular grids)
+    spatial_index: Option<CurvilinearIndex>,
 }
 
 #[cfg(feature = "netcdf")]
@@ -893,6 +1004,13 @@ impl OceanModelReader {
         let temperature = Self::read_variable(&file, &["temperature", "temp", "sea_water_temperature"], n_time, n_y, n_x);
         let salinity = Self::read_variable(&file, &["salinity", "salt", "sea_water_salinity"], n_time, n_y, n_x);
 
+        // Build spatial index for curvilinear grids
+        let spatial_index = if grid_type == OceanGridType::Curvilinear {
+            Some(CurvilinearIndex::build(&lat, &lon, bbox))
+        } else {
+            None
+        };
+
         Ok(Self {
             grid_type,
             lat,
@@ -905,6 +1023,7 @@ impl OceanModelReader {
             salinity,
             dims: (n_y, n_x),
             bbox,
+            spatial_index,
         })
     }
 
@@ -1180,7 +1299,11 @@ impl OceanModelReader {
         })
     }
 
-    /// Find grid cell containing a point (for curvilinear grids).
+    /// Find grid cell containing a point.
+    ///
+    /// For regular grids, uses fast binary search on 1D coordinate arrays.
+    /// For curvilinear grids, uses a bucket grid spatial index for O(1) amortized
+    /// lookup instead of O(n_y × n_x) brute-force search.
     fn find_cell(&self, target_lon: f64, target_lat: f64) -> Option<(usize, usize, f64, f64)> {
         let (n_y, n_x) = self.dims;
 
@@ -1195,46 +1318,65 @@ impl OceanModelReader {
             return Some((j0, i0, fy, fx));
         }
 
-        // For curvilinear grids, search all cells
+        // For curvilinear grids, use spatial index
+        if let Some(ref index) = self.spatial_index {
+            let candidates = index.candidates(target_lon, target_lat);
+            self.find_best_cell(candidates, target_lon, target_lat)
+        } else {
+            // Fallback: brute-force (shouldn't happen if spatial_index is built)
+            let all_cells: Vec<(u32, u32)> = (0..n_y.saturating_sub(1) as u32)
+                .flat_map(|j| (0..n_x.saturating_sub(1) as u32).map(move |i| (j, i)))
+                .collect();
+            self.find_best_cell(&all_cells, target_lon, target_lat)
+        }
+    }
+
+    /// Search a set of candidate cells for the closest one to the target point.
+    fn find_best_cell(
+        &self,
+        candidates: &[(u32, u32)],
+        target_lon: f64,
+        target_lat: f64,
+    ) -> Option<(usize, usize, f64, f64)> {
         let mut best_dist = f64::INFINITY;
         let mut best_cell = None;
 
-        for j in 0..n_y.saturating_sub(1) {
-            for i in 0..n_x.saturating_sub(1) {
-                // Check if point is in this cell
-                let lon00 = self.lon[j][i];
-                let lon01 = self.lon[j][i + 1];
-                let lon10 = self.lon[j + 1][i];
-                let lon11 = self.lon[j + 1][i + 1];
+        for &(j32, i32) in candidates {
+            let j = j32 as usize;
+            let i = i32 as usize;
 
-                let lat00 = self.lat[j][i];
-                let lat01 = self.lat[j][i + 1];
-                let lat10 = self.lat[j + 1][i];
-                let lat11 = self.lat[j + 1][i + 1];
+            let lon00 = self.lon[j][i];
+            let lon01 = self.lon[j][i + 1];
+            let lon10 = self.lon[j + 1][i];
+            let lon11 = self.lon[j + 1][i + 1];
 
-                // Quick bounding box check
-                let min_lon = lon00.min(lon01).min(lon10).min(lon11);
-                let max_lon = lon00.max(lon01).max(lon10).max(lon11);
-                let min_lat = lat00.min(lat01).min(lat10).min(lat11);
-                let max_lat = lat00.max(lat01).max(lat10).max(lat11);
+            let lat00 = self.lat[j][i];
+            let lat01 = self.lat[j][i + 1];
+            let lat10 = self.lat[j + 1][i];
+            let lat11 = self.lat[j + 1][i + 1];
 
-                if target_lon < min_lon - 0.1 || target_lon > max_lon + 0.1 ||
-                   target_lat < min_lat - 0.1 || target_lat > max_lat + 0.1 {
-                    continue;
-                }
+            // Quick bounding box check
+            let min_lon = lon00.min(lon01).min(lon10).min(lon11);
+            let max_lon = lon00.max(lon01).max(lon10).max(lon11);
+            let min_lat = lat00.min(lat01).min(lat10).min(lat11);
+            let max_lat = lat00.max(lat01).max(lat10).max(lat11);
 
-                // Compute bilinear coordinates
-                let center_lon = (lon00 + lon01 + lon10 + lon11) / 4.0;
-                let center_lat = (lat00 + lat01 + lat10 + lat11) / 4.0;
-                let dist = (target_lon - center_lon).powi(2) + (target_lat - center_lat).powi(2);
+            if target_lon < min_lon - 0.1 || target_lon > max_lon + 0.1 ||
+               target_lat < min_lat - 0.1 || target_lat > max_lat + 0.1 {
+                continue;
+            }
 
-                if dist < best_dist {
-                    best_dist = dist;
-                    // Approximate bilinear coordinates
-                    let fx = (target_lon - lon00) / (lon01 - lon00).max(1e-10);
-                    let fy = (target_lat - lat00) / (lat10 - lat00).max(1e-10);
-                    best_cell = Some((j, i, fy.clamp(0.0, 1.0), fx.clamp(0.0, 1.0)));
-                }
+            // Compute bilinear coordinates
+            let center_lon = (lon00 + lon01 + lon10 + lon11) / 4.0;
+            let center_lat = (lat00 + lat01 + lat10 + lat11) / 4.0;
+            let dist = (target_lon - center_lon).powi(2) + (target_lat - center_lat).powi(2);
+
+            if dist < best_dist {
+                best_dist = dist;
+                // Approximate bilinear coordinates
+                let fx = (target_lon - lon00) / (lon01 - lon00).max(1e-10);
+                let fy = (target_lat - lat00) / (lat10 - lat00).max(1e-10);
+                best_cell = Some((j, i, fy.clamp(0.0, 1.0), fx.clamp(0.0, 1.0)));
             }
         }
 
@@ -1415,5 +1557,66 @@ mod tests {
         assert_eq!(mesh.x, x);
         assert_eq!(mesh.y, y);
         assert!(mesh.lat.is_none());
+    }
+
+    #[cfg(feature = "netcdf")]
+    #[test]
+    fn test_curvilinear_index_build_and_lookup() {
+        // Create a simple 4x4 curvilinear grid (slightly rotated)
+        let n = 5; // 5 nodes → 4x4 cells
+        let mut lat = vec![vec![0.0; n]; n];
+        let mut lon = vec![vec![0.0; n]; n];
+
+        for j in 0..n {
+            for i in 0..n {
+                // Slight rotation to make it curvilinear
+                let x = i as f64;
+                let y = j as f64;
+                lon[j][i] = x + 0.05 * y;
+                lat[j][i] = y + 0.05 * x;
+            }
+        }
+
+        let bbox = (
+            lon.iter().flat_map(|r| r.iter()).copied().fold(f64::INFINITY, f64::min),
+            lat.iter().flat_map(|r| r.iter()).copied().fold(f64::INFINITY, f64::min),
+            lon.iter().flat_map(|r| r.iter()).copied().fold(f64::NEG_INFINITY, f64::max),
+            lat.iter().flat_map(|r| r.iter()).copied().fold(f64::NEG_INFINITY, f64::max),
+        );
+
+        let index = CurvilinearIndex::build(&lat, &lon, bbox);
+
+        // A point at the center of cell (1,1) should find candidates
+        let center_lon = (lon[1][1] + lon[1][2] + lon[2][1] + lon[2][2]) / 4.0;
+        let center_lat = (lat[1][1] + lat[1][2] + lat[2][1] + lat[2][2]) / 4.0;
+        let candidates = index.candidates(center_lon, center_lat);
+        assert!(
+            !candidates.is_empty(),
+            "Should find candidates for center of cell (1,1)"
+        );
+        // Cell (1,1) should be among candidates
+        assert!(
+            candidates.contains(&(1, 1)),
+            "Cell (1,1) should be in candidates, got {:?}",
+            candidates
+        );
+
+        // A point well outside the grid should return empty
+        let outside = index.candidates(100.0, 100.0);
+        assert!(outside.is_empty(), "No candidates expected outside grid");
+
+        // Every cell center should find at least one candidate
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let cx = (lon[j][i] + lon[j][i + 1] + lon[j + 1][i] + lon[j + 1][i + 1]) / 4.0;
+                let cy = (lat[j][i] + lat[j][i + 1] + lat[j + 1][i] + lat[j + 1][i + 1]) / 4.0;
+                let cands = index.candidates(cx, cy);
+                assert!(
+                    cands.contains(&(j as u32, i as u32)),
+                    "Cell ({},{}) not found at its center ({:.3},{:.3}), got {:?}",
+                    j, i, cx, cy, cands
+                );
+            }
+        }
     }
 }

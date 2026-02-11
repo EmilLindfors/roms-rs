@@ -208,7 +208,154 @@ impl ConservationLaw for ShallowWater1D {
     }
 }
 
-/// Compute the exact dam break solution (Stoker solution).
+/// Pressure function for the SWE exact Riemann solver (Toro 2009, Ch. 10).
+///
+/// Returns (f, f') where f is the wave function and f' its derivative,
+/// evaluated at depth `h` for the wave connecting to state with depth `h_k`.
+#[allow(dead_code)]
+fn pressure_function_swe(h: f64, h_k: f64, g: f64) -> (f64, f64) {
+    if h <= h_k {
+        // Rarefaction wave
+        let c = (g * h).sqrt();
+        let c_k = (g * h_k).sqrt();
+        let f = 2.0 * (c - c_k);
+        let df = (g / h).sqrt();
+        (f, df)
+    } else {
+        // Shock wave
+        let a = g * (h + h_k) / (2.0 * h * h_k);
+        let a_sqrt = a.sqrt();
+        let f = (h - h_k) * a_sqrt;
+        let df = a_sqrt - g * (h - h_k) / (4.0 * h * h * a_sqrt);
+        (f, df)
+    }
+}
+
+/// Solve the SWE Riemann problem for the star-region state (Toro 2009, Ch. 10).
+///
+/// Uses Newton-Raphson iteration with a two-rarefaction initial guess.
+/// Returns (h_m, u_m) — the depth and velocity in the star region.
+#[allow(dead_code)]
+fn solve_riemann_swe(h_l: f64, h_r: f64, u_l: f64, u_r: f64, g: f64) -> (f64, f64) {
+    let c_l = (g * h_l).sqrt();
+    let c_r = (g * h_r).sqrt();
+
+    // Two-rarefaction initial guess
+    let c_guess = (u_l - u_r) / 4.0 + (c_l + c_r) / 2.0;
+    let mut h_m = (c_guess * c_guess / g).max(1e-14);
+
+    // Newton-Raphson iteration
+    for _ in 0..50 {
+        let (f_l, df_l) = pressure_function_swe(h_m, h_l, g);
+        let (f_r, df_r) = pressure_function_swe(h_m, h_r, g);
+        let residual = f_l + f_r + (u_r - u_l);
+        let derivative = df_l + df_r;
+
+        if derivative.abs() < 1e-30 {
+            break;
+        }
+
+        let dh = residual / derivative;
+        h_m -= dh;
+        h_m = h_m.max(1e-14);
+
+        if dh.abs() < 1e-12 * h_m {
+            break;
+        }
+    }
+
+    // Star-region velocity
+    let (f_l, _) = pressure_function_swe(h_m, h_l, g);
+    let (f_r, _) = pressure_function_swe(h_m, h_r, g);
+    let u_m = 0.5 * (u_l + u_r) + 0.5 * (f_r - f_l);
+
+    (h_m, u_m)
+}
+
+/// Sample the exact SWE Riemann solution at speed s = (x - x_dam) / t.
+///
+/// Given the left/right states and the star-region solution (h_m, u_m),
+/// returns (h, u) at the given sampling speed s.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn sample_riemann_swe(
+    s: f64,
+    h_l: f64,
+    h_r: f64,
+    u_l: f64,
+    u_r: f64,
+    h_m: f64,
+    u_m: f64,
+    g: f64,
+) -> (f64, f64) {
+    let c_m = (g * h_m).sqrt();
+
+    if s <= u_m {
+        // Left of contact discontinuity
+        if h_m <= h_l {
+            // Left rarefaction
+            let c_l = (g * h_l).sqrt();
+            let s_hl = u_l - c_l; // Head speed
+            let s_tl = u_m - c_m; // Tail speed
+
+            if s <= s_hl {
+                (h_l, u_l)
+            } else if s <= s_tl {
+                // Inside rarefaction fan
+                let c = (u_l + 2.0 * c_l - s) / 3.0;
+                let u = (2.0 * s + u_l + 2.0 * c_l) / 3.0;
+                let h = c * c / g;
+                (h.max(0.0), u)
+            } else {
+                (h_m, u_m)
+            }
+        } else {
+            // Left shock
+            let c_l = (g * h_l).sqrt();
+            let q_l = (h_m * (h_m + h_l) / (2.0 * h_l * h_l)).sqrt();
+            let s_l = u_l - c_l * q_l;
+
+            if s <= s_l {
+                (h_l, u_l)
+            } else {
+                (h_m, u_m)
+            }
+        }
+    } else {
+        // Right of contact discontinuity
+        if h_m <= h_r {
+            // Right rarefaction
+            let c_r = (g * h_r).sqrt();
+            let s_hr = u_r + c_r; // Head speed
+            let s_tr = u_m + c_m; // Tail speed
+
+            if s >= s_hr {
+                (h_r, u_r)
+            } else if s >= s_tr {
+                // Inside rarefaction fan
+                let c = (-u_r + 2.0 * c_r + s) / 3.0;
+                let u = (2.0 * s + u_r - 2.0 * c_r) / 3.0;
+                let h = c * c / g;
+                (h.max(0.0), u)
+            } else {
+                (h_m, u_m)
+            }
+        } else {
+            // Right shock
+            let c_r = (g * h_r).sqrt();
+            let q_r = (h_m * (h_m + h_r) / (2.0 * h_r * h_r)).sqrt();
+            let s_r = u_r + c_r * q_r;
+
+            if s >= s_r {
+                (h_r, u_r)
+            } else {
+                (h_m, u_m)
+            }
+        }
+    }
+}
+
+/// Compute the exact dam break solution (Stoker solution for dry bed,
+/// exact Riemann solver for wet bed following Toro 2009, Ch. 10).
 ///
 /// Returns (h, u) at position x and time t for a dam break at x = x_dam
 /// with initial left depth h_l and right depth h_r (h_r can be 0 for dry bed).
@@ -245,22 +392,10 @@ pub fn dam_break_exact(x: f64, t: f64, x_dam: f64, h_l: f64, h_r: f64, g: f64) -
             (h.max(0.0), u)
         }
     } else {
-        // Wet bed case - requires iteration to find intermediate state
-        // For simplicity, use the dry bed solution as approximation
-        // (a proper implementation would solve the Rankine-Hugoniot conditions)
-        let _c_r = (g * h_r).sqrt();
-        let x_a = x_dam - c_l * t;
-
-        if x <= x_a {
-            (h_l, 0.0)
-        } else {
-            // Simplified: assume rarefaction on left, shock on right
-            let h_m = 0.5 * (h_l + h_r); // Rough approximation
-            let u_m = c_l - (g * h_m).sqrt();
-            let x_m = x_dam + u_m * t;
-
-            if x >= x_m { (h_r, 0.0) } else { (h_m, u_m) }
-        }
+        // Wet bed case — exact Riemann solver
+        let (h_m, u_m) = solve_riemann_swe(h_l, h_r, 0.0, 0.0, g);
+        let s = (x - x_dam) / t;
+        sample_riemann_swe(s, h_l, h_r, 0.0, 0.0, h_m, u_m, g)
     }
 }
 
@@ -438,5 +573,159 @@ mod tests {
         let u_dry = swe.velocity(1e-6, 1e-6);
         assert!(u_dry.is_finite());
         assert!(u_dry.abs() < 10.0); // Should be bounded
+    }
+
+    // ====================================================================
+    // Dam-break wet-bed exact Riemann solver tests
+    // ====================================================================
+
+    #[test]
+    fn test_dam_break_wet_symmetric() {
+        // Symmetric: h_l = h_r → h_m = h_l, u_m = 0
+        let g = 9.81;
+        let h = 2.0;
+        let t = 1.0;
+        let x_dam = 5.0;
+
+        // At x = x_dam (center), the solution should be the undisturbed state
+        let (h_sol, u_sol) = dam_break_exact(x_dam, t, x_dam, h, h, g);
+        assert!(
+            (h_sol - h).abs() < 1e-10,
+            "Symmetric dam break: h should be {}, got {}",
+            h,
+            h_sol
+        );
+        assert!(
+            u_sol.abs() < 1e-10,
+            "Symmetric dam break: u should be 0, got {}",
+            u_sol
+        );
+
+        // Far left and far right should be undisturbed
+        let (h_left, u_left) = dam_break_exact(0.0, t, x_dam, h, h, g);
+        assert!((h_left - h).abs() < 1e-10);
+        assert!(u_left.abs() < 1e-10);
+
+        let (h_right, u_right) = dam_break_exact(10.0, t, x_dam, h, h, g);
+        assert!((h_right - h).abs() < 1e-10);
+        assert!(u_right.abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dam_break_wet_classic() {
+        // Classic dam break: h_l=2, h_r=1
+        // Verifies the Newton solver converges and gives physically correct results
+        let g = 9.81;
+        let h_l = 2.0;
+        let h_r = 1.0;
+        let x_dam = 5.0;
+        let t = 0.5;
+
+        // Solve for the star-region state directly
+        let (h_m, u_m) = solve_riemann_swe(h_l, h_r, 0.0, 0.0, g);
+
+        // h_m must be between h_r and h_l
+        assert!(
+            h_m > h_r && h_m < h_l,
+            "h_m={} should be between h_r={} and h_l={}",
+            h_m,
+            h_r,
+            h_l
+        );
+
+        // u_m must be positive (flow from deep to shallow side)
+        assert!(u_m > 0.0, "u_m={} should be positive", u_m);
+
+        // Verify the residual is near zero: f_L + f_R + (u_R - u_L) = 0
+        let (f_l, _) = pressure_function_swe(h_m, h_l, g);
+        let (f_r, _) = pressure_function_swe(h_m, h_r, g);
+        let residual = f_l + f_r; // u_l = u_r = 0
+        assert!(
+            residual.abs() < 1e-10,
+            "Riemann solver residual should be near zero, got {}",
+            residual
+        );
+
+        // Verify continuity: solution should be continuous within each region
+        // Left undisturbed state
+        let (h_far_left, _) = dam_break_exact(0.0, t, x_dam, h_l, h_r, g);
+        assert!((h_far_left - h_l).abs() < 1e-10);
+
+        // Right undisturbed state
+        let (h_far_right, _) = dam_break_exact(10.0, t, x_dam, h_l, h_r, g);
+        assert!((h_far_right - h_r).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_dam_break_wet_continuity_at_boundaries() {
+        // Verify smooth transitions at wave fronts for rarefaction
+        let g = 9.81;
+        let h_l = 2.0;
+        let h_r = 1.0;
+        let x_dam = 5.0;
+        let t = 0.5;
+
+        // Sample densely to check for large jumps within the rarefaction
+        let n = 1000;
+        let mut prev_h = h_l;
+        for i in 0..=n {
+            let x = i as f64 / n as f64 * 10.0;
+            let (h, _) = dam_break_exact(x, t, x_dam, h_l, h_r, g);
+
+            // No jump in h should exceed what's physically reasonable
+            // (only the shock and contact can have jumps)
+            assert!(
+                h.is_finite() && h >= 0.0,
+                "h should be finite and non-negative at x={}, got {}",
+                x,
+                h
+            );
+
+            // h should be monotonically non-increasing from left to right
+            // (for h_l > h_r with zero initial velocity)
+            assert!(
+                h <= prev_h + 1e-10,
+                "h should be monotonically non-increasing: h({})={} > h_prev={}",
+                x,
+                h,
+                prev_h
+            );
+            prev_h = h;
+        }
+    }
+
+    #[test]
+    fn test_dam_break_wet_reduces_to_dry() {
+        // As h_r → 0+, the wet-bed solution should approach the dry-bed solution
+        let g = 9.81;
+        let h_l = 2.0;
+        let x_dam = 5.0;
+        let t = 0.5;
+
+        let h_r_small = 1e-6;
+
+        // Sample at several points and compare with dry-bed solution
+        for &x in &[0.0, 3.0, 5.0, 6.0, 7.0] {
+            let (h_wet, u_wet) = dam_break_exact(x, t, x_dam, h_l, h_r_small, g);
+            let (h_dry, u_dry) = dam_break_exact(x, t, x_dam, h_l, 0.0, g);
+
+            // Allow larger tolerance since h_r is small but not zero
+            assert!(
+                (h_wet - h_dry).abs() < 0.1,
+                "At x={}: wet h={} should be close to dry h={}",
+                x,
+                h_wet,
+                h_dry
+            );
+            if h_dry > 0.01 {
+                assert!(
+                    (u_wet - u_dry).abs() < 0.5,
+                    "At x={}: wet u={} should be close to dry u={}",
+                    x,
+                    u_wet,
+                    u_dry
+                );
+            }
+        }
     }
 }

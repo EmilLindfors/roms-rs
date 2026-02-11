@@ -208,9 +208,22 @@ impl TSTOBC2D {
         rate
     }
 
-    /// Get tidal water depth at time t.
+    /// Get tidal water depth at time t with explicit bathymetry.
+    ///
+    /// h_tidal = η_tidal - bathymetry
+    ///
+    /// where bathymetry is the bed elevation (negative below MSL).
+    pub fn tidal_depth_with_bathy(&self, t: f64, bathymetry: f64) -> f64 {
+        (self.predict_tidal_elevation(t) - bathymetry).max(self.config.h_min)
+    }
+
+    /// Get tidal water depth at time t using h_ref (deprecated).
     ///
     /// h_tidal = h_ref + η_tidal
+    ///
+    /// **Deprecated**: Use [`tidal_depth_with_bathy`] instead. This method uses
+    /// `h_ref` as a proxy for depth, which double-counts when bathymetry is set.
+    #[deprecated(note = "Use tidal_depth_with_bathy instead; h_ref is ignored in ghost_state depth computation")]
     pub fn tidal_depth(&self, t: f64) -> f64 {
         (self.config.h_ref + self.predict_tidal_elevation(t)).max(self.config.h_min)
     }
@@ -229,7 +242,7 @@ impl SWEBoundaryCondition2D for TSTOBC2D {
 
         // 1. Predict tidal elevation and corresponding depth
         let eta_tidal = self.predict_tidal_elevation(t);
-        let h_tidal = (self.config.h_ref + eta_tidal - ctx.bathymetry).max(self.config.h_min);
+        let h_tidal = (eta_tidal - ctx.bathymetry).max(self.config.h_min);
 
         // 2. Interior state
         let h_int = ctx.interior_state.h;
@@ -402,54 +415,17 @@ mod tests {
 
         // Interior matches tidal prediction at t=0
         // η_tidal(0) = mean_elevation + A*cos(0) = 0 + 0.5 = 0.5
+        //
         // With bathymetry = -50 (bed 50m below MSL):
-        // h_tidal = h_ref + η_tidal - bathymetry = 50 + 0.5 - (-50) = 100.5
-        // Wait, that's wrong. Let me reconsider.
-        //
-        // Actually: h_tidal = h_ref + η_tidal - B where B is bed elevation.
-        // If B = -50 (50m below MSL), h_ref = 50, η_tidal = 0.5:
-        // h_tidal = 50 + 0.5 - (-50) = 100.5 (wrong!)
-        //
-        // The formula should be: h = η - B where η is surface elevation
-        // For tidal depth: h_tidal = η_tidal - B = 0.5 - (-50) = 50.5 ✓
-        //
-        // But wait, in my impl: h_tidal = h_ref + eta_tidal - bathymetry
-        // This means: h_ref is the mean depth (when η=0), so h_ref = 0 - B = -B = 50
-        // And h_tidal = h_ref + η_tidal = 50 + 0.5 = 50.5 when B = 0... no that's wrong.
-        //
-        // Simpler approach: set bathymetry to match h_ref assumption.
-        // If h_ref = 50 is the mean depth, and mean surface = 0, then B = 0 - 50 = -50.
-        //
-        // With bathymetry = -50:
-        // h_tidal = h_ref + η_tidal - bathymetry = 50 + 0.5 - (-50) = 100.5
-        // That's still wrong!
-        //
-        // The issue: h_ref already accounts for the depth, so adding bathymetry
-        // double-counts. Fix: when bathymetry = 0 (bed at surface), mean depth = h_ref = 50
-        // is physically impossible. The code assumes a different convention.
-        //
-        // Let's just use bathymetry = 0 and h_ref = 50 as "reference depth" ignoring
-        // physical interpretation. The key is that interior matches tidal prediction.
-        //
-        // At t=0 with bathymetry=0:
-        // - h_tidal = h_ref + η_tidal - 0 = 50 + 0.5 = 50.5
-        // - η_int = h_int + B = h_int + 0 = h_int
-        // - η_tidal (from predict) = 0.5
-        // - For zero velocity: η_int should equal η_tidal, i.e., h_int = 0.5
-        //
-        // But that makes h_int = 0.5m which is tiny! That's the mismatch.
-        //
-        // The real issue: predict_tidal_elevation returns the tidal PERTURBATION,
-        // not the total surface elevation. For Flather, we compare surface elevations.
-        //
-        // Fix the interior: η_int = η_tidal means h_int + B = η_tidal
-        // With B = 0: h_int = η_tidal = 0.5
-        let h_int = 0.5; // Surface elevation matching tidal (with B=0)
-        let ctx = make_context(h_int, 0.0, 0.0, 0.0, 0.0);
+        //   h_tidal = η_tidal - bathymetry = 0.5 - (-50) = 50.5 ✓
+        //   η_int = h_int + B = h_int + (-50) = h_int - 50
+        //   For zero velocity: η_int = η_tidal = 0.5 → h_int = 50.5
+        let h_int = 50.5; // h such that η = h + B = 50.5 - 50 = 0.5 = η_tidal
+        let ctx = make_context(h_int, 0.0, 0.0, -50.0, 0.0);
 
         let ghost = bc.ghost_state(&ctx);
 
-        // Ghost depth = h_tidal = h_ref + η_tidal - B = 50 + 0.5 - 0 = 50.5
+        // Ghost depth = h_tidal = η_tidal - B = 0.5 - (-50) = 50.5
         assert!((ghost.h - 50.5).abs() < 0.01);
 
         // Velocity should be near zero when interior elevation matches tidal
@@ -470,17 +446,18 @@ mod tests {
         let bc = TSTOBC2D::new(config);
 
         // Interior has elevated water (storm surge scenario)
-        // η_tidal = 0, so η_subtidal = η_interior - η_tidal = 51 - 50 = 1m
-        let h_int = 51.0; // 1m above reference
-        let ctx = make_context(h_int, 0.0, 0.0, 0.0, 0.0);
+        // With bathymetry = -50 (bed 50m below MSL):
+        //   η_tidal = 0, η_int = h_int + B = 51 + (-50) = 1.0m
+        //   η_subtidal = η_int - η_tidal = 1.0 - 0.0 = 1.0m
+        let h_int = 51.0; // 1m above MSL
+        let ctx = make_context(h_int, 0.0, 0.0, -50.0, 0.0);
 
         let ghost = bc.ghost_state(&ctx);
 
         // Should generate outward velocity to radiate the surge
-        // The radiation term: u_n = c * η_subtidal / dx
-        // η_subtidal = 1.0m
+        // h_tidal = η_tidal - B = 0 - (-50) = 50
         // c = sqrt(9.81 * 51) ≈ 22.4 m/s
-        // u_n ≈ 22.4 * 1.0 / 800 ≈ 0.028 m/s (outward = positive)
+        // u_n = c * η_subtidal / dx ≈ 22.4 * 1.0 / 800 ≈ 0.028 m/s (outward)
         assert!(
             ghost.hu / ghost.h > 0.0,
             "Expected positive (outward) velocity"
@@ -499,13 +476,14 @@ mod tests {
         };
         let bc = TSTOBC2D::new(config);
 
-        // Interior with tangential velocity
+        // Interior with tangential velocity, bathymetry = -50 (bed 50m below MSL)
+        // η_int = h + B = 50 + (-50) = 0 = η_tidal (no constituents)
         let h = 50.0;
         let ctx = BCContext2D::new(
             0.0,
             (0.0, 0.0),
             SWEState2D::from_primitives(h, 0.0, 2.0), // v = 2 m/s tangential
-            0.0,
+            -50.0,
             (1.0, 0.0),
             G,
             H_MIN,
@@ -592,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tidal_depth() {
+    fn test_tidal_depth_with_bathy() {
         let config = TSTConfig {
             mean_elevation: 0.0,
             constituents: vec![TSTConstituent::new("M2".to_string(), 0.5, M2_OMEGA, 0.0)],
@@ -603,12 +581,31 @@ mod tests {
         };
         let bc = TSTOBC2D::new(config);
 
-        // At t=0, η = 0.5, so h = 50 + 0.5 = 50.5
-        assert!((bc.tidal_depth(0.0) - 50.5).abs() < TOL);
+        // With bathymetry = -50 (bed 50m below MSL):
+        // At t=0, η = 0.5, h = η - B = 0.5 - (-50) = 50.5
+        assert!((bc.tidal_depth_with_bathy(0.0, -50.0) - 50.5).abs() < TOL);
 
-        // At t=T/2, η = -0.5, so h = 50 - 0.5 = 49.5
+        // At t=T/2, η = -0.5, h = -0.5 - (-50) = 49.5
         let t_half = M2_PERIOD / 2.0;
-        assert!((bc.tidal_depth(t_half) - 49.5).abs() < 1e-10);
+        assert!((bc.tidal_depth_with_bathy(t_half, -50.0) - 49.5).abs() < 1e-10);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_tidal_depth_deprecated() {
+        // Verify deprecated method still works with h_ref
+        let config = TSTConfig {
+            mean_elevation: 0.0,
+            constituents: vec![TSTConstituent::new("M2".to_string(), 0.5, M2_OMEGA, 0.0)],
+            h_ref: 50.0,
+            dx: 800.0,
+            subtidal_weight: 1.0,
+            h_min: 1e-6,
+        };
+        let bc = TSTOBC2D::new(config);
+
+        // Deprecated: h = h_ref + η = 50 + 0.5 = 50.5
+        assert!((bc.tidal_depth(0.0) - 50.5).abs() < TOL);
     }
 
     #[test]

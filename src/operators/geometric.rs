@@ -15,6 +15,15 @@ use crate::types::ElementIndex;
 ///
 /// For each element, stores the Jacobian information needed for
 /// DG operations in physical space.
+///
+/// # Affine element assumption
+///
+/// This implementation assumes affine (parallelogram) elements where the
+/// Jacobian is constant per element. Each entry (`rx`, `ry`, `sx`, `sy`,
+/// `det_j`, `det_j_inv`) stores a single scalar per element, not per node.
+/// For curved/non-affine elements (e.g., isoparametric mappings), these
+/// would need to be stored per-node and operations like cell averaging
+/// would need per-node Jacobian weighting.
 #[derive(Clone)]
 pub struct GeometricFactors2D {
     /// dr/dx for each element (inverse Jacobian entry)

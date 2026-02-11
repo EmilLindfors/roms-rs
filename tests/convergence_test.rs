@@ -12,6 +12,11 @@ use dg_rs::{
     Advection2D, AdvectionFluxType, DGOperators2D, DGSolution2D, GeometricFactors2D, Mesh2D,
     PeriodicBC2D, compute_dt_advection_2d, compute_rhs_advection_2d, ssp_rk3_step_2d_timed,
 };
+// SWE 2D imports
+use dg_rs::{
+    Reflective2D, SWE2DRhsConfig, SWEFluxType2D, SWESolution2D, ShallowWater2D,
+    compute_dt_swe_2d, compute_rhs_swe_2d,
+};
 use std::f64::consts::PI;
 
 /// Run a single advection simulation and return the L2 error.
@@ -647,5 +652,162 @@ fn test_advection_2d_x_direction_only() {
         error < 0.1,
         "Pure x-direction advection should have small error, got {}",
         error
+    );
+}
+
+// ============================================================================
+// 2D Shallow Water Equations Convergence Tests
+// ============================================================================
+
+/// Run a 2D SWE simulation with linearized wave on periodic domain.
+///
+/// Uses a small-amplitude wave (ε=1e-4) so the linearized SWE solution
+/// is accurate to O(ε²)=O(1e-8), well below spatial discretization error.
+fn run_swe_2d_convergence(
+    nx: usize,
+    ny: usize,
+    order: usize,
+    t_final: f64,
+    cfl: f64,
+) -> f64 {
+    let g: f64 = 9.81;
+    let h0: f64 = 10.0; // Base depth
+    let eps: f64 = 1e-4; // Small perturbation amplitude
+    let l: f64 = 2.0; // Domain size
+
+    // Wave parameters
+    let kx = 2.0 * PI / l;
+    let ky = 2.0 * PI / l;
+    let k = (kx * kx + ky * ky).sqrt();
+    let omega = (g * h0).sqrt() * k; // Dispersion relation
+
+    // Setup
+    let mesh = Mesh2D::uniform_periodic(0.0, l, 0.0, l, nx, ny);
+    let ops = DGOperators2D::new(order);
+    let geom = GeometricFactors2D::compute(&mesh);
+    let equation = ShallowWater2D::new(g);
+    let bc = Reflective2D::new(); // Never called on periodic mesh
+    let config = SWE2DRhsConfig::new(&equation, &bc)
+        .with_flux_type(SWEFluxType2D::Roe)
+        .with_coriolis(false);
+
+    // Exact solution (linearized SWE)
+    let exact_h = |x: f64, y: f64, t: f64| h0 + eps * (kx * x + ky * y - omega * t).sin();
+    let exact_u = |x: f64, y: f64, t: f64| eps * g * kx / omega * (kx * x + ky * y - omega * t).sin();
+    let exact_v = |x: f64, y: f64, t: f64| eps * g * ky / omega * (kx * x + ky * y - omega * t).sin();
+
+    // Initialize
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    q.set_from_functions(
+        &mesh,
+        &ops,
+        |x, y| exact_h(x, y, 0.0),
+        |x, y| exact_u(x, y, 0.0),
+        |x, y| exact_v(x, y, 0.0),
+    );
+
+    // Compute initial time step
+    let dt_init = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
+    let n_steps = (t_final / dt_init).ceil() as usize;
+    let dt = t_final / n_steps as f64;
+
+    // SSP-RK3 time integration (manual, no limiters for smooth solution)
+    for _ in 0..n_steps {
+        let q0 = q.clone();
+
+        // Stage 1: q = q + dt * L(q)
+        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+        q.axpy(dt, &rhs);
+
+        // Stage 2: q = 3/4*q0 + 1/4*(q + dt*L(q))
+        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+        q.axpy(dt, &rhs);
+        q.scale(0.25);
+        q.axpy(0.75, &q0);
+
+        // Stage 3: q = 1/3*q0 + 2/3*(q + dt*L(q))
+        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+        q.axpy(dt, &rhs);
+        q.scale(2.0 / 3.0);
+        q.axpy(1.0 / 3.0, &q0);
+    }
+
+    // Compute L2 error in depth
+    q.l2_error_depth(&mesh, &ops, &geom, |x, y| exact_h(x, y, t_final))
+}
+
+#[test]
+fn test_convergence_swe_2d_p1() {
+    // P1 (order 1) → expect at least 2nd order convergence (threshold 1.5)
+    let order = 1;
+    let t_final = 0.05;
+    let cfl = 0.2;
+
+    let resolutions = [4, 8, 16];
+    let errors: Vec<f64> = resolutions
+        .iter()
+        .map(|&n| run_swe_2d_convergence(n, n, order, t_final, cfl))
+        .collect();
+
+    println!("\nSWE 2D P1 convergence:");
+    for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
+        if i > 0 {
+            let ratio = errors[i - 1] / err;
+            let observed_order = ratio.log2();
+            println!(
+                "  n={:3}: error={:.4e}, ratio={:.2}, order={:.2}",
+                n, err, ratio, observed_order
+            );
+        } else {
+            println!("  n={:3}: error={:.4e}", n, err);
+        }
+    }
+
+    // Check convergence rate for last refinement
+    let ratio = errors[errors.len() - 2] / errors[errors.len() - 1];
+    let observed_order = ratio.log2();
+
+    assert!(
+        observed_order > 1.5,
+        "SWE 2D P1 should converge at order > 1.5, observed {:.2}",
+        observed_order
+    );
+}
+
+#[test]
+fn test_convergence_swe_2d_p2() {
+    // P2 (order 2) → expect at least 3rd order convergence (threshold 2.5)
+    let order = 2;
+    let t_final = 0.02;
+    let cfl = 0.1;
+
+    let resolutions = [4, 8, 16];
+    let errors: Vec<f64> = resolutions
+        .iter()
+        .map(|&n| run_swe_2d_convergence(n, n, order, t_final, cfl))
+        .collect();
+
+    println!("\nSWE 2D P2 convergence:");
+    for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
+        if i > 0 {
+            let ratio = errors[i - 1] / err;
+            let observed_order = ratio.log2();
+            println!(
+                "  n={:3}: error={:.4e}, ratio={:.2}, order={:.2}",
+                n, err, ratio, observed_order
+            );
+        } else {
+            println!("  n={:3}: error={:.4e}", n, err);
+        }
+    }
+
+    // Check convergence rate for last refinement
+    let ratio = errors[errors.len() - 2] / errors[errors.len() - 1];
+    let observed_order = ratio.log2();
+
+    assert!(
+        observed_order > 2.5,
+        "SWE 2D P2 should converge at order > 2.5, observed {:.2}",
+        observed_order
     );
 }

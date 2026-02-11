@@ -39,6 +39,8 @@ pub struct BCContext2D {
     pub h_min: f64,
     /// Optional boundary tag for multi-BC dispatch
     pub boundary_tag: Option<BoundaryTag>,
+    /// Optional time step for boundary conditions that need it (e.g., Chapman radiation)
+    pub dt: Option<f64>,
 }
 
 impl BCContext2D {
@@ -63,6 +65,7 @@ impl BCContext2D {
             g,
             h_min,
             boundary_tag: None,
+            dt: None,
         }
     }
 
@@ -86,6 +89,7 @@ impl BCContext2D {
             g,
             h_min,
             boundary_tag: Some(boundary_tag),
+            dt: None,
         }
     }
 
@@ -631,7 +635,13 @@ pub struct HarmonicFlather2D {
     pub mean_elevation: f64,
     /// Tidal constituents
     pub constituents: Vec<TidalConstituent>,
-    /// Reference depth (below mean sea level)
+    /// Reference depth (below mean sea level).
+    ///
+    /// **Deprecated**: This field is no longer used in depth computation.
+    /// Depth is now computed as `h = η_tidal - bathymetry`, which correctly
+    /// derives depth from the surface elevation and bed elevation without
+    /// double-counting. The `h_ref` field is retained for API compatibility
+    /// but ignored in `ghost_state`.
     pub h_ref: f64,
     /// External velocity (typically zero)
     pub u_external: (f64, f64),
@@ -752,7 +762,7 @@ impl SWEBoundaryCondition2D for HarmonicFlather2D {
 
         // Compute tidal elevation
         let eta_tidal = self.elevation(t);
-        let h_tidal = (eta_tidal - ctx.bathymetry + self.h_ref).max(self.h_min);
+        let h_tidal = (eta_tidal - ctx.bathymetry).max(self.h_min);
 
         // Validate bathymetry configuration (warns once if misconfigured)
         warn_once_if_misconfigured(
@@ -1170,5 +1180,88 @@ mod tests {
 
         // Celerity
         assert!((ctx.interior_celerity() - (G * 2.0_f64).sqrt()).abs() < TOL);
+    }
+
+    // ====================================================================
+    // Radiation2D tests
+    // ====================================================================
+
+    #[test]
+    fn test_radiation_still_water() {
+        let bc = Radiation2D::new(2.0);
+        let ctx = make_context(2.0, 0.0, 0.0, (1.0, 0.0));
+        let ghost = bc.ghost_state(&ctx);
+
+        // un=0, c=sqrt(G*2), un+c > 0 → outgoing → ghost = interior
+        assert!((ghost.h - 2.0).abs() < TOL);
+        assert!(ghost.hu.abs() < TOL);
+        assert!(ghost.hv.abs() < TOL);
+    }
+
+    #[test]
+    fn test_radiation_outgoing_wave() {
+        let bc = Radiation2D::new(2.0);
+        // h=2, u=5, v=0 → hu=10
+        let ctx = make_context(2.0, 10.0, 0.0, (1.0, 0.0));
+        let ghost = bc.ghost_state(&ctx);
+
+        // un=5, c=sqrt(20)≈4.47, un+c>0 → outgoing → ghost = interior
+        assert!((ghost.h - 2.0).abs() < TOL);
+        assert!((ghost.hu - 10.0).abs() < TOL);
+        assert!(ghost.hv.abs() < TOL);
+    }
+
+    #[test]
+    fn test_radiation_incoming_wave() {
+        let bc = Radiation2D::new(2.0);
+        // h=2, u=-10, v=0 → hu=-20
+        let ctx = make_context(2.0, -20.0, 0.0, (1.0, 0.0));
+        let ghost = bc.ghost_state(&ctx);
+
+        // un=-10, c=sqrt(20)≈4.47, un+c<0 → incoming
+        // h_ext=h_int=2, so Sommerfeld correction = 0
+        // ghost depth = h_external = 2, velocity from Sommerfeld
+        assert!((ghost.h - 2.0).abs() < TOL);
+        // un_ghost = un_ext - c_ext*(h_ext - h_int)/h_ext = 0 - 0 = 0
+        assert!(ghost.hu.abs() < TOL);
+        assert!(ghost.hv.abs() < TOL);
+    }
+
+    #[test]
+    fn test_radiation_velocity_decomposition() {
+        let bc = Radiation2D::new(2.0);
+        let sqrt2_inv = 1.0 / 2.0_f64.sqrt();
+        // h=2, u=-10, v=3 → hu=-20, hv=6
+        let ctx = make_context(2.0, -20.0, 6.0, (sqrt2_inv, sqrt2_inv));
+        let ghost = bc.ghost_state(&ctx);
+
+        // un = (-10+3)/√2 = -7/√2 ≈ -4.95, c = √20 ≈ 4.47
+        // un+c < 0 → incoming branch
+        // Tangential from interior: ut = 10/√2 + 3/√2 = 13/√2
+        let (nx, ny) = (sqrt2_inv, sqrt2_inv);
+        let u_ghost = ghost.hu / ghost.h;
+        let v_ghost = ghost.hv / ghost.h;
+        let ut_ghost = -u_ghost * ny + v_ghost * nx;
+        let ut_int = 10.0 * sqrt2_inv + 3.0 * sqrt2_inv; // -(-10)*ny + 3*nx
+
+        assert!(
+            (ut_ghost - ut_int).abs() < TOL,
+            "Tangential velocity should be preserved: got {}, expected {}",
+            ut_ghost,
+            ut_int
+        );
+    }
+
+    #[test]
+    fn test_radiation_deep_water() {
+        let bc = Radiation2D::new(100.0);
+        // h=100, u=1, v=0 → hu=100
+        let ctx = make_context(100.0, 100.0, 0.0, (1.0, 0.0));
+        let ghost = bc.ghost_state(&ctx);
+
+        // un=1, c=sqrt(G*100)≈31.6, un+c>0 → outgoing → ghost = interior
+        assert!((ghost.h - 100.0).abs() < TOL);
+        assert!((ghost.hu - 100.0).abs() < TOL);
+        assert!(ghost.hv.abs() < TOL);
     }
 }

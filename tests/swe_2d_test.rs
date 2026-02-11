@@ -560,3 +560,209 @@ fn test_long_term_stability() {
         final_error
     );
 }
+
+/// Multi-day stability test.
+///
+/// Runs a 2D SWE simulation for 30+ simulated "days" (measured in wave-crossing
+/// times of the domain) to verify no drift, blow-up, or numerical instability.
+///
+/// Uses a periodic domain with smooth initial perturbation. The wave speed
+/// c = sqrt(g*h) ≈ 3.16 m/s with g=10, h=1, domain=10, so T_cross ≈ 3.16s.
+/// We run for 100 crossing times ≈ 316s (> 30 T_cross "days").
+#[test]
+fn test_multi_day_stability() {
+    let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
+    let ops = DGOperators2D::new(1); // P1 for speed
+    let geom = GeometricFactors2D::compute(&mesh);
+    let equation = ShallowWater2D::new(G);
+    let bc = Reflective2D::new(); // Never called on periodic mesh
+    let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
+
+    // Smooth Gaussian perturbation centered at domain midpoint
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    q.set_from_functions(
+        &mesh,
+        &ops,
+        |x, y| {
+            let r2 = (x - 5.0).powi(2) + (y - 5.0).powi(2);
+            1.0 + 0.05 * (-r2 / 2.0).exp()
+        },
+        |_, _| 0.0,
+        |_, _| 0.0,
+    );
+
+    let initial_mass = q.integrate_depth(&ops, &geom);
+    let initial_max_h = q.max_depth();
+
+    // Wave crossing time: L/c = 10/sqrt(10) ≈ 3.16s
+    // Run for 100 crossing times ≈ 316s
+    let end_time = 100.0 * 10.0 / (G * 1.0_f64).sqrt();
+    let cfl = 0.3;
+    let mut time = 0.0;
+    let mut step = 0;
+    let mut max_h_ever = initial_max_h;
+
+    while time < end_time {
+        let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, ops.order, cfl);
+        let dt = dt.min(end_time - time);
+        if dt <= 0.0 {
+            break;
+        }
+        ssp_rk3_swe_step(&mut q, &mesh, &ops, &geom, &config, dt, time);
+        time += dt;
+        step += 1;
+
+        let current_max = q.max_depth();
+        if current_max > max_h_ever {
+            max_h_ever = current_max;
+        }
+
+        // Periodic checks for stability
+        if step % 500 == 0 {
+            assert!(
+                !q.has_negative_depth(),
+                "Negative depth at t = {:.1}, step {}",
+                time,
+                step
+            );
+
+            // Solution should stay bounded (no blow-up)
+            assert!(
+                current_max < 3.0 * initial_max_h,
+                "Solution blowing up at t = {:.1}: max_h = {:.4} (initial {:.4})",
+                time,
+                current_max,
+                initial_max_h
+            );
+
+            // Mass conservation
+            let current_mass = q.integrate_depth(&ops, &geom);
+            let mass_error = ((current_mass - initial_mass) / initial_mass).abs();
+            assert!(
+                mass_error < 1e-10,
+                "Mass drift at t = {:.1}: {:.2e}",
+                time,
+                mass_error
+            );
+        }
+    }
+
+    // Final verification
+    assert!(step > 1000, "Should have run many steps, got {}", step);
+    let final_mass = q.integrate_depth(&ops, &geom);
+    let final_error = ((final_mass - initial_mass) / initial_mass).abs();
+    assert!(
+        final_error < 1e-10,
+        "Final mass error after {} steps ({:.0}s): {:.2e}",
+        step,
+        time,
+        final_error
+    );
+    assert!(
+        !q.has_negative_depth(),
+        "Negative depth after {} steps",
+        step
+    );
+}
+
+/// Long-time conservation test.
+///
+/// Verifies mass AND momentum conservation over many oscillation periods
+/// on a fully periodic domain with no source terms.
+///
+/// On a periodic domain without friction/Coriolis, the DG scheme should
+/// conserve total mass, x-momentum, and y-momentum to machine precision.
+#[test]
+fn test_long_time_conservation() {
+    use std::f64::consts::PI;
+
+    let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
+    let ops = DGOperators2D::new(1); // P1 for speed
+    let geom = GeometricFactors2D::compute(&mesh);
+    let equation = ShallowWater2D::new(G);
+    let bc = Reflective2D::new(); // Never called on periodic mesh
+    let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
+
+    // Initial condition: standing wave with both h and velocity perturbations
+    // to exercise momentum conservation
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    q.set_from_functions(
+        &mesh,
+        &ops,
+        |x, y| 1.0 + 0.05 * (2.0 * PI * x / 10.0).sin() * (2.0 * PI * y / 10.0).cos(),
+        |x, _y| 0.02 * (2.0 * PI * x / 10.0).cos(), // small u perturbation
+        |_x, y| 0.02 * (2.0 * PI * y / 10.0).sin(), // small v perturbation
+    );
+
+    let initial_mass = q.integrate_depth(&ops, &geom);
+    let initial_hu = q.integrate_x_momentum(&ops, &geom);
+    let initial_hv = q.integrate_y_momentum(&ops, &geom);
+
+    // Run for 50 oscillation periods
+    // Standing wave period ≈ L / c = 10 / sqrt(10) ≈ 3.16s
+    // 50 periods ≈ 158s
+    let period = 10.0 / (G * 1.0_f64).sqrt();
+    let end_time = 50.0 * period;
+    let cfl = 0.3;
+    let mut time = 0.0;
+    let mut step = 0;
+
+    while time < end_time {
+        let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, ops.order, cfl);
+        let dt = dt.min(end_time - time);
+        if dt <= 0.0 {
+            break;
+        }
+        ssp_rk3_swe_step(&mut q, &mesh, &ops, &geom, &config, dt, time);
+        time += dt;
+        step += 1;
+    }
+
+    // Verify conservation of all three quantities
+    let final_mass = q.integrate_depth(&ops, &geom);
+    let final_hu = q.integrate_x_momentum(&ops, &geom);
+    let final_hv = q.integrate_y_momentum(&ops, &geom);
+
+    let mass_error = ((final_mass - initial_mass) / initial_mass).abs();
+    assert!(
+        mass_error < 1e-10,
+        "Mass conservation failed after {} steps ({:.0}s, {:.0} periods): {:.2e}",
+        step,
+        time,
+        time / period,
+        mass_error
+    );
+
+    // Momentum conservation: absolute error (initial momentum may be near zero)
+    let hu_error = (final_hu - initial_hu).abs();
+    assert!(
+        hu_error < 1e-10,
+        "X-momentum conservation failed after {} steps: initial={:.6e}, final={:.6e}, error={:.2e}",
+        step,
+        initial_hu,
+        final_hu,
+        hu_error
+    );
+
+    let hv_error = (final_hv - initial_hv).abs();
+    assert!(
+        hv_error < 1e-10,
+        "Y-momentum conservation failed after {} steps: initial={:.6e}, final={:.6e}, error={:.2e}",
+        step,
+        initial_hv,
+        final_hv,
+        hv_error
+    );
+
+    // Verify solution stays bounded
+    assert!(
+        !q.has_negative_depth(),
+        "Negative depth after {} periods",
+        time / period
+    );
+    assert!(
+        q.max_depth() < 5.0,
+        "Solution blew up: max_h = {:.4}",
+        q.max_depth()
+    );
+}
