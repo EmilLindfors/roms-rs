@@ -48,6 +48,18 @@ impl DGSolution2D {
         }
     }
 
+    /// Get the value at element k, node i.
+    #[inline]
+    pub fn get(&self, k: usize, i: usize) -> f64 {
+        self.data[k * self.n_nodes + i]
+    }
+
+    /// Set the value at element k, node i.
+    #[inline]
+    pub fn set(&mut self, k: usize, i: usize, value: f64) {
+        self.data[k * self.n_nodes + i] = value;
+    }
+
     /// Get the nodal values for element k as a slice.
     #[inline]
     pub fn element(&self, k: ElementIndex) -> &[f64] {

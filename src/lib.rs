@@ -128,6 +128,9 @@ pub use solver::{
     total_energy_2d,
     total_mass_2d,
     total_momentum_2d,
+    // 3D RHS
+    compute_rhs_3d,
+    Rhs3DConfig,
 };
 #[cfg(feature = "parallel")]
 pub use solver::compute_rhs_tracer_2d_parallel;

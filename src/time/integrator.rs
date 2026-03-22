@@ -138,7 +138,7 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
     /// * `rhs` - Function computing the RHS: f(state, time) -> time_derivative
     fn step<F>(&self, state: &mut S, dt: f64, t: f64, rhs: F)
     where
-        F: Fn(&S, f64) -> S;
+        F: FnMut(&S, f64) -> S;
 }
 
 // =============================================================================
@@ -184,9 +184,9 @@ impl IntegratorInfo for SSPRK3 {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
-    fn step<F>(&self, state: &mut S, dt: f64, t: f64, rhs: F)
+    fn step<F>(&self, state: &mut S, dt: f64, t: f64, mut rhs: F)
     where
-        F: Fn(&S, f64) -> S,
+        F: FnMut(&S, f64) -> S,
     {
         // Stage 1: u1 = u + dt * L(u, t)
         let l_u = rhs(state, t);
@@ -247,9 +247,9 @@ impl IntegratorInfo for ForwardEuler {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for ForwardEuler {
-    fn step<F>(&self, state: &mut S, dt: f64, t: f64, rhs: F)
+    fn step<F>(&self, state: &mut S, dt: f64, t: f64, mut rhs: F)
     where
-        F: Fn(&S, f64) -> S,
+        F: FnMut(&S, f64) -> S,
     {
         let l_u = rhs(state, t);
         state.axpy(dt, &l_u);
@@ -310,7 +310,7 @@ impl IntegratorInfo for StandardIntegrator {
 impl<S: Integrable> TimeIntegrator<S> for StandardIntegrator {
     fn step<F>(&self, state: &mut S, dt: f64, t: f64, rhs: F)
     where
-        F: Fn(&S, f64) -> S,
+        F: FnMut(&S, f64) -> S,
     {
         match self {
             StandardIntegrator::SSPRK3 => SSPRK3.step(state, dt, t, rhs),
@@ -342,7 +342,10 @@ pub fn create_integrator_info(integrator: StandardIntegrator) -> BoxedIntegrator
 // Integrable Implementations for Existing Types
 // =============================================================================
 
-use crate::solver::{DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, TracerSolution2D};
+use crate::solver::{
+    DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, TracerSolution2D,
+    state::Solution3D,
+};
 
 impl Integrable for DGSolution1D {
     fn scale(&mut self, c: f64) {
@@ -391,6 +394,39 @@ impl Integrable for TracerSolution2D {
 
     fn axpy(&mut self, c: f64, other: &Self) {
         self.axpy(c, other);
+    }
+}
+
+impl Integrable for Solution3D {
+    fn scale(&mut self, c: f64) {
+        // Scale 2D barotropic state
+        self.eta.scale(c);
+        self.ubar.scale(c);
+        self.vbar.scale(c);
+
+        // Scale 3D baroclinic state
+        for x in &mut self.u { *x *= c; }
+        for x in &mut self.v { *x *= c; }
+        for x in &mut self.w { *x *= c; }
+        for x in &mut self.temp { *x *= c; }
+        for x in &mut self.salt { *x *= c; }
+        for x in &mut self.rho { *x *= c; }
+    }
+
+    fn axpy(&mut self, c: f64, other: &Self) {
+        // AXPY 2D barotropic state
+        self.eta.axpy(c, &other.eta);
+        self.ubar.axpy(c, &other.ubar);
+        self.vbar.axpy(c, &other.vbar);
+
+        // AXPY 3D baroclinic state
+        // Using iterators for now. Optimized SIMD/BLAS kernels should replace this later.
+        for (x, y) in self.u.iter_mut().zip(other.u.iter()) { *x += c * y; }
+        for (x, y) in self.v.iter_mut().zip(other.v.iter()) { *x += c * y; }
+        for (x, y) in self.w.iter_mut().zip(other.w.iter()) { *x += c * y; }
+        for (x, y) in self.temp.iter_mut().zip(other.temp.iter()) { *x += c * y; }
+        for (x, y) in self.salt.iter_mut().zip(other.salt.iter()) { *x += c * y; }
+        for (x, y) in self.rho.iter_mut().zip(other.rho.iter()) { *x += c * y; }
     }
 }
 

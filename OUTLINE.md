@@ -291,6 +291,9 @@ Phase 3: Norwegian coast
 
 Phase 4: Performance
     └─> Profile → cudarc GPU only if needed
+
+Phase 5: 3D Coastal Ocean Model (Current)
+    └─> Mode splitting, Sigma coordinates, Vertical mixing, 3D RHS
 ```
 
 Add abstraction when you have 2+ concrete implementations that share patterns, not before.

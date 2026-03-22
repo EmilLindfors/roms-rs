@@ -22,5 +22,7 @@
 //! ```
 
 mod runner;
+mod simulation_3d;
 
 pub use runner::{Simulation, SimulationConfig, SimulationResult};
+pub use simulation_3d::Simulation3D;

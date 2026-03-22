@@ -4,6 +4,7 @@
 //! - [`apply_wet_dry_correction`]: Wet/dry corrections for shallow water
 
 mod wetting_drying;
+pub mod tridiagonal;
 
 pub use wetting_drying::{WetDryConfig, apply_wet_dry_correction, apply_wet_dry_correction_all};
 

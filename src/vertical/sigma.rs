@@ -319,6 +319,50 @@ impl SigmaGrid {
         (1.0 + sigma) * d_eta_dy + sigma * d_h_dy
     }
 
+    /// Compute ∂z/∂x at constant σ for a batch of columns (e.g. all nodes in an element).
+    ///
+    /// Useful for SIMD-accelerated pressure gradient computation.
+    #[inline]
+    pub fn dz_dx_at_sigma_batch(
+        &self,
+        level: usize,
+        d_eta_dx: &[f64],
+        d_h_dx: &[f64],
+        dz_dx_out: &mut [f64],
+    ) {
+        debug_assert_eq!(d_eta_dx.len(), d_h_dx.len());
+        debug_assert_eq!(d_eta_dx.len(), dz_dx_out.len());
+        
+        let sigma = self.sigma_rho[level];
+        let c1 = 1.0 + sigma;
+        let c2 = sigma;
+
+        for i in 0..d_eta_dx.len() {
+            dz_dx_out[i] = c1 * d_eta_dx[i] + c2 * d_h_dx[i];
+        }
+    }
+
+    /// Compute ∂z/∂y at constant σ for a batch of columns.
+    #[inline]
+    pub fn dz_dy_at_sigma_batch(
+        &self,
+        level: usize,
+        d_eta_dy: &[f64],
+        d_h_dy: &[f64],
+        dz_dy_out: &mut [f64],
+    ) {
+        debug_assert_eq!(d_eta_dy.len(), d_h_dy.len());
+        debug_assert_eq!(d_eta_dy.len(), dz_dy_out.len());
+        
+        let sigma = self.sigma_rho[level];
+        let c1 = 1.0 + sigma;
+        let c2 = sigma;
+
+        for i in 0..d_eta_dy.len() {
+            dz_dy_out[i] = c1 * d_eta_dy[i] + c2 * d_h_dy[i];
+        }
+    }
+
     // =========================================================================
     // Vectorized Operations (write to pre-allocated buffers)
     // =========================================================================
@@ -602,6 +646,34 @@ impl SigmaGrid {
     pub fn refinement_ratio(&self) -> f64 {
         self.max_d_sigma() / self.min_d_sigma()
     }
+
+    /// Compute the depth-weighted average of a vertical column.
+    ///
+    /// Integral is computed as sum(q_k * d_sigma_k).
+    /// Since sum(d_sigma) = 1, this is the average.
+    ///
+    /// # Arguments
+    /// * `column` - Vertical column of values at rho-points
+    #[inline]
+    pub fn depth_average(&self, column: &[f64]) -> f64 {
+        debug_assert_eq!(column.len(), self.n_levels);
+        let mut sum = 0.0;
+        // Auto-vectorizable loop
+        for k in 0..self.n_levels {
+            sum += column[k] * self.d_sigma[k];
+        }
+        sum
+    }
+
+    /// Compute the depth-weighted average of a vertical column (SIMD optimized).
+    /// 
+    /// # Arguments
+    /// * `column` - Vertical column of values
+    /// * `out` - Mutable reference to store result (useful for accumulation)
+    #[inline]
+    pub fn depth_average_accumulate(&self, column: &[f64], out: &mut f64) {
+        *out += self.depth_average(column);
+    }
 }
 
 // =============================================================================
@@ -637,6 +709,25 @@ mod tests {
     use crate::vertical::stretching::{SongHaidvogelStretching, UniformStretching};
 
     const TOL: f64 = 1e-10;
+
+    #[test]
+    fn test_depth_average() {
+        let n_levels = 10;
+        let grid = SigmaGrid::uniform(n_levels);
+        
+        // Constant function: average should be the constant
+        let col_const = vec![5.0; n_levels];
+        let avg = grid.depth_average(&col_const);
+        assert!((avg - 5.0).abs() < 1e-14);
+        
+        // Linear function: f(s) = s + 0.5 (goes from -0.5 to 0.5)
+        // Average should be 0.0
+        let col_lin: Vec<f64> = grid.sigma_rho().iter().map(|s| s + 0.5).collect();
+        let avg_lin = grid.depth_average(&col_lin);
+        // Riemann sum error is O(h^2) for midpoint, so exact for linear?
+        // sigma_rho are midpoints. Yes.
+        assert!(avg_lin.abs() < 1e-14);
+    }
 
     #[test]
     fn test_sigma_grid_creation() {

@@ -10,6 +10,7 @@ mod scalar_1d;
 mod swe_1d;
 mod swe_2d;
 mod tracer_2d;
+pub mod baroclinic;
 
 // 1D scalar
 pub use scalar_1d::{BoundaryCondition, compute_rhs};
@@ -38,3 +39,15 @@ pub use tracer_2d::{
 };
 #[cfg(feature = "parallel")]
 pub use tracer_2d::compute_rhs_tracer_2d_parallel;
+
+// 3D Baroclinic
+pub use baroclinic::compute_pressure_gradient;
+
+pub mod coriolis_3d;
+pub use coriolis_3d::apply_coriolis_3d;
+
+pub mod advection_3d;
+pub use advection_3d::{apply_horizontal_advection_3d, apply_vertical_advection_3d};
+
+pub mod rhs_3d;
+pub use rhs_3d::{compute_rhs_3d, Rhs3DConfig};

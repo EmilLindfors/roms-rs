@@ -72,6 +72,9 @@ pub use rhs::{
     UpwindTracerBC,
     compute_dt_tracer_2d,
     compute_rhs_tracer_2d,
+    // 3D RHS
+    compute_rhs_3d,
+    Rhs3DConfig,
 };
 
 // Re-export limiter types

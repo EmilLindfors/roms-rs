@@ -17,6 +17,7 @@ mod ssp_rk3;
 mod ssp_rk3_2d;
 mod ssp_rk3_swe;
 mod ssp_rk3_swe_2d;
+pub mod mode_split;
 
 #[cfg(feature = "burn")]
 mod burn_ssp_rk3;
@@ -36,6 +37,7 @@ pub use ssp_rk3_swe::{
 pub use ssp_rk3_swe_2d::{
     SWE2DTimeConfig, SWELimiterType, run_swe_2d_simulation, ssp_rk3_swe_2d_step_limited,
 };
+pub use mode_split::{ModeSplitIntegrator, SplitMethod};
 
 // Integrator trait exports
 pub use integrator::{
