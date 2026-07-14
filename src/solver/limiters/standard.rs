@@ -209,8 +209,7 @@ impl Limiter2D for StandardLimiter2D {
     fn preserves_positivity(&self) -> bool {
         matches!(
             self,
-            StandardLimiter2D::Positivity(_)
-                | StandardLimiter2D::KuzminWithPositivity { .. }
+            StandardLimiter2D::Positivity(_) | StandardLimiter2D::KuzminWithPositivity { .. }
         )
     }
 }

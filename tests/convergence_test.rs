@@ -14,8 +14,8 @@ use dg_rs::{
 };
 // SWE 2D imports
 use dg_rs::{
-    Reflective2D, SWE2DRhsConfig, SWEFluxType2D, SWESolution2D, ShallowWater2D,
-    compute_dt_swe_2d, compute_rhs_swe_2d,
+    Reflective2D, SWE2DRhsConfig, SWEFluxType2D, SWESolution2D, ShallowWater2D, compute_dt_swe_2d,
+    compute_rhs_swe_2d,
 };
 use std::f64::consts::PI;
 
@@ -663,13 +663,7 @@ fn test_advection_2d_x_direction_only() {
 ///
 /// Uses a small-amplitude wave (ε=1e-4) so the linearized SWE solution
 /// is accurate to O(ε²)=O(1e-8), well below spatial discretization error.
-fn run_swe_2d_convergence(
-    nx: usize,
-    ny: usize,
-    order: usize,
-    t_final: f64,
-    cfl: f64,
-) -> f64 {
+fn run_swe_2d_convergence(nx: usize, ny: usize, order: usize, t_final: f64, cfl: f64) -> f64 {
     let g: f64 = 9.81;
     let h0: f64 = 10.0; // Base depth
     let eps: f64 = 1e-4; // Small perturbation amplitude
@@ -693,8 +687,10 @@ fn run_swe_2d_convergence(
 
     // Exact solution (linearized SWE)
     let exact_h = |x: f64, y: f64, t: f64| h0 + eps * (kx * x + ky * y - omega * t).sin();
-    let exact_u = |x: f64, y: f64, t: f64| eps * g * kx / omega * (kx * x + ky * y - omega * t).sin();
-    let exact_v = |x: f64, y: f64, t: f64| eps * g * ky / omega * (kx * x + ky * y - omega * t).sin();
+    let exact_u =
+        |x: f64, y: f64, t: f64| eps * g * kx / omega * (kx * x + ky * y - omega * t).sin();
+    let exact_v =
+        |x: f64, y: f64, t: f64| eps * g * ky / omega * (kx * x + ky * y - omega * t).sin();
 
     // Initialize
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);

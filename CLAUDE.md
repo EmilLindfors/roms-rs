@@ -37,22 +37,40 @@ This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean 
 
 ## Architecture Overview
 
+See `OUTLINE.md` for the full annotated module tree and layer-by-layer status,
+and `REVIEW.md` for the current health assessment and prioritized fix plan.
+
 ```
 src/
-├── polynomial/     # Legendre polynomials, GLL nodes/weights
+├── types/          # Newtypes (indices, Depth, Sigma, bounds)
+├── polynomial/     # Legendre polynomials, GLL nodes/weights (1D + 2D)
 ├── basis/          # Vandermonde matrices for nodal-modal transforms
-├── operators/      # Dr, Mass, LIFT matrices (reference element)
-├── mesh/           # Physical mesh, connectivity, Jacobians
-├── flux/           # Numerical fluxes (upwind, Lax-Friedrichs)
-├── solver/         # Solution storage, RHS computation
-└── time/           # SSP-RK3, CFL computation
+├── operators/      # Dr/Ds, Mass, LIFT, geometric factors (reference element)
+├── mesh/           # Mesh1D/Mesh2D, connectivity, bathymetry, land mask, Gmsh
+├── flux/           # Numerical fluxes (upwind, Lax-Friedrichs, Roe, HLL)
+├── equations/      # ConservationLaw trait, advection, SWE 1D/2D, EOS
+├── source/         # Source terms (Coriolis, friction, wind, tidal, sponge,
+│                   # well-balanced bathymetry)
+├── boundary/       # OBCs: Chapman/Flather, TST, radiation, tidal, nesting
+├── solver/         # Solution state (SoA), RHS kernels, limiters,
+│                   # wetting/drying, SIMD, burn GPU prototype
+├── time/           # Integrable/TimeIntegrator traits, SSP-RK3, mode splitting
+├── vertical/       # Sigma grid, stretching functions (3D)
+├── physics/        # PhysicsModule trait, SWEPhysics2D, Hydrostatic3D,
+│                   # vertical mixing/diffusion/velocity
+├── simulation/     # Simulation / Simulation3D runners
+├── io/             # NetCDF, VTK, GeoTIFF, coastline, projections, obs readers
+└── analysis/       # Harmonic analysis, skill metrics, tide gauge, ADCP
 ```
 
 ### Key Types
-- `DGOperators1D`: All reference element operators bundled together
-- `Mesh1D`: Physical mesh with neighbor connectivity
-- `DGSolution1D`: Nodal values stored contiguously `[n_elements × n_nodes]`
-- `BoundaryCondition`: Dirichlet values at inflow boundaries
+- `DGOperators1D` / `DGOperators2D`: reference element operators bundled together
+- `Mesh1D` / `Mesh2D`: physical mesh with neighbor/face connectivity
+- `DGSolution2D` / `SWESolution2D`: SoA nodal storage `[n_elements × n_nodes]` per variable
+- `Solution3D`: 3D state, `[element × node × level]` columns over a `SigmaGrid`
+- `Integrable` + `SSPRK3`: the generic time-integration path (prefer over the
+  legacy per-type `ssp_rk3_*` free functions, which are slated for deletion)
+- `MultiBoundaryCondition2D`: per-tag dispatch of open/closed boundary conditions
 
 ## Common Tasks
 
@@ -68,12 +86,13 @@ src/
 3. Verify order of accuracy with ODE test (exponential growth)
 4. Document stability region if relevant
 
-### Extending to 2D
-When implementing 2D elements:
-- Use tensor-product GLL nodes for quadrilaterals
-- Use Fekete or Warp-Blend nodes for triangles
-- Face-based connectivity for inter-element coupling
-- Surface integrals become edge integrals
+### Extending the 3D layer
+The 3D solver is ROMS-style: 2D DG horizontal × finite-difference vertical on
+sigma coordinates with mode splitting (see `3D_TODO.md`). When working there:
+- Depth convention is `h = eta - B` with `B` = bed elevation (negative under water) — everywhere
+- New vertical/3D discretizations need convergence + conservation tests before merge (the layer is currently under-tested; see `REVIEW.md` §5.2, §6)
+- Layer-thickness (Hz) weighted fluxes for anything advected; divide back to concentration/velocity after
+- Known open numerics: balanced baroclinic PGF, forward-backward barotropic subcycling (`REVIEW.md` §2.2, §1.5)
 
 ## Norwegian Coast Specifics
 
@@ -105,6 +124,27 @@ Before any PR:
 - [ ] `cargo clippy` has no warnings
 - [ ] Convergence rates match theory (check ACCURACY.md)
 - [ ] No new allocations in hot paths (check with profiler if unsure)
+- [ ] `CHANGELOG.md` is updated for notable numerical, API, dependency, or documentation changes
+
+## Windows Native Dependencies
+
+The default feature set includes NetCDF I/O, so Windows builds need native HDF5 and netCDF-C. Prefer the Miniforge/conda-forge workflow documented in `docs/windows-native-deps.md`.
+
+Important details:
+- Use `hdf5=1.14.4` and `libnetcdf<4.10`; current HDF5 `2.x` packages are rejected by `hdf5-metno-sys 0.10.1`.
+- Persist `HDF5_DIR` and `NETCDF_DIR` to the conda environment root, not directly to `Library`.
+- Activate `roms-rs` before running default-feature Cargo commands.
+
+```powershell
+conda activate roms-rs
+cargo check
+```
+
+For checks that do not need NetCDF I/O:
+
+```powershell
+cargo check --no-default-features --features parallel,simd
+```
 
 ## References
 
@@ -121,6 +161,10 @@ cargo test
 
 # Run with parallel feature
 cargo test --features parallel
+
+# Windows default-feature build with native HDF5/netCDF-C
+conda activate roms-rs
+cargo check
 
 # Run convergence tests with output
 cargo test --test convergence_test -- --nocapture

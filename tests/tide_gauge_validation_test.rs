@@ -3,8 +3,8 @@
 //! Tests the full workflow from synthetic model output to validation metrics.
 
 use dg_rs::analysis::{
-    HarmonicAnalysis, PrecomputedExtractor, StationValidationResult, TideGaugeStation,
-    TimeSeries, ValidationSummary, norwegian_stations, validate_stations,
+    HarmonicAnalysis, PrecomputedExtractor, StationValidationResult, TideGaugeStation, TimeSeries,
+    ValidationSummary, norwegian_stations, validate_stations,
 };
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -60,7 +60,10 @@ fn test_perfect_model_validation() {
     let result = StationValidationResult::compute(&station, &model, &obs);
 
     assert!(result.metrics.rmse < 1e-10, "RMSE should be ~0");
-    assert!(result.metrics.correlation > 0.999, "Correlation should be ~1");
+    assert!(
+        result.metrics.correlation > 0.999,
+        "Correlation should be ~1"
+    );
     assert!(result.metrics.skill_score > 0.999, "Skill should be ~1");
     assert!(result.passes_strict_validation());
 }
@@ -80,9 +83,18 @@ fn test_model_with_bias() {
 
     let result = StationValidationResult::compute(&station, &model, &obs);
 
-    assert!((result.metrics.bias - 0.1).abs() < 1e-10, "Bias should be 0.1 m");
-    assert!(result.metrics.correlation > 0.999, "Correlation should still be high");
-    assert!(!result.passes_strict_validation(), "Should fail strict due to bias");
+    assert!(
+        (result.metrics.bias - 0.1).abs() < 1e-10,
+        "Bias should be 0.1 m"
+    );
+    assert!(
+        result.metrics.correlation > 0.999,
+        "Correlation should still be high"
+    );
+    assert!(
+        !result.passes_strict_validation(),
+        "Should fail strict due to bias"
+    );
 }
 
 #[test]
@@ -101,8 +113,14 @@ fn test_model_with_amplitude_error() {
 
     let result = StationValidationResult::compute(&station, &model, &obs);
 
-    assert!(result.metrics.correlation > 0.999, "Correlation should be high");
-    assert!(result.metrics.rmse > 0.05, "RMSE should reflect amplitude error");
+    assert!(
+        result.metrics.correlation > 0.999,
+        "Correlation should be high"
+    );
+    assert!(
+        result.metrics.rmse > 0.05,
+        "RMSE should reflect amplitude error"
+    );
 }
 
 #[test]
@@ -114,7 +132,8 @@ fn test_model_with_phase_error() {
     // Model has 30-minute (π/12 rad) phase error
     let phase_error = PI / 12.0;
     let obs_values = synthetic_tidal_signal(&times, 0.5, 0.0, 0.15, 0.3, 0.0);
-    let model_values = synthetic_tidal_signal(&times, 0.5, phase_error, 0.15, 0.3 + phase_error, 0.0);
+    let model_values =
+        synthetic_tidal_signal(&times, 0.5, phase_error, 0.15, 0.3 + phase_error, 0.0);
 
     let station = TideGaugeStation::new("Test", 5.0, 60.0);
     let model = TimeSeries::new(&times, &model_values);
@@ -123,8 +142,14 @@ fn test_model_with_phase_error() {
     let result = StationValidationResult::compute(&station, &model, &obs);
 
     // Phase error reduces correlation
-    assert!(result.metrics.correlation < 0.999, "Phase error should reduce correlation");
-    assert!(result.metrics.correlation > 0.9, "But correlation still reasonable");
+    assert!(
+        result.metrics.correlation < 0.999,
+        "Phase error should reduce correlation"
+    );
+    assert!(
+        result.metrics.correlation > 0.9,
+        "But correlation still reasonable"
+    );
 }
 
 #[test]
@@ -140,7 +165,14 @@ fn test_harmonic_comparison() {
     let s2_phase = 1.0;
 
     let obs_values = synthetic_tidal_signal(&times, m2_amp, m2_phase, s2_amp, s2_phase, 0.0);
-    let model_values = synthetic_tidal_signal(&times, m2_amp * 0.95, m2_phase + 0.1, s2_amp * 1.05, s2_phase - 0.05, 0.0);
+    let model_values = synthetic_tidal_signal(
+        &times,
+        m2_amp * 0.95,
+        m2_phase + 0.1,
+        s2_amp * 1.05,
+        s2_phase - 0.05,
+        0.0,
+    );
 
     let station = TideGaugeStation::new("Test", 5.0, 60.0);
     let model = TimeSeries::new(&times, &model_values);
@@ -154,11 +186,19 @@ fn test_harmonic_comparison() {
     assert!(!result.constituent_comparisons.is_empty());
 
     // Check that M2 constituent comparison is reasonable
-    if let Some(m2_comp) = result.constituent_comparisons.iter().find(|c| c.name == "M2") {
-        assert!(m2_comp.amplitude_ratio > 0.9 && m2_comp.amplitude_ratio < 1.1,
-            "M2 amplitude ratio should be close to 1");
-        assert!(m2_comp.phase_error.abs() < 0.2,
-            "M2 phase error should be small");
+    if let Some(m2_comp) = result
+        .constituent_comparisons
+        .iter()
+        .find(|c| c.name == "M2")
+    {
+        assert!(
+            m2_comp.amplitude_ratio > 0.9 && m2_comp.amplitude_ratio < 1.1,
+            "M2 amplitude ratio should be close to 1"
+        );
+        assert!(
+            m2_comp.phase_error.abs() < 0.2,
+            "M2 phase error should be small"
+        );
     }
 }
 
@@ -236,7 +276,10 @@ fn test_validation_summary_statistics() {
     let station3 = TideGaugeStation::new("Poor", 2.0, 2.0);
 
     let times: Vec<f64> = (0..100).map(|i| i as f64 * 3600.0).collect();
-    let good_values: Vec<f64> = times.iter().map(|&t| (t / M2_PERIOD * 2.0 * PI).sin()).collect();
+    let good_values: Vec<f64> = times
+        .iter()
+        .map(|&t| (t / M2_PERIOD * 2.0 * PI).sin())
+        .collect();
 
     // Good: perfect match
     let model1 = TimeSeries::new(&times, &good_values);
@@ -270,8 +313,7 @@ fn test_validation_summary_statistics() {
 
 #[test]
 fn test_datum_offset_correction() {
-    let station = TideGaugeStation::new("Test", 5.0, 60.0)
-        .with_datum_offset(0.15); // 15 cm datum difference
+    let station = TideGaugeStation::new("Test", 5.0, 60.0).with_datum_offset(0.15); // 15 cm datum difference
 
     let times: Vec<f64> = (0..100).map(|i| i as f64 * 3600.0).collect();
     let model_values = vec![1.0; 100]; // Model at 1.0 m
@@ -283,6 +325,9 @@ fn test_datum_offset_correction() {
     let result = StationValidationResult::compute(&station, &model, &obs);
 
     // After applying 0.15 m offset, obs becomes 1.0 m, matching model
-    assert!(result.metrics.rmse < 1e-10, "RMSE should be ~0 after datum correction");
+    assert!(
+        result.metrics.rmse < 1e-10,
+        "RMSE should be ~0 after datum correction"
+    );
     assert!((result.metrics.bias).abs() < 1e-10, "Bias should be ~0");
 }

@@ -65,9 +65,20 @@ pub fn ssp_rk3_step_burn<B: Backend>(
     state.hv = state.hv.clone().add(rhs1.hv.mul_scalar(dt));
 
     // Then blend: u2 = 3/4 * u0 + 1/4 * (u1 + dt*L(u1))
-    state.h = u0.h.clone().mul_scalar(0.75).add(state.h.clone().mul_scalar(0.25));
-    state.hu = u0.hu.clone().mul_scalar(0.75).add(state.hu.clone().mul_scalar(0.25));
-    state.hv = u0.hv.clone().mul_scalar(0.75).add(state.hv.clone().mul_scalar(0.25));
+    state.h =
+        u0.h.clone()
+            .mul_scalar(0.75)
+            .add(state.h.clone().mul_scalar(0.25));
+    state.hu = u0
+        .hu
+        .clone()
+        .mul_scalar(0.75)
+        .add(state.hu.clone().mul_scalar(0.25));
+    state.hv = u0
+        .hv
+        .clone()
+        .mul_scalar(0.75)
+        .add(state.hv.clone().mul_scalar(0.25));
 
     // Stage 3: u_new = 1/3 * u0 + 2/3 * (u2 + dt * L(u2))
     let rhs2 = compute_rhs_swe_2d_burn(state, ops, geom, connectivity, config);
@@ -80,9 +91,19 @@ pub fn ssp_rk3_step_burn<B: Backend>(
     // Then blend: u_new = 1/3 * u0 + 2/3 * (u2 + dt*L(u2))
     let one_third = 1.0 / 3.0;
     let two_thirds = 2.0 / 3.0;
-    state.h = u0.h.clone().mul_scalar(one_third).add(state.h.clone().mul_scalar(two_thirds));
-    state.hu = u0.hu.clone().mul_scalar(one_third).add(state.hu.clone().mul_scalar(two_thirds));
-    state.hv = u0.hv.mul_scalar(one_third).add(state.hv.clone().mul_scalar(two_thirds));
+    state.h =
+        u0.h.clone()
+            .mul_scalar(one_third)
+            .add(state.h.clone().mul_scalar(two_thirds));
+    state.hu = u0
+        .hu
+        .clone()
+        .mul_scalar(one_third)
+        .add(state.hu.clone().mul_scalar(two_thirds));
+    state.hv = u0
+        .hv
+        .mul_scalar(one_third)
+        .add(state.hv.clone().mul_scalar(two_thirds));
 }
 
 /// Compute CFL-stable time step on GPU.
@@ -230,17 +251,15 @@ where
 #[cfg(all(test, feature = "burn-ndarray"))]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArray;
     use crate::mesh::Mesh2DBuilder;
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::solver::burn::BurnConnectivity;
     use crate::types::ElementIndex;
+    use burn_ndarray::NdArray;
 
     #[test]
     fn test_compute_dt_burn() {
-        let mesh = Mesh2DBuilder::unit_square()
-            .with_resolution(2, 2)
-            .build();
+        let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh);
@@ -268,9 +287,7 @@ mod tests {
 
     #[test]
     fn test_ssp_rk3_step_lake_at_rest() {
-        let mesh = Mesh2DBuilder::unit_square()
-            .with_resolution(2, 2)
-            .build();
+        let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh);
@@ -279,7 +296,11 @@ mod tests {
         let burn_ops = BurnOperators2D::<NdArray<f64>>::from_cpu(&ops, &device);
         let burn_geom = BurnGeometricFactors2D::<NdArray<f64>>::from_cpu(&geom, &device);
         let connectivity = BurnConnectivity::<NdArray<f64>>::from_mesh(
-            &mesh, &geom, &ops.face_nodes, ops.n_face_nodes, &device,
+            &mesh,
+            &geom,
+            &ops.face_nodes,
+            ops.n_face_nodes,
+            &device,
         );
 
         // Lake at rest: h=1, u=v=0
@@ -295,7 +316,14 @@ mod tests {
 
         // Take a small time step
         let dt = 0.001;
-        ssp_rk3_step_burn(&mut burn_sol, dt, &burn_ops, &burn_geom, &connectivity, &config);
+        ssp_rk3_step_burn(
+            &mut burn_sol,
+            dt,
+            &burn_ops,
+            &burn_geom,
+            &connectivity,
+            &config,
+        );
 
         // Lake at rest should stay at rest (approximately)
         let result = burn_sol.to_cpu();
@@ -303,7 +331,11 @@ mod tests {
             for i in 0..ops.n_nodes {
                 let state = result.get_state(k, i);
                 // Allow some numerical error, but state should be close to initial
-                assert!((state.h - 1.0).abs() < 0.1, "h changed too much: {}", state.h);
+                assert!(
+                    (state.h - 1.0).abs() < 0.1,
+                    "h changed too much: {}",
+                    state.h
+                );
                 assert!(state.hu.abs() < 0.1, "hu should be ~0: {}", state.hu);
                 assert!(state.hv.abs() < 0.1, "hv should be ~0: {}", state.hv);
             }

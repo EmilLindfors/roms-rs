@@ -70,6 +70,8 @@ pub use time::{
 
 // 2D types
 pub use basis::Vandermonde2D;
+#[cfg(feature = "netcdf")]
+pub use boundary::OceanNestingBC2D;
 pub use boundary::{
     BCContext2D, BathymetryValidationConfig, BathymetryValidationResult, Chapman2D,
     ChapmanFlather2D, ConstantDischarge2D, Discharge2D, Extrapolation2D, FixedState2D, Flather2D,
@@ -78,80 +80,84 @@ pub use boundary::{
     TidalBCType, TidalConstituent, TidalSimulationBuilder, format_bathymetry_warning,
     validate_bathymetry_convention,
 };
-#[cfg(feature = "netcdf")]
-pub use boundary::OceanNestingBC2D;
 pub use equations::Advection2D;
 pub use mesh::{BoundaryConfig, BoundaryTag, Mesh2D, Mesh2DBuilder};
 pub use operators::{DGOperators2D, GeometricFactors2D};
+#[cfg(feature = "parallel")]
+pub use solver::compute_rhs_tracer_2d_parallel;
 pub use solver::{
     AdvectionBoundaryCondition2D,
     AdvectionFluxType,
     ConservativeTracerState,
     ConstantBC2D,
     DGSolution2D,
+    // Diagnostics
+    DiagnosticsTracker,
     DirichletBC2D,
     ExtrapolationTracerBC,
+    ExtrapolationTracerBC3D,
     FixedTracerBC,
+    FixedTracerBC3D,
     PeriodicBC2D,
+    ProgressReporter,
+    Rhs3DConfig,
     SWE2DRhsConfig,
+    SWEDiagnostics2D,
     SWESolution2D,
     SWEState2D,
     SystemSolution2D,
     Tracer2DRhsConfig,
     TracerBCContext2D,
+    TracerBCContext3D,
     TracerBoundaryCondition2D,
+    TracerBoundaryCondition3D,
     TracerSolution2D,
     TracerSourceTerm2D,
     TracerState,
     UpwindTracerBC,
+    UpwindTracerBC3D,
+    // Wetting/drying
+    WetDryConfig,
+    // SWE 2D limiters
+    apply_swe_limiters_kuzmin_2d,
+    apply_wet_dry_correction,
+    apply_wet_dry_correction_all,
     compute_dt_advection_2d,
     compute_dt_swe_2d,
-    compute_dt_viscosity,
     // Tracer transport
     compute_dt_tracer_2d,
+    compute_dt_viscosity,
+    // 3D RHS
+    compute_rhs_3d,
     compute_rhs_advection_2d,
     compute_rhs_swe_2d,
     compute_rhs_tracer_2d,
-    // SWE 2D limiters
-    apply_swe_limiters_kuzmin_2d,
-    swe_positivity_limiter_2d,
-    swe_kuzmin_limiter_2d,
-    // Wetting/drying
-    WetDryConfig,
-    apply_wet_dry_correction,
-    apply_wet_dry_correction_all,
-    // Diagnostics
-    DiagnosticsTracker,
-    ProgressReporter,
-    SWEDiagnostics2D,
     current_cfl_2d,
+    swe_kuzmin_limiter_2d,
+    swe_positivity_limiter_2d,
     total_energy_2d,
     total_mass_2d,
     total_momentum_2d,
-    // 3D RHS
-    compute_rhs_3d,
-    Rhs3DConfig,
 };
-#[cfg(feature = "parallel")]
-pub use solver::compute_rhs_tracer_2d_parallel;
 #[cfg(all(feature = "parallel", feature = "simd"))]
-pub use solver::{compute_rhs_swe_2d_parallel, compute_dt_swe_2d_parallel};
+pub use solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
 
 // Burn GPU acceleration exports
 #[cfg(feature = "burn")]
 pub use solver::burn::{
-    BurnConnectivity, BurnError, BurnOperators2D, BurnSWESolution2D,
-    compute_rhs_swe_2d_burn, hll_flux_batched, roe_flux_batched,
+    BurnConnectivity, BurnError, BurnOperators2D, BurnSWESolution2D, compute_rhs_swe_2d_burn,
+    hll_flux_batched,
     rhs::{BurnGeometricFactors2D, BurnRhsConfig},
+    roe_flux_batched,
 };
-#[cfg(feature = "burn")]
-pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};
 pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
     HorizontalViscosity2D, HydrostaticReconstruction2D, P_STANDARD, RectangularBoundary,
     SourceContext2D, SourceTerm2D, SpongeLayer2D, SpongeProfile, TidalPotential,
     TidalPotentialConstituent, ViscosityModel, WindStress2D,
 };
+#[cfg(feature = "burn")]
+pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};
 pub use time::{
     CoupledRhs2D,
     CoupledState2D,
@@ -169,39 +175,81 @@ pub use time::{
 
 // Analysis types
 pub use analysis::{
-    ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary, ConstituentResult,
-    HarmonicAnalysis, HarmonicResult, TimeSeries, TimeSeriesPoint, compare_harmonics,
-    // Stability monitoring
-    StabilityMonitor, StabilityStatus, StabilityThresholds, StabilityWarning,
+    ComparisonMetrics,
+    ConstituentComparison,
+    ConstituentComparisonSummary,
+    ConstituentResult,
+    HarmonicAnalysis,
+    HarmonicResult,
     // Tide gauge validation
-    ModelExtractor, PrecomputedExtractor, StationValidationResult, TideGaugeStation,
-    ValidationSummary, norwegian_stations, validate_stations,
+    ModelExtractor,
+    PrecomputedExtractor,
+    // Stability monitoring
+    StabilityMonitor,
+    StabilityStatus,
+    StabilityThresholds,
+    StabilityWarning,
+    StationValidationResult,
+    TideGaugeStation,
+    TimeSeries,
+    TimeSeriesPoint,
+    ValidationSummary,
+    compare_harmonics,
+    norwegian_stations,
+    validate_stations,
 };
 
 // I/O types
 pub use io::{
-    BathymetryStatistics, BoundaryTimeSeries, CoastlineData, CoastlineError,
-    CoastlineStatistics, ConstituentData, ConstituentEntry, ConstituentFileError,
-    CoordinateProjection, FROYA_BBOX, GeoBoundingBox, GeoTiffBathymetry, GeoTiffError,
-    LocalProjection, NORWAY_BBOX, TimeSeriesFileError, TimeSeriesRecord, UtmProjection,
-    VtkError, constituent_period, parse_constituents, parse_timeseries, read_constituent_file,
-    read_timeseries_file, write_vtk_coupled, write_vtk_series, write_vtk_swe,
+    BathymetryStatistics,
+    BoundaryTimeSeries,
+    CoastlineData,
+    CoastlineError,
+    CoastlineStatistics,
+    ConstituentData,
+    ConstituentEntry,
+    ConstituentFileError,
+    CoordinateProjection,
+    FROYA_BBOX,
+    GeoBoundingBox,
+    GeoTiffBathymetry,
+    GeoTiffError,
+    LocalProjection,
+    NORWAY_BBOX,
     // Tide gauge I/O
-    TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,
-    read_tide_gauge_file, write_tide_gauge_file,
+    TideGaugeFile,
+    TideGaugeFileError,
+    TimeSeriesFileError,
+    TimeSeriesRecord,
+    UtmProjection,
+    VtkError,
+    constituent_period,
+    files_to_observation_map,
+    parse_constituents,
+    parse_timeseries,
+    read_constituent_file,
+    read_tide_gauge_directory,
+    read_tide_gauge_file,
+    read_timeseries_file,
+    write_tide_gauge_file,
+    write_vtk_coupled,
+    write_vtk_series,
+    write_vtk_swe,
 };
 #[cfg(feature = "netcdf")]
 pub use io::{
-    ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo, NetCDFWriter,
-    NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState,
-    FILL_VALUE_F32, FILL_VALUE_F64, is_valid_f32, is_valid_f64,
+    FILL_VALUE_F32, FILL_VALUE_F64, ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo,
+    NetCDFWriter, NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState, is_valid_f32,
+    is_valid_f64,
 };
 
 // Mesh types (additional exports)
 pub use mesh::{LandMask2D, LandMaskStatistics};
 
 // Physics module types
-pub use physics::{PhysicsBuilder, PhysicsConfig, PhysicsModule, PhysicsModuleInfo, SWEPhysics2DBuilder};
+pub use physics::{
+    PhysicsBuilder, PhysicsConfig, PhysicsModule, PhysicsModuleInfo, SWEPhysics2DBuilder,
+};
 
 // Simulation runner types
 pub use simulation::{Simulation, SimulationConfig, SimulationResult};
@@ -215,5 +263,5 @@ pub use vertical::{
 // Strongly-typed domain types
 pub use types::{
     Bounds2D, Depth, ElementIndex, Elevation, FaceIndex, LevelIndex, NodeIndex, PhysicalZ,
-    Resolution2D, Sigma, SideBoundaries,
+    Resolution2D, SideBoundaries, Sigma,
 };

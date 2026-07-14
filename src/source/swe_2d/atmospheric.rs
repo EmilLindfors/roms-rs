@@ -69,11 +69,7 @@ enum PressureField {
     Constant(f64),
 
     /// Uniform pressure gradient (Pa/m in x and y directions).
-    UniformGradient {
-        p_ref: f64,
-        dp_dx: f64,
-        dp_dy: f64,
-    },
+    UniformGradient { p_ref: f64, dp_dx: f64, dp_dy: f64 },
 
     /// Time-varying uniform gradient.
     TimeVaryingGradient(Box<dyn Fn(f64) -> (f64, f64) + Send + Sync>),
@@ -348,9 +344,11 @@ impl AtmosphericPressure2D {
     fn pressure_at(&self, x: f64, y: f64, t: f64) -> f64 {
         match &self.field {
             PressureField::Constant(p) => *p,
-            PressureField::UniformGradient { p_ref, dp_dx, dp_dy } => {
-                p_ref + dp_dx * x + dp_dy * y
-            }
+            PressureField::UniformGradient {
+                p_ref,
+                dp_dx,
+                dp_dy,
+            } => p_ref + dp_dx * x + dp_dy * y,
             PressureField::TimeVaryingGradient(f) => {
                 let (dp_dx, dp_dy) = f(t);
                 P_STANDARD + dp_dx * x + dp_dy * y
@@ -385,10 +383,10 @@ impl AtmosphericPressure2D {
                 // Numerical gradient using central differences
                 let dx = self.grad_delta;
                 let dy = self.grad_delta;
-                let dp_dx = (self.pressure_at(x + dx, y, t) - self.pressure_at(x - dx, y, t))
-                    / (2.0 * dx);
-                let dp_dy = (self.pressure_at(x, y + dy, t) - self.pressure_at(x, y - dy, t))
-                    / (2.0 * dy);
+                let dp_dx =
+                    (self.pressure_at(x + dx, y, t) - self.pressure_at(x - dx, y, t)) / (2.0 * dx);
+                let dp_dy =
+                    (self.pressure_at(x, y + dy, t) - self.pressure_at(x, y - dy, t)) / (2.0 * dy);
                 (dp_dx, dp_dy)
             }
         }
@@ -550,9 +548,9 @@ mod tests {
         // Stationary storm at origin
         let storm = AtmosphericPressure2D::moving_storm(
             |_t| (0.0, 0.0),
-            970.0,  // Central pressure 970 hPa
-            100.0,  // R_max = 100 km
-            1.5,    // Holland B
+            970.0, // Central pressure 970 hPa
+            100.0, // R_max = 100 km
+            1.5,   // Holland B
         );
 
         // At the center, pressure should be central pressure
@@ -577,8 +575,7 @@ mod tests {
     fn test_moving_storm() {
         // Storm moving east at 100 m/s (fast-moving for test)
         // Use small storm (r_max=10km) so it moves out of range quickly
-        let storm =
-            AtmosphericPressure2D::moving_storm(|t| (100.0 * t, 0.0), 970.0, 10.0, 1.5);
+        let storm = AtmosphericPressure2D::moving_storm(|t| (100.0 * t, 0.0), 970.0, 10.0, 1.5);
 
         // At t=0, storm is at origin
         let p_origin_t0 = storm.pressure_at(0.0, 0.0, 0.0);

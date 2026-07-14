@@ -32,9 +32,9 @@
 use std::fs;
 use std::path::Path;
 
-use dg_rs::boundary::{HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D};
 #[cfg(feature = "netcdf")]
 use dg_rs::boundary::OceanNestingBC2D;
+use dg_rs::boundary::{HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D};
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::io::{
     CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry, LocalProjection,
@@ -42,20 +42,20 @@ use dg_rs::io::{
 };
 #[cfg(feature = "netcdf")]
 use dg_rs::io::{NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig, OceanModelReader};
-#[cfg(feature = "netcdf")]
-use std::sync::Arc;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, LandMask2D, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d};
 #[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_rhs_swe_2d_parallel;
+use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d};
 use dg_rs::source::{
-    AtmosphericPressure2D, BathymetrySource2D, CombinedSource2D, CoriolisSource2D,
-    DragCoefficient, ManningFriction2D, WindStress2D,
+    AtmosphericPressure2D, BathymetrySource2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
+    ManningFriction2D, WindStress2D,
 };
 use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 use dg_rs::types::{Depth, ElementIndex};
 use dg_rs::{SWEFluxType2D, SWEState2D};
+#[cfg(feature = "netcdf")]
+use std::sync::Arc;
 
 /// Helper for typed element indices
 fn k(idx: usize) -> ElementIndex {
@@ -172,22 +172,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Define geographic domain
     // ========================================================================
     let geo_bbox = GeoBoundingBox::new(
-        8.0,   // min_lon (western edge)
-        63.6,  // min_lat (southern edge)
-        9.2,   // max_lon (eastern edge)
-        64.0,  // max_lat (northern edge)
+        8.0,  // min_lon (western edge)
+        63.6, // min_lat (southern edge)
+        9.2,  // max_lon (eastern edge)
+        64.0, // max_lat (northern edge)
     );
 
     println!("Geographic domain:");
-    println!("  Longitude: [{:.2}°E, {:.2}°E]", geo_bbox.min_lon, geo_bbox.max_lon);
-    println!("  Latitude:  [{:.2}°N, {:.2}°N]", geo_bbox.min_lat, geo_bbox.max_lat);
+    println!(
+        "  Longitude: [{:.2}°E, {:.2}°E]",
+        geo_bbox.min_lon, geo_bbox.max_lon
+    );
+    println!(
+        "  Latitude:  [{:.2}°N, {:.2}°N]",
+        geo_bbox.min_lat, geo_bbox.max_lat
+    );
 
     // Create projection centered on domain
     let (center_lat, center_lon) = geo_bbox.center();
     let projection = LocalProjection::new(center_lat, center_lon);
 
     println!("\nProjection:");
-    println!("  Reference: ({:.4}°N, {:.4}°E)", projection.ref_lat(), projection.ref_lon());
+    println!(
+        "  Reference: ({:.4}°N, {:.4}°E)",
+        projection.ref_lat(),
+        projection.ref_lon()
+    );
 
     // ========================================================================
     // Load geographic data
@@ -200,8 +210,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check if files exist
     if !bathy_path.exists() || !coastline_path.exists() {
         println!("Warning: Data files not found.");
-        println!("  Bathymetry: {} (exists: {})", bathy_path.display(), bathy_path.exists());
-        println!("  Coastline: {} (exists: {})", coastline_path.display(), coastline_path.exists());
+        println!(
+            "  Bathymetry: {} (exists: {})",
+            bathy_path.display(),
+            bathy_path.exists()
+        );
+        println!(
+            "  Coastline: {} (exists: {})",
+            coastline_path.display(),
+            coastline_path.exists()
+        );
         println!("\nRunning with synthetic data instead.\n");
         return run_synthetic_simulation();
     }
@@ -210,14 +228,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bathy_bbox = GeoBoundingBox::new(7.5, 63.3, 10.0, 64.2);
     let geotiff = GeoTiffBathymetry::load_with_bbox(bathy_path, Some(bathy_bbox))?;
     let bathy_stats = geotiff.statistics();
-    println!("  Bathymetry: {}x{} pixels, depth range [{:.0}, {:.0}] m",
-        bathy_stats.width, bathy_stats.height, bathy_stats.min_depth, bathy_stats.max_depth);
+    println!(
+        "  Bathymetry: {}x{} pixels, depth range [{:.0}, {:.0}] m",
+        bathy_stats.width, bathy_stats.height, bathy_stats.min_depth, bathy_stats.max_depth
+    );
 
     // Load coastline data
     let coastline = CoastlineData::load(coastline_path, &geo_bbox)?;
     let coast_stats = coastline.statistics();
-    println!("  Coastline: {} polygons, {} vertices",
-        coast_stats.polygon_count, coast_stats.total_vertices);
+    println!(
+        "  Coastline: {} polygons, {} vertices",
+        coast_stats.polygon_count, coast_stats.total_vertices
+    );
 
     // ========================================================================
     // Create mesh
@@ -228,17 +250,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (x_max, y_max) = projection.geo_to_xy(geo_bbox.max_lat, geo_bbox.max_lon);
 
     let mut mesh = Mesh2D::uniform_rectangle_with_bc(
-        x_min, x_max, y_min, y_max,
-        NX, NY,
-        BoundaryTag::Wall,  // Default to wall
+        x_min,
+        x_max,
+        y_min,
+        y_max,
+        NX,
+        NY,
+        BoundaryTag::Wall, // Default to wall
     );
 
     // Tag open boundaries (west and north edges = ocean)
     tag_boundaries(&mut mesh, x_min, y_min, x_max, y_max);
 
     println!("  Elements: {} ({}x{})", mesh.n_elements, NX, NY);
-    println!("  Domain: {:.1} km x {:.1} km",
-        (x_max - x_min) / 1000.0, (y_max - y_min) / 1000.0);
+    println!(
+        "  Domain: {:.1} km x {:.1} km",
+        (x_max - x_min) / 1000.0,
+        (y_max - y_min) / 1000.0
+    );
 
     let dx = (x_max - x_min) / NX as f64;
     let dy = (y_max - y_min) / NY as f64;
@@ -261,15 +290,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Use REAL bathymetry from GeoTIFF with well-balanced scheme
     let mut bathymetry = Bathymetry2D::from_geotiff(&mesh, &ops, &geom, &geotiff, &projection);
-    println!("  Original range: [{:.0}, {:.0}] m", bathymetry.min(), bathymetry.max());
-    println!("  Original max gradient: {:.4}", bathymetry.max_gradient_magnitude());
+    println!(
+        "  Original range: [{:.0}, {:.0}] m",
+        bathymetry.min(),
+        bathymetry.max()
+    );
+    println!(
+        "  Original max gradient: {:.4}",
+        bathymetry.max_gradient_magnitude()
+    );
 
     // CRITICAL: Use cell-average bathymetry for well-balanced property
     // This makes bathymetry constant within each element (zero gradients).
     // The hydrostatic reconstruction handles bathymetry jumps at interfaces.
     bathymetry.to_cell_average();
-    println!("  Cell-average range: [{:.0}, {:.0}] m", bathymetry.min(), bathymetry.max());
-    println!("  Cell-average max gradient: {:.4} (should be 0)", bathymetry.max_gradient_magnitude());
+    println!(
+        "  Cell-average range: [{:.0}, {:.0}] m",
+        bathymetry.min(),
+        bathymetry.max()
+    );
+    println!(
+        "  Cell-average max gradient: {:.4} (should be 0)",
+        bathymetry.max_gradient_magnitude()
+    );
 
     // ========================================================================
     // Create land mask
@@ -277,15 +320,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nCreating land mask...");
 
     let land_mask = LandMask2D::from_coastline_and_bathymetry(
-        &mesh, &ops, &coastline, &geotiff, &projection, H_MIN
+        &mesh,
+        &ops,
+        &coastline,
+        &geotiff,
+        &projection,
+        H_MIN,
     );
     let mask_stats = land_mask.statistics();
-    println!("  Wet elements: {} ({:.1}%)",
+    println!(
+        "  Wet elements: {} ({:.1}%)",
         mask_stats.wet_elements,
-        100.0 * mask_stats.wet_elements as f64 / mask_stats.total_elements as f64);
-    println!("  Dry elements: {} ({:.1}%)",
+        100.0 * mask_stats.wet_elements as f64 / mask_stats.total_elements as f64
+    );
+    println!(
+        "  Dry elements: {} ({:.1}%)",
         mask_stats.dry_elements,
-        100.0 * mask_stats.dry_elements as f64 / mask_stats.total_elements as f64);
+        100.0 * mask_stats.dry_elements as f64 / mask_stats.total_elements as f64
+    );
 
     // ========================================================================
     // Initialize state
@@ -293,8 +345,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nSetting up initial conditions...");
 
     let mut state = create_initial_state(&mesh, &ops, &bathymetry, &land_mask);
-    println!("  Initial depth range: [{:.1}, {:.1}] m",
-        state.min_depth(), state.max_depth());
+    println!(
+        "  Initial depth range: [{:.1}, {:.1}] m",
+        state.min_depth(),
+        state.max_depth()
+    );
 
     // ========================================================================
     // Set up physics
@@ -321,12 +376,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Coriolis: f = {:.2e} s⁻¹ (64°N)", F_CORIOLIS);
     println!("  Manning: n = {}", MANNING_N);
     if ENABLE_WIND {
-        println!("  Wind: {:.1} m/s from {:.0}° (Large-Pond drag)", WIND_SPEED, WIND_DIRECTION);
+        println!(
+            "  Wind: {:.1} m/s from {:.0}° (Large-Pond drag)",
+            WIND_SPEED, WIND_DIRECTION
+        );
     } else {
         println!("  Wind: disabled");
     }
     if ENABLE_PRESSURE {
-        println!("  Pressure: {:.1} hPa/100km from {:.0}°", PRESSURE_GRADIENT * 1e5, PRESSURE_DIRECTION);
+        println!(
+            "  Pressure: {:.1} hPa/100km from {:.0}°",
+            PRESSURE_GRADIENT * 1e5,
+            PRESSURE_DIRECTION
+        );
     } else {
         println!("  Pressure: disabled");
     }
@@ -351,7 +413,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            println!("\nWarning: Ocean model file not found: {}", norkyst_path.display());
+            println!(
+                "\nWarning: Ocean model file not found: {}",
+                norkyst_path.display()
+            );
             println!("  Falling back to tidal BC");
             None
         }
@@ -361,8 +426,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Boundary conditions - ocean nesting or tidal forcing at open boundaries
     let wall_bc = Reflective2D::new();
-    let tidal_bc = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0)
-        .with_ramp_up(TIDAL_RAMP_DURATION);
+    let tidal_bc =
+        HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0).with_ramp_up(TIDAL_RAMP_DURATION);
 
     // Create ocean nesting BC if reader is available
     #[cfg(feature = "netcdf")]
@@ -370,7 +435,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         OceanNestingBC2D::new(Arc::clone(reader), projection.clone())
             .with_reference_level(0.0)
             .with_flather(true)
-            .with_flather_weight(0.8)  // Blend with some radiation
+            .with_flather_weight(0.8) // Blend with some radiation
     });
 
     // Use ocean BC if available, otherwise fall back to tidal
@@ -379,13 +444,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  Boundary: Ocean model nesting (NorKyst v3) with Flather blending");
         MultiBoundaryCondition2D::new(&wall_bc).with_open(obc)
     } else {
-        println!("  Boundary: M2 tidal forcing with {:.0} min ramp-up", TIDAL_RAMP_DURATION / 60.0);
+        println!(
+            "  Boundary: M2 tidal forcing with {:.0} min ramp-up",
+            TIDAL_RAMP_DURATION / 60.0
+        );
         MultiBoundaryCondition2D::new(&wall_bc).with_open(&tidal_bc)
     };
 
     #[cfg(not(feature = "netcdf"))]
     let bc = {
-        println!("  Boundary: M2 tidal forcing with {:.0} min ramp-up", TIDAL_RAMP_DURATION / 60.0);
+        println!(
+            "  Boundary: M2 tidal forcing with {:.0} min ramp-up",
+            TIDAL_RAMP_DURATION / 60.0
+        );
         MultiBoundaryCondition2D::new(&wall_bc).with_open(&tidal_bc)
     };
 
@@ -396,11 +467,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Time configuration with Kuzmin limiters and improved wetting/drying
     let time_config = SWE2DTimeConfig::new(CFL, G, H_MIN)
-        .with_kuzmin_limiters(1.0)     // Strict limiting for steep bathymetry
-        .with_wet_dry_treatment();     // Improved wetting/drying (velocity cap, thin-layer damping)
+        .with_kuzmin_limiters(1.0) // Strict limiting for steep bathymetry
+        .with_wet_dry_treatment(); // Improved wetting/drying (velocity cap, thin-layer damping)
 
     println!("\nSimulation parameters:");
-    println!("  Duration: {:.1} hours ({:.2} M2 cycles)", T_END / 3600.0, T_END / M2_PERIOD);
+    println!(
+        "  Duration: {:.1} hours ({:.2} M2 cycles)",
+        T_END / 3600.0,
+        T_END / M2_PERIOD
+    );
     println!("  CFL: {}", CFL);
     println!("  Limiter: Kuzmin (vertex-based)");
     println!("  Output interval: {:.0} min", OUTPUT_INTERVAL / 60.0);
@@ -457,7 +532,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut max_rhs_hu = 0.0_f64;
         let mut max_rhs_hv = 0.0_f64;
         for ki in 0..state.n_elements {
-            if !land_mask.is_wet(ki) { continue; }
+            if !land_mask.is_wet(ki) {
+                continue;
+            }
             for i in 0..state.n_nodes {
                 let rhs_state = rhs_test.get_state(k(ki), i);
                 max_rhs_h = max_rhs_h.max(rhs_state.h.abs());
@@ -480,7 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut t = 0.0;
     let mut step = 0;
-    let mut last_output = -OUTPUT_INTERVAL;  // Force initial output
+    let mut last_output = -OUTPUT_INTERVAL; // Force initial output
     let mut vtk_frame = 0;
 
     while t < T_END {
@@ -495,11 +572,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_flux_type(SWEFluxType2D::Rusanov)
                 .with_source_terms(&sources)
                 .with_bathymetry(&bathymetry)
-                .with_well_balanced(true);  // Enable hydrostatic reconstruction
+                .with_well_balanced(true); // Enable hydrostatic reconstruction
             #[cfg(all(feature = "parallel", feature = "simd"))]
-            { compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time) }
+            {
+                compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time)
+            }
             #[cfg(not(all(feature = "parallel", feature = "simd")))]
-            { compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time) }
+            {
+                compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time)
+            }
         };
 
         // SSP-RK3 step with limiters applied after each stage
@@ -535,7 +616,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=================================================================");
     println!("  Final time: {:.2} hours", t / 3600.0);
     println!("  Total steps: {}", step);
-    println!("  Average dt: {:.2} s", if step > 0 { t / step as f64 } else { 0.0 });
+    println!(
+        "  Average dt: {:.2} s",
+        if step > 0 { t / step as f64 } else { 0.0 }
+    );
     println!("  VTK frames: {}", vtk_frame);
 
     print_final_diagnostics(&state, &land_mask);
@@ -552,7 +636,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Tag domain boundaries as open (ocean) or wall.
 fn tag_boundaries(mesh: &mut Mesh2D, x_min: f64, _y_min: f64, _x_max: f64, y_max: f64) {
-    let tolerance = 100.0;  // meters
+    let tolerance = 100.0; // meters
 
     for edge in mesh.edges.iter_mut() {
         if edge.is_boundary() {
@@ -633,8 +717,10 @@ fn print_diagnostics(t: f64, state: &SWESolution2D, land_mask: &LandMask2D) {
 
     let speed = (u_max * u_max + v_max * v_max).sqrt();
 
-    println!("t = {:5.1} h ({:.2} M2) | h: [{:6.1}, {:6.1}] m | |u|: {:.3} m/s",
-        hours, m2_phase, h_min, h_max, speed);
+    println!(
+        "t = {:5.1} h ({:.2} M2) | h: [{:6.1}, {:6.1}] m | |u|: {:.3} m/s",
+        hours, m2_phase, h_min, h_max, speed
+    );
 }
 
 /// Print final diagnostics.
@@ -669,8 +755,14 @@ fn print_final_diagnostics(state: &SWESolution2D, land_mask: &LandMask2D) {
     let h_mean = if count > 0 { h_sum / count as f64 } else { 0.0 };
     let speed_max = (u_max * u_max + v_max * v_max).sqrt();
 
-    println!("  Water depth: min={:.1} m, mean={:.1} m, max={:.1} m", h_min, h_mean, h_max);
-    println!("  Max velocity: {:.3} m/s (u_max={:.3}, v_max={:.3})", speed_max, u_max, v_max);
+    println!(
+        "  Water depth: min={:.1} m, mean={:.1} m, max={:.1} m",
+        h_min, h_mean, h_max
+    );
+    println!(
+        "  Max velocity: {:.3} m/s (u_max={:.3}, v_max={:.3})",
+        speed_max, u_max, v_max
+    );
 }
 
 /// Run with synthetic data when real files are not available.
@@ -681,15 +773,12 @@ fn run_synthetic_simulation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create simple rectangular domain
     let x_min = 0.0;
-    let x_max = 50_000.0;  // 50 km
+    let x_max = 50_000.0; // 50 km
     let y_min = 0.0;
-    let y_max = 40_000.0;  // 40 km
+    let y_max = 40_000.0; // 40 km
 
-    let mut mesh = Mesh2D::uniform_rectangle_with_bc(
-        x_min, x_max, y_min, y_max,
-        NX, NY,
-        BoundaryTag::Wall,
-    );
+    let mut mesh =
+        Mesh2D::uniform_rectangle_with_bc(x_min, x_max, y_min, y_max, NX, NY, BoundaryTag::Wall);
 
     // Tag west and north as open
     tag_boundaries(&mut mesh, x_min, y_min, x_max, y_max);
@@ -700,7 +789,7 @@ fn run_synthetic_simulation() -> Result<(), Box<dyn std::error::Error>> {
     // Synthetic bathymetry: deeper toward west (offshore)
     let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _y| {
         let t = x / x_max;
-        -100.0 * (1.0 - 0.7 * t)  // -100m to -30m west to east
+        -100.0 * (1.0 - 0.7 * t) // -100m to -30m west to east
     });
 
     // All wet (no land mask)
@@ -719,16 +808,20 @@ fn run_synthetic_simulation() -> Result<(), Box<dyn std::error::Error>> {
 
     // Combine sources based on enabled physics
     let sources: CombinedSource2D = match (ENABLE_WIND, ENABLE_PRESSURE) {
-        (true, true) => CombinedSource2D::new(vec![&coriolis, &friction, &bathy_source, &wind, &pressure]),
+        (true, true) => {
+            CombinedSource2D::new(vec![&coriolis, &friction, &bathy_source, &wind, &pressure])
+        }
         (true, false) => CombinedSource2D::new(vec![&coriolis, &friction, &bathy_source, &wind]),
-        (false, true) => CombinedSource2D::new(vec![&coriolis, &friction, &bathy_source, &pressure]),
+        (false, true) => {
+            CombinedSource2D::new(vec![&coriolis, &friction, &bathy_source, &pressure])
+        }
         (false, false) => CombinedSource2D::new(vec![&coriolis, &friction, &bathy_source]),
     };
 
     // h_ref = 0 because bathymetry is negative below MSL
     // Add ramp-up period for smooth spin-up
-    let tidal_bc = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0)
-        .with_ramp_up(TIDAL_RAMP_DURATION);
+    let tidal_bc =
+        HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0).with_ramp_up(TIDAL_RAMP_DURATION);
     let wall_bc = Reflective2D::new();
     let bc = MultiBoundaryCondition2D::new(&wall_bc).with_open(&tidal_bc);
 
@@ -743,15 +836,23 @@ fn run_synthetic_simulation() -> Result<(), Box<dyn std::error::Error>> {
     let output_dir = Path::new("output/froya_synthetic");
     fs::create_dir_all(output_dir)?;
 
-    println!("Domain: {:.0} km x {:.0} km", (x_max - x_min) / 1000.0, (y_max - y_min) / 1000.0);
+    println!(
+        "Domain: {:.0} km x {:.0} km",
+        (x_max - x_min) / 1000.0,
+        (y_max - y_min) / 1000.0
+    );
     println!("Elements: {}", mesh.n_elements);
-    println!("Bathymetry: [{:.0}, {:.0}] m", bathymetry.min(), bathymetry.max());
+    println!(
+        "Bathymetry: [{:.0}, {:.0}] m",
+        bathymetry.min(),
+        bathymetry.max()
+    );
     println!("Limiter: Kuzmin (vertex-based)");
     println!("Output: {}", output_dir.display());
     println!();
 
     // Full tidal cycle simulation for synthetic case
-    let t_end_synthetic = M2_PERIOD;  // 1 full M2 tidal cycle (~12.4 hours)
+    let t_end_synthetic = M2_PERIOD; // 1 full M2 tidal cycle (~12.4 hours)
 
     let mut t = 0.0;
     let mut step = 0;
@@ -767,11 +868,15 @@ fn run_synthetic_simulation() -> Result<(), Box<dyn std::error::Error>> {
                 .with_flux_type(SWEFluxType2D::Rusanov)
                 .with_source_terms(&sources)
                 .with_bathymetry(&bathymetry)
-                .with_well_balanced(true);  // Enable hydrostatic reconstruction
+                .with_well_balanced(true); // Enable hydrostatic reconstruction
             #[cfg(all(feature = "parallel", feature = "simd"))]
-            { compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time) }
+            {
+                compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time)
+            }
             #[cfg(not(all(feature = "parallel", feature = "simd")))]
-            { compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time) }
+            {
+                compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time)
+            }
         };
 
         // SSP-RK3 step with limiters applied after each stage
@@ -826,8 +931,7 @@ fn create_netcdf_mesh_info(
         }
     }
 
-    NetCDFMeshInfo::from_xy(x_coords, y_coords)
-        .with_latlon(lat_coords, lon_coords)
+    NetCDFMeshInfo::from_xy(x_coords, y_coords).with_latlon(lat_coords, lon_coords)
 }
 
 /// Extract solution data for NetCDF output.
@@ -848,7 +952,7 @@ fn extract_solution_data(
             let b = bathymetry.get(k(ki), i);
 
             h_data.push(st.h);
-            eta_data.push(st.h + b);  // η = h + B
+            eta_data.push(st.h + b); // η = h + B
 
             let (u, v) = st.velocity_simple(Depth::new(H_MIN));
             u_data.push(u);

@@ -153,7 +153,8 @@ pub fn warn_once_if_misconfigured(
     expected_elevation: f64,
 ) -> BathymetryValidationResult {
     let config = BathymetryValidationConfig::default();
-    let result = validate_bathymetry_convention(interior_h, bathymetry, expected_elevation, &config);
+    let result =
+        validate_bathymetry_convention(interior_h, bathymetry, expected_elevation, &config);
 
     if !result.is_valid && !warned.swap(true, Ordering::Relaxed) {
         eprintln!("{}", format_bathymetry_warning(bc_name, &result));

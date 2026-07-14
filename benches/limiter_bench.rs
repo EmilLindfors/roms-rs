@@ -4,13 +4,12 @@
 //!
 //! Benchmarks Kuzmin and positivity limiters for 2D SWE.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use dg_rs::mesh::Mesh2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::solver::{
-    apply_swe_limiters_kuzmin_2d, swe_cell_averages_2d,
-    swe_kuzmin_limiter_2d, swe_positivity_limiter_2d, KuzminParameter2D,
-    SWEState2D, SystemSolution2D,
+    KuzminParameter2D, SWEState2D, SystemSolution2D, apply_swe_limiters_kuzmin_2d,
+    swe_cell_averages_2d, swe_kuzmin_limiter_2d, swe_positivity_limiter_2d,
 };
 use dg_rs::types::ElementIndex;
 

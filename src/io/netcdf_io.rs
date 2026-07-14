@@ -357,7 +357,10 @@ impl NetCDFWriter {
 
         // Add creation timestamp
         let now = Utc::now();
-        file.add_attribute("history", format!("{}: Created by dg-rs", now.format("%Y-%m-%d %H:%M:%S UTC")).as_str())?;
+        file.add_attribute(
+            "history",
+            format!("{}: Created by dg-rs", now.format("%Y-%m-%d %H:%M:%S UTC")).as_str(),
+        )?;
 
         Ok(Self {
             file,
@@ -387,7 +390,9 @@ impl NetCDFWriter {
 
         // Write time
         {
-            let mut time_var = self.file.variable_mut("time")
+            let mut time_var = self
+                .file
+                .variable_mut("time")
                 .ok_or_else(|| NetCDFError::MissingVariable("time".to_string()))?;
             time_var.put_value(time, [t_idx])?;
         }
@@ -395,7 +400,9 @@ impl NetCDFWriter {
         // Write h
         {
             let h_f32: Vec<f32> = h.iter().map(|&x| x as f32).collect();
-            let mut h_var = self.file.variable_mut("h")
+            let mut h_var = self
+                .file
+                .variable_mut("h")
                 .ok_or_else(|| NetCDFError::MissingVariable("h".to_string()))?;
             h_var.put_values(&h_f32, (t_idx, ..))?;
         }
@@ -403,7 +410,9 @@ impl NetCDFWriter {
         // Write eta
         {
             let eta_f32: Vec<f32> = eta.iter().map(|&x| x as f32).collect();
-            let mut eta_var = self.file.variable_mut("eta")
+            let mut eta_var = self
+                .file
+                .variable_mut("eta")
                 .ok_or_else(|| NetCDFError::MissingVariable("eta".to_string()))?;
             eta_var.put_values(&eta_f32, (t_idx, ..))?;
         }
@@ -413,24 +422,32 @@ impl NetCDFWriter {
             if let (Some(u_data), Some(v_data)) = (u, v) {
                 let u_f32: Vec<f32> = u_data.iter().map(|&x| x as f32).collect();
                 let v_f32: Vec<f32> = v_data.iter().map(|&x| x as f32).collect();
-                let speed_f32: Vec<f32> = u_data.iter().zip(v_data.iter())
+                let speed_f32: Vec<f32> = u_data
+                    .iter()
+                    .zip(v_data.iter())
                     .map(|(&u, &v)| (u * u + v * v).sqrt() as f32)
                     .collect();
 
                 {
-                    let mut u_var = self.file.variable_mut("u")
+                    let mut u_var = self
+                        .file
+                        .variable_mut("u")
                         .ok_or_else(|| NetCDFError::MissingVariable("u".to_string()))?;
                     u_var.put_values(&u_f32, (t_idx, ..))?;
                 }
 
                 {
-                    let mut v_var = self.file.variable_mut("v")
+                    let mut v_var = self
+                        .file
+                        .variable_mut("v")
                         .ok_or_else(|| NetCDFError::MissingVariable("v".to_string()))?;
                     v_var.put_values(&v_f32, (t_idx, ..))?;
                 }
 
                 {
-                    let mut speed_var = self.file.variable_mut("speed")
+                    let mut speed_var = self
+                        .file
+                        .variable_mut("speed")
                         .ok_or_else(|| NetCDFError::MissingVariable("speed".to_string()))?;
                     speed_var.put_values(&speed_f32, (t_idx, ..))?;
                 }
@@ -455,14 +472,18 @@ impl NetCDFWriter {
 
         if let Some(temp) = temperature {
             let temp_f32: Vec<f32> = temp.iter().map(|&x| x as f32).collect();
-            let mut temp_var = self.file.variable_mut("temperature")
+            let mut temp_var = self
+                .file
+                .variable_mut("temperature")
                 .ok_or_else(|| NetCDFError::MissingVariable("temperature".to_string()))?;
             temp_var.put_values(&temp_f32, (t_idx, ..))?;
         }
 
         if let Some(sal) = salinity {
             let sal_f32: Vec<f32> = sal.iter().map(|&x| x as f32).collect();
-            let mut sal_var = self.file.variable_mut("salinity")
+            let mut sal_var = self
+                .file
+                .variable_mut("salinity")
                 .ok_or_else(|| NetCDFError::MissingVariable("salinity".to_string()))?;
             sal_var.put_values(&sal_f32, (t_idx, ..))?;
         }
@@ -500,7 +521,13 @@ impl ForcingDataPoint {
     /// Wind direction (meteorological convention: direction wind is FROM, degrees).
     pub fn wind_direction(&self) -> f64 {
         let dir = 270.0 - self.v10.atan2(self.u10).to_degrees();
-        if dir < 0.0 { dir + 360.0 } else if dir >= 360.0 { dir - 360.0 } else { dir }
+        if dir < 0.0 {
+            dir + 360.0
+        } else if dir >= 360.0 {
+            dir - 360.0
+        } else {
+            dir
+        }
     }
 }
 
@@ -557,7 +584,8 @@ impl ForcingReader {
 
         // Check if pressure is in hPa and convert to Pa
         // ERA5 uses Pa, but some sources use hPa
-        let max_pressure = msl.iter()
+        let max_pressure = msl
+            .iter()
             .flat_map(|t| t.iter().flat_map(|r| r.iter()))
             .filter(|&&v| is_valid_f32(v))
             .fold(0.0f32, |a, &b| a.max(b));
@@ -575,7 +603,14 @@ impl ForcingReader {
             }
         }
 
-        Ok(Self { lon, lat, time, u10, v10, msl })
+        Ok(Self {
+            lon,
+            lat,
+            time,
+            u10,
+            v10,
+            msl,
+        })
     }
 
     /// Read a coordinate variable.
@@ -600,7 +635,8 @@ impl ForcingReader {
         for name in names {
             if let Some(var) = file.variable(name) {
                 // Try to read scale_factor and add_offset
-                let scale = var.attribute_value("scale_factor")
+                let scale = var
+                    .attribute_value("scale_factor")
                     .and_then(|r| r.ok())
                     .and_then(|v| match v {
                         netcdf::AttributeValue::Double(d) => Some(d),
@@ -609,7 +645,8 @@ impl ForcingReader {
                     })
                     .unwrap_or(1.0);
 
-                let offset = var.attribute_value("add_offset")
+                let offset = var
+                    .attribute_value("add_offset")
                     .and_then(|r| r.ok())
                     .and_then(|v| match v {
                         netcdf::AttributeValue::Double(d) => Some(d),
@@ -697,9 +734,12 @@ impl ForcingReader {
     fn interpolate_2d(
         &self,
         data: &[Vec<f32>],
-        i0: usize, i1: usize,
-        j0: usize, j1: usize,
-        fx: f64, fy: f64,
+        i0: usize,
+        i1: usize,
+        j0: usize,
+        j1: usize,
+        fx: f64,
+        fy: f64,
     ) -> Option<f32> {
         let v00 = data[j0][i0];
         let v01 = data[j0][i1];
@@ -730,16 +770,22 @@ impl ForcingReader {
 
     /// Get data coverage summary.
     pub fn coverage_summary(&self) -> String {
-        let lon_range = (self.lon.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
-                        self.lon.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)));
-        let lat_range = (self.lat.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
-                        self.lat.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)));
+        let lon_range = (
+            self.lon.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+            self.lon.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)),
+        );
+        let lat_range = (
+            self.lat.iter().fold(f64::INFINITY, |a, &b| a.min(b)),
+            self.lat.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)),
+        );
 
         format!(
             "Forcing data: {} times, lon [{:.2}, {:.2}], lat [{:.2}, {:.2}]",
             self.time.len(),
-            lon_range.0, lon_range.1,
-            lat_range.0, lat_range.1
+            lon_range.0,
+            lon_range.1,
+            lat_range.0,
+            lat_range.1
         )
     }
 }
@@ -772,7 +818,13 @@ impl OceanState {
     /// Current direction (oceanographic: direction flow is TOWARD, degrees).
     pub fn direction(&self) -> f64 {
         let dir = 90.0 - self.v.atan2(self.u).to_degrees();
-        if dir < 0.0 { dir + 360.0 } else if dir >= 360.0 { dir - 360.0 } else { dir }
+        if dir < 0.0 {
+            dir + 360.0
+        } else if dir >= 360.0 {
+            dir - 360.0
+        } else {
+            dir
+        }
     }
 }
 
@@ -969,9 +1021,11 @@ impl OceanModelReader {
         let (lat_name, lon_name, grid_type) = Self::detect_grid_vars(&file)?;
 
         // Read coordinates
-        let lat_var = file.variable(lat_name)
+        let lat_var = file
+            .variable(lat_name)
             .ok_or_else(|| NetCDFError::MissingVariable(lat_name.to_string()))?;
-        let lon_var = file.variable(lon_name)
+        let lon_var = file
+            .variable(lon_name)
             .ok_or_else(|| NetCDFError::MissingVariable(lon_name.to_string()))?;
 
         let lat_dims = lat_var.dimensions();
@@ -1009,11 +1063,41 @@ impl OceanModelReader {
         let n_time = time.len();
 
         // Read variables with automatic name detection
-        let ssh = Self::read_variable(&file, &["zeta", "ssh", "sea_surface_height", "h"], n_time, n_y, n_x);
-        let u = Self::read_variable(&file, &["u_eastward", "u", "eastward_sea_water_velocity"], n_time, n_y, n_x);
-        let v = Self::read_variable(&file, &["v_northward", "v", "northward_sea_water_velocity"], n_time, n_y, n_x);
-        let temperature = Self::read_variable(&file, &["temperature", "temp", "sea_water_temperature"], n_time, n_y, n_x);
-        let salinity = Self::read_variable(&file, &["salinity", "salt", "sea_water_salinity"], n_time, n_y, n_x);
+        let ssh = Self::read_variable(
+            &file,
+            &["zeta", "ssh", "sea_surface_height", "h"],
+            n_time,
+            n_y,
+            n_x,
+        );
+        let u = Self::read_variable(
+            &file,
+            &["u_eastward", "u", "eastward_sea_water_velocity"],
+            n_time,
+            n_y,
+            n_x,
+        );
+        let v = Self::read_variable(
+            &file,
+            &["v_northward", "v", "northward_sea_water_velocity"],
+            n_time,
+            n_y,
+            n_x,
+        );
+        let temperature = Self::read_variable(
+            &file,
+            &["temperature", "temp", "sea_water_temperature"],
+            n_time,
+            n_y,
+            n_x,
+        );
+        let salinity = Self::read_variable(
+            &file,
+            &["salinity", "salt", "sea_water_salinity"],
+            n_time,
+            n_y,
+            n_x,
+        );
 
         // Check if 2D grid is actually regular (constant lat along rows, constant lon along columns)
         // This is common for ocean models like NorKyst that store 2D lat/lon even for regular grids
@@ -1048,7 +1132,11 @@ impl OceanModelReader {
         };
 
         // Update grid_type if we detected a regular 2D grid
-        let grid_type = if is_regular_2d { OceanGridType::Regular } else { grid_type };
+        let grid_type = if is_regular_2d {
+            OceanGridType::Regular
+        } else {
+            grid_type
+        };
 
         // Build spatial index for curvilinear grids
         let spatial_index = if grid_type == OceanGridType::Curvilinear {
@@ -1086,7 +1174,9 @@ impl OceanModelReader {
     }
 
     /// Detect grid variable names and type.
-    fn detect_grid_vars(file: &netcdf::File) -> Result<(&'static str, &'static str, OceanGridType), NetCDFError> {
+    fn detect_grid_vars(
+        file: &netcdf::File,
+    ) -> Result<(&'static str, &'static str, OceanGridType), NetCDFError> {
         // Try common lat/lon names
         let lat_names = ["lat", "latitude", "nav_lat", "lat_rho"];
         let lon_names = ["lon", "longitude", "nav_lon", "lon_rho"];
@@ -1096,14 +1186,20 @@ impl OceanModelReader {
                 let is_2d = lat_var.dimensions().len() == 2;
                 for &lon_name in &lon_names {
                     if file.variable(lon_name).is_some() {
-                        let grid_type = if is_2d { OceanGridType::Curvilinear } else { OceanGridType::Regular };
+                        let grid_type = if is_2d {
+                            OceanGridType::Curvilinear
+                        } else {
+                            OceanGridType::Regular
+                        };
                         return Ok((lat_name, lon_name, grid_type));
                     }
                 }
             }
         }
 
-        Err(NetCDFError::MissingVariable("lat/lon coordinates".to_string()))
+        Err(NetCDFError::MissingVariable(
+            "lat/lon coordinates".to_string(),
+        ))
     }
 
     /// Read time coordinate.
@@ -1163,8 +1259,12 @@ impl OceanModelReader {
                     continue;
                 };
 
-                // Reshape to [time][y][x], taking surface layer if 4D
-                return Some(Self::reshape_to_3d(&flat, &dims, n_time, n_y, n_x));
+                // Reshape to [time][y][x], taking the surface layer if 4D.
+                let n_dims = dims.len();
+                let n_depth = if n_dims == 4 { dims[1].len() } else { 1 };
+                return Some(Self::reshape_to_3d(
+                    &flat, n_dims, n_depth, n_time, n_y, n_x,
+                ));
             }
         }
         None
@@ -1203,17 +1303,23 @@ impl OceanModelReader {
             })
     }
 
-    /// Reshape flat array to 3D [time][y][x], extracting surface from 4D if needed.
+    /// Reshape a flat array to 3D `[time][y][x]`, extracting the surface layer
+    /// from a 4D `[time][s_rho][y][x]` field.
+    ///
+    /// `n_dims` is the rank of the source variable and `n_depth` its vertical
+    /// (`s_rho`) size (ignored unless `n_dims == 4`). ROMS/NorKyst s-coordinates
+    /// are bottom-up, so the surface is layer `n_depth - 1`.
     fn reshape_to_3d(
         flat: &[f32],
-        dims: &[netcdf::Dimension],
+        n_dims: usize,
+        n_depth: usize,
         n_time: usize,
         n_y: usize,
         n_x: usize,
     ) -> Vec<Vec<Vec<f32>>> {
         let mut result = vec![vec![vec![f32::NAN; n_x]; n_y]; n_time];
 
-        match dims.len() {
+        match n_dims {
             2 => {
                 // [y][x] - single time step
                 for j in 0..n_y {
@@ -1239,13 +1345,16 @@ impl OceanModelReader {
                 }
             }
             4 => {
-                // [time][depth][y][x] - take surface (depth=0)
-                let n_depth = dims[1].len();
+                // [time][s_rho][y][x] - take the surface layer.
+                // ROMS/NorKyst s-coordinates are bottom-up: index 0 is the seabed
+                // and index n_depth-1 is the free surface. Taking index 0 (as the
+                // old code did) forces the child model with near-bed velocities.
+                let k_surface = n_depth.saturating_sub(1);
                 for t in 0..n_time {
                     for j in 0..n_y {
                         for i in 0..n_x {
-                            // depth=0 is surface, so depth index contributes 0 to offset
-                            let idx = t * n_depth * n_y * n_x + j * n_x + i;
+                            let idx =
+                                t * n_depth * n_y * n_x + k_surface * n_y * n_x + j * n_x + i;
                             if idx < flat.len() {
                                 result[t][j][i] = flat[idx];
                             }
@@ -1299,27 +1408,43 @@ impl OceanModelReader {
         let i1 = (i0 + 1).min(self.dims.1 - 1);
 
         // Bilinear interpolation for each variable
-        let ssh = self.ssh.as_ref()
+        let ssh = self
+            .ssh
+            .as_ref()
             .and_then(|d| Self::interp_2d(&d[time_idx], j0, j1, i0, i1, fy, fx))
             .unwrap_or(0.0) as f64;
 
-        let u = self.u.as_ref()
+        let u = self
+            .u
+            .as_ref()
             .and_then(|d| Self::interp_2d(&d[time_idx], j0, j1, i0, i1, fy, fx))
             .unwrap_or(0.0) as f64;
 
-        let v = self.v.as_ref()
+        let v = self
+            .v
+            .as_ref()
             .and_then(|d| Self::interp_2d(&d[time_idx], j0, j1, i0, i1, fy, fx))
             .unwrap_or(0.0) as f64;
 
-        let temperature = self.temperature.as_ref()
+        let temperature = self
+            .temperature
+            .as_ref()
             .and_then(|d| Self::interp_2d(&d[time_idx], j0, j1, i0, i1, fy, fx))
             .map(|v| v as f64);
 
-        let salinity = self.salinity.as_ref()
+        let salinity = self
+            .salinity
+            .as_ref()
             .and_then(|d| Self::interp_2d(&d[time_idx], j0, j1, i0, i1, fy, fx))
             .map(|v| v as f64);
 
-        Some(OceanState { ssh, u, v, temperature, salinity })
+        Some(OceanState {
+            ssh,
+            u,
+            v,
+            temperature,
+            salinity,
+        })
     }
 
     /// Get state with time interpolation.
@@ -1416,8 +1541,11 @@ impl OceanModelReader {
             let min_lat = lat00.min(lat01).min(lat10).min(lat11);
             let max_lat = lat00.max(lat01).max(lat10).max(lat11);
 
-            if target_lon < min_lon - 0.1 || target_lon > max_lon + 0.1 ||
-               target_lat < min_lat - 0.1 || target_lat > max_lat + 0.1 {
+            if target_lon < min_lon - 0.1
+                || target_lon > max_lon + 0.1
+                || target_lat < min_lat - 0.1
+                || target_lat > max_lat + 0.1
+            {
                 continue;
             }
 
@@ -1484,9 +1612,12 @@ impl OceanModelReader {
     /// Bilinear interpolation on 2D grid.
     fn interp_2d(
         data: &[Vec<f32>],
-        j0: usize, j1: usize,
-        i0: usize, i1: usize,
-        fy: f64, fx: f64,
+        j0: usize,
+        j1: usize,
+        i0: usize,
+        i1: usize,
+        fy: f64,
+        fx: f64,
     ) -> Option<f32> {
         let v00 = data[j0][i0];
         let v01 = data[j0][i1];
@@ -1518,10 +1649,18 @@ impl OceanModelReader {
     }
 
     /// Check if a variable is available.
-    pub fn has_ssh(&self) -> bool { self.ssh.is_some() }
-    pub fn has_currents(&self) -> bool { self.u.is_some() && self.v.is_some() }
-    pub fn has_temperature(&self) -> bool { self.temperature.is_some() }
-    pub fn has_salinity(&self) -> bool { self.salinity.is_some() }
+    pub fn has_ssh(&self) -> bool {
+        self.ssh.is_some()
+    }
+    pub fn has_currents(&self) -> bool {
+        self.u.is_some() && self.v.is_some()
+    }
+    pub fn has_temperature(&self) -> bool {
+        self.temperature.is_some()
+    }
+    pub fn has_salinity(&self) -> bool {
+        self.salinity.is_some()
+    }
 
     /// Get summary of data coverage.
     pub fn summary(&self) -> String {
@@ -1530,14 +1669,20 @@ impl OceanModelReader {
             self.has_currents().then_some("currents"),
             self.has_temperature().then_some("temperature"),
             self.has_salinity().then_some("salinity"),
-        ].into_iter().flatten().collect();
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
         format!(
             "Ocean model: {}x{} grid, {} times, lon [{:.2}, {:.2}], lat [{:.2}, {:.2}], vars: {}",
-            self.dims.0, self.dims.1,
+            self.dims.0,
+            self.dims.1,
             self.time.len(),
-            self.bbox.0, self.bbox.2,
-            self.bbox.1, self.bbox.3,
+            self.bbox.0,
+            self.bbox.2,
+            self.bbox.1,
+            self.bbox.3,
             vars.join(", ")
         )
     }
@@ -1671,10 +1816,22 @@ mod tests {
         }
 
         let bbox = (
-            lon.iter().flat_map(|r| r.iter()).copied().fold(f64::INFINITY, f64::min),
-            lat.iter().flat_map(|r| r.iter()).copied().fold(f64::INFINITY, f64::min),
-            lon.iter().flat_map(|r| r.iter()).copied().fold(f64::NEG_INFINITY, f64::max),
-            lat.iter().flat_map(|r| r.iter()).copied().fold(f64::NEG_INFINITY, f64::max),
+            lon.iter()
+                .flat_map(|r| r.iter())
+                .copied()
+                .fold(f64::INFINITY, f64::min),
+            lat.iter()
+                .flat_map(|r| r.iter())
+                .copied()
+                .fold(f64::INFINITY, f64::min),
+            lon.iter()
+                .flat_map(|r| r.iter())
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max),
+            lat.iter()
+                .flat_map(|r| r.iter())
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max),
         );
 
         let index = CurvilinearIndex::build(&lat, &lon, bbox);
@@ -1707,9 +1864,34 @@ mod tests {
                 assert!(
                     cands.contains(&(j as u32, i as u32)),
                     "Cell ({},{}) not found at its center ({:.3},{:.3}), got {:?}",
-                    j, i, cx, cy, cands
+                    j,
+                    i,
+                    cx,
+                    cy,
+                    cands
                 );
             }
         }
+    }
+
+    #[cfg(feature = "netcdf")]
+    #[test]
+    fn reshape_to_3d_takes_surface_layer_not_seabed() {
+        // Regression (TODO P0.8): ROMS/NorKyst s-coordinates are bottom-up, so a
+        // 4D [time][s_rho][y][x] field must be sampled at s_rho = n_depth-1 (the
+        // free surface), not index 0 (the seabed). Build a single-time 1x1 column
+        // with a distinct value per layer and assert the surface value is picked.
+        let (n_time, n_depth, n_y, n_x) = (1, 4, 1, 1);
+        // flat layout is [time][s_rho][y][x]; here just one value per layer.
+        let seabed = 10.0_f32;
+        let surface = 40.0_f32;
+        let flat = vec![seabed, 20.0, 30.0, surface];
+
+        let out = OceanModelReader::reshape_to_3d(&flat, 4, n_depth, n_time, n_y, n_x);
+        assert!(
+            (out[0][0][0] - surface).abs() < 1e-6,
+            "expected surface layer value {surface}, got {} (seabed leak?)",
+            out[0][0][0]
+        );
     }
 }

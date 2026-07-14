@@ -216,7 +216,12 @@ impl DGSolution2D {
     /// Extract face values for a specific element and face.
     ///
     /// Returns a vector of nodal values along the face.
-    pub fn extract_face_values(&self, k: ElementIndex, face: usize, ops: &DGOperators2D) -> Vec<f64> {
+    pub fn extract_face_values(
+        &self,
+        k: ElementIndex,
+        face: usize,
+        ops: &DGOperators2D,
+    ) -> Vec<f64> {
         let u_k = self.element(k);
         ops.face_nodes[face].iter().map(|&i| u_k[i]).collect()
     }

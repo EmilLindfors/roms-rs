@@ -22,4 +22,4 @@ pub use coriolis::CoriolisSource2D;
 pub use friction::{ChezyFriction2D, ManningFriction2D, SpatiallyVaryingManning2D};
 pub use tidal::{TidalPotential, TidalPotentialConstituent};
 pub use viscosity::{HorizontalViscosity2D, ViscosityModel};
-pub use wind::{DragCoefficient, WindStress2D, RHO_AIR, RHO_WATER};
+pub use wind::{DragCoefficient, RHO_AIR, RHO_WATER, WindStress2D};

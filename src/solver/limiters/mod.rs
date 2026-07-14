@@ -12,6 +12,7 @@ mod limiters_1d;
 mod standard;
 mod swe_2d;
 mod tracer_2d;
+mod tracer_3d;
 mod traits;
 
 // Traits
@@ -28,8 +29,8 @@ pub use limiters_1d::{TVBParameter, apply_swe_limiters, positivity_limiter, tvb_
 
 // 2D SWE limiters
 pub use swe_2d::{
-    apply_swe_limiters_kuzmin_2d, swe_cell_averages_2d,
-    swe_kuzmin_limiter_2d, swe_positivity_limiter_2d,
+    apply_swe_limiters_kuzmin_2d, swe_cell_averages_2d, swe_kuzmin_limiter_2d,
+    swe_positivity_limiter_2d,
 };
 
 // Parallel 2D SWE limiters
@@ -44,4 +45,10 @@ pub use tracer_2d::{
     KuzminParameter2D, TVBParameter2D, TracerBounds, apply_tracer_limiters_2d,
     apply_tracer_limiters_kuzmin_2d, tracer_cell_averages_2d, tracer_kuzmin_limiter_2d,
     tracer_positivity_limiter_2d, tracer_tvb_limiter_2d,
+};
+
+// 3D Tracer limiters
+pub use tracer_3d::{
+    TracerAveragePolicy3D, TracerLimiter3DConfig, TracerLimiter3DStats, TracerLimiterType3D,
+    apply_tracer_limiters_3d,
 };

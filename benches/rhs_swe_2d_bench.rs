@@ -8,10 +8,9 @@
 //! - Scalar vs SIMD Coriolis source term
 //! - Scalar vs SIMD derivative combination
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use dg_rs::solver::{
-    apply_diff_matrix_scalar, apply_lift_scalar, combine_derivatives_scalar,
-    coriolis_source_scalar,
+    apply_diff_matrix_scalar, apply_lift_scalar, combine_derivatives_scalar, coriolis_source_scalar,
 };
 
 #[cfg(feature = "simd")]
@@ -97,12 +96,9 @@ fn bench_lift_matrix(c: &mut Criterion) {
     let mut group = c.benchmark_group("lift_matrix");
 
     // Test different polynomial orders
-    for (label, n_nodes, n_face_nodes) in [
-        ("P2", 9, 3),
-        ("P3", 16, 4),
-        ("P4", 25, 5),
-        ("P5", 36, 6),
-    ] {
+    for (label, n_nodes, n_face_nodes) in
+        [("P2", 9, 3), ("P3", 16, 4), ("P4", 25, 5), ("P5", 36, 6)]
+    {
         let lift = random_vec(n_nodes * n_face_nodes, 42);
         let flux_diff_h = random_vec(n_face_nodes, 1);
         let flux_diff_hu = random_vec(n_face_nodes, 2);

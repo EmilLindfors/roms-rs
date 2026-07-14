@@ -5,4 +5,4 @@
 
 mod gmsh;
 
-pub use gmsh::{read_gmsh_mesh, write_gmsh_mesh, GmshError};
+pub use gmsh::{GmshError, read_gmsh_mesh, write_gmsh_mesh};

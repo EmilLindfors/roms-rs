@@ -73,10 +73,10 @@ impl VerticalMixing for ConstantMixing {
 /// Kt = v0 / (1 + 5*Ri)^3 + kb
 #[derive(Debug, Clone)]
 pub struct PacanowskiPhilanderMixing {
-    pub v0: f64, // Max viscosity [m^2/s]
-    pub vb: f64, // Background viscosity [m^2/s]
-    pub kb: f64, // Background diffusivity [m^2/s]
-    pub g: f64,  // Gravity [m/s^2]
+    pub v0: f64,   // Max viscosity [m^2/s]
+    pub vb: f64,   // Background viscosity [m^2/s]
+    pub kb: f64,   // Background diffusivity [m^2/s]
+    pub g: f64,    // Gravity [m/s^2]
     pub rho0: f64, // Reference density [kg/m^3]
 }
 
@@ -102,7 +102,7 @@ impl VerticalMixing for PacanowskiPhilanderMixing {
     fn compute_mixing(&self, column: &Column, _forcing: &Forcing) -> (Vec<f64>, Vec<f64>) {
         let n = column.z_r.len();
         let n_w = column.z_w.len();
-        
+
         // Initialize with background values
         let mut av = vec![self.vb; n_w];
         let mut kt = vec![self.kb; n_w];
@@ -113,7 +113,7 @@ impl VerticalMixing for PacanowskiPhilanderMixing {
         // Note: z_w has length N+1 (0..N). z_r has length N (0..N-1).
         // Interface k is between cell k-1 and k.
         // So we iterate k from 1 to N-1.
-        
+
         for k in 1..n {
             // Compute vertical gradients at interface k
             // z_r[k] is above z_r[k-1] (assuming indices increase upwards 0->N-1)
@@ -121,15 +121,17 @@ impl VerticalMixing for PacanowskiPhilanderMixing {
             // z_w[0] is bottom, z_w[N] is surface.
             // z_r[k] is center of cell k.
             // Interface k is between z_r[k-1] and z_r[k].
-            
-            let dz = column.z_r[k] - column.z_r[k-1];
-            if dz < 1e-10 { continue; }
 
-            let du = column.u[k] - column.u[k-1];
-            let dv = column.v[k] - column.v[k-1];
-            let drho = column.rho[k] - column.rho[k-1]; // usually negative for stable stratification (rho decreases upwards)
+            let dz = column.z_r[k] - column.z_r[k - 1];
+            if dz < 1e-10 {
+                continue;
+            }
 
-            let shear2 = (du*du + dv*dv) / (dz*dz);
+            let du = column.u[k] - column.u[k - 1];
+            let dv = column.v[k] - column.v[k - 1];
+            let drho = column.rho[k] - column.rho[k - 1]; // usually negative for stable stratification (rho decreases upwards)
+
+            let shear2 = (du * du + dv * dv) / (dz * dz);
             // N2 = -g/rho0 * d_rho/dz
             let n2 = -self.g / self.rho0 * drho / dz;
 
@@ -156,7 +158,7 @@ impl VerticalMixing for PacanowskiPhilanderMixing {
                 let term = 1.0 + 5.0 * ri;
                 let term2 = term * term;
                 let term3 = term2 * term;
-                
+
                 av[k] = self.v0 / term2 + self.vb;
                 kt[k] = self.v0 / term3 + self.kb;
             }
@@ -165,7 +167,7 @@ impl VerticalMixing for PacanowskiPhilanderMixing {
         // Boundary values (bottom and surface)
         // Usually set to background or matched to log layer.
         // We leave them as background (initialized above).
-        
+
         (av, kt)
     }
 }
@@ -178,11 +180,11 @@ mod tests {
     fn test_constant_mixing() {
         let n = 10;
         let z_r = vec![0.0; n];
-        let z_w = vec![0.0; n+1];
+        let z_w = vec![0.0; n + 1];
         let u = vec![0.0; n];
         let v = vec![0.0; n];
         let rho = vec![0.0; n];
-        
+
         let column = Column {
             z_r: &z_r,
             z_w: &z_w,
@@ -190,21 +192,25 @@ mod tests {
             v: &v,
             rho: &rho,
         };
-        
+
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
             surface_buoyancy_flux: 0.0,
         };
-        
+
         let mix = ConstantMixing::new(0.1, 0.01);
         let (av, kt) = mix.compute_mixing(&column, &forcing);
-        
-        assert_eq!(av.len(), n+1);
-        assert_eq!(kt.len(), n+1);
-        
-        for val in av { assert_eq!(val, 0.1); }
-        for val in kt { assert_eq!(val, 0.01); }
+
+        assert_eq!(av.len(), n + 1);
+        assert_eq!(kt.len(), n + 1);
+
+        for val in av {
+            assert_eq!(val, 0.1);
+        }
+        for val in kt {
+            assert_eq!(val, 0.01);
+        }
     }
 
     #[test]
@@ -215,7 +221,7 @@ mod tests {
         // My implementation: if shear2 < 1e-10, Ri = Infinity.
         // Then term = 1/(1+5*Inf)^2 = 0.
         // So returns background.
-        
+
         let n = 5;
         // dz = 1.0
         let z_r = vec![0.5, 1.5, 2.5, 3.5, 4.5];
@@ -223,20 +229,24 @@ mod tests {
         let u = vec![1.0; n];
         let v = vec![0.0; n];
         let rho = vec![1025.0; n]; // Constant density
-        
+
         let column = Column {
-            z_r: &z_r, z_w: &z_w, u: &u, v: &v, rho: &rho
+            z_r: &z_r,
+            z_w: &z_w,
+            u: &u,
+            v: &v,
+            rho: &rho,
         };
-        
+
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
             surface_buoyancy_flux: 0.0,
         };
-        
+
         let mix = PacanowskiPhilanderMixing::default();
         let (av, kt) = mix.compute_mixing(&column, &forcing);
-        
+
         // Should be background
         for k in 1..n {
             assert!((av[k] - mix.vb).abs() < 1e-10);
@@ -248,34 +258,38 @@ mod tests {
     fn test_pp_mixing_shear_instability() {
         // High shear, no stratification -> Ri = 0.
         // Mixing should be max (v0 + vb).
-        
+
         let n = 3;
         // dz = 1.0
         let z_r = vec![0.5, 1.5, 2.5];
         let z_w = vec![0.0, 1.0, 2.0, 3.0];
-        
+
         // u increases by 1 m/s per meter -> shear = 1.
-        let u = vec![0.0, 1.0, 2.0]; 
+        let u = vec![0.0, 1.0, 2.0];
         let v = vec![0.0; n];
         let rho = vec![1025.0; n]; // Constant density -> N2 = 0.
-        
+
         let column = Column {
-            z_r: &z_r, z_w: &z_w, u: &u, v: &v, rho: &rho
+            z_r: &z_r,
+            z_w: &z_w,
+            u: &u,
+            v: &v,
+            rho: &rho,
         };
-        
+
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
             surface_buoyancy_flux: 0.0,
         };
-        
+
         let mix = PacanowskiPhilanderMixing::default();
         let (av, kt) = mix.compute_mixing(&column, &forcing);
-        
+
         // Ri = 0. term = 1.
         // Av = v0/1 + vb
         // Kt = v0/1 + kb
-        
+
         // Check internal interfaces (k=1, 2)
         // Interface 1 is between cell 0 and 1.
         // Interface 2 is between cell 1 and 2.
@@ -293,38 +307,42 @@ mod tests {
         // drho/dz = -1.0 (stable).
         // N2 = -9.81/1025 * (-1) = 0.00957
         // Ri = 0.00957 / 1.0 = 0.00957
-        
+
         // term = 1 + 5 * 0.00957 = 1.04785
         // av = v0 / term^2 + vb
-        
+
         let n = 3;
         let z_r = vec![0.5, 1.5, 2.5];
         let z_w = vec![0.0, 1.0, 2.0, 3.0];
-        
+
         let u = vec![0.0, 1.0, 2.0];
         let v = vec![0.0; n];
         let rho = vec![1025.0, 1024.0, 1023.0]; // decreasing rho upwards
-        
+
         let column = Column {
-            z_r: &z_r, z_w: &z_w, u: &u, v: &v, rho: &rho
+            z_r: &z_r,
+            z_w: &z_w,
+            u: &u,
+            v: &v,
+            rho: &rho,
         };
-        
+
         let forcing = Forcing {
             surface_stress: [0.0, 0.0],
             bottom_stress: [0.0, 0.0],
             surface_buoyancy_flux: 0.0,
         };
-        
+
         let mix = PacanowskiPhilanderMixing::default();
         let (av, kt) = mix.compute_mixing(&column, &forcing);
-        
+
         let dz = 1.0;
         let shear2 = 1.0;
         let n2 = -mix.g / mix.rho0 * (-1.0) / dz;
         let ri = n2 / shear2;
         let term = 1.0 + 5.0 * ri;
         let expected_av = mix.v0 / (term * term) + mix.vb;
-        
+
         for k in 1..n {
             assert!((av[k] - expected_av).abs() < 1e-10);
         }

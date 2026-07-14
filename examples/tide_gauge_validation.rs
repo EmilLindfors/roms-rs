@@ -19,18 +19,22 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+use dg_rs::SWEFluxType2D;
 use dg_rs::analysis::{
     HarmonicAnalysis, PrecomputedExtractor, StabilityMonitor, StabilityThresholds,
     TideGaugeStation, TimeSeries,
 };
-use dg_rs::boundary::{HarmonicTidal2D, MultiBoundaryCondition2D, Radiation2D, Reflective2D, TidalConstituent};
+use dg_rs::boundary::{
+    HarmonicTidal2D, MultiBoundaryCondition2D, Radiation2D, Reflective2D, TidalConstituent,
+};
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d, swe_positivity_limiter_2d};
+use dg_rs::solver::{
+    SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d, swe_positivity_limiter_2d,
+};
 use dg_rs::source::CoriolisSource2D;
 use dg_rs::types::ElementIndex;
-use dg_rs::SWEFluxType2D;
 
 /// Helper for typed element indices
 fn k(idx: usize) -> ElementIndex {
@@ -113,11 +117,7 @@ fn trondelag_tidal_data() -> Vec<StationTidalData> {
 }
 
 /// Generate synthetic tide gauge observations from tidal constituents.
-fn generate_observations(
-    data: &StationTidalData,
-    times: &[f64],
-    noise_amplitude: f64,
-) -> Vec<f64> {
+fn generate_observations(data: &StationTidalData, times: &[f64], noise_amplitude: f64) -> Vec<f64> {
     // Tidal periods in seconds
     let m2_period = 12.42 * 3600.0;
     let s2_period = 12.00 * 3600.0;
@@ -208,7 +208,11 @@ fn main() {
     let cfl = 0.5;
 
     println!("Simulation Setup:");
-    println!("  Domain: {:.0} km x {:.0} km", domain_size / 1000.0, domain_size / 1000.0);
+    println!(
+        "  Domain: {:.0} km x {:.0} km",
+        domain_size / 1000.0,
+        domain_size / 1000.0
+    );
     println!("  Elements: {} x {}", nx, ny);
     println!("  Polynomial order: {}", n_poly);
     println!("  Mean depth: {:.0} m", h0);
@@ -255,13 +259,19 @@ fn main() {
         let x = domain_size * 0.2 + (data.longitude - 7.0) / 4.0 * domain_size * 0.6;
         let y = domain_size * 0.2 + (data.latitude - 63.0) / 1.0 * domain_size * 0.6;
         let station = TideGaugeStation::new(data.name, data.longitude, data.latitude)
-            .with_local_coords(x.clamp(5000.0, domain_size - 5000.0), y.clamp(5000.0, domain_size - 5000.0));
+            .with_local_coords(
+                x.clamp(5000.0, domain_size - 5000.0),
+                y.clamp(5000.0, domain_size - 5000.0),
+            );
         stations.push(station);
 
         println!(
             "  {}: M2={:.2}m @ {:.0}°, local=({:.1}km, {:.1}km)",
-            data.name, data.m2_amplitude, data.m2_phase_deg,
-            x / 1000.0, y / 1000.0
+            data.name,
+            data.m2_amplitude,
+            data.m2_phase_deg,
+            x / 1000.0,
+            y / 1000.0
         );
     }
     println!();
@@ -282,24 +292,41 @@ fn main() {
         BoundaryTag::Wall,         // North
         BoundaryTag::TidalForcing, // West (tidal inflow)
     ];
-    let mesh = Mesh2D::uniform_rectangle_with_sides(0.0, domain_size, 0.0, domain_size, nx, ny, bc_tags);
+    let mesh =
+        Mesh2D::uniform_rectangle_with_sides(0.0, domain_size, 0.0, domain_size, nx, ny, bc_tags);
     let ops = DGOperators2D::new(n_poly);
     let geom = GeometricFactors2D::compute(&mesh);
 
-    println!("  Mesh: {} elements, {} boundary edges", mesh.n_elements, mesh.n_boundary_edges);
+    println!(
+        "  Mesh: {} elements, {} boundary edges",
+        mesh.n_elements, mesh.n_boundary_edges
+    );
 
     // Use average tidal characteristics for boundary forcing
-    let avg_m2_amp = tidal_data.iter().map(|d| d.m2_amplitude).sum::<f64>() / tidal_data.len() as f64;
-    let avg_s2_amp = tidal_data.iter().map(|d| d.s2_amplitude).sum::<f64>() / tidal_data.len() as f64;
-    let _avg_k1_amp = tidal_data.iter().map(|d| d.k1_amplitude).sum::<f64>() / tidal_data.len() as f64;
-    let _avg_o1_amp = tidal_data.iter().map(|d| d.o1_amplitude).sum::<f64>() / tidal_data.len() as f64;
-    let avg_m2_phase = tidal_data.iter().map(|d| d.m2_phase_deg).sum::<f64>() / tidal_data.len() as f64;
-    let avg_s2_phase = tidal_data.iter().map(|d| d.s2_phase_deg).sum::<f64>() / tidal_data.len() as f64;
-    let _avg_k1_phase = tidal_data.iter().map(|d| d.k1_phase_deg).sum::<f64>() / tidal_data.len() as f64;
-    let _avg_o1_phase = tidal_data.iter().map(|d| d.o1_phase_deg).sum::<f64>() / tidal_data.len() as f64;
+    let avg_m2_amp =
+        tidal_data.iter().map(|d| d.m2_amplitude).sum::<f64>() / tidal_data.len() as f64;
+    let avg_s2_amp =
+        tidal_data.iter().map(|d| d.s2_amplitude).sum::<f64>() / tidal_data.len() as f64;
+    let _avg_k1_amp =
+        tidal_data.iter().map(|d| d.k1_amplitude).sum::<f64>() / tidal_data.len() as f64;
+    let _avg_o1_amp =
+        tidal_data.iter().map(|d| d.o1_amplitude).sum::<f64>() / tidal_data.len() as f64;
+    let avg_m2_phase =
+        tidal_data.iter().map(|d| d.m2_phase_deg).sum::<f64>() / tidal_data.len() as f64;
+    let avg_s2_phase =
+        tidal_data.iter().map(|d| d.s2_phase_deg).sum::<f64>() / tidal_data.len() as f64;
+    let _avg_k1_phase =
+        tidal_data.iter().map(|d| d.k1_phase_deg).sum::<f64>() / tidal_data.len() as f64;
+    let _avg_o1_phase =
+        tidal_data.iter().map(|d| d.o1_phase_deg).sum::<f64>() / tidal_data.len() as f64;
 
-    println!("  Tidal forcing (scaled): M2={:.3}m @ {:.0}°, S2={:.3}m @ {:.0}°",
-        avg_m2_amp * amp_scale, avg_m2_phase, avg_s2_amp * amp_scale, avg_s2_phase);
+    println!(
+        "  Tidal forcing (scaled): M2={:.3}m @ {:.0}°, S2={:.3}m @ {:.0}°",
+        avg_m2_amp * amp_scale,
+        avg_m2_phase,
+        avg_s2_amp * amp_scale,
+        avg_s2_phase
+    );
 
     // Setup boundary conditions
     //
@@ -313,12 +340,10 @@ fn main() {
     let wall_bc = Reflective2D::new();
     let radiation_bc = Radiation2D::new(h0);
 
-    let tidal_bc = HarmonicTidal2D::new(
-        vec![
-            TidalConstituent::m2(avg_m2_amp * amp_scale, avg_m2_phase.to_radians()),
-            TidalConstituent::s2(avg_s2_amp * amp_scale, avg_s2_phase.to_radians()),
-        ],
-    )
+    let tidal_bc = HarmonicTidal2D::new(vec![
+        TidalConstituent::m2(avg_m2_amp * amp_scale, avg_m2_phase.to_radians()),
+        TidalConstituent::s2(avg_s2_amp * amp_scale, avg_s2_phase.to_radians()),
+    ])
     .with_ramp_up(6.0 * 3600.0); // 6-hour ramp (half M2 period)
 
     // Combine boundary conditions
@@ -405,7 +430,11 @@ fn main() {
             print!("\r  t = {:.1} h ({:.0}%), step {}    ", hours, pct, step);
         }
     }
-    println!("\r  Completed: {} steps, {:.1} hours simulated", step, time / 3600.0);
+    println!(
+        "\r  Completed: {} steps, {:.1} hours simulated",
+        step,
+        time / 3600.0
+    );
     println!();
 
     // ========================================================================
@@ -417,11 +446,18 @@ fn main() {
     // Debug: check model output
     for station in &stations {
         let values = model_at_stations.get(&station.name).unwrap();
-        let (min, max) = values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
-            (min.min(v), max.max(v))
-        });
-        println!("  Model at {}: {} points, range [{:.4}, {:.4}] m",
-            station.name, values.len(), min, max);
+        let (min, max) = values
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &v| {
+                (min.min(v), max.max(v))
+            });
+        println!(
+            "  Model at {}: {} points, range [{:.4}, {:.4}] m",
+            station.name,
+            values.len(),
+            min,
+            max
+        );
     }
 
     let mut extractor = PrecomputedExtractor::new();
@@ -524,8 +560,14 @@ fn main() {
 
     println!("\nKey Metrics:");
     println!("  Mean RMSE: {:.3} m (target: < 0.1 m)", summary.mean_rmse);
-    println!("  Mean Correlation: {:.3} (target: > 0.9)", summary.mean_correlation);
-    println!("  Mean Skill: {:.3} (target: > 0.8)", summary.mean_skill_score);
+    println!(
+        "  Mean Correlation: {:.3} (target: > 0.9)",
+        summary.mean_correlation
+    );
+    println!(
+        "  Mean Skill: {:.3} (target: > 0.8)",
+        summary.mean_skill_score
+    );
 
     // Expected result: Model should capture tidal signal but with some phase/amplitude
     // errors due to simplified domain (no real bathymetry, uniform depth)

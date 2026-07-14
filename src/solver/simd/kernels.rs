@@ -541,7 +541,12 @@ pub fn coriolis_source(
         #[inline(always)]
         fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
             simd_impl::coriolis_source_simd_inner(
-                simd, self.hu, self.hv, self.out_hu, self.out_hv, self.f,
+                simd,
+                self.hu,
+                self.hv,
+                self.out_hu,
+                self.out_hv,
+                self.f,
             );
         }
     }
@@ -691,7 +696,14 @@ mod tests {
         let mut out_hv = vec![0.0; n];
 
         apply_diff_matrix_scalar(
-            &d, &flux_h, &flux_hu, &flux_hv, &mut out_h, &mut out_hu, &mut out_hv, n,
+            &d,
+            &flux_h,
+            &flux_hu,
+            &flux_hv,
+            &mut out_h,
+            &mut out_hu,
+            &mut out_hv,
+            n,
         );
 
         // Verify against manual computation for first element

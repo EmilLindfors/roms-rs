@@ -13,10 +13,13 @@ use crate::equations::ShallowWater2D;
 use crate::flux::{SWEFluxType2D, compute_flux_swe_2d};
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::state::{SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{SWESolution2D, SWEState2D};
-use crate::source::{HydrostaticReconstruction2D, SourceContext2D, SourceTerm2D};
 use crate::source::swe_2d::viscosity::HorizontalViscosity2D;
+use crate::source::{HydrostaticReconstruction2D, SourceContext2D, SourceTerm2D};
 use crate::types::ElementIndex;
+
+use super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
 
 /// Configuration for 2D SWE RHS computation.
 pub struct SWE2DRhsConfig<'a, BC: SWEBoundaryCondition2D> {
@@ -173,6 +176,137 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
     }
 }
 
+fn boundary_velocity_component<BC: SWEBoundaryCondition2D>(
+    component: usize,
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    visc_h_min: f64,
+    k: ElementIndex,
+    face: usize,
+    node: usize,
+) -> f64 {
+    let state = q.get_state(k, node);
+    let normal = geom.normals[k.as_usize()][face];
+    let (r, s) = (ops.nodes_r[node], ops.nodes_s[node]);
+    let [x, y] = mesh.reference_to_physical(k, r, s);
+    let bathy_value = config.bathymetry.map(|b| b.get(k, node)).unwrap_or(0.0);
+    let h_min = config.equation.h_min.meters();
+
+    let mut ctx = match mesh.boundary_tag(k, face) {
+        Some(tag) => BCContext2D::with_tag(
+            time,
+            (x, y),
+            state,
+            bathy_value,
+            normal,
+            config.equation.g,
+            h_min,
+            tag,
+        ),
+        None => BCContext2D::new(
+            time,
+            (x, y),
+            state,
+            bathy_value,
+            normal,
+            config.equation.g,
+            h_min,
+        ),
+    };
+    ctx.dt = config.dt;
+
+    let ghost = config.bc.ghost_state(&ctx);
+    if ghost.h <= visc_h_min {
+        return 0.0;
+    }
+
+    let h_safe = ghost.h.max(visc_h_min);
+    match component {
+        0 => ghost.hu / h_safe,
+        1 => ghost.hv / h_safe,
+        _ => unreachable!("invalid velocity component"),
+    }
+}
+
+fn add_br1_viscosity<BC: SWEBoundaryCondition2D>(
+    rhs: &mut SWESolution2D,
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+) {
+    let Some(visc) = config.viscosity else {
+        return;
+    };
+
+    let n_nodes = ops.n_nodes;
+    let total_nodes = mesh.n_elements * n_nodes;
+    let mut u = vec![0.0; total_nodes];
+    let mut v = vec![0.0; total_nodes];
+
+    for k in ElementIndex::iter(mesh.n_elements) {
+        for i in 0..n_nodes {
+            let flat = k.as_usize() * n_nodes + i;
+            let state = q.get_state(k, i);
+            if state.h > visc.h_min {
+                let h_safe = state.h.max(visc.h_min);
+                u[flat] = state.hu / h_safe;
+                v[flat] = state.hv / h_safe;
+            }
+        }
+    }
+
+    let boundary_u_for_gradient = |k, face, _fi, node, _interior| {
+        boundary_velocity_component(
+            0, q, mesh, ops, geom, config, time, visc.h_min, k, face, node,
+        )
+    };
+    let boundary_v_for_gradient = |k, face, _fi, node, _interior| {
+        boundary_velocity_component(
+            1, q, mesh, ops, geom, config, time, visc.h_min, k, face, node,
+        )
+    };
+
+    let grad_u = compute_br1_gradient_2d(&u, mesh, ops, geom, boundary_u_for_gradient);
+    let grad_v = compute_br1_gradient_2d(&v, mesh, ops, geom, boundary_v_for_gradient);
+
+    let mut coeff = vec![0.0; total_nodes];
+    for k in ElementIndex::iter(mesh.n_elements) {
+        let delta = geom.det_j[k.as_usize()].sqrt();
+        for i in 0..n_nodes {
+            let flat = k.as_usize() * n_nodes + i;
+            let state = q.get_state(k, i);
+            if state.h > visc.h_min {
+                let nu = visc.compute_viscosity(
+                    grad_u[flat].dx,
+                    grad_u[flat].dy,
+                    grad_v[flat].dx,
+                    grad_v[flat].dy,
+                    delta,
+                );
+                coeff[flat] = nu * state.h;
+            }
+        }
+    }
+
+    let diff_u = compute_br1_diffusion_rhs_2d(&u, &coeff, &grad_u, mesh, ops, geom);
+    let diff_v = compute_br1_diffusion_rhs_2d(&v, &coeff, &grad_v, mesh, ops, geom);
+
+    for k in ElementIndex::iter(mesh.n_elements) {
+        for i in 0..n_nodes {
+            let flat = k.as_usize() * n_nodes + i;
+            rhs.data[SWE_VAR_HU][flat] += diff_u[flat];
+            rhs.data[SWE_VAR_HV][flat] += diff_v[flat];
+        }
+    }
+}
+
 /// Compute the right-hand side for 2D SWE.
 ///
 /// Implements the DG weak form for a system:
@@ -203,16 +337,6 @@ pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
     let mut ext_states_buf = vec![SWEState2D::zero(); n_face_nodes];
     let mut ext_bathy_buf = vec![0.0; n_face_nodes];
     let mut flux_diff = vec![SWEState2D::zero(); n_face_nodes];
-
-    // Viscosity workspace (only allocated if viscosity is enabled)
-    let mut du_dx_buf = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
-    let mut du_dy_buf = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
-    let mut dv_dx_buf = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
-    let mut dv_dy_buf = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
-    let mut visc_flux_ux = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
-    let mut visc_flux_uy = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
-    let mut visc_flux_vx = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
-    let mut visc_flux_vy = if config.viscosity.is_some() { vec![0.0; n_nodes] } else { vec![] };
 
     for k in ElementIndex::iter(mesh.n_elements) {
         let j_inv = geom.det_j_inv[k.as_usize()];
@@ -310,8 +434,7 @@ pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
                     let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
                     let [x, y] = mesh.reference_to_physical(k, r, s);
 
-                    let bathy_value =
-                        config.bathymetry.map(|b| b.get(k, node_idx)).unwrap_or(0.0);
+                    let bathy_value = config.bathymetry.map(|b| b.get(k, node_idx)).unwrap_or(0.0);
 
                     // Create context with boundary tag for multi-BC dispatch
                     let mut ctx = match boundary_tag {
@@ -325,15 +448,9 @@ pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
                             h_min,
                             tag,
                         ),
-                        None => BCContext2D::new(
-                            time,
-                            (x, y),
-                            state,
-                            bathy_value,
-                            normal,
-                            g,
-                            h_min,
-                        ),
+                        None => {
+                            BCContext2D::new(time, (x, y), state, bathy_value, normal, g, h_min)
+                        }
                     };
                     ctx.dt = config.dt;
                     ext_states_buf[i] = config.bc.ghost_state(&ctx);
@@ -438,101 +555,12 @@ pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
                 rhs.set_state(k, i, current + source);
             }
         }
-
-        // 5. Horizontal viscosity: ∇·(ν h ∇u), ∇·(ν h ∇v)
-        if let Some(visc) = config.viscosity {
-            let delta = geom.det_j[k.as_usize()].sqrt();
-
-            // 5a: Compute velocity gradients in physical coordinates
-            for i in 0..n_nodes {
-                let state = q.get_state(k, i);
-                let h_safe = state.h.max(visc.h_min);
-
-                let mut du_dr = 0.0;
-                let mut du_ds = 0.0;
-                let mut dv_dr = 0.0;
-                let mut dv_ds = 0.0;
-
-                for j in 0..n_nodes {
-                    let state_j = q.get_state(k, j);
-                    let h_j = state_j.h.max(visc.h_min);
-                    let u_j = state_j.hu / h_j;
-                    let v_j = state_j.hv / h_j;
-
-                    let dr_ij = ops.dr[(i, j)];
-                    let ds_ij = ops.ds[(i, j)];
-
-                    du_dr += dr_ij * u_j;
-                    du_ds += ds_ij * u_j;
-                    dv_dr += dr_ij * v_j;
-                    dv_ds += ds_ij * v_j;
-                }
-
-                du_dx_buf[i] = du_dr * rx + du_ds * sx;
-                du_dy_buf[i] = du_dr * ry + du_ds * sy;
-                dv_dx_buf[i] = dv_dr * rx + dv_ds * sx;
-                dv_dy_buf[i] = dv_dr * ry + dv_ds * sy;
-
-                // 5b: Compute viscous fluxes: ν·h·∂u/∂x, ν·h·∂u/∂y, etc.
-                let nu = visc.compute_viscosity(
-                    du_dx_buf[i], du_dy_buf[i], dv_dx_buf[i], dv_dy_buf[i], delta,
-                );
-                visc_flux_ux[i] = nu * h_safe * du_dx_buf[i];
-                visc_flux_uy[i] = nu * h_safe * du_dy_buf[i];
-                visc_flux_vx[i] = nu * h_safe * dv_dx_buf[i];
-                visc_flux_vy[i] = nu * h_safe * dv_dy_buf[i];
-            }
-
-            // 5c: Apply divergence (differentiate viscous fluxes)
-            // ∇·(ν h ∇u) = ∂/∂x(visc_flux_ux) + ∂/∂y(visc_flux_uy)
-            for i in 0..n_nodes {
-                let mut d_vfux_dr = 0.0;
-                let mut d_vfux_ds = 0.0;
-                let mut d_vfuy_dr = 0.0;
-                let mut d_vfuy_ds = 0.0;
-                let mut d_vfvx_dr = 0.0;
-                let mut d_vfvx_ds = 0.0;
-                let mut d_vfvy_dr = 0.0;
-                let mut d_vfvy_ds = 0.0;
-
-                for j in 0..n_nodes {
-                    let dr_ij = ops.dr[(i, j)];
-                    let ds_ij = ops.ds[(i, j)];
-
-                    d_vfux_dr += dr_ij * visc_flux_ux[j];
-                    d_vfux_ds += ds_ij * visc_flux_ux[j];
-                    d_vfuy_dr += dr_ij * visc_flux_uy[j];
-                    d_vfuy_ds += ds_ij * visc_flux_uy[j];
-                    d_vfvx_dr += dr_ij * visc_flux_vx[j];
-                    d_vfvx_ds += ds_ij * visc_flux_vx[j];
-                    d_vfvy_dr += dr_ij * visc_flux_vy[j];
-                    d_vfvy_ds += ds_ij * visc_flux_vy[j];
-                }
-
-                // Transform to physical: ∂/∂x = rx·∂/∂r + sx·∂/∂s
-                let div_visc_u = (rx * d_vfux_dr + sx * d_vfux_ds)
-                    + (ry * d_vfuy_dr + sy * d_vfuy_ds);
-                let div_visc_v = (rx * d_vfvx_dr + sx * d_vfvx_ds)
-                    + (ry * d_vfvy_dr + sy * d_vfvy_ds);
-
-                // Add to momentum RHS only (NOT continuity)
-                let current = rhs.get_state(k, i);
-                rhs.set_state(
-                    k,
-                    i,
-                    SWEState2D {
-                        h: current.h,
-                        hu: current.hu + div_visc_u,
-                        hv: current.hv + div_visc_v,
-                    },
-                );
-            }
-        }
     }
+
+    add_br1_viscosity(&mut rhs, q, mesh, ops, geom, config, time);
 
     rhs
 }
-
 
 /// Compute the stable time step for 2D SWE.
 ///
@@ -684,15 +712,6 @@ struct ThreadWorkspace {
     ext_states_h: Vec<f64>,
     ext_states_hu: Vec<f64>,
     ext_states_hv: Vec<f64>,
-    // Viscosity workspace buffers
-    du_dx: Vec<f64>,
-    du_dy: Vec<f64>,
-    dv_dx: Vec<f64>,
-    dv_dy: Vec<f64>,
-    visc_flux_ux: Vec<f64>,
-    visc_flux_uy: Vec<f64>,
-    visc_flux_vx: Vec<f64>,
-    visc_flux_vy: Vec<f64>,
 }
 
 #[cfg(all(feature = "parallel", feature = "simd"))]
@@ -733,15 +752,6 @@ impl ThreadWorkspace {
             ext_states_h: vec![0.0; n_face_nodes],
             ext_states_hu: vec![0.0; n_face_nodes],
             ext_states_hv: vec![0.0; n_face_nodes],
-            // Viscosity workspace buffers
-            du_dx: vec![0.0; n_nodes],
-            du_dy: vec![0.0; n_nodes],
-            dv_dx: vec![0.0; n_nodes],
-            dv_dy: vec![0.0; n_nodes],
-            visc_flux_ux: vec![0.0; n_nodes],
-            visc_flux_uy: vec![0.0; n_nodes],
-            visc_flux_vx: vec![0.0; n_nodes],
-            visc_flux_vy: vec![0.0; n_nodes],
         }
     }
 
@@ -770,9 +780,7 @@ pub fn compute_rhs_swe_2d_parallel<BC: SWEBoundaryCondition2D + Sync>(
     config: &SWE2DRhsConfig<BC>,
     time: f64,
 ) -> SWESolution2D {
-    use crate::solver::{
-        apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source,
-    };
+    use crate::solver::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
     use rayon::prelude::*;
 
     let n_nodes = ops.n_nodes;
@@ -788,7 +796,8 @@ pub fn compute_rhs_swe_2d_parallel<BC: SWEBoundaryCondition2D + Sync>(
     // Uses par_chunks_mut to eliminate intermediate Vec collection and final copy
     {
         let [rhs_h, rhs_hu, rhs_hv] = &mut rhs.data;
-        rhs_h.par_chunks_mut(n_nodes)
+        rhs_h
+            .par_chunks_mut(n_nodes)
             .zip(rhs_hu.par_chunks_mut(n_nodes))
             .zip(rhs_hv.par_chunks_mut(n_nodes))
             .enumerate()
@@ -802,288 +811,290 @@ pub fn compute_rhs_swe_2d_parallel<BC: SWEBoundaryCondition2D + Sync>(
                     let sx = geom.sx[k];
                     let sy = geom.sy[k];
 
-                // Clear RHS workspace
-                ws.clear_rhs();
+                    // Clear RHS workspace
+                    ws.clear_rhs();
 
-                // 1. Volume term: -(∇ · F)
-                // Compute fluxes at all nodes and extract to SoA
-                for i in 0..n_nodes {
-                    let state = q.get_state(k_idx, i);
-                    let fx = config.equation.flux_x(&state);
-                    let fy = config.equation.flux_y(&state);
-                    ws.flux_x_h[i] = fx.h;
-                    ws.flux_x_hu[i] = fx.hu;
-                    ws.flux_x_hv[i] = fx.hv;
-                    ws.flux_y_h[i] = fy.h;
-                    ws.flux_y_hu[i] = fy.hu;
-                    ws.flux_y_hv[i] = fy.hv;
-                    // Also extract hu, hv for Coriolis
-                    ws.hu_arr[i] = state.hu;
-                    ws.hv_arr[i] = state.hv;
-                }
-
-                // Apply Dr and Ds to flux_x and flux_y using SIMD kernels
-                apply_diff_matrix(
-                    &ops.dr_row_major, &ws.flux_x_h, &ws.flux_x_hu, &ws.flux_x_hv,
-                    &mut ws.dfx_dr_h, &mut ws.dfx_dr_hu, &mut ws.dfx_dr_hv, n_nodes,
-                );
-                apply_diff_matrix(
-                    &ops.ds_row_major, &ws.flux_x_h, &ws.flux_x_hu, &ws.flux_x_hv,
-                    &mut ws.dfx_ds_h, &mut ws.dfx_ds_hu, &mut ws.dfx_ds_hv, n_nodes,
-                );
-                apply_diff_matrix(
-                    &ops.dr_row_major, &ws.flux_y_h, &ws.flux_y_hu, &ws.flux_y_hv,
-                    &mut ws.dfy_dr_h, &mut ws.dfy_dr_hu, &mut ws.dfy_dr_hv, n_nodes,
-                );
-                apply_diff_matrix(
-                    &ops.ds_row_major, &ws.flux_y_h, &ws.flux_y_hu, &ws.flux_y_hv,
-                    &mut ws.dfy_ds_h, &mut ws.dfy_ds_hu, &mut ws.dfy_ds_hv, n_nodes,
-                );
-
-                // Combine derivatives with geometric factors using SIMD kernel: RHS = -div(F)
-                combine_derivatives(
-                    &ws.dfx_dr_h, &ws.dfx_dr_hu, &ws.dfx_dr_hv,
-                    &ws.dfx_ds_h, &ws.dfx_ds_hu, &ws.dfx_ds_hv,
-                    &ws.dfy_dr_h, &ws.dfy_dr_hu, &ws.dfy_dr_hv,
-                    &ws.dfy_ds_h, &ws.dfy_ds_hu, &ws.dfy_ds_hv,
-                    &mut ws.rhs_h, &mut ws.rhs_hu, &mut ws.rhs_hv,
-                    rx, sx, ry, sy, n_nodes,
-                );
-
-                // 2. Surface terms
-                // Create hydrostatic reconstruction once per element (not per face)
-                let hr = if config.well_balanced && config.bathymetry.is_some() {
-                    Some(HydrostaticReconstruction2D::new(g, h_min))
-                } else {
-                    None
-                };
-
-                for face in 0..4 {
-                    let normal = geom.normals[k][face];
-                    let s_jac = geom.surface_j[k][face];
-                    let face_nodes = &ops.face_nodes[face];
-
-                    // Get interior bathymetry at face nodes (reuse workspace buffer)
-                    if config.well_balanced && config.bathymetry.is_some() {
-                        let bathy = config.bathymetry.unwrap();
-                        for (i, &node) in face_nodes.iter().enumerate() {
-                            ws.int_bathy[i] = bathy.get(k_idx, node);
-                        }
-                    } else {
-                        ws.int_bathy[..n_face_nodes].fill(0.0);
+                    // 1. Volume term: -(∇ · F)
+                    // Compute fluxes at all nodes and extract to SoA
+                    for i in 0..n_nodes {
+                        let state = q.get_state(k_idx, i);
+                        let fx = config.equation.flux_x(&state);
+                        let fy = config.equation.flux_y(&state);
+                        ws.flux_x_h[i] = fx.h;
+                        ws.flux_x_hu[i] = fx.hu;
+                        ws.flux_x_hv[i] = fx.hv;
+                        ws.flux_y_h[i] = fy.h;
+                        ws.flux_y_hu[i] = fy.hu;
+                        ws.flux_y_hv[i] = fy.hv;
+                        // Also extract hu, hv for Coriolis
+                        ws.hu_arr[i] = state.hu;
+                        ws.hv_arr[i] = state.hv;
                     }
 
-                    // Get exterior states and bathymetry (reuse workspace buffers)
-                    if let Some(neighbor) = mesh.neighbor(k_idx, face) {
-                        let neighbor_face_nodes = &ops.face_nodes[neighbor.face];
-                        for i in 0..n_face_nodes {
-                            let state = q.get_state(
-                                ElementIndex::new(neighbor.element),
-                                neighbor_face_nodes[n_face_nodes - 1 - i],
-                            );
-                            ws.ext_states_h[i] = state.h;
-                            ws.ext_states_hu[i] = state.hu;
-                            ws.ext_states_hv[i] = state.hv;
-                        }
+                    // Apply Dr and Ds to flux_x and flux_y using SIMD kernels
+                    apply_diff_matrix(
+                        &ops.dr_row_major,
+                        &ws.flux_x_h,
+                        &ws.flux_x_hu,
+                        &ws.flux_x_hv,
+                        &mut ws.dfx_dr_h,
+                        &mut ws.dfx_dr_hu,
+                        &mut ws.dfx_dr_hv,
+                        n_nodes,
+                    );
+                    apply_diff_matrix(
+                        &ops.ds_row_major,
+                        &ws.flux_x_h,
+                        &ws.flux_x_hu,
+                        &ws.flux_x_hv,
+                        &mut ws.dfx_ds_h,
+                        &mut ws.dfx_ds_hu,
+                        &mut ws.dfx_ds_hv,
+                        n_nodes,
+                    );
+                    apply_diff_matrix(
+                        &ops.dr_row_major,
+                        &ws.flux_y_h,
+                        &ws.flux_y_hu,
+                        &ws.flux_y_hv,
+                        &mut ws.dfy_dr_h,
+                        &mut ws.dfy_dr_hu,
+                        &mut ws.dfy_dr_hv,
+                        n_nodes,
+                    );
+                    apply_diff_matrix(
+                        &ops.ds_row_major,
+                        &ws.flux_y_h,
+                        &ws.flux_y_hu,
+                        &ws.flux_y_hv,
+                        &mut ws.dfy_ds_h,
+                        &mut ws.dfy_ds_hu,
+                        &mut ws.dfy_ds_hv,
+                        n_nodes,
+                    );
+
+                    // Combine derivatives with geometric factors using SIMD kernel: RHS = -div(F)
+                    combine_derivatives(
+                        &ws.dfx_dr_h,
+                        &ws.dfx_dr_hu,
+                        &ws.dfx_dr_hv,
+                        &ws.dfx_ds_h,
+                        &ws.dfx_ds_hu,
+                        &ws.dfx_ds_hv,
+                        &ws.dfy_dr_h,
+                        &ws.dfy_dr_hu,
+                        &ws.dfy_dr_hv,
+                        &ws.dfy_ds_h,
+                        &ws.dfy_ds_hu,
+                        &ws.dfy_ds_hv,
+                        &mut ws.rhs_h,
+                        &mut ws.rhs_hu,
+                        &mut ws.rhs_hv,
+                        rx,
+                        sx,
+                        ry,
+                        sy,
+                        n_nodes,
+                    );
+
+                    // 2. Surface terms
+                    // Create hydrostatic reconstruction once per element (not per face)
+                    let hr = if config.well_balanced && config.bathymetry.is_some() {
+                        Some(HydrostaticReconstruction2D::new(g, h_min))
+                    } else {
+                        None
+                    };
+
+                    for face in 0..4 {
+                        let normal = geom.normals[k][face];
+                        let s_jac = geom.surface_j[k][face];
+                        let face_nodes = &ops.face_nodes[face];
+
+                        // Get interior bathymetry at face nodes (reuse workspace buffer)
                         if config.well_balanced && config.bathymetry.is_some() {
-                            let b = config.bathymetry.unwrap();
+                            let bathy = config.bathymetry.unwrap();
+                            for (i, &node) in face_nodes.iter().enumerate() {
+                                ws.int_bathy[i] = bathy.get(k_idx, node);
+                            }
+                        } else {
+                            ws.int_bathy[..n_face_nodes].fill(0.0);
+                        }
+
+                        // Get exterior states and bathymetry (reuse workspace buffers)
+                        if let Some(neighbor) = mesh.neighbor(k_idx, face) {
+                            let neighbor_face_nodes = &ops.face_nodes[neighbor.face];
                             for i in 0..n_face_nodes {
-                                ws.ext_bathy[i] = b.get(
+                                let state = q.get_state(
                                     ElementIndex::new(neighbor.element),
                                     neighbor_face_nodes[n_face_nodes - 1 - i],
                                 );
+                                ws.ext_states_h[i] = state.h;
+                                ws.ext_states_hu[i] = state.hu;
+                                ws.ext_states_hv[i] = state.hv;
+                            }
+                            if config.well_balanced && config.bathymetry.is_some() {
+                                let b = config.bathymetry.unwrap();
+                                for i in 0..n_face_nodes {
+                                    ws.ext_bathy[i] = b.get(
+                                        ElementIndex::new(neighbor.element),
+                                        neighbor_face_nodes[n_face_nodes - 1 - i],
+                                    );
+                                }
+                            } else {
+                                ws.ext_bathy[..n_face_nodes].fill(0.0);
                             }
                         } else {
-                            ws.ext_bathy[..n_face_nodes].fill(0.0);
+                            // Boundary face: compute ghost states
+                            let boundary_tag = mesh.boundary_tag(k_idx, face);
+                            for i in 0..n_face_nodes {
+                                let node_idx = face_nodes[i];
+                                let state = q.get_state(k_idx, node_idx);
+                                let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
+                                let [x, y] = mesh.reference_to_physical(k_idx, r, s);
+
+                                let bathy_value = config
+                                    .bathymetry
+                                    .map(|b| b.get(k_idx, node_idx))
+                                    .unwrap_or(0.0);
+
+                                let mut ctx = match boundary_tag {
+                                    Some(tag) => BCContext2D::with_tag(
+                                        time,
+                                        (x, y),
+                                        state,
+                                        bathy_value,
+                                        normal,
+                                        g,
+                                        h_min,
+                                        tag,
+                                    ),
+                                    None => BCContext2D::new(
+                                        time,
+                                        (x, y),
+                                        state,
+                                        bathy_value,
+                                        normal,
+                                        g,
+                                        h_min,
+                                    ),
+                                };
+                                ctx.dt = config.dt;
+                                let ghost = config.bc.ghost_state(&ctx);
+                                ws.ext_states_h[i] = ghost.h;
+                                ws.ext_states_hu[i] = ghost.hu;
+                                ws.ext_states_hv[i] = ghost.hv;
+                            }
+                            // For boundary faces, mirror the interior bathymetry
+                            ws.ext_bathy[..n_face_nodes]
+                                .copy_from_slice(&ws.int_bathy[..n_face_nodes]);
                         }
-                    } else {
-                        // Boundary face: compute ghost states
-                        let boundary_tag = mesh.boundary_tag(k_idx, face);
+
+                        // Compute numerical flux and flux difference at face nodes
                         for i in 0..n_face_nodes {
                             let node_idx = face_nodes[i];
-                            let state = q.get_state(k_idx, node_idx);
-                            let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
-                            let [x, y] = mesh.reference_to_physical(k_idx, r, s);
-
-                            let bathy_value =
-                                config.bathymetry.map(|b| b.get(k_idx, node_idx)).unwrap_or(0.0);
-
-                            let mut ctx = match boundary_tag {
-                                Some(tag) => BCContext2D::with_tag(
-                                    time, (x, y), state, bathy_value, normal, g, h_min, tag,
-                                ),
-                                None => BCContext2D::new(
-                                    time, (x, y), state, bathy_value, normal, g, h_min,
-                                ),
+                            let q_int = q.get_state(k_idx, node_idx);
+                            let q_ext = SWEState2D {
+                                h: ws.ext_states_h[i],
+                                hu: ws.ext_states_hu[i],
+                                hv: ws.ext_states_hv[i],
                             };
-                            ctx.dt = config.dt;
-                            let ghost = config.bc.ghost_state(&ctx);
-                            ws.ext_states_h[i] = ghost.h;
-                            ws.ext_states_hu[i] = ghost.hu;
-                            ws.ext_states_hv[i] = ghost.hv;
+
+                            let (q_int_flux, q_ext_flux) = if let Some(ref reconstruction) = hr {
+                                reconstruction.reconstruct(
+                                    &q_int,
+                                    &q_ext,
+                                    ws.int_bathy[i],
+                                    ws.ext_bathy[i],
+                                )
+                            } else {
+                                (q_int, q_ext)
+                            };
+
+                            let f_star = compute_flux_swe_2d(
+                                &q_int_flux,
+                                &q_ext_flux,
+                                normal,
+                                g,
+                                h_min,
+                                config.flux_type,
+                            );
+                            let f_int = config.equation.normal_flux(&q_int_flux, normal);
+                            let flux_diff = f_int - f_star;
+
+                            ws.flux_diff_h[i] = flux_diff.h;
+                            ws.flux_diff_hu[i] = flux_diff.hu;
+                            ws.flux_diff_hv[i] = flux_diff.hv;
                         }
-                        // For boundary faces, mirror the interior bathymetry
-                        ws.ext_bathy[..n_face_nodes].copy_from_slice(&ws.int_bathy[..n_face_nodes]);
+
+                        // Apply LIFT using SIMD kernel
+                        let scale = j_inv * s_jac;
+                        apply_lift(
+                            &ops.lift_row_major[face],
+                            &ws.flux_diff_h,
+                            &ws.flux_diff_hu,
+                            &ws.flux_diff_hv,
+                            &mut ws.rhs_h,
+                            &mut ws.rhs_hu,
+                            &mut ws.rhs_hv,
+                            n_nodes,
+                            n_face_nodes,
+                            scale,
+                        );
                     }
 
-                    // Compute numerical flux and flux difference at face nodes
-                    for i in 0..n_face_nodes {
-                        let node_idx = face_nodes[i];
-                        let q_int = q.get_state(k_idx, node_idx);
-                        let q_ext = SWEState2D {
-                            h: ws.ext_states_h[i],
-                            hu: ws.ext_states_hu[i],
-                            hv: ws.ext_states_hv[i],
-                        };
-
-                        let (q_int_flux, q_ext_flux) = if let Some(ref reconstruction) = hr {
-                            reconstruction.reconstruct(&q_int, &q_ext, ws.int_bathy[i], ws.ext_bathy[i])
+                    // 3. Source terms: Legacy Coriolis
+                    if config.include_coriolis
+                        && config.source_terms.is_none()
+                        && (config.equation.f0.abs() > 1e-14 || config.equation.beta.abs() > 1e-14)
+                    {
+                        if config.equation.beta.abs() < 1e-14 {
+                            coriolis_source(
+                                &ws.hu_arr,
+                                &ws.hv_arr,
+                                &mut ws.rhs_hu,
+                                &mut ws.rhs_hv,
+                                config.equation.f0,
+                                n_nodes,
+                            );
                         } else {
-                            (q_int, q_ext)
-                        };
-
-                        let f_star = compute_flux_swe_2d(
-                            &q_int_flux, &q_ext_flux, normal, g, h_min, config.flux_type,
-                        );
-                        let f_int = config.equation.normal_flux(&q_int_flux, normal);
-                        let flux_diff = f_int - f_star;
-
-                        ws.flux_diff_h[i] = flux_diff.h;
-                        ws.flux_diff_hu[i] = flux_diff.hu;
-                        ws.flux_diff_hv[i] = flux_diff.hv;
+                            for i in 0..n_nodes {
+                                let state = q.get_state(k_idx, i);
+                                let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
+                                let [_x, y] = mesh.reference_to_physical(k_idx, r, s);
+                                let source = config.equation.coriolis_source(&state, y);
+                                ws.rhs_hu[i] += source.hu;
+                                ws.rhs_hv[i] += source.hv;
+                            }
+                        }
                     }
 
-                    // Apply LIFT using SIMD kernel
-                    let scale = j_inv * s_jac;
-                    apply_lift(
-                        &ops.lift_row_major[face],
-                        &ws.flux_diff_h, &ws.flux_diff_hu, &ws.flux_diff_hv,
-                        &mut ws.rhs_h, &mut ws.rhs_hu, &mut ws.rhs_hv,
-                        n_nodes, n_face_nodes, scale,
-                    );
-                }
-
-                // 3. Source terms: Legacy Coriolis
-                if config.include_coriolis
-                    && config.source_terms.is_none()
-                    && (config.equation.f0.abs() > 1e-14 || config.equation.beta.abs() > 1e-14)
-                {
-                    if config.equation.beta.abs() < 1e-14 {
-                        coriolis_source(
-                            &ws.hu_arr, &ws.hv_arr, &mut ws.rhs_hu, &mut ws.rhs_hv,
-                            config.equation.f0, n_nodes,
-                        );
-                    } else {
+                    // 4. Trait-based source terms
+                    if let Some(sources) = config.source_terms {
                         for i in 0..n_nodes {
                             let state = q.get_state(k_idx, i);
                             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-                            let [_x, y] = mesh.reference_to_physical(k_idx, r, s);
-                            let source = config.equation.coriolis_source(&state, y);
+                            let [x, y] = mesh.reference_to_physical(k_idx, r, s);
+
+                            let (bathy_value, bathy_gradient) = config
+                                .bathymetry
+                                .map(|b| (b.get(k_idx, i), b.get_gradient(k_idx, i)))
+                                .unwrap_or((0.0, (0.0, 0.0)));
+
+                            let ctx = SourceContext2D::new(
+                                time,
+                                (x, y),
+                                state,
+                                bathy_value,
+                                bathy_gradient,
+                                g,
+                                h_min,
+                            );
+                            let source = sources.evaluate(&ctx);
+                            ws.rhs_h[i] += source.h;
                             ws.rhs_hu[i] += source.hu;
                             ws.rhs_hv[i] += source.hv;
                         }
                     }
-                }
-
-                // 4. Trait-based source terms
-                if let Some(sources) = config.source_terms {
-                    for i in 0..n_nodes {
-                        let state = q.get_state(k_idx, i);
-                        let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-                        let [x, y] = mesh.reference_to_physical(k_idx, r, s);
-
-                        let (bathy_value, bathy_gradient) = config
-                            .bathymetry
-                            .map(|b| (b.get(k_idx, i), b.get_gradient(k_idx, i)))
-                            .unwrap_or((0.0, (0.0, 0.0)));
-
-                        let ctx = SourceContext2D::new(
-                            time, (x, y), state, bathy_value, bathy_gradient, g, h_min,
-                        );
-                        let source = sources.evaluate(&ctx);
-                        ws.rhs_h[i] += source.h;
-                        ws.rhs_hu[i] += source.hu;
-                        ws.rhs_hv[i] += source.hv;
-                    }
-                }
-
-                // 5. Horizontal viscosity: ∇·(ν h ∇u), ∇·(ν h ∇v)
-                if let Some(visc) = config.viscosity {
-                    let delta = geom.det_j[k].sqrt();
-
-                    // 5a: Compute velocity gradients and viscous fluxes
-                    for i in 0..n_nodes {
-                        let state = q.get_state(k_idx, i);
-                        let h_safe = state.h.max(visc.h_min);
-
-                        let mut du_dr = 0.0;
-                        let mut du_ds = 0.0;
-                        let mut dv_dr = 0.0;
-                        let mut dv_ds = 0.0;
-
-                        for j in 0..n_nodes {
-                            let sj = q.get_state(k_idx, j);
-                            let hj = sj.h.max(visc.h_min);
-                            let uj = sj.hu / hj;
-                            let vj = sj.hv / hj;
-
-                            let dr_ij = ops.dr[(i, j)];
-                            let ds_ij = ops.ds[(i, j)];
-
-                            du_dr += dr_ij * uj;
-                            du_ds += ds_ij * uj;
-                            dv_dr += dr_ij * vj;
-                            dv_ds += ds_ij * vj;
-                        }
-
-                        ws.du_dx[i] = du_dr * rx + du_ds * sx;
-                        ws.du_dy[i] = du_dr * ry + du_ds * sy;
-                        ws.dv_dx[i] = dv_dr * rx + dv_ds * sx;
-                        ws.dv_dy[i] = dv_dr * ry + dv_ds * sy;
-
-                        let nu = visc.compute_viscosity(
-                            ws.du_dx[i], ws.du_dy[i], ws.dv_dx[i], ws.dv_dy[i], delta,
-                        );
-                        ws.visc_flux_ux[i] = nu * h_safe * ws.du_dx[i];
-                        ws.visc_flux_uy[i] = nu * h_safe * ws.du_dy[i];
-                        ws.visc_flux_vx[i] = nu * h_safe * ws.dv_dx[i];
-                        ws.visc_flux_vy[i] = nu * h_safe * ws.dv_dy[i];
-                    }
-
-                    // 5b: Differentiate viscous fluxes → divergence
-                    for i in 0..n_nodes {
-                        let mut d_vfux_dr = 0.0;
-                        let mut d_vfux_ds = 0.0;
-                        let mut d_vfuy_dr = 0.0;
-                        let mut d_vfuy_ds = 0.0;
-                        let mut d_vfvx_dr = 0.0;
-                        let mut d_vfvx_ds = 0.0;
-                        let mut d_vfvy_dr = 0.0;
-                        let mut d_vfvy_ds = 0.0;
-
-                        for j in 0..n_nodes {
-                            let dr_ij = ops.dr[(i, j)];
-                            let ds_ij = ops.ds[(i, j)];
-
-                            d_vfux_dr += dr_ij * ws.visc_flux_ux[j];
-                            d_vfux_ds += ds_ij * ws.visc_flux_ux[j];
-                            d_vfuy_dr += dr_ij * ws.visc_flux_uy[j];
-                            d_vfuy_ds += ds_ij * ws.visc_flux_uy[j];
-                            d_vfvx_dr += dr_ij * ws.visc_flux_vx[j];
-                            d_vfvx_ds += ds_ij * ws.visc_flux_vx[j];
-                            d_vfvy_dr += dr_ij * ws.visc_flux_vy[j];
-                            d_vfvy_ds += ds_ij * ws.visc_flux_vy[j];
-                        }
-
-                        let div_visc_u = (rx * d_vfux_dr + sx * d_vfux_ds)
-                            + (ry * d_vfuy_dr + sy * d_vfuy_ds);
-                        let div_visc_v = (rx * d_vfvx_dr + sx * d_vfvx_ds)
-                            + (ry * d_vfvy_dr + sy * d_vfvy_ds);
-
-                        ws.rhs_hu[i] += div_visc_u;
-                        ws.rhs_hv[i] += div_visc_v;
-                    }
-                }
 
                     // Copy workspace results directly to output chunks
                     h_chunk.copy_from_slice(&ws.rhs_h);
@@ -1092,6 +1103,8 @@ pub fn compute_rhs_swe_2d_parallel<BC: SWEBoundaryCondition2D + Sync>(
                 },
             );
     }
+
+    add_br1_viscosity(&mut rhs, q, mesh, ops, geom, config, time);
 
     rhs
 }
@@ -1503,8 +1516,7 @@ mod tests {
         let bc = Reflective2D::new();
 
         // Bilinear bathymetry: B = 0.3*x + 0.2*y
-        let bathymetry =
-            Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| 0.3 * x + 0.2 * y);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| 0.3 * x + 0.2 * y);
 
         // Lake-at-rest: η = 10.0
         let eta_ref = 10.0;
@@ -1718,17 +1730,29 @@ mod tests {
                 assert!(
                     diff_h < 1e-10,
                     "h mismatch at ({}, {}): serial={}, parallel={}, diff={}",
-                    k, i, serial.h, parallel.h, diff_h
+                    k,
+                    i,
+                    serial.h,
+                    parallel.h,
+                    diff_h
                 );
                 assert!(
                     diff_hu < 1e-10,
                     "hu mismatch at ({}, {}): serial={}, parallel={}, diff={}",
-                    k, i, serial.hu, parallel.hu, diff_hu
+                    k,
+                    i,
+                    serial.hu,
+                    parallel.hu,
+                    diff_hu
                 );
                 assert!(
                     diff_hv < 1e-10,
                     "hv mismatch at ({}, {}): serial={}, parallel={}, diff={}",
-                    k, i, serial.hv, parallel.hv, diff_hv
+                    k,
+                    i,
+                    serial.hv,
+                    parallel.hv,
+                    diff_hv
                 );
             }
         }
@@ -1763,15 +1787,21 @@ mod tests {
 
                 assert!(
                     (serial.h - parallel.h).abs() < 1e-10,
-                    "h mismatch with Coriolis at ({}, {})", k, i
+                    "h mismatch with Coriolis at ({}, {})",
+                    k,
+                    i
                 );
                 assert!(
                     (serial.hu - parallel.hu).abs() < 1e-10,
-                    "hu mismatch with Coriolis at ({}, {})", k, i
+                    "hu mismatch with Coriolis at ({}, {})",
+                    k,
+                    i
                 );
                 assert!(
                     (serial.hv - parallel.hv).abs() < 1e-10,
-                    "hv mismatch with Coriolis at ({}, {})", k, i
+                    "hv mismatch with Coriolis at ({}, {})",
+                    k,
+                    i
                 );
             }
         }

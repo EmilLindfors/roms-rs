@@ -79,9 +79,16 @@ impl GeometricFactors2D {
 
         for k in ElementIndex::iter(n_elements) {
             let verts = mesh.element_vertices(k);
+            assert_affine_quadrilateral(k.as_usize(), &verts);
 
             // Compute Jacobian for this element
             let (jac, s_jac, norm) = compute_element_jacobian(&verts);
+            assert!(
+                jac.det.is_finite() && jac.det > 0.0,
+                "GeometricFactors2D requires a positive finite Jacobian; element {} has det(J) = {}",
+                k.as_usize(),
+                jac.det
+            );
 
             rx.push(jac.rx);
             ry.push(jac.ry);
@@ -150,6 +157,34 @@ struct ElementJacobian {
     det: f64,
 }
 
+fn assert_affine_quadrilateral(element: usize, verts: &[[f64; 2]; 4]) {
+    let [x0, y0] = verts[0];
+    let [x1, y1] = verts[1];
+    let [x2, y2] = verts[2];
+    let [x3, y3] = verts[3];
+
+    let bilinear_x = x0 - x1 + x2 - x3;
+    let bilinear_y = y0 - y1 + y2 - y3;
+    let bilinear_norm = (bilinear_x * bilinear_x + bilinear_y * bilinear_y).sqrt();
+
+    let mut scale: f64 = 1.0;
+    for i in 0..4 {
+        let [xa, ya] = verts[i];
+        let [xb, yb] = verts[(i + 1) % 4];
+        let edge_len = ((xb - xa) * (xb - xa) + (yb - ya) * (yb - ya)).sqrt();
+        scale = scale.max(edge_len).max(xa.abs()).max(ya.abs());
+    }
+
+    let tol = 1.0e-12 * scale;
+    assert!(
+        bilinear_norm <= tol,
+        "GeometricFactors2D only supports affine/parallelogram quadrilaterals; element {} has nonzero bilinear mapping term {} (tolerance {})",
+        element,
+        bilinear_norm,
+        tol
+    );
+}
+
 /// Compute Jacobian for an affine quadrilateral element.
 ///
 /// For a quadrilateral with vertices v0, v1, v2, v3 in counter-clockwise order:
@@ -164,9 +199,7 @@ struct ElementJacobian {
 /// For affine quads (parallelograms), we use the linear approximation:
 /// x_r = (x1 - x0 + x2 - x3) / 4
 /// x_s = (x3 - x0 + x2 - x1) / 4
-fn compute_element_jacobian(
-    verts: &[[f64; 2]; 4],
-) -> (ElementJacobian, [f64; 4], [(f64, f64); 4]) {
+fn compute_element_jacobian(verts: &[[f64; 2]; 4]) -> (ElementJacobian, [f64; 4], [(f64, f64); 4]) {
     let [x0, y0] = verts[0];
     let [x1, y1] = verts[1];
     let [x2, y2] = verts[2];
@@ -402,5 +435,24 @@ mod tests {
                 "det_J * det_J_inv should be 1"
             );
         }
+    }
+
+    #[test]
+    fn test_skewed_parallelogram_is_supported() {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
+        mesh.vertices[2] = [0.25, 1.0];
+        mesh.vertices[3] = [1.25, 1.0];
+
+        let geom = GeometricFactors2D::compute(&mesh);
+        assert!((geom.det_j[0] - 0.25).abs() < 1e-14);
+    }
+
+    #[test]
+    #[should_panic(expected = "only supports affine/parallelogram quadrilaterals")]
+    fn test_non_affine_quad_is_rejected() {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
+        mesh.vertices[3] = [1.25, 1.0];
+
+        let _ = GeometricFactors2D::compute(&mesh);
     }
 }

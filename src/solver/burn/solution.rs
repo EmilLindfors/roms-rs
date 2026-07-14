@@ -78,18 +78,12 @@ where
 
         let shape: Vec<usize> = vec![n_elements, n_nodes];
         Self {
-            h: Tensor::from_data(
-                burn::tensor::TensorData::new(h_data, shape.clone()),
-                device,
-            ),
+            h: Tensor::from_data(burn::tensor::TensorData::new(h_data, shape.clone()), device),
             hu: Tensor::from_data(
                 burn::tensor::TensorData::new(hu_data, shape.clone()),
                 device,
             ),
-            hv: Tensor::from_data(
-                burn::tensor::TensorData::new(hv_data, shape),
-                device,
-            ),
+            hv: Tensor::from_data(burn::tensor::TensorData::new(hv_data, shape), device),
             n_elements,
             n_nodes,
             device: device.clone(),

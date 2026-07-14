@@ -82,9 +82,8 @@ mod tide_gauge_reader;
 mod timeseries_reader;
 mod vtk;
 
-pub use coastline::{
-    CoastlineData, CoastlineError, CoastlineStatistics, FROYA_BBOX, NORWAY_BBOX,
-};
+pub use adcp_reader::{ADCPFile, ADCPFileError, read_adcp_file, write_adcp_file};
+pub use coastline::{CoastlineData, CoastlineError, CoastlineStatistics, FROYA_BBOX, NORWAY_BBOX};
 pub use constituent_reader::{
     ConstituentData, ConstituentEntry, ConstituentFileError, constituent_period,
     parse_constituents, read_constituent_file,
@@ -92,18 +91,17 @@ pub use constituent_reader::{
 pub use geotiff::{BathymetryStatistics, GeoTiffBathymetry, GeoTiffError};
 #[cfg(feature = "netcdf")]
 pub use netcdf_io::{
-    ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo, NetCDFWriter,
-    NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState,
-    FILL_VALUE_F32, FILL_VALUE_F64, is_valid_f32, is_valid_f64,
+    FILL_VALUE_F32, FILL_VALUE_F64, ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo,
+    NetCDFWriter, NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState, is_valid_f32,
+    is_valid_f64,
 };
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
-pub use timeseries_reader::{
-    BoundaryTimeSeries, TimeSeriesFileError, TimeSeriesRecord, parse_timeseries,
-    read_timeseries_file,
-};
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,
     read_tide_gauge_file, write_tide_gauge_file,
 };
+pub use timeseries_reader::{
+    BoundaryTimeSeries, TimeSeriesFileError, TimeSeriesRecord, parse_timeseries,
+    read_timeseries_file,
+};
 pub use vtk::{VtkError, write_vtk_coupled, write_vtk_series, write_vtk_swe};
-pub use adcp_reader::{ADCPFile, ADCPFileError, read_adcp_file, write_adcp_file};

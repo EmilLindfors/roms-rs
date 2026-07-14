@@ -145,7 +145,11 @@ pub trait MeshTopology: Send + Sync {
     /// # Arguments
     /// * `element` - Element index
     /// * `local_face` - Local face index (0..FACES_PER_ELEMENT)
-    fn face_connection(&self, element: usize, local_face: usize) -> FaceConnection<Self::BoundaryTag>;
+    fn face_connection(
+        &self,
+        element: usize,
+        local_face: usize,
+    ) -> FaceConnection<Self::BoundaryTag>;
 
     /// Get neighbor element across a face, if interior.
     ///
@@ -302,11 +306,7 @@ pub trait Mesh1DGeometry: MeshGeometry<Coord = f64, RefCoord = f64> {
     /// In 1D, normals are simply -1 (left face) or +1 (right face).
     #[inline]
     fn face_normal_1d(&self, _element: usize, local_face: usize) -> f64 {
-        if local_face == 0 {
-            -1.0
-        } else {
-            1.0
-        }
+        if local_face == 0 { -1.0 } else { 1.0 }
     }
 }
 

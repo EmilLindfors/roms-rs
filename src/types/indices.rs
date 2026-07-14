@@ -194,7 +194,10 @@ impl ElementIndex {
     }
 
     /// Create an iterator over [start, end) element indices.
-    pub fn range_iter(start: ElementIndex, end: ElementIndex) -> impl Iterator<Item = ElementIndex> + ExactSizeIterator {
+    pub fn range_iter(
+        start: ElementIndex,
+        end: ElementIndex,
+    ) -> impl Iterator<Item = ElementIndex> + ExactSizeIterator {
         (start.0..end.0).map(ElementIndex)
     }
 }

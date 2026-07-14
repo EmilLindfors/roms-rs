@@ -151,7 +151,11 @@ pub fn read_adcp_file(path: &Path) -> Result<ADCPFile, ADCPFileError> {
         }
 
         let time: f64 = parts[0].parse().map_err(|_| {
-            ADCPFileError::ParseError(format!("Invalid time at line {}: {}", line_num + 1, parts[0]))
+            ADCPFileError::ParseError(format!(
+                "Invalid time at line {}: {}",
+                line_num + 1,
+                parts[0]
+            ))
         })?;
 
         let u: f64 = parts[1].parse().map_err(|_| {
@@ -214,8 +218,8 @@ pub fn read_adcp_file(path: &Path) -> Result<ADCPFile, ADCPFileError> {
         station = station.with_water_depth(wd);
     }
 
-    let time_series = CurrentTimeSeries::new(&times, &u_values, &v_values)
-        .with_name(station.name.clone());
+    let time_series =
+        CurrentTimeSeries::new(&times, &u_values, &v_values).with_name(station.name.clone());
 
     Ok(ADCPFile {
         station,

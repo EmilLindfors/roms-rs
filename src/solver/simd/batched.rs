@@ -19,7 +19,24 @@ use crate::operators::GeometricFactors2D;
 
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatMut, MatRef, Par};
-use std::num::NonZeroUsize;
+
+/// faer parallelism backend for batched GEMMs.
+///
+/// Uses Rayon when the `parallel` feature is enabled, and falls back to
+/// sequential execution otherwise so that this module compiles and runs with
+/// `--no-default-features` (rayon is an optional dependency).
+#[cfg(feature = "parallel")]
+#[inline]
+fn faer_par() -> Par {
+    use std::num::NonZeroUsize;
+    Par::Rayon(NonZeroUsize::new(rayon::current_num_threads().max(1)).unwrap())
+}
+
+#[cfg(not(feature = "parallel"))]
+#[inline]
+fn faer_par() -> Par {
+    Par::Seq
+}
 
 /// Workspace for batched volume term computation.
 ///
@@ -210,7 +227,7 @@ fn apply_diff_batched(
         d_t.as_ref().transpose(),
         flux_mat,
         1.0,
-        Par::Rayon(NonZeroUsize::new(rayon::current_num_threads()).unwrap()),
+        faer_par(),
     );
 }
 
@@ -298,24 +315,96 @@ pub fn compute_volume_terms_batched(
 
     // Step 2: Apply differentiation matrices using batched GEMM
     // d(flux_x)/dr for h, hu, hv
-    apply_diff_batched(&ws.flux_x_h, &ws.dr_t, &mut ws.dfx_dr_h, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_x_hu, &ws.dr_t, &mut ws.dfx_dr_hu, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_x_hv, &ws.dr_t, &mut ws.dfx_dr_hv, n_elements, n_nodes);
+    apply_diff_batched(
+        &ws.flux_x_h,
+        &ws.dr_t,
+        &mut ws.dfx_dr_h,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_x_hu,
+        &ws.dr_t,
+        &mut ws.dfx_dr_hu,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_x_hv,
+        &ws.dr_t,
+        &mut ws.dfx_dr_hv,
+        n_elements,
+        n_nodes,
+    );
 
     // d(flux_x)/ds for h, hu, hv
-    apply_diff_batched(&ws.flux_x_h, &ws.ds_t, &mut ws.dfx_ds_h, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_x_hu, &ws.ds_t, &mut ws.dfx_ds_hu, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_x_hv, &ws.ds_t, &mut ws.dfx_ds_hv, n_elements, n_nodes);
+    apply_diff_batched(
+        &ws.flux_x_h,
+        &ws.ds_t,
+        &mut ws.dfx_ds_h,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_x_hu,
+        &ws.ds_t,
+        &mut ws.dfx_ds_hu,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_x_hv,
+        &ws.ds_t,
+        &mut ws.dfx_ds_hv,
+        n_elements,
+        n_nodes,
+    );
 
     // d(flux_y)/dr for h, hu, hv
-    apply_diff_batched(&ws.flux_y_h, &ws.dr_t, &mut ws.dfy_dr_h, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_y_hu, &ws.dr_t, &mut ws.dfy_dr_hu, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_y_hv, &ws.dr_t, &mut ws.dfy_dr_hv, n_elements, n_nodes);
+    apply_diff_batched(
+        &ws.flux_y_h,
+        &ws.dr_t,
+        &mut ws.dfy_dr_h,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_y_hu,
+        &ws.dr_t,
+        &mut ws.dfy_dr_hu,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_y_hv,
+        &ws.dr_t,
+        &mut ws.dfy_dr_hv,
+        n_elements,
+        n_nodes,
+    );
 
     // d(flux_y)/ds for h, hu, hv
-    apply_diff_batched(&ws.flux_y_h, &ws.ds_t, &mut ws.dfy_ds_h, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_y_hu, &ws.ds_t, &mut ws.dfy_ds_hu, n_elements, n_nodes);
-    apply_diff_batched(&ws.flux_y_hv, &ws.ds_t, &mut ws.dfy_ds_hv, n_elements, n_nodes);
+    apply_diff_batched(
+        &ws.flux_y_h,
+        &ws.ds_t,
+        &mut ws.dfy_ds_h,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_y_hu,
+        &ws.ds_t,
+        &mut ws.dfy_ds_hu,
+        n_elements,
+        n_nodes,
+    );
+    apply_diff_batched(
+        &ws.flux_y_hv,
+        &ws.ds_t,
+        &mut ws.dfy_ds_hv,
+        n_elements,
+        n_nodes,
+    );
 
     // Step 3: Combine derivatives with geometric factors
     combine_divergence(
@@ -380,8 +469,17 @@ mod tests {
 
         // Compute volume terms
         compute_volume_terms_batched(
-            &h, &hu, &hv, n_elements, n_nodes, &geom, &equation, &mut ws,
-            &mut rhs_h, &mut rhs_hu, &mut rhs_hv,
+            &h,
+            &hu,
+            &hv,
+            n_elements,
+            n_nodes,
+            &geom,
+            &equation,
+            &mut ws,
+            &mut rhs_h,
+            &mut rhs_hu,
+            &mut rhs_hv,
         );
 
         // For uniform flow, divergence should be zero (within numerical precision)
@@ -390,9 +488,21 @@ mod tests {
         let max_rhs_hv: f64 = rhs_hv.iter().map(|x| x.abs()).fold(0.0, f64::max);
 
         // Uniform flow should have zero divergence
-        assert!(max_rhs_h < 1e-10, "RHS_h should be ~0 for uniform flow, got {}", max_rhs_h);
-        assert!(max_rhs_hu < 1e-10, "RHS_hu should be ~0 for uniform flow, got {}", max_rhs_hu);
-        assert!(max_rhs_hv < 1e-10, "RHS_hv should be ~0 for uniform flow, got {}", max_rhs_hv);
+        assert!(
+            max_rhs_h < 1e-10,
+            "RHS_h should be ~0 for uniform flow, got {}",
+            max_rhs_h
+        );
+        assert!(
+            max_rhs_hu < 1e-10,
+            "RHS_hu should be ~0 for uniform flow, got {}",
+            max_rhs_hu
+        );
+        assert!(
+            max_rhs_hv < 1e-10,
+            "RHS_hv should be ~0 for uniform flow, got {}",
+            max_rhs_hv
+        );
     }
 
     #[test]
@@ -425,8 +535,17 @@ mod tests {
         let mut rhs_batched_hu = vec![0.0; total];
         let mut rhs_batched_hv = vec![0.0; total];
         compute_volume_terms_batched(
-            &h, &hu, &hv, n_elements, n_nodes, &geom, &equation, &mut ws,
-            &mut rhs_batched_h, &mut rhs_batched_hu, &mut rhs_batched_hv,
+            &h,
+            &hu,
+            &hv,
+            n_elements,
+            n_nodes,
+            &geom,
+            &equation,
+            &mut ws,
+            &mut rhs_batched_h,
+            &mut rhs_batched_hu,
+            &mut rhs_batched_hv,
         );
 
         // Compute using per-element approach (scalar reference)
@@ -481,20 +600,44 @@ mod tests {
             let mut dfy_ds_hv = vec![0.0; n_nodes];
 
             apply_diff_matrix(
-                &ops.dr_row_major, &flux_x_h, &flux_x_hu, &flux_x_hv,
-                &mut dfx_dr_h, &mut dfx_dr_hu, &mut dfx_dr_hv, n_nodes,
+                &ops.dr_row_major,
+                &flux_x_h,
+                &flux_x_hu,
+                &flux_x_hv,
+                &mut dfx_dr_h,
+                &mut dfx_dr_hu,
+                &mut dfx_dr_hv,
+                n_nodes,
             );
             apply_diff_matrix(
-                &ops.ds_row_major, &flux_x_h, &flux_x_hu, &flux_x_hv,
-                &mut dfx_ds_h, &mut dfx_ds_hu, &mut dfx_ds_hv, n_nodes,
+                &ops.ds_row_major,
+                &flux_x_h,
+                &flux_x_hu,
+                &flux_x_hv,
+                &mut dfx_ds_h,
+                &mut dfx_ds_hu,
+                &mut dfx_ds_hv,
+                n_nodes,
             );
             apply_diff_matrix(
-                &ops.dr_row_major, &flux_y_h, &flux_y_hu, &flux_y_hv,
-                &mut dfy_dr_h, &mut dfy_dr_hu, &mut dfy_dr_hv, n_nodes,
+                &ops.dr_row_major,
+                &flux_y_h,
+                &flux_y_hu,
+                &flux_y_hv,
+                &mut dfy_dr_h,
+                &mut dfy_dr_hu,
+                &mut dfy_dr_hv,
+                n_nodes,
             );
             apply_diff_matrix(
-                &ops.ds_row_major, &flux_y_h, &flux_y_hu, &flux_y_hv,
-                &mut dfy_ds_h, &mut dfy_ds_hu, &mut dfy_ds_hv, n_nodes,
+                &ops.ds_row_major,
+                &flux_y_h,
+                &flux_y_hu,
+                &flux_y_hv,
+                &mut dfy_ds_h,
+                &mut dfy_ds_hu,
+                &mut dfy_ds_hv,
+                n_nodes,
             );
 
             // Combine with geometric factors
@@ -504,9 +647,12 @@ mod tests {
             let sy = geom.sy[k];
 
             for i in 0..n_nodes {
-                let div_h = dfx_dr_h[i] * rx + dfx_ds_h[i] * sx + dfy_dr_h[i] * ry + dfy_ds_h[i] * sy;
-                let div_hu = dfx_dr_hu[i] * rx + dfx_ds_hu[i] * sx + dfy_dr_hu[i] * ry + dfy_ds_hu[i] * sy;
-                let div_hv = dfx_dr_hv[i] * rx + dfx_ds_hv[i] * sx + dfy_dr_hv[i] * ry + dfy_ds_hv[i] * sy;
+                let div_h =
+                    dfx_dr_h[i] * rx + dfx_ds_h[i] * sx + dfy_dr_h[i] * ry + dfy_ds_h[i] * sy;
+                let div_hu =
+                    dfx_dr_hu[i] * rx + dfx_ds_hu[i] * sx + dfy_dr_hu[i] * ry + dfy_ds_hu[i] * sy;
+                let div_hv =
+                    dfx_dr_hv[i] * rx + dfx_ds_hv[i] * sx + dfy_dr_hv[i] * ry + dfy_ds_hv[i] * sy;
 
                 rhs_scalar_h[base + i] = -div_h;
                 rhs_scalar_hu[base + i] = -div_hu;
@@ -521,9 +667,27 @@ mod tests {
             let diff_hu = (rhs_batched_hu[i] - rhs_scalar_hu[i]).abs();
             let diff_hv = (rhs_batched_hv[i] - rhs_scalar_hv[i]).abs();
 
-            assert!(diff_h < tol, "h mismatch at {}: batched={}, scalar={}", i, rhs_batched_h[i], rhs_scalar_h[i]);
-            assert!(diff_hu < tol, "hu mismatch at {}: batched={}, scalar={}", i, rhs_batched_hu[i], rhs_scalar_hu[i]);
-            assert!(diff_hv < tol, "hv mismatch at {}: batched={}, scalar={}", i, rhs_batched_hv[i], rhs_scalar_hv[i]);
+            assert!(
+                diff_h < tol,
+                "h mismatch at {}: batched={}, scalar={}",
+                i,
+                rhs_batched_h[i],
+                rhs_scalar_h[i]
+            );
+            assert!(
+                diff_hu < tol,
+                "hu mismatch at {}: batched={}, scalar={}",
+                i,
+                rhs_batched_hu[i],
+                rhs_scalar_hu[i]
+            );
+            assert!(
+                diff_hv < tol,
+                "hv mismatch at {}: batched={}, scalar={}",
+                i,
+                rhs_batched_hv[i],
+                rhs_scalar_hv[i]
+            );
         }
     }
 }

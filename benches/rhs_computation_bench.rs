@@ -4,13 +4,13 @@
 //!
 //! Benchmarks the complete RHS computation at various mesh sizes and polynomial orders.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use dg_rs::ElementIndex;
 use dg_rs::boundary::Reflective2D;
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::Mesh2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::ElementIndex;
-use dg_rs::solver::{compute_rhs_swe_2d, SWE2DRhsConfig, SWESolution2D};
+use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_rhs_swe_2d};
 
 #[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_rhs_swe_2d_parallel;
@@ -38,7 +38,11 @@ fn setup_problem(
     let v0 = 0.3;
     for k in 0..q.n_elements {
         for i in 0..ops.n_nodes {
-            q.set_state(ElementIndex::new(k), i, dg_rs::solver::SWEState2D::new(h0, h0 * u0, h0 * v0));
+            q.set_state(
+                ElementIndex::new(k),
+                i,
+                dg_rs::solver::SWEState2D::new(h0, h0 * u0, h0 * v0),
+            );
         }
     }
 
@@ -137,7 +141,9 @@ fn bench_rhs_polynomial_order(c: &mut Criterion) {
 /// Benchmark RHS with source terms enabled.
 fn bench_rhs_with_sources(c: &mut Criterion) {
     use dg_rs::mesh::Bathymetry2D;
-    use dg_rs::source::{BathymetrySource2D, CombinedSource2D, CoriolisSource2D, ManningFriction2D};
+    use dg_rs::source::{
+        BathymetrySource2D, CombinedSource2D, CoriolisSource2D, ManningFriction2D,
+    };
 
     let mut group = c.benchmark_group("rhs_with_sources");
     group.sample_size(50);

@@ -33,7 +33,6 @@ pub struct Solution3D {
     pub n_levels: usize,
 
     // --- Barotropic State (2D) ---
-
     /// Free surface elevation η (m)
     pub eta: DGSolution2D,
     /// Depth-averaged u-velocity (m/s)
@@ -42,7 +41,6 @@ pub struct Solution3D {
     pub vbar: DGSolution2D,
 
     // --- Baroclinic State (3D) ---
-
     /// 3D u-velocity (m/s)
     pub u: Vec<f64>,
     /// 3D v-velocity (m/s)
@@ -78,7 +76,7 @@ impl Solution3D {
         // If we change the size, it breaks the "uniform column" stride logic.
         // Let's keep it n_levels for now (cell centers) and assume we interpolate to faces.
         // Or, we can just say this is the "effective" viscosity at the center.
-        
+
         Self {
             n_elements,
             n_nodes,
@@ -229,32 +227,25 @@ impl Solution3D {
     /// Get a mutable reference to the eddy diffusivity column at (k, i).
     #[inline(always)]
     pub fn eddy_diffusivity_column_mut(&mut self, k: ElementIndex, i: usize) -> &mut [f64] {
-        Self::get_column_mut(&mut self.eddy_diffusivity, self.n_nodes, self.n_levels, k, i)
+        Self::get_column_mut(
+            &mut self.eddy_diffusivity,
+            self.n_nodes,
+            self.n_levels,
+            k,
+            i,
+        )
     }
 
     /// Get the value of a 3D variable at a specific point.
     #[inline(always)]
-    pub fn get_value(
-        &self,
-        data: &[f64],
-        k: ElementIndex,
-        i: usize,
-        level: usize,
-    ) -> f64 {
+    pub fn get_value(&self, data: &[f64], k: ElementIndex, i: usize, level: usize) -> f64 {
         let idx = (k.as_usize() * self.n_nodes + i) * self.n_levels + level;
         data[idx]
     }
 
     /// Set the value of a 3D variable at a specific point.
     #[inline(always)]
-    pub fn set_value(
-        &self,
-        data: &mut [f64],
-        k: ElementIndex,
-        i: usize,
-        level: usize,
-        value: f64,
-    ) {
+    pub fn set_value(&self, data: &mut [f64], k: ElementIndex, i: usize, level: usize, value: f64) {
         let idx = (k.as_usize() * self.n_nodes + i) * self.n_levels + level;
         data[idx] = value;
     }

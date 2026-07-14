@@ -84,19 +84,26 @@ impl TSTConstituent {
         }
     }
 
-    /// Create from amplitude and phase in degrees.
+    /// Create from amplitude and Greenwich phase **lag** in degrees.
+    ///
+    /// `phase_degrees` is the Greenwich phase lag G, the standard tidal-harmonic
+    /// convention in which the physical elevation is `A·cos(ωt − G)`. The internal
+    /// phase used by [`evaluate`](Self::evaluate) (which adds, `cos(ωt + φ)`) is
+    /// therefore the negated lag, `φ = −G`. Negating here rather than adding the
+    /// lag is what makes the tide advance in time instead of running backwards.
     pub fn from_degrees(name: String, amplitude: f64, omega: f64, phase_degrees: f64) -> Self {
         Self {
             name,
             amplitude,
             omega,
-            phase: phase_degrees * PI / 180.0,
+            phase: -phase_degrees * PI / 180.0,
         }
     }
 
     /// Evaluate the constituent at time t.
     ///
-    /// Returns: A * cos(ωt + φ)
+    /// Returns: A * cos(ωt + φ), where φ is the internal phase (the negated
+    /// Greenwich phase lag when constructed via [`from_degrees`](Self::from_degrees)).
     pub fn evaluate(&self, t: f64) -> f64 {
         self.amplitude * (self.omega * t + self.phase).cos()
     }
@@ -143,7 +150,10 @@ impl TSTConfig {
                 name: c.name.clone(),
                 amplitude: c.amplitude,
                 omega: 2.0 * PI / c.period,
-                phase: c.phase_degrees * PI / 180.0,
+                // c.phase_degrees is the Greenwich phase lag G; the internal phase
+                // is the negated lag so that elevation is A·cos(ωt − G). See
+                // `TSTConstituent::from_degrees`.
+                phase: -c.phase_degrees * PI / 180.0,
             })
             .collect();
 
@@ -223,7 +233,9 @@ impl TSTOBC2D {
     ///
     /// **Deprecated**: Use [`tidal_depth_with_bathy`] instead. This method uses
     /// `h_ref` as a proxy for depth, which double-counts when bathymetry is set.
-    #[deprecated(note = "Use tidal_depth_with_bathy instead; h_ref is ignored in ghost_state depth computation")]
+    #[deprecated(
+        note = "Use tidal_depth_with_bathy instead; h_ref is ignored in ghost_state depth computation"
+    )]
     pub fn tidal_depth(&self, t: f64) -> f64 {
         (self.config.h_ref + self.predict_tidal_elevation(t)).max(self.config.h_min)
     }
@@ -350,11 +362,21 @@ mod tests {
 
     #[test]
     fn test_tst_constituent_from_degrees() {
+        // Regression (TODO P0.9): a 90° Greenwich phase lag G gives internal
+        // phase φ = −G, so η = 0.5·cos(ωt − π/2) = 0.5·sin(ωt).
         let m2 = TSTConstituent::from_degrees("M2".to_string(), 0.5, M2_OMEGA, 90.0);
 
-        // Phase of 90 degrees means cos(ωt + π/2) = -sin(ωt)
-        // At t=0, cos(π/2) = 0
+        // At t=0, cos(−π/2) = 0 (sign-agnostic).
         assert!(m2.evaluate(0.0).abs() < 1e-10);
+
+        // The tide peaks a quarter period *after* t=0 (t = G/ω = T/4), reaching
+        // +A. The old, mirrored convention cos(ωt + π/2) would give −A here.
+        let t_quarter = M2_PERIOD / 4.0;
+        assert!(
+            (m2.evaluate(t_quarter) - 0.5).abs() < 1e-10,
+            "expected peak +0.5 at T/4, got {} (mirrored tide?)",
+            m2.evaluate(t_quarter)
+        );
     }
 
     #[test]
@@ -531,7 +553,9 @@ mod tests {
         assert_eq!(m2.name, "M2");
         assert!((m2.amplitude - 0.45).abs() < TOL);
         assert!((m2.omega - 2.0 * PI / M2_PERIOD).abs() < 1e-10);
-        assert!((m2.phase - 125.3 * PI / 180.0).abs() < 1e-10);
+        // Internal phase is the negated Greenwich phase lag (φ = −G) so that
+        // elevation is A·cos(ωt − G) rather than a time-reversed A·cos(ωt + G).
+        assert!((m2.phase - (-125.3 * PI / 180.0)).abs() < 1e-10);
     }
 
     #[test]

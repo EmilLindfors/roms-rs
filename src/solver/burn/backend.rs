@@ -40,11 +40,16 @@ impl DGBackend for burn_cuda::Cuda {
 
 /// Helper to create a tensor from a Vec<f64> on the specified device.
 #[inline]
-pub fn tensor_from_vec<B: Backend>(data: Vec<f64>, shape: [usize; 2], device: &B::Device) -> Tensor<B, 2>
+pub fn tensor_from_vec<B: Backend>(
+    data: Vec<f64>,
+    shape: [usize; 2],
+    device: &B::Device,
+) -> Tensor<B, 2>
 where
     B::FloatElem: From<f64>,
 {
-    let data_converted: Vec<B::FloatElem> = data.into_iter().map(|x| B::FloatElem::from(x)).collect();
+    let data_converted: Vec<B::FloatElem> =
+        data.into_iter().map(|x| B::FloatElem::from(x)).collect();
     Tensor::from_data(
         burn::tensor::TensorData::new(data_converted, shape.to_vec()),
         device,
@@ -58,7 +63,8 @@ where
     B::FloatElem: From<f64>,
 {
     let len = data.len();
-    let data_converted: Vec<B::FloatElem> = data.into_iter().map(|x| B::FloatElem::from(x)).collect();
+    let data_converted: Vec<B::FloatElem> =
+        data.into_iter().map(|x| B::FloatElem::from(x)).collect();
     Tensor::from_data(
         burn::tensor::TensorData::new(data_converted, vec![len]),
         device,

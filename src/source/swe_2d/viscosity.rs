@@ -108,7 +108,10 @@ mod tests {
         let visc = HorizontalViscosity2D::smagorinsky(0.1);
         // Zero velocity gradients → zero viscosity
         let nu = visc.compute_viscosity(0.0, 0.0, 0.0, 0.0, 100.0);
-        assert!(nu.abs() < 1e-15, "Zero strain should give zero viscosity, got {nu}");
+        assert!(
+            nu.abs() < 1e-15,
+            "Zero strain should give zero viscosity, got {nu}"
+        );
     }
 
     #[test]

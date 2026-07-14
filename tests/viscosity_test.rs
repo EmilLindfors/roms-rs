@@ -6,9 +6,9 @@
 //! 3. Parallel consistency: parallel RHS matches sequential
 
 use dg_rs::{
-    DGOperators2D, GeometricFactors2D, HorizontalViscosity2D, Mesh2D, Reflective2D,
-    SWE2DRhsConfig, SWEFluxType2D, SWESolution2D, ShallowWater2D,
-    compute_dt_swe_2d, compute_dt_viscosity, compute_rhs_swe_2d,
+    DGOperators2D, GeometricFactors2D, HorizontalViscosity2D, Mesh2D, Reflective2D, SWE2DRhsConfig,
+    SWEFluxType2D, SWESolution2D, ShallowWater2D, compute_dt_swe_2d, compute_dt_viscosity,
+    compute_rhs_swe_2d,
 };
 use std::f64::consts::PI;
 
@@ -90,11 +90,7 @@ fn test_viscosity_exponential_decay() {
     );
 
     // Measure initial amplitude (SoA: data[1] = all hu values)
-    let initial_max_hu = q
-        .data[1]
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0_f64, f64::max);
+    let initial_max_hu = q.data[1].iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
 
     // Time integration
     let t_final = 1.0;
@@ -115,11 +111,7 @@ fn test_viscosity_exponential_decay() {
     }
 
     // Measure final amplitude (SoA: data[1] = all hu values)
-    let final_max_hu = q
-        .data[1]
-        .iter()
-        .map(|v| v.abs())
-        .fold(0.0_f64, f64::max);
+    let final_max_hu = q.data[1].iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
 
     // Theoretical decay factor: exp(-ν·k²·T) = exp(-0.1·2·1.0) = exp(-0.2)
     let theoretical_decay = (-nu * 2.0 * t_final).exp();
@@ -274,7 +266,10 @@ fn test_compute_dt_viscosity() {
 
     // Smaller element → smaller dt (quadratic)
     let dt_small = compute_dt_viscosity(1.0, 0.5, 2, 0.5);
-    assert!((dt_small / dt - 0.25).abs() < 1e-14, "dt_small = {dt_small}");
+    assert!(
+        (dt_small / dt - 0.25).abs() < 1e-14,
+        "dt_small = {dt_small}"
+    );
 }
 
 /// Test parallel RHS matches sequential when viscosity is enabled.

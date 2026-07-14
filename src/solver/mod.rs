@@ -42,73 +42,83 @@ pub use state::{
 
 // Re-export RHS types and functions
 pub use rhs::{
-    // 1D
-    BoundaryCondition,
-    SWEFluxType,
-    SWERhsConfig,
-    compute_dt_swe,
-    compute_rhs,
-    compute_rhs_swe,
     // 2D Advection
     AdvectionBoundaryCondition2D,
     AdvectionFluxType,
+    // 1D
+    BoundaryCondition,
     ConstantBC2D,
     DirichletBC2D,
-    PeriodicBC2D,
-    compute_dt_advection_2d,
-    compute_rhs_advection_2d,
-    // 2D SWE
-    SWE2DRhsConfig,
-    compute_dt_swe_2d,
-    compute_dt_viscosity,
-    compute_rhs_swe_2d,
     // 2D Tracer
     ExtrapolationTracerBC,
+    // 3D RHS
+    ExtrapolationTracerBC3D,
     FixedTracerBC,
+    FixedTracerBC3D,
+    PeriodicBC2D,
+    Rhs3DConfig,
+    // 2D SWE
+    SWE2DRhsConfig,
+    SWEFluxType,
+    SWERhsConfig,
     Tracer2DRhsConfig,
     TracerBCContext2D,
+    TracerBCContext3D,
     TracerBoundaryCondition2D,
+    TracerBoundaryCondition3D,
     TracerSourceTerm2D,
     UpwindTracerBC,
+    UpwindTracerBC3D,
+    compute_dt_advection_2d,
+    compute_dt_swe,
+    compute_dt_swe_2d,
     compute_dt_tracer_2d,
-    compute_rhs_tracer_2d,
-    // 3D RHS
+    compute_dt_viscosity,
+    compute_rhs,
     compute_rhs_3d,
-    Rhs3DConfig,
+    compute_rhs_advection_2d,
+    compute_rhs_swe,
+    compute_rhs_swe_2d,
+    compute_rhs_tracer_2d,
 };
 
 // Re-export limiter types
 pub use limiters::{
     // Traits and context
     BoxedLimiter2D,
+    // 2D SWE limiters
+    KuzminLimiter2D,
+    // 2D Tracer limiters
+    KuzminParameter2D,
     Limiter2D,
     LimiterChain2D,
     LimiterContext2D,
-    // 1D limiters
-    TVBParameter,
-    apply_swe_limiters,
-    positivity_limiter,
-    tvb_limiter,
-    // 2D SWE limiters
-    KuzminLimiter2D,
     NoLimiter2D,
     PositivityLimiter2D,
     StandardLimiter2D,
+    // 1D limiters
+    TVBParameter,
+    TVBParameter2D,
+    TracerAveragePolicy3D,
+    TracerBounds,
+    TracerLimiter3DConfig,
+    TracerLimiter3DStats,
+    TracerLimiterType3D,
+    apply_swe_limiters,
     apply_swe_limiters_kuzmin_2d,
+    apply_tracer_limiters_2d,
+    apply_tracer_limiters_3d,
+    apply_tracer_limiters_kuzmin_2d,
     create_limiter,
+    positivity_limiter,
     swe_cell_averages_2d,
     swe_kuzmin_limiter_2d,
     swe_positivity_limiter_2d,
-    // 2D Tracer limiters
-    KuzminParameter2D,
-    TVBParameter2D,
-    TracerBounds,
-    apply_tracer_limiters_2d,
-    apply_tracer_limiters_kuzmin_2d,
     tracer_cell_averages_2d,
     tracer_kuzmin_limiter_2d,
     tracer_positivity_limiter_2d,
     tracer_tvb_limiter_2d,
+    tvb_limiter,
 };
 
 // Re-export algorithms

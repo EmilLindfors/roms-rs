@@ -118,8 +118,8 @@ impl SWE2DTimeConfig {
 
     /// Enable improved wetting/drying with custom maximum velocity.
     pub fn with_wet_dry_treatment_custom(mut self, max_velocity: f64) -> Self {
-        self.wet_dry = Some(WetDryConfig::new(Depth::new(self.h_min), self.g)
-            .with_max_velocity(max_velocity));
+        self.wet_dry =
+            Some(WetDryConfig::new(Depth::new(self.h_min), self.g).with_max_velocity(max_velocity));
         self
     }
 }
@@ -158,10 +158,10 @@ fn apply_configured_limiter(
     // Apply wet/dry treatment (velocity capping, thin-layer damping)
     if let Some(ref wet_dry) = config.wet_dry {
         #[cfg(feature = "parallel")]
-        apply_wet_dry_correction_all_parallel(swe, wet_dry);
+        apply_wet_dry_correction_all_parallel(swe, ops, wet_dry);
 
         #[cfg(not(feature = "parallel"))]
-        apply_wet_dry_correction_all(swe, wet_dry);
+        apply_wet_dry_correction_all(swe, ops, wet_dry);
     }
 }
 
@@ -294,8 +294,7 @@ mod tests {
 
     #[test]
     fn test_swe_2d_time_config_with_kuzmin() {
-        let config = SWE2DTimeConfig::new(0.3, 9.81, 0.01)
-            .with_kuzmin_limiters(1.1);
+        let config = SWE2DTimeConfig::new(0.3, 9.81, 0.01).with_kuzmin_limiters(1.1);
         assert_eq!(config.limiter_type, SWELimiterType::Kuzmin);
         assert!((config.kuzmin.relaxation - 1.1).abs() < 1e-10);
     }

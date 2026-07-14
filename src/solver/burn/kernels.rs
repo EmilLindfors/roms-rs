@@ -20,7 +20,10 @@ use burn::prelude::*;
 ///
 /// # Returns
 /// Derivatives [n_elements, n_nodes]
-pub fn apply_diff_matrix_batched<B: Backend>(d_t: &Tensor<B, 2>, flux: &Tensor<B, 2>) -> Tensor<B, 2> {
+pub fn apply_diff_matrix_batched<B: Backend>(
+    d_t: &Tensor<B, 2>,
+    flux: &Tensor<B, 2>,
+) -> Tensor<B, 2> {
     // flux @ D^T: [E, N] @ [N, N] -> [E, N]
     flux.clone().matmul(d_t.clone())
 }
@@ -84,7 +87,9 @@ where
     let flux_y_hu = hv.clone().mul(u);
     let flux_y_hv = hv.clone().mul(v).add(pressure);
 
-    (flux_x_h, flux_x_hu, flux_x_hv, flux_y_h, flux_y_hu, flux_y_hv)
+    (
+        flux_x_h, flux_x_hu, flux_x_hv, flux_y_h, flux_y_hu, flux_y_hv,
+    )
 }
 
 /// Combine reference derivatives with geometric factors to get physical derivatives.
@@ -197,7 +202,11 @@ where
     let v = hv.clone().div(h_reg.clone());
 
     // Velocity magnitude: |u| = sqrt(u² + v²)
-    let u_mag = u.clone().powf_scalar(2.0).add(v.clone().powf_scalar(2.0)).sqrt();
+    let u_mag = u
+        .clone()
+        .powf_scalar(2.0)
+        .add(v.clone().powf_scalar(2.0))
+        .sqrt();
 
     // Friction coefficient: C_f = g * n² / h^(1/3)
     let c_f = h_reg.powf_scalar(-1.0 / 3.0).mul_scalar(g_n2);
@@ -283,15 +292,11 @@ mod tests {
         let h_min = 1e-6;
 
         // Constant state: h=1, u=1, v=0 => hu=1, hv=0
-        let h: Tensor<NdArray<f64>, 2> =
-            Tensor::ones([n_elements, n_nodes], &device);
-        let hu: Tensor<NdArray<f64>, 2> =
-            Tensor::ones([n_elements, n_nodes], &device);
-        let hv: Tensor<NdArray<f64>, 2> =
-            Tensor::zeros([n_elements, n_nodes], &device);
+        let h: Tensor<NdArray<f64>, 2> = Tensor::ones([n_elements, n_nodes], &device);
+        let hu: Tensor<NdArray<f64>, 2> = Tensor::ones([n_elements, n_nodes], &device);
+        let hv: Tensor<NdArray<f64>, 2> = Tensor::zeros([n_elements, n_nodes], &device);
 
-        let (fx_h, fx_hu, fx_hv, fy_h, fy_hu, fy_hv) =
-            compute_swe_fluxes(&h, &hu, &hv, g, h_min);
+        let (fx_h, fx_hu, fx_hv, fy_h, fy_hu, fy_hv) = compute_swe_fluxes(&h, &hu, &hv, g, h_min);
 
         // Check x-direction fluxes
         let fx_h_data = fx_h.to_data().to_vec::<f64>().unwrap();
@@ -317,8 +322,7 @@ mod tests {
         let n_nodes = 4;
         let f = 1.2e-4; // Norwegian coast
 
-        let hu: Tensor<NdArray<f64>, 2> =
-            Tensor::ones([n_elements, n_nodes], &device);
+        let hu: Tensor<NdArray<f64>, 2> = Tensor::ones([n_elements, n_nodes], &device);
         let hv: Tensor<NdArray<f64>, 2> =
             Tensor::ones([n_elements, n_nodes], &device).mul_scalar(2.0);
 
@@ -340,8 +344,7 @@ mod tests {
         let n_nodes = 3;
 
         // Simple case: all derivatives = 1
-        let ones_2d: Tensor<NdArray<f64>, 2> =
-            Tensor::ones([n_elements, n_nodes], &device);
+        let ones_2d: Tensor<NdArray<f64>, 2> = Tensor::ones([n_elements, n_nodes], &device);
 
         // Geometric factors: rx=1, sx=0, ry=0, sy=1 (identity transformation)
         let rx: Tensor<NdArray<f64>, 1> = Tensor::ones([n_elements], &device);
@@ -349,9 +352,8 @@ mod tests {
         let ry: Tensor<NdArray<f64>, 1> = Tensor::zeros([n_elements], &device);
         let sy: Tensor<NdArray<f64>, 1> = Tensor::ones([n_elements], &device);
 
-        let result = combine_derivatives_batched(
-            &ones_2d, &ones_2d, &ones_2d, &ones_2d, &rx, &sx, &ry, &sy,
-        );
+        let result =
+            combine_derivatives_batched(&ones_2d, &ones_2d, &ones_2d, &ones_2d, &rx, &sx, &ry, &sy);
 
         let result_data = result.to_data().to_vec::<f64>().unwrap();
 

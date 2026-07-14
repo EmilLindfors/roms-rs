@@ -356,8 +356,14 @@ pub fn characteristic_limiter(
         let [h_plus, hu_plus] = q.get(k, n_nodes - 1);
 
         // Differences in conserved variables
-        let delta_minus = [averages[k.as_usize()][0] - h_minus, averages[k.as_usize()][1] - hu_minus];
-        let delta_plus = [h_plus - averages[k.as_usize()][0], hu_plus - averages[k.as_usize()][1]];
+        let delta_minus = [
+            averages[k.as_usize()][0] - h_minus,
+            averages[k.as_usize()][1] - hu_minus,
+        ];
+        let delta_plus = [
+            h_plus - averages[k.as_usize()][0],
+            hu_plus - averages[k.as_usize()][1],
+        ];
 
         // Transform to characteristic variables
         let c_inv = 1.0 / (2.0 * c);

@@ -6,11 +6,11 @@
 //! - Dam break evolution
 //! - Coriolis effects
 
+use dg_rs::types::ElementIndex;
 use dg_rs::{
     DGOperators2D, GeometricFactors2D, Mesh2D, Reflective2D, SWE2DRhsConfig, SWEFluxType2D,
     SWESolution2D, SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
 };
-use dg_rs::types::ElementIndex;
 
 fn k(idx: usize) -> ElementIndex {
     ElementIndex::new(idx)

@@ -204,7 +204,10 @@ impl Mesh2DBuilder {
     /// * `nx` - Number of elements in x-direction
     /// * `ny` - Number of elements in y-direction
     pub fn with_resolution(mut self, nx: usize, ny: usize) -> Self {
-        assert!(nx > 0 && ny > 0, "Need at least one element in each direction");
+        assert!(
+            nx > 0 && ny > 0,
+            "Need at least one element in each direction"
+        );
         self.nx = nx;
         self.ny = ny;
         self
@@ -258,30 +261,28 @@ impl Mesh2DBuilder {
     /// Build the mesh with the specified configuration.
     pub fn build(self) -> Mesh2D {
         match self.bc_config {
-            BoundaryConfig::Uniform(tag) => {
-                Mesh2D::uniform_rectangle_with_bc(
-                    self.x0, self.x1, self.y0, self.y1,
-                    self.nx, self.ny, tag,
-                )
-            }
-            BoundaryConfig::PerSide { south, east, north, west } => {
-                Mesh2D::uniform_rectangle_with_sides(
-                    self.x0, self.x1, self.y0, self.y1,
-                    self.nx, self.ny,
-                    [south, east, north, west],
-                )
-            }
+            BoundaryConfig::Uniform(tag) => Mesh2D::uniform_rectangle_with_bc(
+                self.x0, self.x1, self.y0, self.y1, self.nx, self.ny, tag,
+            ),
+            BoundaryConfig::PerSide {
+                south,
+                east,
+                north,
+                west,
+            } => Mesh2D::uniform_rectangle_with_sides(
+                self.x0,
+                self.x1,
+                self.y0,
+                self.y1,
+                self.nx,
+                self.ny,
+                [south, east, north, west],
+            ),
             BoundaryConfig::PeriodicX => {
-                Mesh2D::channel_periodic_x(
-                    self.x0, self.x1, self.y0, self.y1,
-                    self.nx, self.ny,
-                )
+                Mesh2D::channel_periodic_x(self.x0, self.x1, self.y0, self.y1, self.nx, self.ny)
             }
             BoundaryConfig::FullyPeriodic => {
-                Mesh2D::uniform_periodic(
-                    self.x0, self.x1, self.y0, self.y1,
-                    self.nx, self.ny,
-                )
+                Mesh2D::uniform_periodic(self.x0, self.x1, self.y0, self.y1, self.nx, self.ny)
             }
         }
     }
@@ -399,17 +400,14 @@ mod tests {
 
     #[test]
     fn test_builder_unit_square() {
-        let mesh = Mesh2DBuilder::unit_square()
-            .with_resolution(10, 10)
-            .build();
+        let mesh = Mesh2DBuilder::unit_square().with_resolution(10, 10).build();
 
         assert_eq!(mesh.n_elements, 100);
     }
 
     #[test]
     fn test_builder_accessors() {
-        let builder = Mesh2DBuilder::new(0.0, 100.0, 0.0, 50.0)
-            .with_resolution(20, 10);
+        let builder = Mesh2DBuilder::new(0.0, 100.0, 0.0, 50.0).with_resolution(20, 10);
 
         assert_eq!(builder.bounds(), (0.0, 100.0, 0.0, 50.0));
         assert_eq!(builder.resolution(), (20, 10));
@@ -486,8 +484,7 @@ mod tests {
     fn test_typed_accessors() {
         use crate::types::{Bounds2D, Resolution2D};
 
-        let builder = Mesh2DBuilder::new(0.0, 100.0, 0.0, 50.0)
-            .with_resolution(20, 10);
+        let builder = Mesh2DBuilder::new(0.0, 100.0, 0.0, 50.0).with_resolution(20, 10);
 
         let bounds = builder.get_bounds();
         assert_eq!(bounds.x_min, 0.0);

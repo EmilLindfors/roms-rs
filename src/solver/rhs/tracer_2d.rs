@@ -15,6 +15,8 @@ use crate::solver::{
 };
 use crate::types::{Depth, ElementIndex};
 
+use super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
+
 /// Context for tracer boundary condition evaluation.
 #[derive(Clone, Copy, Debug)]
 pub struct TracerBCContext2D {
@@ -316,6 +318,137 @@ impl<'a, BC: TracerBoundaryCondition2D> Tracer2DRhsConfig<'a, BC> {
     }
 }
 
+fn boundary_tracer_concentration<BC: TracerBoundaryCondition2D>(
+    component: usize,
+    tracers: &TracerSolution2D,
+    swe: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &Tracer2DRhsConfig<BC>,
+    time: f64,
+    k: ElementIndex,
+    face: usize,
+    node: usize,
+) -> f64 {
+    let tracer = tracers.get_conservative(k, node);
+    let swe_state = swe.get_state(k, node);
+    let normal = geom.normals[k.as_usize()][face];
+    let (r, s) = (ops.nodes_r[node], ops.nodes_s[node]);
+    let [x, y] = mesh.reference_to_physical(k, r, s);
+
+    let ctx = match mesh.boundary_tag(k, face) {
+        Some(tag) => TracerBCContext2D::with_tag(
+            time,
+            (x, y),
+            tracer,
+            swe_state,
+            normal,
+            config.h_min,
+            config.g,
+            tag,
+        ),
+        None => TracerBCContext2D::new(
+            time,
+            (x, y),
+            tracer,
+            swe_state,
+            normal,
+            config.h_min,
+            config.g,
+        ),
+    };
+    let (ghost_tracer, ghost_swe) = config.bc.ghost_state(&ctx);
+    let ghost_concentration = ghost_tracer.to_concentrations(ghost_swe.h, config.h_min);
+
+    match component {
+        0 => ghost_concentration.temperature,
+        1 => ghost_concentration.salinity,
+        _ => unreachable!("invalid tracer component"),
+    }
+}
+
+fn add_br1_tracer_diffusion<BC: TracerBoundaryCondition2D>(
+    rhs: &mut TracerSolution2D,
+    tracers: &TracerSolution2D,
+    swe: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &Tracer2DRhsConfig<BC>,
+    time: f64,
+) {
+    if config.kappa_t <= 0.0 && config.kappa_s <= 0.0 {
+        return;
+    }
+
+    let n_nodes = ops.n_nodes;
+    let total_nodes = mesh.n_elements * n_nodes;
+    let mut temperature = vec![0.0; total_nodes];
+    let mut salinity = vec![0.0; total_nodes];
+    let mut coeff_t = vec![0.0; total_nodes];
+    let mut coeff_s = vec![0.0; total_nodes];
+
+    for k in ElementIndex::iter(mesh.n_elements) {
+        for i in 0..n_nodes {
+            let flat = k.as_usize() * n_nodes + i;
+            let h = swe.get_state(k, i).h;
+            let concentration = tracers.get_concentrations(k, i, h, config.h_min);
+            let h_safe = h.max(config.h_min);
+
+            temperature[flat] = concentration.temperature;
+            salinity[flat] = concentration.salinity;
+            coeff_t[flat] = config.kappa_t * h_safe;
+            coeff_s[flat] = config.kappa_s * h_safe;
+        }
+    }
+
+    if config.kappa_t > 0.0 {
+        let boundary_temperature_for_gradient = |k, face, _fi, node, _interior| {
+            boundary_tracer_concentration(
+                0, tracers, swe, mesh, ops, geom, config, time, k, face, node,
+            )
+        };
+        let grad_t = compute_br1_gradient_2d(
+            &temperature,
+            mesh,
+            ops,
+            geom,
+            boundary_temperature_for_gradient,
+        );
+        let diff_t = compute_br1_diffusion_rhs_2d(&temperature, &coeff_t, &grad_t, mesh, ops, geom);
+
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..n_nodes {
+                let flat = k.as_usize() * n_nodes + i;
+                let mut current = rhs.get_conservative(k, i);
+                current.h_t += diff_t[flat];
+                rhs.set_conservative(k, i, current);
+            }
+        }
+    }
+
+    if config.kappa_s > 0.0 {
+        let boundary_salinity_for_gradient = |k, face, _fi, node, _interior| {
+            boundary_tracer_concentration(
+                1, tracers, swe, mesh, ops, geom, config, time, k, face, node,
+            )
+        };
+        let grad_s =
+            compute_br1_gradient_2d(&salinity, mesh, ops, geom, boundary_salinity_for_gradient);
+        let diff_s = compute_br1_diffusion_rhs_2d(&salinity, &coeff_s, &grad_s, mesh, ops, geom);
+
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..n_nodes {
+                let flat = k.as_usize() * n_nodes + i;
+                let mut current = rhs.get_conservative(k, i);
+                current.h_s += diff_s[flat];
+                rhs.set_conservative(k, i, current);
+            }
+        }
+    }
+}
+
 /// Compute the right-hand side for 2D tracer transport.
 ///
 /// Implements the DG weak form for the tracer equations:
@@ -499,108 +632,7 @@ pub fn compute_rhs_tracer_2d<BC: TracerBoundaryCondition2D>(
             }
         }
 
-        // 3. Diffusion terms: κ∇²C (if enabled)
-        // Use BR1 (Bassi-Rebay 1) scheme for simplicity:
-        // First compute ∇C, then apply κ∇·(∇C)
-        if config.kappa_t > 0.0 || config.kappa_s > 0.0 {
-            // Compute tracer gradients
-            let mut d_t_dx = vec![0.0; n_nodes];
-            let mut d_t_dy = vec![0.0; n_nodes];
-            let mut d_s_dx = vec![0.0; n_nodes];
-            let mut d_s_dy = vec![0.0; n_nodes];
-
-            // Get concentrations at all nodes
-            let concentrations: Vec<TracerState> = (0..n_nodes)
-                .map(|i| {
-                    let h = swe.get_state(k, i).h;
-                    tracers.get_concentrations(k, i, h, h_min.meters())
-                })
-                .collect();
-
-            // Compute gradients using differentiation matrices
-            for i in 0..n_nodes {
-                let mut dt_dr = 0.0;
-                let mut dt_ds = 0.0;
-                let mut ds_dr = 0.0;
-                let mut ds_ds = 0.0;
-
-                for j in 0..n_nodes {
-                    let dr_ij = ops.dr[(i, j)];
-                    let ds_ij = ops.ds[(i, j)];
-
-                    dt_dr += dr_ij * concentrations[j].temperature;
-                    dt_ds += ds_ij * concentrations[j].temperature;
-                    ds_dr += dr_ij * concentrations[j].salinity;
-                    ds_ds += ds_ij * concentrations[j].salinity;
-                }
-
-                // Transform to physical coordinates
-                d_t_dx[i] = dt_dr * rx + dt_ds * sx;
-                d_t_dy[i] = dt_dr * ry + dt_ds * sy;
-                d_s_dx[i] = ds_dr * rx + ds_ds * sx;
-                d_s_dy[i] = ds_dr * ry + ds_ds * sy;
-            }
-
-            // Add diffusion term: κ h ∇²C (keep in conservative form)
-            // ∇·(h κ ∇C) = h κ ∇²C + κ ∇h · ∇C
-            // For simplicity, use: h κ ∇²C (ignoring depth gradient term)
-            //
-            // The Laplacian ∇²T = ∂²T/∂x² + ∂²T/∂y² is computed by
-            // differentiating the physical gradients:
-            //   ∂²T/∂x² = ∂/∂x(∂T/∂x) = (rx·∂/∂r + sx·∂/∂s)(∂T/∂x)
-            //   ∂²T/∂y² = ∂/∂y(∂T/∂y) = (ry·∂/∂r + sy·∂/∂s)(∂T/∂y)
-            for i in 0..n_nodes {
-                let h = swe.get_state(k, i).h.max(h_min.meters());
-
-                // Compute derivatives of physical gradients in reference space
-                // ∂/∂r(∂T/∂x), ∂/∂s(∂T/∂x), ∂/∂r(∂T/∂y), ∂/∂s(∂T/∂y)
-                let mut d_dtdx_dr = 0.0;
-                let mut d_dtdx_ds = 0.0;
-                let mut d_dtdy_dr = 0.0;
-                let mut d_dtdy_ds = 0.0;
-                let mut d_dsdx_dr = 0.0;
-                let mut d_dsdx_ds = 0.0;
-                let mut d_dsdy_dr = 0.0;
-                let mut d_dsdy_ds = 0.0;
-
-                for j in 0..n_nodes {
-                    let dr_ij = ops.dr[(i, j)];
-                    let ds_ij = ops.ds[(i, j)];
-
-                    // Differentiate physical gradients
-                    d_dtdx_dr += dr_ij * d_t_dx[j];
-                    d_dtdx_ds += ds_ij * d_t_dx[j];
-                    d_dtdy_dr += dr_ij * d_t_dy[j];
-                    d_dtdy_ds += ds_ij * d_t_dy[j];
-
-                    d_dsdx_dr += dr_ij * d_s_dx[j];
-                    d_dsdx_ds += ds_ij * d_s_dx[j];
-                    d_dsdy_dr += dr_ij * d_s_dy[j];
-                    d_dsdy_ds += ds_ij * d_s_dy[j];
-                }
-
-                // Transform to physical second derivatives using chain rule:
-                // ∂²T/∂x² = rx·∂/∂r(∂T/∂x) + sx·∂/∂s(∂T/∂x)
-                // ∂²T/∂y² = ry·∂/∂r(∂T/∂y) + sy·∂/∂s(∂T/∂y)
-                let d2t_dx2 = rx * d_dtdx_dr + sx * d_dtdx_ds;
-                let d2t_dy2 = ry * d_dtdy_dr + sy * d_dtdy_ds;
-                let laplacian_t = d2t_dx2 + d2t_dy2;
-
-                let d2s_dx2 = rx * d_dsdx_dr + sx * d_dsdx_ds;
-                let d2s_dy2 = ry * d_dsdy_dr + sy * d_dsdy_ds;
-                let laplacian_s = d2s_dx2 + d2s_dy2;
-
-                // Add diffusion source
-                let current = rhs.get_conservative(k, i);
-                let diffusion = ConservativeTracerState {
-                    h_t: config.kappa_t * h * laplacian_t,
-                    h_s: config.kappa_s * h * laplacian_s,
-                };
-                rhs.set_conservative(k, i, current + diffusion);
-            }
-        }
-
-        // 4. Source terms
+        // 3. Source terms
         if let Some(sources) = config.source_terms {
             for i in 0..n_nodes {
                 let tracer = tracers.get_conservative(k, i);
@@ -614,6 +646,8 @@ pub fn compute_rhs_tracer_2d<BC: TracerBoundaryCondition2D>(
             }
         }
     }
+
+    add_br1_tracer_diffusion(&mut rhs, tracers, swe, mesh, ops, geom, config, time);
 
     rhs
 }
@@ -715,53 +749,54 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
                 let face_nodes = &ops.face_nodes[face];
 
                 // Get exterior states
-                let ext_states: Vec<(ConservativeTracerState, SWEState2D)> =
-                    if let Some(neighbor) = mesh.neighbor(k_idx, face) {
-                        let neighbor_face_nodes = &ops.face_nodes[neighbor.face];
-                        (0..n_face_nodes)
-                            .map(|i| {
-                                let ni = neighbor_face_nodes[n_face_nodes - 1 - i];
-                                (
-                                    tracers.get_conservative(ElementIndex::new(neighbor.element), ni),
-                                    swe.get_state(ElementIndex::new(neighbor.element), ni),
-                                )
-                            })
-                            .collect()
-                    } else {
-                        let boundary_tag = mesh.boundary_tag(k_idx, face);
-                        (0..n_face_nodes)
-                            .map(|i| {
-                                let node_idx = face_nodes[i];
-                                let tracer = tracers.get_conservative(k_idx, node_idx);
-                                let swe_state = swe.get_state(k_idx, node_idx);
-                                let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
-                                let [x, y] = mesh.reference_to_physical(k_idx, r, s);
+                let ext_states: Vec<(ConservativeTracerState, SWEState2D)> = if let Some(neighbor) =
+                    mesh.neighbor(k_idx, face)
+                {
+                    let neighbor_face_nodes = &ops.face_nodes[neighbor.face];
+                    (0..n_face_nodes)
+                        .map(|i| {
+                            let ni = neighbor_face_nodes[n_face_nodes - 1 - i];
+                            (
+                                tracers.get_conservative(ElementIndex::new(neighbor.element), ni),
+                                swe.get_state(ElementIndex::new(neighbor.element), ni),
+                            )
+                        })
+                        .collect()
+                } else {
+                    let boundary_tag = mesh.boundary_tag(k_idx, face);
+                    (0..n_face_nodes)
+                        .map(|i| {
+                            let node_idx = face_nodes[i];
+                            let tracer = tracers.get_conservative(k_idx, node_idx);
+                            let swe_state = swe.get_state(k_idx, node_idx);
+                            let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
+                            let [x, y] = mesh.reference_to_physical(k_idx, r, s);
 
-                                let ctx = match boundary_tag {
-                                    Some(tag) => TracerBCContext2D::with_tag(
-                                        time,
-                                        (x, y),
-                                        tracer,
-                                        swe_state,
-                                        normal,
-                                        h_min.meters(),
-                                        g,
-                                        tag,
-                                    ),
-                                    None => TracerBCContext2D::new(
-                                        time,
-                                        (x, y),
-                                        tracer,
-                                        swe_state,
-                                        normal,
-                                        h_min.meters(),
-                                        g,
-                                    ),
-                                };
-                                config.bc.ghost_state(&ctx)
-                            })
-                            .collect()
-                    };
+                            let ctx = match boundary_tag {
+                                Some(tag) => TracerBCContext2D::with_tag(
+                                    time,
+                                    (x, y),
+                                    tracer,
+                                    swe_state,
+                                    normal,
+                                    h_min.meters(),
+                                    g,
+                                    tag,
+                                ),
+                                None => TracerBCContext2D::new(
+                                    time,
+                                    (x, y),
+                                    tracer,
+                                    swe_state,
+                                    normal,
+                                    h_min.meters(),
+                                    g,
+                                ),
+                            };
+                            config.bc.ghost_state(&ctx)
+                        })
+                        .collect()
+                };
 
                 // Compute flux difference at face nodes
                 let mut flux_diff = vec![ConservativeTracerState::zero(); n_face_nodes];
@@ -805,86 +840,7 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
                 }
             }
 
-            // 3. Diffusion terms: κ∇²C (if enabled)
-            if config.kappa_t > 0.0 || config.kappa_s > 0.0 {
-                let mut d_t_dx = vec![0.0; n_nodes];
-                let mut d_t_dy = vec![0.0; n_nodes];
-                let mut d_s_dx = vec![0.0; n_nodes];
-                let mut d_s_dy = vec![0.0; n_nodes];
-
-                let concentrations: Vec<TracerState> = (0..n_nodes)
-                    .map(|i| {
-                        let h = swe.get_state(k_idx, i).h;
-                        tracers.get_concentrations(k_idx, i, h, h_min.meters())
-                    })
-                    .collect();
-
-                for i in 0..n_nodes {
-                    let mut dt_dr = 0.0;
-                    let mut dt_ds = 0.0;
-                    let mut ds_dr = 0.0;
-                    let mut ds_ds = 0.0;
-
-                    for j in 0..n_nodes {
-                        let dr_ij = ops.dr[(i, j)];
-                        let ds_ij = ops.ds[(i, j)];
-
-                        dt_dr += dr_ij * concentrations[j].temperature;
-                        dt_ds += ds_ij * concentrations[j].temperature;
-                        ds_dr += dr_ij * concentrations[j].salinity;
-                        ds_ds += ds_ij * concentrations[j].salinity;
-                    }
-
-                    d_t_dx[i] = dt_dr * rx + dt_ds * sx;
-                    d_t_dy[i] = dt_dr * ry + dt_ds * sy;
-                    d_s_dx[i] = ds_dr * rx + ds_ds * sx;
-                    d_s_dy[i] = ds_dr * ry + ds_ds * sy;
-                }
-
-                for i in 0..n_nodes {
-                    let h = swe.get_state(k_idx, i).h.max(h_min.meters());
-
-                    let mut d_dtdx_dr = 0.0;
-                    let mut d_dtdx_ds = 0.0;
-                    let mut d_dtdy_dr = 0.0;
-                    let mut d_dtdy_ds = 0.0;
-                    let mut d_dsdx_dr = 0.0;
-                    let mut d_dsdx_ds = 0.0;
-                    let mut d_dsdy_dr = 0.0;
-                    let mut d_dsdy_ds = 0.0;
-
-                    for j in 0..n_nodes {
-                        let dr_ij = ops.dr[(i, j)];
-                        let ds_ij = ops.ds[(i, j)];
-
-                        d_dtdx_dr += dr_ij * d_t_dx[j];
-                        d_dtdx_ds += ds_ij * d_t_dx[j];
-                        d_dtdy_dr += dr_ij * d_t_dy[j];
-                        d_dtdy_ds += ds_ij * d_t_dy[j];
-
-                        d_dsdx_dr += dr_ij * d_s_dx[j];
-                        d_dsdx_ds += ds_ij * d_s_dx[j];
-                        d_dsdy_dr += dr_ij * d_s_dy[j];
-                        d_dsdy_ds += ds_ij * d_s_dy[j];
-                    }
-
-                    let d2t_dx2 = rx * d_dtdx_dr + sx * d_dtdx_ds;
-                    let d2t_dy2 = ry * d_dtdy_dr + sy * d_dtdy_ds;
-                    let laplacian_t = d2t_dx2 + d2t_dy2;
-
-                    let d2s_dx2 = rx * d_dsdx_dr + sx * d_dsdx_ds;
-                    let d2s_dy2 = ry * d_dsdy_dr + sy * d_dsdy_ds;
-                    let laplacian_s = d2s_dx2 + d2s_dy2;
-
-                    let diffusion = ConservativeTracerState {
-                        h_t: config.kappa_t * h * laplacian_t,
-                        h_s: config.kappa_s * h * laplacian_s,
-                    };
-                    rhs_k[i] = rhs_k[i] + diffusion;
-                }
-            }
-
-            // 4. Source terms
+            // 3. Source terms
             if let Some(sources) = config.source_terms {
                 for i in 0..n_nodes {
                     let tracer = tracers.get_conservative(k_idx, i);
@@ -903,6 +859,8 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
                 rhs_chunk[i * 2 + 1] = state.h_s;
             }
         });
+
+    add_br1_tracer_diffusion(&mut rhs, tracers, swe, mesh, ops, geom, config, time);
 
     rhs
 }

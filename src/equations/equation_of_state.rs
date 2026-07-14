@@ -199,7 +199,7 @@ impl EquationOfState {
     /// Compute hydrostatic pressure from depth.
     ///
     /// Approximates pressure as p ≈ ρ₀ * g * |z| / 10000 (converts Pa to dbar).
-    /// 
+    ///
     /// # Arguments
     /// * `z` - Physical depth (negative downwards, in meters)
     /// * `g` - Gravitational acceleration (m/s²)
@@ -210,7 +210,7 @@ impl EquationOfState {
         // p = rho * g * h
         // 1 dbar = 10^4 Pa
         // p[dbar] = 1025 * 9.81 * |z| / 10000 ≈ |z|
-        
+
         let depth = z.abs();
         RHO_0 * g * depth / 10000.0
     }
@@ -652,9 +652,9 @@ mod tests {
     fn test_hydrostatic_pressure() {
         let g = 9.81;
         let z = -100.0; // 100m depth
-        
+
         let p = EquationOfState::hydrostatic_pressure_approx(z, g);
-        
+
         // p ≈ 1025 * 9.81 * 100 / 10000 ≈ 100.55 dbar
         assert!((p - 100.55).abs() < 1.0);
     }
@@ -664,18 +664,18 @@ mod tests {
         let eos = EquationOfState::with_pressure();
         let g = 9.81;
         let n = 5;
-        
+
         let temp = vec![10.0; n];
         let salt = vec![35.0; n];
         // increasing depth
-        let z: Vec<f64> = (0..n).map(|i| -(i as f64) * 100.0).collect(); 
+        let z: Vec<f64> = (0..n).map(|i| -(i as f64) * 100.0).collect();
         let mut rho = vec![0.0; n];
 
         eos.compute_density_column(&temp, &salt, &z, &mut rho, g);
 
         // Density should increase with depth due to pressure
-        for i in 0..n-1 {
-            assert!(rho[i+1] > rho[i]);
+        for i in 0..n - 1 {
+            assert!(rho[i + 1] > rho[i]);
         }
     }
 }

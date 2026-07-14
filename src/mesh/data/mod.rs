@@ -10,7 +10,7 @@ mod bathymetry_2d;
 mod boundary_tags;
 mod land_mask;
 
-pub use bathymetry::{profiles as bathymetry_profiles, Bathymetry1D};
-pub use bathymetry_2d::{profiles as bathymetry_profiles_2d, Bathymetry2D};
+pub use bathymetry::{Bathymetry1D, profiles as bathymetry_profiles};
+pub use bathymetry_2d::{Bathymetry2D, profiles as bathymetry_profiles_2d};
 pub use boundary_tags::BoundaryTag;
 pub use land_mask::{LandMask2D, LandMaskStatistics};

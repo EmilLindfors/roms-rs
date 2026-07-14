@@ -4,16 +4,16 @@
 //!
 //! Benchmarks SSP-RK3 time integration and diagnostic computations.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use dg_rs::boundary::Reflective2D;
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::Mesh2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::solver::{
-    compute_dt_swe_2d, compute_rhs_swe_2d, DiagnosticsTracker, SWE2DRhsConfig, SWEDiagnostics2D,
-    SWEState2D, SWESolution2D,
+    DiagnosticsTracker, SWE2DRhsConfig, SWEDiagnostics2D, SWESolution2D, SWEState2D,
+    compute_dt_swe_2d, compute_rhs_swe_2d,
 };
-use dg_rs::time::{ssp_rk3_swe_2d_step_limited, SWE2DTimeConfig};
+use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 
 /// Setup a test problem.
 fn setup_problem(

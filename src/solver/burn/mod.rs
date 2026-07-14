@@ -58,6 +58,6 @@ pub use kernels::{
     coriolis_source_batched, friction_source_batched,
 };
 pub use operators::BurnOperators2D;
-pub use rhs::{compute_rhs_swe_2d_burn, BurnGeometricFactors2D, BurnRhsConfig};
+pub use rhs::{BurnGeometricFactors2D, BurnRhsConfig, compute_rhs_swe_2d_burn};
 pub use solution::BurnSWESolution2D;
-pub use surface::{apply_lift_all_faces, gather_face_states, BurnFaceStates};
+pub use surface::{BurnFaceStates, apply_lift_all_faces, gather_face_states};

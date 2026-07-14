@@ -171,7 +171,11 @@ pub fn read_tide_gauge_file(path: &Path) -> Result<TideGaugeFile, TideGaugeFileE
 
         // Parse time (first column)
         let time = parse_time_value(parts[0]).map_err(|e| {
-            TideGaugeFileError::ParseError(format!("Line {}: time parse error: {}", line_num + 1, e))
+            TideGaugeFileError::ParseError(format!(
+                "Line {}: time parse error: {}",
+                line_num + 1,
+                e
+            ))
         })?;
 
         // Parse water level (second column)
@@ -280,11 +284,21 @@ fn parse_time_value(s: &str) -> Result<f64, String> {
             return Err(format!("Invalid datetime format: {}", s));
         }
 
-        let year: i64 = date_parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let month: i64 = date_parts[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let day: i64 = date_parts[2].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let hour: i64 = time_parts[0].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let minute: i64 = time_parts[1].parse().map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let year: i64 = date_parts[0]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let month: i64 = date_parts[1]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let day: i64 = date_parts[2]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let hour: i64 = time_parts[0]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
+        let minute: i64 = time_parts[1]
+            .parse()
+            .map_err(|e: std::num::ParseIntError| e.to_string())?;
         let second: f64 = if time_parts.len() > 2 {
             time_parts[2].parse().unwrap_or(0.0)
         } else {
@@ -305,9 +319,7 @@ fn parse_time_value(s: &str) -> Result<f64, String> {
 /// Read multiple tide gauge files from a directory.
 ///
 /// Reads all .txt, .csv, and .dat files in the directory.
-pub fn read_tide_gauge_directory(
-    dir: &Path,
-) -> Result<Vec<TideGaugeFile>, TideGaugeFileError> {
+pub fn read_tide_gauge_directory(dir: &Path) -> Result<Vec<TideGaugeFile>, TideGaugeFileError> {
     let mut files = Vec::new();
 
     for entry in std::fs::read_dir(dir)? {
@@ -365,10 +377,7 @@ pub fn files_to_observation_map(files: &[TideGaugeFile]) -> HashMap<String, Time
 /// Write tide gauge data to a file.
 ///
 /// Writes in the simple text format with metadata headers.
-pub fn write_tide_gauge_file(
-    path: &Path,
-    data: &TideGaugeFile,
-) -> Result<(), TideGaugeFileError> {
+pub fn write_tide_gauge_file(path: &Path, data: &TideGaugeFile) -> Result<(), TideGaugeFileError> {
     use std::io::Write;
 
     let mut file = File::create(path)?;
@@ -461,8 +470,7 @@ mod tests {
         let values = vec![0.1, 0.5, 0.3];
         let ts = TimeSeries::new(&times, &values);
 
-        let data = TideGaugeFile::from_time_series(ts)
-            .with_station(station);
+        let data = TideGaugeFile::from_time_series(ts).with_station(station);
 
         let file = NamedTempFile::new().unwrap();
         write_tide_gauge_file(file.path(), &data).unwrap();

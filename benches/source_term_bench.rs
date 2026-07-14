@@ -4,10 +4,10 @@
 //!
 //! Benchmarks Coriolis, Manning friction, bathymetry, and combined source terms.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use dg_rs::mesh::{Bathymetry2D, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWEState2D, SWESolution2D};
+use dg_rs::solver::{SWESolution2D, SWEState2D};
 use dg_rs::source::{
     BathymetrySource2D, CombinedSource2D, CoriolisSource2D, ManningFriction2D, SourceContext2D,
     SourceTerm2D,
@@ -60,7 +60,13 @@ fn setup_problem(
 }
 
 /// Create a source context for benchmarking.
-fn make_context(state: &SWEState2D, x: f64, y: f64, bathy: f64, grad: (f64, f64)) -> SourceContext2D {
+fn make_context(
+    state: &SWEState2D,
+    x: f64,
+    y: f64,
+    bathy: f64,
+    grad: (f64, f64),
+) -> SourceContext2D {
     SourceContext2D::new(0.0, (x, y), *state, bathy, grad, G, H_MIN)
 }
 

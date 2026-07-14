@@ -13,11 +13,11 @@
 
 mod coupled_swe_tracer;
 pub mod integrator;
+pub mod mode_split;
 mod ssp_rk3;
 mod ssp_rk3_2d;
 mod ssp_rk3_swe;
 mod ssp_rk3_swe_2d;
-pub mod mode_split;
 
 #[cfg(feature = "burn")]
 mod burn_ssp_rk3;
@@ -28,6 +28,7 @@ pub use coupled_swe_tracer::{
     run_coupled_simulation_limited, ssp_rk3_coupled_step, ssp_rk3_coupled_step_limited,
     ssp_rk3_coupled_step_timed, total_mass as total_mass_coupled, total_tracer,
 };
+pub use mode_split::{ModeSplitIntegrator, SplitMethod};
 pub use ssp_rk3::{compute_dt, ssp_rk3_step, ssp_rk3_step_timed};
 pub use ssp_rk3_2d::{run_advection_2d, ssp_rk3_step_2d, ssp_rk3_step_2d_timed};
 pub use ssp_rk3_swe::{
@@ -37,7 +38,6 @@ pub use ssp_rk3_swe::{
 pub use ssp_rk3_swe_2d::{
     SWE2DTimeConfig, SWELimiterType, run_swe_2d_simulation, ssp_rk3_swe_2d_step_limited,
 };
-pub use mode_split::{ModeSplitIntegrator, SplitMethod};
 
 // Integrator trait exports
 pub use integrator::{
@@ -47,6 +47,4 @@ pub use integrator::{
 
 // Burn GPU time integration exports
 #[cfg(feature = "burn")]
-pub use burn_ssp_rk3::{
-    BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn,
-};
+pub use burn_ssp_rk3::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};

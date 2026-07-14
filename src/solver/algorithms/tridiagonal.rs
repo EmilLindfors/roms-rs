@@ -54,7 +54,7 @@ pub fn solve_tridiagonal(
         // For diffusion (I - dt*D), diagonal is 1 + something positive. Always > 1.
         // So safe.
     }
-    
+
     c_prime[0] = c[0] / denom;
     d_prime[0] = d[0] / denom;
 
@@ -75,17 +75,12 @@ pub fn solve_tridiagonal(
 }
 
 /// Solve a tridiagonal system Ax = d using the Thomas algorithm (allocating version).
-pub fn solve_tridiagonal_alloc(
-    a: &[f64],
-    b: &[f64],
-    c: &[f64],
-    d: &[f64],
-) -> Vec<f64> {
+pub fn solve_tridiagonal_alloc(a: &[f64], b: &[f64], c: &[f64], d: &[f64]) -> Vec<f64> {
     let n = b.len();
     let mut x = vec![0.0; n];
     let mut c_prime = vec![0.0; n];
     let mut d_prime = vec![0.0; n];
-    
+
     solve_tridiagonal(a, b, c, d, &mut x, &mut c_prime, &mut d_prime);
     x
 }
@@ -102,9 +97,9 @@ mod tests {
         let b = vec![1.0; n];
         let c = vec![0.0; n];
         let d = vec![1.0, 2.0, 3.0, 4.0, 5.0];
-        
+
         let x = solve_tridiagonal_alloc(&a, &b, &c, &d);
-        
+
         for i in 0..n {
             assert!((x[i] - d[i]).abs() < 1e-12);
         }
@@ -117,15 +112,15 @@ mod tests {
         // -1x0 + 2x1 - 1x2 = 0
         // -1x1 + 2x2 = 1
         // Solution: x = [1, 1, 1]
-        
+
         let n = 3;
         let a = vec![0.0, -1.0, -1.0]; // a[0] ignored
         let b = vec![2.0, 2.0, 2.0];
         let c = vec![-1.0, -1.0, 0.0]; // c[2] ignored
         let d = vec![1.0, 0.0, 1.0];
-        
+
         let x = solve_tridiagonal_alloc(&a, &b, &c, &d);
-        
+
         assert!((x[0] - 1.0).abs() < 1e-12, "x[0] = {}", x[0]);
         assert!((x[1] - 1.0).abs() < 1e-12, "x[1] = {}", x[1]);
         assert!((x[2] - 1.0).abs() < 1e-12, "x[2] = {}", x[2]);

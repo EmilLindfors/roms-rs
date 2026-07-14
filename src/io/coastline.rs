@@ -229,17 +229,11 @@ mod tests {
         let bbox = GeoBoundingBox::new(8.0, 63.5, 9.5, 64.0);
 
         // Coords inside bbox
-        let inside = vec![
-            Coord { x: 8.5, y: 63.75 },
-            Coord { x: 9.0, y: 63.8 },
-        ];
+        let inside = vec![Coord { x: 8.5, y: 63.75 }, Coord { x: 9.0, y: 63.8 }];
         assert!(coords_intersect_bbox(&inside, &bbox));
 
         // Coords outside bbox
-        let outside = vec![
-            Coord { x: 5.0, y: 60.0 },
-            Coord { x: 6.0, y: 61.0 },
-        ];
+        let outside = vec![Coord { x: 5.0, y: 60.0 }, Coord { x: 6.0, y: 61.0 }];
         assert!(!coords_intersect_bbox(&outside, &bbox));
     }
 }

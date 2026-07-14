@@ -7,22 +7,25 @@
 
 use std::time::Instant;
 
+use dg_rs::SWEState2D;
 use dg_rs::mesh::{BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
+use dg_rs::solver::SWESolution2D;
 use dg_rs::solver::burn::{
     BurnConnectivity, BurnGeometricFactors2D, BurnOperators2D, BurnRhsConfig, BurnSWESolution2D,
 };
-use dg_rs::solver::SWESolution2D;
 use dg_rs::time::{compute_dt_burn, ssp_rk3_step_burn};
 use dg_rs::types::ElementIndex;
-use dg_rs::SWEState2D;
 
 #[cfg(feature = "burn-cuda")]
 use burn_cuda::{Cuda, CudaDevice};
+#[cfg(all(
+    feature = "burn-ndarray",
+    not(any(feature = "burn-cuda", feature = "burn-wgpu"))
+))]
+use burn_ndarray::{NdArray, NdArrayDevice};
 #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
 use burn_wgpu::{Wgpu, WgpuDevice};
-#[cfg(all(feature = "burn-ndarray", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
-use burn_ndarray::{NdArray, NdArrayDevice};
 
 fn k(idx: usize) -> ElementIndex {
     ElementIndex::new(idx)
@@ -36,14 +39,20 @@ fn main() {
     type B = Cuda<f64, i64>;
     #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
     type B = Wgpu<f64, i64, u32>;
-    #[cfg(all(feature = "burn-ndarray", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
+    #[cfg(all(
+        feature = "burn-ndarray",
+        not(any(feature = "burn-cuda", feature = "burn-wgpu"))
+    ))]
     type B = NdArray<f64>;
 
     #[cfg(feature = "burn-cuda")]
     let device = CudaDevice::default();
     #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
     let device = WgpuDevice::default();
-    #[cfg(all(feature = "burn-ndarray", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
+    #[cfg(all(
+        feature = "burn-ndarray",
+        not(any(feature = "burn-cuda", feature = "burn-wgpu"))
+    ))]
     let device = NdArrayDevice::default();
 
     // Smaller problem for faster iteration
@@ -54,10 +63,8 @@ fn main() {
     println!("=== GPU Profiling ===");
     println!("Mesh: {}x{} = {} elements, P{}", nx, ny, nx * ny, order);
 
-    let mesh = Mesh2D::uniform_rectangle_with_bc(
-        0.0, 10000.0, 0.0, 5000.0,
-        nx, ny, BoundaryTag::Wall,
-    );
+    let mesh =
+        Mesh2D::uniform_rectangle_with_bc(0.0, 10000.0, 0.0, 5000.0, nx, ny, BoundaryTag::Wall);
 
     let ops = DGOperators2D::new(order);
     let geom = GeometricFactors2D::compute(&mesh);
@@ -83,9 +90,8 @@ fn main() {
     println!("  Geometry upload: {:?}", t0.elapsed());
 
     let t0 = Instant::now();
-    let connectivity = BurnConnectivity::<B>::from_mesh(
-        &mesh, &geom, &ops.face_nodes, ops.n_face_nodes, &device,
-    );
+    let connectivity =
+        BurnConnectivity::<B>::from_mesh(&mesh, &geom, &ops.face_nodes, ops.n_face_nodes, &device);
     println!("  Connectivity upload: {:?}", t0.elapsed());
 
     let t0 = Instant::now();
@@ -126,7 +132,8 @@ fn main() {
     use dg_rs::solver::burn::compute_rhs_swe_2d_burn;
     for i in 0..5 {
         let t0 = Instant::now();
-        let _rhs = compute_rhs_swe_2d_burn(&burn_state, &burn_ops, &burn_geom, &connectivity, &config);
+        let _rhs =
+            compute_rhs_swe_2d_burn(&burn_state, &burn_ops, &burn_geom, &connectivity, &config);
         println!("  RHS {}: {:?}", i, t0.elapsed());
     }
 

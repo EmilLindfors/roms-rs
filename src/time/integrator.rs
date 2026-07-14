@@ -161,6 +161,48 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SSPRK3;
 
+impl SSPRK3 {
+    /// Advance one step while applying a hook after each intermediate RK stage.
+    ///
+    /// This is useful for nonlinear projections such as positivity or bounds
+    /// limiters that must run before the next RHS evaluation.
+    pub fn step_with_stage_hook<S, F, H>(
+        &self,
+        state: &mut S,
+        dt: f64,
+        t: f64,
+        mut rhs: F,
+        mut stage_hook: H,
+    ) where
+        S: Integrable,
+        F: FnMut(&S, f64) -> S,
+        H: FnMut(&mut S),
+    {
+        // Stage 1: u1 = u + dt * L(u, t)
+        let l_u = rhs(state, t);
+        let mut u1 = state.clone();
+        u1.axpy(dt, &l_u);
+        stage_hook(&mut u1);
+
+        // Stage 2: u2 = 3/4 * u + 1/4 * u1 + 1/4 * dt * L(u1, t + dt)
+        let t1 = t + dt;
+        let l_u1 = rhs(&u1, t1);
+        let mut u2 = state.clone();
+        u2.scale(0.75);
+        u2.axpy(0.25, &u1);
+        u2.axpy(0.25 * dt, &l_u1);
+        stage_hook(&mut u2);
+
+        // Stage 3: u_new = 1/3 * u + 2/3 * u2 + 2/3 * dt * L(u2, t + dt/2)
+        let t2 = t + 0.5 * dt;
+        let l_u2 = rhs(&u2, t2);
+        state.scale(1.0 / 3.0);
+        state.axpy(2.0 / 3.0, &u2);
+        state.axpy(2.0 / 3.0 * dt, &l_u2);
+        stage_hook(state);
+    }
+}
+
 impl IntegratorInfo for SSPRK3 {
     fn name(&self) -> &'static str {
         "ssp-rk3"
@@ -343,8 +385,7 @@ pub fn create_integrator_info(integrator: StandardIntegrator) -> BoxedIntegrator
 // =============================================================================
 
 use crate::solver::{
-    DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, TracerSolution2D,
-    state::Solution3D,
+    DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, TracerSolution2D, state::Solution3D,
 };
 
 impl Integrable for DGSolution1D {
@@ -405,12 +446,24 @@ impl Integrable for Solution3D {
         self.vbar.scale(c);
 
         // Scale 3D baroclinic state
-        for x in &mut self.u { *x *= c; }
-        for x in &mut self.v { *x *= c; }
-        for x in &mut self.w { *x *= c; }
-        for x in &mut self.temp { *x *= c; }
-        for x in &mut self.salt { *x *= c; }
-        for x in &mut self.rho { *x *= c; }
+        for x in &mut self.u {
+            *x *= c;
+        }
+        for x in &mut self.v {
+            *x *= c;
+        }
+        for x in &mut self.w {
+            *x *= c;
+        }
+        for x in &mut self.temp {
+            *x *= c;
+        }
+        for x in &mut self.salt {
+            *x *= c;
+        }
+        for x in &mut self.rho {
+            *x *= c;
+        }
     }
 
     fn axpy(&mut self, c: f64, other: &Self) {
@@ -421,12 +474,24 @@ impl Integrable for Solution3D {
 
         // AXPY 3D baroclinic state
         // Using iterators for now. Optimized SIMD/BLAS kernels should replace this later.
-        for (x, y) in self.u.iter_mut().zip(other.u.iter()) { *x += c * y; }
-        for (x, y) in self.v.iter_mut().zip(other.v.iter()) { *x += c * y; }
-        for (x, y) in self.w.iter_mut().zip(other.w.iter()) { *x += c * y; }
-        for (x, y) in self.temp.iter_mut().zip(other.temp.iter()) { *x += c * y; }
-        for (x, y) in self.salt.iter_mut().zip(other.salt.iter()) { *x += c * y; }
-        for (x, y) in self.rho.iter_mut().zip(other.rho.iter()) { *x += c * y; }
+        for (x, y) in self.u.iter_mut().zip(other.u.iter()) {
+            *x += c * y;
+        }
+        for (x, y) in self.v.iter_mut().zip(other.v.iter()) {
+            *x += c * y;
+        }
+        for (x, y) in self.w.iter_mut().zip(other.w.iter()) {
+            *x += c * y;
+        }
+        for (x, y) in self.temp.iter_mut().zip(other.temp.iter()) {
+            *x += c * y;
+        }
+        for (x, y) in self.salt.iter_mut().zip(other.salt.iter()) {
+            *x += c * y;
+        }
+        for (x, y) in self.rho.iter_mut().zip(other.rho.iter()) {
+            *x += c * y;
+        }
     }
 }
 
@@ -465,6 +530,32 @@ mod tests {
                 error
             );
         }
+    }
+
+    #[test]
+    fn test_ssprk3_stage_hook_runs_after_each_stage() {
+        let mut u = DGSolution1D::new(1, 1);
+        u.data[0] = 1.0;
+
+        let integrator = SSPRK3;
+        let mut n_hooks = 0;
+        integrator.step_with_stage_hook(
+            &mut u,
+            0.1,
+            0.0,
+            |state, _time| {
+                let mut rhs = state.clone();
+                rhs.scale(1.0);
+                rhs
+            },
+            |stage_state| {
+                n_hooks += 1;
+                stage_state.data[0] = stage_state.data[0].min(1.05);
+            },
+        );
+
+        assert_eq!(n_hooks, 3);
+        assert!(u.data[0] <= 1.05);
     }
 
     #[test]

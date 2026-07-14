@@ -24,7 +24,7 @@ use crate::solver::SWEState2D;
 use crate::source::{SpongeLayer2D, SpongeProfile};
 
 use super::bathymetry_validation::{
-    validate_bathymetry_convention, BathymetryValidationConfig, BathymetryValidationResult,
+    BathymetryValidationConfig, BathymetryValidationResult, validate_bathymetry_convention,
 };
 
 /// Configuration for sponge layer damping zones.
@@ -265,8 +265,7 @@ impl TidalSimulationBuilder {
                 Box::new(bc)
             }
             TidalBCType::Dirichlet => {
-                let mut bc =
-                    HarmonicTidal2D::new(self.constituents.clone()).with_h_min(self.h_min);
+                let mut bc = HarmonicTidal2D::new(self.constituents.clone()).with_h_min(self.h_min);
                 if let Some(duration) = self.ramp_duration {
                     bc = bc.with_ramp_up(duration);
                 }
@@ -291,9 +290,8 @@ impl TidalSimulationBuilder {
         let h_ref = self.h_ref;
 
         // Reference state: calm water at rest
-        let reference_state = move |_x: f64, _y: f64, _t: f64| {
-            SWEState2D::from_primitives(h_ref, 0.0, 0.0)
-        };
+        let reference_state =
+            move |_x: f64, _y: f64, _t: f64| SWEState2D::from_primitives(h_ref, 0.0, 0.0);
 
         // Domain as (x_min, x_max, y_min, y_max)
         let domain = (x_range.0, x_range.1, y_range.0, y_range.1);
@@ -396,8 +394,8 @@ mod tests {
 
     #[test]
     fn test_build_bc_dirichlet() {
-        let builder = TidalSimulationBuilder::m2(0.5, 0.0, 50.0)
-            .with_bc_type(TidalBCType::Dirichlet);
+        let builder =
+            TidalSimulationBuilder::m2(0.5, 0.0, 50.0).with_bc_type(TidalBCType::Dirichlet);
         let bc = builder.build_bc();
         assert_eq!(bc.name(), "harmonic_tidal_2d");
     }

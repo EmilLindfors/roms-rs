@@ -38,10 +38,7 @@ pub use crate::solver::limiters::tracer_2d::KuzminParameter2D;
 ///
 /// # Returns
 /// Vector of (avg_h, avg_hu, avg_hv) for each element.
-pub fn swe_cell_averages_2d(
-    swe: &SWESolution2D,
-    ops: &DGOperators2D,
-) -> Vec<(f64, f64, f64)> {
+pub fn swe_cell_averages_2d(swe: &SWESolution2D, ops: &DGOperators2D) -> Vec<(f64, f64, f64)> {
     let n_elements = swe.n_elements;
     let n_nodes = swe.n_nodes;
     let mut averages = Vec::with_capacity(n_elements);
@@ -110,11 +107,7 @@ fn compute_theta_positivity(avg: f64, min_elem: f64, h_min: f64) -> f64 {
 /// * `swe` - SWE solution to limit (modified in place)
 /// * `ops` - DG operators (for quadrature weights)
 /// * `h_min` - Minimum depth threshold
-pub fn swe_positivity_limiter_2d(
-    swe: &mut SWESolution2D,
-    ops: &DGOperators2D,
-    h_min: f64,
-) {
+pub fn swe_positivity_limiter_2d(swe: &mut SWESolution2D, ops: &DGOperators2D, h_min: f64) {
     let n_elements = swe.n_elements;
     let n_nodes = ops.n_nodes;
 
@@ -124,11 +117,13 @@ pub fn swe_positivity_limiter_2d(
     for k in ElementIndex::iter(n_elements) {
         let (h_avg, hu_avg, hv_avg) = averages[k.as_usize()];
 
-        // Skip if average is below threshold (dry cell)
+        // If the average is below threshold, this is a dry element. Enforcing
+        // h >= h_min at every node would add water, so preserve the average
+        // depth instead and remove momentum.
         if h_avg < h_min {
-            // Set entire cell to minimum state
+            let dry_depth = h_avg.max(0.0);
             for i in 0..n_nodes {
-                swe.set_state(k, i, SWEState2D::from_primitives(h_min, 0.0, 0.0));
+                swe.set_state(k, i, SWEState2D::new(dry_depth, 0.0, 0.0));
             }
             continue;
         }
@@ -154,11 +149,18 @@ pub fn swe_positivity_limiter_2d(
             let hu_new = theta * (state.hu - hu_avg) + hu_avg;
             let hv_new = theta * (state.hv - hv_avg) + hv_avg;
 
-            swe.set_state(k, i, SWEState2D { h: h_new, hu: hu_new, hv: hv_new });
+            swe.set_state(
+                k,
+                i,
+                SWEState2D {
+                    h: h_new,
+                    hu: hu_new,
+                    hv: hv_new,
+                },
+            );
         }
     }
 }
-
 
 /// Map local vertex index (0-3 in CCW order) to DG node index.
 #[inline]
@@ -302,7 +304,15 @@ pub fn swe_kuzmin_limiter_2d(
                 let hu_new = alpha * (state.hu - hu_avg) + hu_avg;
                 let hv_new = alpha * (state.hv - hv_avg) + hv_avg;
 
-                swe.set_state(k, i, SWEState2D { h: h_new, hu: hu_new, hv: hv_new });
+                swe.set_state(
+                    k,
+                    i,
+                    SWEState2D {
+                        h: h_new,
+                        hu: hu_new,
+                        hv: hv_new,
+                    },
+                );
             }
         }
     }
@@ -422,6 +432,14 @@ pub fn swe_positivity_limiter_2d_parallel(
 
             let (avg_h, avg_hu, avg_hv) = averages[k];
 
+            if avg_h < h_min {
+                let dry_depth = avg_h.max(0.0);
+                h_out.fill(dry_depth);
+                hu_out.fill(0.0);
+                hv_out.fill(0.0);
+                return (h_out, hu_out, hv_out);
+            }
+
             // Find minimum h value in element
             let min_h = h_out.iter().cloned().fold(f64::INFINITY, f64::min);
 
@@ -442,17 +460,15 @@ pub fn swe_positivity_limiter_2d_parallel(
         .collect();
 
     // Step 4: Write results back (borrow sequentially to avoid multiple mutable borrows)
-    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results
-        .into_iter()
-        .fold(
-            (Vec::new(), Vec::new(), Vec::new()),
-            |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
-                h_acc.push(h);
-                hu_acc.push(hu);
-                hv_acc.push(hv);
-                (h_acc, hu_acc, hv_acc)
-            },
-        );
+    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results.into_iter().fold(
+        (Vec::new(), Vec::new(), Vec::new()),
+        |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
+            h_acc.push(h);
+            hu_acc.push(hu);
+            hv_acc.push(hv);
+            (h_acc, hu_acc, hv_acc)
+        },
+    );
 
     for (k, h_elem) in h_results.into_iter().enumerate() {
         let start = k * n_nodes;
@@ -555,17 +571,15 @@ pub fn swe_kuzmin_limiter_2d_parallel(
         .collect();
 
     // Step 5: Write results back (borrow sequentially to avoid multiple mutable borrows)
-    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results
-        .into_iter()
-        .fold(
-            (Vec::new(), Vec::new(), Vec::new()),
-            |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
-                h_acc.push(h);
-                hu_acc.push(hu);
-                hv_acc.push(hv);
-                (h_acc, hu_acc, hv_acc)
-            },
-        );
+    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results.into_iter().fold(
+        (Vec::new(), Vec::new(), Vec::new()),
+        |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
+            h_acc.push(h);
+            hu_acc.push(hu);
+            hv_acc.push(hv);
+            (h_acc, hu_acc, hv_acc)
+        },
+    );
 
     for (k, h_elem) in h_results.into_iter().enumerate() {
         let start = k * n_nodes;
@@ -634,12 +648,28 @@ pub fn apply_swe_limiters_kuzmin_2d_parallel(
             let mut alpha_hv = 1.0_f64;
 
             for (local_v, &global_v) in vertices.iter().enumerate() {
-                let ((bound_h_min, bound_h_max), (hu_min, hu_max), (hv_min, hv_max)) = vertex_bounds[global_v];
+                let ((bound_h_min, bound_h_max), (hu_min, hu_max), (hv_min, hv_max)) =
+                    vertex_bounds[global_v];
                 let node_idx = vertex_to_node_index(local_v, n_1d);
 
-                alpha_h = alpha_h.min(compute_kuzmin_alpha(h_avg, h_out[node_idx], bound_h_min, bound_h_max));
-                alpha_hu = alpha_hu.min(compute_kuzmin_alpha(hu_avg, hu_out[node_idx], hu_min, hu_max));
-                alpha_hv = alpha_hv.min(compute_kuzmin_alpha(hv_avg, hv_out[node_idx], hv_min, hv_max));
+                alpha_h = alpha_h.min(compute_kuzmin_alpha(
+                    h_avg,
+                    h_out[node_idx],
+                    bound_h_min,
+                    bound_h_max,
+                ));
+                alpha_hu = alpha_hu.min(compute_kuzmin_alpha(
+                    hu_avg,
+                    hu_out[node_idx],
+                    hu_min,
+                    hu_max,
+                ));
+                alpha_hv = alpha_hv.min(compute_kuzmin_alpha(
+                    hv_avg,
+                    hv_out[node_idx],
+                    hv_min,
+                    hv_max,
+                ));
             }
 
             let alpha_kuzmin = alpha_h.min(alpha_hu).min(alpha_hv);
@@ -677,17 +707,15 @@ pub fn apply_swe_limiters_kuzmin_2d_parallel(
         .collect();
 
     // Step 5: Write results back (borrow sequentially to avoid multiple mutable borrows)
-    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results
-        .into_iter()
-        .fold(
-            (Vec::new(), Vec::new(), Vec::new()),
-            |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
-                h_acc.push(h);
-                hu_acc.push(hu);
-                hv_acc.push(hv);
-                (h_acc, hu_acc, hv_acc)
-            },
-        );
+    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results.into_iter().fold(
+        (Vec::new(), Vec::new(), Vec::new()),
+        |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
+            h_acc.push(h);
+            hu_acc.push(hu);
+            hv_acc.push(hv);
+            (h_acc, hu_acc, hv_acc)
+        },
+    );
 
     for (k, h_elem) in h_results.into_iter().enumerate() {
         let start = k * n_nodes;
@@ -743,5 +771,25 @@ mod tests {
         let alpha = compute_kuzmin_alpha(10.0, 25.0, 5.0, 20.0);
         let expected = 10.0 / 15.0;
         assert!((alpha - expected).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_positivity_dry_average_does_not_inject_mass() {
+        let ops = DGOperators2D::new(2);
+        let mut swe = SWESolution2D::new(1, ops.n_nodes);
+        let k = ElementIndex::new(0);
+
+        for i in 0..ops.n_nodes {
+            swe.set_state(k, i, SWEState2D::new(0.005, 0.1, -0.1));
+        }
+
+        swe_positivity_limiter_2d(&mut swe, &ops, 0.01);
+
+        for i in 0..ops.n_nodes {
+            let state = swe.get_state(k, i);
+            assert!((state.h - 0.005).abs() < 1e-14);
+            assert!(state.hu.abs() < 1e-14);
+            assert!(state.hv.abs() < 1e-14);
+        }
     }
 }

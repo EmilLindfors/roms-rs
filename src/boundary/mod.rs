@@ -115,6 +115,27 @@ pub use bathymetry_validation::{
 
 use crate::solver::SWEState;
 
+/// Reflect a velocity `(u, v)` across a solid wall with outward unit normal
+/// `(nx, ny)`.
+///
+/// The normal component is reversed (`u_ext·n = −u_int·n`) and the tangential
+/// component is preserved:
+///
+/// ```text
+/// u_ext = u − 2 (u·n) nx
+/// v_ext = v − 2 (u·n) ny
+/// ```
+///
+/// This is the free-slip solid-wall ghost state: pairing it with an unchanged
+/// exterior depth makes the normal mass/momentum flux through the wall vanish.
+/// Shared by the 2D `Reflective2D` boundary and the 3D continuity / momentum
+/// advection land-boundary treatment so all three use one convention.
+#[inline]
+pub fn reflect_velocity(u: f64, v: f64, nx: f64, ny: f64) -> (f64, f64) {
+    let un = u * nx + v * ny;
+    (u - 2.0 * un * nx, v - 2.0 * un * ny)
+}
+
 /// Context for boundary condition evaluation.
 ///
 /// Provides all information needed to compute the ghost state at a boundary.
@@ -327,5 +348,41 @@ mod tests {
         let ghost = bc.ghost_state(&ctx);
         assert!((ghost.h - 2.0).abs() < 1e-14); // Uses interior depth
         assert!((ghost.hu - 5.0).abs() < 1e-14); // Prescribed discharge
+    }
+
+    #[test]
+    fn reflect_velocity_reverses_normal_preserves_tangential() {
+        // Axis-aligned wall (normal +x): normal component flips, tangential kept.
+        let (u, v) = reflect_velocity(1.0, 0.5, 1.0, 0.0);
+        assert!((u - (-1.0)).abs() < 1e-14);
+        assert!((v - 0.5).abs() < 1e-14);
+
+        // Purely tangential flow is untouched.
+        let (u, v) = reflect_velocity(0.0, 2.0, 1.0, 0.0);
+        assert!(u.abs() < 1e-14);
+        assert!((v - 2.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn reflect_velocity_zero_normal_flux_at_wall() {
+        // For any incident velocity and unit normal, the exterior normal velocity
+        // must equal minus the interior normal velocity (=> zero Rusanov mass flux
+        // when the exterior depth equals the interior depth). This is the property
+        // that stops mass leaking through coastal walls (TODO P0.7).
+        let inv_sqrt2 = 1.0 / 2.0_f64.sqrt();
+        for &(u, v, nx, ny) in &[
+            (1.3, -0.7, 1.0, 0.0),
+            (1.3, -0.7, 0.0, 1.0),
+            (1.3, -0.7, inv_sqrt2, inv_sqrt2),
+            (-2.1, 0.4, -inv_sqrt2, inv_sqrt2),
+        ] {
+            let un_int = u * nx + v * ny;
+            let (ue, ve) = reflect_velocity(u, v, nx, ny);
+            let un_ext = ue * nx + ve * ny;
+            assert!(
+                (un_ext + un_int).abs() < 1e-14,
+                "normal velocity not reflected: un_int={un_int}, un_ext={un_ext}"
+            );
+        }
     }
 }

@@ -228,6 +228,13 @@ locality because:
 **Conclusion:** Keep original Vec allocation pattern. The 17% system time is NOT from
 face state allocations.
 
+> **Superseded (2026-07-08, see REVIEW.md §4.1):** the face-Vec hypothesis was the wrong
+> target, but allocation *is* the likely source of the 17% system time — it sits one level
+> up, in the integrator/physics API shape: `compute_rhs(...) -> S` allocates a full solution
+> per RHS evaluation and `SSPRK3::step` clones the state twice, ≈5 full-field allocations
+> (~70 MB alloc/free) per step at this scale. Fix is `compute_rhs_into(&mut S)` +
+> workspace-owning integrator.
+
 ### Kept: Hydrostatic Reconstruction Outside Face Loop
 
 Moved `HydrostaticReconstruction2D::new(g, h_min)` from inside face loop to once per element.

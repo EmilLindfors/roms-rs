@@ -28,7 +28,7 @@ pub trait EquationOfState: Send + Sync {
     ///
     /// Returns density [kg/m^3].
     fn compute_density(&self, t: f64, s: f64, z: f64) -> f64;
-    
+
     /// Update the density field in the 3D solution.
     fn update_density(&self, state: &mut Solution3D);
 }
@@ -66,7 +66,7 @@ impl EquationOfState for LinearEOS {
         let n_elements = state.n_elements;
         let n_nodes = state.n_nodes;
         let n_levels = state.n_levels;
-        
+
         for k in ElementIndex::iter(n_elements) {
             let _ki = k.as_usize();
             for i in 0..n_nodes {
@@ -78,19 +78,19 @@ impl EquationOfState for LinearEOS {
                 // We can't get &temp and &mut rho simultaneously if they are fields of same struct
                 // unless we split the borrow.
                 // Since `Solution3D` fields are public, we can borrow fields individually.
-                
+
                 // This is the borrow checker friendly way:
                 // We cannot access `state.temp_column` and `state.rho_column_mut` simultaneously
                 // if those methods take `&self` and `&mut self`.
                 // But we CAN access `state.temp` and `state.rho` vectors directly.
-                
+
                 let start_idx = (k.as_usize() * n_nodes + i) * n_levels;
                 let end_idx = start_idx + n_levels;
-                
+
                 let t_col = &state.temp[start_idx..end_idx];
                 let s_col = &state.salt[start_idx..end_idx];
                 let rho_col = &mut state.rho[start_idx..end_idx];
-                
+
                 for l in 0..n_levels {
                     rho_col[l] = self.compute_density(t_col[l], s_col[l], 0.0);
                 }
@@ -114,32 +114,34 @@ impl EquationOfState for UnescoEOS {
         // This is a placeholder for the full nonlinear implementation.
         let t2 = t * t;
         let s32 = s.powf(1.5);
-        
+
         // Approx coeff for sigma-t (kg/m^3 - 1000)
-        let sigma = 999.842594 + 6.793952e-2 * t - 9.095290e-3 * t2 + 1.001685e-4 * t2*t
+        let sigma = 999.842594 + 6.793952e-2 * t - 9.095290e-3 * t2
+            + 1.001685e-4 * t2 * t
             + (0.824493 - 4.0899e-3 * t + 7.6438e-5 * t2) * s
-            - 5.72466e-3 * s32 + 4.8314e-4 * s*s;
-            
+            - 5.72466e-3 * s32
+            + 4.8314e-4 * s * s;
+
         sigma
     }
-    
+
     fn update_density(&self, state: &mut Solution3D) {
         let n_elements = state.n_elements;
         let n_nodes = state.n_nodes;
         let n_levels = state.n_levels;
-        
+
         // Parallel iteration could be done here if we had par_iter
         // For now, sequential loop with split borrows.
-        
+
         // We can iterate over the full flat vectors directly!
         // No need to do element/node loops since it's pointwise.
-        
+
         let total_size = n_elements * n_nodes * n_levels;
         for idx in 0..total_size {
-             let t = state.temp[idx];
-             let s = state.salt[idx];
-             // z dependence ignored in this simplified version
-             state.rho[idx] = self.compute_density(t, s, 0.0);
+            let t = state.temp[idx];
+            let s = state.salt[idx];
+            // z dependence ignored in this simplified version
+            state.rho[idx] = self.compute_density(t, s, 0.0);
         }
     }
 }
@@ -154,29 +156,29 @@ mod tests {
         // T=T0, S=S0 -> rho=rho0
         let rho = eos.compute_density(10.0, 35.0, 0.0);
         assert!((rho - 1025.0).abs() < 1e-10);
-        
+
         // Warmer -> lighter
         let rho_warm = eos.compute_density(20.0, 35.0, 0.0);
         assert!(rho_warm < 1025.0);
-        
+
         // Saltier -> heavier
         let rho_salty = eos.compute_density(10.0, 36.0, 0.0);
         assert!(rho_salty > 1025.0);
     }
-    
+
     #[test]
     fn test_update_density() {
         let n_elem = 1;
         let n_nodes = 1;
         let n_levels = 2;
         let mut state = Solution3D::new(n_elem, n_nodes, n_levels);
-        
+
         state.temp.fill(20.0);
         state.salt.fill(35.0);
-        
+
         let eos = LinearEOS::default();
         eos.update_density(&mut state);
-        
+
         let expected = eos.compute_density(20.0, 35.0, 0.0);
         assert!((state.rho[0] - expected).abs() < 1e-10);
         assert!((state.rho[1] - expected).abs() < 1e-10);

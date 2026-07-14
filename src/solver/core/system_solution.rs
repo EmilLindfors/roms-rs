@@ -278,10 +278,7 @@ impl<const N: usize> SystemSolution2D<N> {
 
     /// Get maximum absolute value for a specific variable.
     pub fn max_abs_var(&self, var: usize) -> f64 {
-        self.data[var]
-            .iter()
-            .map(|&x| x.abs())
-            .fold(0.0, f64::max)
+        self.data[var].iter().map(|&x| x.abs()).fold(0.0, f64::max)
     }
 
     /// Copy from another solution.

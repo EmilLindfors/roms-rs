@@ -123,10 +123,10 @@ where
 
         // Reference face normals
         let ref_normals: [(f64, f64); 4] = [
-            (0.0, -1.0),  // Face 0 (bottom)
-            (1.0, 0.0),   // Face 1 (right)
-            (0.0, 1.0),   // Face 2 (top)
-            (-1.0, 0.0),  // Face 3 (left)
+            (0.0, -1.0), // Face 0 (bottom)
+            (1.0, 0.0),  // Face 1 (right)
+            (0.0, 1.0),  // Face 2 (top)
+            (-1.0, 0.0), // Face 3 (left)
         ];
 
         for k in 0..n_elements {
@@ -164,7 +164,10 @@ where
 
         // Create tensors
         let interior_face_elements = if n_interior_faces > 0 {
-            let data: Vec<B::IntElem> = interior_elements.into_iter().map(|x| B::IntElem::from(x)).collect();
+            let data: Vec<B::IntElem> = interior_elements
+                .into_iter()
+                .map(|x| B::IntElem::from(x))
+                .collect();
             Tensor::from_data(
                 burn::tensor::TensorData::new(data, vec![n_interior_faces, 2]),
                 device,
@@ -174,7 +177,10 @@ where
         };
 
         let interior_face_local = if n_interior_faces > 0 {
-            let data: Vec<B::IntElem> = interior_local.into_iter().map(|x| B::IntElem::from(x)).collect();
+            let data: Vec<B::IntElem> = interior_local
+                .into_iter()
+                .map(|x| B::IntElem::from(x))
+                .collect();
             Tensor::from_data(
                 burn::tensor::TensorData::new(data, vec![n_interior_faces, 2]),
                 device,
@@ -184,7 +190,10 @@ where
         };
 
         let face_node_map = {
-            let data: Vec<B::IntElem> = face_node_data.into_iter().map(|x| B::IntElem::from(x)).collect();
+            let data: Vec<B::IntElem> = face_node_data
+                .into_iter()
+                .map(|x| B::IntElem::from(x))
+                .collect();
             Tensor::from_data(
                 burn::tensor::TensorData::new(data, vec![n_elements, 4, n_face_nodes]),
                 device,
@@ -192,7 +201,10 @@ where
         };
 
         let face_normals = {
-            let data: Vec<B::FloatElem> = face_normal_data.into_iter().map(|x| B::FloatElem::from(x)).collect();
+            let data: Vec<B::FloatElem> = face_normal_data
+                .into_iter()
+                .map(|x| B::FloatElem::from(x))
+                .collect();
             Tensor::from_data(
                 burn::tensor::TensorData::new(data, vec![n_elements, 4, 2]),
                 device,
@@ -200,7 +212,10 @@ where
         };
 
         let face_jacobians = {
-            let data: Vec<B::FloatElem> = face_jacobian_data.into_iter().map(|x| B::FloatElem::from(x)).collect();
+            let data: Vec<B::FloatElem> = face_jacobian_data
+                .into_iter()
+                .map(|x| B::FloatElem::from(x))
+                .collect();
             Tensor::from_data(
                 burn::tensor::TensorData::new(data, vec![n_elements, 4]),
                 device,
@@ -208,7 +223,10 @@ where
         };
 
         let boundary_faces = if n_boundary_faces > 0 {
-            let data: Vec<B::IntElem> = boundary_data.into_iter().map(|x| B::IntElem::from(x)).collect();
+            let data: Vec<B::IntElem> = boundary_data
+                .into_iter()
+                .map(|x| B::IntElem::from(x))
+                .collect();
             Tensor::from_data(
                 burn::tensor::TensorData::new(data, vec![n_boundary_faces, 3]),
                 device,
@@ -236,16 +254,14 @@ where
 #[cfg(feature = "burn-ndarray")]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArray;
     use crate::mesh::Mesh2DBuilder;
     use crate::operators::DGOperators2D;
+    use burn_ndarray::NdArray;
 
     #[test]
     fn test_connectivity_creation() {
         // Create a simple 2x2 mesh
-        let mesh = Mesh2DBuilder::unit_square()
-            .with_resolution(2, 2)
-            .build();
+        let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh);

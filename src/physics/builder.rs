@@ -10,8 +10,8 @@ use crate::flux::StandardFlux2D;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::{
-    LimiterContext2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
-    apply_wet_dry_correction_all, Limiter2D,
+    Limiter2D, LimiterContext2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
+    apply_wet_dry_correction_all,
 };
 use crate::source::SourceTerm2D;
 
@@ -77,8 +77,8 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModuleInfo for SWEPhysics2D<BC> {
 
 impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEPhysics2D<BC> {
     fn compute_rhs(&self, state: &SWESolution2D, time: f64) -> SWESolution2D {
-        use crate::solver::compute_rhs_swe_2d;
         use crate::solver::SWE2DRhsConfig;
+        use crate::solver::compute_rhs_swe_2d;
 
         // Build the RHS config
         let mut config = SWE2DRhsConfig::new(&self.equation, &self.bc)
@@ -102,7 +102,14 @@ impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEP
     fn compute_dt(&self, state: &SWESolution2D, cfl: f64) -> f64 {
         use crate::solver::compute_dt_swe_2d;
 
-        compute_dt_swe_2d(state, &self.mesh, &self.geom, &self.equation, self.order, cfl)
+        compute_dt_swe_2d(
+            state,
+            &self.mesh,
+            &self.geom,
+            &self.equation,
+            self.order,
+            cfl,
+        )
     }
 
     fn post_process(&self, state: &mut SWESolution2D) {
@@ -113,7 +120,7 @@ impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEP
         // Apply wet/dry correction
         if self.wet_dry_correction {
             let config = WetDryConfig::new(self.equation.h_min, self.equation.g);
-            apply_wet_dry_correction_all(state, &config);
+            apply_wet_dry_correction_all(state, &self.ops, &config);
         }
     }
 

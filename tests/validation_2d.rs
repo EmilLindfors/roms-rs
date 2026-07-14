@@ -6,12 +6,12 @@
 //! 3. Geostrophic balance (Coriolis equilibrium)
 //! 4. Sponge layer wave absorption
 
+use dg_rs::types::ElementIndex;
 use dg_rs::{
     DGOperators2D, GeometricFactors2D, Mesh2D, Reflective2D, SWE2DRhsConfig, SWESolution2D,
     SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
     source::{CombinedSource2D, CoriolisSource2D, SpongeLayer2D},
 };
-use dg_rs::types::ElementIndex;
 use std::f64::consts::PI;
 
 fn k(idx: usize) -> ElementIndex {

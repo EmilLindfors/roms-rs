@@ -15,6 +15,7 @@
 //! - Medeiros & Hagen (2013), "Review of wetting and drying algorithms for
 //!   numerical tidal flow models"
 
+use crate::operators::DGOperators2D;
 use crate::solver::state::SWEState2D;
 use crate::types::{Depth, ElementIndex};
 
@@ -41,7 +42,7 @@ impl WetDryConfig {
         Self {
             h_min,
             h_thin: Depth::new(10.0 * h_min.meters()), // Start blending at 10x h_min
-            max_velocity: 20.0, // Cap at 20 m/s (very fast tidal current)
+            max_velocity: 20.0,                        // Cap at 20 m/s (very fast tidal current)
             g,
         }
     }
@@ -265,6 +266,7 @@ pub fn apply_wet_dry_correction(state: &mut SWEState2D, config: &WetDryConfig) {
 /// - Precomputes inverse range for blending factor
 pub fn apply_wet_dry_correction_all(
     solution: &mut crate::solver::SWESolution2D,
+    ops: &DGOperators2D,
     config: &WetDryConfig,
 ) {
     let n_elements = solution.n_elements;
@@ -289,18 +291,68 @@ pub fn apply_wet_dry_correction_all(
 
         // If all nodes are dry, zero out momentum
         if max_h <= config.h_min.meters() {
-            // Ensure h >= 0
-            for h in solution.element_h_mut(k) {
+            let target_mass = weighted_depth_sum(solution.element_h(k), &ops.weights).max(0.0);
+            let mut h_new = solution.element_h(k).to_vec();
+            let mut hu_new = vec![0.0; solution.n_nodes];
+            let mut hv_new = vec![0.0; solution.n_nodes];
+            for h in &mut h_new {
                 *h = h.max(0.0);
             }
-            // Zero out momentum
-            solution.element_hu_mut(k).fill(0.0);
-            solution.element_hv_mut(k).fill(0.0);
+            rescale_element_mass(
+                &mut h_new,
+                &mut hu_new,
+                &mut hv_new,
+                &ops.weights,
+                target_mass,
+            );
+            solution.element_h_mut(k).copy_from_slice(&h_new);
+            solution.element_hu_mut(k).copy_from_slice(&hu_new);
+            solution.element_hv_mut(k).copy_from_slice(&hv_new);
             continue;
         }
 
         // Mixed wet/dry: apply full correction per-node
-        apply_wet_dry_correction_element_fused(solution, k, config, inv_range, max_vel_sq);
+        apply_wet_dry_correction_element_fused(solution, k, ops, config, inv_range, max_vel_sq);
+    }
+}
+
+#[inline]
+fn weighted_depth_sum(h: &[f64], weights: &[f64]) -> f64 {
+    h.iter().zip(weights.iter()).map(|(&h_i, &w)| h_i * w).sum()
+}
+
+fn rescale_element_mass(
+    h: &mut [f64],
+    hu: &mut [f64],
+    hv: &mut [f64],
+    weights: &[f64],
+    target_mass: f64,
+) {
+    let target_mass = target_mass.max(0.0);
+    if target_mass <= 0.0 {
+        h.fill(0.0);
+        hu.fill(0.0);
+        hv.fill(0.0);
+        return;
+    }
+
+    let corrected_mass = weighted_depth_sum(h, weights);
+    if corrected_mass <= 1e-14 {
+        h.fill(0.0);
+        hu.fill(0.0);
+        hv.fill(0.0);
+        return;
+    }
+
+    let scale = target_mass / corrected_mass;
+    if (scale - 1.0).abs() <= 1e-14 {
+        return;
+    }
+
+    for i in 0..h.len() {
+        h[i] *= scale;
+        hu[i] *= scale;
+        hv[i] *= scale;
     }
 }
 
@@ -376,6 +428,7 @@ fn apply_velocity_cap_element(
 fn apply_wet_dry_correction_element_fused(
     solution: &mut crate::solver::SWESolution2D,
     k: ElementIndex,
+    ops: &DGOperators2D,
     config: &WetDryConfig,
     inv_range: f64,
     max_vel_sq: f64,
@@ -387,6 +440,7 @@ fn apply_wet_dry_correction_element_fused(
     let h_vals: Vec<f64> = solution.element_h(k).to_vec();
     let hu_vals: Vec<f64> = solution.element_hu(k).to_vec();
     let hv_vals: Vec<f64> = solution.element_hv(k).to_vec();
+    let target_mass = weighted_depth_sum(&h_vals, &ops.weights).max(0.0);
 
     // Compute corrected values
     let mut h_new = vec![0.0; n_nodes];
@@ -437,6 +491,14 @@ fn apply_wet_dry_correction_element_fused(
         hv_new[i] = hv;
     }
 
+    rescale_element_mass(
+        &mut h_new,
+        &mut hu_new,
+        &mut hv_new,
+        &ops.weights,
+        target_mass,
+    );
+
     // Write back corrected values
     solution.element_h_mut(k).copy_from_slice(&h_new);
     solution.element_hu_mut(k).copy_from_slice(&hu_new);
@@ -450,6 +512,7 @@ fn apply_wet_dry_correction_element_fused(
 #[cfg(feature = "parallel")]
 pub fn apply_wet_dry_correction_all_parallel(
     solution: &mut crate::solver::SWESolution2D,
+    ops: &DGOperators2D,
     config: &WetDryConfig,
 ) {
     use rayon::prelude::*;
@@ -460,6 +523,7 @@ pub fn apply_wet_dry_correction_all_parallel(
     let max_vel_sq = config.max_velocity * config.max_velocity;
     let h_min = config.h_min.meters();
     let h_thin = config.h_thin.meters();
+    let weights = ops.weights.clone();
 
     // Process in chunks of elements (SoA layout)
     // Copy data for parallel processing (SoA arrays are separate)
@@ -477,6 +541,7 @@ pub fn apply_wet_dry_correction_all_parallel(
             let mut h_out = h_chunks[start..end].to_vec();
             let mut hu_out = hu_data[start..end].to_vec();
             let mut hv_out = hv_data[start..end].to_vec();
+            let target_mass = weighted_depth_sum(&h_out, &weights).max(0.0);
 
             // Fast path: check if element is fully wet (skip correction)
             let (min_h, max_h) = h_out
@@ -514,12 +579,13 @@ pub fn apply_wet_dry_correction_all_parallel(
                     hu_out[i] = 0.0;
                     hv_out[i] = 0.0;
                 }
+                rescale_element_mass(&mut h_out, &mut hu_out, &mut hv_out, &weights, target_mass);
                 return (h_out, hu_out, hv_out);
             }
 
             // Mixed wet/dry: full correction per-node
             for i in 0..n_nodes {
-                let mut h = h_out[i].max(0.0);
+                let h = h_out[i].max(0.0);
                 let mut hu = hu_out[i];
                 let mut hv = hv_out[i];
 
@@ -564,16 +630,16 @@ pub fn apply_wet_dry_correction_all_parallel(
                 hv_out[i] = hv;
             }
 
+            rescale_element_mass(&mut h_out, &mut hu_out, &mut hv_out, &weights, target_mass);
+
             (h_out, hu_out, hv_out)
         })
         .collect();
 
     // Write results back (must borrow sequentially to avoid multiple mutable borrows)
     // First collect into separate vecs
-    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) = results
-        .into_iter()
-        .map(|(h, hu, hv)| (h, hu, hv))
-        .fold(
+    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) =
+        results.into_iter().map(|(h, hu, hv)| (h, hu, hv)).fold(
             (Vec::new(), Vec::new(), Vec::new()),
             |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
                 h_acc.push(h);
@@ -614,8 +680,20 @@ pub fn apply_wet_dry_correction_all_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operators::DGOperators2D;
+    use crate::solver::SWESolution2D;
 
     const TOL: f64 = 1e-10;
+
+    fn weighted_mass(solution: &SWESolution2D, ops: &DGOperators2D) -> f64 {
+        let k = ElementIndex::new(0);
+        solution
+            .element_h(k)
+            .iter()
+            .zip(ops.weights.iter())
+            .map(|(&h, &w)| h * w)
+            .sum()
+    }
 
     #[test]
     fn test_blending_factor() {
@@ -730,5 +808,31 @@ mod tests {
         apply_wet_dry_correction(&mut state, &config);
         assert!((state.h - 1.0).abs() < TOL);
         assert!((state.hu - 5.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn test_element_correction_preserves_nonnegative_mass() {
+        let ops = DGOperators2D::new(2);
+        let config = WetDryConfig::new(Depth::new(0.01), 9.81);
+        let mut solution = SWESolution2D::new(1, ops.n_nodes);
+        let k = ElementIndex::new(0);
+
+        for i in 0..ops.n_nodes {
+            let h = if i == 0 { -0.01 } else { 0.02 };
+            solution.set_state(k, i, SWEState2D::new(h, 0.2, -0.1));
+        }
+
+        let initial_mass = weighted_mass(&solution, &ops).max(0.0);
+        apply_wet_dry_correction_all(&mut solution, &ops, &config);
+        let final_mass = weighted_mass(&solution, &ops);
+
+        assert!(
+            solution.element_h(k).iter().all(|&h| h >= 0.0),
+            "Wet/dry correction must leave nonnegative nodal depths"
+        );
+        assert!(
+            (final_mass - initial_mass).abs() < 1e-12,
+            "Wet/dry correction changed element mass: initial={initial_mass:.16e}, final={final_mass:.16e}"
+        );
     }
 }

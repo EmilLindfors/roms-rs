@@ -299,7 +299,10 @@ impl StabilityMonitor {
 
                 // Check for non-finite values
                 if !state.h.is_finite() || !state.hu.is_finite() || !state.hv.is_finite() {
-                    warnings.push(StabilityWarning::NonFiniteValue { element: ki, node: i });
+                    warnings.push(StabilityWarning::NonFiniteValue {
+                        element: ki,
+                        node: i,
+                    });
                     found_blow_up = true;
                     continue;
                 }
@@ -426,18 +429,17 @@ impl StabilityMonitor {
                     }
                     StabilityWarning::NonFiniteValue { .. } | StabilityWarning::SolutionBlowUp => {
                         suggestions.push(
-                            "Solution blow-up: Check bathymetry convention for Flather BCs".to_string()
+                            "Solution blow-up: Check bathymetry convention for Flather BCs"
+                                .to_string(),
                         );
                         suggestions.push(
                             "Consider using HarmonicTidal2D instead of HarmonicFlather2D for closed basins".to_string()
                         );
-                        suggestions.push(
-                            "Add sponge layers to absorb reflected waves".to_string()
-                        );
+                        suggestions.push("Add sponge layers to absorb reflected waves".to_string());
                     }
                     StabilityWarning::DepthBelowMin { .. } => {
                         suggestions.push(
-                            "Depth below threshold: Check wetting/drying treatment".to_string()
+                            "Depth below threshold: Check wetting/drying treatment".to_string(),
                         );
                     }
                 }
@@ -454,11 +456,12 @@ impl StabilityMonitor {
     pub fn print_report(&self, time: f64, step: usize) {
         if let Some(status) = &self.last_status {
             if !status.is_stable {
-                eprintln!("\nSTABILITY WARNING at t={:.2}h, step {}:", time / 3600.0, step);
                 eprintln!(
-                    "  h: [{:.2}, {:.2}] m",
-                    status.h_range.0, status.h_range.1
+                    "\nSTABILITY WARNING at t={:.2}h, step {}:",
+                    time / 3600.0,
+                    step
                 );
+                eprintln!("  h: [{:.2}, {:.2}] m", status.h_range.0, status.h_range.1);
                 eprintln!("  max |u|: {:.2} m/s", status.max_velocity);
                 eprintln!("  dt: {:.2e} s", status.dt);
                 eprintln!("  Warnings ({}):", status.warnings.len());
@@ -518,10 +521,12 @@ mod tests {
 
         let status = monitor.check(&q, 1.0);
         assert!(!status.is_stable);
-        assert!(status
-            .warnings
-            .iter()
-            .any(|w| matches!(w, StabilityWarning::VelocityExceedsMax { .. })));
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|w| matches!(w, StabilityWarning::VelocityExceedsMax { .. }))
+        );
     }
 
     #[test]
@@ -531,10 +536,12 @@ mod tests {
 
         let status = monitor.check(&q, 1.0);
         assert!(!status.is_stable);
-        assert!(status
-            .warnings
-            .iter()
-            .any(|w| matches!(w, StabilityWarning::DepthExceedsMax { .. })));
+        assert!(
+            status
+                .warnings
+                .iter()
+                .any(|w| matches!(w, StabilityWarning::DepthExceedsMax { .. }))
+        );
     }
 
     #[test]
@@ -551,9 +558,8 @@ mod tests {
     #[test]
     fn test_consecutive_warnings() {
         let q_bad = make_solution(4, 9, 50.0, 5000.0, 0.0);
-        let mut monitor = StabilityMonitor::new(
-            StabilityThresholds::tidal_default().with_max_velocity(10.0),
-        );
+        let mut monitor =
+            StabilityMonitor::new(StabilityThresholds::tidal_default().with_max_velocity(10.0));
 
         // Generate consecutive warnings
         for _ in 0..5 {

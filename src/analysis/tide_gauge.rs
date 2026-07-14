@@ -239,7 +239,11 @@ impl StationValidationResult {
         );
 
         // Apply datum offset to observations
-        let obs_adjusted: Vec<f64> = obs.values().iter().map(|&v| v + station.datum_offset).collect();
+        let obs_adjusted: Vec<f64> = obs
+            .values()
+            .iter()
+            .map(|&v| v + station.datum_offset)
+            .collect();
 
         let model_values = model.values();
         let metrics = ComparisonMetrics::compute(&model_values, &obs_adjusted);
@@ -443,15 +447,31 @@ impl ValidationSummary {
         // Use partial_cmp with unwrap_or to handle NaN values gracefully
         let worst = results
             .iter()
-            .max_by(|a, b| a.metrics.rmse.partial_cmp(&b.metrics.rmse).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.metrics
+                    .rmse
+                    .partial_cmp(&b.metrics.rmse)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .expect("results is not empty");
         let best = results
             .iter()
-            .min_by(|a, b| a.metrics.rmse.partial_cmp(&b.metrics.rmse).unwrap_or(std::cmp::Ordering::Equal))
+            .min_by(|a, b| {
+                a.metrics
+                    .rmse
+                    .partial_cmp(&b.metrics.rmse)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .expect("results is not empty");
 
-        let n_passing_basic = results.iter().filter(|r| r.passes_basic_validation()).count();
-        let n_passing_strict = results.iter().filter(|r| r.passes_strict_validation()).count();
+        let n_passing_basic = results
+            .iter()
+            .filter(|r| r.passes_basic_validation())
+            .count();
+        let n_passing_strict = results
+            .iter()
+            .filter(|r| r.passes_strict_validation())
+            .count();
 
         Self {
             n_stations: results.len(),
@@ -589,7 +609,10 @@ pub fn validate_stations(
         let model_ts = match model_extractor.extract_at_station(station, times) {
             Some(ts) => ts,
             None => {
-                eprintln!("Warning: Could not extract model data for station {}", station.name);
+                eprintln!(
+                    "Warning: Could not extract model data for station {}",
+                    station.name
+                );
                 continue;
             }
         };
@@ -761,9 +784,8 @@ mod tests {
         let obs = TimeSeries::new(&times, &values);
 
         let analysis = HarmonicAnalysis::standard();
-        let result = StationValidationResult::compute_with_harmonics(
-            &station, &model, &obs, &analysis
-        );
+        let result =
+            StationValidationResult::compute_with_harmonics(&station, &model, &obs, &analysis);
 
         assert!(result.model_harmonics.is_some());
         assert!(result.obs_harmonics.is_some());

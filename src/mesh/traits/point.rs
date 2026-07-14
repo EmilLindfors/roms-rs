@@ -190,7 +190,6 @@ impl Point for [f64; 3] {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

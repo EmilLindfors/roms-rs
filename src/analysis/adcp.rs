@@ -395,9 +395,9 @@ impl CurrentValidationMetrics {
         }
 
         let vector_correlation = if sum_model_sq > 1e-10 && sum_obs_sq > 1e-10 {
-            let inner_prod_mag =
-                (sum_model_obs_real * sum_model_obs_real + sum_model_obs_imag * sum_model_obs_imag)
-                    .sqrt();
+            let inner_prod_mag = (sum_model_obs_real * sum_model_obs_real
+                + sum_model_obs_imag * sum_model_obs_imag)
+                .sqrt();
             inner_prod_mag / (sum_model_sq.sqrt() * sum_obs_sq.sqrt())
         } else {
             0.0
@@ -632,8 +632,14 @@ impl ADCPValidationSummary {
             .sum::<f64>()
             / n as f64;
 
-        let n_passing_basic = results.iter().filter(|r| r.passes_basic_validation()).count();
-        let n_passing_strict = results.iter().filter(|r| r.passes_strict_validation()).count();
+        let n_passing_basic = results
+            .iter()
+            .filter(|r| r.passes_basic_validation())
+            .count();
+        let n_passing_strict = results
+            .iter()
+            .filter(|r| r.passes_strict_validation())
+            .count();
 
         Self {
             station_results: results,

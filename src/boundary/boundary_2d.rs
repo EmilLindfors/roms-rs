@@ -195,11 +195,9 @@ impl SWEBoundaryCondition2D for Reflective2D {
         }
 
         let (u, v) = ctx.interior_velocity();
-        let un = u * nx + v * ny;
 
-        // Reflect normal component: u_ghost = u - 2*(u·n)*n
-        let u_ghost = u - 2.0 * un * nx;
-        let v_ghost = v - 2.0 * un * ny;
+        // Reflect normal component, preserve tangential (free-slip wall).
+        let (u_ghost, v_ghost) = super::reflect_velocity(u, v, nx, ny);
 
         SWEState2D::from_primitives(h, u_ghost, v_ghost)
     }

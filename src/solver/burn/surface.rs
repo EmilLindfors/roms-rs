@@ -141,10 +141,10 @@ where
 
         for fn_idx in 0..n_face_nodes {
             // Get volume node index for this face node
-            let vol_idx_minus = face_node_map
-                [(elem_minus * 4 + face_minus) * n_face_nodes + fn_idx] as usize;
-            let vol_idx_plus = face_node_map
-                [(elem_plus * 4 + face_plus) * n_face_nodes + fn_idx] as usize;
+            let vol_idx_minus =
+                face_node_map[(elem_minus * 4 + face_minus) * n_face_nodes + fn_idx] as usize;
+            let vol_idx_plus =
+                face_node_map[(elem_plus * 4 + face_plus) * n_face_nodes + fn_idx] as usize;
 
             // Get global index in solution array
             let idx_minus = elem_minus * n_nodes + vol_idx_minus;
@@ -166,21 +166,30 @@ where
     let minus_states = BurnFaceStates {
         h: Tensor::from_data(
             burn::tensor::TensorData::new(
-                h_minus.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+                h_minus
+                    .into_iter()
+                    .map(|x| B::FloatElem::from(x))
+                    .collect::<Vec<_>>(),
                 shape.clone(),
             ),
             device,
         ),
         hu: Tensor::from_data(
             burn::tensor::TensorData::new(
-                hu_minus.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+                hu_minus
+                    .into_iter()
+                    .map(|x| B::FloatElem::from(x))
+                    .collect::<Vec<_>>(),
                 shape.clone(),
             ),
             device,
         ),
         hv: Tensor::from_data(
             burn::tensor::TensorData::new(
-                hv_minus.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+                hv_minus
+                    .into_iter()
+                    .map(|x| B::FloatElem::from(x))
+                    .collect::<Vec<_>>(),
                 shape.clone(),
             ),
             device,
@@ -190,21 +199,30 @@ where
     let plus_states = BurnFaceStates {
         h: Tensor::from_data(
             burn::tensor::TensorData::new(
-                h_plus.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+                h_plus
+                    .into_iter()
+                    .map(|x| B::FloatElem::from(x))
+                    .collect::<Vec<_>>(),
                 shape.clone(),
             ),
             device,
         ),
         hu: Tensor::from_data(
             burn::tensor::TensorData::new(
-                hu_plus.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+                hu_plus
+                    .into_iter()
+                    .map(|x| B::FloatElem::from(x))
+                    .collect::<Vec<_>>(),
                 shape.clone(),
             ),
             device,
         ),
         hv: Tensor::from_data(
             burn::tensor::TensorData::new(
-                hv_plus.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+                hv_plus
+                    .into_iter()
+                    .map(|x| B::FloatElem::from(x))
+                    .collect::<Vec<_>>(),
                 shape,
             ),
             device,
@@ -289,7 +307,10 @@ where
 
     let nx = Tensor::from_data(
         burn::tensor::TensorData::new(
-            nx_data.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+            nx_data
+                .into_iter()
+                .map(|x| B::FloatElem::from(x))
+                .collect::<Vec<_>>(),
             shape.clone(),
         ),
         device,
@@ -297,7 +318,10 @@ where
 
     let ny = Tensor::from_data(
         burn::tensor::TensorData::new(
-            ny_data.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+            ny_data
+                .into_iter()
+                .map(|x| B::FloatElem::from(x))
+                .collect::<Vec<_>>(),
             shape,
         ),
         device,
@@ -320,15 +344,14 @@ where
 /// * `rhs` - Output RHS tensor to accumulate into [n_elements, n_nodes]
 pub fn apply_lift_all_faces<B: Backend>(
     ops: &BurnOperators2D<B>,
-    flux_diff_h: &Tensor<B, 2>,   // [n_elements * 4, n_face_nodes]
+    flux_diff_h: &Tensor<B, 2>, // [n_elements * 4, n_face_nodes]
     flux_diff_hu: &Tensor<B, 2>,
     flux_diff_hv: &Tensor<B, 2>,
     connectivity: &BurnConnectivity<B>,
-    rhs_h: &mut Tensor<B, 2>,     // [n_elements, n_nodes]
+    rhs_h: &mut Tensor<B, 2>, // [n_elements, n_nodes]
     rhs_hu: &mut Tensor<B, 2>,
     rhs_hv: &mut Tensor<B, 2>,
-)
-where
+) where
     B::FloatElem: From<f64>,
     B::IntElem: From<i64>,
     f64: From<B::FloatElem>,
@@ -438,21 +461,30 @@ where
     let shape: Vec<usize> = vec![n_elements, n_nodes];
     *rhs_h = Tensor::from_data(
         burn::tensor::TensorData::new(
-            rhs_h_data.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+            rhs_h_data
+                .into_iter()
+                .map(|x| B::FloatElem::from(x))
+                .collect::<Vec<_>>(),
             shape.clone(),
         ),
         device,
     );
     *rhs_hu = Tensor::from_data(
         burn::tensor::TensorData::new(
-            rhs_hu_data.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+            rhs_hu_data
+                .into_iter()
+                .map(|x| B::FloatElem::from(x))
+                .collect::<Vec<_>>(),
             shape.clone(),
         ),
         device,
     );
     *rhs_hv = Tensor::from_data(
         burn::tensor::TensorData::new(
-            rhs_hv_data.into_iter().map(|x| B::FloatElem::from(x)).collect::<Vec<_>>(),
+            rhs_hv_data
+                .into_iter()
+                .map(|x| B::FloatElem::from(x))
+                .collect::<Vec<_>>(),
             shape,
         ),
         device,
@@ -463,17 +495,15 @@ where
 #[cfg(feature = "burn-ndarray")]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArray;
     use crate::mesh::Mesh2DBuilder;
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::types::ElementIndex;
+    use burn_ndarray::NdArray;
 
     #[test]
     fn test_gather_face_states() {
         // Create a simple mesh
-        let mesh = Mesh2DBuilder::unit_square()
-            .with_resolution(2, 2)
-            .build();
+        let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh);

@@ -28,9 +28,9 @@ use dg_rs::boundary::{HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D}
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d};
 #[cfg(feature = "parallel")]
 use dg_rs::solver::compute_dt_swe_2d_parallel;
+use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d};
 
 // RHS functions based on enabled features
 #[cfg(not(all(feature = "parallel", feature = "simd")))]
@@ -88,7 +88,11 @@ fn main() {
     println!("CPU threads: {}", rayon::current_num_threads());
 
     println!();
-    println!("Domain: {:.1} km × {:.1} km", DOMAIN_SIZE / 1000.0, DOMAIN_SIZE / 1000.0);
+    println!(
+        "Domain: {:.1} km × {:.1} km",
+        DOMAIN_SIZE / 1000.0,
+        DOMAIN_SIZE / 1000.0
+    );
     println!("Target effective resolution: {} m", TARGET_RESOLUTION);
     println!("Simulation duration: {:.1} minutes", T_END / 60.0);
     println!();
@@ -96,8 +100,10 @@ fn main() {
     // Test different polynomial orders
     let orders = [2, 3, 4, 5];
 
-    println!("{:<6} {:<10} {:<12} {:<10} {:<12} {:<10} {:<12}",
-        "Order", "Elements", "Total DOFs", "Eff. Res", "Avg dt (s)", "Steps", "Time (s)");
+    println!(
+        "{:<6} {:<10} {:<12} {:<10} {:<12} {:<10} {:<12}",
+        "Order", "Elements", "Total DOFs", "Eff. Res", "Avg dt (s)", "Steps", "Time (s)"
+    );
     println!("{}", "-".repeat(80));
 
     let mut results = Vec::new();
@@ -105,14 +111,16 @@ fn main() {
     for &order in &orders {
         match run_benchmark(order) {
             Ok(result) => {
-                println!("{:<6} {:<10} {:<12} {:<10.1} {:<12.4} {:<10} {:<12.2}",
+                println!(
+                    "{:<6} {:<10} {:<12} {:<10.1} {:<12.4} {:<10} {:<12.2}",
                     format!("P{}", order),
                     result.n_elements,
                     result.total_dofs,
                     result.effective_resolution,
                     result.avg_dt,
                     result.total_steps,
-                    result.wall_time);
+                    result.wall_time
+                );
                 results.push(result);
             }
             Err(e) => {
@@ -135,19 +143,28 @@ fn main() {
             let speedup = baseline.wall_time / result.wall_time;
             let dof_ratio = result.total_dofs as f64 / baseline.total_dofs as f64;
             let step_ratio = result.total_steps as f64 / baseline.total_steps as f64;
-            println!("  P{}: {:.2}× DOFs, {:.2}× steps, {:.2}× wall time (speedup: {:.2}×)",
-                result.order, dof_ratio, step_ratio, result.wall_time / baseline.wall_time, speedup);
+            println!(
+                "  P{}: {:.2}× DOFs, {:.2}× steps, {:.2}× wall time (speedup: {:.2}×)",
+                result.order,
+                dof_ratio,
+                step_ratio,
+                result.wall_time / baseline.wall_time,
+                speedup
+            );
         }
     }
 
     println!();
     println!("Recommendation for 50m resolution coastal modeling:");
-    if let Some(best) = results.iter().min_by(|a, b|
-        a.wall_time.partial_cmp(&b.wall_time).unwrap()
-    ) {
+    if let Some(best) = results
+        .iter()
+        .min_by(|a, b| a.wall_time.partial_cmp(&b.wall_time).unwrap())
+    {
         println!("  → P{} offers best wall-clock performance", best.order);
-        println!("  → {} elements, {} DOFs, {:.4}s avg time step",
-            best.n_elements, best.total_dofs, best.avg_dt);
+        println!(
+            "  → {} elements, {} DOFs, {:.4}s avg time step",
+            best.n_elements, best.total_dofs, best.avg_dt
+        );
     }
 }
 
@@ -173,9 +190,12 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
 
     // Create mesh
     let mut mesh = Mesh2D::uniform_rectangle_with_bc(
-        0.0, DOMAIN_SIZE,
-        0.0, DOMAIN_SIZE,
-        n_elements_1d, n_elements_1d,
+        0.0,
+        DOMAIN_SIZE,
+        0.0,
+        DOMAIN_SIZE,
+        n_elements_1d,
+        n_elements_1d,
         BoundaryTag::Wall,
     );
 
@@ -187,7 +207,8 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
             let x1 = mesh.vertices[v1][0];
             let x_mid = (x0 + x1) / 2.0;
 
-            if x_mid < 10.0 { // West boundary
+            if x_mid < 10.0 {
+                // West boundary
                 edge.boundary_tag = Some(BoundaryTag::Open);
             }
         }
@@ -225,8 +246,7 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
 
     // Boundary conditions
     let wall_bc = Reflective2D::new();
-    let tidal_bc = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0)
-        .with_ramp_up(RAMP_DURATION);
+    let tidal_bc = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0).with_ramp_up(RAMP_DURATION);
     let bc = MultiBoundaryCondition2D::new(&wall_bc).with_open(&tidal_bc);
 
     // Equation and time config
@@ -291,7 +311,10 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
         max_velocity = max_velocity.max(current_max_vel);
 
         if max_velocity > 50.0 {
-            return Err(format!("Velocity blow-up: {:.1} m/s at step {}", max_velocity, step));
+            return Err(format!(
+                "Velocity blow-up: {:.1} m/s at step {}",
+                max_velocity, step
+            ));
         }
     }
 

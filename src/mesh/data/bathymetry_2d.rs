@@ -161,6 +161,29 @@ impl Bathymetry2D {
         (self.gradient_x[idx], self.gradient_y[idx])
     }
 
+    /// Compute positive water-column depth from free surface elevation.
+    ///
+    /// Bathymetry is stored as bed elevation B, so depth is eta - B.
+    #[inline]
+    pub fn water_depth(&self, k: ElementIndex, i: usize, eta: f64) -> f64 {
+        eta - self.get(k, i)
+    }
+
+    /// Compute the gradient of positive water-column depth.
+    ///
+    /// Since depth D = eta - B, grad(D) = grad(eta) - grad(B).
+    #[inline]
+    pub fn water_depth_gradient(
+        &self,
+        k: ElementIndex,
+        i: usize,
+        d_eta_dx: f64,
+        d_eta_dy: f64,
+    ) -> (f64, f64) {
+        let (db_dx, db_dy) = self.get_gradient(k, i);
+        (d_eta_dx - db_dx, d_eta_dy - db_dy)
+    }
+
     /// Get all bathymetry values for element k.
     pub fn element(&self, k: ElementIndex) -> &[f64] {
         let start = k.as_usize() * self.n_nodes;
@@ -322,12 +345,7 @@ impl Bathymetry2D {
     /// * `mesh` - The 2D mesh for element geometry
     /// * `ops` - DG operators for node coordinates
     /// * `geom` - Geometric factors for gradient recomputation
-    pub fn linearize(
-        &mut self,
-        mesh: &Mesh2D,
-        ops: &DGOperators2D,
-        geom: &GeometricFactors2D,
-    ) {
+    pub fn linearize(&mut self, mesh: &Mesh2D, ops: &DGOperators2D, geom: &GeometricFactors2D) {
         let n = self.n_nodes;
 
         for k in ElementIndex::iter(self.n_elements) {
@@ -1040,10 +1058,7 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum();
 
-        assert!(
-            diff < 1e-10,
-            "High threshold should not trigger smoothing"
-        );
+        assert!(diff < 1e-10, "High threshold should not trigger smoothing");
 
         // The low threshold version should be different
         let diff2: f64 = bathy
@@ -1053,10 +1068,7 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .sum();
 
-        assert!(
-            diff2 > 0.1,
-            "Low threshold should trigger smoothing"
-        );
+        assert!(diff2 > 0.1, "Low threshold should trigger smoothing");
     }
 
     #[test]

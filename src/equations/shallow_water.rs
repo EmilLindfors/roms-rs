@@ -314,11 +314,7 @@ fn sample_riemann_swe(
             let q_l = (h_m * (h_m + h_l) / (2.0 * h_l * h_l)).sqrt();
             let s_l = u_l - c_l * q_l;
 
-            if s <= s_l {
-                (h_l, u_l)
-            } else {
-                (h_m, u_m)
-            }
+            if s <= s_l { (h_l, u_l) } else { (h_m, u_m) }
         }
     } else {
         // Right of contact discontinuity
@@ -345,11 +341,7 @@ fn sample_riemann_swe(
             let q_r = (h_m * (h_m + h_r) / (2.0 * h_r * h_r)).sqrt();
             let s_r = u_r + c_r * q_r;
 
-            if s >= s_r {
-                (h_r, u_r)
-            } else {
-                (h_m, u_m)
-            }
+            if s >= s_r { (h_r, u_r) } else { (h_m, u_m) }
         }
     }
 }

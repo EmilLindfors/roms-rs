@@ -2,9 +2,7 @@
 //!
 //! A 1D mesh is a partition of an interval [x_min, x_max] into elements.
 
-use crate::mesh::traits::{
-    FaceConnection, Mesh1DGeometry, MeshGeometry, MeshTopology, Neighbor,
-};
+use crate::mesh::traits::{FaceConnection, Mesh1DGeometry, MeshGeometry, MeshTopology, Neighbor};
 
 /// Boundary face identifier.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -187,10 +185,7 @@ impl Mesh1D {
 
     /// Get maximum element size.
     pub fn h_max(&self) -> f64 {
-        self.element_sizes
-            .iter()
-            .copied()
-            .fold(0.0, f64::max)
+        self.element_sizes.iter().copied().fold(0.0, f64::max)
     }
 }
 
@@ -219,14 +214,14 @@ impl MeshTopology for Mesh1D {
     }
 
     fn n_boundary_faces(&self) -> usize {
-        if self.is_periodic {
-            0
-        } else {
-            2
-        }
+        if self.is_periodic { 0 } else { 2 }
     }
 
-    fn face_connection(&self, element: usize, local_face: usize) -> FaceConnection<Self::BoundaryTag> {
+    fn face_connection(
+        &self,
+        element: usize,
+        local_face: usize,
+    ) -> FaceConnection<Self::BoundaryTag> {
         let neighbor_opt = match local_face {
             0 => self.neighbors[element].0,
             1 => self.neighbors[element].1,

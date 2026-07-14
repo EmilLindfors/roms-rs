@@ -268,20 +268,20 @@ impl CoordinateProjection for UtmProjection {
                 + (15.0 * e4 / 256.0 + 45.0 * e6 / 1024.0) * (4.0 * lat_rad).sin()
                 - (35.0 * e6 / 3072.0) * (6.0 * lat_rad).sin());
 
-        let x = self.scale_factor * n
+        let x = self.scale_factor
+            * n
             * (a_coef
                 + (1.0 - t + c) * a_coef.powi(3) / 6.0
                 + (5.0 - 18.0 * t + t * t + 72.0 * c - 58.0 * e_prime2) * a_coef.powi(5) / 120.0)
             + self.false_easting;
 
         let y = self.scale_factor
-            * (m
-                + n * lat_rad.tan()
-                    * (a_coef.powi(2) / 2.0
-                        + (5.0 - t + 9.0 * c + 4.0 * c * c) * a_coef.powi(4) / 24.0
-                        + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * e_prime2)
-                            * a_coef.powi(6)
-                            / 720.0))
+            * (m + n
+                * lat_rad.tan()
+                * (a_coef.powi(2) / 2.0
+                    + (5.0 - t + 9.0 * c + 4.0 * c * c) * a_coef.powi(4) / 24.0
+                    + (61.0 - 58.0 * t + t * t + 600.0 * c - 330.0 * e_prime2) * a_coef.powi(6)
+                        / 720.0))
             + self.false_northing;
 
         (x, y)
@@ -296,9 +296,8 @@ impl CoordinateProjection for UtmProjection {
         let e1 = (1.0 - (1.0 - e2).sqrt()) / (1.0 + (1.0 - e2).sqrt());
 
         let m = y / self.scale_factor;
-        let mu = m
-            / (Self::A
-                * (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0));
+        let mu =
+            m / (Self::A * (1.0 - e2 / 4.0 - 3.0 * e2 * e2 / 64.0 - 5.0 * e2 * e2 * e2 / 256.0));
 
         let phi1 = mu
             + (3.0 * e1 / 2.0 - 27.0 * e1.powi(3) / 32.0) * (2.0 * mu).sin()
@@ -317,14 +316,14 @@ impl CoordinateProjection for UtmProjection {
                 * (d * d / 2.0
                     - (5.0 + 3.0 * t1 + 10.0 * c1 - 4.0 * c1 * c1 - 9.0 * e_prime2) * d.powi(4)
                         / 24.0
-                    + (61.0 + 90.0 * t1 + 298.0 * c1 + 45.0 * t1 * t1 - 252.0 * e_prime2
+                    + (61.0 + 90.0 * t1 + 298.0 * c1 + 45.0 * t1 * t1
+                        - 252.0 * e_prime2
                         - 3.0 * c1 * c1)
                         * d.powi(6)
                         / 720.0);
 
         let lon = self.central_meridian * PI / 180.0
-            + (d
-                - (1.0 + 2.0 * t1 + c1) * d.powi(3) / 6.0
+            + (d - (1.0 + 2.0 * t1 + c1) * d.powi(3) / 6.0
                 + (5.0 - 2.0 * c1 + 28.0 * t1 - 3.0 * c1 * c1 + 8.0 * e_prime2 + 24.0 * t1 * t1)
                     * d.powi(5)
                     / 120.0)
@@ -346,11 +345,11 @@ mod tests {
 
         // Test roundtrip at several points
         let test_points = [
-            (63.75, 8.75),   // Reference point
-            (63.80, 8.90),   // Northeast
-            (63.70, 8.60),   // Southwest
-            (64.00, 9.00),   // Further north
-            (63.50, 8.50),   // Further south
+            (63.75, 8.75), // Reference point
+            (63.80, 8.90), // Northeast
+            (63.70, 8.60), // Southwest
+            (64.00, 9.00), // Further north
+            (63.50, 8.50), // Further south
         ];
 
         for (lat, lon) in test_points {

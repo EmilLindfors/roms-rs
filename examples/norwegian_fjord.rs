@@ -26,6 +26,10 @@ use dg_rs::solver::{
     UpwindTracerBC, compute_rhs_swe_2d, compute_rhs_tracer_2d,
 };
 // Parallel imports (only beneficial for meshes with 1000+ elements)
+#[cfg(all(feature = "parallel", feature = "simd"))]
+use dg_rs::compute_rhs_swe_2d_parallel;
+#[cfg(feature = "parallel")]
+use dg_rs::compute_rhs_tracer_2d_parallel;
 use dg_rs::source::tracer::{
     CombinedTracerSource2D, RiverTracerSource, SurfaceHeatFlux, gaussian_river_localization,
 };
@@ -36,10 +40,6 @@ use dg_rs::time::{
 };
 use dg_rs::types::{Depth, ElementIndex};
 use dg_rs::{SWEFluxType2D, SWEState2D};
-#[cfg(feature = "parallel")]
-use dg_rs::compute_rhs_tracer_2d_parallel;
-#[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::compute_rhs_swe_2d_parallel;
 
 // ============================================================================
 // Physical Parameters

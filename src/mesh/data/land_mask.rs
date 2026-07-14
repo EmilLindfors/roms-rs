@@ -255,7 +255,8 @@ impl LandMask2D {
     /// Get statistics about the land mask.
     pub fn statistics(&self) -> LandMaskStatistics {
         let wet_count = self.wet_count();
-        let partial_count = self.wet_fraction
+        let partial_count = self
+            .wet_fraction
             .iter()
             .filter(|&&f| f > 0.0 && f < 1.0)
             .count();
@@ -286,12 +287,18 @@ impl std::fmt::Display for LandMaskStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "Land Mask Statistics:")?;
         writeln!(f, "  Total elements: {}", self.total_elements)?;
-        writeln!(f, "  Wet elements: {} ({:.1}%)",
+        writeln!(
+            f,
+            "  Wet elements: {} ({:.1}%)",
             self.wet_elements,
-            100.0 * self.wet_elements as f64 / self.total_elements as f64)?;
-        writeln!(f, "  Dry elements: {} ({:.1}%)",
+            100.0 * self.wet_elements as f64 / self.total_elements as f64
+        )?;
+        writeln!(
+            f,
+            "  Dry elements: {} ({:.1}%)",
             self.dry_elements,
-            100.0 * self.dry_elements as f64 / self.total_elements as f64)?;
+            100.0 * self.dry_elements as f64 / self.total_elements as f64
+        )?;
         write!(f, "  Partial elements: {}", self.partial_elements)
     }
 }

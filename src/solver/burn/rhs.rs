@@ -37,10 +37,7 @@ where
     B::FloatElem: From<f64>,
 {
     /// Upload CPU geometric factors to GPU.
-    pub fn from_cpu(
-        geom: &crate::operators::GeometricFactors2D,
-        device: &B::Device,
-    ) -> Self {
+    pub fn from_cpu(geom: &crate::operators::GeometricFactors2D, device: &B::Device) -> Self {
         let n = geom.rx.len();
 
         Self {
@@ -126,8 +123,13 @@ where
     // =========================================================================
     // Step 1: Compute physical fluxes at all nodes
     // =========================================================================
-    let (flux_x_h, flux_x_hu, flux_x_hv, flux_y_h, flux_y_hu, flux_y_hv) =
-        compute_swe_fluxes(&solution.h, &solution.hu, &solution.hv, config.g, config.h_min);
+    let (flux_x_h, flux_x_hu, flux_x_hv, flux_y_h, flux_y_hu, flux_y_hv) = compute_swe_fluxes(
+        &solution.h,
+        &solution.hu,
+        &solution.hv,
+        config.g,
+        config.h_min,
+    );
 
     // =========================================================================
     // Step 2: Compute volume term: d(flux)/dr and d(flux)/ds
@@ -155,16 +157,13 @@ where
 
     // Combine derivatives with geometric factors
     let mut rhs_h = combine_derivatives_batched(
-        &dfx_dr_h, &dfx_ds_h, &dfy_dr_h, &dfy_ds_h,
-        &geom.rx, &geom.sx, &geom.ry, &geom.sy,
+        &dfx_dr_h, &dfx_ds_h, &dfy_dr_h, &dfy_ds_h, &geom.rx, &geom.sx, &geom.ry, &geom.sy,
     );
     let mut rhs_hu = combine_derivatives_batched(
-        &dfx_dr_hu, &dfx_ds_hu, &dfy_dr_hu, &dfy_ds_hu,
-        &geom.rx, &geom.sx, &geom.ry, &geom.sy,
+        &dfx_dr_hu, &dfx_ds_hu, &dfy_dr_hu, &dfy_ds_hu, &geom.rx, &geom.sx, &geom.ry, &geom.sy,
     );
     let mut rhs_hv = combine_derivatives_batched(
-        &dfx_dr_hv, &dfx_ds_hv, &dfy_dr_hv, &dfy_ds_hv,
-        &geom.rx, &geom.sx, &geom.ry, &geom.sy,
+        &dfx_dr_hv, &dfx_ds_hv, &dfy_dr_hv, &dfy_ds_hv, &geom.rx, &geom.sx, &geom.ry, &geom.sy,
     );
 
     // =========================================================================
@@ -179,10 +178,16 @@ where
 
         // Compute numerical flux using HLL
         let (f_star_h, f_star_hu, f_star_hv) = hll_flux_batched(
-            &states_minus.h, &states_minus.hu, &states_minus.hv,
-            &states_plus.h, &states_plus.hu, &states_plus.hv,
-            &nx, &ny,
-            config.g, config.h_min,
+            &states_minus.h,
+            &states_minus.hu,
+            &states_minus.hv,
+            &states_plus.h,
+            &states_plus.hu,
+            &states_plus.hv,
+            &nx,
+            &ny,
+            config.g,
+            config.h_min,
         );
 
         // Compute physical flux at face for minus side
@@ -211,9 +216,8 @@ where
 
     // Manning friction
     if let Some(g_n2) = config.manning_g_n2 {
-        let (s_hu, s_hv) = friction_source_batched(
-            &solution.h, &solution.hu, &solution.hv, g_n2, config.h_min,
-        );
+        let (s_hu, s_hv) =
+            friction_source_batched(&solution.h, &solution.hu, &solution.hv, g_n2, config.h_min);
         rhs_hu = rhs_hu.add(s_hu);
         rhs_hv = rhs_hv.add(s_hv);
     }
@@ -257,8 +261,13 @@ where
     let n_nodes = solution.n_nodes;
 
     // Compute physical fluxes
-    let (flux_x_h, flux_x_hu, flux_x_hv, flux_y_h, flux_y_hu, flux_y_hv) =
-        compute_swe_fluxes(&solution.h, &solution.hu, &solution.hv, config.g, config.h_min);
+    let (flux_x_h, flux_x_hu, flux_x_hv, flux_y_h, flux_y_hu, flux_y_hv) = compute_swe_fluxes(
+        &solution.h,
+        &solution.hu,
+        &solution.hv,
+        config.g,
+        config.h_min,
+    );
 
     // Compute volume term
     let dr_t = ops.dr_transpose();
@@ -280,16 +289,13 @@ where
     let dfy_ds_hv = apply_diff_matrix_batched(&ds_t, &flux_y_hv);
 
     let rhs_h = combine_derivatives_batched(
-        &dfx_dr_h, &dfx_ds_h, &dfy_dr_h, &dfy_ds_h,
-        &geom.rx, &geom.sx, &geom.ry, &geom.sy,
+        &dfx_dr_h, &dfx_ds_h, &dfy_dr_h, &dfy_ds_h, &geom.rx, &geom.sx, &geom.ry, &geom.sy,
     );
     let rhs_hu = combine_derivatives_batched(
-        &dfx_dr_hu, &dfx_ds_hu, &dfy_dr_hu, &dfy_ds_hu,
-        &geom.rx, &geom.sx, &geom.ry, &geom.sy,
+        &dfx_dr_hu, &dfx_ds_hu, &dfy_dr_hu, &dfy_ds_hu, &geom.rx, &geom.sx, &geom.ry, &geom.sy,
     );
     let rhs_hv = combine_derivatives_batched(
-        &dfx_dr_hv, &dfx_ds_hv, &dfy_dr_hv, &dfy_ds_hv,
-        &geom.rx, &geom.sx, &geom.ry, &geom.sy,
+        &dfx_dr_hv, &dfx_ds_hv, &dfy_dr_hv, &dfy_ds_hv, &geom.rx, &geom.sx, &geom.ry, &geom.sy,
     );
 
     // Scale by inverse Jacobian
@@ -309,18 +315,16 @@ where
 #[cfg(feature = "burn-ndarray")]
 mod tests {
     use super::*;
-    use burn_ndarray::NdArray;
     use crate::mesh::Mesh2DBuilder;
     use crate::operators::DGOperators2D;
     use crate::operators::GeometricFactors2D;
     use crate::types::ElementIndex;
+    use burn_ndarray::NdArray;
 
     #[test]
     fn test_rhs_volume_only_constant_state() {
         // A constant state should have zero volume term (no gradients)
-        let mesh = Mesh2DBuilder::unit_square()
-            .with_resolution(2, 2)
-            .build();
+        let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh);
@@ -349,17 +353,23 @@ mod tests {
             for i in 0..ops.n_nodes {
                 let state = rhs_cpu.get_state(k, i);
                 assert!(state.h.abs() < 1e-10, "rhs_h should be ~0, got {}", state.h);
-                assert!(state.hu.abs() < 1e-10, "rhs_hu should be ~0, got {}", state.hu);
-                assert!(state.hv.abs() < 1e-10, "rhs_hv should be ~0, got {}", state.hv);
+                assert!(
+                    state.hu.abs() < 1e-10,
+                    "rhs_hu should be ~0, got {}",
+                    state.hu
+                );
+                assert!(
+                    state.hv.abs() < 1e-10,
+                    "rhs_hv should be ~0, got {}",
+                    state.hv
+                );
             }
         }
     }
 
     #[test]
     fn test_geometric_factors_upload() {
-        let mesh = Mesh2DBuilder::unit_square()
-            .with_resolution(2, 2)
-            .build();
+        let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh);

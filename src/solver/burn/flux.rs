@@ -78,12 +78,24 @@ where
     let pressure_r = h_r.clone().powf_scalar(2.0).mul_scalar(half_g);
 
     let f_h_l = h_l.clone().mul(un_l.clone());
-    let f_hu_l = hu_l.clone().mul(un_l.clone()).add(pressure_l.clone().mul(nx.clone()));
-    let f_hv_l = hv_l.clone().mul(un_l.clone()).add(pressure_l.mul(ny.clone()));
+    let f_hu_l = hu_l
+        .clone()
+        .mul(un_l.clone())
+        .add(pressure_l.clone().mul(nx.clone()));
+    let f_hv_l = hv_l
+        .clone()
+        .mul(un_l.clone())
+        .add(pressure_l.mul(ny.clone()));
 
     let f_h_r = h_r.clone().mul(un_r.clone());
-    let f_hu_r = hu_r.clone().mul(un_r.clone()).add(pressure_r.clone().mul(nx.clone()));
-    let f_hv_r = hv_r.clone().mul(un_r.clone()).add(pressure_r.mul(ny.clone()));
+    let f_hu_r = hu_r
+        .clone()
+        .mul(un_r.clone())
+        .add(pressure_r.clone().mul(nx.clone()));
+    let f_hv_r = hv_r
+        .clone()
+        .mul(un_r.clone())
+        .add(pressure_r.mul(ny.clone()));
 
     // HLL flux computation with conditional blending
     // For numerical stability, we compute the general formula and use masks
@@ -96,17 +108,23 @@ where
     // F = (s_R * F_L - s_L * F_R + s_L * s_R * (q_R - q_L)) / (s_R - s_L)
     let s_l_s_r = s_l.clone().mul(s_r.clone());
 
-    let f_h_hll = s_r.clone().mul(f_h_l.clone())
+    let f_h_hll = s_r
+        .clone()
+        .mul(f_h_l.clone())
         .sub(s_l.clone().mul(f_h_r.clone()))
         .add(s_l_s_r.clone().mul(h_r.clone().sub(h_l.clone())))
         .mul(inv_denom.clone());
 
-    let f_hu_hll = s_r.clone().mul(f_hu_l.clone())
+    let f_hu_hll = s_r
+        .clone()
+        .mul(f_hu_l.clone())
         .sub(s_l.clone().mul(f_hu_r.clone()))
         .add(s_l_s_r.clone().mul(hu_r.clone().sub(hu_l.clone())))
         .mul(inv_denom.clone());
 
-    let f_hv_hll = s_r.clone().mul(f_hv_l.clone())
+    let f_hv_hll = s_r
+        .clone()
+        .mul(f_hv_l.clone())
         .sub(s_l.clone().mul(f_hv_r.clone()))
         .add(s_l_s_r.mul(hv_r.clone().sub(hv_l.clone())))
         .mul(inv_denom);
@@ -127,7 +145,9 @@ where
     let f_h = f_h_l.clone().mask_where(mask_left.clone(), f_h_hll.clone());
     let f_h = f_h_r.mask_where(mask_right.clone(), f_h);
 
-    let f_hu = f_hu_l.clone().mask_where(mask_left.clone(), f_hu_hll.clone());
+    let f_hu = f_hu_l
+        .clone()
+        .mask_where(mask_left.clone(), f_hu_hll.clone());
     let f_hu = f_hu_r.mask_where(mask_right.clone(), f_hu);
 
     let f_hv = f_hv_l.clone().mask_where(mask_left, f_hv_hll.clone());
@@ -179,17 +199,24 @@ where
     let sqrt_sum = sqrt_h_l.clone().add(sqrt_h_r.clone());
     let inv_sqrt_sum = sqrt_sum.recip();
 
-    let u_roe = sqrt_h_l.clone().mul(u_l.clone())
+    let u_roe = sqrt_h_l
+        .clone()
+        .mul(u_l.clone())
         .add(sqrt_h_r.clone().mul(u_r.clone()))
         .mul(inv_sqrt_sum.clone());
-    let v_roe = sqrt_h_l.clone().mul(v_l.clone())
+    let v_roe = sqrt_h_l
+        .clone()
+        .mul(v_l.clone())
         .add(sqrt_h_r.clone().mul(v_r.clone()))
         .mul(inv_sqrt_sum.clone());
     let h_roe = sqrt_h_l.mul(sqrt_h_r);
     let c_roe = h_roe.clone().mul_scalar(g).sqrt();
 
     // Normal and tangential Roe velocities
-    let un_roe = u_roe.clone().mul(nx.clone()).add(v_roe.clone().mul(ny.clone()));
+    let un_roe = u_roe
+        .clone()
+        .mul(nx.clone())
+        .add(v_roe.clone().mul(ny.clone()));
 
     // Wave strengths
     let dh = h_r.clone().sub(h_l.clone());
@@ -203,7 +230,10 @@ where
     let inv_2c = c_roe.clone().mul_scalar(2.0).recip();
 
     // alpha_1 = (dh - dun/c) / 2
-    let alpha_1 = dh.clone().sub(dun.clone().mul(inv_2c.clone())).mul_scalar(0.5);
+    let alpha_1 = dh
+        .clone()
+        .sub(dun.clone().mul(inv_2c.clone()))
+        .mul_scalar(0.5);
 
     // alpha_2 = dh - alpha_1 - alpha_3 (computed via continuity)
     // alpha_3 = (dh + dun/c) / 2
@@ -229,11 +259,17 @@ where
     let pressure_r = h_r.clone().powf_scalar(2.0).mul_scalar(half_g);
 
     let f_h_l = h_l.clone().mul(un_l.clone());
-    let f_hu_l = hu_l.clone().mul(un_l.clone()).add(pressure_l.clone().mul(nx.clone()));
+    let f_hu_l = hu_l
+        .clone()
+        .mul(un_l.clone())
+        .add(pressure_l.clone().mul(nx.clone()));
     let f_hv_l = hv_l.clone().mul(un_l).add(pressure_l.mul(ny.clone()));
 
     let f_h_r = h_r.clone().mul(un_r.clone());
-    let f_hu_r = hu_r.clone().mul(un_r.clone()).add(pressure_r.clone().mul(nx.clone()));
+    let f_hu_r = hu_r
+        .clone()
+        .mul(un_r.clone())
+        .add(pressure_r.clone().mul(nx.clone()));
     let f_hv_r = hv_r.clone().mul(un_r).add(pressure_r.mul(ny.clone()));
 
     // Average flux
@@ -243,7 +279,9 @@ where
 
     // Dissipation terms (simplified for SWE)
     // For h: sum of |lambda_i| * alpha_i
-    let diss_h = abs_lambda_1.clone().mul(alpha_1.clone())
+    let diss_h = abs_lambda_1
+        .clone()
+        .mul(alpha_1.clone())
         .add(abs_lambda_3.clone().mul(alpha_3.clone()));
 
     // For hu and hv: more complex eigenvector contributions
@@ -310,11 +348,17 @@ where
     let pressure_r = h_r.clone().powf_scalar(2.0).mul_scalar(half_g);
 
     let f_h_l = h_l.clone().mul(un_l.clone());
-    let f_hu_l = hu_l.clone().mul(un_l.clone()).add(pressure_l.clone().mul(nx.clone()));
+    let f_hu_l = hu_l
+        .clone()
+        .mul(un_l.clone())
+        .add(pressure_l.clone().mul(nx.clone()));
     let f_hv_l = hv_l.clone().mul(un_l).add(pressure_l.mul(ny.clone()));
 
     let f_h_r = h_r.clone().mul(un_r.clone());
-    let f_hu_r = hu_r.clone().mul(un_r.clone()).add(pressure_r.clone().mul(nx.clone()));
+    let f_hu_r = hu_r
+        .clone()
+        .mul(un_r.clone())
+        .add(pressure_r.clone().mul(nx.clone()));
     let f_hv_r = hv_r.clone().mul(un_r).add(pressure_r.mul(ny.clone()));
 
     // Rusanov flux
@@ -322,11 +366,17 @@ where
     let dhu = hu_r.clone().sub(hu_l.clone());
     let dhv = hv_r.clone().sub(hv_l.clone());
 
-    let f_h = f_h_l.add(f_h_r).mul_scalar(0.5)
+    let f_h = f_h_l
+        .add(f_h_r)
+        .mul_scalar(0.5)
         .sub(alpha.clone().mul(dh).mul_scalar(0.5));
-    let f_hu = f_hu_l.add(f_hu_r).mul_scalar(0.5)
+    let f_hu = f_hu_l
+        .add(f_hu_r)
+        .mul_scalar(0.5)
         .sub(alpha.clone().mul(dhu).mul_scalar(0.5));
-    let f_hv = f_hv_l.add(f_hv_r).mul_scalar(0.5)
+    let f_hv = f_hv_l
+        .add(f_hv_r)
+        .mul_scalar(0.5)
         .sub(alpha.mul(dhv).mul_scalar(0.5));
 
     (f_h, f_hu, f_hv)
@@ -353,9 +403,7 @@ mod tests {
         let nx: Tensor<NdArray<f64>, 2> = Tensor::ones([n_faces, n_nodes], &device);
         let ny: Tensor<NdArray<f64>, 2> = Tensor::zeros([n_faces, n_nodes], &device);
 
-        let (f_h, f_hu, f_hv) = hll_flux_batched(
-            &h, &hu, &hv, &h, &hu, &hv, &nx, &ny, g, h_min,
-        );
+        let (f_h, f_hu, f_hv) = hll_flux_batched(&h, &hu, &hv, &h, &hu, &hv, &nx, &ny, g, h_min);
 
         // For symmetric states, flux should be the physical flux
         let f_h_data = f_h.to_data().to_vec::<f64>().unwrap();
@@ -378,16 +426,16 @@ mod tests {
         let h_min = 1e-6;
 
         // Left and right states
-        let h_l: Tensor<NdArray<f64>, 2> = Tensor::ones([n_faces, n_nodes], &device).mul_scalar(2.0);
+        let h_l: Tensor<NdArray<f64>, 2> =
+            Tensor::ones([n_faces, n_nodes], &device).mul_scalar(2.0);
         let h_r: Tensor<NdArray<f64>, 2> = Tensor::ones([n_faces, n_nodes], &device);
         let hu: Tensor<NdArray<f64>, 2> = Tensor::zeros([n_faces, n_nodes], &device);
         let hv: Tensor<NdArray<f64>, 2> = Tensor::zeros([n_faces, n_nodes], &device);
         let nx: Tensor<NdArray<f64>, 2> = Tensor::ones([n_faces, n_nodes], &device);
         let ny: Tensor<NdArray<f64>, 2> = Tensor::zeros([n_faces, n_nodes], &device);
 
-        let (f_h, _f_hu, _f_hv) = rusanov_flux_batched(
-            &h_l, &hu, &hv, &h_r, &hu, &hv, &nx, &ny, g, h_min,
-        );
+        let (f_h, _f_hu, _f_hv) =
+            rusanov_flux_batched(&h_l, &hu, &hv, &h_r, &hu, &hv, &nx, &ny, g, h_min);
 
         // With zero velocity and depth difference, flux should be non-zero
         let f_h_data = f_h.to_data().to_vec::<f64>().unwrap();

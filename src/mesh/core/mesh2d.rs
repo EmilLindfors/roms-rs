@@ -938,7 +938,11 @@ impl MeshTopology for Mesh2D {
         self.n_boundary_edges
     }
 
-    fn face_connection(&self, element: usize, local_face: usize) -> FaceConnection<Self::BoundaryTag> {
+    fn face_connection(
+        &self,
+        element: usize,
+        local_face: usize,
+    ) -> FaceConnection<Self::BoundaryTag> {
         let edge_idx = self.element_edges[element][local_face];
         let edge = &self.edges[edge_idx];
 
@@ -1406,7 +1410,10 @@ mod tests {
                 boundary_count += 1;
             }
         }
-        assert_eq!(boundary_count, 2, "Corner element should have 2 boundary faces");
+        assert_eq!(
+            boundary_count, 2,
+            "Corner element should have 2 boundary faces"
+        );
 
         // Test interior connectivity
         // Element 0 (bottom-left) face 1 (right) should connect to element 1

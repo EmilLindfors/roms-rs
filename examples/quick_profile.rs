@@ -17,13 +17,15 @@
 
 use std::time::Instant;
 
+use dg_rs::SWEState2D;
 use dg_rs::mesh::{BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::solver::SWESolution2D;
 use dg_rs::types::ElementIndex;
-use dg_rs::SWEState2D;
 
 // CPU imports
+#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
+use dg_rs::SWEFluxType2D;
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
 use dg_rs::boundary::{MultiBoundaryCondition2D, Reflective2D};
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
@@ -33,17 +35,18 @@ use dg_rs::mesh::Bathymetry2D;
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
 use dg_rs::solver::SWE2DRhsConfig;
 #[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::time::{ssp_rk3_swe_2d_step_limited, SWE2DTimeConfig};
-#[cfg(not(any(feature = "burn-cuda", feature = "burn-wgpu")))]
-use dg_rs::SWEFluxType2D;
+use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 
-#[cfg(all(feature = "parallel", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
-use dg_rs::solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
 #[cfg(all(
     not(feature = "parallel"),
     not(any(feature = "burn-cuda", feature = "burn-wgpu"))
 ))]
 use dg_rs::solver::{compute_dt_swe_2d, compute_rhs_swe_2d};
+#[cfg(all(
+    feature = "parallel",
+    not(any(feature = "burn-cuda", feature = "burn-wgpu"))
+))]
+use dg_rs::solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
 
 // GPU imports
 #[cfg(any(feature = "burn-cuda", feature = "burn-wgpu"))]
@@ -72,8 +75,13 @@ fn main() {
     let ny = 100; // 5km / 50m
 
     let mesh = Mesh2D::uniform_rectangle_with_bc(
-        0.0, 20000.0, 0.0, 5000.0, // 20km x 5km fjord
-        nx, ny, BoundaryTag::Wall,
+        0.0,
+        20000.0,
+        0.0,
+        5000.0, // 20km x 5km fjord
+        nx,
+        ny,
+        BoundaryTag::Wall,
     );
 
     let ops = DGOperators2D::new(order);
@@ -85,7 +93,10 @@ fn main() {
     let backend_name = "GPU (CUDA)";
     #[cfg(all(feature = "burn-wgpu", not(feature = "burn-cuda")))]
     let backend_name = "GPU (WGPU)";
-    #[cfg(all(feature = "parallel", not(any(feature = "burn-cuda", feature = "burn-wgpu"))))]
+    #[cfg(all(
+        feature = "parallel",
+        not(any(feature = "burn-cuda", feature = "burn-wgpu"))
+    ))]
     let backend_name = "CPU (parallel/rayon)";
     #[cfg(all(
         not(feature = "parallel"),

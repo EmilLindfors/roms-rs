@@ -261,7 +261,15 @@ mod tests {
     const G: f64 = 9.81;
     const H_MIN: f64 = 1e-6;
 
-    fn make_context(x: f64, y: f64, h: f64, hu: f64, hv: f64, bathy: f64, time: f64) -> BCContext2D {
+    fn make_context(
+        x: f64,
+        y: f64,
+        h: f64,
+        hu: f64,
+        hv: f64,
+        bathy: f64,
+        time: f64,
+    ) -> BCContext2D {
         BCContext2D::new(
             time,
             (x, y),

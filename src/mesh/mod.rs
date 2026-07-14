@@ -26,19 +26,19 @@ pub mod io;
 pub mod traits;
 
 // Re-export core mesh types
-pub use core::{BoundaryFace, BoundaryConfig, Edge, ElementFace, Mesh1D, Mesh2D, Mesh2DBuilder};
+pub use core::{BoundaryConfig, BoundaryFace, Edge, ElementFace, Mesh1D, Mesh2D, Mesh2DBuilder};
 
 // Re-export data types
 pub use data::{
-    bathymetry_profiles, bathymetry_profiles_2d, Bathymetry1D, Bathymetry2D, BoundaryTag,
-    LandMask2D, LandMaskStatistics,
+    Bathymetry1D, Bathymetry2D, BoundaryTag, LandMask2D, LandMaskStatistics, bathymetry_profiles,
+    bathymetry_profiles_2d,
 };
 
 // Re-export I/O types
-pub use io::{read_gmsh_mesh, write_gmsh_mesh, GmshError};
+pub use io::{GmshError, read_gmsh_mesh, write_gmsh_mesh};
 
 // Re-export trait types
 pub use traits::{
-    FaceConnection, Mesh1DGeometry, Mesh2DGeometry, MeshCFL, MeshGeometry, MeshGeometryExt,
-    MeshGPUData, MeshIter, MeshTopology, Neighbor, Point,
+    FaceConnection, Mesh1DGeometry, Mesh2DGeometry, MeshCFL, MeshGPUData, MeshGeometry,
+    MeshGeometryExt, MeshIter, MeshTopology, Neighbor, Point,
 };

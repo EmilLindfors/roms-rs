@@ -333,7 +333,13 @@ impl TracerSolution2D {
     }
 
     /// Set from concentrations and water depth at node i in element k.
-    pub fn set_from_concentrations(&mut self, k: ElementIndex, i: usize, h: f64, tracers: TracerState) {
+    pub fn set_from_concentrations(
+        &mut self,
+        k: ElementIndex,
+        i: usize,
+        h: f64,
+        tracers: TracerState,
+    ) {
         let cons = ConservativeTracerState::from_depth_and_tracers(h, tracers);
         self.set_conservative(k, i, cons);
     }

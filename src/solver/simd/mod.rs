@@ -10,7 +10,7 @@ mod buffers;
 mod kernels;
 
 // Batched GEMM volume computation
-pub use batched::{compute_volume_terms_batched, BatchedVolumeWorkspace};
+pub use batched::{BatchedVolumeWorkspace, compute_volume_terms_batched};
 
 // SIMD data structures
 pub use buffers::{FaceWorkspace, SIMDWorkspace, SWESoABuffer};

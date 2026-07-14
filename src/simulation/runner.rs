@@ -64,7 +64,13 @@ pub struct SimulationResult {
 
 impl SimulationResult {
     /// Create a successful result.
-    pub fn success(final_time: f64, n_steps: usize, dt_min: f64, dt_max: f64, wall_time: f64) -> Self {
+    pub fn success(
+        final_time: f64,
+        n_steps: usize,
+        dt_min: f64,
+        dt_max: f64,
+        wall_time: f64,
+    ) -> Self {
         Self {
             final_time,
             n_steps,
@@ -329,10 +335,7 @@ mod tests {
     }
     use crate::time::SSPRK3;
 
-    fn create_test_setup() -> (
-        crate::physics::SWEPhysics2D<Reflective2D>,
-        SWESolution2D,
-    ) {
+    fn create_test_setup() -> (crate::physics::SWEPhysics2D<Reflective2D>, SWESolution2D) {
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2));
         let ops = Arc::new(DGOperators2D::new(2));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh));

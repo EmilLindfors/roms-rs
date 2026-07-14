@@ -7,26 +7,26 @@
 
 use std::time::Instant;
 
+use dg_rs::SWEFluxType2D;
+use dg_rs::SWEState2D;
 use dg_rs::boundary::{MultiBoundaryCondition2D, Reflective2D};
 use dg_rs::equations::ShallowWater2D;
-use dg_rs::mesh::{BoundaryTag, Mesh2D, Bathymetry2D};
+use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-use dg_rs::solver::{SWESolution2D, SWE2DRhsConfig};
-use dg_rs::time::{ssp_rk3_swe_2d_step_limited, SWE2DTimeConfig};
+use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D};
+use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 use dg_rs::types::ElementIndex;
-use dg_rs::SWEState2D;
-use dg_rs::SWEFluxType2D;
 
 // Use the best available RHS function based on enabled features
-#[cfg(all(feature = "parallel", feature = "simd"))]
-use dg_rs::solver::compute_rhs_swe_2d_parallel;
 #[cfg(not(all(feature = "parallel", feature = "simd")))]
 use dg_rs::solver::compute_rhs_swe_2d;
+#[cfg(all(feature = "parallel", feature = "simd"))]
+use dg_rs::solver::compute_rhs_swe_2d_parallel;
 
-#[cfg(feature = "parallel")]
-use dg_rs::solver::compute_dt_swe_2d_parallel;
 #[cfg(not(feature = "parallel"))]
 use dg_rs::solver::compute_dt_swe_2d;
+#[cfg(feature = "parallel")]
+use dg_rs::solver::compute_dt_swe_2d_parallel;
 
 fn k(idx: usize) -> ElementIndex {
     ElementIndex::new(idx)
@@ -53,10 +53,8 @@ fn main() {
     println!("=== CPU Profiling ({}) ===", backend);
     println!("Mesh: {}x{} = {} elements, P{}", nx, ny, nx * ny, order);
 
-    let mesh = Mesh2D::uniform_rectangle_with_bc(
-        0.0, 10000.0, 0.0, 5000.0,
-        nx, ny, BoundaryTag::Wall,
-    );
+    let mesh =
+        Mesh2D::uniform_rectangle_with_bc(0.0, 10000.0, 0.0, 5000.0, nx, ny, BoundaryTag::Wall);
 
     let ops = DGOperators2D::new(order);
     let geom = GeometricFactors2D::compute(&mesh);
@@ -119,9 +117,13 @@ fn main() {
                 .with_well_balanced(true);
 
             #[cfg(all(feature = "parallel", feature = "simd"))]
-            { compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time) }
+            {
+                compute_rhs_swe_2d_parallel(s, &mesh, &ops, &geom, &config, time)
+            }
             #[cfg(not(all(feature = "parallel", feature = "simd")))]
-            { compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time) }
+            {
+                compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time)
+            }
         };
 
         let t0 = Instant::now();

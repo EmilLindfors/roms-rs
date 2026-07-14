@@ -180,9 +180,8 @@ impl GeoTiffBathymetry {
             return None;
         }
 
-        let col =
-            ((lon - self.bbox.min_lon) / (self.bbox.max_lon - self.bbox.min_lon) * self.width as f64)
-                as usize;
+        let col = ((lon - self.bbox.min_lon) / (self.bbox.max_lon - self.bbox.min_lon)
+            * self.width as f64) as usize;
         let row = ((self.bbox.max_lat - lat) / (self.bbox.max_lat - self.bbox.min_lat)
             * self.height as f64) as usize;
 
@@ -373,11 +372,7 @@ impl fmt::Display for BathymetryStatistics {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Bathymetry Statistics:")?;
         writeln!(f, "  Dimensions: {}x{} pixels", self.width, self.height)?;
-        writeln!(
-            f,
-            "  Total cells: {}",
-            self.width * self.height
-        )?;
+        writeln!(f, "  Total cells: {}", self.width * self.height)?;
         writeln!(f, "  Valid water cells: {}", self.valid_count)?;
         writeln!(f, "  Land cells: {}", self.land_count)?;
         writeln!(f, "  NoData cells: {}", self.nodata_count)?;

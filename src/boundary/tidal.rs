@@ -491,8 +491,7 @@ mod tests {
 
     #[test]
     fn test_ramp_factor() {
-        let bc = TidalBC::simple(0.0, 1.0, 2.0 * PI, 0.0, G)
-            .with_ramp_up(10.0);
+        let bc = TidalBC::simple(0.0, 1.0, 2.0 * PI, 0.0, G).with_ramp_up(10.0);
 
         // At t=0: ramp = 0
         assert!(bc.ramp_factor(0.0).abs() < TOL);
@@ -521,8 +520,7 @@ mod tests {
 
     #[test]
     fn test_elevation_with_ramp() {
-        let bc = TidalBC::simple(2.0, 1.0, 2.0 * PI, 0.0, G)
-            .with_ramp_up(10.0);
+        let bc = TidalBC::simple(2.0, 1.0, 2.0 * PI, 0.0, G).with_ramp_up(10.0);
 
         // At t=0: ramp=0, so η = mean_elevation only = 2.0
         // (constituent contribution is ramped to zero)
@@ -539,8 +537,7 @@ mod tests {
 
     #[test]
     fn test_ramp_smooth_derivative() {
-        let bc = TidalBC::simple(0.0, 1.0, 2.0 * PI, 0.0, G)
-            .with_ramp_up(10.0);
+        let bc = TidalBC::simple(0.0, 1.0, 2.0 * PI, 0.0, G).with_ramp_up(10.0);
 
         // Derivative should be zero at endpoints (smooth entry/exit)
         assert!(bc.ramp_derivative(0.0).abs() < TOL);
@@ -579,8 +576,6 @@ mod tests {
 
         // Test clamping at boundaries
         assert!((bc.elevation(-1.0) - 0.0).abs() < TOL);
-        assert!(
-            (bc.elevation(200.0) - ((n - 1) as f64 * 0.1 * 0.5).sin()).abs() < TOL
-        );
+        assert!((bc.elevation(200.0) - ((n - 1) as f64 * 0.1 * 0.5).sin()).abs() < TOL);
     }
 }

@@ -77,9 +77,7 @@ impl Stretching for UniformStretching {
         let n = n_levels;
 
         // Cell faces: equally spaced from -1 to 0
-        let sigma_w: Vec<f64> = (0..=n)
-            .map(|k| -1.0 + k as f64 / n as f64)
-            .collect();
+        let sigma_w: Vec<f64> = (0..=n).map(|k| -1.0 + k as f64 / n as f64).collect();
 
         // Cell centers: midpoints between faces
         let sigma_rho: Vec<f64> = (0..n)
@@ -161,7 +159,11 @@ impl Default for SongHaidvogelStretching {
 impl SongHaidvogelStretching {
     /// Create stretching with custom parameters.
     pub fn new(theta_s: f64, theta_b: f64, hc: f64) -> Self {
-        Self { theta_s, theta_b, hc }
+        Self {
+            theta_s,
+            theta_b,
+            hc,
+        }
     }
 
     /// Compute the C(sigma) stretching function.
@@ -220,15 +222,10 @@ impl Stretching for SongHaidvogelStretching {
         let n = n_levels;
 
         // First compute uniform sigma levels
-        let sigma_uniform: Vec<f64> = (0..=n)
-            .map(|k| -1.0 + k as f64 / n as f64)
-            .collect();
+        let sigma_uniform: Vec<f64> = (0..=n).map(|k| -1.0 + k as f64 / n as f64).collect();
 
         // Apply stretching function to get sigma_w
-        let sigma_w: Vec<f64> = sigma_uniform
-            .iter()
-            .map(|&s| self.cs_function(s))
-            .collect();
+        let sigma_w: Vec<f64> = sigma_uniform.iter().map(|&s| self.cs_function(s)).collect();
 
         // Cell centers: midpoints in stretched space
         let sigma_rho: Vec<f64> = (0..n)
@@ -346,15 +343,10 @@ impl Stretching for ROMSVstretching4 {
         let n = n_levels;
 
         // Compute uniform sigma levels
-        let sigma_uniform: Vec<f64> = (0..=n)
-            .map(|k| -1.0 + k as f64 / n as f64)
-            .collect();
+        let sigma_uniform: Vec<f64> = (0..=n).map(|k| -1.0 + k as f64 / n as f64).collect();
 
         // Apply stretching function to get sigma_w
-        let sigma_w: Vec<f64> = sigma_uniform
-            .iter()
-            .map(|&s| self.cs_function(s))
-            .collect();
+        let sigma_w: Vec<f64> = sigma_uniform.iter().map(|&s| self.cs_function(s)).collect();
 
         // Cell centers: midpoints in stretched space
         let sigma_rho: Vec<f64> = (0..n)

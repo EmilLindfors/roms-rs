@@ -283,7 +283,8 @@ impl DiagnosticsTracker {
     /// Get relative mass conservation error.
     pub fn mass_error(&self) -> f64 {
         if self.initial.total_mass.abs() > 1e-14 {
-            (self.current.total_mass - self.initial.total_mass).abs() / self.initial.total_mass.abs()
+            (self.current.total_mass - self.initial.total_mass).abs()
+                / self.initial.total_mass.abs()
         } else {
             0.0
         }
@@ -291,8 +292,10 @@ impl DiagnosticsTracker {
 
     /// Get relative momentum conservation error (magnitude).
     pub fn momentum_error(&self) -> f64 {
-        let initial_mom = (self.initial.momentum_x.powi(2) + self.initial.momentum_y.powi(2)).sqrt();
-        let current_mom = (self.current.momentum_x.powi(2) + self.current.momentum_y.powi(2)).sqrt();
+        let initial_mom =
+            (self.initial.momentum_x.powi(2) + self.initial.momentum_y.powi(2)).sqrt();
+        let current_mom =
+            (self.current.momentum_x.powi(2) + self.current.momentum_y.powi(2)).sqrt();
 
         if initial_mom.abs() > 1e-14 {
             (current_mom - initial_mom).abs() / initial_mom.abs()
@@ -304,7 +307,8 @@ impl DiagnosticsTracker {
     /// Get relative energy change (can be negative due to dissipation).
     pub fn energy_change(&self) -> f64 {
         if self.initial.total_energy.abs() > 1e-14 {
-            (self.current.total_energy - self.initial.total_energy) / self.initial.total_energy.abs()
+            (self.current.total_energy - self.initial.total_energy)
+                / self.initial.total_energy.abs()
         } else {
             0.0
         }
@@ -352,7 +356,10 @@ impl DiagnosticsTracker {
     /// Print a summary of the simulation diagnostics.
     pub fn print_summary(&self) {
         println!("=== Diagnostics Summary ===");
-        println!("Time: {:.2} s ({} updates)", self.current_time, self.n_updates);
+        println!(
+            "Time: {:.2} s ({} updates)",
+            self.current_time, self.n_updates
+        );
         println!();
         println!("Conservation:");
         println!(
@@ -653,7 +660,12 @@ mod tests {
         ElementIndex::new(idx)
     }
 
-    fn setup() -> (Mesh2D, DGOperators2D, GeometricFactors2D, SystemSolution2D<3>) {
+    fn setup() -> (
+        Mesh2D,
+        DGOperators2D,
+        GeometricFactors2D,
+        SystemSolution2D<3>,
+    ) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
         let geom = GeometricFactors2D::compute(&mesh);

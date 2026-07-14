@@ -111,11 +111,15 @@ impl ConstituentData {
 
     /// Evaluate tidal elevation at time t.
     ///
-    /// η(t) = reference_level + Σ Aᵢ cos(ωᵢt + φᵢ)
+    /// η(t) = reference_level + Σ Aᵢ cos(ωᵢt − Gᵢ)
+    ///
+    /// `phase_degrees` (and hence [`phase_radians`](ConstituentEntry::phase_radians))
+    /// is the Greenwich phase **lag** G, so it is subtracted, not added. Adding it
+    /// would time-reverse the tide.
     pub fn evaluate(&self, t: f64) -> f64 {
         let mut eta = self.reference_level;
         for c in &self.constituents {
-            eta += c.amplitude * (c.omega() * t + c.phase_radians()).cos();
+            eta += c.amplitude * (c.omega() * t - c.phase_radians()).cos();
         }
         eta
     }
@@ -500,6 +504,36 @@ S2 0.15 158.7
 
         // At t=pi: cos(pi) = -1, so eta = 1.0 + 0.5*(-1) = 0.5
         assert!((data.evaluate(std::f64::consts::PI) - 0.5).abs() < TOL);
+    }
+
+    #[test]
+    fn test_greenwich_phase_lag_is_subtracted() {
+        // Regression (TODO P0.9): the Greenwich phase lag G is subtracted, so
+        // η = A·cos(ωt − G) peaks at t = G/ω (in the future). The old code added
+        // the lag and peaked at t = −G/ω, i.e. the time-reversed (mirrored) tide.
+        use std::f64::consts::PI;
+        let mut data = ConstituentData::new();
+        data.reference_level = 0.0;
+        data.constituents.push(ConstituentEntry {
+            name: "TEST".into(),
+            amplitude: 1.0,
+            phase_degrees: 90.0, // G = π/2, ω = 1
+            period: 2.0 * PI,
+        });
+
+        // Peak occurs at t = G/ω = π/2 (correct convention).
+        assert!(
+            (data.evaluate(PI / 2.0) - 1.0).abs() < TOL,
+            "elevation should peak at t = G/ω; got {}",
+            data.evaluate(PI / 2.0)
+        );
+        // The mirrored (old, buggy) convention would peak at t = -π/2, so at
+        // t = +π/2 it would read cos(π) = -1. Guard against regressing to it.
+        assert!(
+            data.evaluate(-PI / 2.0) < -0.5,
+            "mirrored tide detected: elevation at t = -G/ω was {}",
+            data.evaluate(-PI / 2.0)
+        );
     }
 
     #[test]

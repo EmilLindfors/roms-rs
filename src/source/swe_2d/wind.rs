@@ -344,11 +344,7 @@ impl SourceTerm2D for WindStress2D {
         let (tau_x, tau_y) = self.compute_stress(u_10, v_10);
 
         // Source terms: S_hu = τ_x / ρ_water, S_hv = τ_y / ρ_water
-        SWEState2D::new(
-            0.0,
-            tau_x / self.rho_water,
-            tau_y / self.rho_water,
-        )
+        SWEState2D::new(0.0, tau_x / self.rho_water, tau_y / self.rho_water)
     }
 
     fn name(&self) -> &'static str {
@@ -473,16 +469,26 @@ mod tests {
 
         // At t=0: u=0
         let ctx0 = SourceContext2D::new(
-            0.0, (0.0, 0.0), SWEState2D::new(10.0, 0.0, 0.0),
-            0.0, (0.0, 0.0), 9.81, 1e-6,
+            0.0,
+            (0.0, 0.0),
+            SWEState2D::new(10.0, 0.0, 0.0),
+            0.0,
+            (0.0, 0.0),
+            9.81,
+            1e-6,
         );
         let s0 = wind.evaluate(&ctx0);
         assert!(s0.hu.abs() < TOL);
 
         // At t=0.25: u=10
         let ctx1 = SourceContext2D::new(
-            0.25, (0.0, 0.0), SWEState2D::new(10.0, 0.0, 0.0),
-            0.0, (0.0, 0.0), 9.81, 1e-6,
+            0.25,
+            (0.0, 0.0),
+            SWEState2D::new(10.0, 0.0, 0.0),
+            0.0,
+            (0.0, 0.0),
+            9.81,
+            1e-6,
         );
         let s1 = wind.evaluate(&ctx1);
         assert!(s1.hu > 0.0);
@@ -559,14 +565,24 @@ mod tests {
 
         // At t=0 (midnight-ish, phase=-π/2): speed = 0.5 * (1 + 0) = 0.5 * max
         let ctx0 = SourceContext2D::new(
-            0.0, (0.0, 0.0), SWEState2D::new(10.0, 0.0, 0.0),
-            0.0, (0.0, 0.0), 9.81, 1e-6,
+            0.0,
+            (0.0, 0.0),
+            SWEState2D::new(10.0, 0.0, 0.0),
+            0.0,
+            (0.0, 0.0),
+            9.81,
+            1e-6,
         );
 
         // At t=period/4 (solar noon): speed = max
         let ctx_noon = SourceContext2D::new(
-            21600.0, (0.0, 0.0), SWEState2D::new(10.0, 0.0, 0.0),
-            0.0, (0.0, 0.0), 9.81, 1e-6,
+            21600.0,
+            (0.0, 0.0),
+            SWEState2D::new(10.0, 0.0, 0.0),
+            0.0,
+            (0.0, 0.0),
+            9.81,
+            1e-6,
         );
 
         let s0 = breeze.evaluate(&ctx0);

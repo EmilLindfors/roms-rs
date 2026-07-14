@@ -25,7 +25,6 @@
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::types::ElementIndex;
 use crate::solver::{
     KuzminParameter2D, SWE2DRhsConfig, SWESolution2D, SWEState2D, TVBParameter2D,
     Tracer2DRhsConfig, TracerBoundaryCondition2D, TracerBounds, TracerSolution2D, TracerState,
@@ -33,6 +32,7 @@ use crate::solver::{
     compute_rhs_tracer_2d,
 };
 use crate::source::{BaroclinicSource2D, compute_tracer_gradients};
+use crate::types::ElementIndex;
 
 /// Combined state for coupled SWE-tracer system.
 #[derive(Clone)]

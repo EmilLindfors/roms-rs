@@ -81,12 +81,12 @@ fn main() {
 
             let ctx = BCContext2D::new(
                 time,
-                (0.0, 0.0),    // Position at origin (= lat, lon center)
+                (0.0, 0.0), // Position at origin (= lat, lon center)
                 interior_state,
                 bathymetry,
-                (1.0, 0.0),   // Outward normal in +x direction
-                9.81,         // g
-                1e-6,         // h_min
+                (1.0, 0.0), // Outward normal in +x direction
+                9.81,       // g
+                1e-6,       // h_min
             );
 
             let ghost = bc.ghost_state(&ctx);

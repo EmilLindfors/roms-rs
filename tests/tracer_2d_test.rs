@@ -161,6 +161,59 @@ fn test_tracer_conservation_periodic() {
     );
 }
 
+#[test]
+fn test_tracer_diffusion_is_conservative_across_element_jumps() {
+    let (mesh, ops, geom) = create_periodic_setup(2, 2, 1);
+    let n_elements = mesh.n_elements;
+    let n_nodes = ops.n_nodes;
+
+    let mut swe = SWESolution2D::new(n_elements, n_nodes);
+    let mut tracers = TracerSolution2D::new(n_elements, n_nodes);
+
+    for ki in 0..n_elements {
+        for i in 0..n_nodes {
+            let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
+            let [x, _y] = mesh.reference_to_physical(k(ki), r, s);
+            let (temp, salinity) = if x < 0.5 { (20.0, 36.0) } else { (5.0, 30.0) };
+
+            swe.set_state(k(ki), i, SWEState2D::from_primitives(10.0, 0.0, 0.0));
+            tracers.set_from_concentrations(k(ki), i, 10.0, TracerState::new(temp, salinity));
+        }
+    }
+
+    let bc = ExtrapolationTracerBC;
+    let config = Tracer2DRhsConfig::new(&bc, G, H_MIN).with_diffusivity(1.0);
+    let rhs = compute_rhs_tracer_2d(&tracers, &swe, &mesh, &ops, &geom, &config, 0.0);
+
+    let mut integral_h_t = 0.0;
+    let mut integral_h_s = 0.0;
+    let mut max_rhs: f64 = 0.0;
+    for ki in 0..n_elements {
+        let j = geom.det_j[ki];
+        for (i, &w) in ops.weights.iter().enumerate() {
+            let state = rhs.get_conservative(k(ki), i);
+            integral_h_t += w * state.h_t * j;
+            integral_h_s += w * state.h_s * j;
+            max_rhs = max_rhs.max(state.h_t.abs()).max(state.h_s.abs());
+        }
+    }
+
+    assert!(
+        max_rhs > 1e-8,
+        "Diffusion should couple discontinuous neighboring elements"
+    );
+    assert!(
+        integral_h_t.abs() < 1e-10,
+        "Temperature diffusion must conserve total hT: d(total)/dt = {:.2e}",
+        integral_h_t
+    );
+    assert!(
+        integral_h_s.abs() < 1e-10,
+        "Salinity diffusion must conserve total hS: d(total)/dt = {:.2e}",
+        integral_h_s
+    );
+}
+
 // ============================================================================
 // Limiter Regression Tests
 // ============================================================================

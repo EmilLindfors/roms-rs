@@ -100,9 +100,7 @@ impl SigmaGrid {
         let (sigma_rho, sigma_w) = stretching.compute_sigma(n_levels);
 
         // Compute layer thicknesses
-        let d_sigma: Vec<f64> = (0..n_levels)
-            .map(|k| sigma_w[k + 1] - sigma_w[k])
-            .collect();
+        let d_sigma: Vec<f64> = (0..n_levels).map(|k| sigma_w[k + 1] - sigma_w[k]).collect();
 
         Self {
             n_levels,
@@ -332,7 +330,7 @@ impl SigmaGrid {
     ) {
         debug_assert_eq!(d_eta_dx.len(), d_h_dx.len());
         debug_assert_eq!(d_eta_dx.len(), dz_dx_out.len());
-        
+
         let sigma = self.sigma_rho[level];
         let c1 = 1.0 + sigma;
         let c2 = sigma;
@@ -353,7 +351,7 @@ impl SigmaGrid {
     ) {
         debug_assert_eq!(d_eta_dy.len(), d_h_dy.len());
         debug_assert_eq!(d_eta_dy.len(), dz_dy_out.len());
-        
+
         let sigma = self.sigma_rho[level];
         let c1 = 1.0 + sigma;
         let c2 = sigma;
@@ -406,10 +404,7 @@ impl SigmaGrid {
     /// * `z_out` - Output buffer, must have length >= n_levels + 1
     #[inline]
     pub fn z_at_faces_into(&self, eta: f64, h: f64, z_out: &mut [f64]) {
-        debug_assert!(
-            z_out.len() > self.n_levels,
-            "Output buffer too small"
-        );
+        debug_assert!(z_out.len() > self.n_levels, "Output buffer too small");
 
         let depth = eta + h;
         for (z, &sigma) in z_out.iter_mut().zip(self.sigma_w.iter()) {
@@ -426,10 +421,7 @@ impl SigmaGrid {
     /// * `dz_out` - Output buffer, must have length >= n_levels
     #[inline]
     pub fn layer_thicknesses_into(&self, eta: f64, h: f64, dz_out: &mut [f64]) {
-        debug_assert!(
-            dz_out.len() >= self.n_levels,
-            "Output buffer too small"
-        );
+        debug_assert!(dz_out.len() >= self.n_levels, "Output buffer too small");
 
         let depth = eta + h;
         for (dz, &ds) in dz_out.iter_mut().zip(self.d_sigma.iter()) {
@@ -481,13 +473,7 @@ impl SigmaGrid {
     ///
     /// For each column i: z[i] = eta[i] + (eta[i] + h[i]) * sigma_rho[level]
     #[inline]
-    pub fn z_at_level_batch(
-        &self,
-        level: usize,
-        eta: &[f64],
-        h: &[f64],
-        z_out: &mut [f64],
-    ) {
+    pub fn z_at_level_batch(&self, level: usize, eta: &[f64], h: &[f64], z_out: &mut [f64]) {
         debug_assert_eq!(eta.len(), h.len());
         debug_assert_eq!(eta.len(), z_out.len());
         debug_assert!(level < self.n_levels);
@@ -510,13 +496,7 @@ impl SigmaGrid {
     /// * `h` - Water depths, length = n_columns
     /// * `dz_out` - Output buffer, length = n_columns
     #[inline]
-    pub fn layer_thickness_batch(
-        &self,
-        level: usize,
-        eta: &[f64],
-        h: &[f64],
-        dz_out: &mut [f64],
-    ) {
+    pub fn layer_thickness_batch(&self, level: usize, eta: &[f64], h: &[f64], dz_out: &mut [f64]) {
         debug_assert_eq!(eta.len(), h.len());
         debug_assert_eq!(eta.len(), dz_out.len());
         debug_assert!(level < self.n_levels);
@@ -608,8 +588,7 @@ impl SigmaGrid {
         println!("  Stretching: {}", self.stretching_description);
         println!(
             "  Sigma range: [{:.6}, {:.6}]",
-            self.sigma_w[0],
-            self.sigma_w[self.n_levels]
+            self.sigma_w[0], self.sigma_w[self.n_levels]
         );
 
         // Layer thickness statistics
@@ -626,10 +605,7 @@ impl SigmaGrid {
 
     /// Get minimum layer thickness in sigma space.
     pub fn min_d_sigma(&self) -> f64 {
-        self.d_sigma
-            .iter()
-            .copied()
-            .fold(f64::INFINITY, f64::min)
+        self.d_sigma.iter().copied().fold(f64::INFINITY, f64::min)
     }
 
     /// Get maximum layer thickness in sigma space.
@@ -666,7 +642,7 @@ impl SigmaGrid {
     }
 
     /// Compute the depth-weighted average of a vertical column (SIMD optimized).
-    /// 
+    ///
     /// # Arguments
     /// * `column` - Vertical column of values
     /// * `out` - Mutable reference to store result (useful for accumulation)
@@ -714,12 +690,12 @@ mod tests {
     fn test_depth_average() {
         let n_levels = 10;
         let grid = SigmaGrid::uniform(n_levels);
-        
+
         // Constant function: average should be the constant
         let col_const = vec![5.0; n_levels];
         let avg = grid.depth_average(&col_const);
         assert!((avg - 5.0).abs() < 1e-14);
-        
+
         // Linear function: f(s) = s + 0.5 (goes from -0.5 to 0.5)
         // Average should be 0.0
         let col_lin: Vec<f64> = grid.sigma_rho().iter().map(|s| s + 0.5).collect();
