@@ -15,7 +15,11 @@
       "Bash(findstr:*)",
       "Bash(find:*)",
       "Bash(Select-String -Pattern \"test result:|FAILED\")",
-      "Bash(cargo check:*)"
+      "Bash(cargo check:*)",
+      "Bash(cargo fmt *)",
+      "Bash(echo \"fmt exit: $?\")",
+      "PowerShell(cargo test *)",
+      "Bash(norkyst-client --help)"
     ],
     "deny": [],
     "ask": []

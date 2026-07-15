@@ -147,8 +147,9 @@ pub fn compute_vertical_velocity(
                     // interior (transmissive) would leak mass through the coastline.
                     for i in 0..n_face_nodes {
                         h_ext[i] = h_int[i];
-                        (u_ext[i], v_ext[i]) =
-                            crate::boundary::reflect_velocity(u_int[i], v_int[i], normal.0, normal.1);
+                        (u_ext[i], v_ext[i]) = crate::boundary::reflect_velocity(
+                            u_int[i], v_int[i], normal.0, normal.1,
+                        );
                     }
                 }
 

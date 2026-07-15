@@ -167,6 +167,64 @@ impl TSTConfig {
         }
     }
 
+    /// Create a TST configuration from constituent file data, applying nodal
+    /// corrections and equilibrium arguments at a prediction epoch.
+    ///
+    /// This is the astronomically complete counterpart to
+    /// [`from_constituent_data`](Self::from_constituent_data): each constituent's
+    /// amplitude is scaled by its nodal factor `f`, and its internal phase gains
+    /// the equilibrium argument plus nodal phase `(V₀ + u)`, so the prediction is
+    ///
+    /// ```text
+    /// η(t) = Σ fᵢ Aᵢ cos(ωᵢ t + (V₀ + u)ᵢ − Gᵢ)
+    /// ```
+    ///
+    /// where `t` is elapsed simulation time (seconds) measured from `epoch_jd`.
+    /// Constituents whose names are not recognised by
+    /// [`nodal_correction`](crate::tides::nodal_correction) are carried through
+    /// uncorrected (identity `f = 1`, `V₀ = u = 0`).
+    ///
+    /// # Arguments
+    /// * `data` - Parsed constituent data (amplitude, Greenwich phase lag `G`)
+    /// * `h_ref` - Reference depth below mean sea level
+    /// * `dx` - Grid spacing for the radiation term
+    /// * `epoch_jd` - Julian Date (UTC) of simulation time `t = 0`
+    ///   (see [`julian_date`](crate::tides::julian_date))
+    pub fn from_constituent_data_at_epoch(
+        data: &ConstituentData,
+        h_ref: f64,
+        dx: f64,
+        epoch_jd: f64,
+    ) -> Self {
+        use crate::tides::{AstronomicalArguments, NodalCorrection, nodal_correction};
+
+        let astro = AstronomicalArguments::at_julian_date(epoch_jd);
+        let constituents = data
+            .constituents
+            .iter()
+            .map(|c| {
+                let correction =
+                    nodal_correction(&c.name, &astro).unwrap_or(NodalCorrection::IDENTITY);
+                // Internal phase φ = −G; add (V₀ + u), scale amplitude by f.
+                TSTConstituent {
+                    name: c.name.clone(),
+                    amplitude: correction.f * c.amplitude,
+                    omega: 2.0 * PI / c.period,
+                    phase: -c.phase_degrees * PI / 180.0 + correction.phase_offset_rad(),
+                }
+            })
+            .collect();
+
+        Self {
+            mean_elevation: data.reference_level,
+            constituents,
+            h_ref,
+            dx,
+            subtidal_weight: 1.0,
+            h_min: 1e-6,
+        }
+    }
+
     /// Builder: Set subtidal radiation weight.
     pub fn with_subtidal_weight(mut self, weight: f64) -> Self {
         self.subtidal_weight = weight.clamp(0.0, 1.0);
@@ -556,6 +614,77 @@ mod tests {
         // Internal phase is the negated Greenwich phase lag (φ = −G) so that
         // elevation is A·cos(ωt − G) rather than a time-reversed A·cos(ωt + G).
         assert!((m2.phase - (-125.3 * PI / 180.0)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_from_constituent_data_at_epoch_applies_nodal_correction() {
+        use crate::io::ConstituentData;
+        use crate::tides::{AstronomicalArguments, nodal_correction};
+
+        // K1 carries the large diurnal nodal modulation (11–19%), so it is the
+        // clearest witness that corrections were applied vs the uncorrected path.
+        let data = ConstituentData {
+            location: None,
+            reference_level: 0.0,
+            constituents: vec![crate::io::ConstituentEntry {
+                name: "K1".to_string(),
+                amplitude: 0.10,
+                phase_degrees: 60.0,
+                period: 23.9344697 * 3600.0,
+            }],
+        };
+
+        // Epoch: 2024-01-01 00:00 UTC.
+        let epoch_jd = crate::tides::julian_date(2024, 1, 1, 0, 0, 0.0);
+        let astro = AstronomicalArguments::at_julian_date(epoch_jd);
+        let corr = nodal_correction("K1", &astro).unwrap();
+
+        let corrected = TSTConfig::from_constituent_data_at_epoch(&data, 50.0, 800.0, epoch_jd);
+        let uncorrected = TSTConfig::from_constituent_data(&data, 50.0, 800.0);
+
+        let c_corr = &corrected.constituents[0];
+        let c_raw = &uncorrected.constituents[0];
+
+        // Amplitude scaled by the nodal factor f (materially different from raw).
+        assert!((c_corr.amplitude - corr.f * 0.10).abs() < 1e-12);
+        assert!(
+            (c_corr.amplitude - c_raw.amplitude).abs() > 1e-3,
+            "nodal factor should shift K1 amplitude appreciably (f = {})",
+            corr.f
+        );
+
+        // Internal phase = −G + (V₀ + u).
+        let expected_phase = -60.0 * PI / 180.0 + corr.phase_offset_rad();
+        assert!((c_corr.phase - expected_phase).abs() < 1e-12);
+        // The equilibrium argument is a real, nonzero astronomical offset.
+        assert!((c_corr.phase - c_raw.phase).abs() > 1e-3);
+
+        // Frequency and mean level are untouched by the correction.
+        assert!((c_corr.omega - c_raw.omega).abs() < 1e-15);
+        assert!((corrected.mean_elevation - uncorrected.mean_elevation).abs() < TOL);
+    }
+
+    #[test]
+    fn test_from_constituent_data_at_epoch_passes_through_unknown() {
+        use crate::io::ConstituentData;
+
+        // An unrecognised constituent name is carried through with identity
+        // correction (period still drives omega).
+        let data = ConstituentData {
+            location: None,
+            reference_level: 0.2,
+            constituents: vec![crate::io::ConstituentEntry {
+                name: "SA".to_string(), // solar annual — not in the nodal table
+                amplitude: 0.05,
+                phase_degrees: 30.0,
+                period: 365.25 * 24.0 * 3600.0,
+            }],
+        };
+        let epoch_jd = crate::tides::julian_date(2024, 1, 1, 0, 0, 0.0);
+        let config = TSTConfig::from_constituent_data_at_epoch(&data, 50.0, 800.0, epoch_jd);
+        let c = &config.constituents[0];
+        assert!((c.amplitude - 0.05).abs() < 1e-12); // f = 1
+        assert!((c.phase - (-30.0 * PI / 180.0)).abs() < 1e-12); // V0 = u = 0
     }
 
     #[test]

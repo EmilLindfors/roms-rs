@@ -22,6 +22,7 @@
 
 use super::TimeSeries;
 use crate::boundary::TidalConstituent;
+use crate::tides::{AstronomicalArguments, NodalCorrection, nodal_correction};
 use faer::{Mat, linalg::solvers::Solve};
 use std::f64::consts::PI;
 
@@ -48,6 +49,49 @@ impl ConstituentResult {
     pub fn evaluate(&self, t: f64) -> f64 {
         let omega = 2.0 * PI / self.period;
         self.amplitude * (omega * t + self.phase).cos()
+    }
+
+    /// Remove a nodal correction from this *apparent* constituent, recovering the
+    /// nodal-corrected *reference* constants (`H_ref`, `φ_ref = −G`).
+    ///
+    /// Harmonic analysis of a finite record fits the *apparent* amplitude and
+    /// phase seen during that record: `H_app = f·H_ref` and, in the crate's
+    /// internal phase convention (`η = H·cos(ω t + φ)`, so `φ = −G`),
+    /// `φ_app = φ_ref + (V₀ + u)` — the equilibrium argument `V₀` and nodal phase
+    /// `u` are baked in. This is the inverse of [`crate::tides::correct_amplitude_phase`]:
+    ///
+    /// ```text
+    /// H_ref = H_app / f,   φ_ref = φ_app − (V₀ + u)
+    /// ```
+    ///
+    /// so the result is comparable to a published catalogue's `(H, G)` pairs.
+    /// A degenerate `f` (≈ 0) leaves the amplitude untouched.
+    pub fn remove_nodal_correction(&self, correction: &NodalCorrection) -> ConstituentResult {
+        let amplitude = if correction.f.abs() > 1e-12 {
+            self.amplitude / correction.f
+        } else {
+            self.amplitude
+        };
+        let phase = (self.phase - correction.phase_offset_rad()).rem_euclid(2.0 * PI);
+        ConstituentResult {
+            name: self.name,
+            period: self.period,
+            amplitude,
+            phase,
+        }
+    }
+
+    /// Convert this apparent constituent into reference constants at `epoch`.
+    ///
+    /// `epoch` is the astronomical state at the analysed record's time origin
+    /// (`t = 0`); see [`Self::remove_nodal_correction`]. Constituents with no
+    /// tabulated nodal correction (see [`crate::tides::nodal_correction`]) are
+    /// returned unchanged.
+    pub fn to_reference(&self, epoch: &AstronomicalArguments) -> ConstituentResult {
+        match nodal_correction(self.name, epoch) {
+            Some(correction) => self.remove_nodal_correction(&correction),
+            None => *self,
+        }
     }
 }
 
@@ -82,6 +126,24 @@ impl HarmonicResult {
     /// Get a constituent by name.
     pub fn get_constituent(&self, name: &str) -> Option<&ConstituentResult> {
         self.constituents.iter().find(|c| c.name == name)
+    }
+
+    /// Nodal-correct every fitted constituent to reference constants at `epoch`.
+    ///
+    /// `epoch` must be the astronomical state at the analysed record's time
+    /// origin (`t = 0`), i.e. `AstronomicalArguments::at_datetime(...)` for the
+    /// UTC instant that the first sample was taken. The returned constituents
+    /// carry reference amplitude `H` and internal phase `φ = −G`, directly
+    /// comparable to a published harmonic catalogue (Kartverket, ROMS, …).
+    ///
+    /// The mean and fit statistics are not returned because reference constants
+    /// no longer reconstruct the original series (they omit the nodal factors);
+    /// see [`ConstituentResult::to_reference`].
+    pub fn reference_constants(&self, epoch: &AstronomicalArguments) -> Vec<ConstituentResult> {
+        self.constituents
+            .iter()
+            .map(|c| c.to_reference(epoch))
+            .collect()
     }
 }
 
@@ -503,6 +565,91 @@ mod tests {
         assert_eq!(constituent.name, "M2");
         assert!((constituent.amplitude - 1.5).abs() < TOL);
         assert!((constituent.phase - 0.5).abs() < TOL);
+    }
+
+    /// Smallest signed angular difference `a − b`, wrapped to `(−π, π]`.
+    fn angle_diff(a: f64, b: f64) -> f64 {
+        let mut d = (a - b) % (2.0 * PI);
+        if d > PI {
+            d -= 2.0 * PI;
+        } else if d <= -PI {
+            d += 2.0 * PI;
+        }
+        d
+    }
+
+    /// End-to-end nodal-correction inference: start from reference constants,
+    /// apply the forward Schureman correction at a chosen epoch to get the
+    /// *apparent* signal, synthesize and fit it, then `to_reference` must recover
+    /// the original reference amplitude and phase. This ties the harmonic-analysis
+    /// inference to `tides::correct_amplitude_phase` (its exact inverse).
+    #[test]
+    fn test_reference_constants_round_trip() {
+        use crate::tides::{AstronomicalArguments, correct_amplitude_phase, nodal_correction};
+
+        // Epoch = record's t = 0 instant.
+        let epoch = AstronomicalArguments::at_datetime(2024, 6, 1, 0, 0, 0.0);
+
+        // Reference K1: H = 0.10 m, Greenwich lag G = 45° → internal φ = −G.
+        let h_ref = 0.10_f64;
+        let phi_ref = (-45.0_f64.to_radians()).rem_euclid(2.0 * PI);
+
+        // Forward correction → apparent constants seen during the record.
+        let corr = nodal_correction("K1", &epoch).unwrap();
+        let (h_app, phi_app) = correct_amplitude_phase(h_ref, phi_ref, &corr);
+        // The nodal factor genuinely moves the amplitude (guards a no-op epoch).
+        assert!(
+            (h_app - h_ref).abs() > 1e-3,
+            "f(K1) too close to 1 at epoch"
+        );
+
+        // Synthesize ~30 days of hourly apparent K1 and fit it.
+        let apparent = TidalConstituent::k1(h_app, phi_app);
+        let times: Vec<f64> = (0..720).map(|i| i as f64 * 3600.0).collect();
+        let values: Vec<f64> = times.iter().map(|&t| apparent.evaluate(t)).collect();
+        let series = make_test_series(&times, &values);
+        let result = HarmonicAnalysis::single(TidalConstituent::k1(0.0, 0.0)).fit(&series);
+
+        // The fit recovers the apparent constants...
+        let fitted = &result.constituents[0];
+        assert!(
+            (fitted.amplitude - h_app).abs() < 1e-3,
+            "apparent amplitude"
+        );
+        assert!(
+            angle_diff(fitted.phase, phi_app).abs() < 1e-3,
+            "apparent phase"
+        );
+
+        // ...and inference recovers the reference constants we started from.
+        let reference = result.reference_constants(&epoch);
+        assert!(
+            (reference[0].amplitude - h_ref).abs() < 1e-3,
+            "reference amplitude: expected {h_ref}, got {}",
+            reference[0].amplitude
+        );
+        assert!(
+            angle_diff(reference[0].phase, phi_ref).abs() < 1e-3,
+            "reference phase: expected {phi_ref}, got {}",
+            reference[0].phase
+        );
+    }
+
+    /// Constituents with no tabulated nodal correction pass through untouched.
+    #[test]
+    fn test_reference_constants_unknown_constituent_unchanged() {
+        use crate::tides::AstronomicalArguments;
+
+        let epoch = AstronomicalArguments::at_datetime(2024, 1, 1, 0, 0, 0.0);
+        let c = ConstituentResult {
+            name: "XYZ",
+            period: 12.0 * 3600.0,
+            amplitude: 0.5,
+            phase: 1.2,
+        };
+        let r = c.to_reference(&epoch);
+        assert!((r.amplitude - 0.5).abs() < TOL);
+        assert!((r.phase - 1.2).abs() < TOL);
     }
 
     #[test]

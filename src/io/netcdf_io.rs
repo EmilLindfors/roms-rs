@@ -1070,16 +1070,36 @@ impl OceanModelReader {
             n_y,
             n_x,
         );
+        // Nesting forces the 2D barotropic child, which needs the *depth-averaged*
+        // velocity (`hu = h·ubar`), not the surface current. Prefer the
+        // vertically-integrated `ubar`/`vbar` (3D `[time][y][x]`) when the source
+        // provides them; only fall back to the surface s-layer of the 3D `u`/`v`
+        // when no barotropic field exists. The `_eastward`/`_northward` variants
+        // are NorKyst's rho-point rotated fields (matching this reader's rho grid);
+        // raw `ubar`/`vbar` are ROMS-native and only used if their element count
+        // matches the rho grid (see the size guard in `read_variable`).
         let u = Self::read_variable(
             &file,
-            &["u_eastward", "u", "eastward_sea_water_velocity"],
+            &[
+                "ubar_eastward",
+                "ubar",
+                "u_eastward",
+                "u",
+                "eastward_sea_water_velocity",
+            ],
             n_time,
             n_y,
             n_x,
         );
         let v = Self::read_variable(
             &file,
-            &["v_northward", "v", "northward_sea_water_velocity"],
+            &[
+                "vbar_northward",
+                "vbar",
+                "v_northward",
+                "v",
+                "northward_sea_water_velocity",
+            ],
             n_time,
             n_y,
             n_x,
@@ -1262,6 +1282,23 @@ impl OceanModelReader {
                 // Reshape to [time][y][x], taking the surface layer if 4D.
                 let n_dims = dims.len();
                 let n_depth = if n_dims == 4 { dims[1].len() } else { 1 };
+
+                // Guard against staggered (u-/v-point) grids: this reader assumes
+                // the variable lives on the same rho grid as lat/lon. A ROMS-native
+                // `ubar`/`u` on the u-point grid has one fewer column, so its flat
+                // element count would not match and `reshape_to_3d` would silently
+                // read shifted/garbage rows. Skip such candidates and fall through
+                // to the next name (e.g. the rho-point surface `u_eastward`).
+                let expected = match n_dims {
+                    2 => n_y * n_x,
+                    3 => n_time * n_y * n_x,
+                    4 => n_time * n_depth * n_y * n_x,
+                    _ => 0,
+                };
+                if expected == 0 || flat.len() != expected {
+                    continue;
+                }
+
                 return Some(Self::reshape_to_3d(
                     &flat, n_dims, n_depth, n_time, n_y, n_x,
                 ));
@@ -1353,8 +1390,7 @@ impl OceanModelReader {
                 for t in 0..n_time {
                     for j in 0..n_y {
                         for i in 0..n_x {
-                            let idx =
-                                t * n_depth * n_y * n_x + k_surface * n_y * n_x + j * n_x + i;
+                            let idx = t * n_depth * n_y * n_x + k_surface * n_y * n_x + j * n_x + i;
                             if idx < flat.len() {
                                 result[t][j][i] = flat[idx];
                             }
@@ -1892,6 +1928,79 @@ mod tests {
             (out[0][0][0] - surface).abs() < 1e-6,
             "expected surface layer value {surface}, got {} (seabed leak?)",
             out[0][0][0]
+        );
+    }
+
+    #[cfg(feature = "netcdf")]
+    #[test]
+    fn nesting_prefers_depth_averaged_ubar_over_surface_layer() {
+        // Regression (TODO P0.8 follow-up): the reader forces the 2D barotropic
+        // child, which needs the depth-averaged velocity (`hu = h·ubar`). When a
+        // file provides both the vertically-integrated `ubar_eastward`/
+        // `vbar_northward` (3D) and the full 3D `u_eastward`/`v_northward` (4D),
+        // the reader must pick the barotropic field, NOT the surface s-layer.
+        use netcdf::create;
+
+        let (n_time, n_depth, n_y, n_x) = (1usize, 3usize, 2usize, 2usize);
+        // Whole-number velocities so the value survives `read_variable`'s
+        // packed-i16-first read path exactly (real NorKyst fields are packed
+        // i16 + scale_factor; unpacked fractional floats would truncate here).
+        let ubar_val = 2.0_f32; // depth-averaged (what a barotropic child needs)
+        let surface_u = 9.0_f32; // surface current (must NOT be selected)
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nest.nc");
+        {
+            let mut file = create(&path).unwrap();
+            file.add_dimension("time", n_time).unwrap();
+            file.add_dimension("s_rho", n_depth).unwrap();
+            file.add_dimension("lat", n_y).unwrap();
+            file.add_dimension("lon", n_x).unwrap();
+
+            let mut lat = file.add_variable::<f64>("lat", &["lat"]).unwrap();
+            lat.put_values(&[60.0_f64, 60.1], ..).unwrap();
+            let mut lon = file.add_variable::<f64>("lon", &["lon"]).unwrap();
+            lon.put_values(&[5.0_f64, 5.1], ..).unwrap();
+            let mut time = file.add_variable::<f64>("time", &["time"]).unwrap();
+            time.put_values(&[0.0_f64], ..).unwrap();
+
+            // Depth-averaged barotropic velocity: 3D [time][lat][lon].
+            let mut ubar = file
+                .add_variable::<f32>("ubar_eastward", &["time", "lat", "lon"])
+                .unwrap();
+            ubar.put_values(&vec![ubar_val; n_time * n_y * n_x], ..)
+                .unwrap();
+            let mut vbar = file
+                .add_variable::<f32>("vbar_northward", &["time", "lat", "lon"])
+                .unwrap();
+            vbar.put_values(&vec![ubar_val; n_time * n_y * n_x], ..)
+                .unwrap();
+
+            // Full 3D velocity: 4D [time][s_rho][lat][lon]; surface (top s-layer)
+            // set to a distinct, larger value so any leak is unambiguous.
+            let mut u = file
+                .add_variable::<f32>("u_eastward", &["time", "s_rho", "lat", "lon"])
+                .unwrap();
+            let mut u3d = vec![0.1_f32; n_time * n_depth * n_y * n_x];
+            let surf = n_depth - 1;
+            for j in 0..n_y {
+                for i in 0..n_x {
+                    u3d[surf * n_y * n_x + j * n_x + i] = surface_u;
+                }
+            }
+            u.put_values(&u3d, ..).unwrap();
+            let mut v = file
+                .add_variable::<f32>("v_northward", &["time", "s_rho", "lat", "lon"])
+                .unwrap();
+            v.put_values(&u3d, ..).unwrap();
+        }
+
+        let reader = OceanModelReader::from_file(&path).unwrap();
+        let u = reader.u.expect("u field read");
+        assert!(
+            (u[0][0][0] - ubar_val).abs() < 1e-6,
+            "expected depth-averaged ubar {ubar_val}, got {} (surface-layer leak?)",
+            u[0][0][0]
         );
     }
 }

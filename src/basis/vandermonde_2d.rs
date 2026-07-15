@@ -408,7 +408,7 @@ mod tests {
         let order = 2;
         let vander = Vandermonde2D::new(order);
 
-        let constant = vec![3.14159; vander.n_nodes];
+        let constant = vec![2.5; vander.n_nodes];
         let dr = vander.differentiate_r(&constant);
         let ds = vander.differentiate_s(&constant);
 

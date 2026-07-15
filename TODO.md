@@ -12,17 +12,34 @@ See `reports/` for the 2026-02-11 analysis: ROMS comparison, math evaluation, BC
 
 ## ▶ Next session — start here
 
-Last worked: 2026-07-09 (P0 correctness fixes, committed on branch `fix/p0-review-bugs`;
-fast-forward `main` if not already done). Pick up in roughly this order:
+Last worked: 2026-07-15 (harmonic-analysis nodal-correction inference — item 3 below.
+`HarmonicResult::reference_constants(&epoch)` / `ConstituentResult::to_reference` invert the
+nodal correction so *apparent* constants fitted from a finite record become catalogue-comparable
+*reference* constants; end-to-end round-trip test against `tides::correct_amplitude_phase`. This
+was the last self-contained enabler for P1.5.) Earlier the same day: the P0.9 Doodson/Schureman
+`src/tides/` astronomy module (V₀, f/u) and epoch-aware BC builders. **Every P0 correctness item
+is fixed except P0.11** (burn GPU surface term, deferred with the module). Pick up in roughly
+this order:
 
-1. **Small, well-scoped P0 follow-ups** (each already diagnosed below):
-   - P0.6 — cosine barotropic time filter to replace the raw subcycle endpoint (REVIEW.md §1.5)
-   - P0.9 — nodal corrections (f, u) + equilibrium argument V₀ for tides (K1/O1 errors 11–19% without them)
-   - P0.8 — read `ubar`/`vbar` for the barotropic nesting child instead of the surface s-layer
-   - P0.10 — add a `cargo check --no-default-features` CI step (no CI infra exists yet)
-2. **P1.5 Validation Against Observations** — the main milestone toward operational quality
+1. **P1.5 Validation Against Observations** — the main milestone toward operational quality
    (NorKyst-800 tides, Bergen/Stavanger/Trondheim/Kristiansund tide gauges, ADCP; infra exists).
-3. **P1.6 End-to-end benchmarks** — full-RHS throughput and parallel scaling.
+   The tidal-comparison code path is now complete end-to-end: fit a record with
+   `HarmonicAnalysis`, call `HarmonicResult::reference_constants(&epoch)` to strip the nodal
+   modulation, then compare to catalogue `(H, G)` pairs. **The remaining blocker is data, not
+   code.** NorKyst-800 data can be pulled with the global `norkyst-client` CLI (v0.1.0, `~/.cargo/bin`)
+   — point/sites/grid extraction over OPeNDAP; see the P1.5 section for invocations. It emits
+   parquet/arrow (not NetCDF), so the validation harness needs a small parquet reader or a convert
+   step. Real Kartverket gauge records still need to be dropped into `data/tide_gauges/` (only
+   synthetic `heimsjo.txt` ships today).
+2. **P1.6 End-to-end benchmarks** — full-RHS throughput and parallel scaling.
+3. **Optional P0.9 extensions** (not blocking): ~~hook `nodal_correction` into
+   harmonic-analysis inference (`analysis/harmonic.rs`)~~ DONE 2026-07-15
+   (`HarmonicResult::reference_constants(&epoch)` / `ConstituentResult::to_reference`
+   invert the nodal correction so fitted apparent constants become catalogue-comparable
+   reference constants). Remaining: add the full satellite-modulation (t_vuf-style)
+   apparatus only if the ~0.1% closed-form f/u proves insufficient during P1.5 validation.
+   (Epoch-aware constructors for `HarmonicTidal2D`/`HarmonicFlather2D` are also done —
+   `with_nodal_corrections(epoch_jd)`.)
 
 Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF;
 otherwise use `cargo test --no-default-features --features parallel,simd`.
@@ -37,9 +54,11 @@ realistic run".
 
 **Status (2026-07-09):** P0.5, P0.6, P0.7, P0.8, P0.9 (phase sign), P0.10 all FIXED with
 tests; P0.11 (delete burn) DEFERRED per user decision (burn-cuda is the primary GPU target).
-Follow-ups remain: nodal tidal corrections (P0.9), cosine barotropic time filter (P0.6),
-`ubar/vbar` nesting (P0.8), a `--no-default-features` CI step (P0.10), and the burn surface
-term (P0.11). All 986 default-feature lib tests pass; `--no-default-features` compiles.
+The cosine barotropic time filter (P0.6), `ubar/vbar` barotropic nesting (P0.8), the
+`--no-default-features` CI step (P0.10), and the P0.9 nodal-correction / equilibrium-argument
+astronomy module were completed 2026-07-15. The only remaining P0 follow-up is the burn surface
+term (P0.11, deferred with the module). All 997 `--no-default-features` lib tests pass (the new
+`tides` astronomy suite included); the default-feature build compiles.
 
 ### P0.5 Hardcoded 100 m depth in vertical diffusion (BLOCKER, 3D) — FIXED
 - [x] `src/physics/vertical_diffusion.rs` — replaced `let h = 100.0` with `h = -bathymetry.get(...)` (still-water depth; `eta + h = eta - B = water_depth`, matching the PGF/advection paths)
@@ -51,7 +70,7 @@ term (P0.11). All 986 default-feature lib tests pass; `--no-default-features` co
 - [x] Regression test `baroclinic_only_pgf_excludes_surface_slope`: constant-density tilted surface → full PGF = `−g∇η`, baroclinic-only PGF = 0 (deterministic)
 - [x] **Second bug found while validating the seiche:** the barotropic subcycle used a flat time-average (centred at t+dt/2) as the t+dt state, halving the evolution rate and *doubling* the seiche period. Switched `ModeSplitIntegrator::{step, step_with_stage_hook}` to the subcycle **endpoint**. Confirmed: full PGF + endpoint → 142 s ≈ 2L/√(2gH) (the double-count signature); baroclinic-only + endpoint → within 15% of the analytic 2L/√(gH) ≈ 202 s
 - [x] Regression test `seiche_period_matches_analytic` (closed basin, fundamental mode) — now passing
-- [ ] Follow-up (REVIEW.md §1.5): replace the raw endpoint with a properly centred cosine time filter to suppress barotropic aliasing over long baroclinic steps
+- [x] Follow-up (REVIEW.md §1.5): replaced the raw endpoint with a centred cosine (Hann) time filter — the barotropic subcycle now overshoots to `t+2·dt` (`dt_bt` unchanged, CFL preserved) and the fields fed back to the slow mode are a raised-cosine weighted average `w_m = 1 − cos(π·m/n_bt)` centred at `t+dt`, suppressing barotropic aliasing while staying consistent for the slow trend. Shared `subcycle_barotropic_filtered` helper (both `step` and `step_with_stage_hook`); regression test `cosine_filter_is_centred_at_baroclinic_endpoint` proves centring (constant tendency → exact `t+dt` value); `seiche_period_matches_analytic` still passes
 
 ### P0.7 Coastal walls transmissive in the 3D path (BLOCKER, 3D) — FIXED
 - [x] Omega diagnostic (`vertical_velocity.rs`) and 3D momentum advection (`advection_3d.rs`) now build a mirrored-normal reflective ghost state at physical boundaries instead of copying the interior
@@ -62,7 +81,7 @@ term (P0.11). All 986 default-feature lib tests pass; `--no-default-features` co
 - [x] `OceanModelReader::reshape_to_3d` now samples the 4D `[time][s_rho][y][x]` field at `s_rho = n_depth-1` (free surface) instead of index 0 (seabed); ROMS/NorKyst s-coordinates are bottom-up
 - [x] Refactored the function to take `(n_dims, n_depth)` instead of `&[netcdf::Dimension]` so it is pure and unit-testable
 - [x] Regression test `reshape_to_3d_takes_surface_layer_not_seabed` (distinct per-layer values; asserts surface value chosen) — netcdf-gated, verified passing under `--features netcdf`
-- [ ] Follow-up (may split out): read `ubar`/`vbar` directly for a barotropic child instead of the surface s-layer (REVIEW.md §3.4)
+- [x] Follow-up (REVIEW.md §3.4): `OceanModelReader` now prefers the depth-averaged `ubar_eastward`/`vbar_northward` (NorKyst rho-point) / `ubar`/`vbar` (ROMS) fields over the surface s-layer of 3D `u`/`v` — the 2D barotropic child needs `hu = h·ubar`, not the surface current. Added a size-consistency guard in `read_variable` (skips staggered u-/v-point variables whose element count doesn't match the rho grid, so they can't silently corrupt the read). Regression test `nesting_prefers_depth_averaged_ubar_over_surface_layer` (netcdf-gated) builds a file with both fields and asserts the depth-averaged one wins
 
 ### P0.9 Tidal phase sign + missing astronomy (MAJOR, tides) — phase sign FIXED
 - [x] Greenwich phase lag was ADDED, not subtracted — now negated on ingest so elevation is `A·cos(ωt − G)`:
@@ -71,12 +90,12 @@ term (P0.11). All 986 default-feature lib tests pass; `--no-default-features` co
 - [x] Documented the convention (internal phase φ = −G) on all three paths
 - [x] Fixed `test_from_constituent_data` (encoded the old `+G` bug); strengthened `test_tst_constituent_from_degrees` to be sign-sensitive; added `test_greenwich_phase_lag_is_subtracted` (peaks at t = G/ω, guards against the mirrored tide)
 - [x] `tidal.rs` reviewed: uses the low-level internal-phase convention (caller passes φ = −G directly), not a Greenwich-lag ingest — correct as-is
-- [ ] Follow-up (may split out): nodal corrections (f, u) and equilibrium argument V₀ from Doodson args at a configured epoch (K1/O1 amplitude errors are 11–19% without them)
+- [x] Follow-up (2026-07-15): nodal corrections (f, u) and equilibrium argument V₀ from Doodson args at a configured epoch (K1/O1 amplitude errors are 11–19% without them). New `src/tides/` module: `AstronomicalArguments` (Meeus J2000 mean longitudes s/h/p/N/p₁ + mean lunar time τ), a Gregorian→Julian-Date converter, per-constituent Doodson equilibrium arguments, and Schureman closed-form `f`/`u` for M2, S2, N2, K2, K1, O1, P1, Q1, M4, MS4, MN4, M6, Mf, Mm, Ssa. Exposed as `tides::nodal_correction(name, &astro)` and wired into prediction via `TSTConfig::from_constituent_data_at_epoch(data, h_ref, dx, epoch_jd)`, the epoch-aware builders `HarmonicFlather2D::with_nodal_corrections(epoch_jd)` and `HarmonicTidal2D::with_nodal_corrections(epoch_jd)`, the `TidalConstituent::with_nodal_correction` primitive, and the `tides::correct_amplitude_phase` helper (all apply `A → f·A`, internal phase `φ → φ + (V₀+u)`). Validated by: mean longitudes at J2000 vs Meeus constants; Meeus Julian-date worked examples; an internal-consistency test recovering each constituent's tabulated period from analytic dV₀/dt (also checks the Doodson coefficients + longitude rates); S2 V₀ = 30°·H_UT (solar time); nodal-factor ranges (M2 0.963–1.038, K1/O1 diurnal 11–19% modulation); node-cycle periodicity; plus per-BC tests that the corrections are baked into amplitude/phase and that unknown constituents pass through unchanged. Not (yet) done: full satellite-modulation apparatus (t_vuf-style) and hooking corrections into harmonic-analysis inference — the closed-form `f`/`u` used here are accurate to ~0.1%/~0.1°, far below the omitted-correction error.
 
 ### P0.10 `--no-default-features` build broken (BLOCKER, build) — FIXED
 - [x] `src/solver/simd/batched.rs` — replaced the unconditional `rayon::current_num_threads()` call with a `faer_par()` helper that returns `Par::Rayon` under the `parallel` feature and `Par::Seq` otherwise (keeps batched GEMM usable single-threaded)
 - [x] Verified `cargo check --no-default-features` and `cargo check --no-default-features --features parallel,simd` both compile
-- [ ] Add a CI/check step: `cargo check --no-default-features` (no CI infra exists yet; follow-up)
+- [x] Added CI (`.github/workflows/ci.yml`, 2026-07-15): a `check` matrix over `--no-default-features` and the `parallel`/`simd` combinations, a `test` job (`cargo nextest run --no-default-features --features parallel,simd`), a `clippy` job (`--lib --tests`; benches excluded — they've drifted from the API), and a `fmt --check` job. Native-HDF5/netCDF default build is intentionally left out of CI (awkward to provision on hosted runners). Ran `cargo fmt --all` to make the fmt gate green and fixed a pre-existing `approx_constant` clippy error in `vandermonde_2d` tests.
 
 ### P0.11 Burn GPU RHS is physically wrong (BLOCKER, GPU) — DEFERRED (keep module for now)
 Decision (2026-07-09): keep `src/solver/burn/` for now — burn-cuda is the stated primary GPU
@@ -150,8 +169,15 @@ These items bring the 2D barotropic solver to operational quality.
 - [x] Unit test verifying all cell centers are found correctly via the index
 
 ### P1.5 Validation Against Observations
-- [ ] Run comparison against NorKyst-800 barotropic tides for a test period
-- [ ] Compare with Norwegian tide gauge observations (infrastructure exists in `analysis/tide_gauge.rs`)
+**Tidal-comparison code path is complete** (fit with `HarmonicAnalysis` → `HarmonicResult::reference_constants(&epoch)` → compare to catalogue `(H,G)`). Remaining work is fetching real data and wiring it through.
+
+- [ ] **Fetch NorKyst-800 data via the global `norkyst-client` CLI** (v0.1.0 at `~/.cargo/bin/norkyst-client`). Extracts NorKyst historical/forecast over OPeNDAP:
+  - Point time series at a gauge: `norkyst-client --source historical --lat <lat> --lon <lon> --start-date YYYY-MM-DD --end-date YYYY-MM-DD --time-grain hourly --format parquet -o <dir>`
+  - Multiple gauges at once: `--sites sites.csv` (CSV columns `id,lat,lon`) — build one row per target station.
+  - Regional grid (for a bbox run): `--bbox min_lat min_lon max_lat max_lon` or `--area <1-13> --geojson PO.geojson`; `--partition-grain day|month`.
+  - **Caveat:** output formats are `text|arrow|parquet|vortex` — NOT NetCDF. The existing NetCDF nesting reader (`OceanModelReader`) will not ingest these directly; either add a small parquet/arrow reader for the validation harness or convert to NetCDF first.
+- [ ] Run comparison against NorKyst-800 barotropic tides for a test period (use the fetched series as the reference)
+- [ ] Compare with Norwegian tide gauge observations (infrastructure exists in `analysis/tide_gauge.rs`; real Kartverket records still need to be dropped into `data/tide_gauges/` — only synthetic `heimsjo.txt` ships today)
 - [ ] Compare with ADCP current data (infrastructure exists in `analysis/adcp.rs`)
 - [ ] Document skill scores (RMSE, bias, correlation) for key stations
 - [ ] Target: Bergen, Stavanger, Trondheim, Kristiansund tide gauges
@@ -298,7 +324,7 @@ See `TODO_old.md` for detailed history of resolved issues.
 
 | Metric | Current | Target (2D operational) |
 |--------|---------|------------------------|
-| Unit tests | 986 | 1,100+ |
+| Unit tests | 1,004 (no-default lib) | 1,100+ |
 | Math correctness | 30/30 | 30/30 ✓ |
 | RHS allocations in hot path | Zero ✓ | Zero ✓ |
 | Depth formula consistency | Fixed ✓ | Fixed ✓ |

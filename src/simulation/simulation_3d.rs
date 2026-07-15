@@ -293,7 +293,8 @@ mod tests {
         }
         physics.update_density(&mut state);
 
-        let integrator = ModeSplitIntegrator::new(20, &DGSolution2D::new(mesh.n_elements, ops.n_nodes));
+        let integrator =
+            ModeSplitIntegrator::new(20, &DGSolution2D::new(mesh.n_elements, ops.n_nodes));
         let mut sim = Simulation3D::new(physics, integrator)
             .with_cfl(0.4)
             .with_dt_max(4.0) // resolve the ~200 s period with many samples

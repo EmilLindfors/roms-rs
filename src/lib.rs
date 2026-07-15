@@ -41,6 +41,7 @@ pub mod polynomial;
 pub mod simulation;
 pub mod solver;
 pub mod source;
+pub mod tides;
 pub mod time;
 pub mod types;
 pub mod vertical;

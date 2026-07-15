@@ -582,6 +582,25 @@ impl SWEBoundaryCondition2D for FixedState2D {
 /// This is a re-export for convenience; see [`super::TidalConstituent`] for details.
 pub use super::TidalConstituent;
 
+/// Apply Doodson/Schureman nodal corrections to a set of constituents in place,
+/// evaluated at the prediction epoch `epoch_jd` (Julian Date, UTC).
+///
+/// Each constituent's amplitude is scaled by its nodal factor `f` and its phase
+/// is shifted by the equilibrium argument plus nodal phase `(V₀ + u)`.
+/// Constituents whose names are not recognised by
+/// [`nodal_correction`](crate::tides::nodal_correction) are left unchanged
+/// (identity correction). Shared by the epoch-aware builders on
+/// [`HarmonicFlather2D`] and [`HarmonicTidal2D`].
+fn apply_nodal_corrections(constituents: &mut [TidalConstituent], epoch_jd: f64) {
+    use crate::tides::{AstronomicalArguments, NodalCorrection, nodal_correction};
+
+    let astro = AstronomicalArguments::at_julian_date(epoch_jd);
+    for c in constituents.iter_mut() {
+        let correction = nodal_correction(c.name, &astro).unwrap_or(NodalCorrection::IDENTITY);
+        *c = c.with_nodal_correction(&correction);
+    }
+}
+
 /// Flather radiation BC with harmonic tidal forcing (non-generic version).
 ///
 /// This is a convenience struct that stores tidal constituents directly,
@@ -709,6 +728,25 @@ impl HarmonicFlather2D {
     /// * `duration` - Ramp-up period in seconds (typically 1-3 tidal periods)
     pub fn with_ramp_up(mut self, duration: f64) -> Self {
         self.ramp_duration = Some(duration);
+        self
+    }
+
+    /// Apply Doodson/Schureman nodal corrections at a prediction epoch.
+    ///
+    /// Scales each constituent's amplitude by its nodal factor `f` and shifts its
+    /// phase by the equilibrium argument plus nodal phase `(V₀ + u)`, so the
+    /// prescribed elevation becomes the astronomically complete
+    ///
+    /// ```text
+    /// η(t) = η₀ + Σ fᵢ Aᵢ cos(ωᵢ t + (V₀ + u)ᵢ − Gᵢ)
+    /// ```
+    ///
+    /// where `t` is elapsed simulation time (seconds) from `epoch_jd`
+    /// (Julian Date, UTC; see [`julian_date`](crate::tides::julian_date)).
+    /// Apply **once**, after all constituents are set; unrecognised constituent
+    /// names are left uncorrected.
+    pub fn with_nodal_corrections(mut self, epoch_jd: f64) -> Self {
+        apply_nodal_corrections(&mut self.constituents, epoch_jd);
         self
     }
 
@@ -880,6 +918,25 @@ impl HarmonicTidal2D {
         self
     }
 
+    /// Apply Doodson/Schureman nodal corrections at a prediction epoch.
+    ///
+    /// Scales each constituent's amplitude by its nodal factor `f` and shifts its
+    /// phase by the equilibrium argument plus nodal phase `(V₀ + u)`, so the
+    /// prescribed elevation becomes the astronomically complete
+    ///
+    /// ```text
+    /// η(t) = η₀ + Σ fᵢ Aᵢ cos(ωᵢ t + (V₀ + u)ᵢ − Gᵢ)
+    /// ```
+    ///
+    /// where `t` is elapsed simulation time (seconds) from `epoch_jd`
+    /// (Julian Date, UTC; see [`julian_date`](crate::tides::julian_date)).
+    /// Apply **once**, after all constituents are set; unrecognised constituent
+    /// names are left uncorrected.
+    pub fn with_nodal_corrections(mut self, epoch_jd: f64) -> Self {
+        apply_nodal_corrections(&mut self.constituents, epoch_jd);
+        self
+    }
+
     /// Compute ramp factor at time t.
     pub fn ramp_factor(&self, t: f64) -> f64 {
         match self.ramp_duration {
@@ -1006,6 +1063,60 @@ mod tests {
             G,
             H_MIN,
         )
+    }
+
+    #[test]
+    fn test_harmonic_flather_nodal_corrections_applied() {
+        use crate::tides::{AstronomicalArguments, julian_date, nodal_correction};
+
+        // K1 shows the large diurnal nodal modulation, so it is the clearest
+        // witness that the correction was baked into amplitude and phase.
+        let raw = TidalConstituent::k1(0.10, 0.30);
+        let epoch_jd = julian_date(2024, 1, 1, 0, 0, 0.0);
+        let astro = AstronomicalArguments::at_julian_date(epoch_jd);
+        let corr = nodal_correction("K1", &astro).unwrap();
+
+        let bc = HarmonicFlather2D::new(vec![raw.clone()], 50.0).with_nodal_corrections(epoch_jd);
+        let c = &bc.constituents[0];
+
+        assert!((c.amplitude - corr.f * 0.10).abs() < TOL);
+        assert!((c.phase - (0.30 + corr.phase_offset_rad())).abs() < TOL);
+        // The correction is material (f ≠ 1, V₀+u ≠ 0).
+        assert!((c.amplitude - raw.amplitude).abs() > 1e-3);
+        assert!((c.phase - raw.phase).abs() > 1e-3);
+        // Frequency untouched.
+        assert!((c.period - raw.period).abs() < TOL);
+    }
+
+    #[test]
+    fn test_harmonic_tidal_nodal_corrections_applied() {
+        use crate::tides::{AstronomicalArguments, julian_date, nodal_correction};
+
+        let raw = TidalConstituent::m2(0.50, 0.0);
+        let epoch_jd = julian_date(2024, 6, 1, 0, 0, 0.0);
+        let astro = AstronomicalArguments::at_julian_date(epoch_jd);
+        let corr = nodal_correction("M2", &astro).unwrap();
+
+        let bc = HarmonicTidal2D::new(vec![raw.clone()]).with_nodal_corrections(epoch_jd);
+        let c = &bc.constituents[0];
+
+        assert!((c.amplitude - corr.f * 0.50).abs() < TOL);
+        assert!((c.phase - (0.0 + corr.phase_offset_rad())).abs() < TOL);
+        // M2 nodal factor stays within a few percent of unity.
+        assert!((corr.f - 1.0).abs() < 0.05 && (corr.f - 1.0).abs() > 1e-6);
+    }
+
+    #[test]
+    fn test_nodal_corrections_pass_through_unknown() {
+        use crate::tides::julian_date;
+
+        // "simple" is not in the astronomy table → identity correction.
+        let raw = TidalConstituent::new("simple", 0.4, 3600.0, 0.7);
+        let epoch_jd = julian_date(2024, 1, 1, 0, 0, 0.0);
+        let bc = HarmonicTidal2D::new(vec![raw.clone()]).with_nodal_corrections(epoch_jd);
+        let c = &bc.constituents[0];
+        assert!((c.amplitude - 0.4).abs() < TOL);
+        assert!((c.phase - 0.7).abs() < TOL);
     }
 
     #[test]

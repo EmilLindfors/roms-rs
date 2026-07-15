@@ -350,7 +350,10 @@ mod tests {
             full_x_err < 1e-9,
             "full PGF should be -g∇η = {expected_fx:.3e}; max x error {full_x_err:.3e}"
         );
-        assert!(full_y_err < 1e-9, "full PGF y should vanish, got {full_y_err:.3e}");
+        assert!(
+            full_y_err < 1e-9,
+            "full PGF y should vanish, got {full_y_err:.3e}"
+        );
 
         // Baroclinic-only PGF (rho_ref = rho0) must vanish (density anomaly is 0).
         compute_pressure_gradient(

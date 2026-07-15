@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The default feature set pulls in NetCDF, which needs native HDF5/netCDF-C
+  # (see docs/windows-native-deps.md) and is awkward to provision on hosted
+  # runners. These jobs therefore exercise the feature combinations that build
+  # with only the Rust toolchain — crucially the `--no-default-features` path,
+  # which regressed once (TODO P0.10) because a hot loop called
+  # `rayon::current_num_threads()` unconditionally.
+  check:
+    name: check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            features: "--no-default-features"
+          - name: parallel+simd
+            features: "--no-default-features --features parallel,simd"
+          - name: parallel-only
+            features: "--no-default-features --features parallel"
+          - name: simd-only
+            features: "--no-default-features --features simd"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - name: cargo check
+        run: cargo check ${{ matrix.features }}
+
+  test:
+    name: test (parallel+simd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: cargo nextest run
+        run: cargo nextest run --no-default-features --features parallel,simd
+
+  clippy:
+    name: clippy (parallel+simd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # `--lib --tests` deliberately excludes `benches/`, which have drifted from
+      # the current API and do not build (tracked separately). Add `--benches`
+      # once they are repaired.
+      - name: cargo clippy
+        run: cargo clippy --no-default-features --features parallel,simd --lib --tests
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
