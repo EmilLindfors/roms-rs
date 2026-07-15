@@ -4,13 +4,32 @@ Roadmap informed by multi-agent review (2026-02-11) comparing against ROMS/NorKy
 updated by the full-crate review (2026-07-08) in `REVIEW.md`.
 See `reports/` for the 2026-02-11 analysis: ROMS comparison, math evaluation, BC assessment, devil's advocate.
 
-**Current state**: Feature-complete 2D SWE solver, ~1,091 tests passing, SIMD/parallel scaffolding, early 3D layer. The 2D solver is research-ready; production use requires addressing the items below.
+**Current state**: Feature-complete 2D SWE solver (986 default-feature lib tests passing), SIMD/parallel scaffolding, early 3D layer. The 2D solver is research-ready; production use requires addressing the items below. The seven P0 correctness blockers are now fixed (P0.11 deferred) — see Priority 0.
 
 **Strategic direction**: Position as a **high-accuracy 2D barotropic/storm surge model** first, then extend to 3D incrementally. DG's geometric flexibility for complex fjord coastlines is the key differentiator over ROMS.
 
 ---
 
-## Priority 0: Correctness Bugs from the 2026-07-08 Review (Fix Now)
+## ▶ Next session — start here
+
+Last worked: 2026-07-09 (P0 correctness fixes, committed on branch `fix/p0-review-bugs`;
+fast-forward `main` if not already done). Pick up in roughly this order:
+
+1. **Small, well-scoped P0 follow-ups** (each already diagnosed below):
+   - P0.6 — cosine barotropic time filter to replace the raw subcycle endpoint (REVIEW.md §1.5)
+   - P0.9 — nodal corrections (f, u) + equilibrium argument V₀ for tides (K1/O1 errors 11–19% without them)
+   - P0.8 — read `ubar`/`vbar` for the barotropic nesting child instead of the surface s-layer
+   - P0.10 — add a `cargo check --no-default-features` CI step (no CI infra exists yet)
+2. **P1.5 Validation Against Observations** — the main milestone toward operational quality
+   (NorKyst-800 tides, Bergen/Stavanger/Trondheim/Kristiansund tide gauges, ADCP; infra exists).
+3. **P1.6 End-to-end benchmarks** — full-RHS throughput and parallel scaling.
+
+Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF;
+otherwise use `cargo test --no-default-features --features parallel,simd`.
+
+---
+
+## Priority 0: Correctness Bugs from the 2026-07-08 Review — RESOLVED (P0.11 deferred)
 
 The seven "top bugs" from `REVIEW.md`. Each fix landed with a regression test that would
 have caught it. Together they are the difference between "demo" and "trustworthy first
