@@ -217,6 +217,11 @@ pub use io::{
     GeoTiffError,
     LocalProjection,
     NORWAY_BBOX,
+    // NorKyst text ingest
+    NorKystLevel,
+    NorKystRecord,
+    NorKystTextData,
+    NorKystTextError,
     // Tide gauge I/O
     TideGaugeFile,
     TideGaugeFileError,
@@ -227,8 +232,10 @@ pub use io::{
     constituent_period,
     files_to_observation_map,
     parse_constituents,
+    parse_norkyst_text_str,
     parse_timeseries,
     read_constituent_file,
+    read_norkyst_text_file,
     read_tide_gauge_directory,
     read_tide_gauge_file,
     read_timeseries_file,
