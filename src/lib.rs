@@ -250,6 +250,11 @@ pub use io::{
     NetCDFWriter, NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState, is_valid_f32,
     is_valid_f64,
 };
+#[cfg(feature = "parquet")]
+pub use io::{
+    NorKystGridData, NorKystGridError, NorKystGridRow, read_norkyst_parquet,
+    read_norkyst_parquet_glob,
+};
 
 // Mesh types (additional exports)
 pub use mesh::{LandMask2D, LandMaskStatistics};

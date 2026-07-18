@@ -77,7 +77,10 @@ mod constituent_reader;
 mod geotiff;
 #[cfg(feature = "netcdf")]
 mod netcdf_io;
+#[cfg(feature = "parquet")]
+mod norkyst_parquet;
 mod norkyst_reader;
+mod norkyst_time;
 mod projection;
 mod tide_gauge_reader;
 mod timeseries_reader;
@@ -95,6 +98,11 @@ pub use netcdf_io::{
     FILL_VALUE_F32, FILL_VALUE_F64, ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo,
     NetCDFWriter, NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState, is_valid_f32,
     is_valid_f64,
+};
+#[cfg(feature = "parquet")]
+pub use norkyst_parquet::{
+    NorKystGridData, NorKystGridError, NorKystGridRow, read_norkyst_parquet,
+    read_norkyst_parquet_glob,
 };
 pub use norkyst_reader::{
     NorKystLevel, NorKystRecord, NorKystTextData, NorKystTextError, parse_norkyst_text_str,

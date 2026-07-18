@@ -20,11 +20,21 @@
 //! cargo run --example norkyst_tidal_validation --no-default-features --features parallel,simd
 //! ```
 //!
-//! Real data — point series fetched with
+//! Real data. Point series (text) fetched with
 //! `norkyst-client … --format text -o series.txt`:
 //!
 //! ```bash
 //! cargo run --example norkyst_tidal_validation -- series.txt
+//! ```
+//!
+//! Grid parquet (the reliable OPeNDAP path) fetched with
+//! `norkyst-client … --bbox … --format parquet -o dataset/` — pass the dataset
+//! directory (or a single `.parquet`) plus optional `lon lat` to pick the
+//! nearest cell (defaults to Bergen). Requires the `parquet` feature:
+//!
+//! ```bash
+//! cargo run --example norkyst_tidal_validation \
+//!   --features parquet -- dataset/ 5.32 60.39
 //! ```
 //!
 //! In real-data mode the record's first sample time is taken as the analysis
@@ -85,7 +95,19 @@ const BERGEN_LIKE: &[Catalogue] = &[
 
 fn main() {
     match std::env::args().nth(1) {
-        Some(path) => real_data_mode(&path),
+        Some(path) => {
+            // Optional station coords (used to pick the nearest grid cell for
+            // gridded parquet input); default to Bergen.
+            let lon = std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(5.32);
+            let lat = std::env::args()
+                .nth(3)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60.39);
+            real_data_mode(&path, lon, lat);
+        }
         None => synthetic_self_check(),
     }
 }
@@ -94,29 +116,11 @@ fn main() {
 // Real-data mode
 // ---------------------------------------------------------------------------
 
-fn real_data_mode(path: &str) {
-    println!("Reading NorKyst text output: {path}");
-    let data = match read_norkyst_text_file(std::path::Path::new(path)) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
+fn real_data_mode(path: &str, lon: f64, lat: f64) {
+    let zeta = match load_zeta(path, lon, lat) {
+        Some(z) => z,
+        None => std::process::exit(1),
     };
-
-    let zeta = data.sea_surface_height_series();
-    println!(
-        "  {} snapshots, {} with sea-surface height",
-        data.len(),
-        zeta.len()
-    );
-    if zeta.is_empty() {
-        eprintln!(
-            "error: no sea-surface height in the record. This needs a norkyst-client build \
-             whose text writer emits the `surface …` line."
-        );
-        std::process::exit(1);
-    }
 
     let analysis = HarmonicAnalysis::norwegian_coast();
     let (rel, epoch) = match to_relative_series_and_epoch(&zeta, &analysis) {
@@ -150,6 +154,72 @@ fn real_data_mode(path: &str) {
         "\nCompare these against the station's published catalogue to score the model \
          (RMS amplitude error, RMS phase error)."
     );
+}
+
+/// Load a sea-surface-height series from either the text point format or, with
+/// the `parquet` feature, a norkyst-client **grid** parquet file/dataset
+/// (picking the wet cell nearest `(lon, lat)`). Returns `None` (after printing
+/// why) if nothing usable is found.
+#[cfg_attr(not(feature = "parquet"), allow(unused_variables))]
+fn load_zeta(path: &str, lon: f64, lat: f64) -> Option<TimeSeries> {
+    let p = std::path::Path::new(path);
+    let looks_parquet = p.is_dir() || p.extension().is_some_and(|e| e == "parquet");
+
+    if looks_parquet {
+        #[cfg(feature = "parquet")]
+        {
+            println!("Reading NorKyst grid parquet: {path}");
+            let data = match dg_rs::io::read_norkyst_parquet_glob(p) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return None;
+                }
+            };
+            let zeta = data.sea_surface_height_series_nearest(lon, lat);
+            println!(
+                "  {} grid rows; nearest wet cell to ({lon}, {lat}) → {} zeta samples",
+                data.len(),
+                zeta.len()
+            );
+            if zeta.is_empty() {
+                eprintln!("error: no wet cell with sea-surface height near ({lon}, {lat}).");
+                return None;
+            }
+            return Some(zeta);
+        }
+        #[cfg(not(feature = "parquet"))]
+        {
+            eprintln!(
+                "error: {path} looks like parquet, but this build lacks the `parquet` feature.\n\
+                 Rebuild with `--features parquet` to read grid parquet natively."
+            );
+            return None;
+        }
+    }
+
+    println!("Reading NorKyst text output: {path}");
+    let data = match read_norkyst_text_file(p) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return None;
+        }
+    };
+    let zeta = data.sea_surface_height_series();
+    println!(
+        "  {} snapshots, {} with sea-surface height",
+        data.len(),
+        zeta.len()
+    );
+    if zeta.is_empty() {
+        eprintln!(
+            "error: no sea-surface height in the record. This needs a norkyst-client build \
+             whose text writer emits the `surface …` line."
+        );
+        return None;
+    }
+    Some(zeta)
 }
 
 // ---------------------------------------------------------------------------

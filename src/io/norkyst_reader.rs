@@ -41,6 +41,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use super::norkyst_time::parse_datetime_seconds;
 use crate::analysis::TimeSeries;
 
 /// Error type for parsing norkyst-client text output.
@@ -411,86 +412,11 @@ fn parse_opt_f64(s: &str, field: &str, line_no: usize) -> Result<Option<f64>, No
         })
 }
 
-/// Convert a datetime string to seconds since the Unix epoch.
-///
-/// Accepts a bare number (already seconds), chrono's
-/// `YYYY-MM-DD HH:MM:SS[.f] [UTC]`, or RFC3339 `YYYY-MM-DDTHH:MM:SS[.f]Z`.
-/// The date→days conversion is exact proleptic Gregorian.
-fn parse_datetime_seconds(s: &str) -> Result<f64, String> {
-    let s = s.trim();
-    if let Ok(v) = s.parse::<f64>() {
-        return Ok(v);
-    }
-
-    // Strip timezone markers (only UTC is emitted).
-    let s = s.trim_end_matches('Z').trim();
-    let s = s.strip_suffix("UTC").map(str::trim).unwrap_or(s);
-
-    let (date_part, time_part) = if let Some(pos) = s.find('T') {
-        (&s[..pos], &s[pos + 1..])
-    } else if let Some(pos) = s.find(' ') {
-        (&s[..pos], &s[pos + 1..])
-    } else {
-        (s, "")
-    };
-
-    let d: Vec<&str> = date_part.split('-').collect();
-    if d.len() != 3 {
-        return Err(format!("unrecognized date {date_part:?}"));
-    }
-    let year: i64 = d[0].parse().map_err(|_| "bad year".to_string())?;
-    let month: i64 = d[1].parse().map_err(|_| "bad month".to_string())?;
-    let day: i64 = d[2].parse().map_err(|_| "bad day".to_string())?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return Err(format!("date out of range {date_part:?}"));
-    }
-
-    let (mut hour, mut minute, mut second) = (0i64, 0i64, 0.0f64);
-    if !time_part.is_empty() {
-        let t: Vec<&str> = time_part.split(':').collect();
-        if t.len() < 2 {
-            return Err(format!("unrecognized time {time_part:?}"));
-        }
-        hour = t[0].parse().map_err(|_| "bad hour".to_string())?;
-        minute = t[1].parse().map_err(|_| "bad minute".to_string())?;
-        if t.len() > 2 {
-            second = t[2].parse().map_err(|_| "bad second".to_string())?;
-        }
-    }
-
-    let days = days_from_civil(year, month, day);
-    Ok(days as f64 * 86_400.0 + hour as f64 * 3600.0 + minute as f64 * 60.0 + second)
-}
-
-/// Days from 1970-01-01 to the given proleptic-Gregorian date.
-///
-/// Howard Hinnant's `days_from_civil` (public-domain), exact for all valid dates.
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = (if y >= 0 { y } else { y - 399 }) / 400;
-    let yoe = y - era * 400; // [0, 399]
-    let mp = if m > 2 { m - 3 } else { m + 9 }; // [0, 11]
-    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
-    era * 146_097 + doe - 719_468
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const TOL: f64 = 1e-9;
-
-    #[test]
-    fn days_from_civil_reference_points() {
-        assert_eq!(days_from_civil(1970, 1, 1), 0);
-        assert_eq!(days_from_civil(1970, 1, 2), 1);
-        assert_eq!(days_from_civil(1969, 12, 31), -1);
-        // 2000-01-01 is 30 years after the epoch, spanning leap years.
-        assert_eq!(days_from_civil(2000, 1, 1), 10_957);
-        // 2024-01-01
-        assert_eq!(days_from_civil(2024, 1, 1), 19_723);
-    }
 
     #[test]
     fn parse_datetime_formats_agree() {
