@@ -12,11 +12,19 @@ See `reports/` for the 2026-02-11 analysis: ROMS comparison, math evaluation, BC
 
 ## ▶ Next session — start here
 
-Last worked: 2026-07-15 (harmonic-analysis nodal-correction inference — item 3 below.
+Last worked: 2026-07-15 (P1.5 NorKyst text-ingest reader — item 1 below.
+`io::read_norkyst_text_file`/`parse_norkyst_text_str` turn `norkyst-client --format text`
+point/site output into `NorKystTextData`, exposing `sea_surface_height_series()` (zeta, for the
+tidal fit) and `surface_current_series()` (shallowest-level u/v, for ADCP). `std`-only, no
+`netcdf` feature; 10 unit tests. Needed a one-line companion fix in the `norkyst-client` repo
+(`print_ocean_data`) to emit a `surface …` line — the text format had been dropping the surface
+elevation, writing it only to parquet/arrow. NOTE: met.no THREDDS was returning HTTP 503 this
+session, so no real NorKyst series was fetched — the reader is ready; the remaining P1.5 blocker
+is still live data.) Earlier the same day: harmonic-analysis nodal-correction inference —
 `HarmonicResult::reference_constants(&epoch)` / `ConstituentResult::to_reference` invert the
 nodal correction so *apparent* constants fitted from a finite record become catalogue-comparable
-*reference* constants; end-to-end round-trip test against `tides::correct_amplitude_phase`. This
-was the last self-contained enabler for P1.5.) Earlier the same day: the P0.9 Doodson/Schureman
+*reference* constants; end-to-end round-trip test against `tides::correct_amplitude_phase`. And
+earlier still: the P0.9 Doodson/Schureman
 `src/tides/` astronomy module (V₀, f/u) and epoch-aware BC builders. **Every P0 correctness item
 is fixed except P0.11** (burn GPU surface term, deferred with the module). Pick up in roughly
 this order:
@@ -27,10 +35,11 @@ this order:
    `HarmonicAnalysis`, call `HarmonicResult::reference_constants(&epoch)` to strip the nodal
    modulation, then compare to catalogue `(H, G)` pairs. **The remaining blocker is data, not
    code.** NorKyst-800 data can be pulled with the global `norkyst-client` CLI (v0.1.0, `~/.cargo/bin`)
-   — point/sites/grid extraction over OPeNDAP; see the P1.5 section for invocations. It emits
-   parquet/arrow (not NetCDF), so the validation harness needs a small parquet reader or a convert
-   step. Real Kartverket gauge records still need to be dropped into `data/tide_gauges/` (only
-   synthetic `heimsjo.txt` ships today).
+   — point/sites/grid extraction over OPeNDAP; see the P1.5 section for invocations. Ingest is
+   now solved: fetch with `--format text` and read it with `io::read_norkyst_text_file` (no
+   parquet dependency, no convert step). Real Kartverket gauge records still need to be dropped
+   into `data/tide_gauges/` (only synthetic `heimsjo.txt` ships today), and met.no THREDDS was
+   returning 503 this session — retry the fetch when the server is back.
 2. **P1.6 End-to-end benchmarks** — full-RHS throughput and parallel scaling.
 3. **Optional P0.9 extensions** (not blocking): ~~hook `nodal_correction` into
    harmonic-analysis inference (`analysis/harmonic.rs`)~~ DONE 2026-07-15
@@ -175,7 +184,10 @@ These items bring the 2D barotropic solver to operational quality.
   - Point time series at a gauge: `norkyst-client --source historical --lat <lat> --lon <lon> --start-date YYYY-MM-DD --end-date YYYY-MM-DD --time-grain hourly --format parquet -o <dir>`
   - Multiple gauges at once: `--sites sites.csv` (CSV columns `id,lat,lon`) — build one row per target station.
   - Regional grid (for a bbox run): `--bbox min_lat min_lon max_lat max_lon` or `--area <1-13> --geojson PO.geojson`; `--partition-grain day|month`.
-  - **Caveat:** output formats are `text|arrow|parquet|vortex` — NOT NetCDF. The existing NetCDF nesting reader (`OceanModelReader`) will not ingest these directly; either add a small parquet/arrow reader for the validation harness or convert to NetCDF first.
+  - **Caveat:** output formats are `text|arrow|parquet|vortex` — NOT NetCDF. The existing NetCDF nesting reader (`OceanModelReader`) will not ingest these directly.
+  - **Ingest reader DONE (2026-07-15):** `io::read_norkyst_text_file` / `parse_norkyst_text_str` parse `--format text` point/site output into `NorKystTextData` (`std`-only, no `netcdf` feature). `sea_surface_height_series()` → `TimeSeries` of `zeta` for the tidal fit; `surface_current_series()` → shallowest-level `(u,v)` for ADCP. This required a one-line companion fix in `norkyst-client` (`print_ocean_data`) to emit a `surface sea_surface_height=… bottom_depth=…` line — the text format previously dropped the surface elevation (it was written only to parquet/arrow). Fetch with `--format text -o <file>` (or stdout) and read it directly; no parquet dependency added.
+  - **Native parquet reader + real Bergen result DONE (2026-07-18):** point/NCSS text fetch is chronically 503; the reliable path is `--bbox … --format parquet` over OPeNDAP. Extended norkyst-client's grid writer to emit `sea_surface_height`/`bottom_depth` (client PR #2), then added `io::read_norkyst_parquet_glob` behind the off-by-default `parquet` feature (`sea_surface_height_series_nearest(lon,lat)` → zeta `TimeSeries`). The example reads a parquet dataset directly with `--features parquet` — no DuckDB/Python step. Ran on a real 2-month Bergen fetch: **M2 H≈0.427 m G≈278°, S2 H≈0.117 m, fit R²≈0.97** over 61 days (P1 aliases into K1 at 61 days — needs ~6 months to separate). Remaining for a *scored* result: real Kartverket `(H,G)` for Bergen to diff against, and a longer fetch for the diurnal band.
+  - **End-to-end example DONE (2026-07-16):** `examples/norkyst_tidal_validation.rs` runs reader → `HarmonicAnalysis::fit` → `reference_constants` → catalogue compare. `cargo run --example norkyst_tidal_validation --no-default-features --features parallel,simd` does a synthetic round-trip (recovers a known catalogue to ~0 RMS); pass a real text file as an arg to fit/print inferred reference constants. Note the absolute-time→epoch recipe it encodes: shift the read series to `t = 0` and take `AstronomicalArguments` at the first sample before calling `reference_constants`. Once real Kartverket `(H, G)` values are on hand, drop them in as the catalogue to score a station.
 - [ ] Run comparison against NorKyst-800 barotropic tides for a test period (use the fetched series as the reference)
 - [ ] Compare with Norwegian tide gauge observations (infrastructure exists in `analysis/tide_gauge.rs`; real Kartverket records still need to be dropped into `data/tide_gauges/` — only synthetic `heimsjo.txt` ships today)
 - [ ] Compare with ADCP current data (infrastructure exists in `analysis/adcp.rs`)
