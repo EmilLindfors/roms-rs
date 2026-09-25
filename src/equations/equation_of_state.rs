@@ -134,6 +134,9 @@ impl EquationOfState {
 
     /// Compute seawater density at given pressure.
     ///
+    /// ρ(S, T, p) = ρ(S, T, 0) / (1 − p / K(S, T, p)), with the UNESCO secant
+    /// bulk modulus `K` and `p` in bar (converted from the dbar argument).
+    ///
     /// # Arguments
     /// * `temperature` - Temperature in °C
     /// * `salinity` - Salinity in PSU
@@ -148,16 +151,17 @@ impl EquationOfState {
 
         let t = temperature;
         let s = salinity;
-        let p = pressure;
+        // The UNESCO (Millero & Poisson 1981) bulk-modulus fit is in bar.
+        let p_bar = pressure / 10.0;
 
         // Surface density
         let rho_0 = self.density_surface(t, s);
 
         // Secant bulk modulus K(S, T, p)
-        let k = self.secant_bulk_modulus(t, s, p);
+        let k = self.secant_bulk_modulus(t, s, p_bar);
 
         // Density at pressure
-        rho_0 / (1.0 - p / k)
+        rho_0 / (1.0 - p_bar / k)
     }
 
     /// Compute density from TracerState.
@@ -275,13 +279,14 @@ impl EquationOfState {
         ((rho_plus - rho_minus) / (2.0 * ds)) / rho
     }
 
-    /// Compute the secant bulk modulus K(S, T, p) for pressure effects.
+    /// Compute the secant bulk modulus K(S, T, p) in bar for pressure effects.
     ///
-    /// Internal helper function for density at depth.
-    fn secant_bulk_modulus(&self, temperature: f64, salinity: f64, pressure: f64) -> f64 {
+    /// Internal helper function for density at depth. `pressure_bar` is in
+    /// **bar** (1 bar = 10 dbar), the unit of the UNESCO fit.
+    fn secant_bulk_modulus(&self, temperature: f64, salinity: f64, pressure_bar: f64) -> f64 {
         let t = temperature;
         let s = salinity;
-        let p = pressure;
+        let p = pressure_bar;
 
         // Pure water secant bulk modulus
         let kw = 19652.21 + 148.4206 * t - 2.327105 * t.powi(2) + 1.360477e-2 * t.powi(3)
@@ -657,6 +662,39 @@ mod tests {
 
         // p ≈ 1025 * 9.81 * 100 / 10000 ≈ 100.55 dbar
         assert!((p - 100.55).abs() < 1.0);
+    }
+
+    /// Regression: `density` takes pressure in dbar but the UNESCO secant bulk
+    /// modulus is fitted in bar. Passing dbar straight through made seawater
+    /// 10× too compressible (ρ(5 °C, 35, 1000 dbar) ≈ 1069.5 instead of ≈ 1032.3).
+    ///
+    /// Check values from UNESCO (1981) / Fofonoff & Millard (1983), tabulated
+    /// at p = 0 and 1000 bar = 10 000 dbar.
+    #[test]
+    fn test_unesco_check_values() {
+        let eos = EquationOfState::with_pressure();
+        // (T °C, S psu, p dbar, ρ kg/m³)
+        let cases = [
+            (5.0, 0.0, 0.0, 999.96675),
+            (5.0, 0.0, 10_000.0, 1044.12802),
+            (25.0, 0.0, 0.0, 997.04796),
+            (25.0, 0.0, 10_000.0, 1037.90204),
+            (5.0, 35.0, 0.0, 1027.67547),
+            (5.0, 35.0, 10_000.0, 1069.48914),
+            (25.0, 35.0, 0.0, 1023.34306),
+            (25.0, 35.0, 10_000.0, 1062.53817),
+        ];
+        for (t, s, p, rho_ref) in cases {
+            let rho = eos.density(t, s, p);
+            assert!(
+                (rho - rho_ref).abs() < 1e-5,
+                "ρ(T={t}, S={s}, p={p} dbar) = {rho}, UNESCO check value {rho_ref}"
+            );
+        }
+
+        // An intermediate pressure: 1000 dbar (≈ 1000 m) compresses by ~4.6 kg/m³.
+        let rho = eos.density(5.0, 35.0, 1000.0);
+        assert!((rho - 1032.3).abs() < 0.1, "ρ(5, 35, 1000 dbar) = {rho}");
     }
 
     #[test]
