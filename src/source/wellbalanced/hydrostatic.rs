@@ -120,6 +120,35 @@ impl HydrostaticReconstruction2D {
         )
     }
 
+    /// Hydrostatic interface correction for one side of a face.
+    ///
+    /// Audusse et al. (2004) give the side with nodal depth `h` and reconstructed
+    /// depth `h*` the flux `F*(q*⁻, q*⁺)·n + ½g(h² − h*²)·n` (momentum only).
+    /// In the DG strong form the surface term is `F(q⁻)·n − (that flux)`, where
+    /// `F(q⁻)` must be the physical flux of the actual nodal state so that the
+    /// surface term telescopes with the volume term (SBP property, discrete mass
+    /// conservation). This returns the resulting addition to `F(q⁻)·n − F*·n`:
+    ///
+    /// ```text
+    /// ½g(h*² − h²)·n   in (hu, hv),   0 in h
+    /// ```
+    ///
+    /// The pressure `½gh²` is taken as zero for `h ≤ h_min`, matching the dry-node
+    /// cutoff of `ShallowWater2D::flux_x`/`flux_y`, so that at lake-at-rest the
+    /// correction cancels `F(q⁻)·n − F*·n` exactly (also at dry nodes).
+    #[inline]
+    pub fn pressure_correction(&self, h: f64, h_star: f64, normal: (f64, f64)) -> SWEState2D {
+        let pressure = |depth: f64| {
+            if depth > self.h_min {
+                0.5 * self.g * depth * depth
+            } else {
+                0.0
+            }
+        };
+        let dp = pressure(h_star) - pressure(h);
+        SWEState2D::new(0.0, dp * normal.0, dp * normal.1)
+    }
+
     /// Fast reconstruction when both sides are known to be wet.
     ///
     /// Skips dry-cell checks for better performance in deep water.
@@ -335,6 +364,45 @@ mod tests {
             q_r_star.h,
             h_expected
         );
+    }
+
+    #[test]
+    fn test_pressure_correction_balances_lake_at_rest() {
+        use crate::equations::ShallowWater2D;
+        use crate::flux::{SWEFluxType2D, compute_flux_swe_2d};
+
+        let equation = ShallowWater2D::new(9.81);
+        let hr = HydrostaticReconstruction2D::new(equation.g, equation.h_min.meters());
+
+        // Lake at rest across a bathymetry jump, arbitrary face normal
+        let eta = 10.0;
+        let (b_int, b_ext) = (2.0, 5.0);
+        let q_int = SWEState2D::new(eta - b_int, 0.0, 0.0);
+        let q_ext = SWEState2D::new(eta - b_ext, 0.0, 0.0);
+        let normal = (0.6, 0.8);
+
+        let (q_int_star, q_ext_star) = hr.reconstruct(&q_int, &q_ext, b_int, b_ext);
+        for flux_type in [
+            SWEFluxType2D::Roe,
+            SWEFluxType2D::HLL,
+            SWEFluxType2D::Rusanov,
+        ] {
+            let f_star =
+                compute_flux_swe_2d(&q_int_star, &q_ext_star, normal, hr.g, hr.h_min, flux_type);
+            let flux_diff = equation.normal_flux(&q_int, normal) - f_star
+                + hr.pressure_correction(q_int.h, q_int_star.h, normal);
+            assert!(flux_diff.h.abs() < 1e-12, "{flux_type:?}: {flux_diff:?}");
+            assert!(flux_diff.hu.abs() < 1e-12, "{flux_type:?}: {flux_diff:?}");
+            assert!(flux_diff.hv.abs() < 1e-12, "{flux_type:?}: {flux_diff:?}");
+        }
+
+        // Continuous bathymetry: reconstruction is the identity, no correction
+        let c = hr.pressure_correction(8.0, 8.0, normal);
+        assert_eq!((c.h, c.hu, c.hv), (0.0, 0.0, 0.0));
+
+        // Dry on both sides of the reconstruction: no pressure either way
+        let c = hr.pressure_correction(0.5 * hr.h_min, 0.0, normal);
+        assert_eq!((c.h, c.hu, c.hv), (0.0, 0.0, 0.0));
     }
 
     #[test]

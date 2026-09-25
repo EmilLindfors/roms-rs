@@ -104,6 +104,7 @@ pub use solver::{
     Rhs3DConfig,
     SWE2DRhsConfig,
     SWEDiagnostics2D,
+    SWEFormulation2D,
     SWESolution2D,
     SWEState2D,
     SystemSolution2D,

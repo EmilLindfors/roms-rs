@@ -94,6 +94,10 @@ impl SourceTerm2D for BathymetrySource2D {
     fn name(&self) -> &'static str {
         "bathymetry_source_2d"
     }
+
+    fn includes_bathymetry_slope(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
