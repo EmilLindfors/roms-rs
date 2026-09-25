@@ -273,7 +273,7 @@ fn test_compute_dt_viscosity() {
 }
 
 /// Test parallel RHS matches sequential when viscosity is enabled.
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "simd"))]
 #[test]
 fn test_viscosity_parallel_consistency() {
     use dg_rs::compute_rhs_swe_2d_parallel;

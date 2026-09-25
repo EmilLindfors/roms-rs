@@ -507,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_batched_matches_scalar() {
-        use crate::solver::simd::kernels::apply_diff_matrix;
+        use crate::solver::simd::kernels::apply_diff_matrix_scalar;
 
         // Create a mesh and operators
         let mesh = Mesh2D::uniform_rectangle(0.0, 100.0, 0.0, 100.0, 4, 4);
@@ -599,7 +599,7 @@ mod tests {
             let mut dfy_ds_hu = vec![0.0; n_nodes];
             let mut dfy_ds_hv = vec![0.0; n_nodes];
 
-            apply_diff_matrix(
+            apply_diff_matrix_scalar(
                 &ops.dr_row_major,
                 &flux_x_h,
                 &flux_x_hu,
@@ -609,7 +609,7 @@ mod tests {
                 &mut dfx_dr_hv,
                 n_nodes,
             );
-            apply_diff_matrix(
+            apply_diff_matrix_scalar(
                 &ops.ds_row_major,
                 &flux_x_h,
                 &flux_x_hu,
@@ -619,7 +619,7 @@ mod tests {
                 &mut dfx_ds_hv,
                 n_nodes,
             );
-            apply_diff_matrix(
+            apply_diff_matrix_scalar(
                 &ops.dr_row_major,
                 &flux_y_h,
                 &flux_y_hu,
@@ -629,7 +629,7 @@ mod tests {
                 &mut dfy_dr_hv,
                 n_nodes,
             );
-            apply_diff_matrix(
+            apply_diff_matrix_scalar(
                 &ops.ds_row_major,
                 &flux_y_h,
                 &flux_y_hu,
