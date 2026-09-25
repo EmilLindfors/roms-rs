@@ -68,8 +68,9 @@ fn main() {
                 .with_flather_weight(1.0);
 
             println!("BC name: {}", bc.name());
-            if let Some((t0, t1)) = bc.time_range() {
-                println!("Time range: {:.0} - {:.0} s", t0, t1);
+            if let (Some((t0, t1)), Some((s0, s1))) = (bc.time_range(), bc.simulation_time_range())
+            {
+                println!("Time range: {t0:.0} - {t1:.0} Unix s (simulation {s0:.0} - {s1:.0} s)");
             }
             println!("Spatial bounds: {:?}", bc.spatial_bounds());
 
@@ -77,7 +78,7 @@ fn main() {
             // At origin (0, 0) in local coords = center lat/lon
             let bathymetry = 50.0; // 50m depth
             let interior_state = SWEState2D::from_primitives(50.0, 0.0, 0.0); // Still water
-            let time = reader.time[0]; // First timestep
+            let time = 0.0; // Simulation time; t = 0 is the first snapshot by default
 
             let ctx = BCContext2D::new(
                 time,

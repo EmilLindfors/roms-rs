@@ -439,6 +439,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_reference_level(0.0)
             .with_flather(true)
     });
+    #[cfg(feature = "netcdf")]
+    if let Some(ref obc) = ocean_bc {
+        // Fail now rather than mid-run if the NorKyst file does not cover the run
+        obc.check_time_coverage(0.0, T_END)?;
+    }
 
     // Use ocean BC if available, otherwise fall back to tidal
     #[cfg(feature = "netcdf")]

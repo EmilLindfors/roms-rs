@@ -29,7 +29,7 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
 1. **Priority 0 (2026-09-25): confirmed small bugs.**
    - Each needs a regression test that fails before the fix.
    - P0.15–P0.18 (tidal periods, 3D vertical advection ÷Hz with Ω at w-points, EOS units, Chezy units) are fixed in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
-   - P0.12 (Flather), P0.13 (reconstruction mass leak), P0.14 (docs), P0.19 (limiter plumbing), P0.21 (time step) and P0.22 (3D tracer wall flux) are fixed. Next: P0.20 NorKyst time base.
+   - P0.12 (Flather), P0.13 (reconstruction mass leak), P0.14 (docs), P0.19 (limiter plumbing), P0.20 (NorKyst time base), P0.21 (time step) and P0.22 (3D tracer wall flux) are fixed. Priority 0 is done apart from the deferred P0.11 (GPU); next is P1.1.
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
 4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
@@ -87,10 +87,12 @@ All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Ea
 - [x] The high-level `Simulation` API limits once per step, not per RK stage (`runner.rs:286-287`, `builder.rs:115-125`). That voids the Zhang–Shu guarantee; move limiting into the stage hook.
   - Done: `step_with_stage_hook` is now a `TimeIntegrator` method (`step` = no-op hook) and `Simulation` passes `post_process` as the hook.
 
-### P0.20 NorKyst nesting time base and ingest (BLOCKER, nesting)
-- [ ] `read_time` returns raw values and `find_bracket` clamps out-of-range times (`netcdf_io.rs:1226-1236`), so the forcing freezes at the first snapshot. Parse CF `units` and add an epoch/offset to `OceanNestingBC2D`. Error on out-of-range times.
-- [ ] Remove `"h"` (bathymetry) from the SSH candidate names (`netcdf_io.rs:1068`).
-- [ ] `read_variable` tries i16 before f32 (`:1258`), so unpacked float fields are truncated to integers. Read by declared type.
+### P0.20 NorKyst nesting time base and ingest (BLOCKER, nesting) — FIXED
+- [x] `read_time` returns raw values and `find_bracket` clamps out-of-range times (`netcdf_io.rs:1226-1236`), so the forcing freezes at the first snapshot. Parse CF `units` and add an epoch/offset to `OceanNestingBC2D`. Error on out-of-range times.
+  - Done: `OceanModelReader::time` is Unix seconds from CF `units`/`calendar` (missing units, non-Gregorian calendars and non-increasing times are errors). Time interpolation no longer clamps. `OceanNestingBC2D::with_epoch` (default: first snapshot), `check_time_coverage`, and a panic in `ghost_state` outside the file.
+- [x] Remove `"h"` (bathymetry) from the SSH candidate names (`netcdf_io.rs:1068`).
+- [x] `read_variable` tries i16 before f32 (`:1258`), so unpacked float fields are truncated to integers. Read by declared type.
+  - Done: branches on `vartype()`, reads numerics as f64, CF unpacking with `_FillValue`/`missing_value` (netCDF default integer fills when absent).
 
 ### P0.21 Time step (CRITICAL for cost, 2D) — FIXED: [PR #11](https://github.com/EmilLindfors/roms-rs/pull/11)
 - [x] `compute_dt_swe_2d` (`swe_2d.rs:582-602`, parallel `:620-650`) pairs the global minimum element size with the global maximum wave speed. Use min over elements of hₖ/λₖ with a direction-aware (anisotropic) length.
@@ -140,7 +142,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 
 ### P1.4 Open boundaries and tidal forcing
 - [ ] Spatially varying tidal forcing: a TPXO/FES reader, or boundary harmonics from NorKyst. Uniform-phase forcing is wrong by ~30° of M2 phase along 200 km.
-- [ ] A `ModelClock { epoch_unix }` threaded through BCs, forcing, NetCDF output (writer time units, `netcdf_io.rs:241` vs `:397`) and validation (`tide_gauge.rs:234-239` compares by length only).
+- [ ] A `ModelClock { epoch_unix }` threaded through BCs (`OceanNestingBC2D::with_epoch` is the first per-BC epoch; fold it in), forcing, NetCDF output (writer time units, `netcdf_io.rs:241` vs `:397`) and validation (`tide_gauge.rs:234-239` compares by length only).
 - [ ] Nodal f/u at the run or record midpoint, not frozen at the epoch; guard against double application.
 - [ ] **One characteristic OBC.** Flather, Chapman, radiation, TST and nesting differ only in the external data that sets the incoming invariant `w− = u_n − 2√(gh)`; the outgoing `w+` always comes from the interior. Replace the per-type ghost logic with:
   - a single `CharacteristicOBC` that builds the boundary state from the invariants (`u_b = ½(w+_int + w−_ext)`, `√(g h_b) = ¼(w+_int − w−_ext)`, u_t from the upwind side) and evaluates the flux as `F(q_b)·n`, so the result does not depend on the Riemann solver (ghost = external state is exact only for Roe; Lax–Friedrichs matches only at u = 0). The 1D `RadiationBC` (`radiation.rs`) already builds this state;
@@ -210,6 +212,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Full-RHS and full-step throughput vs mesh size at realistic size (≥ 100k elements, bathymetry, limiter, open BCs), not cache-resident micro-cases.
 - [ ] DOFs/second; parallel scaling 1–16 cores; memory-bandwidth utilisation; allocation counting in CI.
 - [ ] Reconcile PERFORMANCE.md vs PROFILE.md: the same 65k run is recorded as 70.5 s and 217 s, and some cited RHS variants no longer exist.
+- [ ] The criterion benches do not compile (`benches/source_term_bench.rs`, `time_stepping_bench.rs`: `usize` where `ElementIndex` is expected, tuple access on `[f64; 2]` vertices). CI never builds them (clippy runs `--lib --tests`); fix them and add `--benches` to the CI check.
 
 ### P2.7 GPU and distributed memory (decision)
 - [ ] Either fix Burn (P0.11) or replace it with custom fused f64 kernels (CubeCL/cudarc) over CSR faces. Burn with fusion disabled (`Cargo.toml:38`) moves ~13× more bytes per node-stage than fused kernels.
@@ -328,6 +331,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
   - reachable panics (`timeseries_reader.rs:198`, `geotiff.rs:239-245`);
   - library `eprintln!` in `tide_gauge.rs`.
 - [ ] Feature-gate `tiff`/`shapefile`/`geo` behind `geodata`.
+- [ ] Build the `netcdf` feature in CI. It is excluded because it needs native HDF5/netCDF-C, so the NetCDF reader and nesting tests (P0.20) only run locally. `cargo check --features netcdf/static` builds HDF5 and netCDF-C from source with CMake and no conda (verified on Windows 2026-09-25: ~5.5 min cold, cached afterwards); use it for a CI job, and consider it as the documented local alternative to conda.
 - [ ] Characteristic-based limiting for the 2D SWE system (1D version exists but is dead code; was P2.4). Likely subsumed by P1.2.
 - [ ] Consolidate the root markdown files into `docs/`. Decide crate vs repo name; `dg-core`/`roms-rs` workspace split.
 

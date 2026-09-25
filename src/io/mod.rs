@@ -78,6 +78,8 @@ mod datetime;
 mod geotiff;
 #[cfg(feature = "netcdf")]
 mod netcdf_io;
+#[cfg(all(test, feature = "netcdf"))]
+pub(crate) use netcdf_io::test_files;
 #[cfg(feature = "parquet")]
 mod norkyst_parquet;
 mod norkyst_reader;

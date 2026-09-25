@@ -22,6 +22,16 @@
 //! it twice and reflect outgoing waves, so `with_flather` and
 //! `with_flather_weight` no longer change the ghost state.
 //!
+//! # Time base
+//!
+//! The reader decodes the parent's CF time to Unix seconds. Simulation time
+//! `t` (seconds) maps to the parent instant `epoch + t`; by default the epoch is
+//! the first parent snapshot, so `t = 0` starts the run there. Set it with
+//! [`OceanNestingBC2D::with_epoch`] to start elsewhere in the file. Asking for a
+//! time outside the file panics instead of freezing the forcing at the first or
+//! last snapshot; check a run up front with
+//! [`OceanNestingBC2D::check_time_coverage`].
+//!
 //! # Example
 //!
 //! ```ignore
@@ -37,7 +47,8 @@
 //! // Create nesting BC
 //! let bc = OceanNestingBC2D::new(reader, projection)
 //!     .with_reference_level(0.0)  // MSL reference
-//!     .with_flather(true);
+//!     .with_epoch(1_706_594_400.0); // 2024-01-30 06:00 UTC
+//! bc.check_time_coverage(0.0, 6.0 * 3600.0)?;
 //! ```
 
 use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
@@ -66,6 +77,8 @@ pub struct OceanNestingBC2D<P: CoordinateProjection> {
     h_min: f64,
     /// Fallback state when ocean model has no data at location
     fallback_state: Option<SWEState2D>,
+    /// Parent-model instant (Unix seconds) of simulation time t = 0
+    epoch_unix: f64,
 }
 
 impl<P: CoordinateProjection> OceanNestingBC2D<P> {
@@ -75,6 +88,7 @@ impl<P: CoordinateProjection> OceanNestingBC2D<P> {
     /// * `reader` - Ocean model data reader (shared via Arc for efficiency)
     /// * `projection` - Coordinate projection to convert mesh coords to lat/lon
     pub fn new(reader: Arc<OceanModelReader>, projection: P) -> Self {
+        let epoch_unix = reader.time.first().copied().unwrap_or(0.0);
         Self {
             reader,
             projection,
@@ -83,6 +97,47 @@ impl<P: CoordinateProjection> OceanNestingBC2D<P> {
             flather_weight: 1.0,
             h_min: 1e-6,
             fallback_state: None,
+            epoch_unix,
+        }
+    }
+
+    /// Set the parent-model instant (Unix seconds, UTC) of simulation time 0.
+    ///
+    /// Defaults to the first snapshot in the file.
+    pub fn with_epoch(mut self, epoch_unix: f64) -> Self {
+        self.epoch_unix = epoch_unix;
+        self
+    }
+
+    /// Parent-model instant (Unix seconds) of simulation time 0.
+    pub fn epoch(&self) -> f64 {
+        self.epoch_unix
+    }
+
+    /// Parent-model instant (Unix seconds) of simulation time `t`.
+    fn model_time(&self, t: f64) -> f64 {
+        self.epoch_unix + t
+    }
+
+    /// Check that simulation times `[t_start, t_end]` lie within the parent
+    /// file, so a run cannot hit the out-of-range panic in `ghost_state`.
+    pub fn check_time_coverage(&self, t_start: f64, t_end: f64) -> Result<(), String> {
+        for t in [t_start, t_end] {
+            if !self.reader.covers_time(self.model_time(t)) {
+                return Err(self.coverage_message(t));
+            }
+        }
+        Ok(())
+    }
+
+    fn coverage_message(&self, t: f64) -> String {
+        match self.simulation_time_range() {
+            Some((t0, t1)) => format!(
+                "OceanNestingBC2D: simulation time {t} s is outside the parent file, which \
+                 covers simulation times [{t0}, {t1}] s (epoch {} Unix s)",
+                self.epoch_unix
+            ),
+            None => "OceanNestingBC2D: the parent file has no time steps".to_string(),
         }
     }
 
@@ -128,13 +183,14 @@ impl<P: CoordinateProjection> OceanNestingBC2D<P> {
         self
     }
 
-    /// Get the ocean state at a position and time.
+    /// Get the ocean state at a position and simulation time.
     fn get_ocean_state(&self, x: f64, y: f64, time: f64) -> Option<OceanState> {
         // Convert mesh coordinates to geographic
         let (lat, lon) = self.projection.xy_to_geo(x, y);
 
         // Query ocean model with time interpolation
-        self.reader.get_state_interpolated(lon, lat, time)
+        self.reader
+            .get_state_interpolated(lon, lat, self.model_time(time))
     }
 
     /// Convert ocean state to SWE state.
@@ -157,16 +213,16 @@ impl<P: CoordinateProjection> OceanNestingBC2D<P> {
         SWEState2D::new(h, hu, hv)
     }
 
-    /// Get the time range covered by the ocean model.
+    /// Get the time range covered by the ocean model, in Unix seconds.
     pub fn time_range(&self) -> Option<(f64, f64)> {
-        if self.reader.time.is_empty() {
-            None
-        } else {
-            Some((
-                self.reader.time[0],
-                self.reader.time[self.reader.time.len() - 1],
-            ))
-        }
+        self.reader.time_range()
+    }
+
+    /// Get the time range covered by the ocean model, in simulation time
+    /// (seconds after the epoch).
+    pub fn simulation_time_range(&self) -> Option<(f64, f64)> {
+        let (t0, t1) = self.reader.time_range()?;
+        Some((t0 - self.epoch_unix, t1 - self.epoch_unix))
     }
 
     /// Get the spatial bounding box of the ocean model.
@@ -189,14 +245,18 @@ impl<P: CoordinateProjection + Send + Sync> SWEBoundaryCondition2D for OceanNest
         let (x, y) = ctx.position;
         let t = ctx.time;
 
+        // Out-of-range times are a configuration error. Falling back (or
+        // clamping to the nearest snapshot) would silently freeze the forcing.
+        if !self.reader.covers_time(self.model_time(t)) {
+            panic!("{}", self.coverage_message(t));
+        }
+
         // Try to get ocean state at this position and time
         let ocean_state = match self.get_ocean_state(x, y, t) {
             Some(state) => state,
             None => {
                 // No data - use fallback or mirror interior
-                return self
-                    .fallback_state
-                    .unwrap_or_else(|| ctx.interior_state.clone());
+                return self.fallback_state.unwrap_or(ctx.interior_state);
             }
         };
 
@@ -226,6 +286,7 @@ impl<P: CoordinateProjection + Clone> Clone for OceanNestingBC2D<P> {
             flather_weight: self.flather_weight,
             h_min: self.h_min,
             fallback_state: self.fallback_state,
+            epoch_unix: self.epoch_unix,
         }
     }
 }
@@ -298,5 +359,61 @@ mod tests {
         let (lat2, lon2) = proj.xy_to_geo(1000.0, 0.0);
         assert!(lon2 > lon);
         assert!((lat2 - lat).abs() < 0.01); // Latitude roughly same
+    }
+
+    mod parent_file {
+        use super::*;
+        use crate::io::test_files::{self, CENTRE, T0, Zeta};
+
+        /// Nesting BC on a parent with hourly SSH 0.1, 0.3, 0.7 m, centred on
+        /// the grid. The reader loads everything, so the temp dir can go.
+        fn bc() -> OceanNestingBC2D<LocalProjection> {
+            let dir = tempfile::tempdir().unwrap();
+            let path = test_files::write(
+                dir.path(),
+                Some("hours since 2024-01-30 06:00:00"),
+                &[0.1, 0.3, 0.7],
+                Zeta::Float,
+            );
+            let reader = Arc::new(OceanModelReader::from_file(path).unwrap());
+            OceanNestingBC2D::new(reader, LocalProjection::new(CENTRE.0, CENTRE.1))
+        }
+
+        fn ghost_ssh(bc: &OceanNestingBC2D<LocalProjection>, t: f64) -> f64 {
+            let ctx = make_context(0.0, 0.0, 50.0, 0.0, 0.0, -50.0, t);
+            bc.ghost_state(&ctx).h - 50.0
+        }
+
+        #[test]
+        fn simulation_time_starts_at_first_snapshot_by_default() {
+            let bc = bc();
+            assert_eq!(bc.epoch(), T0);
+            assert!((ghost_ssh(&bc, 0.0) - 0.1).abs() < 1e-6);
+            assert!((ghost_ssh(&bc, 1800.0) - 0.2).abs() < 1e-6);
+            assert!((ghost_ssh(&bc, 5400.0) - 0.5).abs() < 1e-6);
+            assert_eq!(bc.simulation_time_range(), Some((0.0, 7200.0)));
+        }
+
+        #[test]
+        fn epoch_shifts_the_parent_time() {
+            let bc = bc().with_epoch(T0 + 3600.0);
+            assert!((ghost_ssh(&bc, 0.0) - 0.3).abs() < 1e-6);
+            assert_eq!(bc.simulation_time_range(), Some((-3600.0, 3600.0)));
+        }
+
+        #[test]
+        fn coverage_check_reports_out_of_range_runs() {
+            let bc = bc();
+            assert!(bc.check_time_coverage(0.0, 7200.0).is_ok());
+            assert!(bc.check_time_coverage(0.0, 7201.0).is_err());
+            assert!(bc.check_time_coverage(-1.0, 3600.0).is_err());
+        }
+
+        #[test]
+        #[should_panic(expected = "outside the parent file")]
+        fn forcing_past_the_last_snapshot_panics() {
+            // P0.20: this used to return the last snapshot forever.
+            ghost_ssh(&bc(), 7200.0 + 60.0);
+        }
     }
 }
