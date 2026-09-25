@@ -276,15 +276,18 @@ where
             dt_min_used = dt_min_used.min(dt);
             dt_max_used = dt_max_used.max(dt);
 
-            // Advance solution using time integrator
-            self.integrator
-                .step(state, dt, t, |s, time| self.physics.compute_rhs(s, time));
+            // Advance the solution. Limiters and wet/dry treatment run after
+            // every RK stage, so no RHS evaluation sees an unlimited state.
+            self.integrator.step_with_stage_hook(
+                state,
+                dt,
+                t,
+                |s, time| self.physics.compute_rhs(s, time),
+                |s| self.physics.post_process(s),
+            );
 
             t += dt;
             n_steps += 1;
-
-            // Post-process (limiters, wet/dry, etc.)
-            self.physics.post_process(state);
 
             // Callback at configured interval
             let should_callback = if let Some(interval) = self.config.callback_interval {
@@ -397,6 +400,101 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(result.n_steps, 5);
+    }
+
+    /// dh/dt = −1 everywhere; `post_process` clamps h ≥ 0. Records the smallest
+    /// depth any RHS evaluation saw and how often `post_process` ran.
+    struct DrainingPhysics {
+        mesh: Mesh2D,
+        ops: DGOperators2D,
+        geom: GeometricFactors2D,
+        min_h_seen: std::sync::Mutex<f64>,
+        post_process_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::physics::PhysicsModuleInfo for DrainingPhysics {
+        fn name(&self) -> &'static str {
+            "draining"
+        }
+        fn description(&self) -> &str {
+            "test: uniform drain with a positivity clamp"
+        }
+        fn n_variables(&self) -> usize {
+            3
+        }
+        fn variable_names(&self) -> &[&'static str] {
+            &["h", "hu", "hv"]
+        }
+    }
+
+    impl PhysicsModule<SWESolution2D> for DrainingPhysics {
+        fn compute_rhs(&self, state: &SWESolution2D, _time: f64) -> SWESolution2D {
+            let seen = state.h_data().iter().cloned().fold(f64::INFINITY, f64::min);
+            let mut min_h = self.min_h_seen.lock().unwrap();
+            *min_h = min_h.min(seen);
+            let mut rhs = SWESolution2D::new(state.n_elements, state.n_nodes);
+            rhs.h_data_mut().fill(-1.0);
+            rhs
+        }
+        fn compute_dt(&self, _state: &SWESolution2D, _cfl: f64) -> f64 {
+            1.0
+        }
+        fn post_process(&self, state: &mut SWESolution2D) {
+            self.post_process_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            for h in state.h_data_mut() {
+                *h = h.max(0.0);
+            }
+        }
+        fn mesh(&self) -> &Mesh2D {
+            &self.mesh
+        }
+        fn operators(&self) -> &DGOperators2D {
+            &self.ops
+        }
+        fn geometry(&self) -> &GeometricFactors2D {
+            &self.geom
+        }
+        fn order(&self) -> usize {
+            self.ops.order
+        }
+    }
+
+    #[test]
+    fn test_simulation_limits_every_stage() {
+        // P0.19 regression: `Simulation` called `post_process` once per step, so
+        // the 2nd and 3rd SSP-RK3 stages evaluated the RHS on unlimited states
+        // (here h = 0.5 − 1 = −0.5), voiding the Zhang–Shu positivity guarantee.
+        let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
+        let ops = DGOperators2D::new(1);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let mut state = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        state.h_data_mut().fill(0.5);
+        let physics = DrainingPhysics {
+            mesh,
+            ops,
+            geom,
+            min_h_seen: std::sync::Mutex::new(f64::INFINITY),
+            post_process_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let sim = Simulation::new(physics, SSPRK3);
+        let result = sim.run(&mut state, 0.0, 2.0);
+
+        assert!(result.success);
+        assert_eq!(result.n_steps, 2);
+        let physics = sim.physics();
+        let calls = physics
+            .post_process_calls
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            calls,
+            3 * result.n_steps,
+            "post_process must run after every stage"
+        );
+        let min_h = *physics.min_h_seen.lock().unwrap();
+        assert!(min_h >= 0.0, "an RHS evaluation saw h = {min_h}");
+        assert!(state.h_data().iter().all(|&h| h >= 0.0));
     }
 
     #[test]

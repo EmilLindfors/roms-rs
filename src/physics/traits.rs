@@ -82,10 +82,12 @@ pub trait PhysicsModule<S: Integrable>: PhysicsModuleInfo {
     /// Maximum stable time step.
     fn compute_dt(&self, state: &S, cfl: f64) -> f64;
 
-    /// Post-process the solution after each time step.
+    /// Post-process a stage value of the time integrator.
     ///
     /// This is where limiters, positivity correction, and wet/dry treatment
-    /// should be applied. Called after the time integrator completes a step.
+    /// should be applied. `Simulation` calls it after **every** RK stage
+    /// (including the last), before the next RHS evaluation, as the
+    /// Zhang–Shu positivity argument for SSP methods requires.
     ///
     /// Default implementation does nothing.
     fn post_process(&self, _state: &mut S) {

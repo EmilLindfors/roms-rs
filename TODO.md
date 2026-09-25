@@ -29,7 +29,7 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
 1. **Priority 0 (2026-09-25): confirmed small bugs.**
    - Each needs a regression test that fails before the fix.
    - P0.15–P0.18 (tidal periods, 3D vertical advection ÷Hz with Ω at w-points, EOS units, Chezy units) are fixed in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
-   - P0.12 (Flather), P0.13 (reconstruction mass leak), P0.14 (docs) and P0.21 (time step) are fixed. Next: P0.19 limiter plumbing → P0.22 3D tracer wall flux → P0.20 NorKyst time base.
+   - P0.12 (Flather), P0.13 (reconstruction mass leak), P0.14 (docs), P0.19 (limiter plumbing) and P0.21 (time step) are fixed. Next: P0.22 3D tracer wall flux → P0.20 NorKyst time base.
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
 4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
@@ -81,9 +81,11 @@ All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Ea
 - [x] `ChezyFriction2D` (`friction.rs:200-239`) and the 1D Chezy compute −C_D|u|u/h with dimensionless C_D. The momentum source is −C_D|u|u (currently 50× too weak in 50 m of water).
 - [x] Test the magnitude, not just the sign.
 
-### P0.19 Limiter plumbing (MAJOR, 2D)
-- [ ] The parallel fused Kuzmin+positivity limiter (`limiters/swe_2d.rs:686-703`) lacks the serial dry-element branch (`:118-129`): dry cells keep momentum and negative means survive. Add the branch plus a serial-vs-parallel equivalence test with dry cells.
-- [ ] The high-level `Simulation` API limits once per step, not per RK stage (`runner.rs:286-287`, `builder.rs:115-125`). That voids the Zhang–Shu guarantee; move limiting into the stage hook.
+### P0.19 Limiter plumbing (MAJOR, 2D) — FIXED
+- [x] The parallel fused Kuzmin+positivity limiter (`limiters/swe_2d.rs:686-703`) lacks the serial dry-element branch (`:118-129`): dry cells keep momentum and negative means survive. Add the branch plus a serial-vs-parallel equivalence test with dry cells.
+  - Done: serial and parallel limiters now run the same per-element kernels (`positivity_limit_element`, `kuzmin_limit_element`), in place (no `to_vec`/copy-back), and agree bitwise. `StandardLimiter2D` uses the fused kernel and the parallel versions under `parallel`.
+- [x] The high-level `Simulation` API limits once per step, not per RK stage (`runner.rs:286-287`, `builder.rs:115-125`). That voids the Zhang–Shu guarantee; move limiting into the stage hook.
+  - Done: `step_with_stage_hook` is now a `TimeIntegrator` method (`step` = no-op hook) and `Simulation` passes `post_process` as the hook.
 
 ### P0.20 NorKyst nesting time base and ingest (BLOCKER, nesting)
 - [ ] `read_time` returns raw values and `find_bracket` clamps out-of-range times (`netcdf_io.rs:1226-1236`), so the forcing freezes at the first snapshot. Parse CF `units` and add an epoch/offset to `OceanNestingBC2D`. Error on out-of-range times.
@@ -121,6 +123,8 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Wet/dry and positivity per Wintermeyer et al. (2018). Zhang–Shu towards h ≥ 0 (not h_min). Velocity desingularization (Kurganov–Petrova).
 - [ ] Limit η (and velocities or characteristic variables), not h, with a troubled-cell indicator (TVB-M/KXRCF). Limit h only in partially dry cells (Vater et al. 2019).
   - Today, strict Kuzmin on h with cell-average B collapses sloping elements to P0 on every flood/ebb half-cycle.
+- [ ] Nothing enforces the positivity CFL: `positivity_cfl_swe_2d` exists but callers must apply it. Let `PhysicsModule` report a maximum CFL (limiter + flux dependent) and have `Simulation` clamp to it; warn when Roe is combined with a positivity limiter.
+- [ ] The dry-element branch of the positivity limiter clips a negative mean depth to 0, silently creating mass. Under the positivity CFL with HLL/Rusanov a negative mean cannot occur, so count/report these events (debug assertion or a diagnostic counter) instead of hiding them.
 - [ ] Point-implicit friction after each stage (`semi_implicit_update` exists but is unused). Explicit friction flips momentum sign at wet/dry fronts.
 - [ ] Replace dt-dependent wet/dry momentum damping (`wetting_drying.rs:469-473`) with implicit relaxation; h_dry ≈ 1e-3 m.
 - [ ] HLL as the default flux for wet/dry runs (Roe is not positivity-preserving).
@@ -182,6 +186,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 
 ### P2.1 Time step
 - [ ] Per-element directional dt (P0.21) run near the stability limit. Evaluate SSPRK(4,3) or low-storage RK (+1.3–1.5×).
+- [ ] The other dt helpers still pair the global minimum √detJ size with the global maximum speed: `compute_dt_advection_2d`, `compute_dt_tracer_2d`, `compute_dt_viscosity` (takes a global size), `Mesh`-trait `compute_dt`, `time/ssp_rk3.rs:110`, `compute_dt_swe` (1D). Port them to the per-node metric form of `compute_dt_swe_2d` (one shared helper over ∇r, ∇s).
 
 ### P2.2 Kernels
 - [ ] Sum-factorised contravariant volume term. Currently 4 dense (p+1)⁴ mat-vecs per element (`swe_2d.rs:835-874`): 2.6× fewer flops at P2, 3.5× at P3.
@@ -191,6 +196,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 
 ### P2.3 Fused in-place stepper
 - [ ] Limiter, positivity and wet/dry in one parallel in-place pass. Today the "parallel" paths `to_vec` every field, allocate per element, and copy back serially (`limiters/swe_2d.rs:626-725`, `wetting_drying.rs:526-541`): 1.5–2.5× of wall time.
+  - Limiters done (P0.19: in-place `par_chunks_exact_mut` over the SoA fields). Still open: `wetting_drying.rs` parallel path (same pattern applies), and the per-stage `Vec` of cell averages and vertex bounds (move to a workspace with P1.1).
 
 ### P2.4 Water-only work
 - [ ] Mesh water only, or keep an active-element set (41 % of Frøya's elements are land). Limit only troubled cells.
@@ -309,6 +315,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 
 ## Priority 6: Tech Debt and Structure (`REVIEW.md` §6.2)
 
+- [ ] Move `examples/froya_real_data.rs` (and the other examples) from the legacy `ssp_rk3_swe_2d` stepper and its `SWE2DTimeConfig` onto `Simulation` + `SWEPhysics2D`; this is the precondition for deleting the legacy integrators below. The two paths currently duplicate limiter and wet/dry dispatch.
 - [ ] Delete the legacy integrators (`ssp_rk3*.rs`, three `coupled_swe_tracer` variants, `burn_ssp_rk3.rs`; ~2.4k lines). Make `CoupledState2D` implement `Integrable`; one time loop (fold `Simulation3D::run_with_callback`).
 - [ ] Collapse the duplicate config enums (`SWEFluxType2D` vs `StandardFlux2D`; three limiter enums).
 - [ ] Prune ~200 root re-exports to a `prelude`; export `Simulation3D`.
