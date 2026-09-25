@@ -81,6 +81,7 @@ pub use rhs::{
     compute_rhs_swe,
     compute_rhs_swe_2d,
     compute_rhs_tracer_2d,
+    positivity_cfl_swe_2d,
 };
 
 // Re-export limiter types

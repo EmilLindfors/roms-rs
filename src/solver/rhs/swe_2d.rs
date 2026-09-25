@@ -668,9 +668,21 @@ pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
 
 /// Compute the stable time step for 2D SWE.
 ///
-/// Uses CFL condition: dt ≤ CFL * h_min / (λ_max * (2*p + 1))
+/// Each node pairs its own wave speeds with its element's metric:
 ///
-/// where λ_max = max(|u| + c) over all nodes.
+///   Δt = CFL/(2N+1) · min over elements k and nodes i of 4 / (λ_r + λ_s),
+///   λ_r = |u·∇r| + c|∇r|,  λ_s = |u·∇s| + c|∇s|,
+///
+/// the spectral radii of the flux Jacobian along the reference directions
+/// (reference length 2). On a square element of side Δx at rest this is
+/// CFL·Δx/((2N+1)c), the classic form, so CFL values keep their meaning. On an
+/// element of width w ≪ length L the limit follows w, not √(wL).
+///
+/// Summing the two directions is the 2D tensor-product bound (as in Trixi.jl's
+/// `max_dt`); with it the SSP-RK3 + Zhang–Shu positivity bound is a single
+/// CFL per order for every element shape, see [`positivity_cfl_swe_2d`].
+///
+/// Returns `f64::INFINITY` when every node is dry or at rest in zero depth.
 pub fn compute_dt_swe_2d(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -679,36 +691,13 @@ pub fn compute_dt_swe_2d(
     order: usize,
     cfl: f64,
 ) -> f64 {
-    // Find maximum wave speed over all nodes
-    let mut max_speed: f64 = 0.0;
-    let mut min_h_elem = f64::INFINITY;
-
-    for k in ElementIndex::iter(mesh.n_elements) {
-        // Estimate element size from Jacobian
-        let h_elem = geom.det_j[k.as_usize()].sqrt() * 2.0;
-        min_h_elem = min_h_elem.min(h_elem);
-
-        // Find max wave speed in this element
-        for i in 0..q.n_nodes {
-            let state = q.get_state(k, i);
-            let speed = equation.max_wave_speed(&state);
-            max_speed = max_speed.max(speed);
-        }
-    }
-
-    if max_speed < 1e-14 {
-        return f64::INFINITY;
-    }
-
-    // DG CFL factor
-    let dg_factor = 2.0 * order as f64 + 1.0;
-
-    cfl * min_h_elem / (max_speed * dg_factor)
+    let max_rate = ElementIndex::iter(mesh.n_elements)
+        .map(|k| element_max_reference_rate(q, geom, equation, k))
+        .fold(0.0_f64, f64::max);
+    dt_from_reference_rate(max_rate, order, cfl)
 }
 
-/// Parallel version of CFL time step computation.
-///
-/// Uses Rayon to compute max wave speed across all elements in parallel.
+/// Parallel version of [`compute_dt_swe_2d`] (identical result).
 #[cfg(feature = "parallel")]
 pub fn compute_dt_swe_2d_parallel(
     q: &SWESolution2D,
@@ -720,38 +709,60 @@ pub fn compute_dt_swe_2d_parallel(
 ) -> f64 {
     use rayon::prelude::*;
 
-    // Parallel reduction over elements
-    let (max_speed, min_h_elem) = (0..mesh.n_elements)
+    let max_rate = (0..mesh.n_elements)
         .into_par_iter()
-        .map(|k| {
-            let k_idx = ElementIndex::new(k);
+        .map(|k| element_max_reference_rate(q, geom, equation, ElementIndex::new(k)))
+        .reduce(|| 0.0_f64, f64::max);
+    dt_from_reference_rate(max_rate, order, cfl)
+}
 
-            // Estimate element size from Jacobian
-            let h_elem = geom.det_j[k].sqrt() * 2.0;
+/// Largest CFL for which [`compute_dt_swe_2d`] satisfies the DGSEM positivity
+/// bound of Zhang & Shu (2010) for SSP-RK3 with a positivity-preserving flux
+/// (HLL, Rusanov/Lax–Friedrichs; not Roe).
+///
+/// The cell mean stays non-negative under forward Euler when
+/// Δt·(λ_x/Δx + λ_y/Δy) ≤ ŵ₀ = 1/(N(N+1)), the first GLL weight on [0, 1].
+/// In this module's units that is CFL ≤ (2N+1)/(2N(N+1)): 0.75, 0.42, 0.29,
+/// 0.23 for N = 1–4, independent of element shape. SSP-RK3 (SSP coefficient 1)
+/// inherits it. Wet/dry runs should use `cfl.min(positivity_cfl_swe_2d(N))`.
+pub const fn positivity_cfl_swe_2d(order: usize) -> f64 {
+    assert!(order >= 1, "positivity bound needs N ≥ 1");
+    let n = order as f64;
+    (2.0 * n + 1.0) / (2.0 * n * (n + 1.0))
+}
 
-            // Find max wave speed in this element
-            let mut elem_max_speed = 0.0_f64;
-            for i in 0..q.n_nodes {
-                let state = q.get_state(k_idx, i);
-                let speed = equation.max_wave_speed(&state);
-                elem_max_speed = elem_max_speed.max(speed);
-            }
+/// max over the nodes of element `k` of (λ_r + λ_s)/4 (1/s).
+#[inline]
+fn element_max_reference_rate(
+    q: &SWESolution2D,
+    geom: &GeometricFactors2D,
+    equation: &ShallowWater2D,
+    k: ElementIndex,
+) -> f64 {
+    let ki = k.as_usize();
+    let grad_r = (geom.rx[ki], geom.ry[ki]);
+    let grad_s = (geom.sx[ki], geom.sy[ki]);
+    let norm_r = grad_r.0.hypot(grad_r.1);
+    let norm_s = grad_s.0.hypot(grad_s.1);
+    let dir_r = (grad_r.0 / norm_r, grad_r.1 / norm_r);
+    let dir_s = (grad_s.0 / norm_s, grad_s.1 / norm_s);
 
-            (elem_max_speed, h_elem)
+    (0..q.n_nodes)
+        .map(|i| {
+            let state = q.get_state(k, i);
+            let lambda_r = norm_r * equation.max_wave_speed_normal(&state, dir_r);
+            let lambda_s = norm_s * equation.max_wave_speed_normal(&state, dir_s);
+            0.25 * (lambda_r + lambda_s)
         })
-        .reduce(
-            || (0.0_f64, f64::INFINITY),
-            |(s1, h1), (s2, h2)| (s1.max(s2), h1.min(h2)),
-        );
+        .fold(0.0_f64, f64::max)
+}
 
-    if max_speed < 1e-14 {
+#[inline]
+fn dt_from_reference_rate(max_rate: f64, order: usize, cfl: f64) -> f64 {
+    if max_rate < 1e-14 {
         return f64::INFINITY;
     }
-
-    // DG CFL factor
-    let dg_factor = 2.0 * order as f64 + 1.0;
-
-    cfl * min_h_elem / (max_speed * dg_factor)
+    cfl / ((2.0 * order as f64 + 1.0) * max_rate)
 }
 
 /// Compute the diffusive time step restriction for horizontal viscosity.
@@ -1410,6 +1421,151 @@ mod tests {
         assert!(dt < 0.1); // Should be small for this test case
     }
 
+    /// Depth `depth(k)` in element k, velocity (u, 0) everywhere.
+    fn element_wise_state(
+        mesh: &Mesh2D,
+        n_nodes: usize,
+        depth: impl Fn(usize) -> f64,
+        u: f64,
+    ) -> SWESolution2D {
+        let mut q = SWESolution2D::new(mesh.n_elements, n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..n_nodes {
+                q.set_state(
+                    k,
+                    i,
+                    SWEState2D::from_primitives(depth(k.as_usize()), u, 0.0),
+                );
+            }
+        }
+        q
+    }
+
+    #[test]
+    fn test_dt_square_elements_match_classic_formula() {
+        // At rest on squares the per-direction bound reduces to CFL·Δx/((2N+1)c),
+        // so CFL numbers keep the meaning they had before P0.21.
+        let order = 2;
+        let (cfl, dx, depth) = (0.4, 250.0, 100.0);
+        let mesh = Mesh2D::uniform_rectangle(0.0, 4.0 * dx, 0.0, 3.0 * dx, 4, 3);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let n_nodes = (order + 1) * (order + 1);
+        let equation = ShallowWater2D::new(G);
+        let c = (G * depth).sqrt();
+        let dg = 2.0 * order as f64 + 1.0;
+
+        let q = element_wise_state(&mesh, n_nodes, |_| depth, 0.0);
+        let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
+        let expected = cfl * dx / (dg * c);
+        assert!(
+            (dt / expected - 1.0).abs() < 1e-12,
+            "dt = {dt}, expected {expected}"
+        );
+
+        // Flow along x: λ_r = 2(|u| + c)/Δx, λ_s = 2c/Δx.
+        let u = 3.0;
+        let q = element_wise_state(&mesh, n_nodes, |_| depth, u);
+        let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
+        let expected = 2.0 * cfl * dx / (dg * (u + 2.0 * c));
+        assert!(
+            (dt / expected - 1.0).abs() < 1e-12,
+            "dt = {dt}, expected {expected}"
+        );
+    }
+
+    /// Two elements side by side, 50 m × 1000 m and 1000 m × 1000 m.
+    fn graded_anisotropic_mesh() -> Mesh2D {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 1);
+        for v in mesh.vertices.iter_mut() {
+            v[0] = if v[0] < 0.75 {
+                100.0 * v[0]
+            } else {
+                50.0 + 1000.0 * (v[0] - 0.5) * 2.0
+            };
+            v[1] *= 1000.0;
+        }
+        mesh
+    }
+
+    #[test]
+    fn test_dt_pairs_local_wave_speed_with_local_anisotropic_size() {
+        // P0.21 regression. The old bound used min_k 2√detJ_k with max over all
+        // nodes of |u| + c: here √(50·1000) = 224 m paired with the deep-water
+        // celerity, ≈ 3.8× too small, while for the thin element alone √detJ
+        // overestimates the 50 m width.
+        let order = 3;
+        let cfl = 0.25;
+        let mesh = graded_anisotropic_mesh();
+        let geom = GeometricFactors2D::compute(&mesh);
+        let equation = ShallowWater2D::new(G);
+        let n_nodes = (order + 1) * (order + 1);
+        let depths = [5.0, 400.0];
+        let q = element_wise_state(&mesh, n_nodes, |k| depths[k], 0.0);
+
+        let dg = 2.0 * order as f64 + 1.0;
+        let sizes = [(50.0, 1000.0), (1000.0, 1000.0)];
+        let expected = depths
+            .iter()
+            .zip(sizes)
+            .map(|(&h, (dx, dy))| 2.0 * cfl / (dg * (G * h).sqrt() * (1.0 / dx + 1.0 / dy)))
+            .fold(f64::INFINITY, f64::min);
+
+        let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
+        assert!(
+            (dt / expected - 1.0).abs() < 1e-12,
+            "dt = {dt}, expected {expected}"
+        );
+
+        let old = cfl * (4.0 * geom.det_j[0]).sqrt() / (dg * (G * 400.0).sqrt());
+        assert!(
+            dt > 3.0 * old,
+            "dt = {dt} should exceed the old global pairing {old}"
+        );
+
+        // The thin element alone: limited by its 50 m width, below the √detJ size.
+        let q = element_wise_state(&mesh, n_nodes, |_| 5.0, 0.0);
+        let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
+        let sqrt_det_j = cfl * (4.0 * geom.det_j[0]).sqrt() / (dg * (G * 5.0).sqrt());
+        assert!(
+            dt < 0.5 * sqrt_det_j,
+            "dt = {dt} vs √detJ-based {sqrt_det_j}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_dt_parallel_matches_serial() {
+        let order = 2;
+        let mesh = graded_anisotropic_mesh();
+        let geom = GeometricFactors2D::compute(&mesh);
+        let equation = ShallowWater2D::new(G);
+        let q = element_wise_state(&mesh, (order + 1) * (order + 1), |k| [3.0, 250.0][k], 1.5);
+        let serial = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, 0.3);
+        let parallel = compute_dt_swe_2d_parallel(&q, &mesh, &geom, &equation, order, 0.3);
+        assert_eq!(serial, parallel);
+    }
+
+    #[test]
+    fn test_positivity_cfl_values() {
+        // (2N+1)/(2N(N+1)): REVIEW.md §1.7 quotes 0.75 / 0.42 / 0.29 / 0.23.
+        let expected = [0.75, 5.0 / 12.0, 7.0 / 24.0, 9.0 / 40.0];
+        for (n, &e) in (1..=4).zip(&expected) {
+            assert!((positivity_cfl_swe_2d(n) - e).abs() < 1e-15);
+        }
+    }
+
+    #[test]
+    fn test_dt_dry_domain_is_unbounded() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let equation = ShallowWater2D::new(G);
+        let q = SWESolution2D::new(mesh.n_elements, 9);
+        assert_eq!(
+            compute_dt_swe_2d(&q, &mesh, &geom, &equation, 2, 0.5),
+            f64::INFINITY
+        );
+    }
+
     #[test]
     fn test_coriolis_source() {
         // Test that Coriolis source term is included correctly
@@ -1967,6 +2123,53 @@ mod tests {
                      max RHS = {max_rhs_par:.3e}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_lake_at_rest_linearized_bathymetry() {
+        // P0.14: `Bathymetry2D::linearize` used to claim planar B is well-balanced.
+        // With the collocated scheme that holds only for p ≥ 2 (½gh² resolved);
+        // at p = 1 the interpolation of ½gh² leaves g(h̄ − hᵢ)∂B. The split form
+        // is balanced at every order.
+        use crate::source::BathymetrySource2D;
+
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let bathy_source = BathymetrySource2D::new(G);
+
+        for order in 1..=3 {
+            let (mesh, ops, geom, mut bathymetry) = sloped_periodic_setup(order, false);
+            bathymetry.linearize(&mesh, &ops, &geom);
+            let q = sloped_state(&mesh, &ops, &bathymetry, 0.0);
+
+            let standard = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_bathymetry(&bathymetry)
+                .with_source_terms(&bathy_source)
+                .with_well_balanced(true);
+            let residual = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &standard, 0.0).max_abs();
+            if order == 1 {
+                assert!(
+                    residual > 1e-3,
+                    "p=1: expected an aliasing residual for planar B, got {residual:.3e}"
+                );
+            } else {
+                assert!(
+                    residual < 1e-10,
+                    "p={order}: lake at rest over planar B, max RHS = {residual:.3e}"
+                );
+            }
+
+            let split = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_formulation(SWEFormulation2D::EntropyStable)
+                .with_bathymetry(&bathymetry);
+            let residual = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &split, 0.0).max_abs();
+            assert!(
+                residual < 1e-9,
+                "p={order}: split form over planar B, max RHS = {residual:.3e}"
+            );
         }
     }
 

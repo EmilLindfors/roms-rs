@@ -332,14 +332,26 @@ impl Bathymetry2D {
 
     /// Project bathymetry to linear (planar) within each element.
     ///
-    /// This is CRITICAL for well-balanced schemes. The DG pressure gradient
-    /// and bathymetry source term only cancel exactly when bathymetry is
-    /// linear within elements. Non-linear variations cause spurious velocities.
-    ///
-    /// For each element, computes the best-fit linear function:
+    /// For each element, sets the nodal values to the planar function
     ///   B_linear(x, y) = B_mean + (∂B/∂x)_mean * (x - x_c) + (∂B/∂y)_mean * (y - y_c)
     ///
-    /// where (x_c, y_c) is the element centroid.
+    /// where (x_c, y_c) is the mean of the nodal coordinates. The fit is done
+    /// element by element, so the result generally jumps across faces.
+    ///
+    /// # Well-balancing
+    ///
+    /// Planar B is **not** well-balanced at every order with
+    /// `SWEFormulation2D::Standard`. The collocated volume term differentiates
+    /// the interpolant of ½gh², which balances the `BathymetrySource2D` term
+    /// g·h·∂B only if ½gh² is resolved by the element polynomials (deg B ≤ p/2):
+    /// - p = 1: ½gh² is quadratic but interpolated linearly, leaving a nodal
+    ///   residual g(h̄ − hᵢ)∂B (≈ 0.07 m/s² on steep coastal slopes). Not balanced.
+    /// - p ≥ 2: balanced to round-off, provided `BathymetrySource2D` is in
+    ///   `source_terms` and `with_well_balanced(true)` handles the face jumps.
+    ///
+    /// `SWEFormulation2D::EntropyStable` is well-balanced for any nodal B at every
+    /// order, so this projection (and its loss of sub-element detail) is not
+    /// needed there.
     ///
     /// # Arguments
     /// * `mesh` - The 2D mesh for element geometry
