@@ -29,7 +29,7 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
 1. **Priority 0 (2026-09-25): confirmed small bugs.**
    - Each needs a regression test that fails before the fix.
    - P0.15–P0.18 (tidal periods, 3D vertical advection ÷Hz with Ω at w-points, EOS units, Chezy units) are fixed in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
-   - P0.12 (Flather) and P0.13 (reconstruction mass leak) are fixed. Then: the rest of P0.14 (`linearize` doc) → P0.21 time step → the rest.
+   - P0.12 (Flather), P0.13 (reconstruction mass leak), P0.14 (docs) and P0.21 (time step) are fixed. Next: P0.19 limiter plumbing → P0.22 3D tracer wall flux → P0.20 NorKyst time base.
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
 4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
@@ -57,9 +57,10 @@ All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Ea
   - A periodic mass-rate test with cell-averaged B and u ∝ cos·cos (a uniform u hides the bug by symmetry).
   - Lake-at-rest with cell-averaged B, serial and parallel.
 
-### P0.14 Documentation directs users to the unbalanced configuration (MAJOR, 2D)
+### P0.14 Documentation directs users to the unbalanced configuration (MAJOR, 2D) — FIXED
 - [x] The `SWE2DRhsConfig::well_balanced` / `with_well_balanced` docs (`swe_2d.rs:50-53,142-153`) say to omit `BathymetrySource2D`. Doing so gives ≈ 0.6 m/s² lake-at-rest residuals with nodal B. The advice holds only for cell-constant B.
-- [ ] The `Bathymetry2D::linearize()` doc says "linear B is well-balanced", which is false at p = 1 (0.07 m/s² measured).
+- [x] The `Bathymetry2D::linearize()` doc says "linear B is well-balanced", which is false at p = 1 (0.07 m/s² measured).
+  - Doc corrected (p ≥ 2 only, face jumps need `with_well_balanced`, split form balanced for any B); `test_lake_at_rest_linearized_bathymetry`.
 
 ### P0.15 Truncated tidal constituent periods (MAJOR, tides/analysis) — FIXED: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
 - [x] **The bug.** `TidalConstituent::{m2,k1,o1,n2,p1}` (`boundary/tidal.rs:76-113`) use 12.42 / 23.93 / 25.82 / 12.66 / 24.07 h. They feed `HarmonicAnalysis::standard()`/`norwegian_coast()` and the harmonic BCs.
@@ -89,9 +90,11 @@ All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Ea
 - [ ] Remove `"h"` (bathymetry) from the SSH candidate names (`netcdf_io.rs:1068`).
 - [ ] `read_variable` tries i16 before f32 (`:1258`), so unpacked float fields are truncated to integers. Read by declared type.
 
-### P0.21 Time step (CRITICAL for cost, 2D)
-- [ ] `compute_dt_swe_2d` (`swe_2d.rs:582-602`, parallel `:620-650`) pairs the global minimum element size with the global maximum wave speed. Use min over elements of hₖ/λₖ with a direction-aware (anisotropic) length.
-- [ ] `froya_real_data.rs:163` uses CFL = 0.1 where ~0.5 is stable (5× cost). Also respect the DGSEM positivity bound for wet/dry runs (CFL ≤ 0.75/0.42/0.29/0.23 for N = 1–4 in current units).
+### P0.21 Time step (CRITICAL for cost, 2D) — FIXED
+- [x] `compute_dt_swe_2d` (`swe_2d.rs:582-602`, parallel `:620-650`) pairs the global minimum element size with the global maximum wave speed. Use min over elements of hₖ/λₖ with a direction-aware (anisotropic) length.
+  - Done: per node, Δt = CFL/(2N+1)·4/(λ_r + λ_s) with λ_r = |u·∇r| + c|∇r|; unchanged on squares at rest. Serial and parallel share one kernel.
+- [x] `froya_real_data.rs:163` uses CFL = 0.1 where ~0.5 is stable (5× cost). Also respect the DGSEM positivity bound for wet/dry runs (CFL ≤ 0.75/0.42/0.29/0.23 for N = 1–4 in current units).
+  - Done: `positivity_cfl_swe_2d(N)`; with the directional dt the bound holds for any element shape. Froya now runs at it (5/12 at P2). Not yet enforced automatically by the steppers.
 
 ### P0.22 3D tracer flux leaks through coastal walls (MAJOR, 3D; P0.7 follow-up)
 - [ ] The tracer kernel sets `u_ext = u_int` at physical boundaries (`advection_3d.rs:489-491`), so heat and salt cross the coastline while the mass flux is zero. Use `boundary::reflect_velocity` as for Ω and momentum.

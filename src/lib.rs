@@ -135,6 +135,7 @@ pub use solver::{
     compute_rhs_swe_2d,
     compute_rhs_tracer_2d,
     current_cfl_2d,
+    positivity_cfl_swe_2d,
     swe_kuzmin_limiter_2d,
     swe_positivity_limiter_2d,
     total_energy_2d,
