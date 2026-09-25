@@ -19,16 +19,18 @@
 
 use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
-use crate::solver::{KuzminParameter2D, SWESolution2D, WetDryConfig};
+use crate::solver::{ImplicitDamping2D, KuzminParameter2D, SWESolution2D, WetDryConfig};
 #[cfg(not(feature = "parallel"))]
 use crate::solver::{
-    apply_swe_limiters_kuzmin_2d, apply_wet_dry_correction_all, swe_positivity_limiter_2d,
+    apply_implicit_damping_2d as implicit_damping, apply_swe_limiters_kuzmin_2d,
+    apply_wet_dry_correction_all, swe_positivity_limiter_2d,
 };
 #[cfg(feature = "parallel")]
 use crate::solver::{
-    apply_swe_limiters_kuzmin_2d_parallel, apply_wet_dry_correction_all_parallel,
-    swe_positivity_limiter_2d_parallel,
+    apply_implicit_damping_2d_parallel as implicit_damping, apply_swe_limiters_kuzmin_2d_parallel,
+    apply_wet_dry_correction_all_parallel, swe_positivity_limiter_2d_parallel,
 };
+use crate::time::{SSPRK3, StageWorkspace, TimeIntegrator};
 use crate::types::Depth;
 
 /// Type of limiter to use for 2D SWE.
@@ -55,7 +57,9 @@ pub struct SWE2DTimeConfig {
     pub cfl: f64,
     /// Gravitational acceleration
     pub g: f64,
-    /// Minimum water depth
+    /// Dry threshold (m): the positivity limiter enforces h ≥ 0 and zeroes the
+    /// momentum of elements with a smaller mean depth; the wet/dry treatment
+    /// desingularizes velocities below it
     pub h_min: f64,
     /// Type of limiter to apply
     pub limiter_type: SWELimiterType,
@@ -105,12 +109,14 @@ impl SWE2DTimeConfig {
         self
     }
 
-    /// Enable improved wetting/drying treatment.
+    /// Enable the wetting/drying treatment with `h_dry = h_min` (see
+    /// [`WetDryConfig`]).
     ///
     /// This applies:
-    /// - Thin-layer blending (gradual flux reduction as h → h_min)
+    /// - Positivity (h ≥ 0) and Kurganov–Petrova velocity desingularization
+    ///   after every stage
     /// - Velocity capping (default 20 m/s)
-    /// - Smooth momentum damping in shallow areas
+    /// - Point-implicit thin-layer relaxation of the momentum in every stage
     pub fn with_wet_dry_treatment(mut self) -> Self {
         self.wet_dry = Some(WetDryConfig::new(Depth::new(self.h_min), self.g));
         self
@@ -155,7 +161,7 @@ fn apply_configured_limiter(
         }
     }
 
-    // Apply wet/dry treatment (velocity capping, thin-layer damping)
+    // Apply wet/dry treatment (positivity, desingularization, velocity cap)
     if let Some(ref wet_dry) = config.wet_dry {
         #[cfg(feature = "parallel")]
         apply_wet_dry_correction_all_parallel(swe, ops, wet_dry);
@@ -172,7 +178,10 @@ fn apply_configured_limiter(
 /// - Stage 2: t + dt
 /// - Stage 3: t + dt/2
 ///
-/// Limiters are applied after each stage to maintain stability.
+/// Limiters are applied after each stage to maintain stability; the wet/dry
+/// thin-layer relaxation is implicit in each stage
+/// (`SSPRK3::step_with_relaxation`). Allocates stage storage every call; the
+/// `Simulation` path does not.
 ///
 /// # Arguments
 /// * `state` - SWE solution to update (modified in place)
@@ -193,38 +202,20 @@ pub fn ssp_rk3_swe_2d_step_limited<F>(
 ) where
     F: Fn(&SWESolution2D, f64) -> SWESolution2D,
 {
-    let n_elements = state.n_elements;
-    let n_nodes = state.n_nodes;
-
-    // Stage 1: q1 = q + dt * L(q, t)
-    let rhs = rhs_fn(state, t);
-    let mut state1 = state.clone();
-    state1.axpy(dt, &rhs);
-
-    // Apply limiters after stage 1
-    apply_configured_limiter(&mut state1, mesh, ops, config);
-
-    // Stage 2: q2 = 3/4 * q + 1/4 * q1 + 1/4 * dt * L(q1, t + dt)
-    let t1 = t + dt;
-    let rhs1 = rhs_fn(&state1, t1);
-    let mut state2 = SWESolution2D::new(n_elements, n_nodes);
-    state2.copy_from(state);
-    state2.scale(0.75);
-    state2.axpy(0.25, &state1);
-    state2.axpy(0.25 * dt, &rhs1);
-
-    // Apply limiters after stage 2
-    apply_configured_limiter(&mut state2, mesh, ops, config);
-
-    // Stage 3: q_new = 1/3 * q + 2/3 * q2 + 2/3 * dt * L(q2, t + dt/2)
-    let t2 = t + 0.5 * dt;
-    let rhs2 = rhs_fn(&state2, t2);
-    state.scale(1.0 / 3.0);
-    state.axpy(2.0 / 3.0, &state2);
-    state.axpy(2.0 / 3.0 * dt, &rhs2);
-
-    // Apply limiters after final stage
-    apply_configured_limiter(state, mesh, ops, config);
+    let damping = ImplicitDamping2D {
+        friction: None,
+        wet_dry: config.wet_dry.as_ref(),
+        h_min: Depth::new(config.h_min),
+    };
+    SSPRK3.step_with_relaxation(
+        state,
+        dt,
+        t,
+        |q, time, out: &mut SWESolution2D| *out = rhs_fn(q, time),
+        |stage, from, dt| implicit_damping(stage, from, dt, &damping),
+        |q| apply_configured_limiter(q, mesh, ops, config),
+        &mut StageWorkspace::new(),
+    );
 }
 
 /// Run a complete 2D SWE simulation with limiters.

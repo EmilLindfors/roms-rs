@@ -17,8 +17,8 @@ use dg_rs::mesh::{Bathymetry2D, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::PhysicsBuilder;
 use dg_rs::simulation::Simulation;
-use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::BathymetrySource2D;
+use dg_rs::solver::{SWESolution2D, SWEState2D, WetDryConfig};
+use dg_rs::source::{BathymetrySource2D, ManningFriction2D};
 use dg_rs::time::SSPRK3;
 use dg_rs::types::ElementIndex;
 
@@ -77,6 +77,10 @@ fn simulation_steps_do_not_allocate_state_sized_buffers() {
     .with_bathymetry(bathymetry)
     .with_well_balanced(true)
     .with_source(BathymetrySource2D::new(G))
+    // Wet/dry correction and implicit friction run every stage (P1.2); the
+    // positivity limiter is left out: it still allocates cell averages (P2.3)
+    .with_wet_dry(WetDryConfig::default())
+    .with_implicit_friction(ManningFriction2D::new(G, 0.025))
     .build();
 
     // Fixed dt (well below the CFL limit) so both runs take a known step count

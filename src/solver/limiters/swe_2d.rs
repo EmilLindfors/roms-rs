@@ -7,8 +7,17 @@
 //! - Strong tidal forcing
 //!
 //! This module provides:
-//! - Positivity-preserving limiter (Zhang-Shu) for water depth h > 0
+//! - Positivity-preserving limiter (Zhang-Shu) for water depth h ≥ 0
 //! - Kuzmin vertex-based limiter for unstructured meshes
+//!
+//! Positivity is enforced towards h ≥ 0, not towards a minimum depth: raising
+//! nodes to h_min > 0 lowers the wet nodes of a partially dry element (mass is
+//! kept) and so breaks lake at rest at every shoreline (REVIEW.md §1.5).
+//! With a positivity-preserving interface flux (HLL, Rusanov; not Roe) and
+//! `CFL ≤ positivity_cfl_swe_2d(N)`, the cell means stay non-negative, so the
+//! limiter never has to create mass. The limiters return the number of
+//! elements whose mean depth was nevertheless negative (emptied, which creates
+//! mass): a diagnostic that should stay zero.
 //!
 //! # References
 //! - Zhang & Shu (2010), "Maximum-principle-satisfying and positivity-preserving
@@ -39,60 +48,28 @@ pub use crate::solver::limiters::tracer_2d::KuzminParameter2D;
 /// # Returns
 /// Vector of (avg_h, avg_hu, avg_hv) for each element.
 pub fn swe_cell_averages_2d(swe: &SWESolution2D, ops: &DGOperators2D) -> Vec<(f64, f64, f64)> {
-    let n_elements = swe.n_elements;
-    let n_nodes = swe.n_nodes;
-    let mut averages = Vec::with_capacity(n_elements);
-
-    // Precompute inverse total weight for faster division
     let inv_total_weight: f64 = 1.0 / ops.weights.iter().sum::<f64>();
-
-    for k in ElementIndex::iter(n_elements) {
-        let mut integral_h = 0.0;
-        let mut integral_hu = 0.0;
-        let mut integral_hv = 0.0;
-
-        // SoA data access - get slices for each variable
-        let elem_h = swe.element_h(k);
-        let elem_hu = swe.element_hu(k);
-        let elem_hv = swe.element_hv(k);
-
-        for i in 0..n_nodes {
-            let w = ops.weights[i];
-            integral_h += w * elem_h[i];
-            integral_hu += w * elem_hu[i];
-            integral_hv += w * elem_hv[i];
-        }
-
-        // Compute averages using precomputed inverse
-        averages.push((
-            integral_h * inv_total_weight,
-            integral_hu * inv_total_weight,
-            integral_hv * inv_total_weight,
-        ));
-    }
-
-    averages
+    ElementIndex::iter(swe.n_elements)
+        .map(|k| {
+            element_mean(
+                swe.element_h(k),
+                swe.element_hu(k),
+                swe.element_hv(k),
+                &ops.weights,
+                inv_total_weight,
+            )
+        })
+        .collect()
 }
 
-/// Compute the Zhang-Shu theta parameter for depth positivity.
-///
-/// Given a cell average and minimum value, computes the maximum θ ∈ [0,1]
-/// such that `θ(h - avg) + avg >= h_min`.
-fn compute_theta_positivity(avg: f64, min_elem: f64, h_min: f64) -> f64 {
-    if min_elem >= h_min {
+/// The Zhang-Shu theta parameter for depth positivity: the largest θ ∈ [0, 1]
+/// with `θ(min_elem − avg) + avg ≥ 0`, for `avg ≥ 0`.
+fn compute_theta_positivity(avg: f64, min_elem: f64) -> f64 {
+    if min_elem >= 0.0 {
         return 1.0; // No limiting needed
     }
-
-    if (avg - min_elem).abs() < 1e-14 {
-        return 1.0; // Constant, no oscillation
-    }
-
-    // Need: θ(min - avg) + avg >= h_min
-    // => θ(min - avg) >= h_min - avg
-    // Since min < avg (otherwise min >= h_min), we have (min - avg) < 0
-    // => θ <= (avg - h_min) / (avg - min)
-    let theta = (avg - h_min) / (avg - min_elem);
-    theta.clamp(0.0, 1.0)
+    // min_elem < 0 ≤ avg, so avg − min_elem > 0
+    (avg / (avg - min_elem)).clamp(0.0, 1.0)
 }
 
 /// Per-vertex (min, max) bounds for (h, hu, hv).
@@ -114,36 +91,71 @@ fn scale_deviation(
     }
 }
 
+/// Mean of (h, hu, hv) over one element with GLL weights `weights` (affine
+/// elements, see [`swe_cell_averages_2d`]).
+#[inline]
+pub(crate) fn element_mean(
+    h: &[f64],
+    hu: &[f64],
+    hv: &[f64],
+    weights: &[f64],
+    inv_total_weight: f64,
+) -> (f64, f64, f64) {
+    let (mut sh, mut shu, mut shv) = (0.0, 0.0, 0.0);
+    for (i, &w) in weights.iter().enumerate() {
+        sh += w * h[i];
+        shu += w * hu[i];
+        shv += w * hv[i];
+    }
+    (
+        sh * inv_total_weight,
+        shu * inv_total_weight,
+        shv * inv_total_weight,
+    )
+}
+
 /// Zhang-Shu positivity limiting of one element (SoA slices) with mean `avg`.
 ///
-/// A dry element (mean depth below `h_min`) is set to its mean depth, clipped
-/// at zero, with zero momentum: enforcing h >= h_min at every node would add
-/// water. Otherwise all variables are scaled towards their means until
-/// h >= h_min at every node.
+/// All variables are scaled towards their means until h ≥ 0 at every node.
+/// This keeps the element's mass, and it leaves a lake-at-rest shoreline
+/// (h = max(0, η − B) ≥ 0) untouched. An element whose mean depth is below
+/// `h_dry` is dry: its momentum is set to zero, its depths are kept.
+///
+/// Returns `true` if the mean depth was negative. The element is then emptied
+/// (h = 0), which creates mass; with a positivity-preserving flux under the
+/// positivity CFL this cannot happen.
 #[inline]
-fn positivity_limit_element(
+pub(crate) fn positivity_limit_element(
     h: &mut [f64],
     hu: &mut [f64],
     hv: &mut [f64],
     avg: (f64, f64, f64),
-    h_min: f64,
-) {
+    h_dry: f64,
+) -> bool {
     let h_avg = avg.0;
-    if h_avg < h_min {
-        h.fill(h_avg.max(0.0));
+    if h_avg <= 0.0 {
+        h.fill(0.0);
         hu.fill(0.0);
         hv.fill(0.0);
-        return;
+        return h_avg < 0.0;
     }
 
     let h_min_elem = h.iter().copied().fold(f64::INFINITY, f64::min);
-    if h_min_elem >= h_min {
-        return;
+    if h_min_elem < 0.0 {
+        // Limiting all variables with the same theta preserves well-balancing
+        let theta = compute_theta_positivity(h_avg, h_min_elem);
+        scale_deviation(h, hu, hv, avg, theta);
+        // θ(min − avg) + avg may round to −ulp
+        for h in h.iter_mut() {
+            *h = h.max(0.0);
+        }
     }
 
-    // Limiting all variables with the same theta preserves well-balancing
-    let theta = compute_theta_positivity(h_avg, h_min_elem, h_min);
-    scale_deviation(h, hu, hv, avg, theta);
+    if h_avg < h_dry {
+        hu.fill(0.0);
+        hv.fill(0.0);
+    }
+    false
 }
 
 /// Kuzmin vertex-based limiting of one element (SoA slices) with mean `avg`.
@@ -178,41 +190,48 @@ fn kuzmin_limit_element(
     }
 }
 
-/// Run `f(k, h, hu, hv)` on the nodal slices of every element.
+/// Run `f(k, h, hu, hv)` on the nodal slices of every element and sum its
+/// results.
 fn for_each_element(
     swe: &mut SWESolution2D,
-    mut f: impl FnMut(usize, &mut [f64], &mut [f64], &mut [f64]),
-) {
+    mut f: impl FnMut(usize, &mut [f64], &mut [f64], &mut [f64]) -> usize,
+) -> usize {
     let n = swe.n_nodes;
     let [h, hu, hv] = &mut swe.data;
-    for (k, ((h, hu), hv)) in h
-        .chunks_exact_mut(n)
+    h.chunks_exact_mut(n)
         .zip(hu.chunks_exact_mut(n))
         .zip(hv.chunks_exact_mut(n))
         .enumerate()
-    {
-        f(k, h, hu, hv);
-    }
+        .map(|(k, ((h, hu), hv))| f(k, h, hu, hv))
+        .sum()
 }
 
 /// Apply Zhang-Shu positivity-preserving limiter for water depth.
 ///
-/// Ensures h >= h_min at all nodes while preserving cell averages.
+/// Ensures h >= 0 at all nodes while preserving cell averages.
 /// Uses the theta-scaling approach:
 ///   q_limited = theta(q - avg) + avg
 ///
-/// where theta is chosen to enforce h >= h_min. Elements whose mean depth is
-/// below `h_min` are treated as dry (see `positivity_limit_element`).
+/// where theta is chosen to enforce h >= 0. Elements whose mean depth is
+/// below `h_dry` are treated as dry (see `positivity_limit_element`).
 ///
 /// # Arguments
 /// * `swe` - SWE solution to limit (modified in place)
 /// * `ops` - DG operators (for quadrature weights)
-/// * `h_min` - Minimum depth threshold
-pub fn swe_positivity_limiter_2d(swe: &mut SWESolution2D, ops: &DGOperators2D, h_min: f64) {
+/// * `h_dry` - Dry threshold: elements with a smaller mean depth lose their momentum
+///
+/// # Returns
+/// The number of elements with a negative mean depth, emptied to h = 0
+/// (creating mass). Zero under the positivity CFL with HLL or Rusanov.
+pub fn swe_positivity_limiter_2d(
+    swe: &mut SWESolution2D,
+    ops: &DGOperators2D,
+    h_dry: f64,
+) -> usize {
     let averages = swe_cell_averages_2d(swe, ops);
     for_each_element(swe, |k, h, hu, hv| {
-        positivity_limit_element(h, hu, hv, averages[k], h_min);
-    });
+        positivity_limit_element(h, hu, hv, averages[k], h_dry) as usize
+    })
 }
 
 /// Map local vertex index (0-3 in CCW order) to DG node index.
@@ -328,6 +347,7 @@ pub fn swe_kuzmin_limiter_2d(
     for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
         kuzmin_limit_element(h, hu, hv, averages[k], vertices, &vertex_bounds, ops.n_1d);
+        0
     });
 }
 
@@ -335,7 +355,7 @@ pub fn swe_kuzmin_limiter_2d(
 ///
 /// Per element, in one pass:
 /// 1. Kuzmin limiter (vertex-based oscillation control)
-/// 2. Positivity limiter (ensures h >= h_min; dry elements lose momentum)
+/// 2. Positivity limiter (ensures h >= 0; dry elements lose momentum)
 ///
 /// Kuzmin preserves the cell means, so both steps use the same averages.
 /// `apply_swe_limiters_kuzmin_2d_parallel` runs the same element kernels.
@@ -345,21 +365,24 @@ pub fn swe_kuzmin_limiter_2d(
 /// * `mesh` - 2D mesh
 /// * `ops` - DG operators
 /// * `kuzmin` - Kuzmin limiter parameter
-/// * `h_min` - Minimum depth threshold
+/// * `h_dry` - Dry threshold for the element mean depth
+///
+/// # Returns
+/// The number of negative-mean elements, as for [`swe_positivity_limiter_2d`].
 pub fn apply_swe_limiters_kuzmin_2d(
     swe: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     kuzmin: &KuzminParameter2D,
-    h_min: f64,
-) {
+    h_dry: f64,
+) -> usize {
     let averages = swe_cell_averages_2d(swe, ops);
     let vertex_bounds = all_vertex_bounds(mesh, &averages, kuzmin.relaxation);
     for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
         kuzmin_limit_element(h, hu, hv, averages[k], vertices, &vertex_bounds, ops.n_1d);
-        positivity_limit_element(h, hu, hv, averages[k], h_min);
-    });
+        positivity_limit_element(h, hu, hv, averages[k], h_dry) as usize
+    })
 }
 
 // ============================================================================
@@ -376,42 +399,13 @@ pub fn swe_cell_averages_2d_parallel(
 ) -> Vec<(f64, f64, f64)> {
     use rayon::prelude::*;
 
-    let n_elements = swe.n_elements;
-    let n_nodes = swe.n_nodes;
+    let n = swe.n_nodes;
     let inv_total_weight: f64 = 1.0 / ops.weights.iter().sum::<f64>();
-
-    // Get immutable slices to the SoA data
-    let h_data = swe.h_data();
-    let hu_data = swe.hu_data();
-    let hv_data = swe.hv_data();
-
-    (0..n_elements)
-        .into_par_iter()
-        .map(|k| {
-            let start = k * n_nodes;
-            let end = start + n_nodes;
-
-            let elem_h = &h_data[start..end];
-            let elem_hu = &hu_data[start..end];
-            let elem_hv = &hv_data[start..end];
-
-            let mut integral_h = 0.0;
-            let mut integral_hu = 0.0;
-            let mut integral_hv = 0.0;
-
-            for i in 0..n_nodes {
-                let w = ops.weights[i];
-                integral_h += w * elem_h[i];
-                integral_hu += w * elem_hu[i];
-                integral_hv += w * elem_hv[i];
-            }
-
-            (
-                integral_h * inv_total_weight,
-                integral_hu * inv_total_weight,
-                integral_hv * inv_total_weight,
-            )
-        })
+    swe.h_data()
+        .par_chunks_exact(n)
+        .zip(swe.hu_data().par_chunks_exact(n))
+        .zip(swe.hv_data().par_chunks_exact(n))
+        .map(|((h, hu), hv)| element_mean(h, hu, hv, &ops.weights, inv_total_weight))
         .collect()
 }
 
@@ -419,8 +413,8 @@ pub fn swe_cell_averages_2d_parallel(
 #[cfg(feature = "parallel")]
 fn par_for_each_element(
     swe: &mut SWESolution2D,
-    f: impl Fn(usize, &mut [f64], &mut [f64], &mut [f64]) + Sync + Send,
-) {
+    f: impl Fn(usize, &mut [f64], &mut [f64], &mut [f64]) -> usize + Sync + Send,
+) -> usize {
     use rayon::prelude::*;
 
     let n = swe.n_nodes;
@@ -429,7 +423,8 @@ fn par_for_each_element(
         .zip(hu.par_chunks_exact_mut(n))
         .zip(hv.par_chunks_exact_mut(n))
         .enumerate()
-        .for_each(|(k, ((h, hu), hv))| f(k, h, hu, hv));
+        .map(|(k, ((h, hu), hv))| f(k, h, hu, hv))
+        .sum()
 }
 
 /// Parallel patch bounds at every mesh vertex.
@@ -454,12 +449,12 @@ fn all_vertex_bounds_parallel(
 pub fn swe_positivity_limiter_2d_parallel(
     swe: &mut SWESolution2D,
     ops: &DGOperators2D,
-    h_min: f64,
-) {
+    h_dry: f64,
+) -> usize {
     let averages = swe_cell_averages_2d_parallel(swe, ops);
     par_for_each_element(swe, |k, h, hu, hv| {
-        positivity_limit_element(h, hu, hv, averages[k], h_min);
-    });
+        positivity_limit_element(h, hu, hv, averages[k], h_dry) as usize
+    })
 }
 
 /// Parallel Kuzmin vertex-based slope limiter using Rayon.
@@ -477,6 +472,7 @@ pub fn swe_kuzmin_limiter_2d_parallel(
     par_for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
         kuzmin_limit_element(h, hu, hv, averages[k], vertices, &vertex_bounds, ops.n_1d);
+        0
     });
 }
 
@@ -490,15 +486,15 @@ pub fn apply_swe_limiters_kuzmin_2d_parallel(
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     kuzmin: &KuzminParameter2D,
-    h_min: f64,
-) {
+    h_dry: f64,
+) -> usize {
     let averages = swe_cell_averages_2d_parallel(swe, ops);
     let vertex_bounds = all_vertex_bounds_parallel(mesh, &averages, kuzmin.relaxation);
     par_for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
         kuzmin_limit_element(h, hu, hv, averages[k], vertices, &vertex_bounds, ops.n_1d);
-        positivity_limit_element(h, hu, hv, averages[k], h_min);
-    });
+        positivity_limit_element(h, hu, hv, averages[k], h_dry) as usize
+    })
 }
 
 #[cfg(test)]
@@ -551,8 +547,70 @@ mod tests {
     #[test]
     fn test_fused_limiter_dry_elements() {
         let (mesh, ops, mut swe) = wet_dry_setup();
-        apply_swe_limiters_kuzmin_2d(&mut swe, &mesh, &ops, &KuzminParameter2D::strict(), H_MIN);
+        let clipped = apply_swe_limiters_kuzmin_2d(
+            &mut swe,
+            &mesh,
+            &ops,
+            &KuzminParameter2D::strict(),
+            H_MIN,
+        );
         assert_positive_and_dry_at_rest(&swe);
+        // Element 6 has a negative mean; it is emptied and reported
+        assert_eq!(clipped, 1);
+        assert!(
+            swe.element_h(ElementIndex::new(6))
+                .iter()
+                .all(|&h| h == 0.0)
+        );
+    }
+
+    #[test]
+    fn test_positivity_keeps_lake_at_rest_shoreline() {
+        // REVIEW.md §1.5: limiting towards h ≥ h_min put a film on the dry
+        // nodes of a shoreline element and lowered its wet nodes, in every
+        // stage. Towards h ≥ 0, a lake at rest (h = max(0, η − B)) is untouched,
+        // also when the element mean is below the dry threshold.
+        let ops = DGOperators2D::new(3);
+        for (eta, h_dry) in [(0.3, 0.01), (0.02, 0.1)] {
+            let mut swe = SWESolution2D::new(1, ops.n_nodes);
+            for i in 0..ops.n_nodes {
+                let bed = 0.5 * ops.nodes_r[i] + 0.1 * ops.nodes_s[i];
+                swe.set_state(
+                    ElementIndex::new(0),
+                    i,
+                    SWEState2D::new((eta - bed).max(0.0), 0.0, 0.0),
+                );
+            }
+            let before = swe.data.clone();
+            assert_eq!(swe_positivity_limiter_2d(&mut swe, &ops, h_dry), 0);
+            assert_eq!(swe.data, before, "η = {eta}, h_dry = {h_dry}");
+        }
+    }
+
+    #[test]
+    fn test_positivity_limits_towards_zero_conserving_mass() {
+        let ops = DGOperators2D::new(2);
+        let mut swe = SWESolution2D::new(1, ops.n_nodes);
+        let k = ElementIndex::new(0);
+        for i in 0..ops.n_nodes {
+            let h = if i == 0 { -0.05 } else { 0.03 }; // corner node: positive mean
+            swe.set_state(k, i, SWEState2D::new(h, 0.01, -0.02));
+        }
+        let mass = |swe: &SWESolution2D| -> f64 {
+            swe.element_h(k)
+                .iter()
+                .zip(&ops.weights)
+                .map(|(h, w)| h * w)
+                .sum()
+        };
+        let before = mass(&swe);
+
+        assert_eq!(swe_positivity_limiter_2d(&mut swe, &ops, 1e-3), 0);
+        let h = swe.element_h(k);
+        assert!(h.iter().all(|&h| h >= 0.0));
+        // The limited minimum is zero, not a positive floor
+        assert!(h.iter().copied().fold(f64::INFINITY, f64::min) < 1e-15);
+        assert!((mass(&swe) - before).abs() < 1e-16);
     }
 
     #[test]
@@ -596,17 +654,15 @@ mod tests {
 
     #[test]
     fn test_compute_theta_positivity_no_violation() {
-        // avg = 10, min = 5, h_min = 1 -> no limiting needed
-        let theta = compute_theta_positivity(10.0, 5.0, 1.0);
+        // avg = 10, min = 5 -> no limiting needed
+        let theta = compute_theta_positivity(10.0, 5.0);
         assert!((theta - 1.0).abs() < 1e-10);
     }
 
     #[test]
     fn test_compute_theta_positivity_with_violation() {
-        // avg = 10, min = -2, h_min = 1
-        // Need: theta * (-2 - 10) + 10 >= 1
-        // => -12*theta >= -9 => theta <= 9/12 = 0.75
-        let theta = compute_theta_positivity(10.0, -2.0, 1.0);
+        // avg = 6, min = -2: theta * (-2 - 6) + 6 >= 0 => theta <= 6/8
+        let theta = compute_theta_positivity(6.0, -2.0);
         assert!((theta - 0.75).abs() < 1e-10);
     }
 

@@ -125,10 +125,13 @@ pub use limiters::{
 };
 
 // Re-export algorithms
-pub use algorithms::{WetDryConfig, apply_wet_dry_correction, apply_wet_dry_correction_all};
+pub use algorithms::{
+    ImplicitDamping2D, WetDryConfig, apply_implicit_damping_2d, apply_wet_dry_correction,
+    apply_wet_dry_correction_all,
+};
 
 #[cfg(feature = "parallel")]
-pub use algorithms::apply_wet_dry_correction_all_parallel;
+pub use algorithms::{apply_implicit_damping_2d_parallel, apply_wet_dry_correction_all_parallel};
 
 // Re-export diagnostics
 pub use diagnostics::{

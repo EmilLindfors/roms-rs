@@ -32,6 +32,8 @@ pub use swe_2d::{
     apply_swe_limiters_kuzmin_2d, swe_cell_averages_2d, swe_kuzmin_limiter_2d,
     swe_positivity_limiter_2d,
 };
+// Element kernels shared with the wet/dry correction
+pub(crate) use swe_2d::{element_mean, positivity_limit_element};
 
 // Parallel 2D SWE limiters
 #[cfg(feature = "parallel")]

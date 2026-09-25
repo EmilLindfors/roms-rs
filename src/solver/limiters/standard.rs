@@ -69,7 +69,8 @@ impl PositivityLimiter2D {
     /// Create a new positivity limiter.
     ///
     /// # Arguments
-    /// * `h_min` - Minimum allowed depth (typically 1e-6 to 1e-4)
+    /// * `h_min` - Dry threshold for the element mean depth (typically 1e-3 m):
+    ///   drier elements lose their momentum. Depths are limited to h ≥ 0.
     pub fn new(h_min: f64) -> Self {
         Self { h_min }
     }
@@ -182,29 +183,40 @@ pub enum StandardLimiter2D {
     None,
     /// Kuzmin vertex-based limiter
     Kuzmin(KuzminParameter2D),
-    /// Positivity limiter only
+    /// Positivity limiter only (h ≥ 0), with the dry threshold for the element
+    /// mean depth (dry elements lose their momentum)
     Positivity(f64),
     /// Kuzmin + positivity (common combination)
     KuzminWithPositivity {
+        /// Kuzmin parameters
         kuzmin: KuzminParameter2D,
+        /// Dry threshold for the element mean depth (the limiter enforces h ≥ 0)
         h_min: f64,
     },
 }
 
-impl Limiter2D for StandardLimiter2D {
-    fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
+impl StandardLimiter2D {
+    /// [`Limiter2D::apply`], returning the number of elements whose negative
+    /// mean depth had to be emptied (creating mass); see
+    /// `swe_positivity_limiter_2d`. Always 0 without positivity limiting.
+    pub fn apply_counting(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) -> usize {
         match self {
-            StandardLimiter2D::None => {}
+            StandardLimiter2D::None => 0,
             StandardLimiter2D::Kuzmin(param) => {
                 kuzmin(solution, ctx.mesh, ctx.ops, param);
+                0
             }
-            StandardLimiter2D::Positivity(h_min) => {
-                positivity(solution, ctx.ops, *h_min);
-            }
+            StandardLimiter2D::Positivity(h_dry) => positivity(solution, ctx.ops, *h_dry),
             StandardLimiter2D::KuzminWithPositivity { kuzmin, h_min } => {
-                kuzmin_with_positivity(solution, ctx.mesh, ctx.ops, kuzmin, *h_min);
+                kuzmin_with_positivity(solution, ctx.mesh, ctx.ops, kuzmin, *h_min)
             }
         }
+    }
+}
+
+impl Limiter2D for StandardLimiter2D {
+    fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
+        self.apply_counting(solution, ctx);
     }
 
     fn name(&self) -> &'static str {

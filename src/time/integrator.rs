@@ -216,8 +216,7 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
     /// Allocation-free version of [`Self::step_with_stage_hook`].
     ///
     /// `rhs(state, time, out)` must overwrite `out` with the time derivative;
-    /// stage values live in `workspace`, reused across steps. This is the one
-    /// method an integrator implements; the others are built on it.
+    /// stage values live in `workspace`, reused across steps.
     fn step_with_workspace<F, H>(
         &self,
         state: &mut S,
@@ -228,6 +227,44 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
         workspace: &mut StageWorkspace<S>,
     ) where
         F: FnMut(&S, f64, &mut S),
+        H: FnMut(&mut S),
+    {
+        self.step_with_relaxation(state, dt, t, rhs, |_, _, _| {}, stage_hook, workspace);
+    }
+
+    /// [`Self::step_with_workspace`] with a point-implicit relaxation of every
+    /// stage. This is the one method an integrator implements; the others are
+    /// built on it.
+    ///
+    /// In Shu–Osher form every stage is
+    /// `u⁽ⁱ⁾ = Σₖ αᵢₖ u⁽ᵏ⁾ + βᵢ dt·L(u⁽ⁱ⁻¹⁾)` with `Σₖ αᵢₖ = 1`. Each is
+    /// followed by `relax(u⁽ⁱ⁾, u⁽ⁱ⁻¹⁾, βᵢ dt)`, which applies a stiff damping
+    /// source `−Λ(u⁽ⁱ⁻¹⁾)·q` implicitly, `u⁽ⁱ⁾ ← u⁽ⁱ⁾ / (1 + βᵢ dt·Λ)`, with the
+    /// rate frozen at the state `L` was evaluated at:
+    /// - the damping shrinks the stage value but never flips its sign, for any
+    ///   `dt` (explicit SSP-RK3 goes unstable once `dt·Λ > 2.5`);
+    /// - a steady state of `L(u) − Λ(u)u = 0` is a fixed point of every stage
+    ///   (the numerator is `u*(1 + βᵢ dt Λ)`), so balances such as forcing
+    ///   against friction are kept exactly, independently of `dt`;
+    /// - as `dt·Λ → ∞` every stage is driven to zero (L-stable), unlike
+    ///   relaxing only the Euler substeps, which leaves `u/3` per SSP-RK3 step.
+    ///
+    /// The damping term is integrated to first order; the rest keeps the
+    /// integrator's order. `stage_hook` then runs on each stage value as in
+    /// [`Self::step_with_workspace`].
+    #[allow(clippy::too_many_arguments)]
+    fn step_with_relaxation<F, R, H>(
+        &self,
+        state: &mut S,
+        dt: f64,
+        t: f64,
+        rhs: F,
+        relax: R,
+        stage_hook: H,
+        workspace: &mut StageWorkspace<S>,
+    ) where
+        F: FnMut(&S, f64, &mut S),
+        R: FnMut(&mut S, &S, f64),
         H: FnMut(&mut S);
 }
 
@@ -274,16 +311,18 @@ impl IntegratorInfo for SSPRK3 {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
-    fn step_with_workspace<F, H>(
+    fn step_with_relaxation<F, R, H>(
         &self,
         state: &mut S,
         dt: f64,
         t: f64,
         mut rhs: F,
+        mut relax: R,
         mut stage_hook: H,
         workspace: &mut StageWorkspace<S>,
     ) where
         F: FnMut(&S, f64, &mut S),
+        R: FnMut(&mut S, &S, f64),
         H: FnMut(&mut S),
     {
         let (u1, u2, k) = workspace.buffers(state);
@@ -292,6 +331,7 @@ impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
         rhs(state, t, k);
         u1.copy_from(state);
         u1.axpy(dt, k);
+        relax(u1, state, dt);
         stage_hook(u1);
 
         // Stage 2: u2 = 3/4 * u + 1/4 * u1 + 1/4 * dt * L(u1, t + dt)
@@ -300,6 +340,7 @@ impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
         u2.scale(0.75);
         u2.axpy(0.25, u1);
         u2.axpy(0.25 * dt, k);
+        relax(u2, u1, 0.25 * dt);
         stage_hook(u2);
 
         // Stage 3: u_new = 1/3 * u + 2/3 * u2 + 2/3 * dt * L(u2, t + dt/2)
@@ -307,6 +348,7 @@ impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
         state.scale(1.0 / 3.0);
         state.axpy(2.0 / 3.0, u2);
         state.axpy(2.0 / 3.0 * dt, k);
+        relax(state, u2, 2.0 / 3.0 * dt);
         stage_hook(state);
     }
 }
@@ -348,21 +390,25 @@ impl IntegratorInfo for ForwardEuler {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for ForwardEuler {
-    fn step_with_workspace<F, H>(
+    fn step_with_relaxation<F, R, H>(
         &self,
         state: &mut S,
         dt: f64,
         t: f64,
         mut rhs: F,
+        mut relax: R,
         mut stage_hook: H,
         workspace: &mut StageWorkspace<S>,
     ) where
         F: FnMut(&S, f64, &mut S),
+        R: FnMut(&mut S, &S, f64),
         H: FnMut(&mut S),
     {
-        let (_, _, k) = workspace.buffers(state);
+        let (u0, _, k) = workspace.buffers(state);
         rhs(state, t, k);
+        u0.copy_from(state);
         state.axpy(dt, k);
+        relax(state, u0, dt);
         stage_hook(state);
     }
 }
@@ -419,24 +465,26 @@ impl IntegratorInfo for StandardIntegrator {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for StandardIntegrator {
-    fn step_with_workspace<F, H>(
+    fn step_with_relaxation<F, R, H>(
         &self,
         state: &mut S,
         dt: f64,
         t: f64,
         rhs: F,
+        relax: R,
         stage_hook: H,
         workspace: &mut StageWorkspace<S>,
     ) where
         F: FnMut(&S, f64, &mut S),
+        R: FnMut(&mut S, &S, f64),
         H: FnMut(&mut S),
     {
         match self {
             StandardIntegrator::SSPRK3 => {
-                SSPRK3.step_with_workspace(state, dt, t, rhs, stage_hook, workspace)
+                SSPRK3.step_with_relaxation(state, dt, t, rhs, relax, stage_hook, workspace)
             }
             StandardIntegrator::ForwardEuler => {
-                ForwardEuler.step_with_workspace(state, dt, t, rhs, stage_hook, workspace)
+                ForwardEuler.step_with_relaxation(state, dt, t, rhs, relax, stage_hook, workspace)
             }
         }
     }
@@ -637,6 +685,103 @@ mod tests {
 
         assert_eq!(n_hooks, 3);
         assert!(u.data[0] <= 1.05);
+    }
+
+    /// du/dt = F − Λ|u|u (constant forcing, quadratic drag) with the drag
+    /// relaxed point-implicitly: Λ|u_in| frozen at the RHS input.
+    fn step_forced_drag<I: TimeIntegrator<DGSolution1D>>(
+        integrator: &I,
+        u: &mut DGSolution1D,
+        dt: f64,
+        forcing: f64,
+        drag: f64,
+    ) {
+        integrator.step_with_relaxation(
+            u,
+            dt,
+            0.0,
+            |_, _, out: &mut DGSolution1D| out.data.fill(forcing),
+            |w: &mut DGSolution1D, from: &DGSolution1D, dt| {
+                for (w, &u) in w.data.iter_mut().zip(&from.data) {
+                    *w /= 1.0 + dt * drag * u.abs();
+                }
+            },
+            |_| {},
+            &mut StageWorkspace::new(),
+        );
+    }
+
+    #[test]
+    fn test_relaxation_keeps_forced_steady_state_for_any_dt() {
+        // Steady state F = Λ u*²: a fixed point of every relaxed stage,
+        // however stiff Λ·dt is.
+        let (forcing, drag) = (2.0_f64, 50.0);
+        let u_star = (forcing / drag).sqrt();
+        for integrator in [StandardIntegrator::SSPRK3, StandardIntegrator::ForwardEuler] {
+            for dt in [1e-3, 1.0, 1e3] {
+                let mut u = DGSolution1D::new(1, 2);
+                u.data.fill(u_star);
+                for _ in 0..10 {
+                    step_forced_drag(&integrator, &mut u, dt, forcing, drag);
+                }
+                for &v in &u.data {
+                    assert!(
+                        (v - u_star).abs() < 1e-14,
+                        "{}: dt = {dt}: {v} drifted from {u_star}",
+                        integrator.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_relaxation_is_l_stable() {
+        // Λ·dt → ∞ must remove the damped quantity within one step (relaxing
+        // only the Euler substeps of SSP-RK3 would leave u/3)
+        let mut u = DGSolution1D::new(1, 1);
+        u.data[0] = 1.0;
+        step_forced_drag(&SSPRK3, &mut u, 1e8, 0.0, 1.0);
+        assert!(u.data[0] > 0.0 && u.data[0] < 1e-6, "{}", u.data[0]);
+    }
+
+    #[test]
+    fn test_relaxation_never_flips_sign() {
+        // Pure drag, Λ|u|·dt up to 1e4: explicit SSP-RK3 would oscillate and
+        // blow up; the relaxed steps decay monotonically towards zero.
+        for dt in [0.1, 10.0, 1e4] {
+            let mut u = DGSolution1D::new(1, 1);
+            u.data[0] = 1.0;
+            let mut previous = 1.0;
+            for _ in 0..20 {
+                step_forced_drag(&SSPRK3, &mut u, dt, 0.0, 1.0);
+                let v = u.data[0];
+                assert!(v > 0.0 && v < previous, "dt = {dt}: {previous} -> {v}");
+                previous = v;
+            }
+        }
+    }
+
+    #[test]
+    fn test_relaxation_converges_to_exact_decay() {
+        // du/dt = −Λ|u|u has u(t) = u0 / (1 + Λ u0 t); the relaxed drag is
+        // first-order accurate inside SSP-RK3.
+        let error_at = |dt: f64| {
+            let t_end = 1.0;
+            let mut u = DGSolution1D::new(1, 1);
+            u.data[0] = 1.0;
+            for _ in 0..(t_end / dt).round() as usize {
+                step_forced_drag(&SSPRK3, &mut u, dt, 0.0, 3.0);
+            }
+            (u.data[0] - 1.0 / (1.0 + 3.0 * t_end)).abs()
+        };
+        let (coarse, fine) = (error_at(0.02), error_at(0.01));
+        let rate = (coarse / fine).log2();
+        assert!(fine < 1e-2, "error {fine}");
+        assert!(
+            rate > 0.9,
+            "convergence rate {rate} (errors {coarse}, {fine})"
+        );
     }
 
     #[test]
