@@ -7,7 +7,7 @@
 //!
 //! Available boundary conditions:
 //! - Reflective (wall): no-flux through boundary, tangential velocity preserved
-//! - Radiation (absorbing): Sommerfeld radiation condition
+//! - Radiation (absorbing): characteristic condition towards a constant far field
 //! - Flather: characteristic-based open boundary (combines radiation and tidal)
 //! - Tidal: prescribed water surface elevation
 //! - Discharge: prescribed normal flow rate
@@ -39,10 +39,11 @@ pub struct BCContext2D {
     pub h_min: f64,
     /// Optional boundary tag for multi-BC dispatch
     pub boundary_tag: Option<BoundaryTag>,
-    /// Optional time step for boundary conditions that need it (e.g., Chapman radiation).
+    /// Optional time step for boundary conditions that need it.
     ///
     /// Populated from `SWE2DRhsConfig::dt`, which is `None` unless the caller
-    /// sets it with `SWE2DRhsConfig::with_dt`.
+    /// sets it with `SWE2DRhsConfig::with_dt`. No boundary condition in this
+    /// crate reads it (`Chapman2D` no longer needs a time step).
     pub dt: Option<f64>,
 }
 
@@ -220,16 +221,51 @@ impl SWEBoundaryCondition2D for Reflective2D {
 
 /// Radiation (absorbing) boundary condition for 2D.
 ///
-/// Implements a Sommerfeld-type radiation condition that allows waves
-/// to exit the domain without reflection. Based on characteristics.
+/// Open boundary towards a far field with constant surface elevation
+/// `eta_external` (default 0, mean sea level) and velocity `u_external`.
 ///
-/// u_n = ±c * (h - h_ext) / h_ext
+/// # Weak (ghost-state) formulation
 ///
-/// where c = sqrt(gh) is the wave speed and h_ext is the external depth.
+/// The ghost is the far-field state: `h = η_ext − B` (depth convention
+/// h = η − B), `u_n = u_n,ext`, `u_t` from the interior. The upwind Riemann
+/// solver at the boundary face then takes the outgoing characteristics from
+/// the interior and the incoming ones from the ghost, in every flow regime:
+/// in subcritical flow this is the Flather condition (outgoing waves leave,
+/// the incoming invariant is `u_n,ext − sqrt(g/h) η_ext`); in supercritical
+/// inflow the whole ghost state enters; in supercritical outflow everything
+/// comes from the interior. It is therefore [`Flather2D`] with constant
+/// external data.
+///
+/// # Previous formulation
+///
+/// Earlier versions switched on the interior characteristic speed:
+///
+/// - `u_n + c > 0` (every subcritical state): ghost = interior trace
+///   (zero-gradient / "transmissive"). This takes the incoming invariant from
+///   the interior instead of the far field — the do-nothing condition on an
+///   incoming characteristic, which in the weak DG setting feeds energy in. In
+///   the channel test of `tests/open_boundary_flather_test.rs` an outgoing
+///   pulse left 10% of its amplitude behind after 50 s and grew to 17× by
+///   150 s; 1e-6 m noise grew to metres. `h_external` was never used.
+/// - `u_n + c ≤ 0` (supercritical inflow, or a node with `h = 0`): ghost depth
+///   `h_external` regardless of the local bed, and ghost normal velocity
+///   `u_n,ext − sqrt(g/h_ext)(h_ext − h_int)`. With both characteristics
+///   incoming the Riemann solver takes the whole state from the ghost, so the
+///   interior depth leaked into the inflow, and the depth (rather than η)
+///   difference responded to bed slope; a dry node on a high bed was given
+///   `h_external` of water.
+///
+/// `h_external` is kept for API compatibility; the ghost depth now comes from
+/// `eta_external` and the local bed.
 #[derive(Clone, Debug)]
 pub struct Radiation2D {
-    /// External (far-field) water depth
+    /// Far-field water depth.
+    ///
+    /// **Unused**: the ghost depth is `eta_external − B` (see the type docs).
+    /// Retained for API compatibility.
     pub h_external: f64,
+    /// Far-field surface elevation η_ext (m above the datum of B; default 0)
+    pub eta_external: f64,
     /// External (far-field) velocity (typically zero)
     pub u_external: (f64, f64),
     /// Minimum depth
@@ -237,63 +273,68 @@ pub struct Radiation2D {
 }
 
 impl Radiation2D {
-    /// Create a new radiation BC with specified external depth.
+    /// Create a radiation BC towards a sea at rest at mean sea level
+    /// (η_ext = 0).
+    ///
+    /// `h_external` (the far-field depth) no longer affects the ghost state;
+    /// see the type docs. Use [`Radiation2D::with_elevation`] for another
+    /// far-field level.
     pub fn new(h_external: f64) -> Self {
         Self {
             h_external,
+            eta_external: 0.0,
             u_external: (0.0, 0.0),
             h_min: 1e-6,
         }
     }
 
-    /// Create with external depth and velocity.
+    /// Create with far-field depth (unused, see type docs) and velocity.
     pub fn with_velocity(h_external: f64, u_external: (f64, f64)) -> Self {
         Self {
             h_external,
+            eta_external: 0.0,
             u_external,
             h_min: 1e-6,
         }
+    }
+
+    /// Set the far-field surface elevation η_ext.
+    pub fn with_elevation(mut self, eta_external: f64) -> Self {
+        self.eta_external = eta_external;
+        self
     }
 }
 
 impl SWEBoundaryCondition2D for Radiation2D {
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
-        let h_int = ctx.interior_state.h;
+        use std::sync::atomic::AtomicBool;
+        static WARNED: AtomicBool = AtomicBool::new(false);
+
         let (nx, ny) = ctx.normal;
-        let g = ctx.g;
 
-        // Use characteristic-based approach
-        // For outgoing waves, use interior state
-        // For incoming waves, use external state
-        let c_int = (g * h_int.max(0.0)).sqrt();
-        let (u_int, v_int) = ctx.interior_velocity();
-        let un_int = u_int * nx + v_int * ny;
+        // Validate bathymetry configuration (warns once if misconfigured)
+        warn_once_if_misconfigured(
+            &WARNED,
+            "Radiation2D",
+            ctx.interior_state.h,
+            ctx.bathymetry,
+            self.eta_external,
+        );
 
-        // Outgoing characteristic: un + 2c (positive for outflow)
-        // Incoming characteristic: un - 2c (negative for inflow)
-        if un_int + c_int > 0.0 {
-            // Outgoing - extrapolate interior
-            ctx.interior_state
-        } else {
-            // Incoming - use external with radiation condition
-            let c_ext = (g * self.h_external.max(0.0)).sqrt();
-            let (u_ext, v_ext) = self.u_external;
-            let un_ext = u_ext * nx + v_ext * ny;
-            let _ut_ext = -u_ext * ny + v_ext * nx;
+        // Ghost = far-field state; the Riemann solver sorts incoming from
+        // outgoing characteristics (see type docs).
+        let h_ghost = (self.eta_external - ctx.bathymetry).max(self.h_min);
+        let (u_ext, v_ext) = self.u_external;
+        let un_ghost = u_ext * nx + v_ext * ny;
 
-            // Sommerfeld condition: incoming characteristic from exterior
-            let un_ghost =
-                un_ext - c_ext * (self.h_external - h_int) / self.h_external.max(self.h_min);
+        // Preserve tangential velocity from interior
+        let ut_ghost = ctx.interior_tangential_velocity();
 
-            // Preserve tangential velocity from interior
-            let ut_ghost = ctx.interior_tangential_velocity();
+        // Convert back to (u, v)
+        let u_ghost = un_ghost * nx - ut_ghost * ny;
+        let v_ghost = un_ghost * ny + ut_ghost * nx;
 
-            // Convert back to (u, v)
-            let u_ghost = un_ghost * nx - ut_ghost * ny;
-            let v_ghost = un_ghost * ny + ut_ghost * nx;
-
-            SWEState2D::from_primitives(self.h_external, u_ghost, v_ghost)
-        }
+        SWEState2D::from_primitives(h_ghost, u_ghost, v_ghost)
     }
 
     fn name(&self) -> &'static str {
@@ -1423,82 +1464,131 @@ mod tests {
     // Radiation2D tests
     // ====================================================================
 
+    fn radiation_context(h: f64, u: f64, v: f64, bathymetry: f64) -> BCContext2D {
+        BCContext2D::new(
+            0.0,
+            (0.0, 0.0),
+            SWEState2D::from_primitives(h, u, v),
+            bathymetry,
+            (1.0, 0.0),
+            G,
+            H_MIN,
+        )
+    }
+
     #[test]
     fn test_radiation_still_water() {
         let bc = Radiation2D::new(2.0);
-        let ctx = make_context(2.0, 0.0, 0.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
+        let ghost = bc.ghost_state(&radiation_context(2.0, 0.0, 0.0, -2.0));
 
-        // un=0, c=sqrt(G*2), un+c > 0 → outgoing → ghost = interior
+        // Sea at rest at η = 0 over B = −2: ghost h = 2, at rest
         assert!((ghost.h - 2.0).abs() < TOL);
         assert!(ghost.hu.abs() < TOL);
         assert!(ghost.hv.abs() < TOL);
     }
 
     #[test]
-    fn test_radiation_outgoing_wave() {
-        let bc = Radiation2D::new(2.0);
-        // h=2, u=5, v=0 → hu=10
-        let ctx = make_context(2.0, 10.0, 0.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
-
-        // un=5, c=sqrt(20)≈4.47, un+c>0 → outgoing → ghost = interior
-        assert!((ghost.h - 2.0).abs() < TOL);
-        assert!((ghost.hu - 10.0).abs() < TOL);
-        assert!(ghost.hv.abs() < TOL);
+    fn test_radiation_ghost_is_far_field_state() {
+        // In every flow regime the ghost is the far-field state
+        // (h = η_ext − B, u_n = u_n,ext, u_t from the interior); the Riemann
+        // solver decides which characteristics it contributes.
+        // Regressions: subcritical states used to get ghost = interior (the
+        // do-nothing condition, unstable in DG), and supercritical inflow got
+        // u_n,ext − c_ext (h_ext − h_int)/h_ext, leaking the interior depth
+        // into an inflow that the Riemann solver takes wholly from the ghost.
+        let bathymetry = -2.0;
+        let bc = Radiation2D::with_velocity(2.0, (0.6 * -0.3, 0.8 * -0.3)).with_elevation(0.1);
+        let c = (G * 2.0_f64).sqrt();
+        for (h, un, ut) in [
+            (2.3, 0.5, 0.2),      // subcritical outflow
+            (1.7, -0.4, -1.0),    // subcritical inflow
+            (2.0, 5.0, 0.0),      // supercritical outflow
+            (1.2, -2.0 * c, 0.7), // supercritical inflow (old incoming branch)
+            (100.0, 1.0, 0.0),    // deep interior, h_int ≠ h_ext
+        ] {
+            let ghost = bc.ghost_state(&oblique_context(h, un, ut, bathymetry));
+            let (un_g, ut_g) = oblique_velocity(&ghost);
+            assert!(
+                (ghost.h - 2.1).abs() < TOL,
+                "h_ghost = {} for h = {h}",
+                ghost.h
+            );
+            assert!(
+                (un_g - (-0.3)).abs() < 1e-10,
+                "u_n,ghost = {un_g} for h = {h}"
+            );
+            assert!(
+                (ut_g - ut).abs() < 1e-10,
+                "u_t,ghost = {ut_g}, interior {ut}"
+            );
+        }
     }
 
     #[test]
-    fn test_radiation_incoming_wave() {
-        let bc = Radiation2D::new(2.0);
-        // h=2, u=-10, v=0 → hu=-20
-        let ctx = make_context(2.0, -20.0, 0.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
+    fn test_radiation_ghost_follows_local_bed() {
+        // The far field is a level surface η_ext: the ghost depth tracks the
+        // local bed, not the nominal h_external. Regression: the old ghost
+        // used h_external everywhere (bathymetry-blind) and gave a dry node on
+        // a high bed h_external of water.
+        let bc = Radiation2D::new(50.0);
+        for bathymetry in [-50.0, -12.0, -3.5] {
+            let ghost = bc.ghost_state(&radiation_context(-bathymetry, 0.0, 0.0, bathymetry));
+            assert!(
+                (ghost.h - (-bathymetry)).abs() < TOL,
+                "B = {bathymetry}: h_ghost = {}",
+                ghost.h
+            );
+        }
 
-        // un=-10, c=sqrt(20)≈4.47, un+c<0 → incoming
-        // h_ext=h_int=2, so Sommerfeld correction = 0
-        // ghost depth = h_external = 2, velocity from Sommerfeld
-        assert!((ghost.h - 2.0).abs() < TOL);
-        // un_ghost = un_ext - c_ext*(h_ext - h_int)/h_ext = 0 - 0 = 0
-        assert!(ghost.hu.abs() < TOL);
-        assert!(ghost.hv.abs() < TOL);
+        let ghost = bc.ghost_state(&radiation_context(0.0, 0.0, 0.0, 1.0));
+        assert!(
+            ghost.h <= H_MIN + TOL,
+            "dry high bed: h_ghost = {}",
+            ghost.h
+        );
+    }
+
+    #[test]
+    fn test_radiation_elevated_interior_drains() {
+        // Interior at rest but above the far-field level: the Riemann flux
+        // through the boundary face carries mass out (Flather response).
+        let bc = Radiation2D::new(10.0);
+        let ctx = radiation_context(10.5, 0.0, 0.0, -10.0);
+        let ghost = bc.ghost_state(&ctx);
+        let flux = crate::flux::roe_flux_swe_2d(&ctx.interior_state, &ghost, ctx.normal, G, H_MIN);
+        assert!(flux.h > 0.0, "expected outward mass flux, got {}", flux.h);
     }
 
     #[test]
     fn test_radiation_velocity_decomposition() {
         let bc = Radiation2D::new(2.0);
         let sqrt2_inv = 1.0 / 2.0_f64.sqrt();
-        // h=2, u=-10, v=3 → hu=-20, hv=6
-        let ctx = make_context(2.0, -20.0, 6.0, (sqrt2_inv, sqrt2_inv));
+        let (nx, ny) = (sqrt2_inv, sqrt2_inv);
+        let ctx = BCContext2D::new(
+            0.0,
+            (0.0, 0.0),
+            SWEState2D::from_primitives(2.0, -10.0, 3.0),
+            -2.0,
+            (nx, ny),
+            G,
+            H_MIN,
+        );
         let ghost = bc.ghost_state(&ctx);
 
-        // un = (-10+3)/√2 = -7/√2 ≈ -4.95, c = √20 ≈ 4.47
-        // un+c < 0 → incoming branch
-        // Tangential from interior: ut = 10/√2 + 3/√2 = 13/√2
-        let (nx, ny) = (sqrt2_inv, sqrt2_inv);
+        // Normal velocity from the far field (0), tangential from interior:
+        // ut = -u*ny + v*nx = 10/√2 + 3/√2
         let u_ghost = ghost.hu / ghost.h;
         let v_ghost = ghost.hv / ghost.h;
+        let un_ghost = u_ghost * nx + v_ghost * ny;
         let ut_ghost = -u_ghost * ny + v_ghost * nx;
-        let ut_int = 10.0 * sqrt2_inv + 3.0 * sqrt2_inv; // -(-10)*ny + 3*nx
+        let ut_int = 13.0 * sqrt2_inv;
 
+        assert!(un_ghost.abs() < 1e-10, "u_n,ghost = {un_ghost}");
         assert!(
-            (ut_ghost - ut_int).abs() < TOL,
+            (ut_ghost - ut_int).abs() < 1e-10,
             "Tangential velocity should be preserved: got {}, expected {}",
             ut_ghost,
             ut_int
         );
-    }
-
-    #[test]
-    fn test_radiation_deep_water() {
-        let bc = Radiation2D::new(100.0);
-        // h=100, u=1, v=0 → hu=100
-        let ctx = make_context(100.0, 100.0, 0.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
-
-        // un=1, c=sqrt(G*100)≈31.6, un+c>0 → outgoing → ghost = interior
-        assert!((ghost.h - 100.0).abs() < TOL);
-        assert!((ghost.hu - 100.0).abs() < TOL);
-        assert!(ghost.hv.abs() < TOL);
     }
 }

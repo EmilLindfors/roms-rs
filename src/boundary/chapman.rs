@@ -1,33 +1,75 @@
 //! Chapman radiation boundary condition for sea surface height.
 //!
-//! The Chapman condition provides a radiation BC that allows long gravity waves
-//! to exit the domain without reflection. It's based on the characteristic
-//! wave equation:
+//! The Chapman (1985) condition lets long gravity waves leave the domain by
+//! radiating the surface elevation anomaly outward at the shallow-water wave
+//! speed:
 //!
-//! ∂η/∂t ± c ∂η/∂n = 0
+//! ```text
+//! ∂(η − η_ext)/∂t + c ∂η/∂n = 0,    c = sqrt(g h)
+//! ```
 //!
-//! where c = √(gh) is the shallow water wave speed and the sign depends on
-//! whether the boundary is outgoing (+) or incoming (-).
+//! Finite-difference models (e.g. ROMS's Chapman free-surface option) apply it
+//! as an implicit update of the boundary value,
+//! `η_b^{n+1} = (η_b^n + C η_{b−1}^{n+1}) / (1 + C)` with `C = c·dt/dx`, paired
+//! with a separate condition for the velocity.
 //!
-//! In discrete form, the Chapman condition gives:
+//! # Weak (ghost-state) DG formulation
 //!
-//! η_ghost = α·η_ext + (1-α)·η_int
+//! For the linearised shallow water equations at normal incidence, with
+//! Riemann invariants `w± = u_n ± sqrt(g/h) η` travelling at `±c`, the Chapman
+//! condition is equivalent to holding the incoming invariant at its external
+//! value. Writing `η = (w+ − w−) / (2 sqrt(g/h))` and using `∂w−/∂t = c ∂w−/∂n`
+//! (n the outward normal coordinate, η_ext uniform along n),
 //!
-//! where α = 1/(1 + c·dt/dx) is the radiation coefficient.
+//! ```text
+//! ∂η/∂t + c ∂η/∂n = −sqrt(h/g) ∂w−/∂t = ∂η_ext/∂t   ⇔   w− = −sqrt(g/h) η_ext,
+//! ```
 //!
-//! # Weak (ghost-state) DG caveat
+//! up to a constant fixed by the initial state (zero when the initial state
+//! is in equilibrium with η_ext).
 //!
-//! Chapman's formula is an implicit finite-difference update of the boundary
-//! value. Used as a DG ghost state (blended η, extrapolated velocity) it is
-//! **not** a radiation condition: the upwind Riemann solver then takes the
-//! incoming Riemann invariant `u_n − sqrt(g/h) η_ghost`, which is pulled
-//! towards η_ext and also re-uses the interior's own incoming invariant. In a
-//! quasi-1D channel test [`Chapman2D`] reflects ~99% of an outgoing pulse for
-//! α ≳ 0.8 (like [`HarmonicTidal2D`](crate::boundary::HarmonicTidal2D)), and
-//! is unstable for α ≲ 0.7 (c·dt/dx ≳ 0.4). For radiating open boundaries use
-//! [`Flather2D`](crate::boundary::Flather2D) or [`ChapmanFlather2D`], whose
-//! ghost is the external state and whose radiation comes from the Riemann
-//! solver.
+//! In the weak DG setting the upwind Riemann solver at a boundary face takes
+//! the outgoing invariant from the interior trace and the incoming one from
+//! the ghost state, so [`Chapman2D`] imposes the condition through the ghost:
+//! the velocity is extrapolated from the interior (the BC only acts on η, as in
+//! ROMS) and the ghost elevation is chosen so that the ghost's incoming
+//! invariant is the external one. Using the nonlinear invariant
+//! `R− = u_n − 2 sqrt(g h)` and `h_ext = η_ext − B`:
+//!
+//! ```text
+//! sqrt(h_ghost) = sqrt(h_ext) + u_n,int / (2 sqrt(g)),
+//! ```
+//!
+//! which linearises to `η_ghost = η_ext + sqrt(h/g) u_n,int`. `dt` and `dx`
+//! drop out: the Riemann solver supplies the radiation.
+//!
+//! ## Relation to `Flather2D`
+//!
+//! To first order in the wave amplitude this is the same boundary flux as
+//! [`Flather2D`](crate::boundary::Flather2D) with zero external velocity
+//! (ghost `(η_ext, u_n = 0)`): both fix `w− = −sqrt(g/h) η_ext`. They differ in
+//! the ghost state itself. For an outgoing simple wave over a quiescent
+//! exterior the Chapman ghost *equals* the interior trace, so the boundary
+//! flux is exact for any consistent numerical flux, not only for an upwind
+//! one. In the channel test (`tests/open_boundary_flather_test.rs`, pulse
+//! amplitude a/H = 0.1) it reflects ~2e-4 with Roe, HLL and Rusanov fluxes,
+//! against 4e-4 (Roe/HLL) and 1.4e-3 (Rusanov) for `Flather2D`; the linearised
+//! ghost `η_ext + sqrt(h/g) u_n,int` reflects 1.1% there.
+//!
+//! As for `Flather2D` with zero external velocity, a *progressive* wave forced
+//! through the boundary arrives at η_ext / 2; the boundary elevation equals
+//! η_ext where the boundary sits at an antinode of a standing tide. Use
+//! [`ChapmanFlather2D`] with `u_n,ext = −sqrt(g/h) η_ext` to force a
+//! progressive wave at full amplitude.
+//!
+//! ## Previous formulation
+//!
+//! Earlier versions used Chapman's finite-difference blend directly as the
+//! ghost, `η_ghost = α η_ext + (1 − α) η_int` with α = 1/(1 + c·dt/dx) and
+//! extrapolated velocity. The ghost's incoming invariant then contains
+//! `(1 − α) η_int`, i.e. the interior's outgoing wave: the channel test
+//! reflected ~99% of an outgoing pulse for every α ≥ 0.7, and the scheme blew
+//! up for α ≤ 0.6.
 //!
 //! # Reference
 //!
@@ -40,22 +82,21 @@ use crate::solver::SWEState2D;
 
 /// Chapman radiation boundary condition for 2D.
 ///
-/// Blends the external and interior surface elevation into the ghost
-/// (`α η_ext + (1 − α) η_int`, α = 1/(1 + c·dt/dx)) and extrapolates the
-/// velocity. In the weak DG setting this behaves as a softened elevation
-/// clamp that reflects outgoing waves, not as a radiation condition, and it
-/// is unstable for small α — see the module docs. It is not affected by the
-/// Flather double-counting fixed in [`ChapmanFlather2D`] because it never
-/// modifies the normal velocity.
+/// Radiates the surface elevation anomaly `η − η_ext` out of the domain.
+/// The ghost keeps the interior velocity and sets the elevation so that the
+/// incoming Riemann invariant `u_n − 2 sqrt(g h)` equals its external value
+/// `−2 sqrt(g (η_ext − B))`. See the module docs for the derivation and its
+/// relation to [`Flather2D`](crate::boundary::Flather2D).
+///
+/// Intended for subcritical open boundaries (|u_n| < sqrt(g h)). Like other
+/// Flather-type BCs it needs the depth convention `h = η − B` (set bathymetry
+/// on the RHS config; a one-time warning is printed if it looks unset).
 ///
 /// # Time step
 ///
-/// α needs `dt`, taken from [`BCContext2D::dt`] (set via
-/// `SWE2DRhsConfig::with_dt`) or else from [`Chapman2D::with_dt`] /
-/// [`Chapman2D::set_dt`]. The library's RHS drivers (e.g. `SWEPhysics2D`) do
-/// **not** set `BCContext2D::dt`. When no dt is available α = 1 (pure
-/// elevation clamp, the dt → 0 limit); the previous fallback c·dt/dx = 1
-/// (α = 1/2) made the DG discretisation unstable.
+/// The condition needs neither `dt` nor `dx`: the Riemann solver provides the
+/// radiation. `dx`, `dt`, [`Chapman2D::with_dt`] and [`Chapman2D::set_dt`] are
+/// retained for API compatibility and do not affect the ghost state.
 ///
 /// # Type Parameters
 ///
@@ -67,14 +108,14 @@ use crate::solver::SWEState2D;
 /// use dg_rs::boundary::{Chapman2D, BCContext2D, SWEBoundaryCondition2D};
 /// use dg_rs::SWEState2D;
 ///
-/// // Create Chapman BC with constant external elevation
+/// // Radiate towards a sea at rest at mean sea level
 /// let chapman = Chapman2D::new(|_x, _y, _t| 0.0, 100.0);
 ///
-/// // Evaluate at boundary
+/// // Evaluate at boundary: 10 m of water over a bed at B = −10 m
 /// let ctx = BCContext2D::new(
 ///     0.0, (0.0, 0.0),
 ///     SWEState2D::new(10.0, 5.0, 0.0), // h=10, hu=5
-///     0.0, (1.0, 0.0), // outward normal in x
+///     -10.0, (1.0, 0.0), // bathymetry, outward normal in x
 ///     9.81, 1e-6,
 /// );
 /// let ghost = chapman.ghost_state(&ctx);
@@ -86,10 +127,15 @@ where
 {
     /// External (far-field) surface elevation function η_ext(x, y, t)
     pub external_elevation: F,
-    /// Characteristic length scale (grid spacing) for radiation
+    /// Grid spacing.
+    ///
+    /// **Unused**: the Riemann solver provides the radiation (see the type
+    /// docs). Retained for API compatibility.
     pub dx: f64,
-    /// Time step for the radiation coefficient (used when the context has no dt;
-    /// α = 1 if neither is set)
+    /// Time step.
+    ///
+    /// **Unused**: the Riemann solver provides the radiation (see the type
+    /// docs). Retained for API compatibility.
     pub dt: Option<f64>,
     /// Minimum depth threshold
     pub h_min: f64,
@@ -103,7 +149,7 @@ where
     ///
     /// # Arguments
     /// * `external_elevation` - Function returning η_ext(x, y, t)
-    /// * `dx` - Grid spacing (characteristic length for radiation)
+    /// * `dx` - Grid spacing (unused, see type docs)
     pub fn new(external_elevation: F, dx: f64) -> Self {
         Self {
             external_elevation,
@@ -113,7 +159,7 @@ where
         }
     }
 
-    /// Create with time step for improved radiation accuracy.
+    /// Create with a time step (unused, see type docs).
     pub fn with_dt(external_elevation: F, dx: f64, dt: f64) -> Self {
         Self {
             external_elevation,
@@ -123,7 +169,7 @@ where
         }
     }
 
-    /// Set the time step.
+    /// Set the time step (unused, see type docs).
     pub fn set_dt(&mut self, dt: f64) {
         self.dt = Some(dt);
     }
@@ -140,35 +186,33 @@ where
     F: Fn(f64, f64, f64) -> f64 + Send + Sync,
 {
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
+        use std::sync::atomic::AtomicBool;
+        static WARNED: AtomicBool = AtomicBool::new(false);
+
         let (x, y) = ctx.position;
-        let t = ctx.time;
-        let g = ctx.g;
+        let (nx, ny) = ctx.normal;
 
-        // External surface elevation
-        let eta_ext = (self.external_elevation)(x, y, t);
+        // External surface elevation and the depth it implies here
+        let eta_ext = (self.external_elevation)(x, y, ctx.time);
+        let h_ext = (eta_ext - ctx.bathymetry).max(0.0);
 
-        // Interior surface elevation
-        let eta_int = ctx.interior_surface_elevation();
+        warn_once_if_misconfigured(
+            &WARNED,
+            "Chapman2D",
+            ctx.interior_state.h,
+            ctx.bathymetry,
+            eta_ext,
+        );
 
-        // Wave celerity at interior
-        let c = (g * ctx.interior_state.h.max(self.h_min)).sqrt();
-
-        // Chapman radiation coefficient
-        // α = 1/(1 + c·dt/dx) blends between exterior (α=1) and interior (α=0)
-        // Prefer dt from the context (set via SWE2DRhsConfig::with_dt), fall
-        // back to the dt stored on the BC. Without either, use the dt → 0
-        // limit α = 1: the old cfl = 1 fallback (α = 1/2) is unstable in the
-        // weak DG setting (see module docs).
-        let cfl = ctx.dt.or(self.dt).map_or(0.0, |dt| c * dt / self.dx);
-        let alpha = 1.0 / (1.0 + cfl);
-
-        // Radiation condition for elevation
-        // η_ghost = α·η_ext + (1-α)·η_int
-        let eta_ghost = alpha * eta_ext + (1.0 - alpha) * eta_int;
-        let h_ghost = (eta_ghost - ctx.bathymetry).max(self.h_min);
-
-        // Extrapolate velocity from interior (tangential preserved)
+        // Velocity extrapolated from the interior
         let (u, v) = ctx.interior_velocity();
+        let un = u * nx + v * ny;
+
+        // Ghost depth with incoming invariant u_n − 2 sqrt(g h) equal to the
+        // external −2 sqrt(g h_ext). A negative root means inflow strong
+        // enough to drain the ghost (u_n < −2 sqrt(g h_ext)).
+        let sqrt_h = (h_ext.sqrt() + un / (2.0 * ctx.g.sqrt())).max(0.0);
+        let h_ghost = (sqrt_h * sqrt_h).max(self.h_min);
 
         SWEState2D::from_primitives(h_ghost, u, v)
     }
@@ -378,19 +422,140 @@ mod tests {
         );
     }
 
+    fn make_context_with_bed(
+        h: f64,
+        u: f64,
+        v: f64,
+        bathymetry: f64,
+        normal: (f64, f64),
+    ) -> BCContext2D {
+        BCContext2D::new(
+            0.0,
+            (0.0, 0.0),
+            SWEState2D::from_primitives(h, u, v),
+            bathymetry,
+            normal,
+            G,
+            1e-6,
+        )
+    }
+
+    /// Incoming nonlinear Riemann invariant u_n − 2 sqrt(g h) along `normal`.
+    fn incoming_invariant(state: &SWEState2D, normal: (f64, f64)) -> f64 {
+        let un = (state.hu * normal.0 + state.hv * normal.1) / state.h;
+        un - 2.0 * (G * state.h).sqrt()
+    }
+
     #[test]
-    fn test_chapman_radiation_blending() {
-        // With dt specified, should blend between external and internal
-        let chapman = Chapman2D::with_dt(|_, _, _| 0.0, 100.0, 0.1);
+    fn test_chapman_ghost_holds_external_incoming_invariant() {
+        // Whatever the interior does, the ghost's incoming invariant is the
+        // external one, so the Riemann solver cannot feed the interior's
+        // outgoing wave back in. Regression: the old blended ghost
+        // α η_ext + (1 − α) η_int carried (1 − α) η_int into it and reflected
+        // outgoing waves (~99% in the channel test).
+        let eta_ext = 0.3;
+        let bed = -20.0;
+        let chapman = Chapman2D::new(move |_, _, _| eta_ext, 100.0);
+        let s = 1.0 / 2.0_f64.sqrt();
+        let normals = [(1.0, 0.0), (0.0, -1.0), (s, s), (-0.6, 0.8)];
+        let interiors = [
+            (20.0, 0.0, 0.0),
+            (21.5, 0.8, -0.4),
+            (18.2, -1.1, 0.7),
+            (23.0, 2.5, 1.0),
+        ];
 
-        // Interior elevation = 10 (h=10, B=0)
-        // External elevation = 0
-        // With some CFL, ghost should be between 0 and 10
-        let ctx = make_context(10.0, 0.0, 0.0, (1.0, 0.0));
+        let expected = -2.0 * (G * (eta_ext - bed)).sqrt();
+        for normal in normals {
+            for (h, u, v) in interiors {
+                let ctx = make_context_with_bed(h, u, v, bed, normal);
+                let ghost = chapman.ghost_state(&ctx);
+                let w = incoming_invariant(&ghost, normal);
+                assert!(
+                    (w - expected).abs() < 1e-9,
+                    "incoming invariant {w} != external {expected} for h={h}, \
+                     u=({u}, {v}), n={normal:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_chapman_ghost_equals_interior_for_outgoing_simple_wave() {
+        // A simple wave leaving into a sea at rest at η_ext has the external
+        // incoming invariant, u_n = 2 (sqrt(g h) − sqrt(g h_ext)). The ghost
+        // then reproduces the interior trace, so any consistent numerical
+        // flux returns the physical flux: no reflection.
+        let eta_ext = 0.0;
+        let bed = -10.0;
+        let chapman = Chapman2D::new(move |_, _, _| eta_ext, 100.0);
+        let normal = (0.6, -0.8);
+        for eta in [-0.5, 0.01, 1.0] {
+            let h = eta - bed;
+            let un = 2.0 * ((G * h).sqrt() - (G * (eta_ext - bed)).sqrt());
+            let ut = 0.3;
+            let (u, v) = (un * normal.0 - ut * normal.1, un * normal.1 + ut * normal.0);
+            let ctx = make_context_with_bed(h, u, v, bed, normal);
+            let ghost = chapman.ghost_state(&ctx);
+
+            assert!((ghost.h - h).abs() < 1e-9, "ghost h {} != {h}", ghost.h);
+            assert!((ghost.hu - h * u).abs() < 1e-9, "ghost hu {}", ghost.hu);
+            assert!((ghost.hv - h * v).abs() < 1e-9, "ghost hv {}", ghost.hv);
+        }
+    }
+
+    #[test]
+    fn test_chapman_linearises_to_elevation_form() {
+        // For small u_n the ghost elevation is η_ext + sqrt(h/g) u_n, with an
+        // O(u_n²) remainder u_n² / (4g).
+        let eta_ext = 0.2;
+        let bed = -15.0;
+        let h_ext = eta_ext - bed;
+        let chapman = Chapman2D::new(move |_, _, _| eta_ext, 100.0);
+        for un in [-0.01, 0.003, 0.02] {
+            let ctx = make_context_with_bed(h_ext + 0.05, un, 0.0, bed, (1.0, 0.0));
+            let ghost = chapman.ghost_state(&ctx);
+            let eta_ghost = ghost.h + bed;
+            let linear = eta_ext + (h_ext / G).sqrt() * un;
+            assert!(
+                (eta_ghost - linear - un * un / (4.0 * G)).abs() < 1e-12,
+                "η_ghost = {eta_ghost}, linear form {linear}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chapman_ghost_outward_mass_flux_for_elevated_interior() {
+        // Interior at rest but raised above η_ext: the Roe flux through the
+        // boundary face must carry mass out of the domain.
+        let chapman = Chapman2D::new(|_, _, _| 0.0, 100.0);
+        let ctx = make_context_with_bed(10.5, 0.0, 0.0, -10.0, (1.0, 0.0));
         let ghost = chapman.ghost_state(&ctx);
+        let flux = crate::flux::roe_flux_swe_2d(&ctx.interior_state, &ghost, ctx.normal, G, 1e-6);
+        assert!(flux.h > 0.0, "expected outward mass flux, got {}", flux.h);
+    }
 
-        assert!(ghost.h > 0.0, "Ghost depth should be positive");
-        assert!(ghost.h < 10.0, "Ghost should blend toward external");
+    #[test]
+    fn test_chapman_dry_ghost() {
+        // Bed above the external surface: nothing flows in from outside.
+        let chapman = Chapman2D::new(|_, _, _| 0.0, 100.0);
+        let ctx = make_context_with_bed(0.0, 0.0, 0.0, 2.0, (1.0, 0.0));
+        let ghost = chapman.ghost_state(&ctx);
+        assert!(
+            ghost.h <= 1e-6 + TOL,
+            "ghost should be dry, h = {}",
+            ghost.h
+        );
+
+        // Inflow faster than 2 sqrt(g h_ext) empties the ghost instead of
+        // wrapping round to a positive depth.
+        let ctx = make_context_with_bed(1.0, -10.0, 0.0, -1.0, (1.0, 0.0));
+        let ghost = chapman.ghost_state(&ctx);
+        assert!(
+            ghost.h <= 1e-6 + TOL,
+            "ghost should be dry, h = {}",
+            ghost.h
+        );
     }
 
     #[test]
@@ -454,20 +619,23 @@ mod tests {
     }
 
     #[test]
-    fn test_chapman_without_dt_clamps_to_external() {
-        // No dt on the BC or in the context: fall back to α = 1 (the dt → 0
-        // limit). Regression: the old fallback c·dt/dx = 1 gave α = 1/2,
-        // which is unstable in the weak DG setting.
-        let chapman = Chapman2D::new(|_, _, _| 7.0, 100.0);
-        let ctx = make_context(10.0, 0.0, 0.0, (1.0, 0.0)); // η_int = 10
-        assert!(ctx.dt.is_none());
-        let ghost = chapman.ghost_state(&ctx);
+    fn test_chapman_ignores_dt() {
+        // The Riemann solver supplies the radiation, so dt (on the BC or in
+        // the context) must not change the ghost. Regression: the old blend
+        // used α = 1/(1 + c·dt/dx) and was unstable for α ≲ 0.7.
+        let without = Chapman2D::new(|_, _, _| 0.1, 100.0);
+        let with_bc_dt = Chapman2D::with_dt(|_, _, _| 0.1, 100.0, 10.0);
+        let mut ctx = make_context_with_bed(10.4, 0.3, -0.2, -10.0, (1.0, 0.0));
+        let reference = without.ghost_state(&ctx);
 
-        assert!(
-            (ghost.h - 7.0).abs() < TOL,
-            "ghost elevation should be η_ext without dt, got {}",
-            ghost.h
-        );
+        let ghost = with_bc_dt.ghost_state(&ctx);
+        assert!((ghost.h - reference.h).abs() < TOL);
+        assert!((ghost.hu - reference.hu).abs() < TOL);
+
+        ctx.dt = Some(10.0);
+        let ghost = without.ghost_state(&ctx);
+        assert!((ghost.h - reference.h).abs() < TOL);
+        assert!((ghost.hu - reference.hu).abs() < TOL);
     }
 
     #[test]

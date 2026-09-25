@@ -8,8 +8,8 @@
 //! | BC Type | Description |
 //! |---------|-------------|
 //! | `Reflective2D` | Wall (no-flux), tangential velocity preserved |
-//! | `Radiation2D` | Sommerfeld absorbing condition |
-//! | `Chapman2D` | Blended sea surface height (reflective in DG, see its docs) |
+//! | `Radiation2D` | Characteristic condition towards a constant far field (η_ext, u_ext) |
+//! | `Chapman2D` | Chapman radiation of η towards η_ext (velocity extrapolated) |
 //! | `Flather2D` | Characteristic (Flather) open boundary |
 //! | `ChapmanFlather2D` | Flather with time-varying external (η, u_n) |
 //! | `HarmonicTidal2D` | Harmonic constituents (Dirichlet) |
@@ -36,11 +36,18 @@
 //! `u_n = u_n,ext + sqrt(g/h)(η − η_ext)` is precisely "`w−` from outside,
 //! `w+` from inside", so the Flather-type BCs (`Flather2D`,
 //! `HarmonicFlather2D`, `ChapmanFlather2D`, `TSTOBC2D`, `NestingBC2D`,
-//! `OceanNestingBC2D`) use the external state itself as ghost:
-//! `h = η_ext − B`, `u_n = u_n,ext`, `u_t` from the interior or external data.
-//! Adding the Flather correction to the ghost as well applies it twice and
-//! reflects outgoing waves (coefficient −1/3); see
+//! `OceanNestingBC2D`, and `Radiation2D` with constant data) use the external
+//! state itself as ghost: `h = η_ext − B`, `u_n = u_n,ext`, `u_t` from the
+//! interior or external data. Adding the Flather correction to the ghost as
+//! well applies it twice and reflects outgoing waves (coefficient −1/3); see
 //! `tests/open_boundary_flather_test.rs`.
+//!
+//! `Chapman2D` imposes the same incoming invariant (with `u_n,ext = 0`) but
+//! keeps the interior velocity and adjusts the ghost elevation instead, which
+//! makes the ghost equal to the interior trace for an outgoing simple wave.
+//! Any ghost that takes the incoming invariant from the interior — zero-gradient
+//! extrapolation, or blending η_int into the ghost — either reflects outgoing
+//! waves or feeds energy in through the incoming characteristic.
 //!
 //! With zero external velocity (the default for the elevation-only BCs) the
 //! boundary elevation equals η_ext only where the boundary sits at an antinode
@@ -52,8 +59,9 @@
 //!
 //! # IMPORTANT: Bathymetry Convention for Flather BCs
 //!
-//! Flather-type BCs (`Flather2D`, `HarmonicFlather2D`, `ChapmanFlather2D`) use
-//! surface elevation η = h + B where B is bathymetry.
+//! Flather-type BCs (`Flather2D`, `HarmonicFlather2D`, `ChapmanFlather2D`,
+//! `Chapman2D`, `Radiation2D`) use surface elevation η = h + B where B is
+//! bathymetry.
 //!
 //! **You MUST set bathymetry correctly** to avoid spurious velocities:
 //!
