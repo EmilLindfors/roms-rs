@@ -48,7 +48,8 @@ use super::traits::{PhysicsModule, PhysicsModuleInfo};
 /// A run has wetting/drying when it has a positivity limiter
 /// (`StandardLimiter2D::Positivity`/`KuzminWithPositivity`) or a
 /// [`WetDryConfig`] (`with_wet_dry`). Then:
-/// - the interface flux defaults to HLL (Roe is not positivity preserving);
+/// - the formulation defaults to `SWEFormulation2D::WetDry`, and the interface
+///   flux of `Standard` to HLL (Roe is not positivity preserving);
 /// - `max_cfl` reports `positivity_cfl_swe_2d(N)`, which `Simulation` enforces;
 /// - after every RK stage, depths are limited to h ≥ 0 and near-dry velocities
 ///   desingularized ([`crate::solver::apply_wet_dry_correction_all`]);
@@ -59,10 +60,12 @@ use super::traits::{PhysicsModule, PhysicsModuleInfo};
 /// Elements whose mean depth went negative anyway are emptied (creating mass)
 /// and counted in [`SWEPhysics2D::negative_depth_clips`].
 ///
-/// For wet/dry runs use `SWEFormulation2D::WetDry` (well-balanced at shorelines;
-/// its dry-node threshold is `WetDryConfig::h_dry`), or `Standard` with
-/// hydrostatic reconstruction. `EntropyStable`/`EntropyConservative` have no
-/// wet/dry interface treatment.
+/// `SWEFormulation2D::WetDry` is exactly well-balanced at shorelines and
+/// more accurate on moving shorelines than `Standard` with hydrostatic
+/// reconstruction; its dry-node threshold is `WetDryConfig::h_dry`. It
+/// includes the bed slope, so the source terms must not contain
+/// `BathymetrySource2D`. `EntropyStable`/`EntropyConservative` have no wet/dry
+/// interface treatment.
 pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     /// The mesh
     pub mesh: Arc<Mesh2D>,
@@ -270,7 +273,7 @@ pub struct SWEPhysics2DBuilder<BC: SWEBoundaryCondition2D> {
     bathymetry: Option<Arc<Bathymetry2D>>,
     limiter: StandardLimiter2D,
     well_balanced: bool,
-    formulation: SWEFormulation2D,
+    formulation: Option<SWEFormulation2D>,
     wet_dry: Option<WetDryConfig>,
     friction: Option<Arc<dyn BottomFriction2D>>,
     order: usize,
@@ -297,7 +300,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             bathymetry: None,
             limiter: StandardLimiter2D::default(),
             well_balanced: false,
-            formulation: SWEFormulation2D::default(),
+            formulation: None,
             wet_dry: None,
             friction: None,
             order,
@@ -346,10 +349,13 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
 
     /// Set the spatial formulation of the SWE operator.
     ///
-    /// The split-form formulations include the bed slope in the operator, so
-    /// the source terms must not contain `BathymetrySource2D`.
+    /// Default: `WetDry` for runs with wetting/drying (a positivity limiter or
+    /// [`Self::with_wet_dry`]), `Standard` otherwise. The split-form
+    /// formulations include the bed slope in the operator, so the source terms
+    /// must not contain `BathymetrySource2D`; choose `Standard` (with
+    /// [`Self::with_well_balanced`]) to keep it.
     pub fn with_formulation(mut self, formulation: SWEFormulation2D) -> Self {
-        self.formulation = formulation;
+        self.formulation = Some(formulation);
         self
     }
 
@@ -381,8 +387,28 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
     }
 
     /// Build the physics module.
+    ///
+    /// # Panics
+    /// If a wet/dry run leaves the formulation at its default (`WetDry`) but
+    /// its source terms contain `BathymetrySource2D`, which would count the
+    /// bed slope twice.
     pub fn build(self) -> SWEPhysics2D<BC> {
         let wetting_drying = self.wet_dry.is_some() || self.limiter.preserves_positivity();
+        let formulation = self.formulation.unwrap_or_else(|| {
+            if !wetting_drying {
+                return SWEFormulation2D::Standard;
+            }
+            assert!(
+                !self
+                    .source
+                    .as_ref()
+                    .is_some_and(|s| s.includes_bathymetry_slope()),
+                "wet/dry runs default to SWEFormulation2D::WetDry, which includes the \
+                 bed slope: remove BathymetrySource2D from the sources, or keep it with \
+                 .with_formulation(SWEFormulation2D::Standard)"
+            );
+            SWEFormulation2D::WetDry
+        });
         let flux = self.flux.unwrap_or(if wetting_drying {
             StandardFlux2D::HLL
         } else {
@@ -406,7 +432,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             bathymetry: self.bathymetry,
             limiter: self.limiter,
             well_balanced: self.well_balanced,
-            formulation: self.formulation,
+            formulation,
             wet_dry: self.wet_dry,
             friction: self.friction,
             order: self.order,
@@ -499,20 +525,22 @@ mod tests {
             )
         };
 
-        // Fully wet run: Roe, no CFL cap
+        // Fully wet run: Standard with Roe, no CFL cap
         let wet = builder().build();
+        assert_eq!(wet.formulation, SWEFormulation2D::Standard);
         assert_eq!(wet.flux, StandardFlux2D::Roe);
         assert!(!wet.has_wetting_drying());
         assert_eq!(wet.max_cfl(), None);
 
         // Wetting/drying via the wet/dry treatment or a positivity limiter:
-        // HLL and the positivity CFL (order 2)
+        // WetDry, HLL (for Standard) and the positivity CFL (order 2)
         for physics in [
             builder().with_wet_dry_correction(true).build(),
             builder()
                 .with_limiter(StandardLimiter2D::Positivity(1e-3))
                 .build(),
         ] {
+            assert_eq!(physics.formulation, SWEFormulation2D::WetDry);
             assert_eq!(physics.flux, StandardFlux2D::HLL);
             assert_eq!(physics.max_cfl(), Some(positivity_cfl_swe_2d(2)));
         }
@@ -520,13 +548,32 @@ mod tests {
         // An explicit choice wins
         let rusanov = builder()
             .with_wet_dry_correction(true)
+            .with_formulation(SWEFormulation2D::Standard)
+            .with_source(crate::source::BathymetrySource2D::new(9.81))
             .with_flux(StandardFlux2D::Rusanov)
             .build();
+        assert_eq!(rusanov.formulation, SWEFormulation2D::Standard);
         assert_eq!(rusanov.flux, StandardFlux2D::Rusanov);
         assert_eq!(
             rusanov.wet_dry.unwrap().h_dry,
             Depth::new(WetDryConfig::DEFAULT_H_DRY)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "remove BathymetrySource2D")]
+    fn test_wet_dry_default_rejects_bathymetry_source() {
+        let (mesh, ops, geom) = create_test_components();
+        PhysicsBuilder::swe_2d(
+            mesh,
+            ops,
+            geom,
+            ShallowWater2D::new(9.81),
+            Reflective2D::default(),
+        )
+        .with_wet_dry_correction(true)
+        .with_source(crate::source::BathymetrySource2D::new(9.81))
+        .build();
     }
 
     #[test]

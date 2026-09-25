@@ -6,13 +6,23 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Second-order subcell finite volumes for `SWEFormulation2D::WetDry` (TODO P1.2).**
+  - Partially dry elements reconstruct `h`, `η`, `u` and `v` linearly on their GLL subcells, with a monotonized-central limiter on the non-uniform subcells. The end subcells take their outer slope neighbour from the adjacent element. Faces use the hydrostatic HLL flux on the reconstructed states, plus the second-order Audusse et al. (2004) bed term `−½g(h_L + h_R)(B_R − B_L)` (Rueda-Ramírez et al. 2021 for subcell reconstruction).
+  - Face depths stay between neighbouring node values (h ≥ 0). A shoreline lake at rest is still kept to round-off, and mass is conserved exactly.
+  - With subcells forced in every element, the scheme converges at second order: P1/P2/P3 1.90/1.87/1.92. Without the reconstruction the rate falls to 0.68 at P2.
+  - Thacker's paraboloid over one period, L1 depth error at 40²:
+    - P2: 1.2 % (was 4.8 %), P1: 3.2 % (was 6.0 %).
+    - `WetDry` is now more accurate than `Standard` at every order: P1 3.2 % vs 10 %, P2 1.2 % vs 1.3 %, P3 0.9 % vs 1.8 %, P4 0.7 % vs 2.3 %.
+  - Also fixed: when both reconstructed depths are below `h_min`, the HLL flux returns zero, pressure included, and the hydrostatic correction now supplies all of `½g h²`. Before, lake at rest over films thinner than `h_min` was unbalanced.
+  - Tests: `test_convergence_swe_2d_wet_dry_subcells` and `test_wet_dry_lake_at_rest_with_films_below_h_min`; the Thacker `WetDry` bound is tightened from 9 % to 2 %.
+  - **`WetDry` is now the default for wet/dry runs in `SWEPhysics2DBuilder`.** A run counts as wet/dry when it has a positivity limiter or `with_wet_dry`. Fully wet runs still default to `Standard`. `WetDry` includes the bed slope, so `build()` panics with instructions if such a run leaves the formulation unset but adds `BathymetrySource2D`. To keep the old behaviour, add `.with_formulation(SWEFormulation2D::Standard)`. `SWE2DRhsConfig` (the low-level API) still defaults to `Standard`. The allocation test now covers both formulations, with a shoreline; `WetDry` allocates 0 B per warm step.
 - **`SWEFormulation2D::WetDry`: a wet/dry split form that is exactly well-balanced at shorelines (TODO P1.2, P1.7).**
   - Faces use HLL on Audusse hydrostatically reconstructed states, which is positivity preserving. The entropy-stable dissipation's mass flux `−½λ[[η]]` drains wet nodes next to dry ones, so it is not used.
   - Fully wet elements keep the flux-differencing volume term.
   - Elements with a node shallower than `SWE2DRhsConfig::h_dry` (set from `WetDryConfig::h_dry` by `SWEPhysics2D`) use a first-order finite-volume update on their GLL subcells, with the same reconstructed HLL flux (Hennemann et al. 2021, as in Trixi.jl). The subcell fluxes telescope, so mass is conserved and the element means stay positive.
   - A shoreline lake at rest is kept to round-off (P1–P4, smooth and rough beds, walls and periodic; 100 s runs through `Simulation`: |u| ≤ 6e-14 m/s). `Standard` leaves 5–11 cm/s where h > 1 cm, and m/s in the film.
   - Fully wet: N+1 convergence (P2 3.06, P3 4.02), energy dissipated, serial and parallel bitwise identical.
-  - Trade-off: on a moving shoreline `Standard` is about 3× more accurate (Thacker P2, 40²: 1.3 % vs 4.8 %, both converging at about second order), because shoreline elements drop to first order here.
+  - Trade-off at the time: on a moving shoreline `Standard` was about 3× more accurate (Thacker P2, 40²: 1.3 % vs 4.8 %), because the shoreline elements were first order. The second-order subcells (above) resolved this.
   - Tests: `test_wet_dry_lake_at_rest_with_shorelines`, `test_wet_dry_mass_conservation_with_dry_regions`, `test_convergence_swe_2d_wet_dry_split_form`; the P1.7 gate `lake_at_rest_with_shoreline_is_exact` is no longer ignored; Thacker and Ritter run under both formulations.
 - **Robust wetting and drying for the 2D SWE (TODO P1.2; REVIEW.md §1.5–§1.7, §1.9).**
   - Positivity towards h ≥ 0 instead of h ≥ h_min. The Zhang–Shu limiter used to raise dry nodes to h_min, which lowered the wet nodes of every shoreline element in every stage. The wet/dry correction used to rescale whole elements. A lake-at-rest shoreline is now left untouched. Elements whose mean depth is below the dry threshold lose their momentum but keep their depths (they used to be flattened). Negative-mean elements are still emptied, but the limiters now return how many (`swe_positivity_limiter_2d` & co. return `usize`, `StandardLimiter2D::apply_counting`, `SWEPhysics2D::negative_depth_clips`). The count stays 0 under the positivity CFL with HLL/Rusanov.

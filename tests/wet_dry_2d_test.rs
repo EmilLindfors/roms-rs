@@ -8,8 +8,8 @@
 //! Two formulations handle wetting and drying: `Standard` (collocated, with
 //! hydrostatic reconstruction at faces) and `WetDry` (split form, subcell
 //! finite volumes in partially dry elements). `WetDry` keeps a shoreline lake
-//! at rest to round-off, where `Standard` settles into a spurious circulation;
-//! `Standard` is about 3× more accurate for a moving shoreline (Thacker).
+//! at rest to round-off, where `Standard` settles into a spurious circulation,
+//! and is also slightly more accurate for a moving shoreline (Thacker, P2).
 //!
 //! Before P1.2 (same probes, HLL flux, `main` at 521ca1a): the shoreline lake
 //! at rest reached the 20 m/s velocity cap at P1 and P3 and 5.6 m/s at P2, with
@@ -260,8 +260,7 @@ impl Thacker {
 ///
 /// The dry threshold is 1e-5 m = 1e-4 of the 0.1 m bowl depth: the 1 mm
 /// field-scale default is 1 % of this laboratory case and dominates its
-/// error (7.4 % instead of 4.5 % for Standard at 20², 19.7 % instead of
-/// 17.3 % for WetDry).
+/// error (7.4 % instead of 4.5 % for Standard at 20²).
 fn thacker_one_period(formulation: SWEFormulation2D, n: usize) -> (f64, f64) {
     let case = Thacker::SWASHES;
     let period = 2.0 * PI / case.omega();
@@ -316,11 +315,11 @@ fn thacker_planar_oscillation_converges_standard() {
 
 #[test]
 fn thacker_planar_oscillation_converges_wet_dry() {
-    // Measured: 22.6 % / 7.3 % at 16² / 32² (rate 1.6), and 17.3 % / 4.8 %
-    // / 1.3 % at 20² / 40² / 80², about 3× Standard: every element the moving
-    // shoreline crosses drops to first-order subcell finite volumes.
-    // Max |u| where h > 1 cm: 0.91 m/s at 32².
-    check_thacker(SWEFormulation2D::WetDry, 0.09);
+    // Measured: 5.5 % / 1.7 % at 16² / 32² (rate 1.7), and 4.4 % / 1.2 %
+    // at 20² / 40². Every element the moving shoreline crosses uses subcell
+    // finite volumes; with first-order subcells (no reconstruction) this was
+    // 22.6 % / 7.3 %, about 3× Standard. Max |u| where h > 1 cm: 0.87 m/s at 32².
+    check_thacker(SWEFormulation2D::WetDry, 0.02);
 }
 
 // ---------------------------------------------------------------------------

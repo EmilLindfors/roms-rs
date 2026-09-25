@@ -1019,9 +1019,11 @@ impl dg_rs::SourceTerm2D for ManufacturedSource {
     }
 }
 
-/// L2 depth error of a split form on an n×n periodic mesh.
+/// L2 depth error of a split form on an n×n periodic mesh (`WetDry`: subcell
+/// finite volumes in elements with a node shallower than `h_dry`).
 fn run_swe_2d_split_form_manufactured(
     formulation: dg_rs::SWEFormulation2D,
+    h_dry: f64,
     n: usize,
     order: usize,
     t_final: f64,
@@ -1042,7 +1044,8 @@ fn run_swe_2d_split_form_manufactured(
         .with_coriolis(false)
         .with_formulation(formulation)
         .with_bathymetry(&bathymetry)
-        .with_source_terms(&source);
+        .with_source_terms(&source)
+        .with_dry_threshold(h_dry);
 
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
     q.set_from_functions(&mesh, &ops, |x, y| depth(x, y, 0.0), |_, _| U, |_, _| V);
@@ -1081,14 +1084,26 @@ fn check_split_form_convergence(
     cfl: f64,
     min_order: f64,
 ) {
+    check_split_form_convergence_with(formulation, 0.0, &[4, 8, 16], order, cfl, min_order);
+}
+
+fn check_split_form_convergence_with(
+    formulation: dg_rs::SWEFormulation2D,
+    h_dry: f64,
+    resolutions: &[usize],
+    order: usize,
+    cfl: f64,
+    min_order: f64,
+) {
     let t_final = 0.1;
-    let resolutions = [4, 8, 16];
     let errors: Vec<f64> = resolutions
         .iter()
-        .map(|&n| run_swe_2d_split_form_manufactured(formulation, n, order, t_final, cfl))
+        .map(|&n| run_swe_2d_split_form_manufactured(formulation, h_dry, n, order, t_final, cfl))
         .collect();
 
-    println!("\nSWE 2D split form {formulation:?} P{order} (manufactured, bathymetry):");
+    println!(
+        "\nSWE 2D split form {formulation:?} P{order}, h_dry = {h_dry:e} (manufactured, bathymetry):"
+    );
     for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
         if i > 0 {
             let observed = (errors[i - 1] / err).log2();
@@ -1122,4 +1137,23 @@ fn test_convergence_swe_2d_wet_dry_split_form() {
     // Fully wet: flux differencing with hydrostatic-HLL faces keeps N+1
     check_split_form_convergence(dg_rs::SWEFormulation2D::WetDry, 2, 0.1, 2.5);
     check_split_form_convergence(dg_rs::SWEFormulation2D::WetDry, 3, 0.05, 3.5);
+}
+
+#[test]
+fn test_convergence_swe_2d_wet_dry_subcells() {
+    // Subcell finite volumes forced in every element (every node is "dry"
+    // below an infinite threshold): the limited linear reconstruction on the
+    // GLL subcells converges at second order for any N. Measured 8 → 16:
+    // P1 1.90, P2 1.87, P3 1.92 (1.96 / 1.90 / 2.04 from 16 → 32). Without the
+    // reconstruction: P2 1.37, then 0.68 from 16 → 32.
+    for order in 1..=3 {
+        check_split_form_convergence_with(
+            dg_rs::SWEFormulation2D::WetDry,
+            f64::INFINITY,
+            &[4, 8, 16],
+            order,
+            0.2,
+            1.7,
+        );
+    }
 }
