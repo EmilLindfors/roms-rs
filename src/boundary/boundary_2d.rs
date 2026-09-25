@@ -220,16 +220,32 @@ impl SWEBoundaryCondition2D for Reflective2D {
 
 /// Radiation (absorbing) boundary condition for 2D.
 ///
-/// Implements a Sommerfeld-type radiation condition that allows waves
-/// to exit the domain without reflection. Based on characteristics.
+/// Lets outgoing waves leave while holding the far field at a fixed
+/// reference state (η_ext, u_ext), usually still water at mean sea level.
 ///
-/// u_n = ±c * (h - h_ext) / h_ext
+/// # Weak (ghost-state) formulation
 ///
-/// where c = sqrt(gh) is the wave speed and h_ext is the external depth.
+/// At a subcritical boundary the upwind Riemann solver takes the outgoing
+/// Riemann invariant `w+ = u_n + sqrt(g/h) η` from the interior trace and the
+/// incoming one `w− = u_n − sqrt(g/h) η` from the ghost. A radiation
+/// condition prescribes `w−` from the reference state, so the ghost is simply
+/// that state:
+///
+/// - h = η_ext − B (depth convention h = η − B, so the reference level is
+///   the same over any bathymetry)
+/// - u_n = u_n,ext
+/// - u_t from the interior
+///
+/// This is [`Flather2D`] with a constant external elevation.
+///
+/// Returning the interior state as the ghost (zero-gradient extrapolation)
+/// takes `w−` from the interior as well. Nothing then pins the far-field
+/// level: an outgoing pulse reflected ~10% and the channel grew to ~50× the
+/// pulse amplitude within 200 s (see `tests/open_boundary_flather_test.rs`).
 #[derive(Clone, Debug)]
 pub struct Radiation2D {
-    /// External (far-field) water depth
-    pub h_external: f64,
+    /// External (far-field) surface elevation η_ext (m)
+    pub eta_external: f64,
     /// External (far-field) velocity (typically zero)
     pub u_external: (f64, f64),
     /// Minimum depth
@@ -237,63 +253,59 @@ pub struct Radiation2D {
 }
 
 impl Radiation2D {
-    /// Create a new radiation BC with specified external depth.
-    pub fn new(h_external: f64) -> Self {
+    /// Radiate towards still water at mean sea level (η_ext = 0, u_ext = 0).
+    pub fn still_water() -> Self {
+        Self::with_elevation(0.0)
+    }
+
+    /// Radiate towards still water at surface elevation `eta_external`.
+    pub fn with_elevation(eta_external: f64) -> Self {
         Self {
-            h_external,
+            eta_external,
             u_external: (0.0, 0.0),
             h_min: 1e-6,
         }
     }
 
-    /// Create with external depth and velocity.
-    pub fn with_velocity(h_external: f64, u_external: (f64, f64)) -> Self {
-        Self {
-            h_external,
-            u_external,
-            h_min: 1e-6,
-        }
+    /// Set the far-field velocity (u, v).
+    pub fn with_external_velocity(mut self, u_external: (f64, f64)) -> Self {
+        self.u_external = u_external;
+        self
+    }
+}
+
+impl Default for Radiation2D {
+    fn default() -> Self {
+        Self::still_water()
     }
 }
 
 impl SWEBoundaryCondition2D for Radiation2D {
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
-        let h_int = ctx.interior_state.h;
+        use std::sync::atomic::AtomicBool;
+        static WARNED: AtomicBool = AtomicBool::new(false);
+
         let (nx, ny) = ctx.normal;
-        let g = ctx.g;
 
-        // Use characteristic-based approach
-        // For outgoing waves, use interior state
-        // For incoming waves, use external state
-        let c_int = (g * h_int.max(0.0)).sqrt();
-        let (u_int, v_int) = ctx.interior_velocity();
-        let un_int = u_int * nx + v_int * ny;
+        warn_once_if_misconfigured(
+            &WARNED,
+            "Radiation2D",
+            ctx.interior_state.h,
+            ctx.bathymetry,
+            self.eta_external,
+        );
 
-        // Outgoing characteristic: un + 2c (positive for outflow)
-        // Incoming characteristic: un - 2c (negative for inflow)
-        if un_int + c_int > 0.0 {
-            // Outgoing - extrapolate interior
-            ctx.interior_state
-        } else {
-            // Incoming - use external with radiation condition
-            let c_ext = (g * self.h_external.max(0.0)).sqrt();
-            let (u_ext, v_ext) = self.u_external;
-            let un_ext = u_ext * nx + v_ext * ny;
-            let _ut_ext = -u_ext * ny + v_ext * nx;
+        // Ghost = external state; the Riemann solver takes the outgoing
+        // invariant from the interior and the incoming one from here.
+        let h_ghost = (self.eta_external - ctx.bathymetry).max(self.h_min);
+        let (u_ext, v_ext) = self.u_external;
+        let un_ghost = u_ext * nx + v_ext * ny;
+        let ut_ghost = ctx.interior_tangential_velocity();
 
-            // Sommerfeld condition: incoming characteristic from exterior
-            let un_ghost =
-                un_ext - c_ext * (self.h_external - h_int) / self.h_external.max(self.h_min);
+        let u_ghost = un_ghost * nx - ut_ghost * ny;
+        let v_ghost = un_ghost * ny + ut_ghost * nx;
 
-            // Preserve tangential velocity from interior
-            let ut_ghost = ctx.interior_tangential_velocity();
-
-            // Convert back to (u, v)
-            let u_ghost = un_ghost * nx - ut_ghost * ny;
-            let v_ghost = un_ghost * ny + ut_ghost * nx;
-
-            SWEState2D::from_primitives(self.h_external, u_ghost, v_ghost)
-        }
+        SWEState2D::from_primitives(h_ghost, u_ghost, v_ghost)
     }
 
     fn name(&self) -> &'static str {
@@ -1423,82 +1435,97 @@ mod tests {
     // Radiation2D tests
     // ====================================================================
 
-    #[test]
-    fn test_radiation_still_water() {
-        let bc = Radiation2D::new(2.0);
-        let ctx = make_context(2.0, 0.0, 0.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
-
-        // un=0, c=sqrt(G*2), un+c > 0 → outgoing → ghost = interior
-        assert!((ghost.h - 2.0).abs() < TOL);
-        assert!(ghost.hu.abs() < TOL);
-        assert!(ghost.hv.abs() < TOL);
+    fn radiation_context(
+        h: f64,
+        u: f64,
+        v: f64,
+        bathymetry: f64,
+        normal: (f64, f64),
+    ) -> BCContext2D {
+        BCContext2D::new(
+            0.0,
+            (0.0, 0.0),
+            SWEState2D::from_primitives(h, u, v),
+            bathymetry,
+            normal,
+            G,
+            H_MIN,
+        )
     }
 
     #[test]
-    fn test_radiation_outgoing_wave() {
-        let bc = Radiation2D::new(2.0);
-        // h=2, u=5, v=0 → hu=10
-        let ctx = make_context(2.0, 10.0, 0.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
-
-        // un=5, c=sqrt(20)≈4.47, un+c>0 → outgoing → ghost = interior
-        assert!((ghost.h - 2.0).abs() < TOL);
-        assert!((ghost.hu - 10.0).abs() < TOL);
-        assert!(ghost.hv.abs() < TOL);
+    fn test_radiation_still_water_is_balanced_over_any_bed() {
+        // Interior at rest at mean sea level: the ghost must equal the
+        // interior, so the boundary flux carries no spurious wave.
+        let bc = Radiation2D::still_water();
+        for bed in [-2.0, -50.0, -400.0] {
+            let ctx = radiation_context(-bed, 0.0, 0.0, bed, (1.0, 0.0));
+            let ghost = bc.ghost_state(&ctx);
+            assert!(
+                (ghost.h + bed).abs() < TOL,
+                "bed {bed}: ghost h {}",
+                ghost.h
+            );
+            assert!(ghost.hu.abs() < TOL);
+            assert!(ghost.hv.abs() < TOL);
+        }
     }
 
     #[test]
-    fn test_radiation_incoming_wave() {
-        let bc = Radiation2D::new(2.0);
-        // h=2, u=-10, v=0 → hu=-20
-        let ctx = make_context(2.0, -20.0, 0.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
+    fn test_radiation_ghost_depth_from_reference_elevation() {
+        // h_ghost = η_ext − B, independent of the interior elevation.
+        let bc = Radiation2D::with_elevation(0.3);
+        for eta_int in [-0.5, 0.0, 1.2] {
+            let ctx = radiation_context(50.0 + eta_int, 0.0, 0.0, -50.0, (1.0, 0.0));
+            let ghost = bc.ghost_state(&ctx);
+            assert!(
+                (ghost.h - 50.3).abs() < TOL,
+                "η_int {eta_int}: ghost h {}",
+                ghost.h
+            );
+        }
+    }
 
-        // un=-10, c=sqrt(20)≈4.47, un+c<0 → incoming
-        // h_ext=h_int=2, so Sommerfeld correction = 0
-        // ghost depth = h_external = 2, velocity from Sommerfeld
-        assert!((ghost.h - 2.0).abs() < TOL);
-        // un_ghost = un_ext - c_ext*(h_ext - h_int)/h_ext = 0 - 0 = 0
-        assert!(ghost.hu.abs() < TOL);
-        assert!(ghost.hv.abs() < TOL);
+    /// Regression: the old ghost was the interior state whenever
+    /// `u_n + c > 0`, i.e. zero-gradient extrapolation for any subcritical
+    /// flow, so the incoming invariant came from the interior.
+    #[test]
+    fn test_radiation_does_not_extrapolate_interior() {
+        let bc = Radiation2D::still_water();
+        // Outflow at 0.5 m/s with a 0.2 m raised surface over a 10 m bed.
+        let ctx = radiation_context(10.2, 0.5, 0.0, -10.0, (1.0, 0.0));
+        let ghost = bc.ghost_state(&ctx);
+        assert!((ghost.h - 10.0).abs() < TOL);
+        assert!(ghost.hu.abs() < TOL, "ghost normal momentum {}", ghost.hu);
     }
 
     #[test]
     fn test_radiation_velocity_decomposition() {
-        let bc = Radiation2D::new(2.0);
         let sqrt2_inv = 1.0 / 2.0_f64.sqrt();
-        // h=2, u=-10, v=3 → hu=-20, hv=6
-        let ctx = make_context(2.0, -20.0, 6.0, (sqrt2_inv, sqrt2_inv));
+        let (nx, ny) = (sqrt2_inv, sqrt2_inv);
+        let bc = Radiation2D::still_water().with_external_velocity((1.0, 0.0));
+        // Interior u = (-10, 3): tangential component 13/√2.
+        let ctx = radiation_context(2.0, -10.0, 3.0, -2.0, (nx, ny));
         let ghost = bc.ghost_state(&ctx);
 
-        // un = (-10+3)/√2 = -7/√2 ≈ -4.95, c = √20 ≈ 4.47
-        // un+c < 0 → incoming branch
-        // Tangential from interior: ut = 10/√2 + 3/√2 = 13/√2
-        let (nx, ny) = (sqrt2_inv, sqrt2_inv);
         let u_ghost = ghost.hu / ghost.h;
         let v_ghost = ghost.hv / ghost.h;
+        let un_ghost = u_ghost * nx + v_ghost * ny;
         let ut_ghost = -u_ghost * ny + v_ghost * nx;
-        let ut_int = 10.0 * sqrt2_inv + 3.0 * sqrt2_inv; // -(-10)*ny + 3*nx
 
-        assert!(
-            (ut_ghost - ut_int).abs() < TOL,
-            "Tangential velocity should be preserved: got {}, expected {}",
-            ut_ghost,
-            ut_int
-        );
+        // Normal component from the external velocity, tangential from the
+        // interior.
+        assert!((un_ghost - sqrt2_inv).abs() < TOL, "u_n {un_ghost}");
+        assert!((ut_ghost - 13.0 * sqrt2_inv).abs() < TOL, "u_t {ut_ghost}");
     }
 
     #[test]
-    fn test_radiation_deep_water() {
-        let bc = Radiation2D::new(100.0);
-        // h=100, u=1, v=0 → hu=100
-        let ctx = make_context(100.0, 100.0, 0.0, (1.0, 0.0));
+    fn test_radiation_dry_reference_clamps_depth() {
+        // Reference level below the bed: ghost depth clamps to h_min.
+        let bc = Radiation2D::with_elevation(-3.0);
+        let ctx = radiation_context(1.0, 0.0, 0.0, -1.0, (1.0, 0.0));
         let ghost = bc.ghost_state(&ctx);
-
-        // un=1, c=sqrt(G*100)≈31.6, un+c>0 → outgoing → ghost = interior
-        assert!((ghost.h - 100.0).abs() < TOL);
-        assert!((ghost.hu - 100.0).abs() < TOL);
-        assert!(ghost.hv.abs() < TOL);
+        assert!(ghost.h > 0.0 && ghost.h <= 1e-6 + TOL);
+        assert!(ghost.hu.abs() < TOL);
     }
 }

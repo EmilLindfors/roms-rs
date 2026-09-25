@@ -8,7 +8,7 @@
 //! | BC Type | Description |
 //! |---------|-------------|
 //! | `Reflective2D` | Wall (no-flux), tangential velocity preserved |
-//! | `Radiation2D` | Sommerfeld absorbing condition |
+//! | `Radiation2D` | Characteristic radiation towards still water at η_ext |
 //! | `Chapman2D` | Blended sea surface height (reflective in DG, see its docs) |
 //! | `Flather2D` | Characteristic (Flather) open boundary |
 //! | `ChapmanFlather2D` | Flather with time-varying external (η, u_n) |

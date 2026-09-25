@@ -29,7 +29,7 @@
 
 use dg_rs::boundary::{
     Chapman2D, ChapmanFlather2D, Flather2D, HarmonicFlather2D, MultiBoundaryCondition2D,
-    NestingBC2D, Reflective2D, SWEBoundaryCondition2D, TSTConfig, TSTOBC2D,
+    NestingBC2D, Radiation2D, Reflective2D, SWEBoundaryCondition2D, TSTConfig, TSTOBC2D,
 };
 use dg_rs::io::{BoundaryTimeSeries, TimeSeriesRecord};
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag};
@@ -268,6 +268,81 @@ fn nesting_bc_outgoing_pulse_does_not_reflect() {
         let bc = with_walls(&nesting);
         assert_no_reflection(name, outgoing_pulse_reflection(&bc));
     }
+}
+
+#[test]
+fn radiation2d_outgoing_pulse_does_not_reflect() {
+    let radiation = Radiation2D::still_water();
+    let bc = with_walls(&radiation);
+    assert_no_reflection("Radiation2D", outgoing_pulse_reflection(&bc));
+}
+
+// ---------------------------------------------------------------------------
+// Long run after the pulse has left: no late reflection, no growth
+// ---------------------------------------------------------------------------
+
+/// By this time the pulse (and its tail) has left through the east end.
+const PULSE_EXIT_TIME: f64 = 50.0;
+/// Three channel crossings after the pulse has left. A boundary that takes
+/// the incoming Riemann invariant from the interior instead of from outside
+/// has no restoring mechanism, so small errors drift or grow unchecked.
+const QUIET_T_END: f64 = 200.0;
+
+/// Launch the right-going pulse and return the largest |η| in the channel
+/// over `[PULSE_EXIT_TIME, QUIET_T_END]`, relative to the pulse amplitude.
+/// NaN counts as unbounded.
+fn max_eta_after_pulse_exit<BC: SWEBoundaryCondition2D>(bc: &BC) -> f64 {
+    let ch = Channel::new(BoundaryTag::Open, BoundaryTag::Open);
+    let eta0 = |x: f64| PULSE_AMP * (-((x - PULSE_X0) / PULSE_WIDTH).powi(2)).exp();
+    let u0 = |x: f64| 2.0 * ((G * (H0 + eta0(x))).sqrt() - celerity());
+    let mut q = ch.initial_state(eta0, u0);
+
+    let mut max_eta: f64 = 0.0;
+    ch.run(bc, &mut q, QUIET_T_END, |q, t| {
+        if t < PULSE_EXIT_TIME {
+            return;
+        }
+        for k in 0..ch.mesh.n_elements {
+            for i in 0..ch.ops.n_nodes {
+                let eta = q.get_state(ElementIndex::new(k), i).h - H0;
+                max_eta = if eta.is_nan() {
+                    f64::INFINITY
+                } else {
+                    max_eta.max(eta.abs())
+                };
+            }
+        }
+    });
+    max_eta / PULSE_AMP
+}
+
+fn assert_stays_quiet(name: &str, after_exit: f64) {
+    println!(
+        "{name}: max |η| over [{PULSE_EXIT_TIME}, {QUIET_T_END}] s = {after_exit:.2e} × pulse"
+    );
+    assert!(
+        after_exit < MAX_REFLECTION,
+        "{name}: |η| reached {after_exit:.3e} × the pulse amplitude between \
+         {PULSE_EXIT_TIME} s and {QUIET_T_END} s (limit {MAX_REFLECTION})"
+    );
+}
+
+/// Regression: `Radiation2D` returned the interior state as the ghost whenever
+/// `u_n + c > 0`, i.e. for every subcritical flow. That is zero-gradient
+/// extrapolation: the incoming invariant comes from the interior, so nothing
+/// pins the far-field level.
+#[test]
+fn radiation2d_stays_quiet_after_pulse_exits() {
+    let radiation = Radiation2D::still_water();
+    let bc = with_walls(&radiation);
+    assert_stays_quiet("Radiation2D", max_eta_after_pulse_exit(&bc));
+}
+
+#[test]
+fn flather2d_stays_quiet_after_pulse_exits() {
+    let flather = Flather2D::new(|_, _, _| 0.0, H0);
+    let bc = with_walls(&flather);
+    assert_stays_quiet("Flather2D", max_eta_after_pulse_exit(&bc));
 }
 
 /// `Chapman2D` is not a Flather BC (it never touches the normal velocity),

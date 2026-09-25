@@ -133,7 +133,13 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Spatially varying tidal forcing: a TPXO/FES reader, or boundary harmonics from NorKyst. Uniform-phase forcing is wrong by ~30° of M2 phase along 200 km.
 - [ ] A `ModelClock { epoch_unix }` threaded through BCs, forcing, NetCDF output (writer time units, `netcdf_io.rs:241` vs `:397`) and validation (`tide_gauge.rs:234-239` compares by length only).
 - [ ] Nodal f/u at the run or record midpoint, not frozen at the epoch; guard against double application.
-- [ ] Wire `SWE2DRhsConfig::with_dt` (no callers, so Chapman always runs α = 0.5). Relabel or fix "Chapman" (relaxation, not radiation), TST's "subtidal" term, and `Radiation2D` (driven by h, not η).
+- [ ] **One characteristic OBC.** Flather, Chapman, radiation, TST and nesting differ only in the external data that sets the incoming invariant `w− = u_n − 2√(gh)`; the outgoing `w+` always comes from the interior. Replace the per-type ghost logic with:
+  - a single `CharacteristicOBC` that builds the boundary state from the invariants (`u_b = ½(w+_int + w−_ext)`, `√(g h_b) = ¼(w+_int − w−_ext)`, u_t from the upwind side) and evaluates the flux as `F(q_b)·n`, so the result does not depend on the Riemann solver (ghost = external state is exact only for Roe; Lax–Friedrichs matches only at u = 0). The 1D `RadiationBC` (`radiation.rs`) already builds this state;
+  - external-state providers (constant/still water, harmonic tide, time series, nesting interpolation) in place of the BC zoo. Drop the finite-difference remnants: Chapman's elevation blend (a reflecting clamp in DG), TST's extra "subtidal" velocity, `NestingBC2D::flather_weight`, and `SWE2DRhsConfig::with_dt` (no callers);
+  - nesting relaxation in a sponge/FRS band (`source/`), not in the ghost; 1D characteristic OBCs reflect oblique incidence (~17 % at 45°);
+  - elevation-only forcing: take transports from NorKyst/TPXO, or assume an incoming progressive wave (`u_n,ext = −√(g/h) η_ext`); `u_ext = 0` delivers a progressive tide at half amplitude.
+  - Gate: extend `tests/open_boundary_flather_test.rs` to all three fluxes, oblique incidence and elevation-only forcing.
+  - Done: `Radiation2D` is now η-referenced still water (ghost = external state) instead of zero-gradient extrapolation.
 - [ ] Inverse-barometer consistency at open boundaries; cap Large–Pond Cd.
 
 ### P1.5 Nesting done properly (NorKyst/ROMS parent)

@@ -438,7 +438,7 @@ As a result, model and observation phases can be compared on different origins w
 - "Chapman" (`chapman.rs:129-137`) is relaxation toward external η, not radiation.
 - `SWE2DRhsConfig::with_dt` has **no callers** [V], so Chapman always runs with cfl = 1 and α = 0.5.
 - TST's "subtidal" term is only c·Δη/dx (≈ 6 % of Flather), with no frequency separation.
-- `Radiation2D` is driven by h rather than η, so it is bathymetry-blind. Orlanski is named but not implemented.
+- `Radiation2D` is driven by h rather than η, so it is bathymetry-blind. Orlanski is named but not implemented. (Fixed since: `Radiation2D` is η-referenced, and its ghost is the external state rather than the interior, which it used to return for all subcritical flow; an outgoing pulse reflected ~10 % and the channel grew to ~50× the pulse amplitude.)
 
 ### 4.7 [MEDIUM] Atmospheric forcing
 
