@@ -50,20 +50,31 @@
 //!   `h* = max(0, η − max(B⁻, B⁺))`. At lake at rest `F* = F(q⁻)·n`, wet or
 //!   dry, and its mass part is positivity preserving (h* ≤ h);
 //! - replaces the volume term of every element that has a node shallower than
-//!   `h_dry` by a first-order finite-volume update on the GLL subcells
-//!   (Hennemann et al. 2021), with the same reconstructed HLL flux at the
-//!   subcell interfaces and the physical flux `F(q)·m` at the element
-//!   boundary nodes:
+//!   `h_dry` by a second-order finite-volume update on the GLL subcells
+//!   (Hennemann et al. 2021; Rueda-Ramírez et al. 2021 for the reconstruction),
+//!   per GLL line and in both directions:
 //!
 //!   ```text
-//!   dq_a/dt = −(F̂_{a,a+1} − F̂_{a−1,a}) / w_a   (per GLL line, both directions)
+//!   dq_a/dt = −(F̂_{a,a+1} − F̂_{a−1,a} − S_a) / w_a
+//!   S_a     = −½g (h_a,L + h_a,R)(B_a,R − B_a,L) (0, m)
 //!   ```
+//!
+//!   Subcell `a` has width `w_a` (the GLL weight) and contains node `a`.
+//!   `h`, `η`, `u`, `v` are reconstructed linearly from the node values with a
+//!   monotonized-central limiter; end subcells take their outer neighbour
+//!   from the next element. `F̂` is the same hydrostatic HLL flux on the
+//!   reconstructed face states `q_a,L`, `q_a,R`, and `S_a` is the Audusse et al.
+//!   (2004) second-order bed term. At the element faces `F̂` is the physical
+//!   flux `F(q)·m` of the node, which the surface term replaces by `F*`.
 //!
 //!   The subcell fluxes telescope, so the element still exchanges exactly
 //!   `∓F*` with its neighbours (mass conservation, and the Zhang–Shu argument
-//!   for the element means). With the bed piecewise constant per subcell, the
-//!   hydrostatic reconstruction alone balances lake at rest, dry subcells
-//!   included.
+//!   for the element means). Face depths stay between neighbouring node
+//!   values (`h ≥ 0`), and lake at rest is kept to round-off, dry subcells
+//!   included (see [`reconstruct_subcell`]). On smooth flow the subcells
+//!   converge at second order (first order without the reconstruction, which
+//!   made `WetDry` about 3× less accurate than `Standard` on Thacker's
+//!   paraboloid at P2).
 //!
 //! Fully wet elements keep the flux-differencing volume term. The positivity
 //! limiter and wet/dry correction (`SWEPhysics2D`) still run after every stage.
@@ -80,6 +91,75 @@ use crate::source::HydrostaticReconstruction2D;
 use crate::types::ElementIndex;
 
 use super::swe_2d::{SWE2DRhsConfig, SWEFormulation2D};
+
+/// Limited slope of one variable at node `ξ` of a subcell spanning
+/// `[x_l, x_r]`, from the values at the neighbouring nodes `ξ_m < ξ < ξ_p`:
+/// the central slope, capped so that the face values `q + σ(x − ξ)` stay
+/// between the neighbouring node values (a monotonized-central limiter on the
+/// non-uniform GLL subcells); zero at an extremum.
+#[inline]
+fn limited_slope(q: [f64; 3], xi: [f64; 3], (x_l, x_r): (f64, f64)) -> f64 {
+    let (dm, dp) = (q[1] - q[0], q[2] - q[1]);
+    if dm * dp <= 0.0 {
+        return 0.0;
+    }
+    let central = (q[2] - q[0]) / (xi[2] - xi[0]);
+    // An end subcell has its face on the node, where the value is the node
+    // value; bound its slope on that side as the standard MC limiter does
+    // (face halfway to the neighbour), so that a round-off difference cannot
+    // let the central slope through
+    let bound = |dq: f64, face: f64, node: f64| {
+        let dx = if face > 0.0 { face } else { 0.5 * node };
+        (dq / dx).abs()
+    };
+    let bound = bound(dm, xi[1] - x_l, xi[1] - xi[0]).min(bound(dp, x_r - xi[1], xi[2] - xi[1]));
+    central.signum() * central.abs().min(bound)
+}
+
+/// Face states `(q_L, q_R)` of the subcell `[x_l, x_r]` around node `ξ`, from
+/// a limited linear reconstruction of `h`, `η = h + B`, `u` and `v` between
+/// the nodes `ξ_m < ξ < ξ_p` (second-order Audusse et al. 2004). The bed at
+/// a face is `B = η − h`.
+///
+/// Every face value lies between the neighbouring node values, so `h ≥ 0` at
+/// faces, and lake at rest (wet nodes at `η₀`, dry nodes with `B ≥ η₀`) stays
+/// balanced, also across shorelines:
+/// - at a wet node `η` is constant or has a minimum (a dry neighbour has
+///   `η = B ≥ η₀`), so its slope is zero and `h + B = η₀` at both faces;
+/// - at a dry node the depth has a minimum, so its face depths are zero, and
+///   its face beds `B = η` lie between `η₀` and neighbouring beds `≥ η₀`, so
+///   the hydrostatic reconstruction closes the interface to a wet side;
+/// - each side of an interface then sees the flux `½g h_face² (0, m)`, and
+///   these balance `S_a`: `½g(h_R² − h_L²) = −½g(h_L + h_R)(B_R − B_L)`.
+#[inline]
+fn reconstruct_subcell(
+    nodes: [&SWENodeState2D; 3],
+    xi: [f64; 3],
+    subcell: (f64, f64),
+) -> (SWENodeState2D, SWENodeState2D) {
+    let [m, c, p] = nodes;
+    let slope = |f: fn(&SWENodeState2D) -> f64| limited_slope([f(m), f(c), f(p)], xi, subcell);
+    let (s_h, s_eta, s_u, s_v) = (
+        slope(|n| n.h),
+        slope(SWENodeState2D::eta),
+        slope(|n| n.u),
+        slope(|n| n.v),
+    );
+    let at = |x: f64| {
+        let d = x - xi[1];
+        let h = (c.h + s_h * d).max(0.0);
+        let (u, v) = (c.u + s_u * d, c.v + s_v * d);
+        SWENodeState2D {
+            h,
+            hu: h * u,
+            hv: h * v,
+            u,
+            v,
+            b: c.eta() + s_eta * d - h,
+        }
+    };
+    (at(subcell.0), at(subcell.1))
+}
 
 /// Interface flux of a split form.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -98,6 +178,12 @@ pub(super) struct SplitFormWorkspace {
     nodes: Vec<SWENodeState2D>,
     /// RHS accumulator of the current element
     rhs: Vec<SWEState2D>,
+    /// Reconstructed (left, right) face states of the subcells of one line
+    faces: Vec<(SWENodeState2D, SWENodeState2D)>,
+    /// Per face node (`face · n_1d + fi`): the first interior node of the
+    /// neighbour element on the GLL line through it, and its distance from
+    /// the face in this element's reference coordinate (`None` at boundaries)
+    outer: Vec<Option<(SWENodeState2D, f64)>>,
 }
 
 impl SplitFormWorkspace {
@@ -105,11 +191,18 @@ impl SplitFormWorkspace {
         // Unused trailing capacity keeps workspaces of different threads off
         // shared cache lines (see `padded` in swe_2d.rs).
         const SLACK: usize = 4;
-        let mut nodes = Vec::with_capacity(n_nodes + SLACK);
-        nodes.resize(n_nodes, SWENodeState2D::default());
-        let mut rhs = Vec::with_capacity(n_nodes + SLACK);
-        rhs.resize(n_nodes, SWEState2D::zero());
-        Self { nodes, rhs }
+        fn padded<T: Clone>(n: usize, value: T) -> Vec<T> {
+            let mut v = Vec::with_capacity(n + SLACK);
+            v.resize(n, value);
+            v
+        }
+        let n_1d = (n_nodes as f64).sqrt().round() as usize;
+        Self {
+            nodes: padded(n_nodes, SWENodeState2D::default()),
+            rhs: padded(n_nodes, SWEState2D::zero()),
+            faces: padded(n_1d, Default::default()),
+            outer: padded(4 * n_1d, None),
+        }
     }
 }
 
@@ -206,10 +299,18 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let subcells = self
             .h_dry
             .is_some_and(|h_dry| ws.nodes.iter().any(|n| n.h < h_dry));
+        if subcells {
+            self.outer_nodes(k, ws);
+        }
         for line in 0..n1 {
             if subcells {
-                self.line_subcells(ws, |a| line * n1 + a, dir_r, g);
-                self.line_subcells(ws, |j| j * n1 + line, dir_s, g);
+                // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2
+                // and 3 list their nodes in reverse
+                let (rev, fwd) = (n1 - 1 - line, line);
+                let ends = [ws.outer[3 * n1 + rev], ws.outer[n1 + fwd]];
+                self.line_subcells(ws, |a| line * n1 + a, ends, dir_r, g);
+                let ends = [ws.outer[fwd], ws.outer[2 * n1 + rev]];
+                self.line_subcells(ws, |j| j * n1 + line, ends, dir_s, g);
             } else {
                 self.line_volume(ws, |a| line * n1 + a, dir_r, g);
                 self.line_volume(ws, |j| j * n1 + line, dir_s, g);
@@ -331,8 +432,13 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let norm = m.0.hypot(m.1);
         let unit = (m.0 / norm, m.1 / norm);
         let flux = norm * hll_flux_swe_2d(&a_star, &b_star, unit, g, h_min);
+        // HLL returns zero, without the pressure ½g h*², when both sides are
+        // below h_min (thin reconstructed subcell faces at a shoreline): the
+        // correction then restores all of ½g h²
+        let hll_dry = a_star.h <= h_min && b_star.h <= h_min;
         // Pressure as in F(q)·m = F#(q, q)·m (no dry cutoff)
         let correction = |h: f64, h_star: f64| {
+            let h_star = if hll_dry { 0.0 } else { h_star };
             let dp = 0.5 * g * (h * h - h_star * h_star);
             SWEState2D::new(0.0, dp * m.0, dp * m.1)
         };
@@ -342,20 +448,34 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         )
     }
 
-    /// Accumulate the subcell finite-volume update `−(F̂_{a,a+1} − F̂_{a−1,a})/w_a`
-    /// along one line of nodes `idx(0..n1)`: the hydrostatic HLL flux at the
-    /// subcell interfaces and the physical flux `F(q)·dir` at the two ends,
-    /// which the surface term then replaces by `F*`.
+    /// Accumulate the subcell finite-volume update along one line of nodes
+    /// `idx(0..n1)`:
+    ///
+    /// ```text
+    /// dq_a/dt = −(F̂_{a,a+1} − F̂_{a−1,a} − S_a) / w_a
+    /// S_a     = −½g (h_a,L + h_a,R)(B_a,R − B_a,L) (0, dir)
+    /// ```
+    ///
+    /// with the hydrostatic HLL flux on the reconstructed subcell face states
+    /// at the subcell interfaces, and the physical flux `F(q)·dir` at the two
+    /// ends, which the surface term then replaces by `F*`. See
+    /// [`reconstruct_subcell`] for the face states.
+    ///
+    /// `ends` are the outer neighbours of the two end nodes (see
+    /// [`SplitFormWorkspace::outer`]); an end subcell without one (physical
+    /// boundary) keeps its node state.
     #[inline]
     fn line_subcells(
         &self,
         ws: &mut SplitFormWorkspace,
         idx: impl Fn(usize) -> usize,
+        ends: [Option<(SWENodeState2D, f64)>; 2],
         dir: (f64, f64),
         g: f64,
     ) {
         let n1 = self.ops.n_1d;
         let w = &self.ops.weights_1d;
+        let xi = &self.ops.nodes_1d;
 
         let (first, last) = (idx(0), idx(n1 - 1));
         let (q_first, q_last) = (ws.nodes[first], ws.nodes[last]);
@@ -364,11 +484,77 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         ws.rhs[last] =
             ws.rhs[last] - (1.0 / w[n1 - 1]) * wintermeyer_flux_2d(&q_last, &q_last, dir, g);
 
+        // Face states. Subcell a spans [x_a, x_a + w_a] with x_0 = −1; the
+        // end nodes sit on the element faces, where the face value is the node
+        // value, and take their outer slope neighbour from the next element.
+        let mut x_left = -1.0;
+        for a in 0..n1 {
+            let q = ws.nodes[idx(a)];
+            let x_right = x_left + w[a];
+            let left = if a > 0 {
+                Some((ws.nodes[idx(a - 1)], xi[a - 1]))
+            } else {
+                ends[0].map(|(s, d)| (s, -1.0 - d))
+            };
+            let right = if a + 1 < n1 {
+                Some((ws.nodes[idx(a + 1)], xi[a + 1]))
+            } else {
+                ends[1].map(|(s, d)| (s, 1.0 + d))
+            };
+            ws.faces[a] = match (left, right) {
+                (Some((l, x_l)), Some((r, x_r))) => {
+                    reconstruct_subcell([&l, &q, &r], [x_l, xi[a], x_r], (x_left, x_right))
+                }
+                _ => (q, q),
+            };
+            x_left = x_right;
+        }
+
         for a in 0..n1 - 1 {
             let (ia, ib) = (idx(a), idx(a + 1));
-            let (f_a, f_b) = self.hydrostatic_hll(&ws.nodes[ia], &ws.nodes[ib], dir, g);
+            let (f_a, f_b) = self.hydrostatic_hll(&ws.faces[a].1, &ws.faces[a + 1].0, dir, g);
             ws.rhs[ia] = ws.rhs[ia] - (1.0 / w[a]) * f_a;
             ws.rhs[ib] = ws.rhs[ib] + (1.0 / w[a + 1]) * f_b;
+        }
+
+        // Bed-slope term, zero in subcells without a slope (B_L = B_R)
+        for (a, ((left, right), w_a)) in ws.faces.iter().zip(w).enumerate() {
+            let force = -0.5 * g * (left.h + right.h) * (right.b - left.b) / w_a;
+            let ia = idx(a);
+            ws.rhs[ia] = ws.rhs[ia] + SWEState2D::new(0.0, force * dir.0, force * dir.1);
+        }
+    }
+
+    /// Fill [`SplitFormWorkspace::outer`] for element `k`.
+    fn outer_nodes(&self, k: ElementIndex, ws: &mut SplitFormWorkspace) {
+        let ops = self.ops;
+        let n1 = ops.n_1d;
+        let h_min = self.config.equation.h_min.meters();
+        // Element height normal to a face (affine), in physical units / 2
+        let height = |e: usize, f: usize| self.geom.det_j[e] / self.geom.surface_j[e][f];
+        for face in 0..4 {
+            let neighbor = self.mesh.neighbor(k, face);
+            for fi in 0..n1 {
+                ws.outer[face * n1 + fi] = neighbor.map(|nb| {
+                    let nb_k = ElementIndex::new(nb.element);
+                    let nb_node = ops.face_nodes[nb.face][n1 - 1 - fi];
+                    // One node into the neighbour, normal to its face
+                    let inner = match nb.face {
+                        0 => nb_node + n1,
+                        1 => nb_node - 1,
+                        2 => nb_node - n1,
+                        _ => nb_node + 1,
+                    };
+                    let distance = (ops.nodes_1d[1] - ops.nodes_1d[0])
+                        * height(nb.element, nb.face)
+                        / height(k.as_usize(), face);
+                    let state = self.q.get_state(nb_k, inner);
+                    (
+                        SWENodeState2D::new(&state, self.bed(nb_k, inner), h_min),
+                        distance,
+                    )
+                });
+            }
         }
     }
 
@@ -404,7 +590,7 @@ mod tests {
     use crate::solver::rhs::swe_2d::{SWE2DRhsConfig, SWEFormulation2D, compute_rhs_swe_2d};
     use crate::solver::{SWESolution2D, SWEState2D};
     use crate::source::{BathymetrySource2D, CombinedSource2D, CoriolisSource2D};
-    use crate::types::ElementIndex;
+    use crate::types::{Depth, ElementIndex};
 
     const G: f64 = 9.81;
     const L: f64 = 20_000.0;
@@ -742,6 +928,35 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_wet_dry_lake_at_rest_with_films_below_h_min() {
+        // The HLL flux returns zero, pressure included, when both sides are
+        // shallower than h_min; the hydrostatic correction must then supply
+        // all of ½g h². Films of 5 mm under h_min = 1 cm make the dropped
+        // pressure visible (~1e-7 m/s² before the fix).
+        let equation = ShallowWater2D::with_h_min(G, Depth::new(1e-2));
+        let bc = Reflective2D::new();
+        for order in 1..=3 {
+            let (mesh, ops, geom, mut bathymetry) = shoreline_setup(order, true, false);
+            for b in bathymetry.data.iter_mut() {
+                if (0.25..0.3).contains(b) {
+                    *b = 0.3 - 5e-3;
+                }
+            }
+            bathymetry.compute_gradients(&ops, &geom);
+            let q = shoreline_state(&mesh, &ops, &bathymetry, 0.0);
+            assert!(q.h_data().iter().any(|&h| (h - 5e-3).abs() < 1e-12));
+
+            let config = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_formulation(SWEFormulation2D::WetDry)
+                .with_bathymetry(&bathymetry);
+            let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+            let max_mom = max_momentum_rate(&rhs);
+            assert!(max_mom < 1e-13, "p={order}: max |d(hu)/dt| = {max_mom:.3e}");
         }
     }
 

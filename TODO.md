@@ -33,8 +33,9 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
    - Split form done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)). Wet/dry robustness is done for the collocated form: h ≥ 0, desingularization, implicit friction, HLL default and the CFL cap.
-   - `SWEFormulation2D::WetDry` is done: split-form wet/dry that keeps a shoreline lake at rest exactly.
-   - Next: its first-order shoreline elements, η-based limiting, and moving Frøya onto it.
+   - `SWEFormulation2D::WetDry` is done: split-form wet/dry that keeps a shoreline lake at rest exactly. Its shoreline elements are now second order, and it is more accurate than `Standard` on Thacker at P1–P4.
+   - `WetDry` is now the `SWEPhysics2DBuilder` default for wet/dry runs.
+   - Next: η-based limiting, and moving Frøya onto `WetDry`.
 4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
 
 Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF. Otherwise use `cargo test --no-default-features --features parallel,simd`.
@@ -136,10 +137,17 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - A shoreline lake at rest is kept to round-off (P1–P4, smooth/rough beds; the P1.7 gate `lake_at_rest_with_shoreline_is_exact` passes).
   - Fully wet it keeps N+1 (P2 3.06, P3 4.02) and dissipates energy.
   - `Standard` is still not balanced in partially dry elements: on a 2 % beach it settles into a stationary circulation of ≈ 5 cm/s where h > 1 cm, and 1–4 m/s in the film.
-- [ ] **`WetDry` accuracy on moving shorelines.** Every element the shoreline crosses drops to first-order subcell FV. On Thacker's paraboloid (P2) this gives 4.8 % at 40², against 1.3 % for `Standard`; both converge at ≈ 2nd order. Options:
-  - a second-order (MUSCL) subcell reconstruction that stays positivity preserving and well-balanced;
-  - convex DG/FV blending (Hennemann–Gassner / Rueda-Ramírez subcell limiting) with a balanced DG part;
-  - using FV only in elements with a dry node that is not at rest.
+- [x] **`WetDry` accuracy on moving shorelines.** Every element the shoreline crosses uses subcell FV, which was first order: 4.8 % on Thacker (P2, 40²) against 1.3 % for `Standard`.
+  - Done: a second-order subcell reconstruction of h, η, u, v. It uses a monotonized-central limiter on the non-uniform GLL subcells, end-subcell slopes from the adjacent element, and the Audusse second-order bed term.
+    - It stays well-balanced at shorelines and keeps h ≥ 0 at faces.
+    - With subcells forced everywhere it converges at second order (P1–P3 ≈ 1.9).
+    - Thacker at 40²: P1 3.2 %, P2 1.2 %, P3 0.9 %, P4 0.7 %, against `Standard` 10 / 1.3 / 1.8 / 2.3 %.
+  - Also fixed: HLL returns zero, pressure included, when both reconstructed depths are below `h_min`; the hydrostatic correction now supplies all of ½g h².
+  - [ ] End subcells on physical boundaries (no neighbour element) stay first order. Take the outer slope neighbour from the boundary condition (mirror the interior node for walls).
+  - [ ] `outer_nodes` scales the neighbour's node distance by the affine element heights normal to the face. Revisit with per-node isoparametric factors (P1.3).
+  - [ ] Any node below `h_dry` switches the whole element to subcells. Convex DG/FV blending (Hennemann–Gassner) could keep DG in the wet part, but it needs a DG part that is balanced with dry nodes present. Lower priority now that the subcells are second order.
+  - [x] `WetDry` is now the default for wet/dry runs in `SWEPhysics2DBuilder`. `Standard` stays available via `with_formulation`, and `SWE2DRhsConfig` still defaults to it.
+  - [ ] Retire the `Standard` wet/dry path (hydrostatic reconstruction + `BathymetrySource2D` in partially dry elements) together with the cell-average workarounds (below), once the legacy `ssp_rk3_swe_2d` users (Frøya, P6) are on `Simulation`.
 - [ ] Guide the choice of `h_dry`. It should be about 1e-4 of the characteristic depth: the 1 mm default suits field scale, but it dominates the error of the 0.1 m Thacker case (7.4 % vs 4.5 %). Consider deriving it from the bathymetry range, or making it relative.
 - [ ] The Chen–Noelle (2017) reconstruction instead of Audusse. It is more accurate for bed steps larger than the depth (thin films on steep subcell beds, e.g. fjord walls); it changes only B* and h* (`b* = min(max B, min η)`, `h* = min(η − b*, h)`).
 - [ ] Dry fronts lag: in the Ritter test the h = 1 mm front is at 71.5 m instead of 79.8 m (P2, 1 m elements; the same on `main`). It moves only to 73 m at 0.5 m resolution, or 75 m with h_dry = 1e-5. The thin-layer relaxation plays no role. Suspects: strict Kuzmin at the front, and zeroing the momentum of elements with mean < h_dry. Revisit with η-based limiting.
@@ -356,6 +364,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
   - reachable panics (`timeseries_reader.rs:198`, `geotiff.rs:239-245`);
   - library `eprintln!` in `tide_gauge.rs`.
 - [ ] Feature-gate `tiff`/`shapefile`/`geo` behind `geodata`.
+- [ ] `cargo clippy --no-default-features --features parallel,simd --lib` reports 130 warnings (2026-09-25), but the CLAUDE.md checklist says none. CI runs clippy without `-D warnings`, so nothing stops new ones. Clear them, then add `-D warnings` to the CI job.
 - [ ] Build the `netcdf` feature in CI. It is excluded because it needs native HDF5/netCDF-C, so the NetCDF reader and nesting tests (P0.20) only run locally. `cargo check --features netcdf/static` builds HDF5 and netCDF-C from source with CMake and no conda (verified on Windows 2026-09-25: ~5.5 min cold, cached afterwards); use it for a CI job, and consider it as the documented local alternative to conda.
 - [ ] Characteristic-based limiting for the 2D SWE system (1D version exists but is dead code; was P2.4). Likely subsumed by P1.2.
 - [ ] Consolidate the root markdown files into `docs/`. Decide crate vs repo name; `dg-core`/`roms-rs` workspace split.

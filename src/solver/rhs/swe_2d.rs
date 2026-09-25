@@ -65,7 +65,8 @@ pub enum SWEFormulation2D {
     /// - fully wet elements use the flux-differencing volume term of
     ///   [`Self::EntropyStable`];
     /// - elements with a node shallower than `SWE2DRhsConfig::h_dry` use a
-    ///   first-order finite-volume update on their GLL subcells;
+    ///   second-order (limited linear reconstruction) finite-volume update on
+    ///   their GLL subcells;
     /// - every interface, faces and subcell faces alike, uses HLL on
     ///   Audusse et al. (2004) hydrostatically reconstructed states.
     ///
@@ -75,12 +76,13 @@ pub enum SWEFormulation2D {
     /// split forms the bed slope is part of the operator: no
     /// `BathymetrySource2D`; `flux_type` and `well_balanced` are ignored.
     ///
-    /// Trade-off against [`Self::Standard`] with hydrostatic reconstruction:
-    /// that one leaves a stationary spurious circulation at a lake-at-rest
-    /// shoreline (≈ 5 cm/s where h > 1 cm on a 2 % beach), but on a moving
-    /// shoreline it is about 3× more accurate, because here every element the
-    /// shoreline crosses is first order (Thacker's paraboloid, P2: 4.8 % vs
-    /// 1.3 % at 40², both converging; `tests/wet_dry_2d_test.rs`).
+    /// Compared with [`Self::Standard`] with hydrostatic reconstruction, which
+    /// leaves a stationary spurious circulation at a lake-at-rest shoreline
+    /// (≈ 5 cm/s where h > 1 cm on a 2 % beach), it is also more accurate on a
+    /// moving shoreline (Thacker's paraboloid at 40², L1 depth error: P1
+    /// 3.2 % vs 10 %, P2 1.2 % vs 1.3 %, P3 0.9 % vs 1.8 %, P4 0.7 % vs 2.3 %;
+    /// `tests/wet_dry_2d_test.rs`). `SWEPhysics2DBuilder` uses it by default
+    /// for runs with wetting/drying.
     WetDry,
 }
 
