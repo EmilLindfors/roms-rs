@@ -104,9 +104,11 @@ pub struct SWE2DRhsConfig<'a, BC: SWEBoundaryCondition2D> {
     pub viscosity: Option<&'a HorizontalViscosity2D>,
     /// Optional time step to pass to boundary conditions (e.g., Chapman radiation).
     ///
-    /// When set, the dt value is propagated to `BCContext2D` so that BCs like
-    /// Chapman and ChapmanFlather can use the current time step automatically
-    /// without requiring manual `set_dt()` calls.
+    /// When set, the dt value is propagated to `BCContext2D` so that
+    /// `Chapman2D` can use the current time step without manual `set_dt()`
+    /// calls. The library's own drivers (e.g. `SWEPhysics2D`) build the config
+    /// without a dt, so callers that rely on it must set it themselves (see
+    /// `Chapman2D` for the fallback when it is unset).
     pub dt: Option<f64>,
 }
 
@@ -237,8 +239,8 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
 
     /// Set the time step for boundary condition propagation.
     ///
-    /// When set, the dt is passed to `BCContext2D` so that radiation BCs
-    /// (Chapman, ChapmanFlather) can use the current time step automatically.
+    /// When set, the dt is passed to `BCContext2D` so that `Chapman2D` can use
+    /// the current time step. Not called by the library's own drivers.
     pub fn with_dt(mut self, dt: f64) -> Self {
         self.dt = Some(dt);
         self
