@@ -25,7 +25,6 @@ use std::array;
 ///
 /// This layout provides good cache locality when accessing all variables at a node,
 /// which is the common pattern in flux computations.
-#[derive(Clone)]
 pub struct SystemSolution<const N: usize> {
     /// Nodal values in interleaved layout
     pub data: Vec<f64>,
@@ -133,7 +132,6 @@ impl<const N: usize> SystemSolution<N> {
 /// - Efficient per-variable operations (SIMD vectorization)
 /// - Batched GEMM without memory layout conversion
 /// - Cache-friendly access to individual variables
-#[derive(Clone)]
 pub struct SystemSolution2D<const N: usize> {
     /// Nodal values in SoA layout: data[var][k * n_nodes + i]
     pub data: [Vec<f64>; N],
@@ -301,6 +299,42 @@ impl<const N: usize> SystemSolution2D<N> {
     #[inline(always)]
     pub fn total_nodes(&self) -> usize {
         self.n_elements * self.n_nodes
+    }
+}
+
+// Manual `Clone` so that `clone_from` reuses the buffers: the time
+// integrators copy the state into persistent stage storage every stage.
+impl<const N: usize> Clone for SystemSolution<N> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            n_elements: self.n_elements,
+            n_nodes: self.n_nodes,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.data.clone_from(&source.data);
+        self.n_elements = source.n_elements;
+        self.n_nodes = source.n_nodes;
+    }
+}
+
+impl<const N: usize> Clone for SystemSolution2D<N> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            n_elements: self.n_elements,
+            n_nodes: self.n_nodes,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        for (dst, src) in self.data.iter_mut().zip(&source.data) {
+            dst.clone_from(src);
+        }
+        self.n_elements = source.n_elements;
+        self.n_nodes = source.n_nodes;
     }
 }
 

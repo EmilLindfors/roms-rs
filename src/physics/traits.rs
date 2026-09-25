@@ -72,6 +72,15 @@ pub trait PhysicsModule<S: Integrable>: PhysicsModuleInfo {
     /// The time derivative of the state.
     fn compute_rhs(&self, state: &S, time: f64) -> S;
 
+    /// [`Self::compute_rhs`] into `out`, which is overwritten.
+    ///
+    /// `Simulation` calls this every RK stage with a reused buffer. The
+    /// default delegates to `compute_rhs` (allocating); implement it directly
+    /// to make stepping allocation-free.
+    fn compute_rhs_into(&self, state: &S, time: f64, out: &mut S) {
+        *out = self.compute_rhs(state, time);
+    }
+
     /// Compute the CFL-limited time step.
     ///
     /// # Arguments

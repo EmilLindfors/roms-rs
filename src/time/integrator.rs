@@ -66,6 +66,51 @@ pub trait Integrable: Clone + Send + Sized {
         result.scale(0.0);
         result
     }
+
+    /// Overwrite `self` with `other` (same shape expected).
+    ///
+    /// Defaults to [`Clone::clone_from`], which reuses the allocation for the
+    /// SoA solution types, so the stage buffers of
+    /// [`TimeIntegrator::step_with_workspace`] are not reallocated.
+    fn copy_from(&mut self, other: &Self) {
+        self.clone_from(other);
+    }
+}
+
+/// Reusable stage storage for [`TimeIntegrator::step_with_workspace`].
+///
+/// The buffers are cloned from the state on first use and reused afterwards,
+/// so a step allocates nothing once the workspace is warm (given an RHS that
+/// writes into its output). Keep one per simulation.
+pub struct StageWorkspace<S> {
+    u1: Option<S>,
+    u2: Option<S>,
+    k: Option<S>,
+}
+
+impl<S> Default for StageWorkspace<S> {
+    fn default() -> Self {
+        Self {
+            u1: None,
+            u2: None,
+            k: None,
+        }
+    }
+}
+
+impl<S: Integrable> StageWorkspace<S> {
+    /// Empty workspace; buffers are created on the first step.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Two stage buffers and one RHS buffer shaped like `like`.
+    fn buffers(&mut self, like: &S) -> (&mut S, &mut S, &mut S) {
+        let u1 = self.u1.get_or_insert_with(|| like.clone());
+        let u2 = self.u2.get_or_insert_with(|| like.clone());
+        let k = self.k.get_or_insert_with(|| like.clone());
+        (u1, u2, k)
+    }
 }
 
 // =============================================================================
@@ -149,9 +194,40 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
     /// This is where nonlinear projections (positivity and slope limiters,
     /// wet/dry correction) belong: the Zhang–Shu positivity guarantee for SSP
     /// methods holds only if every RHS evaluation sees a limited state.
-    fn step_with_stage_hook<F, H>(&self, state: &mut S, dt: f64, t: f64, rhs: F, stage_hook: H)
+    ///
+    /// Allocates stage storage and an RHS result per stage; long runs should
+    /// use [`Self::step_with_workspace`].
+    fn step_with_stage_hook<F, H>(&self, state: &mut S, dt: f64, t: f64, mut rhs: F, stage_hook: H)
     where
         F: FnMut(&S, f64) -> S,
+        H: FnMut(&mut S),
+    {
+        let mut workspace = StageWorkspace::new();
+        self.step_with_workspace(
+            state,
+            dt,
+            t,
+            |s, time, out: &mut S| *out = rhs(s, time),
+            stage_hook,
+            &mut workspace,
+        );
+    }
+
+    /// Allocation-free version of [`Self::step_with_stage_hook`].
+    ///
+    /// `rhs(state, time, out)` must overwrite `out` with the time derivative;
+    /// stage values live in `workspace`, reused across steps. This is the one
+    /// method an integrator implements; the others are built on it.
+    fn step_with_workspace<F, H>(
+        &self,
+        state: &mut S,
+        dt: f64,
+        t: f64,
+        rhs: F,
+        stage_hook: H,
+        workspace: &mut StageWorkspace<S>,
+    ) where
+        F: FnMut(&S, f64, &mut S),
         H: FnMut(&mut S);
 }
 
@@ -198,38 +274,39 @@ impl IntegratorInfo for SSPRK3 {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
-    fn step_with_stage_hook<F, H>(
+    fn step_with_workspace<F, H>(
         &self,
         state: &mut S,
         dt: f64,
         t: f64,
         mut rhs: F,
         mut stage_hook: H,
+        workspace: &mut StageWorkspace<S>,
     ) where
-        F: FnMut(&S, f64) -> S,
+        F: FnMut(&S, f64, &mut S),
         H: FnMut(&mut S),
     {
+        let (u1, u2, k) = workspace.buffers(state);
+
         // Stage 1: u1 = u + dt * L(u, t)
-        let l_u = rhs(state, t);
-        let mut u1 = state.clone();
-        u1.axpy(dt, &l_u);
-        stage_hook(&mut u1);
+        rhs(state, t, k);
+        u1.copy_from(state);
+        u1.axpy(dt, k);
+        stage_hook(u1);
 
         // Stage 2: u2 = 3/4 * u + 1/4 * u1 + 1/4 * dt * L(u1, t + dt)
-        let t1 = t + dt;
-        let l_u1 = rhs(&u1, t1);
-        let mut u2 = state.clone();
+        rhs(u1, t + dt, k);
+        u2.copy_from(state);
         u2.scale(0.75);
-        u2.axpy(0.25, &u1);
-        u2.axpy(0.25 * dt, &l_u1);
-        stage_hook(&mut u2);
+        u2.axpy(0.25, u1);
+        u2.axpy(0.25 * dt, k);
+        stage_hook(u2);
 
         // Stage 3: u_new = 1/3 * u + 2/3 * u2 + 2/3 * dt * L(u2, t + dt/2)
-        let t2 = t + 0.5 * dt;
-        let l_u2 = rhs(&u2, t2);
+        rhs(u2, t + 0.5 * dt, k);
         state.scale(1.0 / 3.0);
-        state.axpy(2.0 / 3.0, &u2);
-        state.axpy(2.0 / 3.0 * dt, &l_u2);
+        state.axpy(2.0 / 3.0, u2);
+        state.axpy(2.0 / 3.0 * dt, k);
         stage_hook(state);
     }
 }
@@ -271,19 +348,21 @@ impl IntegratorInfo for ForwardEuler {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for ForwardEuler {
-    fn step_with_stage_hook<F, H>(
+    fn step_with_workspace<F, H>(
         &self,
         state: &mut S,
         dt: f64,
         t: f64,
         mut rhs: F,
         mut stage_hook: H,
+        workspace: &mut StageWorkspace<S>,
     ) where
-        F: FnMut(&S, f64) -> S,
+        F: FnMut(&S, f64, &mut S),
         H: FnMut(&mut S),
     {
-        let l_u = rhs(state, t);
-        state.axpy(dt, &l_u);
+        let (_, _, k) = workspace.buffers(state);
+        rhs(state, t, k);
+        state.axpy(dt, k);
         stage_hook(state);
     }
 }
@@ -340,17 +419,24 @@ impl IntegratorInfo for StandardIntegrator {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for StandardIntegrator {
-    fn step_with_stage_hook<F, H>(&self, state: &mut S, dt: f64, t: f64, rhs: F, stage_hook: H)
-    where
-        F: FnMut(&S, f64) -> S,
+    fn step_with_workspace<F, H>(
+        &self,
+        state: &mut S,
+        dt: f64,
+        t: f64,
+        rhs: F,
+        stage_hook: H,
+        workspace: &mut StageWorkspace<S>,
+    ) where
+        F: FnMut(&S, f64, &mut S),
         H: FnMut(&mut S),
     {
         match self {
             StandardIntegrator::SSPRK3 => {
-                SSPRK3.step_with_stage_hook(state, dt, t, rhs, stage_hook)
+                SSPRK3.step_with_workspace(state, dt, t, rhs, stage_hook, workspace)
             }
             StandardIntegrator::ForwardEuler => {
-                ForwardEuler.step_with_stage_hook(state, dt, t, rhs, stage_hook)
+                ForwardEuler.step_with_workspace(state, dt, t, rhs, stage_hook, workspace)
             }
         }
     }

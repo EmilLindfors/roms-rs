@@ -113,10 +113,14 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 
 ## Priority 1: A Correct 2D Barotropic Tide Model (`REVIEW.md` §1, §4, §7 Phase A)
 
-### P1.1 Non-allocating RHS and one kernel
-- [ ] `compute_rhs_into(&self, state, t, out: &mut S)` plus a workspace-owning integrator. Today the production stepper allocates ~33 full-field arrays per step (`REVIEW.md` §5.3).
-- [ ] Unify the serial (`swe_2d.rs:318-563`) and parallel (`:775-1110`) RHS into one per-element kernel. `iter` vs `par_iter` should be the only difference.
-- [ ] Route the `Simulation`/`SWEPhysics2D` path through the parallel kernel (`builder.rs:99`).
+### P1.1 Non-allocating RHS and one kernel — DONE for the `Simulation` path
+- [x] `compute_rhs_into(&self, state, t, out: &mut S)` plus a workspace-owning integrator. Today the production stepper allocates ~33 full-field arrays per step (`REVIEW.md` §5.3).
+  - Done: `PhysicsModule::compute_rhs_into`, `TimeIntegrator::step_with_workspace` + `StageWorkspace` (the only method an integrator implements), buffer-reusing `clone_from` for the SoA solutions. A warm `Simulation` step allocates 0 B (`tests/allocation_test.rs`; was 1.3 MB per step at 24² P3).
+- [x] Unify the serial (`swe_2d.rs:318-563`) and parallel (`:775-1110`) RHS into one per-element kernel. `iter` vs `par_iter` should be the only difference.
+  - Done: `SWE2DRhsKernel`; bitwise serial = parallel; per-thread cached, padded scratch. Parallel RHS 1.2–1.7× faster with `_into` (false sharing between cached workspaces cost ~25 % until padded).
+- [x] Route the `Simulation`/`SWEPhysics2D` path through the parallel kernel (`builder.rs:99`).
+- [ ] Remaining allocations: the limiters allocate the cell-average and vertex-bound `Vec`s every stage (P2.3); horizontal viscosity allocates ~10 field arrays per RHS (`add_br1_viscosity`); the legacy `ssp_rk3_swe_2d` stepper used by the examples still clones stages (P6: move the examples to `Simulation`); `DGSolution1D`/`DGSolution2D`/`TracerSolution2D`/`Solution3D` use the allocating default `clone_from`, and `Simulation3D`/mode splitting do not use the stage workspace (P4.1).
+- [ ] Use the new split to specialise hot paths without duplicating them again: e.g. a `const N` (order) generic kernel for the fixed-size matrix products, and skipping the `reference_to_physical` + `SourceContext2D` build for sources that need neither (P2.2).
 
 ### P1.2 Well-balanced, entropy-stable, positivity-preserving DGSEM
 - [x] Flux-differencing volume term with the Wintermeyer et al. (2017) two-point flux and the g·hᵢ(DB)ᵢ term. It is exactly well-balanced for any nodal B (including face-discontinuous B), conservative, and fixes GLL aliasing.
@@ -406,7 +410,7 @@ Details are in `CHANGELOG.md` and git history. Caveats found on 2026-09-25 are n
 | Mass conservation, face-discontinuous B | **Fails**: −5.5e-5 relative per second | machine precision |
 | Open-boundary reflection (Flather) | ≈ 33 % | < 1 % |
 | SWE convergence | P1 1.67, P2 3.02 (linearised, flat, periodic; thresholds 1.5/2.5) | N+1, nonlinear, bathymetry, curved |
-| Allocations per 2D step (production stepper) | ~33 full-field arrays + ~1.2M small Vecs | 0 |
+| Allocations per 2D step (production stepper) | `Simulation` path: 0 B warm (without limiter/viscosity); legacy `ssp_rk3_swe_2d`: ~33 full-field arrays | 0 |
 | 2D tidal cost vs ROMS (model estimate) | ~47× core-hours | ≤ 1× per unit accuracy (P3.2) |
 | Validated against observations | No (NorKyst Bergen harmonic fit only) | 5+ tide gauges, ADCP |
 | Multi-day stability | 316 s tested | 30+ days, real domain |
