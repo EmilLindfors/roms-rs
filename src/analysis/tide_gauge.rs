@@ -196,6 +196,30 @@ pub mod norwegian_stations {
     }
 }
 
+/// Model values linearly interpolated to the observation times that lie
+/// inside the model's time span, paired with those observations.
+fn paired_by_time(model: &TimeSeries, obs: &TimeSeries) -> (Vec<f64>, Vec<f64>) {
+    let (mt, mv) = (model.times(), model.values());
+    let (Some(&first), Some(&last)) = (mt.first(), mt.last()) else {
+        return (Vec::new(), Vec::new());
+    };
+    obs.times()
+        .iter()
+        .zip(obs.values())
+        .filter(|(t, _)| (first..=last).contains(*t))
+        .map(|(&t, v)| {
+            let i = mt.partition_point(|&m| m < t);
+            let model_at = if mt[i] == t || i == 0 {
+                mv[i]
+            } else {
+                let w = (t - mt[i - 1]) / (mt[i] - mt[i - 1]);
+                mv[i - 1] + w * (mv[i] - mv[i - 1])
+            };
+            (model_at, v)
+        })
+        .unzip()
+}
+
 /// Validation result for a single tide gauge station.
 #[derive(Clone, Debug)]
 pub struct StationValidationResult {
@@ -224,42 +248,44 @@ pub struct StationValidationResult {
 impl StationValidationResult {
     /// Compute validation result from model and observation time series.
     ///
+    /// The series are paired by time, not by index: the model is linearly
+    /// interpolated to each observation time inside the model's time span.
+    /// Both must therefore be on the same time axis; put model output on the
+    /// observations' Unix axis with [`ModelClock::unix`](crate::time::ModelClock::unix).
+    /// Means, spreads and metrics are over the paired samples.
+    ///
     /// # Arguments
     /// * `station` - Station metadata
-    /// * `model` - Model water level time series
-    /// * `obs` - Observed water level time series (will have datum_offset applied)
+    /// * `model` - Model water level time series (increasing times)
+    /// * `obs` - Observed water level time series (increasing times; will have
+    ///   datum_offset applied)
     ///
     /// # Panics
-    /// Panics if time series have different lengths.
+    /// Panics if fewer than two observations fall inside the model's time span.
     pub fn compute(station: &TideGaugeStation, model: &TimeSeries, obs: &TimeSeries) -> Self {
-        assert_eq!(
-            model.len(),
-            obs.len(),
-            "Model and observation time series must have same length"
+        let (model_values, obs_values) = paired_by_time(model, obs);
+        assert!(
+            model_values.len() >= 2,
+            "{}: fewer than two observations inside the model's time span",
+            station.name
         );
 
         // Apply datum offset to observations
-        let obs_adjusted: Vec<f64> = obs
-            .values()
+        let obs_adjusted: Vec<f64> = obs_values
             .iter()
             .map(|&v| v + station.datum_offset)
             .collect();
 
-        let model_values = model.values();
         let metrics = ComparisonMetrics::compute(&model_values, &obs_adjusted);
 
-        // Compute means and standard deviations
-        let model_mean = model.mean();
-        let obs_mean = obs_adjusted.iter().sum::<f64>() / obs_adjusted.len() as f64;
-        let model_std = model.std_dev();
-        let obs_std = {
-            let var: f64 = obs_adjusted
-                .iter()
-                .map(|&v| (v - obs_mean).powi(2))
-                .sum::<f64>()
-                / (obs_adjusted.len() - 1) as f64;
-            var.sqrt()
+        let mean_std = |values: &[f64]| {
+            let n = values.len() as f64;
+            let mean = values.iter().sum::<f64>() / n;
+            let var = values.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0);
+            (mean, var.sqrt())
         };
+        let (model_mean, model_std) = mean_std(&model_values);
+        let (obs_mean, obs_std) = mean_std(&obs_adjusted);
 
         Self {
             station: station.clone(),
@@ -686,6 +712,33 @@ mod tests {
         assert!(result.metrics.skill_score > 0.99);
         assert!(result.passes_basic_validation());
         assert!(result.passes_strict_validation());
+    }
+
+    /// Series with different sampling and spans are compared at the same
+    /// instants (this used to require equal lengths and pair by index).
+    #[test]
+    fn test_series_are_paired_by_time() {
+        let station = TideGaugeStation::new("Test", 0.0, 0.0);
+        let signal = |t: f64| 0.3 + 2e-6 * t;
+        let t0 = 1.75e9;
+        let model_t: Vec<f64> = (0..100).map(|i| t0 + i as f64 * 3600.0).collect();
+        let obs_t: Vec<f64> = (0..300)
+            .map(|i| t0 + 36_000.0 + i as f64 * 1800.0)
+            .collect();
+        let model = TimeSeries::new(
+            &model_t,
+            &model_t.iter().map(|&t| signal(t)).collect::<Vec<_>>(),
+        );
+        let obs = TimeSeries::new(
+            &obs_t,
+            &obs_t.iter().map(|&t| signal(t)).collect::<Vec<_>>(),
+        );
+
+        let result = StationValidationResult::compute(&station, &model, &obs);
+        assert!(result.metrics.rmse < 1e-9, "rmse {}", result.metrics.rmse);
+        // Observations after the model's last output are not compared
+        let paired = paired_by_time(&model, &obs).0.len();
+        assert_eq!(paired, 1 + (99 - 10) * 2);
     }
 
     #[test]

@@ -200,7 +200,15 @@ pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let mp = (5 * doy + 2) / 153; // [0, 11]
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    (if m <= 2 { yoe + era * 400 + 1 } else { yoe + era * 400 }, m, d)
+    (
+        if m <= 2 {
+            yoe + era * 400 + 1
+        } else {
+            yoe + era * 400
+        },
+        m,
+        d,
+    )
 }
 
 /// `YYYY-MM-DD HH:MM:SS` (UTC) of a Unix time, to the nearest second.
@@ -274,7 +282,11 @@ mod tests {
 
     #[test]
     fn format_utc_round_trips_parse() {
-        for s in ["1970-01-01 00:00:00", "2024-02-29 23:59:59", "1969-12-31 12:30:00"] {
+        for s in [
+            "1970-01-01 00:00:00",
+            "2024-02-29 23:59:59",
+            "1969-12-31 12:30:00",
+        ] {
             assert_eq!(format_utc(parse_datetime_seconds(s).unwrap()), s);
         }
     }

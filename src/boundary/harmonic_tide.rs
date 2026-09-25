@@ -11,9 +11,9 @@
 //! ramp `R(t)`. The corrections are stored apart from the constants, so setting
 //! them again replaces them instead of applying them twice.
 
+use super::BCContext2D;
 use super::TidalConstituent;
 use super::characteristic::{ExternalState, ExternalStateProvider};
-use super::BCContext2D;
 use crate::io::ConstituentData;
 use crate::tides::{NodalCorrection, canonical_name};
 use crate::time::ModelClock;

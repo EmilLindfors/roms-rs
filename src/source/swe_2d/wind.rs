@@ -58,6 +58,9 @@ pub const RHO_AIR: f64 = 1.225;
 /// Sea water density (kg/m³).
 pub const RHO_WATER: f64 = 1025.0;
 
+/// Wind speed (m/s) above which [`DragCoefficient::LargePond`] is held constant.
+pub const LARGE_POND_MAX_WIND: f64 = 25.0;
+
 /// Drag coefficient formulation for wind stress.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DragCoefficient {
@@ -69,9 +72,11 @@ pub enum DragCoefficient {
     /// Large & Pond (1981) formulation.
     ///
     /// C_d = 1.2×10⁻³ for |U| ≤ 11 m/s
-    /// C_d = (0.49 + 0.065×|U|) × 10⁻³ for |U| > 11 m/s
+    /// C_d = (0.49 + 0.065×|U|) × 10⁻³ for 11 < |U| ≤ 25 m/s
     ///
-    /// Valid for |U| < 25 m/s.
+    /// Fitted for |U| < 25 m/s; above that the formula is held at its 25 m/s
+    /// value (2.1 × 10⁻³) instead of growing without bound: observed drag
+    /// saturates in strong winds (Powell et al. 2003).
     LargePond,
 
     /// Wu (1982) formulation.
@@ -114,7 +119,7 @@ impl DragCoefficient {
                 if wind_speed <= 11.0 {
                     1.2e-3
                 } else {
-                    (0.49 + 0.065 * wind_speed) * 1e-3
+                    (0.49 + 0.065 * wind_speed.min(LARGE_POND_MAX_WIND)) * 1e-3
                 }
             }
 
@@ -388,6 +393,11 @@ mod tests {
         // Above 11 m/s: linear increase
         // C_d = (0.49 + 0.065 * 15) * 1e-3 = 1.465e-3
         assert!((cd.compute(15.0) - 1.465e-3).abs() < TOL);
+
+        // Held at the 25 m/s value beyond the fitted range
+        let cd_max = (0.49 + 0.065 * 25.0) * 1e-3;
+        assert!((cd.compute(25.0) - cd_max).abs() < TOL);
+        assert!((cd.compute(40.0) - cd_max).abs() < TOL);
     }
 
     #[test]

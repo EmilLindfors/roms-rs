@@ -781,7 +781,6 @@ mod tests {
         assert!((ctx.interior_celerity() - (G * 2.0_f64).sqrt()).abs() < TOL);
     }
 
-
     #[test]
     fn test_harmonic_tidal_clamps_elevation() {
         let clock = ModelClock::at_datetime(2024, 6, 1, 0, 0);

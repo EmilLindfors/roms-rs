@@ -79,8 +79,8 @@ pub use boundary_2d::{
     HarmonicTidal2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
 };
 pub use characteristic::{
-    CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider, ParentTimeSeries,
-    StillWater, characteristic_state,
+    CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider, InverseBarometer,
+    ParentTimeSeries, StillWater, characteristic_state,
 };
 pub use harmonic_tide::{HarmonicTide, tidal_ramp};
 pub use multi_bc_2d::MultiBoundaryCondition2D;

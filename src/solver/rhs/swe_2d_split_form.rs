@@ -332,7 +332,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
                         let nb_k = ElementIndex::new(nb.element);
                         let nb_node = ops.face_nodes[nb.face][n_face_nodes - 1 - fi];
                         let state = self.q.get_state(nb_k, nb_node);
-                        (SWENodeState2D::new(&state, self.bed(nb_k, nb_node), h_min), false)
+                        (
+                            SWENodeState2D::new(&state, self.bed(nb_k, nb_node), h_min),
+                            false,
+                        )
                     }
                     // Boundary state with mirrored bathymetry: no bed step at boundaries
                     None => {

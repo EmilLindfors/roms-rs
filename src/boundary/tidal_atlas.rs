@@ -350,7 +350,8 @@ impl TidalAtlas {
                     if slot_of_node[flat] != u32::MAX {
                         continue;
                     }
-                    let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
+                    let [x, y] =
+                        mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
 
                     // Inverse-distance weights of the nearest atlas points
                     nearest.clear();

@@ -51,7 +51,7 @@ src/
 ├── equations/      # ConservationLaw trait, advection, SWE 1D/2D, EOS
 ├── source/         # Source terms (Coriolis, friction, wind, tidal, sponge,
 │                   # well-balanced bathymetry)
-├── boundary/       # OBCs: Chapman/Flather, TST, radiation, tidal, nesting
+├── boundary/       # CharacteristicOBC + providers (tides, atlas, nesting), walls
 ├── solver/         # Solution state (SoA), RHS kernels, limiters,
 │                   # wetting/drying, SIMD, burn GPU prototype
 ├── time/           # Integrable/TimeIntegrator traits, SSP-RK3, mode splitting
@@ -71,6 +71,8 @@ src/
 - `Integrable` + `SSPRK3`: the generic time-integration path (prefer over the
   legacy per-type `ssp_rk3_*` free functions, which are slated for deletion)
 - `MultiBoundaryCondition2D`: per-tag dispatch of open/closed boundary conditions
+- `CharacteristicOBC<P>`: every open boundary (radiation, tides, nesting); the external data comes from an `ExternalStateProvider` (`StillWater`, `HarmonicTide`, `BoundaryTides` from a `TidalAtlas`, `OceanModelState`)
+- `ModelClock`: the UTC instant of simulation time 0, for tides (V₀, nodal f/u), parent-model time and output units
 
 ## Common Tasks
 

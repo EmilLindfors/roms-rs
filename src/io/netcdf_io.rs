@@ -36,6 +36,8 @@ use chrono::Utc;
 use netcdf::create;
 use thiserror::Error;
 
+use crate::time::ModelClock;
+
 /// Error type for NetCDF operations.
 #[derive(Debug, Error)]
 pub enum NetCDFError {
@@ -104,6 +106,10 @@ pub struct NetCDFWriterConfig {
     pub include_tracers: bool,
     /// Compression level (0-9, 0=none)
     pub compression_level: u8,
+    /// UTC instant of simulation time 0; the `time` variable is written in
+    /// simulation seconds with units `seconds since <epoch>`. Default: the
+    /// Unix epoch (simulation time is Unix time).
+    pub clock: ModelClock,
 }
 
 impl NetCDFWriterConfig {
@@ -120,7 +126,14 @@ impl NetCDFWriterConfig {
             include_velocity: true,
             include_tracers: false,
             compression_level: 4,
+            clock: ModelClock::default(),
         }
+    }
+
+    /// Set the model clock, so the `time` units name the run's epoch.
+    pub fn with_clock(mut self, clock: ModelClock) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Set the title attribute.
@@ -238,7 +251,7 @@ impl NetCDFWriter {
             let mut time_var = file.add_variable::<f64>("time", &["time"])?;
             time_var.put_attribute("standard_name", "time")?;
             time_var.put_attribute("long_name", "simulation time")?;
-            time_var.put_attribute("units", "seconds since 1970-01-01 00:00:00")?;
+            time_var.put_attribute("units", config.clock.cf_time_units().as_str())?;
             time_var.put_attribute("calendar", "standard")?;
         }
 
@@ -1974,6 +1987,30 @@ mod tests {
         assert_eq!(config.path, "test.nc");
         assert_eq!(config.title, Some("Test Simulation".to_string()));
         assert_eq!(config.compression_level, 6);
+    }
+
+    /// The `time` variable holds simulation seconds, so its units must name
+    /// the model epoch (they used to claim the Unix epoch).
+    #[test]
+    fn writer_time_units_name_the_model_epoch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("out.nc");
+        let clock = ModelClock::parse("2025-06-01T00:00:00Z").unwrap();
+        let config = NetCDFWriterConfig::new(path.to_string_lossy()).with_clock(clock);
+        let mesh = NetCDFMeshInfo::from_xy(vec![0.0, 1.0], vec![0.0, 0.0]);
+        let mut writer = NetCDFWriter::create(config, &mesh).unwrap();
+        writer
+            .write_timestep(3600.0, &[1.0, 1.0], &[0.0, 0.0], None, None)
+            .unwrap();
+        drop(writer);
+
+        let file = netcdf::open(&path).unwrap();
+        let time = file.variable("time").unwrap();
+        let units = OceanModelReader::get_attr_string(&time, "units").unwrap();
+        assert_eq!(units, "seconds since 2025-06-01 00:00:00");
+        let (scale, reference) = super::super::datetime::parse_cf_time_units(&units, None).unwrap();
+        let t: f64 = time.get_value([0]).unwrap();
+        assert_eq!(reference + scale * t, clock.unix(3600.0));
     }
 
     #[test]

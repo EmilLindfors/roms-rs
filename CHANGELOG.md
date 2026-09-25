@@ -6,6 +6,25 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **One characteristic open boundary, `CharacteristicOBC` (TODO P1.4).**
+  - The boundary state takes the outgoing Riemann invariant `w+ = u_n + 2c` from the interior and the incoming `w− = u_n − 2c` from external data: `u_n,b = ½(w+ + w−)`, `c_b = ¼(w+ − w−)`, tangential velocity from the upwind side. Supercritical flow takes a whole side. A dry side gives the sonic state of the rarefaction into it.
+  - The face flux is the physical flux `F(q_b)·n` (new `BoundaryState::Exact` from `SWEBoundaryCondition2D::boundary_state`, honoured by the standard and split-form kernels). The boundary no longer depends on the Riemann solver: the old ghost = external state was exact only for Roe.
+  - Elevation-only data (`ElevationOnly`): `AtRest` (`u_n,e = 0`, half amplitude for an incoming progressive wave) or `IncomingWave` (a simple wave from still water, full amplitude).
+  - External data comes from an `ExternalStateProvider`: `StillWater`, `HarmonicTide`, `ParentTimeSeries`, `OceanModelState` (netcdf), `BoundaryTides` (tidal atlas), `InverseBarometer` (adds `−(p − p₀)/(ρg)` of a pressure field to another provider), or any closure `(x, y, t) → ExternalState`.
+  - Gate tests (`tests/open_boundary_flather_test.rs`), for Roe, HLL, Rusanov, `EntropyStable` and `WetDry`:
+    - outgoing pulse reflection ~1e-6, nothing left after it exits;
+    - delivered progressive-wave amplitude 0.997–1.001 from full `(η, u)`, from elevation-only data as an incoming wave, and from a parent time series; 0.50 from elevation-only data at rest;
+    - 45° plane wave: reflection 0.180 against the 1D-characteristic theory `(1 − cos θ)/(1 + cos θ)` = 0.172;
+    - boundary flux identical for all Riemann solvers (one element, all faces open);
+    - lake at rest over a stepped bed with open boundaries: 4e-14;
+    - pressure gradient over an open basin at its inverse-barometer level: RHS 4e-14 with `InverseBarometer`, 5e-3 without.
+- **`ModelClock` (`time::ModelClock`, TODO P1.4).** The UTC instant of simulation time 0: Unix and Julian-date conversion, CF units (`seconds since <epoch>`), and `nodal_correction(name, t_mid)` with `V₀` at the epoch and `f`, `u` at the middle of the run or record. `HarmonicTide`, `HarmonicTidal2D`, `BoundaryTides`, `OceanModelState` and `NetCDFWriterConfig::with_clock` take it.
+- **`HarmonicTide`: a uniform harmonic tide with nodal corrections stored apart from the constants**, so setting them twice replaces them instead of applying them twice. `HarmonicTide::from_constituent_data` reads constituent files. `tides::canonical_name` / `CONSTITUENT_NAMES` give the `'static` constituent names.
+- **Spatially varying boundary tides: `TidalAtlas` and `BoundaryTides` (TODO P1.4).** An atlas holds reference constants `(H, G)` of η and of depth-averaged east/north velocity at geographic points, in a plain text format. `TidalAtlas::boundary_tides` projects it once onto the open-boundary nodes of a mesh: complex (wrap-safe) inverse-distance interpolation from the 4 nearest points, a coverage check, rotation of the velocity into the mesh axes, and nodal corrections from the `ModelClock`. `BoundaryTides` finds its node through the new `BCContext2D::node_index`, without a search per call.
+- **`examples/norkyst_boundary_tides.rs`: a tidal atlas from NorKyst-800 over OPeNDAP.** Samples the perimeter of a lon/lat box, snaps to wet NorKyst cells, fetches hourly `zeta` and 15-level `u_eastward`/`v_northward` (one window request per day and variable), depth-averages the currents (`io::depth_average_z`), and fits reference constants of 10 constituents plus inferred P1 and K2.
+- **`analysis::fit_reference_constants`: least-squares fit of reference constants on a Unix time axis**, with `V₀` at the first sample and `f`, `u` at the record midpoint in the basis functions, a Rayleigh check between the fitted constituents, and `Inference` of unresolvable constituents from resolved ones (equilibrium ratios: `P1_FROM_K1` 0.331, `K2_FROM_S2` 0.272). A 30-day synthetic record is recovered to 1e-8 m, inferred constituents included.
+- `io::depth_average_z`: depth average of a z-level profile (NorKyst `*_zdepth` output).
+
 - **`Mesh2D::retain_elements`: water-only meshes (TODO P2.4).** Keeps the elements a predicate selects, renumbers vertices and edges, and turns faces towards dropped elements into boundary faces with a given tag (walls for a coastline). Original boundary tags are kept. It returns the index map to the original elements. Tests cover connectivity and tags on an L-shaped submesh, and `WetDry` lake at rest plus mass conservation on a mesh with an island cut out.
 - **`SWEPhysics2DBuilder` plumbing.**
   - `with_source` and `with_source_arc` now add up: repeated calls combine through the new owned `source::SourceTerms2D`. Before, each call replaced the previous source.
@@ -61,6 +80,10 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **API (boundary, breaking): the open-boundary zoo is replaced by `CharacteristicOBC` + providers (TODO P1.4).** Removed: `Flather2D` → `CharacteristicOBC::new(closure)`; `HarmonicFlather2D` → `CharacteristicOBC::new(HarmonicTide)`; `Radiation2D` → `CharacteristicOBC::still_water()` / `StillWater::at(η)`; `NestingBC2D` → `CharacteristicOBC::new(ParentTimeSeries)`; `OceanNestingBC2D` → `CharacteristicOBC::new(OceanModelState)` (the epoch is now a `ModelClock`; `OceanModelState::first_snapshot` gives the old default); `Chapman2D`, `ChapmanFlather2D` and `TSTOBC2D` (finite-difference remnants: Chapman's elevation blend is a reflecting clamp in DG, TST's "subtidal" velocity has no frequency separation); `SWE2DRhsConfig::{dt, with_dt}` and `BCContext2D::dt` (no callers). `TidalSimulationBuilder`'s Flather type builds a `CharacteristicOBC`. `HarmonicTidal2D` now wraps a `HarmonicTide` (`.tide`), and its `with_nodal_corrections` takes a `ModelClock` and the run midpoint instead of a Julian date.
+- **Tide-gauge validation pairs model and observations by time (TODO P1.4).** `StationValidationResult::compute` interpolates the model to the observation times inside its span, instead of requiring equal lengths and pairing by index. Both series must share a time axis (`ModelClock::unix`).
+- **`DragCoefficient::LargePond` is held at its 25 m/s value above 25 m/s** (2.1e-3), the edge of the fitted range, instead of growing without bound (TODO P1.4; drag saturates in strong winds, Powell et al. 2003).
+- **`examples/froya_real_data.rs`: NorKyst boundary tides.** Open boundaries are a `CharacteristicOBC` forced by the tidal atlas (`tides=`, default `data/froya_boundary_tides.txt`) on a `ModelClock` (`start=`), with the inverse-barometer level added when the pressure forcing is on; NorKyst nesting (`norkyst=`) and a uniform M2 fallback remain. The NetCDF output carries the clock's time units.
 - **`examples/froya_real_data.rs` rewritten on the production path (TODO P1.2, P6).**
   - It uses `Simulation` + `SSPRK3` + `SWEPhysics2D` with the wet/dry defaults (`WetDry`, HLL, positivity, implicit Manning friction), nodal bathymetry and a water-only mesh.
   - Before, it used the legacy `ssp_rk3_swe_2d` stepper, cell-averaged bathymetry, `H_MIN` = 5 m (land as a 5 m water film, and water shallower than 5 m masked as land), and walls on the south and east sides, which cut through open water.
@@ -114,6 +137,7 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **NetCDF output time units (io, TODO P1.4).** `NetCDFWriter` labelled its `time` variable `seconds since 1970-01-01` but wrote simulation seconds, so every output file claimed to be from January 1970. The units now name the `ModelClock` epoch (`NetCDFWriterConfig::with_clock`; the default clock keeps Unix time). Test: `writer_time_units_name_the_model_epoch`.
 - **GeoTIFF georeferencing was never read (io, TODO P1.6).**
   - `GeoTiffBathymetry` looked up the GeoTIFF tags as `Tag::Unknown(33550)` and friends. The `tiff` crate decodes those numbers to named variants (`ModelPixelScaleTag`, …), so no lookup ever matched, and every file silently took its extent from the bbox hint. The loader also knew nothing of `ModelTransformation` (tag 34264).
   - `froya_smola_hitra.tif` is georeferenced by `ModelTransformation` (7.27–10.03°E, 62.88–64.32°N). The example's hint (7.5–10.0°E, 63.3–64.2°N) squeezed the latitude span by 40 %, so the Frøya bathymetry was misplaced by several km, up to ~20 km. Agreement with the GSHHS land mask was 72 % unshifted and peaked at 88 % under a 4 km / 13 km shift. It is now 93 % unshifted, and zero shift is the best.

@@ -77,8 +77,8 @@ pub use boundary::{
     BCContext2D, BathymetryValidationConfig, BathymetryValidationResult, BoundaryState,
     BoundaryTides, CharacteristicOBC, ConstantDischarge2D, Discharge2D, ElevationOnly,
     ExternalState, ExternalStateProvider, Extrapolation2D, FixedState2D, HarmonicTidal2D,
-    HarmonicTide, ParentTimeSeries, Reflective2D, SWEBoundaryCondition2D, SpongeConfig,
-    StillWater, TidalAtlas, Tidal2D, TidalBCType, TidalConstituent, TidalSimulationBuilder,
+    HarmonicTide, ParentTimeSeries, Reflective2D, SWEBoundaryCondition2D, SpongeConfig, StillWater,
+    Tidal2D, TidalAtlas, TidalBCType, TidalConstituent, TidalSimulationBuilder,
     format_bathymetry_warning, validate_bathymetry_convention,
 };
 pub use equations::Advection2D;

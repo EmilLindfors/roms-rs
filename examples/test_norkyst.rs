@@ -92,7 +92,10 @@ fn main() {
                 1e-6,       // h_min
             );
 
-            println!("\nParent state at origin: {:?}", parent.external_state(&ctx));
+            println!(
+                "\nParent state at origin: {:?}",
+                parent.external_state(&ctx)
+            );
             let ghost = bc.ghost_state(&ctx);
             println!("Boundary state at origin:");
             println!("  h: {:.3} m", ghost.h);

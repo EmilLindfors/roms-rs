@@ -164,6 +164,45 @@ impl ExternalStateProvider for ParentTimeSeries {
     }
 }
 
+/// Adds the inverse-barometer response of the sea to another provider's
+/// elevation.
+///
+/// With atmospheric pressure forcing (`AtmosphericPressure2D`) the interior
+/// sea level settles at `η_IB = −(p − p₀)/(ρ g)` (≈ −1 cm/hPa), which the
+/// pressure-gradient force balances exactly. External data without that
+/// response (tides, still water) pins the boundary to the wrong level and
+/// drives a spurious current through it. `level(x, y, t)` is the inverse
+/// barometer elevation, e.g. `|x, y, t| pressure.inverse_barometer(x, y, t)`.
+#[derive(Clone, Debug)]
+pub struct InverseBarometer<P, F> {
+    provider: P,
+    level: F,
+}
+
+impl<P, F> InverseBarometer<P, F>
+where
+    P: ExternalStateProvider,
+    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
+{
+    /// `provider`'s external state, raised by `level(x, y, t)`.
+    pub fn new(provider: P, level: F) -> Self {
+        Self { provider, level }
+    }
+}
+
+impl<P, F> ExternalStateProvider for InverseBarometer<P, F>
+where
+    P: ExternalStateProvider,
+    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
+{
+    fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
+        let mut state = self.provider.external_state(ctx);
+        let (x, y) = ctx.position;
+        state.eta += (self.level)(x, y, ctx.time);
+        state
+    }
+}
+
 /// External normal velocity for elevation-only data; see the module docs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ElevationOnly {
@@ -418,7 +457,8 @@ mod tests {
     #[test]
     fn incoming_wave_is_a_simple_wave_from_still_water() {
         let (depth, n) = (10.0, (-1.0, 0.0));
-        let bc = CharacteristicOBC::new(|_, _, _| ExternalState::elevation(0.1)).with_incoming_wave();
+        let bc =
+            CharacteristicOBC::new(|_, _, _| ExternalState::elevation(0.1)).with_incoming_wave();
         // Interior already carries the same simple wave: the boundary state is it
         let h = depth + 0.1;
         let un = 2.0 * ((G * depth).sqrt() - (G * h).sqrt());

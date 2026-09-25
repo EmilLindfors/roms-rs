@@ -26,8 +26,8 @@
 use std::f64::consts::PI;
 
 use dg_rs::boundary::{
-    CharacteristicOBC, ElevationOnly, ExternalState,
-    MultiBoundaryCondition2D, ParentTimeSeries, Reflective2D, SWEBoundaryCondition2D, StillWater,
+    CharacteristicOBC, ElevationOnly, ExternalState, MultiBoundaryCondition2D, ParentTimeSeries,
+    Reflective2D, SWEBoundaryCondition2D, StillWater,
 };
 use dg_rs::flux::SWEFluxType2D;
 use dg_rs::io::{BoundaryTimeSeries, TimeSeriesRecord};
@@ -110,7 +110,8 @@ impl Domain {
     }
 
     fn nodes(&self) -> impl Iterator<Item = (ElementIndex, usize)> + '_ {
-        ElementIndex::iter(self.mesh.n_elements).flat_map(|k| (0..self.ops.n_nodes).map(move |i| (k, i)))
+        ElementIndex::iter(self.mesh.n_elements)
+            .flat_map(|k| (0..self.ops.n_nodes).map(move |i| (k, i)))
     }
 
     fn xy(&self, k: ElementIndex, i: usize) -> [f64; 2] {
@@ -173,7 +174,10 @@ impl Domain {
     fn max_abs_eta(&self, q: &SWESolution2D) -> f64 {
         self.nodes()
             .map(|(k, i)| (q.get_state(k, i).h - H0).abs())
-            .fold(0.0, |m, e| if e.is_nan() { f64::INFINITY } else { m.max(e) })
+            .fold(
+                0.0,
+                |m, e| if e.is_nan() { f64::INFINITY } else { m.max(e) },
+            )
     }
 }
 
@@ -333,7 +337,12 @@ fn elevation_only_forcing_as_incoming_wave_delivers_the_wave() {
         CharacteristicOBC::new(|_, _, t| ExternalState::elevation(eastward_wave_at_west(t).0))
             .with_incoming_wave();
     for scheme in [SCHEMES[0], SCHEMES[2], SCHEMES[4]] {
-        assert_amplitude("η, incoming", scheme, delivered_amplitude(&forcing, scheme), 1.0);
+        assert_amplitude(
+            "η, incoming",
+            scheme,
+            delivered_amplitude(&forcing, scheme),
+            1.0,
+        );
     }
 }
 
@@ -537,9 +546,46 @@ fn lake_at_rest_is_exact_with_open_boundaries() {
         Scheme::Split(SWEFormulation2D::WetDry),
     ] {
         let config = domain.config(&obc, scheme);
-        let rhs =
-            compute_rhs_swe_2d(&q, &domain.mesh, &domain.ops, &domain.geom, &config, 0.0);
+        let rhs = compute_rhs_swe_2d(&q, &domain.mesh, &domain.ops, &domain.geom, &config, 0.0);
         println!("{scheme:?}: max |rhs| = {:.2e}", rhs.max_abs());
         assert!(rhs.max_abs() < 1e-10, "{scheme:?}: {:.3e}", rhs.max_abs());
     }
+}
+
+/// A uniform atmospheric pressure gradient over a basin open on all sides:
+/// the sea at its inverse-barometer level is at rest (the pressure force
+/// balances the surface slope) only if the open boundaries carry that level
+/// too; still water at mean sea level outside drives flow through them.
+#[test]
+fn inverse_barometer_at_open_boundaries_keeps_the_sea_at_rest() {
+    use dg_rs::boundary::InverseBarometer;
+    use dg_rs::source::AtmosphericPressure2D;
+
+    let domain = Domain::new(Mesh2D::uniform_rectangle_with_bc(
+        0.0,
+        400.0,
+        0.0,
+        300.0,
+        4,
+        3,
+        BoundaryTag::Open,
+    ));
+    let pressure = AtmosphericPressure2D::uniform_gradient(2e-2, -1e-2);
+    let q = domain.state(|x, y| (pressure.inverse_barometer(x, y, 0.0), 0.0, 0.0));
+
+    let rhs_with = |bc: &dyn SWEBoundaryCondition2D| {
+        let bc = with_walls(bc);
+        let config = domain
+            .config(&bc, Scheme::Split(SWEFormulation2D::EntropyStable))
+            .with_source_terms(&pressure);
+        compute_rhs_swe_2d(&q, &domain.mesh, &domain.ops, &domain.geom, &config, 0.0).max_abs()
+    };
+    let with_ib = rhs_with(&CharacteristicOBC::new(InverseBarometer::new(
+        StillWater::default(),
+        |x, y, t| pressure.inverse_barometer(x, y, t),
+    )));
+    let without = rhs_with(&CharacteristicOBC::still_water());
+    println!("max |rhs|: {with_ib:.2e} with the IB level outside, {without:.2e} without");
+    assert!(with_ib < 1e-12, "{with_ib:.3e}");
+    assert!(without > 1e-6, "{without:.3e}");
 }

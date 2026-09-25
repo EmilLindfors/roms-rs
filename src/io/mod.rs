@@ -87,6 +87,7 @@ mod projection;
 mod tide_gauge_reader;
 mod timeseries_reader;
 mod vtk;
+mod z_levels;
 
 pub use adcp_reader::{ADCPFile, ADCPFileError, read_adcp_file, write_adcp_file};
 pub use coastline::{CoastlineData, CoastlineError, CoastlineStatistics, FROYA_BBOX, NORWAY_BBOX};
@@ -120,3 +121,4 @@ pub use timeseries_reader::{
     read_timeseries_file,
 };
 pub use vtk::{VtkError, write_vtk_coupled, write_vtk_series, write_vtk_swe};
+pub use z_levels::depth_average_z;

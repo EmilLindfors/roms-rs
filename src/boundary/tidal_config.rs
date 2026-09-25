@@ -255,8 +255,8 @@ impl TidalSimulationBuilder {
 
     /// The configured tide.
     fn tide(&self) -> HarmonicTide {
-        let tide = HarmonicTide::new(self.constituents.clone())
-            .with_mean_elevation(self.mean_elevation);
+        let tide =
+            HarmonicTide::new(self.constituents.clone()).with_mean_elevation(self.mean_elevation);
         match self.ramp_duration {
             Some(duration) => tide.with_ramp_up(duration),
             None => tide,
