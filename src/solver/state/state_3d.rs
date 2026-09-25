@@ -45,7 +45,9 @@ pub struct Solution3D {
     pub u: Vec<f64>,
     /// 3D v-velocity (m/s)
     pub v: Vec<f64>,
-    /// 3D vertical velocity w (m/s)
+    /// Vertical velocity diagnostic (m/s) at the layer centres: the sigma-coordinate
+    /// Ω, averaged from its w-point values by `Hydrostatic3D::post_process`
+    /// (output only; the RHS uses Ω at the interfaces).
     pub w: Vec<f64>,
     /// Temperature (°C)
     pub temp: Vec<f64>,

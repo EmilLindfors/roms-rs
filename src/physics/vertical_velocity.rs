@@ -18,6 +18,15 @@ use crate::vertical::SigmaGrid;
 /// In practice, we compute the uncorrected omega by integrating divergence from the bottom up,
 /// and then apply a linear correction to enforce $\Omega(0) = 0$.
 ///
+/// $\Omega$ is the volume flux per unit horizontal area through a sigma surface (m/s).
+/// It is stored at the **w-points** (layer interfaces, `sigma.sigma_w()`), so
+/// `w_out` holds `n_levels + 1` values per column in the layout
+/// `[element][node][interface]` (interface 0 = bed, `n_levels` = surface; both are
+/// zero by the kinematic conditions). Keeping the interface values — rather than
+/// averaging to layer centres — preserves discrete layer continuity
+/// $\partial_t H_z + \nabla\cdot(H_z \mathbf{u}) + \Omega_{k+1/2} - \Omega_{k-1/2} = 0$,
+/// which the vertical advection in [`crate::solver::rhs::apply_vertical_advection_3d`]
+/// relies on.
 pub fn compute_vertical_velocity(
     w_out: &mut [f64],
     state: &Solution3D,
@@ -33,6 +42,12 @@ pub fn compute_vertical_velocity(
     let n_levels = sigma.n_levels();
     let d_sigma = sigma.d_sigma();
     let sigma_w = sigma.sigma_w();
+    let n_faces = n_levels + 1;
+    assert_eq!(
+        w_out.len(),
+        n_elements * n_nodes * n_faces,
+        "omega is stored at w-points: n_elements * n_nodes * (n_levels + 1)"
+    );
 
     // Borrow fields
     let u = &state.u;
@@ -189,42 +204,95 @@ pub fn compute_vertical_velocity(
             }
         }
 
-        // 3. Integrate vertically to find Omega
-        // Omega_face has N+1 levels (interfaces)
-        // Omega_face[0] = 0 (bottom)
-        // Omega_face[k+1] = Omega_face[k] - Div_k * d_sigma_k
-
-        let mut omega_face = vec![0.0; n_levels + 1];
-
+        // 3. Integrate vertically to find Omega at the interfaces:
+        // Omega[0] = 0 (bottom), Omega[k+1] = Omega[k] - Div_k * d_sigma_k,
+        // then apply the linear correction Omega(s) -= (s + 1) * Omega(surface)
+        // so that Omega[n_levels] = 0 (sigma ranges from -1 to 0).
         for i in 0..n_nodes {
-            omega_face[0] = 0.0;
+            let start = (e * n_nodes + i) * n_faces;
+            let w_col = &mut w[start..start + n_faces];
 
-            // Integrate up
+            w_col[0] = 0.0;
             for k in 0..n_levels {
-                let div = div_layer[k * n_nodes + i];
-                omega_face[k + 1] = omega_face[k] - div * d_sigma[k];
+                w_col[k + 1] = w_col[k] - div_layer[k * n_nodes + i] * d_sigma[k];
             }
 
-            // Apply linear correction to enforce Omega_face[N] = 0
-            // Omega_corr(s) = Omega(s) - (s + 1) * Omega(N)
-            // (Assuming sigma ranges from -1 to 0)
-            let omega_surface = omega_face[n_levels];
+            let omega_surface = w_col[n_levels];
+            for (w_face, &s_face) in w_col.iter_mut().zip(sigma_w) {
+                *w_face -= (s_face + 1.0) * omega_surface;
+            }
+        }
+    }
+}
 
-            for k in 0..n_levels {
-                // Calculate corrected Omega at faces k and k+1
-                // We need sigma_w[k]
-                let s_k = sigma_w[k];
-                let s_k1 = sigma_w[k + 1];
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
 
-                let w_face_k = omega_face[k] - (s_k + 1.0) * omega_surface;
-                let w_face_k1 = omega_face[k + 1] - (s_k1 + 1.0) * omega_surface;
+    /// Ω is stored at the w-points and satisfies discrete layer continuity.
+    ///
+    /// A zero-depth-mean shear flow `u_k = U_k sin(2πx)` over a flat bed has no
+    /// net column divergence, so the surface correction vanishes and each layer
+    /// increment `Ω_{k+1/2} − Ω_{k−1/2} = −Δσ_k ∇·(D u_k)` must scale with `U_k`.
+    /// The previous layer-centre storage (averaged back to interfaces by the
+    /// advection kernels) mixed neighbouring layers and broke this.
+    #[test]
+    fn omega_at_w_points_satisfies_layer_continuity() {
+        let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 1);
+        let ops = DGOperators2D::new(3);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let n_levels = 4;
+        let sigma = SigmaGrid::uniform(n_levels);
+        let n_nodes = ops.n_nodes;
+        let bathymetry = Bathymetry2D::constant(mesh.n_elements, n_nodes, -10.0);
 
-                // Interpolate to center (layer k)
-                let w_center = 0.5 * (w_face_k + w_face_k1);
+        let mut state = Solution3D::new(mesh.n_elements, n_nodes, n_levels);
+        state.eta.fill(0.0);
+        // U_k = σ_k + 1/2 has zero depth mean on the uniform grid.
+        let shear: Vec<f64> = sigma.sigma_rho().iter().map(|&s| s + 0.5).collect();
+        for k in 0..mesh.n_elements {
+            let el = ElementIndex::new(k);
+            for i in 0..n_nodes {
+                let [x, _] = mesh.reference_to_physical(el, ops.nodes_r[i], ops.nodes_s[i]);
+                for (u, &shear_l) in state.u_column_mut(el, i).iter_mut().zip(&shear) {
+                    *u = shear_l * (2.0 * PI * x).sin();
+                }
+            }
+        }
 
-                // Store in w (w_out)
-                let idx_3d = (e * n_nodes + i) * n_levels + k;
-                w[idx_3d] = w_center;
+        let mut w = vec![0.0; mesh.n_elements * n_nodes * (n_levels + 1)];
+        compute_vertical_velocity(
+            &mut w,
+            &state,
+            &mesh,
+            &ops,
+            &sigma,
+            &bathymetry,
+            &geom,
+            9.81,
+        );
+
+        let scale = w.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+        assert!(scale > 1e-3, "test flow should drive a non-trivial Ω");
+        let tol = 1e-12 * scale;
+        let d_sigma = sigma.d_sigma();
+        for col in w.chunks_exact(n_levels + 1) {
+            assert!(col[0].abs() < tol, "Ω at bed = {}", col[0]);
+            assert!(
+                col[n_levels].abs() < tol,
+                "Ω at surface = {}",
+                col[n_levels]
+            );
+            // Per-unit-shear increment in the bottom layer fixes the column's divergence.
+            let rate = (col[1] - col[0]) / (shear[0] * d_sigma[0]);
+            for l in 0..n_levels {
+                let increment = col[l + 1] - col[l];
+                let expected = rate * shear[l] * d_sigma[l];
+                assert!(
+                    (increment - expected).abs() < tol,
+                    "layer {l}: Ω increment {increment}, continuity requires {expected}"
+                );
             }
         }
     }

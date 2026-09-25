@@ -400,7 +400,7 @@ pub fn apply_tracer_advection_3d(
                 phi_nodes[i] = state.get_value(tracer, el_idx, i, l);
                 u_nodes[i] = state.u_column(el_idx, i)[l];
                 v_nodes[i] = state.v_column(el_idx, i)[l];
-                hz_nodes[i] = tracer_layer_thickness(state, bathymetry, el_idx, i, d_sigma[l]);
+                hz_nodes[i] = layer_thickness(state, bathymetry, el_idx, i, d_sigma[l]);
             }
 
             // --- 1. Volume Term: div(Hz*u*phi, Hz*v*phi) ---
@@ -451,7 +451,7 @@ pub fn apply_tracer_advection_3d(
                     phi_int[i] = state.get_value(tracer, el_idx, ni, l);
                     u_int[i] = state.u_column(el_idx, ni)[l];
                     v_int[i] = state.v_column(el_idx, ni)[l];
-                    hz_int[i] = tracer_layer_thickness(state, bathymetry, el_idx, ni, d_sigma[l]);
+                    hz_int[i] = layer_thickness(state, bathymetry, el_idx, ni, d_sigma[l]);
                 }
 
                 // Gather exterior values
@@ -469,8 +469,7 @@ pub fn apply_tracer_advection_3d(
                         phi_ext[i] = state.get_value(tracer, nb_idx, ni, l);
                         u_ext[i] = state.u_column(nb_idx, ni)[l];
                         v_ext[i] = state.v_column(nb_idx, ni)[l];
-                        hz_ext[i] =
-                            tracer_layer_thickness(state, bathymetry, nb_idx, ni, d_sigma[l]);
+                        hz_ext[i] = layer_thickness(state, bathymetry, nb_idx, ni, d_sigma[l]);
                     }
                 } else {
                     let boundary_tag = mesh.boundary_tag(el_idx, face);
@@ -526,7 +525,7 @@ pub fn apply_tracer_advection_3d(
                     let rhs_col =
                         Solution3D::get_column_mut(rhs_tracer, n_nodes, n_levels, el_idx, i);
                     let ni = i;
-                    let hz = tracer_layer_thickness(state, bathymetry, el_idx, ni, d_sigma[l]);
+                    let hz = layer_thickness(state, bathymetry, el_idx, ni, d_sigma[l]);
                     rhs_col[l] += lift_scale * lift / hz;
                 }
             }
@@ -534,7 +533,9 @@ pub fn apply_tracer_advection_3d(
     }
 }
 
-fn tracer_layer_thickness(
+/// Layer thickness `Hz = D·Δσ` (m) at a node, with `D = η − B`, floored at
+/// [`MIN_LAYER_THICKNESS`].
+fn layer_thickness(
     state: &Solution3D,
     bathymetry: &Bathymetry2D,
     element: ElementIndex,
@@ -548,7 +549,10 @@ fn tracer_layer_thickness(
 
 /// Apply vertical advection to 3D fields.
 ///
-/// $\frac{\partial (\Omega \phi)}{\partial s}$
+/// $-\frac{1}{H_z} \delta_k (\Omega \phi)$, where $\Omega$ (m/s) is the volume flux
+/// per unit area through sigma surfaces from
+/// [`crate::physics::compute_vertical_velocity`] and $H_z = D\,\Delta\sigma_k$ is
+/// the layer thickness ($D = \eta - B$).
 ///
 /// Uses centered interface values for momentum and upwind interface values for
 /// tracers. The tracer path is intentionally more diffusive because centered
@@ -558,7 +562,10 @@ fn tracer_layer_thickness(
 /// # Arguments
 /// * `rhs`: RHS accumulator
 /// * `state`: Current state
+/// * `w_vel`: $\Omega$ at the w-points, `n_levels + 1` values per column
+///   (see [`crate::physics::compute_vertical_velocity`])
 /// * `sigma`: Sigma grid (for vertical spacing)
+/// * `bathymetry`: Bed elevation `B`, for the layer thickness
 pub fn apply_vertical_advection_3d(
     rhs: &mut Solution3D,
     state: &Solution3D,
@@ -567,24 +574,8 @@ pub fn apply_vertical_advection_3d(
     bathymetry: &Bathymetry2D,
 ) {
     // Momentum
-    apply_vertical_advection_field(
-        &mut rhs.u,
-        &state.u,
-        w_vel,
-        state.n_elements,
-        state.n_nodes,
-        state.n_levels,
-        sigma,
-    );
-    apply_vertical_advection_field(
-        &mut rhs.v,
-        &state.v,
-        w_vel,
-        state.n_elements,
-        state.n_nodes,
-        state.n_levels,
-        sigma,
-    );
+    apply_vertical_advection_field(&mut rhs.u, &state.u, state, bathymetry, w_vel, sigma);
+    apply_vertical_advection_field(&mut rhs.v, &state.v, state, bathymetry, w_vel, sigma);
 
     // Tracers
     apply_vertical_tracer_advection_field(
@@ -606,22 +597,30 @@ pub fn apply_vertical_advection_3d(
 }
 
 /// Centered vertical advection for momentum-like fields.
+///
+/// $-\frac{1}{H_z}(\Omega_{k+1/2}\phi_{k+1/2} - \Omega_{k-1/2}\phi_{k-1/2})$ with
+/// $\phi$ averaged to the interfaces. `w_vel` is $\Omega$ at the w-points
+/// (`n_levels + 1` per column). $\Omega$ is in m/s, so the flux difference is
+/// divided by the layer thickness $H_z = D\,\Delta\sigma$, not by $\Delta\sigma$.
 pub fn apply_vertical_advection_field(
     rhs_field: &mut [f64],
     field: &[f64],
-    w_vel: &[f64], // Omega
-    n_elements: usize,
-    n_nodes: usize,
-    n_levels: usize,
+    state: &Solution3D,
+    bathymetry: &Bathymetry2D,
+    w_vel: &[f64], // Omega at w-points
     sigma: &SigmaGrid,
 ) {
     let d_sigma = sigma.d_sigma();
+    let n_elements = state.n_elements;
+    let n_nodes = state.n_nodes;
+    let n_levels = state.n_levels;
+    debug_assert_eq!(w_vel.len(), n_elements * n_nodes * (n_levels + 1));
     let mut flux = vec![0.0; n_levels + 1];
 
     for k in 0..n_elements {
         let el_idx = ElementIndex::new(k);
         for i in 0..n_nodes {
-            let w_col = Solution3D::get_column(w_vel, n_nodes, n_levels, el_idx, i);
+            let w_col = Solution3D::get_column(w_vel, n_nodes, n_levels + 1, el_idx, i);
             let phi_col = Solution3D::get_column(field, n_nodes, n_levels, el_idx, i);
 
             // Compute fluxes at interfaces
@@ -629,17 +628,16 @@ pub fn apply_vertical_advection_field(
             flux[n_levels] = 0.0;
 
             for l in 1..n_levels {
-                // Centered difference for flux
-                let w_face = 0.5 * (w_col[l - 1] + w_col[l]);
+                // Centered interface value
                 let phi_face = 0.5 * (phi_col[l - 1] + phi_col[l]);
-                flux[l] = w_face * phi_face;
+                flux[l] = w_col[l] * phi_face;
             }
 
             // Update RHS
             let rhs_col = Solution3D::get_column_mut(rhs_field, n_nodes, n_levels, el_idx, i);
             for l in 0..n_levels {
-                let div = (flux[l + 1] - flux[l]) / d_sigma[l];
-                rhs_col[l] -= div;
+                let hz = layer_thickness(state, bathymetry, el_idx, i, d_sigma[l]);
+                rhs_col[l] -= (flux[l + 1] - flux[l]) / hz;
             }
         }
     }
@@ -649,31 +647,33 @@ pub fn apply_vertical_advection_field(
 ///
 /// This preserves the conservative flux-difference form but avoids centered
 /// interface concentrations, which can create new extrema in advected tracers.
+/// `w_vel` is $\Omega$ at the w-points (`n_levels + 1` per column).
 pub fn apply_vertical_tracer_advection_field(
     rhs_field: &mut [f64],
     field: &[f64],
     state: &Solution3D,
     bathymetry: &Bathymetry2D,
-    w_vel: &[f64], // Omega
+    w_vel: &[f64], // Omega at w-points
     sigma: &SigmaGrid,
 ) {
     let d_sigma = sigma.d_sigma();
     let n_elements = state.n_elements;
     let n_nodes = state.n_nodes;
     let n_levels = state.n_levels;
+    debug_assert_eq!(w_vel.len(), n_elements * n_nodes * (n_levels + 1));
     let mut flux = vec![0.0; n_levels + 1];
 
     for k in 0..n_elements {
         let el_idx = ElementIndex::new(k);
         for i in 0..n_nodes {
-            let w_col = Solution3D::get_column(w_vel, n_nodes, n_levels, el_idx, i);
+            let w_col = Solution3D::get_column(w_vel, n_nodes, n_levels + 1, el_idx, i);
             let phi_col = Solution3D::get_column(field, n_nodes, n_levels, el_idx, i);
 
             flux[0] = 0.0;
             flux[n_levels] = 0.0;
 
             for l in 1..n_levels {
-                let w_face = 0.5 * (w_col[l - 1] + w_col[l]);
+                let w_face = w_col[l];
                 let phi_face = if w_face >= 0.0 {
                     phi_col[l - 1]
                 } else {
@@ -684,7 +684,7 @@ pub fn apply_vertical_tracer_advection_field(
 
             let rhs_col = Solution3D::get_column_mut(rhs_field, n_nodes, n_levels, el_idx, i);
             for l in 0..n_levels {
-                let hz = tracer_layer_thickness(state, bathymetry, el_idx, i, d_sigma[l]);
+                let hz = layer_thickness(state, bathymetry, el_idx, i, d_sigma[l]);
                 let div = (flux[l + 1] - flux[l]) / hz;
                 rhs_col[l] -= div;
             }
@@ -711,7 +711,8 @@ mod tests {
         state.eta.fill(0.0);
         let bathymetry = Bathymetry2D::constant(1, 1, -1.0);
         let field = vec![1.0, 2.0, 4.0];
-        let w = vec![1.0, 1.0, 1.0];
+        // Omega at the w-points (bed, two interior interfaces, surface).
+        let w = vec![0.0, 1.0, 1.0, 0.0];
         let mut rhs = vec![0.0; 3];
 
         apply_vertical_tracer_advection_field(&mut rhs, &field, &state, &bathymetry, &w, &sigma);
@@ -728,7 +729,7 @@ mod tests {
         state.eta.fill(0.0);
         let bathymetry = Bathymetry2D::constant(1, 1, -1.0);
         let field = vec![1.0, 2.0, 4.0];
-        let w = vec![-1.0, -1.0, -1.0];
+        let w = vec![0.0, -1.0, -1.0, 0.0];
         let mut rhs = vec![0.0; 3];
 
         apply_vertical_tracer_advection_field(&mut rhs, &field, &state, &bathymetry, &w, &sigma);
@@ -736,6 +737,58 @@ mod tests {
         assert_close(rhs[0], 6.0);
         assert_close(rhs[1], 6.0);
         assert_close(rhs[2], -12.0);
+    }
+
+    /// Regression: Ω from `compute_vertical_velocity` is a volume flux per unit
+    /// area (m/s), so vertical momentum advection is −(1/Hz)·δ(Ω u) with
+    /// Hz = D·Δσ. It used to divide by Δσ alone — D (here 200×) too large.
+    /// Linear Ω(σ) and u(σ) in a D = 200 m column make the interface values exact,
+    /// so the tendency must match the analytic flux difference to rounding.
+    #[test]
+    fn vertical_momentum_advection_divides_by_layer_thickness() {
+        let n = 4;
+        let depth = 200.0;
+        let sigma = SigmaGrid::uniform(n);
+        let bathymetry = Bathymetry2D::constant(1, 1, -depth);
+        let mut state = Solution3D::new(1, 1, n);
+        state.eta.fill(0.0);
+
+        let omega = |s: f64| 0.03 * (s + 1.0);
+        let u = |s: f64| 0.4 - 0.5 * s;
+        let v = |s: f64| -0.2 + 0.1 * s;
+        for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+            state.u[l] = u(s);
+            state.v[l] = v(s);
+        }
+        let w: Vec<f64> = sigma.sigma_w().iter().map(|&s| omega(s)).collect();
+
+        let mut rhs = Solution3D::new(1, 1, n);
+        apply_vertical_advection_3d(&mut rhs, &state, &w, &sigma, &bathymetry);
+
+        // Kinematic conditions: no flux through the bed or the surface.
+        let sw = sigma.sigma_w();
+        let flux = |f: usize, phi: &dyn Fn(f64) -> f64| {
+            if f == 0 || f == n {
+                0.0
+            } else {
+                omega(sw[f]) * phi(sw[f])
+            }
+        };
+        for l in 0..n {
+            let hz = depth * sigma.d_sigma()[l];
+            let expected_u = -(flux(l + 1, &u) - flux(l, &u)) / hz;
+            let expected_v = -(flux(l + 1, &v) - flux(l, &v)) / hz;
+            assert!(
+                (rhs.u[l] - expected_u).abs() <= 1e-12 * expected_u.abs(),
+                "u level {l}: got {}, expected {expected_u}",
+                rhs.u[l]
+            );
+            assert!(
+                (rhs.v[l] - expected_v).abs() <= 1e-12 * expected_v.abs(),
+                "v level {l}: got {}, expected {expected_v}",
+                rhs.v[l]
+            );
+        }
     }
 
     #[test]
@@ -801,13 +854,8 @@ mod tests {
             for i in 0..ops.n_nodes {
                 for level in 0..sigma.n_levels() {
                     let idx = (k * ops.n_nodes + i) * sigma.n_levels() + level;
-                    let hz = tracer_layer_thickness(
-                        &state,
-                        &bathymetry,
-                        el_idx,
-                        i,
-                        sigma.d_sigma()[level],
-                    );
+                    let hz =
+                        layer_thickness(&state, &bathymetry, el_idx, i, sigma.d_sigma()[level]);
                     total_inventory_tendency += ops.weights[i] * geom.det_j[k] * hz * rhs[idx];
                 }
             }

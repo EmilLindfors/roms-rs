@@ -72,7 +72,8 @@ where
         g: f64,
         rho0: f64,
     ) -> Self {
-        let n_w = mesh.n_elements * ops.n_nodes * sigma.n_levels();
+        // Omega lives at the w-points: n_levels + 1 interfaces per column.
+        let n_w = mesh.n_elements * ops.n_nodes * (sigma.n_levels() + 1);
         Self {
             mesh,
             ops,
@@ -340,11 +341,17 @@ where
             self.g,
         );
 
-        // Copy to state.w
-        // Assuming Solution3D has helper for bulk copy or we iterate
-        // Since state.w is Vec<f64> and w_vel is Vec<f64>, we can use copy_from_slice
-        if state.w.len() == w_vel.len() {
-            state.w.copy_from_slice(&*w_vel);
+        // state.w is an output field at the layer centres: average the two
+        // bounding interface values of each layer.
+        let n_levels = state.n_levels;
+        for (w_col, omega_col) in state
+            .w
+            .chunks_exact_mut(n_levels)
+            .zip(w_vel.chunks_exact(n_levels + 1))
+        {
+            for (l, w) in w_col.iter_mut().enumerate() {
+                *w = 0.5 * (omega_col[l] + omega_col[l + 1]);
+            }
         }
 
         // Could also apply equation of state update here to ensure rho is fresh
