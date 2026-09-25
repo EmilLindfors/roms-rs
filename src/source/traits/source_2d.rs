@@ -94,6 +94,15 @@ pub trait SourceTerm2D: Send + Sync {
     fn is_stiff(&self) -> bool {
         false
     }
+
+    /// Whether this source term discretizes the bed-slope force `−g h ∇B`.
+    ///
+    /// The split-form formulations (`SWEFormulation2D::EntropyStable` and
+    /// `EntropyConservative`) build the bed slope into the DG operator itself, so
+    /// the 2D SWE RHS refuses source terms that would add it a second time.
+    fn includes_bathymetry_slope(&self) -> bool {
+        false
+    }
 }
 
 /// Combine multiple 2D source terms into one.
@@ -147,6 +156,10 @@ impl<'a> SourceTerm2D for CombinedSource2D<'a> {
 
     fn is_stiff(&self) -> bool {
         self.sources.iter().any(|s| s.is_stiff())
+    }
+
+    fn includes_bathymetry_slope(&self) -> bool {
+        self.sources.iter().any(|s| s.includes_bathymetry_slope())
     }
 }
 

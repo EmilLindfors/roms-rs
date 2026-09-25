@@ -154,6 +154,42 @@ For periodic domains without source terms:
 | X-momentum (hu) | < 1e-10 |
 | Y-momentum (hv) | < 1e-10 |
 
+### Well-Balancing with Variable Bathymetry
+
+Periodic 20 km domain (12×12), B = −200 + 150·sin(2πx/L)·cos(2πy/L) m, η = 0.3 m.
+Beds: smooth nodal (degree ≥ p), cell-averaged (jumps at every face), and
+rough (smooth + ±15 m per-node noise). Also on a walled 8×5 domain.
+
+| Formulation | Bathymetry | Max \|d(hu)/dt\| at lake-at-rest (m²/s²) |
+|-------------|------------|--------------------------------------|
+| Standard + `BathymetrySource2D` + reconstruction | smooth nodal, P2 | 2.5 (not balanced: needs deg B ≤ p/2) |
+| Standard + reconstruction | cell-averaged, P1–P3 | ≤ 3e-12 |
+| Entropy-stable split form | smooth / cell-averaged / rough, P1–P4 | ≤ 4e-12 |
+
+Mass conservation (slope-correlated flow, cell-averaged B with hydrostatic
+reconstruction): relative d(mass)/dt ≈ 1e-20 (was −5.2e-5 per second before the
+interior-flux fix). Split form, all beds: ≤ 6e-20.
+
+### Entropy-Stable Split Form (Wintermeyer et al. 2017)
+
+`SWEFormulation2D::EntropyStable` / `EntropyConservative` (flux differencing
+with the Wintermeyer two-point flux, collocated bed source, interface bed term
+½g h⁻[[B]]). Discrete entropy rate ∫ w·dq/dt on periodic and walled domains:
+
+| Formulation | Relative entropy rate |
+|-------------|-----------------------|
+| EntropyConservative | ≤ 3e-14 (round-off) |
+| EntropyStable | < 0 whenever (η, u, v) jump across faces |
+
+Nonlinear manufactured solution over variable bathymetry on [0, √2]²
+(H = 7 + cos(2π√2 x)·sin(2π√2 y)·cos(2πt), b = 2 + ½ sin(√2πx) + ½ sin(√2πy),
+(u, v) = (½, 3/2)), t = 0.1, L2 error in h:
+
+| Order | 4×4 | 8×8 | 16×16 | Observed order |
+|-------|-----|-----|-------|----------------|
+| P2 | 2.64e-1 | 3.94e-2 | 4.74e-3 | 3.06 |
+| P3 | 3.98e-2 | 3.17e-3 | 1.98e-4 | 4.00 |
+
 ### Numerical Flux Comparison
 
 For smooth solutions, all flux types produce similar results:
@@ -204,6 +240,9 @@ cargo test --test convergence_test test_convergence_2d -- --nocapture
 
 # Run 2D SWE tests
 cargo test --test swe_2d_test -- --nocapture
+
+# Split-form (entropy-stable) SWE convergence with bathymetry
+cargo test --test convergence_test split_form -- --nocapture
 
 # Run all 2D-related tests
 cargo test 2d -- --nocapture

@@ -300,7 +300,7 @@ The critical path to ROMS-equivalent capability. See `3D_TODO.md` for detailed i
 Beyond operational 2D, for research and long-term capability.
 
 ### Research Numerics
-- [ ] Entropy-stable DG (SBP operators + entropy-conservative fluxes)
+- [x] Entropy-stable DG (SBP operators + entropy-conservative fluxes) — 2D SWE split-form DGSEM of Wintermeyer et al. (2017), opt-in via `SWEFormulation2D::EntropyStable` (`EntropyConservative` for verification). Well-balanced for any nodal bathymetry incl. face jumps (REVIEW.md §1.1), exact mass conservation, entropy conserved/dissipated to round-off, P2/P3 convergence 3.06/4.00 on a nonlinear manufactured solution with bathymetry. Follow-ups: η-based limiting (REVIEW.md §1.4), positivity/wetting-drying for the split form, switch `examples/froya_real_data.rs` from cell-averaged B to nodal B + split form
 - [ ] IMEX time stepping via diffsol (implicit vertical diffusion)
 - [ ] Subcell positivity preservation with convex limiting (Wu et al. 2024)
 - [ ] Sum-factorization for tensor-product elements
