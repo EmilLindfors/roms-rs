@@ -12,7 +12,7 @@ use crate::time::{Integrable, StageWorkspace, TimeIntegrator};
 /// Configuration for a simulation run.
 #[derive(Clone, Debug)]
 pub struct SimulationConfig {
-    /// CFL number for time step calculation.
+    /// CFL number for time step calculation (capped by `PhysicsModule::max_cfl`).
     pub cfl: f64,
     /// Maximum time step (overrides CFL if smaller).
     pub dt_max: Option<f64>,
@@ -225,6 +225,11 @@ where
         let mut last_callback_time = t_start;
         // Stage buffers reused for the whole run (no per-step allocation)
         let mut stages = StageWorkspace::new();
+        // e.g. the positivity bound of a wet/dry scheme
+        let cfl = self
+            .physics
+            .max_cfl()
+            .map_or(self.config.cfl, |max| self.config.cfl.min(max));
 
         // Call initial callback
         callback(state, t);
@@ -236,6 +241,13 @@ where
                 self.integrator.name()
             );
             println!("  t_start = {:.4}, t_end = {:.4}", t_start, t_end);
+            if cfl < self.config.cfl {
+                println!(
+                    "  CFL {} capped at {cfl:.3} by {}",
+                    self.config.cfl,
+                    self.physics.name()
+                );
+            }
         }
 
         while t < t_end {
@@ -251,7 +263,7 @@ where
             }
 
             // Compute time step
-            let mut dt = self.physics.compute_dt(state, self.config.cfl);
+            let mut dt = self.physics.compute_dt(state, cfl);
 
             // Apply dt limits
             if let Some(dt_max) = self.config.dt_max {
@@ -278,13 +290,16 @@ where
             dt_min_used = dt_min_used.min(dt);
             dt_max_used = dt_max_used.max(dt);
 
-            // Advance the solution. Limiters and wet/dry treatment run after
-            // every RK stage, so no RHS evaluation sees an unlimited state.
-            self.integrator.step_with_workspace(
+            // Advance the solution. Stiff damping (friction, wet/dry
+            // relaxation) is implicit in every RK stage; limiters
+            // and wet/dry treatment run after every RK stage, so no RHS
+            // evaluation sees an unlimited state.
+            self.integrator.step_with_relaxation(
                 state,
                 dt,
                 t,
                 |s, time, out| self.physics.compute_rhs_into(s, time, out),
+                |stage, from, dt| self.physics.implicit_damping(stage, from, dt),
                 |s| self.physics.post_process(s),
                 &mut stages,
             );

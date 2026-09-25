@@ -3,6 +3,7 @@
 //! This module provides builder patterns for constructing physics modules.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::equations::ShallowWater2D;
@@ -10,10 +11,20 @@ use crate::flux::StandardFlux2D;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::{
-    Limiter2D, LimiterContext2D, SWEFormulation2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
-    apply_wet_dry_correction_all,
+    ImplicitDamping2D, Limiter2D, LimiterContext2D, SWEFormulation2D, SWESolution2D,
+    StandardLimiter2D, WetDryConfig, positivity_cfl_swe_2d,
 };
-use crate::source::SourceTerm2D;
+#[cfg(not(feature = "parallel"))]
+use crate::solver::{
+    apply_implicit_damping_2d as implicit_damping,
+    apply_wet_dry_correction_all as wet_dry_correction,
+};
+#[cfg(feature = "parallel")]
+use crate::solver::{
+    apply_implicit_damping_2d_parallel as implicit_damping,
+    apply_wet_dry_correction_all_parallel as wet_dry_correction,
+};
+use crate::source::{BottomFriction2D, SourceTerm2D};
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -30,6 +41,26 @@ use super::traits::{PhysicsModule, PhysicsModuleInfo};
 /// - Boundary conditions
 /// - Source terms
 /// - Limiters
+/// - Wetting/drying and point-implicit bottom friction
+///
+/// # Wetting and drying
+///
+/// A run has wetting/drying when it has a positivity limiter
+/// (`StandardLimiter2D::Positivity`/`KuzminWithPositivity`) or a
+/// [`WetDryConfig`] (`with_wet_dry`). Then:
+/// - the interface flux defaults to HLL (Roe is not positivity preserving);
+/// - `max_cfl` reports `positivity_cfl_swe_2d(N)`, which `Simulation` enforces;
+/// - after every RK stage, depths are limited to h ≥ 0 and near-dry velocities
+///   desingularized ([`crate::solver::apply_wet_dry_correction_all`]);
+/// - in every RK stage, bottom friction (`with_implicit_friction`)
+///   and the thin-layer relaxation are applied point-implicitly
+///   ([`crate::solver::apply_implicit_damping_2d`]).
+///
+/// Elements whose mean depth went negative anyway are emptied (creating mass)
+/// and counted in [`SWEPhysics2D::negative_depth_clips`].
+///
+/// The split-form formulations have no wet/dry interface treatment yet: use
+/// `SWEFormulation2D::Standard` with hydrostatic reconstruction for wet/dry runs.
 pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     /// The mesh
     pub mesh: Arc<Mesh2D>,
@@ -53,10 +84,14 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     pub well_balanced: bool,
     /// Spatial formulation of the SWE operator
     pub formulation: SWEFormulation2D,
-    /// Whether to apply wet/dry correction
-    pub wet_dry_correction: bool,
+    /// Wetting/drying treatment, if enabled
+    pub wet_dry: Option<WetDryConfig>,
+    /// Bottom friction applied point-implicitly, if any
+    pub friction: Option<Arc<dyn BottomFriction2D>>,
     /// Polynomial order
     pub order: usize,
+    /// Elements emptied because their mean depth was negative
+    negative_depth_clips: AtomicUsize,
 }
 
 impl<BC: SWEBoundaryCondition2D> PhysicsModuleInfo for SWEPhysics2D<BC> {
@@ -78,6 +113,29 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModuleInfo for SWEPhysics2D<BC> {
 }
 
 impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
+    /// Whether this run has wetting/drying (a positivity limiter or a
+    /// [`WetDryConfig`]).
+    pub fn has_wetting_drying(&self) -> bool {
+        self.wet_dry.is_some() || self.limiter.preserves_positivity()
+    }
+
+    /// Number of elements (summed over all stages so far) whose mean depth
+    /// was negative and that were emptied, creating mass.
+    ///
+    /// Zero under the positivity CFL with HLL or Rusanov; anything else means
+    /// the time step or the flux broke the positivity guarantee.
+    pub fn negative_depth_clips(&self) -> usize {
+        self.negative_depth_clips.load(Ordering::Relaxed)
+    }
+
+    fn damping(&self) -> ImplicitDamping2D<'_> {
+        ImplicitDamping2D {
+            friction: self.friction.as_deref(),
+            wet_dry: self.wet_dry.as_ref(),
+            h_min: self.equation.h_min,
+        }
+    }
+
     /// RHS configuration for this module's components.
     fn rhs_config(&self) -> crate::solver::SWE2DRhsConfig<'_, BC> {
         use crate::solver::SWE2DRhsConfig;
@@ -136,16 +194,28 @@ impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEP
         )
     }
 
+    /// Limiter, then positivity and velocity desingularization (wet/dry).
     fn post_process(&self, state: &mut SWESolution2D) {
-        // Apply limiter
         let ctx = LimiterContext2D::new(&self.mesh, &self.ops);
-        self.limiter.apply(state, &ctx);
-
-        // Apply wet/dry correction
-        if self.wet_dry_correction {
-            let config = WetDryConfig::new(self.equation.h_min, self.equation.g);
-            apply_wet_dry_correction_all(state, &self.ops, &config);
+        let mut clips = self.limiter.apply_counting(state, &ctx);
+        if let Some(ref config) = self.wet_dry {
+            clips += wet_dry_correction(state, &self.ops, config);
         }
+        if clips > 0 {
+            self.negative_depth_clips
+                .fetch_add(clips, Ordering::Relaxed);
+        }
+    }
+
+    /// Point-implicit bottom friction and thin-layer relaxation.
+    fn implicit_damping(&self, stage: &mut SWESolution2D, from: &SWESolution2D, dt: f64) {
+        implicit_damping(stage, from, dt, &self.damping());
+    }
+
+    /// The DGSEM positivity bound when the run has wetting/drying.
+    fn max_cfl(&self) -> Option<f64> {
+        self.has_wetting_drying()
+            .then(|| positivity_cfl_swe_2d(self.order))
     }
 
     fn mesh(&self) -> &Mesh2D {
@@ -190,13 +260,14 @@ pub struct SWEPhysics2DBuilder<BC: SWEBoundaryCondition2D> {
     geom: Arc<GeometricFactors2D>,
     equation: ShallowWater2D,
     bc: BC,
-    flux: StandardFlux2D,
+    flux: Option<StandardFlux2D>,
     source: Option<Arc<dyn SourceTerm2D>>,
     bathymetry: Option<Arc<Bathymetry2D>>,
     limiter: StandardLimiter2D,
     well_balanced: bool,
     formulation: SWEFormulation2D,
-    wet_dry_correction: bool,
+    wet_dry: Option<WetDryConfig>,
+    friction: Option<Arc<dyn BottomFriction2D>>,
     order: usize,
 }
 
@@ -216,20 +287,25 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             geom,
             equation,
             bc,
-            flux: StandardFlux2D::default(),
+            flux: None,
             source: None,
             bathymetry: None,
             limiter: StandardLimiter2D::default(),
             well_balanced: false,
             formulation: SWEFormulation2D::default(),
-            wet_dry_correction: false,
+            wet_dry: None,
+            friction: None,
             order,
         }
     }
 
     /// Set the numerical flux.
+    ///
+    /// Default: HLL for runs with wetting/drying (a positivity limiter or
+    /// [`Self::with_wet_dry`]), Roe otherwise. Roe is not positivity preserving
+    /// (Einfeldt et al. 1991), so wet/dry runs should keep HLL or use Rusanov.
     pub fn with_flux(mut self, flux: StandardFlux2D) -> Self {
-        self.flux = flux;
+        self.flux = Some(flux);
         self
     }
 
@@ -272,28 +348,64 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
         self
     }
 
-    /// Enable wet/dry correction.
+    /// Enable wetting/drying with the given configuration (see
+    /// [`SWEPhysics2D`]): positivity, velocity desingularization and thin-layer
+    /// relaxation below `config.h_dry`.
+    pub fn with_wet_dry(mut self, config: WetDryConfig) -> Self {
+        self.wet_dry = Some(config);
+        self
+    }
+
+    /// Enable (with [`WetDryConfig::default`], h_dry = 1 mm) or disable
+    /// wetting/drying.
     pub fn with_wet_dry_correction(mut self, enabled: bool) -> Self {
-        self.wet_dry_correction = enabled;
+        self.wet_dry = enabled.then(WetDryConfig::default);
+        self
+    }
+
+    /// Apply a bottom friction law point-implicitly in every RK stage
+    /// (`TimeIntegrator::step_with_relaxation`), instead of as an explicit
+    /// source term.
+    ///
+    /// Unconditionally stable and sign-preserving: explicit friction flips the
+    /// momentum once Δt·C_f|u|/h > 2.5, which happens at every wet/dry front.
+    /// Do not also put the same law in the source terms.
+    pub fn with_implicit_friction<F: BottomFriction2D + 'static>(mut self, friction: F) -> Self {
+        self.friction = Some(Arc::new(friction));
         self
     }
 
     /// Build the physics module.
     pub fn build(self) -> SWEPhysics2D<BC> {
+        let wetting_drying = self.wet_dry.is_some() || self.limiter.preserves_positivity();
+        let flux = self.flux.unwrap_or(if wetting_drying {
+            StandardFlux2D::HLL
+        } else {
+            StandardFlux2D::Roe
+        });
+        if wetting_drying && flux == StandardFlux2D::Roe {
+            eprintln!(
+                "warning: SWEPhysics2D with wetting/drying and the Roe flux: \
+                 Roe is not positivity preserving; use HLL or Rusanov"
+            );
+        }
+
         SWEPhysics2D {
             mesh: self.mesh,
             ops: self.ops,
             geom: self.geom,
             equation: self.equation,
-            flux: self.flux,
+            flux,
             bc: self.bc,
             source: self.source,
             bathymetry: self.bathymetry,
             limiter: self.limiter,
             well_balanced: self.well_balanced,
             formulation: self.formulation,
-            wet_dry_correction: self.wet_dry_correction,
+            wet_dry: self.wet_dry,
+            friction: self.friction,
             order: self.order,
+            negative_depth_clips: AtomicUsize::new(0),
         }
     }
 }
@@ -366,7 +478,50 @@ mod tests {
 
         assert!(physics.well_balanced);
         assert_eq!(physics.formulation, SWEFormulation2D::EntropyStable);
-        assert!(physics.wet_dry_correction);
+        assert!(physics.wet_dry.is_some());
+    }
+
+    #[test]
+    fn test_wet_dry_defaults() {
+        let (mesh, ops, geom) = create_test_components();
+        let builder = || {
+            PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(9.81),
+                Reflective2D::default(),
+            )
+        };
+
+        // Fully wet run: Roe, no CFL cap
+        let wet = builder().build();
+        assert_eq!(wet.flux, StandardFlux2D::Roe);
+        assert!(!wet.has_wetting_drying());
+        assert_eq!(wet.max_cfl(), None);
+
+        // Wetting/drying via the wet/dry treatment or a positivity limiter:
+        // HLL and the positivity CFL (order 2)
+        for physics in [
+            builder().with_wet_dry_correction(true).build(),
+            builder()
+                .with_limiter(StandardLimiter2D::Positivity(1e-3))
+                .build(),
+        ] {
+            assert_eq!(physics.flux, StandardFlux2D::HLL);
+            assert_eq!(physics.max_cfl(), Some(positivity_cfl_swe_2d(2)));
+        }
+
+        // An explicit choice wins
+        let rusanov = builder()
+            .with_wet_dry_correction(true)
+            .with_flux(StandardFlux2D::Rusanov)
+            .build();
+        assert_eq!(rusanov.flux, StandardFlux2D::Rusanov);
+        assert_eq!(
+            rusanov.wet_dry.unwrap().h_dry,
+            Depth::new(WetDryConfig::DEFAULT_H_DRY)
+        );
     }
 
     #[test]

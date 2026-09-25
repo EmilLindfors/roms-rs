@@ -32,6 +32,8 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
    - P0.12 (Flather), P0.13 (reconstruction mass leak), P0.14 (docs), P0.19 (limiter plumbing), P0.20 (NorKyst time base), P0.21 (time step) and P0.22 (3D tracer wall flux) are fixed. Priority 0 is done apart from the deferred P0.11 (GPU); next is P1.1.
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
+   - Split form done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)). Wet/dry robustness is done for the collocated form: h ≥ 0, desingularization, implicit friction, HLL default and the CFL cap.
+   - Next: shoreline well-balancing, and wet/dry for the split form (HLL + Chen–Noelle surface flux).
 4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
 
 Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF. Otherwise use `cargo test --no-default-features --features parallel,simd`.
@@ -128,15 +130,25 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [x] Flux-differencing volume term with the Wintermeyer et al. (2017) two-point flux and the g·hᵢ(DB)ᵢ term. It is exactly well-balanced for any nodal B (including face-discontinuous B), conservative, and fixes GLL aliasing.
   - Done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)): opt-in via `SWEFormulation2D::EntropyStable` (`EntropyConservative` for verification). Exact mass conservation, entropy conserved/dissipated to round-off, P2/P3 convergence 3.06/4.00 on a nonlinear manufactured solution with bathymetry.
   - Follow-up: switch `examples/froya_real_data.rs` from cell-averaged B to nodal B + split form.
-- [ ] Wet/dry and positivity per Wintermeyer et al. (2018). Zhang–Shu towards h ≥ 0 (not h_min). Velocity desingularization (Kurganov–Petrova).
+- [x] Wet/dry and positivity: Zhang–Shu towards h ≥ 0 (not h_min), Kurganov–Petrova velocity desingularization below `h_dry` (1 mm). Done for the collocated (`Standard`) formulation (`solver/algorithms/wetting_drying.rs`, `limiters/swe_2d.rs`). Gates in `tests/wet_dry_2d_test.rs`: Ritter dry dam break (L1 1.5 %, first order), Thacker's paraboloid (L1 7.4 % after one period, was 9.2 %), shoreline lake at rest (|u| < 0.06 m/s where h > 1 cm, was up to the 20 m/s cap). All conserve mass to round-off with h ≥ 0.
+- [ ] **Shoreline well-balancing.** Partially dry elements are not balanced: at lake at rest the dry nodes have η = B ≠ η₀, so the collocated pressure/bed terms leave a residual at the wet nodes. On a 2 % beach, P2/P3 settle within ~10 s into a stationary circulation in the shoreline element: |hu| ≈ 2e-3 m²/s, |u| up to 1 m/s in the 1 mm – 1 cm film. P1 keeps sloshing, with 4 mm offshore η errors.
+  - Candidate fixes: hydrostatic reconstruction inside the element (the pairwise Audusse / Chen–Noelle reconstruction in the split-form volume term), or subcell FV in partially dry elements (Ersing & Winters; Trixi.jl).
+  - Gate: `lake_at_rest_with_shoreline_is_exact` (ignored until then).
+- [ ] **Wet/dry for the split form.** `EntropyStable` uses entropy-stable interface dissipation, which is not positivity preserving, and it has no hydrostatic reconstruction at wet/dry faces. Add an HLL + Chen–Noelle hydrostatic-reconstruction surface flux as a formulation option; this is what Wintermeyer et al. (2018) and Trixi.jl pair with the flux-differencing volume term. Until then, wet/dry runs must use `Standard` (documented on `SWEPhysics2D`).
+- [ ] Dry fronts lag: in the Ritter test the h = 1 mm front is at 71.5 m instead of 79.8 m (P2, 1 m elements; the same on `main`). It moves only to 73 m at 0.5 m resolution, or 75 m with h_dry = 1e-5. The thin-layer relaxation plays no role. Suspects: strict Kuzmin at the front, and zeroing the momentum of elements with mean < h_dry. Revisit with η-based limiting.
+- [ ] Positivity alone does not control a dry front: without a slope limiter, P1/P2 dam breaks shed a thin film that runs ahead at the 20 m/s velocity cap. Partially dry cells need limiting (next item).
 - [ ] Limit η (and velocities or characteristic variables), not h, with a troubled-cell indicator (TVB-M/KXRCF). Limit h only in partially dry cells (Vater et al. 2019).
   - Today, strict Kuzmin on h with cell-average B collapses sloping elements to P0 on every flood/ebb half-cycle.
-- [ ] Nothing enforces the positivity CFL: `positivity_cfl_swe_2d` exists but callers must apply it. Let `PhysicsModule` report a maximum CFL (limiter + flux dependent) and have `Simulation` clamp to it; warn when Roe is combined with a positivity limiter.
-- [ ] The dry-element branch of the positivity limiter clips a negative mean depth to 0, silently creating mass. Under the positivity CFL with HLL/Rusanov a negative mean cannot occur, so count/report these events (debug assertion or a diagnostic counter) instead of hiding them.
-- [ ] Point-implicit friction after each stage (`semi_implicit_update` exists but is unused). Explicit friction flips momentum sign at wet/dry fronts.
-- [ ] Replace dt-dependent wet/dry momentum damping (`wetting_drying.rs:469-473`) with implicit relaxation; h_dry ≈ 1e-3 m.
-- [ ] HLL as the default flux for wet/dry runs (Roe is not positivity-preserving).
-- [ ] Retire the cell-average/`linearize` workarounds once this lands.
+- [x] The positivity CFL is enforced: `PhysicsModule::max_cfl`, applied by `Simulation`; `SWEPhysics2D` reports `positivity_cfl_swe_2d(N)` when it has wetting/drying. Roe with wetting/drying prints a warning at build time.
+- [x] Negative-mean elements are counted, not hidden: the positivity limiters and wet/dry correction return the count; `SWEPhysics2D::negative_depth_clips`.
+- [x] Point-implicit friction in every RK stage (`TimeIntegrator::step_with_relaxation`, `BottomFriction2D`, `SWEPhysics2DBuilder::with_implicit_friction`). It keeps friction balances exact for any dt, is L-stable, and is first order in the friction term (13–32 % above the exact decay at dt·Λ ≈ 3; explicit flips the sign there).
+  - [ ] `SpatiallyVaryingManning2D` does not implement `BottomFriction2D`: the rate needs the node position. Precompute a per-node n field (also avoids the closure call per node).
+  - [ ] A second-order IMEX treatment (e.g. an SSP IMEX-RK) if the friction term's first-order error matters in shallow tidal flats.
+- [x] The dt-dependent wet/dry momentum damping is gone. It is replaced by the point-implicit thin-layer relaxation r(h) = (h_dry/h − 1)²/τ, which is zero at h ≥ h_dry.
+- [x] HLL is the default flux for wet/dry runs in `SWEPhysics2DBuilder`. `SWE2DRhsConfig::new` still defaults to Roe (low-level API).
+- [ ] Retire the cell-average/`linearize` workarounds once the split form has wet/dry.
+- [ ] Move `examples/froya_real_data.rs` off the legacy `SWE2DTimeConfig`, which sets `H_MIN` = 5 m and makes land a 5 m film. Use `Simulation` + `with_wet_dry` + `with_implicit_friction` + HLL, and mesh water only (P2.4).
+- [ ] `SWEPhysics2D::post_process` builds a `LimiterContext2D` every stage, whose `new` computes `mesh.h_min()` (a sqrt per edge over all elements). No limiter reads `LimiterContext2D::h_min`: drop the field or cache it.
 
 ### P1.3 Geometry for real coastlines
 - [ ] Per-node isoparametric geometric factors (`[K]` → `[K × n_nodes]`). Remove the parallelogram-only panic (`geometric.rs:160-186`).
@@ -177,8 +189,9 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 ### P1.7 Gating tests (write first; most fail today)
 - [ ] Lake-at-rest with steep nodal B (e.g. 30→400 m), p = 1–4, serial and parallel: residual < 1e-10.
 - [ ] Lake-at-rest with face-discontinuous B, and with wet/dry shorelines.
+  - Shoreline: `tests/wet_dry_2d_test.rs::lake_at_rest_with_shoreline_is_exact` (ignored, fails); `…_stays_near_rest` bounds today's error.
 - [ ] Mass conservation with discontinuous B and slope-correlated flow.
-- [ ] Thacker parabolic bowl (dynamic wet/dry).
+- [x] Thacker parabolic bowl (dynamic wet/dry): `thacker_planar_oscillation_one_period` (planar SWASHES case, L1 < 9 %). Also the Ritter dry dam break.
 - [ ] Outgoing-pulse reflection < 1 %; delivered tidal amplitude.
 - [ ] Nonlinear SWE convergence with bathymetry on curved meshes. Assert N+1: current thresholds 1.5/2.5 are below it (`tests/convergence_test.rs`).
 - [ ] Fix vacuous tests:
@@ -204,7 +217,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 
 ### P2.3 Fused in-place stepper
 - [ ] Limiter, positivity and wet/dry in one parallel in-place pass. Today the "parallel" paths `to_vec` every field, allocate per element, and copy back serially (`limiters/swe_2d.rs:626-725`, `wetting_drying.rs:526-541`): 1.5–2.5× of wall time.
-  - Limiters done (P0.19: in-place `par_chunks_exact_mut` over the SoA fields). Still open: `wetting_drying.rs` parallel path (same pattern applies), and the per-stage `Vec` of cell averages and vertex bounds (move to a workspace with P1.1).
+  - Limiters done (P0.19: in-place `par_chunks_exact_mut` over the SoA fields). The `wetting_drying.rs` parallel path is done too (P1.2: in place, plus a node-parallel implicit damping pass). Still open: the per-stage `Vec` of cell averages and vertex bounds (move to a workspace with P1.1). Then fuse the limiter, the wet/dry correction and the implicit damping into one pass.
 
 ### P2.4 Water-only work
 - [ ] Mesh water only, or keep an active-element set (41 % of Frøya's elements are land). Limit only troubled cells.

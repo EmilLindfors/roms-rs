@@ -103,6 +103,25 @@ pub trait PhysicsModule<S: Integrable>: PhysicsModuleInfo {
         // Default: no post-processing
     }
 
+    /// Point-implicit stiff damping of an RK stage value.
+    ///
+    /// `stage` has just been formed from an RHS evaluated at `from`, with
+    /// weight `dt` on that RHS; apply damping sources (bottom friction, wet/dry
+    /// relaxation) implicitly over `dt`, with rates frozen at `from`.
+    /// `Simulation` calls this for every stage via
+    /// [`TimeIntegrator::step_with_relaxation`](crate::time::TimeIntegrator::step_with_relaxation),
+    /// before the stage combination and `post_process`.
+    ///
+    /// Default implementation does nothing.
+    fn implicit_damping(&self, _stage: &mut S, _from: &S, _dt: f64) {}
+
+    /// Largest CFL number for which this module's nonlinear stability
+    /// guarantees hold (e.g. the positivity bound of a wet/dry scheme), if any.
+    /// `Simulation` uses `min(cfl, max_cfl)`.
+    fn max_cfl(&self) -> Option<f64> {
+        None
+    }
+
     /// Get the mesh reference.
     fn mesh(&self) -> &Mesh2D;
 

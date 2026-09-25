@@ -1,31 +1,65 @@
-//! Improved wetting/drying treatment for shallow water equations.
+//! Wetting and drying for the 2D shallow water equations.
 //!
-//! The standard approach uses a hard cutoff at h_min, which can cause:
-//! - Sharp transitions and numerical oscillations
-//! - Unrealistic velocities at wet/dry fronts
-//! - Momentum discontinuities
+//! Three pieces, each where it belongs in a time step:
 //!
-//! This module provides improved treatment:
-//! - **Thin-layer blending**: Gradual flux reduction as h → h_min
-//! - **Velocity capping**: Maximum velocity based on shallow water physics
-//! - **Smooth momentum damping**: Continuous transition to zero momentum
+//! 1. **Positivity** (after every RK stage, [`apply_wet_dry_correction_all`]).
+//!    Zhang–Shu scaling of each element towards its mean until h ≥ 0 at every
+//!    node (Zhang & Shu 2010; Xing, Zhang & Shu 2010). It conserves mass and
+//!    leaves a lake-at-rest shoreline, h = max(0, η − B), untouched. Elements
+//!    whose mean depth is below `h_dry` lose their momentum. With a
+//!    positivity-preserving flux (HLL, Rusanov) under `positivity_cfl_swe_2d`
+//!    the element means stay non-negative; a negative mean is emptied (which
+//!    creates mass) and counted.
+//! 2. **Velocity desingularization** (same pass). Kurganov & Petrova (2007):
+//!
+//!    ```text
+//!    u = √2 h (hu) / √(h⁴ + max(h⁴, ε⁴)),   hu ← h u,   ε = h_dry
+//!    ```
+//!
+//!    The identity for h ≥ ε; below it the velocity vanishes like h², so a
+//!    near-dry node cannot carry a huge hu/h (which collapses the time step
+//!    and pollutes the fluxes). A velocity cap follows as a last resort.
+//! 3. **Thin-layer relaxation** (point-implicit in every RK stage,
+//!    [`apply_implicit_damping_2d`] via
+//!    `TimeIntegrator::step_with_relaxation`). A drag in films thinner than
+//!    h_dry,
+//!
+//!    ```text
+//!    ∂(hu)/∂t = −r(h) hu,   r(h) = (h_dry/h − 1)² / τ   (0 < h < h_dry)
+//!    ```
+//!
+//!    and r = 0 for h ≥ h_dry, discretized as `hu ← hu / (1 + Δt r(h))`. It
+//!    replaces multiplying hu by a blending factor α(h) after every stage,
+//!    whose damping per unit time grew as Δt shrank and which erased currents
+//!    up to 10·h_min deep (REVIEW.md §1.7). Bottom friction laws are applied in
+//!    the same implicit update.
+//!
+//! Water at least h_dry deep is never touched by 2. or 3.
 //!
 //! # References
-//! - Kärnä et al. (2011), "A non-hydrostatic version of SELFE"
-//! - Medeiros & Hagen (2013), "Review of wetting and drying algorithms for
-//!   numerical tidal flow models"
+//! - Zhang & Shu (2010), JCP 229, positivity-preserving high-order DG
+//! - Xing, Zhang & Shu (2010), Adv. Water Resour. 33, positivity-preserving
+//!   well-balanced DG for the SWE
+//! - Kurganov & Petrova (2007), Commun. Math. Sci. 5, desingularization
+//! - Medeiros & Hagen (2013), review of wetting and drying algorithms
 
 use crate::operators::DGOperators2D;
+use crate::solver::SWESolution2D;
+use crate::solver::limiters::{element_mean, positivity_limit_element};
 use crate::solver::state::SWEState2D;
-use crate::types::{Depth, ElementIndex};
+use crate::source::BottomFriction2D;
+use crate::types::Depth;
 
 /// Configuration for wetting/drying treatment.
 #[derive(Clone, Debug)]
 pub struct WetDryConfig {
-    /// Minimum depth threshold (cells with h < h_min are considered dry)
-    pub h_min: Depth,
-    /// Depth at which thin-layer blending begins (h_thin > h_min)
-    pub h_thin: Depth,
+    /// Dry threshold and desingularization depth ε (default 1e-3 m): elements
+    /// with a smaller mean depth are dry, and nodal velocities are
+    /// desingularized below it.
+    pub h_dry: Depth,
+    /// Thin-layer relaxation time τ (s) at h = h_dry/2 (see
+    /// [`Self::thin_layer_rate`]).
+    pub relaxation_time: f64,
     /// Maximum allowed velocity magnitude (m/s)
     pub max_velocity: f64,
     /// Gravitational acceleration
@@ -33,662 +67,315 @@ pub struct WetDryConfig {
 }
 
 impl WetDryConfig {
-    /// Create configuration with standard parameters.
+    /// Default dry threshold (m).
+    pub const DEFAULT_H_DRY: f64 = 1e-3;
+
+    /// Configuration with dry threshold `h_dry`, a 1 s thin-layer relaxation
+    /// time and a 20 m/s velocity cap.
     ///
     /// # Arguments
-    /// * `h_min` - Minimum depth (typically 0.001 - 0.1 m)
+    /// * `h_dry` - Dry threshold / desingularization depth (typically 1e-3 m)
     /// * `g` - Gravitational acceleration
-    pub fn new(h_min: Depth, g: f64) -> Self {
+    pub fn new(h_dry: Depth, g: f64) -> Self {
         Self {
-            h_min,
-            h_thin: Depth::new(10.0 * h_min.meters()), // Start blending at 10x h_min
-            max_velocity: 20.0,                        // Cap at 20 m/s (very fast tidal current)
+            h_dry,
+            relaxation_time: 1.0,
+            max_velocity: 20.0, // very fast tidal current
             g,
         }
     }
 
-    /// Create with custom thin-layer threshold.
-    pub fn with_h_thin(mut self, h_thin: Depth) -> Self {
-        let min_val = h_thin.meters().max(self.h_min.meters());
-        self.h_thin = Depth::new(min_val);
+    /// Set the thin-layer relaxation time τ (s) at h = h_dry/2.
+    pub fn with_relaxation_time(mut self, relaxation_time: f64) -> Self {
+        assert!(relaxation_time > 0.0, "relaxation time must be positive");
+        self.relaxation_time = relaxation_time;
         self
     }
 
-    /// Create with custom maximum velocity.
+    /// Set the maximum velocity.
     pub fn with_max_velocity(mut self, max_velocity: f64) -> Self {
         self.max_velocity = max_velocity;
         self
     }
 
-    /// Check if depth is in the thin-layer regime.
-    #[inline]
-    pub fn is_thin_layer(&self, h: f64) -> bool {
-        h > self.h_min.meters() && h < self.h_thin.meters()
-    }
-
-    /// Check if cell is dry.
+    /// Whether a depth is below the dry threshold.
     #[inline]
     pub fn is_dry(&self, h: f64) -> bool {
-        h <= self.h_min.meters()
+        h < self.h_dry.meters()
     }
 
-    /// Check if cell is fully wet (above thin-layer).
+    /// Kurganov–Petrova desingularized velocity,
+    /// `(u, v) = √2 h (hu, hv) / √(h⁴ + max(h⁴, ε⁴))` with ε = h_dry.
+    ///
+    /// Equal to (hu/h, hv/h) for h ≥ h_dry, zero for h ≤ 0.
     #[inline]
-    pub fn is_wet(&self, h: f64) -> bool {
-        h >= self.h_thin.meters()
-    }
-
-    /// Compute blending factor for thin-layer regime.
-    ///
-    /// Returns:
-    /// - 0 when h <= h_min (dry)
-    /// - 1 when h >= h_thin (fully wet)
-    /// - Smooth transition in between (cubic Hermite)
-    #[inline(always)]
-    pub fn blending_factor(&self, h: f64) -> f64 {
-        let h_min = self.h_min.meters();
-        let h_thin = self.h_thin.meters();
-        if h <= h_min {
-            0.0
-        } else if h >= h_thin {
-            1.0
-        } else {
-            // Smooth Hermite interpolation: 3t² - 2t³
-            // Precompute inverse for efficiency
-            let inv_range = 1.0 / (h_thin - h_min);
-            let t = (h - h_min) * inv_range;
-            t * t * (3.0 - 2.0 * t)
-        }
-    }
-
-    /// Precomputed inverse range for blending factor (call once per timestep).
-    #[inline(always)]
-    pub fn inv_blend_range(&self) -> f64 {
-        1.0 / (self.h_thin.meters() - self.h_min.meters())
-    }
-
-    /// Fast blending factor with precomputed inverse range.
-    #[inline(always)]
-    pub fn blending_factor_fast(&self, h: f64, inv_range: f64) -> f64 {
-        let h_min = self.h_min.meters();
-        let h_thin = self.h_thin.meters();
-        if h <= h_min {
-            0.0
-        } else if h >= h_thin {
-            1.0
-        } else {
-            let t = (h - h_min) * inv_range;
-            t * t * (3.0 - 2.0 * t)
-        }
-    }
-
-    /// Compute desingularized velocity with thin-layer blending.
-    ///
-    /// Returns velocity that:
-    /// - Goes to zero smoothly as h → h_min
-    /// - Is capped at max_velocity
-    /// - Uses desingularization for numerical stability
-    pub fn compute_velocity(&self, h: f64, hu: f64, hv: f64) -> (f64, f64) {
-        let h_min = self.h_min.meters();
-        if h <= h_min {
+    pub fn desingularized_velocity(&self, h: f64, hu: f64, hv: f64) -> (f64, f64) {
+        if h <= 0.0 {
             return (0.0, 0.0);
         }
+        let eps = self.h_dry.meters();
+        if h >= eps {
+            return (hu / h, hv / h);
+        }
+        // √(h⁴ + ε⁴) = ε²√(1 + r⁴) with r = h/ε, so ε⁴ never underflows
+        let r = h / eps;
+        let factor = std::f64::consts::SQRT_2 * r / (eps * (1.0 + r * r * r * r).sqrt());
+        (factor * hu, factor * hv)
+    }
 
-        // Desingularization formula: u = 2h·hu / (h² + h_reg²)
-        let h_reg = h.max(h_min);
-        let denom = h * h + h_reg * h_reg;
-        let u = 2.0 * h * hu / denom;
-        let v = 2.0 * h * hv / denom;
+    /// Thin-layer drag rate r(h) = (h_dry/h − 1)² / τ (1/s) below h_dry:
+    /// zero for h ≥ h_dry, 1/τ at h_dry/2, infinite at h ≤ 0.
+    #[inline]
+    pub fn thin_layer_rate(&self, h: f64) -> f64 {
+        let h_dry = self.h_dry.meters();
+        if h >= h_dry {
+            return 0.0;
+        }
+        if h <= 0.0 {
+            return f64::INFINITY;
+        }
+        let excess = h_dry / h - 1.0;
+        excess * excess / self.relaxation_time
+    }
 
-        // Apply velocity cap
-        let speed = (u * u + v * v).sqrt();
+    /// Desingularize and cap the velocity of one node in place (h unchanged).
+    /// Nodes with h ≥ h_dry below the cap are left bitwise unchanged.
+    #[inline]
+    fn correct_node(&self, h: f64, hu: &mut f64, hv: &mut f64) {
+        if h <= 0.0 {
+            *hu = 0.0;
+            *hv = 0.0;
+            return;
+        }
+        if h < self.h_dry.meters() {
+            let (u, v) = self.desingularized_velocity(h, *hu, *hv);
+            *hu = h * u;
+            *hv = h * v;
+        }
+        let speed = hu.hypot(*hv) / h;
         if speed > self.max_velocity {
             let scale = self.max_velocity / speed;
-            (u * scale, v * scale)
-        } else {
-            (u, v)
-        }
-    }
-
-    /// Apply thin-layer damping to momentum.
-    ///
-    /// In the thin-layer regime, momentum is gradually reduced to prevent
-    /// unrealistic velocities as depth decreases.
-    pub fn damp_momentum(&self, state: &SWEState2D) -> SWEState2D {
-        let alpha = self.blending_factor(state.h);
-
-        if alpha >= 1.0 {
-            // Fully wet: no damping, but still apply velocity cap
-            return self.apply_velocity_cap(state);
-        }
-
-        if alpha <= 0.0 {
-            // Dry: zero momentum
-            return SWEState2D::new(state.h.max(0.0), 0.0, 0.0);
-        }
-
-        // Thin layer: blend momentum toward zero
-        let hu_damped = alpha * state.hu;
-        let hv_damped = alpha * state.hv;
-
-        // Also apply velocity cap
-        let result = SWEState2D::new(state.h, hu_damped, hv_damped);
-        self.apply_velocity_cap(&result)
-    }
-
-    /// Apply velocity cap to state, preserving direction.
-    pub fn apply_velocity_cap(&self, state: &SWEState2D) -> SWEState2D {
-        if state.h <= self.h_min.meters() {
-            return SWEState2D::new(state.h.max(0.0), 0.0, 0.0);
-        }
-
-        let (u, v) = self.compute_velocity(state.h, state.hu, state.hv);
-        let speed = (u * u + v * v).sqrt();
-
-        if speed <= self.max_velocity {
-            *state
-        } else {
-            // Cap velocity while preserving direction
-            let scale = self.max_velocity / speed;
-            SWEState2D::new(state.h, state.h * u * scale, state.h * v * scale)
-        }
-    }
-
-    /// Determine wet/dry status of an interface.
-    ///
-    /// Returns (left_wet, right_wet) tuple.
-    pub fn interface_wet_status(&self, h_l: f64, h_r: f64) -> (bool, bool) {
-        let h_min = self.h_min.meters();
-        (h_l > h_min, h_r > h_min)
-    }
-
-    /// Compute interface flux factor for wet/dry interfaces.
-    ///
-    /// At wet-dry interfaces, we need to:
-    /// 1. Allow water to flow from wet to dry (wetting)
-    /// 2. Allow water to flow from thin to wet (draining)
-    /// 3. Prevent spurious flow into very dry regions
-    ///
-    /// Returns a factor in [0, 1] to multiply the numerical flux.
-    pub fn interface_flux_factor(&self, h_l: f64, h_r: f64) -> f64 {
-        let (l_wet, r_wet) = self.interface_wet_status(h_l, h_r);
-
-        match (l_wet, r_wet) {
-            (false, false) => 0.0, // Both dry: no flux
-            (true, true) => {
-                // Both wet: use minimum blending factor
-                let alpha_l = self.blending_factor(h_l);
-                let alpha_r = self.blending_factor(h_r);
-                alpha_l.min(alpha_r)
-            }
-            (true, false) => {
-                // Left wet, right dry: wetting front
-                // Allow outflow from wet side, scaled by blending
-                self.blending_factor(h_l)
-            }
-            (false, true) => {
-                // Left dry, right wet: wetting front (reversed)
-                self.blending_factor(h_r)
-            }
+            *hu *= scale;
+            *hv *= scale;
         }
     }
 }
 
 impl Default for WetDryConfig {
     fn default() -> Self {
-        Self::new(Depth::new(0.01), 9.81) // 1cm minimum depth
+        Self::new(Depth::new(Self::DEFAULT_H_DRY), 9.81)
     }
 }
 
-/// Apply wetting/drying correction to SWE state.
+/// Apply the nodal part of the wetting/drying correction to one state:
+/// negative depths become dry (h = 0, no momentum), then the velocity is
+/// desingularized and capped.
 ///
-/// This function should be called after each RK stage to:
-/// 1. Ensure h >= 0
-/// 2. Damp momentum in thin-layer regime
-/// 3. Cap unrealistic velocities
-///
-/// # Arguments
-/// * `state` - State to correct (modified in place)
-/// * `config` - Wet/dry configuration
+/// Clipping a single node does not conserve mass; for solutions use
+/// [`apply_wet_dry_correction_all`], which limits whole elements.
 pub fn apply_wet_dry_correction(state: &mut SWEState2D, config: &WetDryConfig) {
-    // Ensure non-negative depth
     state.h = state.h.max(0.0);
-
-    // Apply thin-layer damping and velocity cap
-    *state = config.damp_momentum(state);
+    config.correct_node(state.h, &mut state.hu, &mut state.hv);
 }
 
-/// Apply wetting/drying correction to entire solution.
-///
-/// Optimized version that:
-/// - Skips fully-wet elements (no correction needed)
-/// - Fuses blending and velocity cap into single pass
-/// - Precomputes inverse range for blending factor
-pub fn apply_wet_dry_correction_all(
-    solution: &mut crate::solver::SWESolution2D,
-    ops: &DGOperators2D,
-    config: &WetDryConfig,
-) {
-    let n_elements = solution.n_elements;
-    let inv_range = config.inv_blend_range();
-    let max_vel_sq = config.max_velocity * config.max_velocity;
-
-    for k in ElementIndex::iter(n_elements) {
-        // Fast path: check if element is fully wet (skip correction)
-        let elem_h = solution.element_h(k);
-        let (min_h, max_h) = elem_h
-            .iter()
-            .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &h| {
-                (min.min(h), max.max(h))
-            });
-
-        // If all nodes are fully wet and depths are non-negative, check velocity cap only
-        if min_h >= config.h_thin.meters() {
-            // Fully wet: only need to check velocity cap
-            apply_velocity_cap_element(solution, k, config, max_vel_sq);
-            continue;
-        }
-
-        // If all nodes are dry, zero out momentum
-        if max_h <= config.h_min.meters() {
-            let target_mass = weighted_depth_sum(solution.element_h(k), &ops.weights).max(0.0);
-            let mut h_new = solution.element_h(k).to_vec();
-            let mut hu_new = vec![0.0; solution.n_nodes];
-            let mut hv_new = vec![0.0; solution.n_nodes];
-            for h in &mut h_new {
-                *h = h.max(0.0);
-            }
-            rescale_element_mass(
-                &mut h_new,
-                &mut hu_new,
-                &mut hv_new,
-                &ops.weights,
-                target_mass,
-            );
-            solution.element_h_mut(k).copy_from_slice(&h_new);
-            solution.element_hu_mut(k).copy_from_slice(&hu_new);
-            solution.element_hv_mut(k).copy_from_slice(&hv_new);
-            continue;
-        }
-
-        // Mixed wet/dry: apply full correction per-node
-        apply_wet_dry_correction_element_fused(solution, k, ops, config, inv_range, max_vel_sq);
-    }
-}
-
+/// Wet/dry correction of one element (SoA slices). Returns `true` if its mean
+/// depth was negative (see `positivity_limit_element`).
 #[inline]
-fn weighted_depth_sum(h: &[f64], weights: &[f64]) -> f64 {
-    h.iter().zip(weights.iter()).map(|(&h_i, &w)| h_i * w).sum()
-}
-
-fn rescale_element_mass(
+fn wet_dry_element(
     h: &mut [f64],
     hu: &mut [f64],
     hv: &mut [f64],
     weights: &[f64],
-    target_mass: f64,
-) {
-    let target_mass = target_mass.max(0.0);
-    if target_mass <= 0.0 {
-        h.fill(0.0);
-        hu.fill(0.0);
-        hv.fill(0.0);
-        return;
-    }
-
-    let corrected_mass = weighted_depth_sum(h, weights);
-    if corrected_mass <= 1e-14 {
-        h.fill(0.0);
-        hu.fill(0.0);
-        hv.fill(0.0);
-        return;
-    }
-
-    let scale = target_mass / corrected_mass;
-    if (scale - 1.0).abs() <= 1e-14 {
-        return;
-    }
-
-    for i in 0..h.len() {
-        h[i] *= scale;
-        hu[i] *= scale;
-        hv[i] *= scale;
-    }
-}
-
-/// Apply velocity cap only (for fully wet elements).
-#[inline]
-fn apply_velocity_cap_element(
-    solution: &mut crate::solver::SWESolution2D,
-    k: ElementIndex,
+    inv_total_weight: f64,
     config: &WetDryConfig,
-    max_vel_sq: f64,
-) {
-    let n_nodes = solution.n_nodes;
-    let h_min = config.h_min.meters();
-
-    // Get slices for SoA access
-    let elem_h = solution.element_h(k);
-    let h_vals: Vec<f64> = elem_h.to_vec();
-
-    // Now we can get mutable access
-    let elem_hu = solution.element_hu_mut(k);
-    let hu_vals: Vec<f64> = elem_hu.to_vec();
-
-    let elem_hv = solution.element_hv_mut(k);
-    let hv_vals: Vec<f64> = elem_hv.to_vec();
-
-    // Reacquire mutable slices for writing
-    let elem_hu = solution.element_hu_mut(k);
-    for i in 0..n_nodes {
-        let h = h_vals[i];
-        if h <= h_min {
-            continue;
-        }
-
-        let hu = hu_vals[i];
-        let hv = hv_vals[i];
-
-        // Compute velocity squared to check cap
-        let h_inv = 1.0 / h;
-        let u = hu * h_inv;
-        let v = hv * h_inv;
-        let speed_sq = u * u + v * v;
-
-        if speed_sq > max_vel_sq {
-            let scale = (max_vel_sq / speed_sq).sqrt();
-            elem_hu[i] = h * u * scale;
-        }
+) -> bool {
+    let h_dry = config.h_dry.meters();
+    // Common case: wet, positive element; the positivity step would be a no-op
+    let needs_limiting = h.iter().any(|&h| h < h_dry);
+    let clipped = needs_limiting && {
+        let avg = element_mean(h, hu, hv, weights, inv_total_weight);
+        positivity_limit_element(h, hu, hv, avg, h_dry)
+    };
+    for ((&h, hu), hv) in h.iter().zip(hu.iter_mut()).zip(hv.iter_mut()) {
+        config.correct_node(h, hu, hv);
     }
-
-    let elem_hv = solution.element_hv_mut(k);
-    for i in 0..n_nodes {
-        let h = h_vals[i];
-        if h <= h_min {
-            continue;
-        }
-
-        let hu = hu_vals[i];
-        let hv = hv_vals[i];
-
-        let h_inv = 1.0 / h;
-        let u = hu * h_inv;
-        let v = hv * h_inv;
-        let speed_sq = u * u + v * v;
-
-        if speed_sq > max_vel_sq {
-            let scale = (max_vel_sq / speed_sq).sqrt();
-            elem_hv[i] = h * v * scale;
-        }
-    }
+    clipped
 }
 
-/// Fused wet/dry correction for mixed wet/dry elements.
-#[inline]
-fn apply_wet_dry_correction_element_fused(
-    solution: &mut crate::solver::SWESolution2D,
-    k: ElementIndex,
+/// Apply the wetting/drying correction to an entire solution, in place.
+///
+/// Per element: Zhang–Shu positivity towards h ≥ 0 (dry elements lose their
+/// momentum), then Kurganov–Petrova desingularization and the velocity cap at
+/// every node. Call it after every RK stage (`SWEPhysics2D::post_process`);
+/// the thin-layer relaxation needs Δt and is applied separately
+/// ([`apply_implicit_damping_2d`]).
+///
+/// Returns the number of elements whose negative mean depth was emptied
+/// (creating mass); zero under the positivity CFL with HLL or Rusanov.
+pub fn apply_wet_dry_correction_all(
+    solution: &mut SWESolution2D,
     ops: &DGOperators2D,
     config: &WetDryConfig,
-    inv_range: f64,
-    max_vel_sq: f64,
-) {
-    let n_nodes = solution.n_nodes;
-    let h_min = config.h_min.meters();
-
-    // Read current values (SoA)
-    let h_vals: Vec<f64> = solution.element_h(k).to_vec();
-    let hu_vals: Vec<f64> = solution.element_hu(k).to_vec();
-    let hv_vals: Vec<f64> = solution.element_hv(k).to_vec();
-    let target_mass = weighted_depth_sum(&h_vals, &ops.weights).max(0.0);
-
-    // Compute corrected values
-    let mut h_new = vec![0.0; n_nodes];
-    let mut hu_new = vec![0.0; n_nodes];
-    let mut hv_new = vec![0.0; n_nodes];
-
-    for i in 0..n_nodes {
-        let mut h = h_vals[i];
-        let mut hu = hu_vals[i];
-        let mut hv = hv_vals[i];
-
-        // Ensure non-negative depth
-        h = h.max(0.0);
-
-        // Compute blending factor
-        let alpha = config.blending_factor_fast(h, inv_range);
-
-        if alpha <= 0.0 {
-            // Dry: zero momentum
-            h_new[i] = h;
-            hu_new[i] = 0.0;
-            hv_new[i] = 0.0;
-            continue;
-        }
-
-        // Apply thin-layer damping
-        if alpha < 1.0 {
-            hu *= alpha;
-            hv *= alpha;
-        }
-
-        // Apply velocity cap
-        if h > h_min {
-            let h_inv = 1.0 / h;
-            let u = hu * h_inv;
-            let v = hv * h_inv;
-            let speed_sq = u * u + v * v;
-
-            if speed_sq > max_vel_sq {
-                let scale = (max_vel_sq / speed_sq).sqrt();
-                hu = h * u * scale;
-                hv = h * v * scale;
-            }
-        }
-
-        h_new[i] = h;
-        hu_new[i] = hu;
-        hv_new[i] = hv;
-    }
-
-    rescale_element_mass(
-        &mut h_new,
-        &mut hu_new,
-        &mut hv_new,
-        &ops.weights,
-        target_mass,
-    );
-
-    // Write back corrected values
-    solution.element_h_mut(k).copy_from_slice(&h_new);
-    solution.element_hu_mut(k).copy_from_slice(&hu_new);
-    solution.element_hv_mut(k).copy_from_slice(&hv_new);
+) -> usize {
+    let n = solution.n_nodes;
+    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
+    let [h, hu, hv] = &mut solution.data;
+    h.chunks_exact_mut(n)
+        .zip(hu.chunks_exact_mut(n))
+        .zip(hv.chunks_exact_mut(n))
+        .map(|((h, hu), hv)| {
+            wet_dry_element(h, hu, hv, &ops.weights, inv_total_weight, config) as usize
+        })
+        .sum()
 }
 
-/// Parallel version of wet/dry correction using Rayon.
-///
-/// Each element's correction is independent, making this embarrassingly parallel.
-/// Uses SoA layout: processes h, hu, hv arrays separately in parallel chunks.
+/// Parallel version of [`apply_wet_dry_correction_all`] (identical result),
+/// in place.
 #[cfg(feature = "parallel")]
 pub fn apply_wet_dry_correction_all_parallel(
-    solution: &mut crate::solver::SWESolution2D,
+    solution: &mut SWESolution2D,
     ops: &DGOperators2D,
     config: &WetDryConfig,
+) -> usize {
+    use rayon::prelude::*;
+
+    let n = solution.n_nodes;
+    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
+    let [h, hu, hv] = &mut solution.data;
+    h.par_chunks_exact_mut(n)
+        .zip(hu.par_chunks_exact_mut(n))
+        .zip(hv.par_chunks_exact_mut(n))
+        .map(|((h, hu), hv)| {
+            wet_dry_element(h, hu, hv, &ops.weights, inv_total_weight, config) as usize
+        })
+        .sum()
+}
+
+/// Stiff momentum damping applied point-implicitly: bottom friction and the
+/// wet/dry thin-layer relaxation.
+#[derive(Clone, Copy)]
+pub struct ImplicitDamping2D<'a> {
+    /// Bottom friction law, if any
+    pub friction: Option<&'a dyn BottomFriction2D>,
+    /// Wet/dry configuration (thin-layer relaxation and desingularization), if any
+    pub wet_dry: Option<&'a WetDryConfig>,
+    /// Desingularization depth for the friction velocity without `wet_dry`
+    pub h_min: Depth,
+}
+
+impl ImplicitDamping2D<'_> {
+    /// Whether this applies any damping at all.
+    pub fn is_active(&self) -> bool {
+        self.friction.is_some() || self.wet_dry.is_some()
+    }
+
+    /// Damp the momentum of one node of a stage value with depth `h`, whose
+    /// RHS was evaluated at `from`.
+    #[inline]
+    fn damp_node(&self, h: f64, hu: &mut f64, hv: &mut f64, from: SWEState2D, dt: f64) {
+        if h <= 0.0 {
+            *hu = 0.0;
+            *hv = 0.0;
+            return;
+        }
+        let mut rate = 0.0;
+        if let Some(friction) = self.friction {
+            // |u| frozen at the RHS input keeps friction balances exact
+            let (u, v) = match self.wet_dry {
+                Some(wd) => wd.desingularized_velocity(from.h, from.hu, from.hv),
+                None => from.velocity(self.h_min),
+            };
+            let speed = u.hypot(v);
+            if speed > 0.0 {
+                rate += friction.damping_rate(h, speed);
+            }
+        }
+        if let Some(wet_dry) = self.wet_dry {
+            rate += wet_dry.thin_layer_rate(h);
+        }
+        // rate may be +inf (factor 0); dt > 0 keeps dt·rate from being NaN
+        let factor = 1.0 / (1.0 + dt * rate);
+        *hu *= factor;
+        *hv *= factor;
+    }
+}
+
+/// Apply stiff momentum damping point-implicitly to the RK stage value
+/// `stage`, whose RHS was evaluated at `from` with weight `dt`:
+///
+/// ```text
+/// (hu, hv) ← (hu, hv) / (1 + dt·Λ),   Λ = Λ_friction(h, |u_from|) + r(h)
+/// ```
+///
+/// with h the stage depth. Momentum is only ever shrunk, never sign-flipped,
+/// for any `dt`. This is the `relax` step of
+/// `TimeIntegrator::step_with_relaxation`, which explains why |u| is taken
+/// from the RHS input. Allocation-free.
+pub fn apply_implicit_damping_2d(
+    stage: &mut SWESolution2D,
+    from: &SWESolution2D,
+    dt: f64,
+    damping: &ImplicitDamping2D,
+) {
+    if !damping.is_active() {
+        return;
+    }
+    let [h, hu, hv] = &mut stage.data;
+    let [fh, fhu, fhv] = &from.data;
+    damp_nodes(h, hu, hv, (fh, fhu, fhv), dt, damping);
+}
+
+/// Parallel version of [`apply_implicit_damping_2d`] (identical result).
+#[cfg(feature = "parallel")]
+pub fn apply_implicit_damping_2d_parallel(
+    stage: &mut SWESolution2D,
+    from: &SWESolution2D,
+    dt: f64,
+    damping: &ImplicitDamping2D,
 ) {
     use rayon::prelude::*;
 
-    let n_nodes = solution.n_nodes;
-    let n_elements = solution.n_elements;
-    let inv_range = config.inv_blend_range();
-    let max_vel_sq = config.max_velocity * config.max_velocity;
-    let h_min = config.h_min.meters();
-    let h_thin = config.h_thin.meters();
-    let weights = ops.weights.clone();
-
-    // Process in chunks of elements (SoA layout)
-    // Copy data for parallel processing (SoA arrays are separate)
-    let h_chunks: Vec<f64> = solution.h_data().to_vec();
-    let hu_data: Vec<f64> = solution.hu_data().to_vec();
-    let hv_data: Vec<f64> = solution.hv_data().to_vec();
-
-    // Parallel process elements
-    let results: Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> = (0..n_elements)
-        .into_par_iter()
-        .map(|k| {
-            let start = k * n_nodes;
-            let end = start + n_nodes;
-
-            let mut h_out = h_chunks[start..end].to_vec();
-            let mut hu_out = hu_data[start..end].to_vec();
-            let mut hv_out = hv_data[start..end].to_vec();
-            let target_mass = weighted_depth_sum(&h_out, &weights).max(0.0);
-
-            // Fast path: check if element is fully wet (skip correction)
-            let (min_h, max_h) = h_out
-                .iter()
-                .fold((f64::INFINITY, f64::NEG_INFINITY), |(min, max), &h| {
-                    (min.min(h), max.max(h))
-                });
-
-            // Fully wet: only velocity cap needed
-            if min_h >= h_thin {
-                for i in 0..n_nodes {
-                    let h = h_out[i];
-                    if h <= h_min {
-                        continue;
-                    }
-                    let hu = hu_out[i];
-                    let hv = hv_out[i];
-                    let h_inv = 1.0 / h;
-                    let u = hu * h_inv;
-                    let v = hv * h_inv;
-                    let speed_sq = u * u + v * v;
-                    if speed_sq > max_vel_sq {
-                        let scale = (max_vel_sq / speed_sq).sqrt();
-                        hu_out[i] = h * u * scale;
-                        hv_out[i] = h * v * scale;
-                    }
-                }
-                return (h_out, hu_out, hv_out);
-            }
-
-            // Fully dry: zero momentum
-            if max_h <= h_min {
-                for i in 0..n_nodes {
-                    h_out[i] = h_out[i].max(0.0);
-                    hu_out[i] = 0.0;
-                    hv_out[i] = 0.0;
-                }
-                rescale_element_mass(&mut h_out, &mut hu_out, &mut hv_out, &weights, target_mass);
-                return (h_out, hu_out, hv_out);
-            }
-
-            // Mixed wet/dry: full correction per-node
-            for i in 0..n_nodes {
-                let h = h_out[i].max(0.0);
-                let mut hu = hu_out[i];
-                let mut hv = hv_out[i];
-
-                // Compute blending factor
-                let alpha = if h <= h_min {
-                    0.0
-                } else if h >= h_thin {
-                    1.0
-                } else {
-                    let t = (h - h_min) * inv_range;
-                    t * t * (3.0 - 2.0 * t)
-                };
-
-                if alpha <= 0.0 {
-                    h_out[i] = h;
-                    hu_out[i] = 0.0;
-                    hv_out[i] = 0.0;
-                    continue;
-                }
-
-                // Thin-layer damping
-                if alpha < 1.0 {
-                    hu *= alpha;
-                    hv *= alpha;
-                }
-
-                // Velocity cap
-                if h > h_min {
-                    let h_inv = 1.0 / h;
-                    let u = hu * h_inv;
-                    let v = hv * h_inv;
-                    let speed_sq = u * u + v * v;
-                    if speed_sq > max_vel_sq {
-                        let scale = (max_vel_sq / speed_sq).sqrt();
-                        hu = h * u * scale;
-                        hv = h * v * scale;
-                    }
-                }
-
-                h_out[i] = h;
-                hu_out[i] = hu;
-                hv_out[i] = hv;
-            }
-
-            rescale_element_mass(&mut h_out, &mut hu_out, &mut hv_out, &weights, target_mass);
-
-            (h_out, hu_out, hv_out)
-        })
-        .collect();
-
-    // Write results back (must borrow sequentially to avoid multiple mutable borrows)
-    // First collect into separate vecs
-    let (h_results, hu_results, hv_results): (Vec<_>, Vec<_>, Vec<_>) =
-        results.into_iter().map(|(h, hu, hv)| (h, hu, hv)).fold(
-            (Vec::new(), Vec::new(), Vec::new()),
-            |(mut h_acc, mut hu_acc, mut hv_acc), (h, hu, hv)| {
-                h_acc.push(h);
-                hu_acc.push(hu);
-                hv_acc.push(hv);
-                (h_acc, hu_acc, hv_acc)
-            },
-        );
-
-    // Write h
-    {
-        let h_data = solution.h_data_mut();
-        for (k, h_elem) in h_results.into_iter().enumerate() {
-            let start = k * n_nodes;
-            h_data[start..start + n_nodes].copy_from_slice(&h_elem);
-        }
+    const CHUNK: usize = 4096;
+    if !damping.is_active() {
+        return;
     }
+    let [h, hu, hv] = &mut stage.data;
+    let [fh, fhu, fhv] = &from.data;
+    h.par_chunks(CHUNK)
+        .zip(hu.par_chunks_mut(CHUNK))
+        .zip(hv.par_chunks_mut(CHUNK))
+        .zip(fh.par_chunks(CHUNK))
+        .zip(fhu.par_chunks(CHUNK))
+        .zip(fhv.par_chunks(CHUNK))
+        .for_each(|(((((h, hu), hv), fh), fhu), fhv)| {
+            damp_nodes(h, hu, hv, (fh, fhu, fhv), dt, damping);
+        });
+}
 
-    // Write hu
-    {
-        let hu_data = solution.hu_data_mut();
-        for (k, hu_elem) in hu_results.into_iter().enumerate() {
-            let start = k * n_nodes;
-            hu_data[start..start + n_nodes].copy_from_slice(&hu_elem);
-        }
-    }
-
-    // Write hv
-    {
-        let hv_data = solution.hv_data_mut();
-        for (k, hv_elem) in hv_results.into_iter().enumerate() {
-            let start = k * n_nodes;
-            hv_data[start..start + n_nodes].copy_from_slice(&hv_elem);
-        }
+#[inline]
+fn damp_nodes(
+    h: &[f64],
+    hu: &mut [f64],
+    hv: &mut [f64],
+    (fh, fhu, fhv): (&[f64], &[f64], &[f64]),
+    dt: f64,
+    damping: &ImplicitDamping2D,
+) {
+    for i in 0..h.len() {
+        let from = SWEState2D::new(fh[i], fhu[i], fhv[i]);
+        damping.damp_node(h[i], &mut hu[i], &mut hv[i], from, dt);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operators::DGOperators2D;
-    use crate::solver::SWESolution2D;
-
-    const TOL: f64 = 1e-10;
+    use crate::source::ManningFriction2D;
+    use crate::types::ElementIndex;
 
     fn weighted_mass(solution: &SWESolution2D, ops: &DGOperators2D) -> f64 {
-        let k = ElementIndex::new(0);
         solution
-            .element_h(k)
+            .element_h(ElementIndex::new(0))
             .iter()
             .zip(ops.weights.iter())
             .map(|(&h, &w)| h * w)
@@ -696,26 +383,28 @@ mod tests {
     }
 
     #[test]
-    fn test_blending_factor() {
-        let config = WetDryConfig::new(Depth::new(0.01), 9.81); // h_min=0.01, h_thin=0.1
+    fn test_desingularized_velocity() {
+        let config = WetDryConfig::new(Depth::new(1e-3), 9.81);
 
-        // Dry: factor = 0
-        assert!((config.blending_factor(0.0) - 0.0).abs() < TOL);
-        assert!((config.blending_factor(0.005) - 0.0).abs() < TOL);
-        assert!((config.blending_factor(0.01) - 0.0).abs() < TOL);
+        // Identity for h ≥ h_dry
+        let (u, v) = config.desingularized_velocity(0.5, 0.25, -0.1);
+        assert!((u - 0.5).abs() < 1e-15 && (v + 0.2).abs() < 1e-15);
+        let (u, _) = config.desingularized_velocity(1e-3, 1e-3, 0.0);
+        assert!((u - 1.0).abs() < 1e-12);
 
-        // Wet: factor = 1
-        assert!((config.blending_factor(0.1) - 1.0).abs() < TOL);
-        assert!((config.blending_factor(1.0) - 1.0).abs() < TOL);
+        // Kurganov–Petrova formula below it
+        let (h, hu) = (4e-4, 1e-3);
+        let (u, _) = config.desingularized_velocity(h, hu, 0.0);
+        let expected = 2f64.sqrt() * h * hu / (h.powi(4) + 1e-12).sqrt();
+        assert!((u - expected).abs() < 1e-12 * expected, "{u} vs {expected}");
 
-        // Thin layer: 0 < factor < 1
-        let mid = config.blending_factor(0.055); // midpoint
-        assert!(mid > 0.0 && mid < 1.0);
-
-        // Hermite interpolation is smooth: f(0.5) = 0.5 for t=0.5
-        // t = (0.055 - 0.01) / (0.1 - 0.01) = 0.045/0.09 = 0.5
-        // f(0.5) = 3*0.25 - 2*0.125 = 0.75 - 0.25 = 0.5
-        assert!((mid - 0.5).abs() < TOL);
+        // Bounded as h → 0 with fixed momentum: |u| ≤ √2 |hu| h / ε²
+        for h in [1e-5, 1e-8, 1e-12, 1e-300] {
+            let (u, _) = config.desingularized_velocity(h, 1e-3, 0.0);
+            assert!(u.is_finite() && u <= 2f64.sqrt() * 1e-3 * h / 1e-6 * (1.0 + 1e-12));
+        }
+        assert_eq!(config.desingularized_velocity(0.0, 1.0, 1.0), (0.0, 0.0));
+        assert_eq!(config.desingularized_velocity(-1e-3, 1.0, 1.0), (0.0, 0.0));
     }
 
     #[test]
@@ -723,91 +412,41 @@ mod tests {
         let config = WetDryConfig::new(Depth::new(0.01), 9.81).with_max_velocity(10.0);
 
         // Normal velocity (not capped)
-        let (u, v) = config.compute_velocity(1.0, 5.0, 0.0);
-        assert!((u - 5.0).abs() < 1e-8);
-        assert!(v.abs() < TOL);
+        let mut state = SWEState2D::new(1.0, 5.0, 0.0);
+        apply_wet_dry_correction(&mut state, &config);
+        assert!((state.hu - 5.0).abs() < 1e-12);
 
-        // High velocity (should be capped)
-        let (u, v) = config.compute_velocity(1.0, 50.0, 0.0);
-        let speed = (u * u + v * v).sqrt();
-        assert!((speed - 10.0).abs() < 1e-8); // Capped at 10 m/s
+        // High velocity (capped, direction kept)
+        let mut state = SWEState2D::new(1.0, 30.0, 40.0);
+        apply_wet_dry_correction(&mut state, &config);
+        assert!((state.hu.hypot(state.hv) - 10.0).abs() < 1e-12);
+        assert!((state.hu / state.hv - 0.75).abs() < 1e-12);
     }
 
     #[test]
-    fn test_thin_layer_damping() {
-        let config = WetDryConfig::new(Depth::new(0.01), 9.81);
-
-        // Fully wet: no damping
-        let state_wet = SWEState2D::new(1.0, 5.0, 3.0);
-        let damped_wet = config.damp_momentum(&state_wet);
-        assert!((damped_wet.hu - 5.0).abs() < 1e-8);
-        assert!((damped_wet.hv - 3.0).abs() < 1e-8);
-
-        // Dry: zero momentum
-        let state_dry = SWEState2D::new(0.005, 0.1, 0.05);
-        let damped_dry = config.damp_momentum(&state_dry);
-        assert!(damped_dry.hu.abs() < TOL);
-        assert!(damped_dry.hv.abs() < TOL);
-
-        // Thin layer: reduced momentum
-        let state_thin = SWEState2D::new(0.055, 1.0, 0.5); // h at midpoint
-        let damped_thin = config.damp_momentum(&state_thin);
-        // At midpoint, alpha ≈ 0.5
-        assert!((damped_thin.hu - 0.5).abs() < 0.1);
-        assert!((damped_thin.hv - 0.25).abs() < 0.05);
+    fn test_thin_layer_rate() {
+        let config = WetDryConfig::new(Depth::new(1e-3), 9.81).with_relaxation_time(2.0);
+        assert!((config.thin_layer_rate(5e-4) - 0.5).abs() < 1e-15);
+        assert!((config.thin_layer_rate(1e-4) - 40.5).abs() < 1e-12);
+        // Wet water is not relaxed at all
+        assert_eq!(config.thin_layer_rate(1e-3), 0.0);
+        assert_eq!(config.thin_layer_rate(1.0), 0.0);
+        assert_eq!(config.thin_layer_rate(0.0), f64::INFINITY);
     }
 
     #[test]
-    fn test_interface_flux_factor() {
+    fn test_apply_correction_single_node() {
         let config = WetDryConfig::new(Depth::new(0.01), 9.81);
 
-        // Both dry: no flux
-        let factor = config.interface_flux_factor(0.005, 0.003);
-        assert!(factor.abs() < TOL);
-
-        // Both fully wet: full flux
-        let factor = config.interface_flux_factor(1.0, 2.0);
-        assert!((factor - 1.0).abs() < TOL);
-
-        // Wet-dry interface: reduced flux
-        let factor = config.interface_flux_factor(0.5, 0.005);
-        assert!((factor - 1.0).abs() < TOL); // Wet side is fully wet
-
-        // Thin layer interface: reduced flux
-        let factor = config.interface_flux_factor(0.055, 0.055);
-        assert!(factor > 0.0 && factor < 1.0);
-    }
-
-    #[test]
-    fn test_wet_dry_status() {
-        let config = WetDryConfig::new(Depth::new(0.01), 9.81);
-
-        assert!(config.is_dry(0.005));
-        assert!(!config.is_dry(0.02));
-
-        assert!(config.is_thin_layer(0.05));
-        assert!(!config.is_thin_layer(0.005));
-        assert!(!config.is_thin_layer(0.5));
-
-        assert!(config.is_wet(1.0));
-        assert!(!config.is_wet(0.05));
-    }
-
-    #[test]
-    fn test_apply_correction() {
-        let config = WetDryConfig::new(Depth::new(0.01), 9.81);
-
-        // Negative depth should become zero
+        // Negative depth becomes dry with no momentum
         let mut state = SWEState2D::new(-0.1, 1.0, 0.5);
         apply_wet_dry_correction(&mut state, &config);
-        assert!(state.h >= 0.0);
-        assert!(state.hu.abs() < TOL); // Dry, so zero momentum
+        assert_eq!(state, SWEState2D::zero());
 
-        // Normal state should be unchanged (except velocity cap)
+        // Wet state unchanged
         let mut state = SWEState2D::new(1.0, 5.0, 3.0);
         apply_wet_dry_correction(&mut state, &config);
-        assert!((state.h - 1.0).abs() < TOL);
-        assert!((state.hu - 5.0).abs() < 1e-8);
+        assert_eq!(state, SWEState2D::new(1.0, 5.0, 3.0));
     }
 
     #[test]
@@ -823,7 +462,10 @@ mod tests {
         }
 
         let initial_mass = weighted_mass(&solution, &ops).max(0.0);
-        apply_wet_dry_correction_all(&mut solution, &ops, &config);
+        assert_eq!(
+            apply_wet_dry_correction_all(&mut solution, &ops, &config),
+            0
+        );
         let final_mass = weighted_mass(&solution, &ops);
 
         assert!(
@@ -834,5 +476,117 @@ mod tests {
             (final_mass - initial_mass).abs() < 1e-12,
             "Wet/dry correction changed element mass: initial={initial_mass:.16e}, final={final_mass:.16e}"
         );
+    }
+
+    #[test]
+    fn test_correction_keeps_lake_at_rest_shoreline() {
+        // The old correction rescaled every depth of an element with a clipped
+        // node, lowering its wet nodes in every stage (REVIEW.md §1.5).
+        let ops = DGOperators2D::new(3);
+        let config = WetDryConfig::default();
+        let mut solution = SWESolution2D::new(1, ops.n_nodes);
+        for i in 0..ops.n_nodes {
+            let bed = 0.4 * ops.nodes_r[i] - 0.2 * ops.nodes_s[i];
+            let h = (0.1 - bed).max(0.0);
+            solution.set_state(ElementIndex::new(0), i, SWEState2D::new(h, 0.0, 0.0));
+        }
+        let before = solution.data.clone();
+        assert_eq!(
+            apply_wet_dry_correction_all(&mut solution, &ops, &config),
+            0
+        );
+        assert_eq!(solution.data, before);
+    }
+
+    #[test]
+    fn test_correction_does_not_touch_wet_currents() {
+        // The old α(h) blending damped every node shallower than 10·h_min in
+        // every stage; wet nodes must now keep their momentum exactly.
+        let ops = DGOperators2D::new(2);
+        let config = WetDryConfig::new(Depth::new(1e-3), 9.81);
+        let mut solution = SWESolution2D::new(1, ops.n_nodes);
+        for i in 0..ops.n_nodes {
+            let h = 0.005 + 0.001 * i as f64;
+            solution.set_state(
+                ElementIndex::new(0),
+                i,
+                SWEState2D::new(h, 0.3 * h, -0.2 * h),
+            );
+        }
+        let before = solution.data.clone();
+        apply_wet_dry_correction_all(&mut solution, &ops, &config);
+        assert_eq!(solution.data, before);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn test_parallel_correction_matches_serial() {
+        let ops = DGOperators2D::new(2);
+        let config = WetDryConfig::new(Depth::new(0.01), 9.81).with_max_velocity(3.0);
+        let n_elements = 16;
+        let mut input = SWESolution2D::new(n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(n_elements) {
+            for i in 0..ops.n_nodes {
+                let x = (7 * k.as_usize() + 3 * i) as f64;
+                let h = 0.02 * (0.37 * x).sin() + if k.as_usize() == 3 { -0.03 } else { 0.01 };
+                input.set_state(k, i, SWEState2D::new(h, (0.5 * x).cos(), 0.1 * x.sin()));
+            }
+        }
+        let (mut serial, mut parallel) = (input.clone(), input.clone());
+        let n_serial = apply_wet_dry_correction_all(&mut serial, &ops, &config);
+        let n_parallel = apply_wet_dry_correction_all_parallel(&mut parallel, &ops, &config);
+        assert_eq!(serial.data, parallel.data);
+        assert_eq!(n_serial, n_parallel);
+        assert_eq!(n_serial, 1);
+    }
+
+    #[test]
+    fn test_implicit_damping_is_exact_quadratic_drag_and_sign_preserving() {
+        let friction = ManningFriction2D::new(9.81, 0.03);
+        let damping = ImplicitDamping2D {
+            friction: Some(&friction),
+            wet_dry: None,
+            h_min: Depth::new(1e-6),
+        };
+        let (h, u0) = (0.5, 2.0);
+        let from = {
+            let mut s = SWESolution2D::new(1, 1);
+            s.set_state(ElementIndex::new(0), 0, SWEState2D::new(h, h * u0, 0.0));
+            s
+        };
+        for dt in [0.1, 10.0, 1e5] {
+            let mut stage = from.clone();
+            apply_implicit_damping_2d(&mut stage, &from, dt, &damping);
+            // d|u|/dt = −a|u|², a = g n²/h^{4/3}: |u| = u0 / (1 + a u0 dt)
+            let a = 9.81 * 0.03f64.powi(2) / h.powf(4.0 / 3.0);
+            let exact = u0 / (1.0 + a * u0 * dt);
+            let u = stage.get_state(ElementIndex::new(0), 0).hu / h;
+            assert!(
+                u > 0.0 && (u - exact).abs() < 1e-14 * u0,
+                "dt = {dt}: {u} vs {exact}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_implicit_thin_layer_relaxation() {
+        let config = WetDryConfig::new(Depth::new(1e-3), 9.81);
+        let damping = ImplicitDamping2D {
+            friction: None,
+            wet_dry: Some(&config),
+            h_min: Depth::new(1e-6),
+        };
+        let mut from = SWESolution2D::new(1, 3);
+        let k = ElementIndex::new(0);
+        from.set_state(k, 0, SWEState2D::new(5e-4, 1e-4, 0.0)); // rate 1/s
+        from.set_state(k, 1, SWEState2D::new(10.0, 1.0, 1.0)); // wet: rate 0
+        from.set_state(k, 2, SWEState2D::new(0.0, 0.0, 0.0));
+        let mut stage = from.clone();
+        stage.set_state(k, 2, SWEState2D::new(0.0, 0.3, 0.3));
+
+        apply_implicit_damping_2d(&mut stage, &from, 1.0, &damping);
+        assert!((stage.get_state(k, 0).hu - 0.5e-4).abs() < 1e-18);
+        assert_eq!(stage.get_state(k, 1).hu, 1.0);
+        assert_eq!(stage.get_state(k, 2), SWEState2D::zero());
     }
 }

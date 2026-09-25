@@ -10,11 +10,30 @@
 //!
 //! where n is the Manning coefficient and |u| = sqrt(u² + v²).
 //!
-//! Friction becomes stiff in shallow water, so implicit or semi-implicit
-//! treatment may be needed for stability.
+//! Friction becomes stiff in shallow water: with SSP-RK3 the explicit source
+//! flips the momentum sign once Δt·C_f|u|/h > 2.5, i.e. in centimetre-deep
+//! water at every wet/dry front. Laws that implement [`BottomFriction2D`] can
+//! instead be applied point-implicitly in every RK stage
+//! (`SWEPhysics2DBuilder::with_implicit_friction`, via
+//! `TimeIntegrator::step_with_relaxation`).
 
 use crate::solver::SWEState2D;
 use crate::source::{SourceContext2D, SourceTerm2D};
+
+/// A bottom-friction law written as a linear damping of the momentum,
+///
+/// ```text
+/// S = −Λ(h, |u|)·(0, hu, hv),
+/// ```
+///
+/// which can be applied point-implicitly: `hu ← hu / (1 + Δt·Λ)` never
+/// changes the sign of the momentum, for any Δt. For quadratic drag
+/// (Λ ∝ |u|) with Λ taken at the start of the step, this is the exact
+/// solution of `d(hu)/dt = −Λ hu` over Δt at fixed depth.
+pub trait BottomFriction2D: Send + Sync {
+    /// Damping rate Λ ≥ 0 (1/s) at depth `h > 0` and speed `speed = |u|`.
+    fn damping_rate(&self, h: f64, speed: f64) -> f64;
+}
 
 /// Manning bottom friction source term for 2D shallow water equations.
 ///
@@ -104,23 +123,17 @@ impl ManningFriction2D {
         }
 
         let h_inv = 1.0 / state.h;
-        let u = state.hu * h_inv;
-        let v = state.hv * h_inv;
-        let speed_sq = u * u + v * v;
-
-        if speed_sq < 1e-28 {
+        let speed = (state.hu * h_inv).hypot(state.hv * h_inv);
+        if speed < 1e-14 {
             return SWEState2D::zero();
         }
 
-        let speed = speed_sq.sqrt();
-        let c_f = self.friction_coefficient(state.h);
-        let factor = -c_f * speed;
-
-        // S = (0, -C_f |u| u, -C_f |u| v)
+        // S = (0, -C_f |u| u, -C_f |u| v) = -Λ (0, hu, hv)
+        let rate = self.damping_rate(state.h, speed);
         SWEState2D {
             h: 0.0,
-            hu: factor * u,
-            hv: factor * v,
+            hu: -rate * state.hu,
+            hv: -rate * state.hv,
         }
     }
 
@@ -133,6 +146,9 @@ impl ManningFriction2D {
     /// Linearize: du/dt ≈ -C_f |u^n| u^{n+1} / h
     /// Solution: u^{n+1} = u^n / (1 + dt * C_f * |u^n| / h)
     ///
+    /// This is the exact solution of the friction ODE over `dt` (|u| obeys
+    /// d|u|/dt = −(C_f/h)|u|², solved by |u^n| / (1 + dt C_f |u^n| / h)).
+    ///
     /// # Arguments
     /// * `state` - Current state
     /// * `dt` - Time step
@@ -144,25 +160,16 @@ impl ManningFriction2D {
             return *state;
         }
 
-        let u = state.hu / state.h;
-        let v = state.hv / state.h;
-        let speed = (u * u + v * v).sqrt();
-
+        let speed = (state.hu / state.h).hypot(state.hv / state.h);
         if speed < 1e-14 {
             return *state;
         }
 
-        let c_f = self.friction_coefficient(state.h);
-
-        // Damping factor
-        let denom = 1.0 + dt * c_f * speed / state.h;
-        let u_new = u / denom;
-        let v_new = v / denom;
-
+        let factor = 1.0 / (1.0 + dt * self.damping_rate(state.h, speed));
         SWEState2D {
             h: state.h,
-            hu: state.h * u_new,
-            hv: state.h * v_new,
+            hu: factor * state.hu,
+            hv: factor * state.hv,
         }
     }
 
@@ -174,12 +181,16 @@ impl ManningFriction2D {
             return false;
         }
 
-        let u = state.hu / state.h;
-        let v = state.hv / state.h;
-        let speed = (u * u + v * v).sqrt();
-        let c_f = self.friction_coefficient(state.h);
+        let speed = (state.hu / state.h).hypot(state.hv / state.h);
+        dt * self.damping_rate(state.h, speed) > 1.0
+    }
+}
 
-        dt * c_f * speed / state.h > 1.0
+impl BottomFriction2D for ManningFriction2D {
+    /// Λ = C_f |u| / h = g n² |u| / h^{4/3}.
+    #[inline]
+    fn damping_rate(&self, h: f64, speed: f64) -> f64 {
+        self.friction_coefficient(h) * speed / h.max(self.h_min)
     }
 }
 
@@ -227,19 +238,26 @@ impl ChezyFriction2D {
             return SWEState2D::zero();
         }
 
-        let u = state.hu / state.h;
-        let v = state.hv / state.h;
-        let speed = (u * u + v * v).sqrt();
-
+        let speed = (state.hu / state.h).hypot(state.hv / state.h);
         if speed < 1e-14 {
             return SWEState2D::zero();
         }
 
+        // S = (0, -C_D |u| u, -C_D |u| v) = -Λ (0, hu, hv)
+        let rate = self.damping_rate(state.h, speed);
         SWEState2D {
             h: 0.0,
-            hu: -self.c_d * speed * u,
-            hv: -self.c_d * speed * v,
+            hu: -rate * state.hu,
+            hv: -rate * state.hv,
         }
+    }
+}
+
+impl BottomFriction2D for ChezyFriction2D {
+    /// Λ = C_D |u| / h.
+    #[inline]
+    fn damping_rate(&self, h: f64, speed: f64) -> f64 {
+        self.c_d * speed / h.max(self.h_min)
     }
 }
 

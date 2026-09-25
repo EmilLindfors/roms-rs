@@ -110,8 +110,10 @@ REVIEW.md §7 (2026-09-25):
    leak.
 2. **Correct 2D barotropic tides** — non-allocating unified RHS first, then
    well-balanced entropy-stable DGSEM (split form done, opt-in
-   `SWEFormulation2D::EntropyStable`) with positivity/wet-dry, η-limiting and
-   implicit friction; isoparametric quads + triangles; spatially varying
+   `SWEFormulation2D::EntropyStable`) with positivity/wet-dry (done for the
+   collocated form: h ≥ 0, desingularization, point-implicit friction, HLL
+   default; shoreline well-balancing open), η-limiting; isoparametric quads +
+   triangles; spatially varying
    tides, model clock, proper NorKyst nesting.
 3. **Cheap enough to matter** — per-element dt, sum factorisation, one Riemann
    solve per face, water-only meshes, then local time stepping or an implicit
@@ -148,5 +150,6 @@ discretizations (the 3D layer currently fails this bar — REVIEW.md §6.1):
 3. **Conservation**: mass/momentum to machine precision on periodic domains,
    including long-time (50+ period) runs.
 4. **Physics regression**: lake-at-rest (must use non-trivial bathymetry),
-   dam-break vs exact Riemann, dynamic wet/dry (Thacker bowl — missing),
+   dam-break vs exact Riemann, dynamic wet/dry (Ritter dry dam break and
+   Thacker bowl in `tests/wet_dry_2d_test.rs`),
    stratified lake-at-rest for 3D PGF (missing).
