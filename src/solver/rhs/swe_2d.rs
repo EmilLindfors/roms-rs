@@ -24,9 +24,15 @@ use crate::source::{HydrostaticReconstruction2D, SourceContext2D, SourceTerm2D};
 use crate::types::ElementIndex;
 
 use super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
-use super::swe_2d_split_form::SplitFormSWE2D;
-#[cfg(all(feature = "parallel", feature = "simd"))]
-use super::swe_2d_split_form::SplitFormWorkspace;
+use super::swe_2d_split_form::{SplitFormSWE2D, SplitFormWorkspace};
+#[cfg(feature = "simd")]
+use crate::solver::simd::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
+#[cfg(not(feature = "simd"))]
+use crate::solver::simd::{
+    apply_diff_matrix_scalar as apply_diff_matrix, apply_lift_scalar as apply_lift,
+    combine_derivatives_scalar as combine_derivatives, coriolis_source_scalar as coriolis_source,
+};
+use std::cell::RefCell;
 
 /// Spatial discretization of the 2D SWE flux divergence and bathymetry terms.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -247,6 +253,36 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
     }
 }
 
+/// Ghost state from the configured boundary condition at `node` of boundary
+/// face `face` of element `k`. Shared by the standard and split-form kernels
+/// and the viscous boundary terms.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn boundary_ghost_state<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    k: ElementIndex,
+    face: usize,
+    node: usize,
+    normal: (f64, f64),
+) -> SWEState2D {
+    let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
+    let state = q.get_state(k, node);
+    let bathy_value = config.bathymetry.map_or(0.0, |b| b.get(k, node));
+    let g = config.equation.g;
+    let h_min = config.equation.h_min.meters();
+
+    let mut ctx = match mesh.boundary_tag(k, face) {
+        Some(tag) => BCContext2D::with_tag(time, (x, y), state, bathy_value, normal, g, h_min, tag),
+        None => BCContext2D::new(time, (x, y), state, bathy_value, normal, g, h_min),
+    };
+    ctx.dt = config.dt;
+    config.bc.ghost_state(&ctx)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn boundary_velocity_component<BC: SWEBoundaryCondition2D>(
     component: usize,
     q: &SWESolution2D,
@@ -260,37 +296,8 @@ fn boundary_velocity_component<BC: SWEBoundaryCondition2D>(
     face: usize,
     node: usize,
 ) -> f64 {
-    let state = q.get_state(k, node);
     let normal = geom.normals[k.as_usize()][face];
-    let (r, s) = (ops.nodes_r[node], ops.nodes_s[node]);
-    let [x, y] = mesh.reference_to_physical(k, r, s);
-    let bathy_value = config.bathymetry.map(|b| b.get(k, node)).unwrap_or(0.0);
-    let h_min = config.equation.h_min.meters();
-
-    let mut ctx = match mesh.boundary_tag(k, face) {
-        Some(tag) => BCContext2D::with_tag(
-            time,
-            (x, y),
-            state,
-            bathy_value,
-            normal,
-            config.equation.g,
-            h_min,
-            tag,
-        ),
-        None => BCContext2D::new(
-            time,
-            (x, y),
-            state,
-            bathy_value,
-            normal,
-            config.equation.g,
-            h_min,
-        ),
-    };
-    ctx.dt = config.dt;
-
-    let ghost = config.bc.ghost_state(&ctx);
+    let ghost = boundary_ghost_state(q, mesh, ops, config, time, k, face, node, normal);
     if ghost.h <= visc_h_min {
         return 0.0;
     }
@@ -378,14 +385,386 @@ fn add_br1_viscosity<BC: SWEBoundaryCondition2D>(
     }
 }
 
+/// Scratch space for one element of the RHS kernel (SoA, one `Vec` per
+/// variable).
+struct ElementWorkspace {
+    n_nodes: usize,
+    n_face_nodes: usize,
+    flux_x: [Vec<f64>; 3],
+    flux_y: [Vec<f64>; 3],
+    dfx_dr: [Vec<f64>; 3],
+    dfx_ds: [Vec<f64>; 3],
+    dfy_dr: [Vec<f64>; 3],
+    dfy_ds: [Vec<f64>; 3],
+    /// hu, hv of the element (f-plane Coriolis kernel)
+    momentum: [Vec<f64>; 2],
+    /// F(q⁻)·n − F* at the face nodes
+    flux_diff: [Vec<f64>; 3],
+    /// Exterior (neighbour or ghost) states at the face nodes
+    ext: [Vec<f64>; 3],
+    int_bathy: Vec<f64>,
+    ext_bathy: Vec<f64>,
+    split_form: SplitFormWorkspace,
+}
+
+/// `n` zeros with two cache lines of unused capacity after them.
+///
+/// Workspaces of different threads are small and allocated at about the same
+/// time, so without the slack their buffers can share cache lines, and every
+/// write then invalidates another core's copy (false sharing): the cached
+/// workspaces made the parallel RHS ~25 % slower than fresh ones.
+fn padded(n: usize) -> Vec<f64> {
+    const SLACK: usize = 16; // 128 bytes
+    let mut v = Vec::with_capacity(n + SLACK);
+    v.resize(n, 0.0);
+    v
+}
+
+impl ElementWorkspace {
+    fn new(n_nodes: usize, n_face_nodes: usize) -> Self {
+        let nodes = || [padded(n_nodes), padded(n_nodes), padded(n_nodes)];
+        let face = || {
+            [
+                padded(n_face_nodes),
+                padded(n_face_nodes),
+                padded(n_face_nodes),
+            ]
+        };
+        Self {
+            n_nodes,
+            n_face_nodes,
+            flux_x: nodes(),
+            flux_y: nodes(),
+            dfx_dr: nodes(),
+            dfx_ds: nodes(),
+            dfy_dr: nodes(),
+            dfy_ds: nodes(),
+            momentum: [padded(n_nodes), padded(n_nodes)],
+            flux_diff: face(),
+            ext: face(),
+            int_bathy: padded(n_face_nodes),
+            ext_bathy: padded(n_face_nodes),
+            split_form: SplitFormWorkspace::new(n_nodes),
+        }
+    }
+}
+
+thread_local! {
+    /// Cached element workspace of this thread (rayon workers persist, so after
+    /// the first RHS evaluation nothing is allocated).
+    static ELEMENT_WORKSPACE: RefCell<Option<ElementWorkspace>> = const { RefCell::new(None) };
+}
+
+/// An element workspace taken from this thread's cache for one serial loop or
+/// one rayon job, and returned to the cache on drop.
+///
+/// Taking it once per job instead of looking it up per element matters: a
+/// per-element lookup (lock or thread-local) made the parallel RHS ~25 %
+/// slower. A new workspace is allocated only if the cache is empty (first
+/// use, or a nested job on the same thread) or sized for other operators.
+struct WorkspaceGuard(Option<ElementWorkspace>);
+
+impl WorkspaceGuard {
+    fn take(ops: &DGOperators2D) -> Self {
+        let (n_nodes, n_face_nodes) = (ops.n_nodes, ops.n_face_nodes);
+        let cached = ELEMENT_WORKSPACE
+            .with(|cell| cell.try_borrow_mut().ok().and_then(|mut slot| slot.take()))
+            .filter(|ws| ws.n_nodes == n_nodes && ws.n_face_nodes == n_face_nodes);
+        Self(Some(cached.unwrap_or_else(|| {
+            ElementWorkspace::new(n_nodes, n_face_nodes)
+        })))
+    }
+}
+
+impl std::ops::Deref for WorkspaceGuard {
+    type Target = ElementWorkspace;
+    fn deref(&self) -> &ElementWorkspace {
+        self.0.as_ref().expect("workspace present until drop")
+    }
+}
+
+impl std::ops::DerefMut for WorkspaceGuard {
+    fn deref_mut(&mut self) -> &mut ElementWorkspace {
+        self.0.as_mut().expect("workspace present until drop")
+    }
+}
+
+impl Drop for WorkspaceGuard {
+    fn drop(&mut self) {
+        let ws = self.0.take();
+        // `try_with`: the thread-local may already be gone at thread exit
+        let _ = ELEMENT_WORKSPACE.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut()
+                && slot.is_none()
+            {
+                *slot = ws;
+            }
+        });
+    }
+}
+
+/// One 2D SWE RHS evaluation. `element` is the only place the per-element
+/// terms are computed; the serial and parallel drivers just iterate over it.
+struct SWE2DRhsKernel<'a, 'c, BC: SWEBoundaryCondition2D> {
+    q: &'a SWESolution2D,
+    mesh: &'a Mesh2D,
+    ops: &'a DGOperators2D,
+    geom: &'a GeometricFactors2D,
+    config: &'a SWE2DRhsConfig<'c, BC>,
+    time: f64,
+    /// Split-form (Wintermeyer et al. 2017) operator, if selected
+    split_form: Option<SplitFormSWE2D<'a, 'c, BC>>,
+}
+
+impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
+    fn new(
+        q: &'a SWESolution2D,
+        mesh: &'a Mesh2D,
+        ops: &'a DGOperators2D,
+        geom: &'a GeometricFactors2D,
+        config: &'a SWE2DRhsConfig<'c, BC>,
+        time: f64,
+    ) -> Self {
+        Self {
+            q,
+            mesh,
+            ops,
+            geom,
+            config,
+            time,
+            split_form: SplitFormSWE2D::new(q, mesh, ops, geom, config, time),
+        }
+    }
+
+    /// Volume, surface and source terms of element `k`, written (not added)
+    /// to `out = [h, hu, hv]`.
+    fn element(&self, k: usize, ws: &mut ElementWorkspace, out: [&mut [f64]; 3]) {
+        let k_idx = ElementIndex::new(k);
+        let [out_h, out_hu, out_hv] = out;
+
+        // 1–2. Volume and surface terms
+        match &self.split_form {
+            Some(split_form) => {
+                split_form.element_rhs(k_idx, &mut ws.split_form, [out_h, out_hu, out_hv])
+            }
+            None => self.collocated_terms(k_idx, ws, [out_h, out_hu, out_hv]),
+        }
+
+        // 3–4. Source terms
+        self.source_terms(k_idx, ws, [out_h, out_hu, out_hv]);
+    }
+
+    /// Collocated nodal DG volume and surface terms:
+    ///   −J⁻¹[Dr·Fr + Ds·Fs] + J⁻¹ Σ_f LIFT_f sJ_f (F(q⁻)·n − F*)
+    /// with Fr = F·∇r, Fs = F·∇s.
+    fn collocated_terms(&self, k: ElementIndex, ws: &mut ElementWorkspace, out: [&mut [f64]; 3]) {
+        let (q, mesh, ops, geom, config) = (self.q, self.mesh, self.ops, self.geom, self.config);
+        let ki = k.as_usize();
+        let n_nodes = ops.n_nodes;
+        let n_face_nodes = ops.n_face_nodes;
+        let g = config.equation.g;
+        let h_min = config.equation.h_min.meters();
+        let [out_h, out_hu, out_hv] = out;
+
+        // 1. Volume term: −(∇·F), from the reference derivatives of the nodal flux
+        {
+            let [fx_h, fx_hu, fx_hv] = &mut ws.flux_x;
+            let [fy_h, fy_hu, fy_hv] = &mut ws.flux_y;
+            for i in 0..n_nodes {
+                let state = q.get_state(k, i);
+                let fx = config.equation.flux_x(&state);
+                let fy = config.equation.flux_y(&state);
+                (fx_h[i], fx_hu[i], fx_hv[i]) = (fx.h, fx.hu, fx.hv);
+                (fy_h[i], fy_hu[i], fy_hv[i]) = (fy.h, fy.hu, fy.hv);
+            }
+        }
+        for (d, flux, out) in [
+            (&ops.dr_row_major, &ws.flux_x, &mut ws.dfx_dr),
+            (&ops.ds_row_major, &ws.flux_x, &mut ws.dfx_ds),
+            (&ops.dr_row_major, &ws.flux_y, &mut ws.dfy_dr),
+            (&ops.ds_row_major, &ws.flux_y, &mut ws.dfy_ds),
+        ] {
+            let [o_h, o_hu, o_hv] = out;
+            apply_diff_matrix(d, &flux[0], &flux[1], &flux[2], o_h, o_hu, o_hv, n_nodes);
+        }
+        combine_derivatives(
+            &ws.dfx_dr[0],
+            &ws.dfx_dr[1],
+            &ws.dfx_dr[2],
+            &ws.dfx_ds[0],
+            &ws.dfx_ds[1],
+            &ws.dfx_ds[2],
+            &ws.dfy_dr[0],
+            &ws.dfy_dr[1],
+            &ws.dfy_dr[2],
+            &ws.dfy_ds[0],
+            &ws.dfy_ds[1],
+            &ws.dfy_ds[2],
+            out_h,
+            out_hu,
+            out_hv,
+            geom.rx[ki],
+            geom.sx[ki],
+            geom.ry[ki],
+            geom.sy[ki],
+            n_nodes,
+        );
+
+        // 2. Surface terms
+        let well_balanced = config.bathymetry.filter(|_| config.well_balanced);
+        let hr = well_balanced.map(|_| HydrostaticReconstruction2D::new(g, h_min));
+        let j_inv = geom.det_j_inv[ki];
+
+        for face in 0..4 {
+            let normal = geom.normals[ki][face];
+            let face_nodes = &ops.face_nodes[face];
+            let [ext_h, ext_hu, ext_hv] = &mut ws.ext;
+
+            // Interior bathymetry at the face (well-balanced reconstruction only)
+            match well_balanced {
+                Some(b) => {
+                    for (fi, &node) in face_nodes.iter().enumerate() {
+                        ws.int_bathy[fi] = b.get(k, node);
+                    }
+                }
+                None => ws.int_bathy.fill(0.0),
+            }
+
+            // Exterior states and bathymetry: neighbour (face nodes reversed) or ghost
+            if let Some(neighbor) = mesh.neighbor(k, face) {
+                let nb = ElementIndex::new(neighbor.element);
+                let nb_face_nodes = &ops.face_nodes[neighbor.face];
+                for fi in 0..n_face_nodes {
+                    let nb_node = nb_face_nodes[n_face_nodes - 1 - fi];
+                    let state = q.get_state(nb, nb_node);
+                    (ext_h[fi], ext_hu[fi], ext_hv[fi]) = (state.h, state.hu, state.hv);
+                    ws.ext_bathy[fi] = well_balanced.map_or(0.0, |b| b.get(nb, nb_node));
+                }
+            } else {
+                for (fi, &node) in face_nodes.iter().enumerate() {
+                    let ghost = boundary_ghost_state(
+                        q, mesh, ops, config, self.time, k, face, node, normal,
+                    );
+                    (ext_h[fi], ext_hu[fi], ext_hv[fi]) = (ghost.h, ghost.hu, ghost.hv);
+                }
+                // Boundary faces mirror the interior bathymetry
+                ws.ext_bathy.copy_from_slice(&ws.int_bathy);
+            }
+
+            // Numerical flux and flux difference at the face nodes
+            let [diff_h, diff_hu, diff_hv] = &mut ws.flux_diff;
+            for (fi, &node) in face_nodes.iter().enumerate() {
+                let q_int = q.get_state(k, node);
+                let q_ext = SWEState2D::new(ext_h[fi], ext_hu[fi], ext_hv[fi]);
+
+                // Hydrostatically reconstructed states for F* (if enabled)
+                let (q_int_flux, q_ext_flux) = match &hr {
+                    Some(r) => r.reconstruct(&q_int, &q_ext, ws.int_bathy[fi], ws.ext_bathy[fi]),
+                    None => (q_int, q_ext),
+                };
+                let f_star = compute_flux_swe_2d(
+                    &q_int_flux,
+                    &q_ext_flux,
+                    normal,
+                    g,
+                    h_min,
+                    config.flux_type,
+                );
+
+                // Interior flux F(q⁻)·n of the actual nodal state. It must match the
+                // volume term for the surface/volume pair to telescope (SBP); using the
+                // reconstructed state here adds −∮(h⁻ − h*⁻)u⁻·n to the element mass.
+                let mut diff = config.equation.normal_flux(&q_int, normal) - f_star;
+
+                // Well-balancing enters as the Audusse momentum correction ½g(h*⁻² − h⁻²)·n
+                if let Some(r) = &hr {
+                    diff = diff + r.pressure_correction(q_int.h, q_int_flux.h, normal);
+                }
+                (diff_h[fi], diff_hu[fi], diff_hv[fi]) = (diff.h, diff.hu, diff.hv);
+            }
+
+            // out += J⁻¹ sJ LIFT_f (F(q⁻)·n − F*)
+            apply_lift(
+                &ops.lift_row_major[face],
+                diff_h,
+                diff_hu,
+                diff_hv,
+                out_h,
+                out_hu,
+                out_hv,
+                n_nodes,
+                n_face_nodes,
+                j_inv * geom.surface_j[ki][face],
+            );
+        }
+    }
+
+    /// Legacy built-in Coriolis and the trait-based source terms, added to `out`.
+    fn source_terms(&self, k: ElementIndex, ws: &mut ElementWorkspace, out: [&mut [f64]; 3]) {
+        let (q, mesh, ops, config) = (self.q, self.mesh, self.ops, self.config);
+        let n_nodes = ops.n_nodes;
+        let g = config.equation.g;
+        let h_min = config.equation.h_min.meters();
+        let [out_h, out_hu, out_hv] = out;
+
+        // 3. Legacy Coriolis (only without trait-based source terms)
+        if config.include_coriolis
+            && config.source_terms.is_none()
+            && (config.equation.f0.abs() > 1e-14 || config.equation.beta.abs() > 1e-14)
+        {
+            if config.equation.beta.abs() < 1e-14 {
+                let [hu, hv] = &mut ws.momentum;
+                for i in 0..n_nodes {
+                    let state = q.get_state(k, i);
+                    (hu[i], hv[i]) = (state.hu, state.hv);
+                }
+                coriolis_source(hu, hv, out_hu, out_hv, config.equation.f0, n_nodes);
+            } else {
+                for i in 0..n_nodes {
+                    let [_x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                    let source = config.equation.coriolis_source(&q.get_state(k, i), y);
+                    out_hu[i] += source.hu;
+                    out_hv[i] += source.hv;
+                }
+            }
+        }
+
+        // 4. Trait-based source terms (preferred)
+        if let Some(sources) = config.source_terms {
+            for i in 0..n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let (bathy_value, bathy_gradient) = config
+                    .bathymetry
+                    .map_or((0.0, (0.0, 0.0)), |b| (b.get(k, i), b.get_gradient(k, i)));
+                let ctx = SourceContext2D::new(
+                    self.time,
+                    (x, y),
+                    q.get_state(k, i),
+                    bathy_value,
+                    bathy_gradient,
+                    g,
+                    h_min,
+                );
+                let source = sources.evaluate(&ctx);
+                out_h[i] += source.h;
+                out_hu[i] += source.hu;
+                out_hv[i] += source.hv;
+            }
+        }
+    }
+}
+
 /// Compute the right-hand side for 2D SWE.
 ///
 /// Implements the DG weak form for a system:
-///   dq/dt = -1/J * [Dr * (Fr) + Ds * (Fs)] + 1/J * Σ_f LIFT_f * sJ_f * (F* - F-) + S
+///   dq/dt = -1/J * [Dr * (Fr) + Ds * (Fs)] + 1/J * Σ_f LIFT_f * sJ_f * (F(q⁻)·n - F*) + S
 ///
 /// where:
 ///   Fr = F · ∇r = F_x * rx + F_y * ry
 ///   Fs = F · ∇s = F_x * sx + F_y * sy
+///
+/// Allocates the result; time steppers should reuse an output buffer with
+/// [`compute_rhs_swe_2d_into`] instead.
 pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -394,276 +773,50 @@ pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
     config: &SWE2DRhsConfig<BC>,
     time: f64,
 ) -> SWESolution2D {
-    let n_nodes = ops.n_nodes;
-    let n_face_nodes = ops.n_face_nodes;
-    let mut rhs = SWESolution2D::new(mesh.n_elements, n_nodes);
-
-    let g = config.equation.g;
-    let h_min = config.equation.h_min.meters();
-
-    // Pre-allocate workspace buffers (reused across elements, no allocation in hot loop)
-    let mut flux_x = vec![SWEState2D::zero(); n_nodes];
-    let mut flux_y = vec![SWEState2D::zero(); n_nodes];
-    let mut int_bathy_buf = vec![0.0; n_face_nodes];
-    let mut ext_states_buf = vec![SWEState2D::zero(); n_face_nodes];
-    let mut ext_bathy_buf = vec![0.0; n_face_nodes];
-    let mut flux_diff = vec![SWEState2D::zero(); n_face_nodes];
-
-    // Split-form (Wintermeyer et al. 2017) volume and surface kernel, if selected
-    let split_form = SplitFormSWE2D::new(q, mesh, ops, geom, config, time);
-    let mut split_ws = split_form.as_ref().map(SplitFormSWE2D::workspace);
-
-    for k in ElementIndex::iter(mesh.n_elements) {
-        if let (Some(split_form), Some(split_ws)) = (&split_form, &mut split_ws) {
-            // 1–2. Split-form volume, bed-slope and surface terms
-            let nodes = k.as_usize() * n_nodes..(k.as_usize() + 1) * n_nodes;
-            let [rhs_h, rhs_hu, rhs_hv] = &mut rhs.data;
-            split_form.element_rhs(
-                k,
-                split_ws,
-                [
-                    &mut rhs_h[nodes.clone()],
-                    &mut rhs_hu[nodes.clone()],
-                    &mut rhs_hv[nodes],
-                ],
-            );
-        } else {
-            let j_inv = geom.det_j_inv[k.as_usize()];
-            let rx = geom.rx[k.as_usize()];
-            let ry = geom.ry[k.as_usize()];
-            let sx = geom.sx[k.as_usize()];
-            let sy = geom.sy[k.as_usize()];
-
-            // 1. Volume term: -(∇ · F) = -(∂F/∂x + ∂G/∂y)
-            // In reference coordinates:
-            //   ∂F/∂x = (∂F/∂r)·(∂r/∂x) + (∂F/∂s)·(∂s/∂x) = Dr*F * rx + Ds*F * sx
-            //   ∂G/∂y = (∂G/∂r)·(∂r/∂y) + (∂G/∂s)·(∂s/∂y) = Dr*G * ry + Ds*G * sy
-
-            // Compute fluxes at all nodes
-
-            for i in 0..n_nodes {
-                let state = q.get_state(k, i);
-                flux_x[i] = config.equation.flux_x(&state);
-                flux_y[i] = config.equation.flux_y(&state);
-            }
-
-            // Apply Dr and Ds to compute derivatives
-            for i in 0..n_nodes {
-                let mut dfx_dr = SWEState2D::zero();
-                let mut dfx_ds = SWEState2D::zero();
-                let mut dfy_dr = SWEState2D::zero();
-                let mut dfy_ds = SWEState2D::zero();
-
-                for j in 0..n_nodes {
-                    let dr_ij = ops.dr[(i, j)];
-                    let ds_ij = ops.ds[(i, j)];
-
-                    dfx_dr = dfx_dr + dr_ij * flux_x[j];
-                    dfx_ds = dfx_ds + ds_ij * flux_x[j];
-                    dfy_dr = dfy_dr + dr_ij * flux_y[j];
-                    dfy_ds = dfy_ds + ds_ij * flux_y[j];
-                }
-
-                // Volume term: -(dF/dx + dG/dy)
-                // = -(dfx_dr * rx + dfx_ds * sx + dfy_dr * ry + dfy_ds * sy)
-                let div_flux = dfx_dr * rx + dfx_ds * sx + dfy_dr * ry + dfy_ds * sy;
-
-                rhs.set_state(k, i, -1.0 * div_flux);
-            }
-
-            // 2. Surface terms: 1/J * LIFT_f * sJ_f * (F* - F-)
-            for face in 0..4 {
-                let normal = geom.normals[k.as_usize()][face];
-                let s_jac = geom.surface_j[k.as_usize()][face];
-                let face_nodes = &ops.face_nodes[face];
-
-                // Get interior bathymetry at face nodes (for well-balanced scheme)
-                if config.well_balanced && config.bathymetry.is_some() {
-                    let bathy = config.bathymetry.unwrap();
-                    for (fi, &node) in face_nodes.iter().enumerate() {
-                        int_bathy_buf[fi] = bathy.get(k, node);
-                    }
-                } else {
-                    for fi in 0..n_face_nodes {
-                        int_bathy_buf[fi] = 0.0;
-                    }
-                }
-
-                // Get exterior states and bathymetry (neighbor or boundary)
-                if let Some(neighbor) = mesh.neighbor(k, face) {
-                    // Interior face: get states and bathymetry from neighbor
-                    let neighbor_face_nodes = &ops.face_nodes[neighbor.face];
-                    for i in 0..n_face_nodes {
-                        // Reverse ordering for neighbor face
-                        ext_states_buf[i] = q.get_state(
-                            ElementIndex::new(neighbor.element),
-                            neighbor_face_nodes[n_face_nodes - 1 - i],
-                        );
-                    }
-                    if config.well_balanced && config.bathymetry.is_some() {
-                        let b = config.bathymetry.unwrap();
-                        for i in 0..n_face_nodes {
-                            ext_bathy_buf[i] = b.get(
-                                ElementIndex::new(neighbor.element),
-                                neighbor_face_nodes[n_face_nodes - 1 - i],
-                            );
-                        }
-                    } else {
-                        for i in 0..n_face_nodes {
-                            ext_bathy_buf[i] = 0.0;
-                        }
-                    }
-                } else {
-                    // Boundary face: compute ghost states
-                    let boundary_tag = mesh.boundary_tag(k, face);
-
-                    for i in 0..n_face_nodes {
-                        let node_idx = face_nodes[i];
-                        let state = q.get_state(k, node_idx);
-                        let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
-                        let [x, y] = mesh.reference_to_physical(k, r, s);
-
-                        let bathy_value =
-                            config.bathymetry.map(|b| b.get(k, node_idx)).unwrap_or(0.0);
-
-                        // Create context with boundary tag for multi-BC dispatch
-                        let mut ctx = match boundary_tag {
-                            Some(tag) => BCContext2D::with_tag(
-                                time,
-                                (x, y),
-                                state,
-                                bathy_value,
-                                normal,
-                                g,
-                                h_min,
-                                tag,
-                            ),
-                            None => {
-                                BCContext2D::new(time, (x, y), state, bathy_value, normal, g, h_min)
-                            }
-                        };
-                        ctx.dt = config.dt;
-                        ext_states_buf[i] = config.bc.ghost_state(&ctx);
-                    }
-
-                    // For boundary faces, mirror the interior bathymetry
-                    ext_bathy_buf[..n_face_nodes].copy_from_slice(&int_bathy_buf[..n_face_nodes]);
-                }
-
-                // Create hydrostatic reconstruction if enabled
-                let hr = if config.well_balanced && config.bathymetry.is_some() {
-                    Some(HydrostaticReconstruction2D::new(g, h_min))
-                } else {
-                    None
-                };
-
-                // Compute numerical flux and flux difference at face nodes
-                for i in 0..n_face_nodes {
-                    let node_idx = face_nodes[i];
-                    let q_int = q.get_state(k, node_idx);
-                    let q_ext = ext_states_buf[i];
-
-                    // Apply hydrostatic reconstruction if enabled
-                    let (q_int_flux, q_ext_flux) = if let Some(ref reconstruction) = hr {
-                        reconstruction.reconstruct(
-                            &q_int,
-                            &q_ext,
-                            int_bathy_buf[i],
-                            ext_bathy_buf[i],
-                        )
-                    } else {
-                        (q_int, q_ext)
-                    };
-
-                    // Numerical flux F* · n using (possibly reconstructed) states
-                    let f_star = compute_flux_swe_2d(
-                        &q_int_flux,
-                        &q_ext_flux,
-                        normal,
-                        g,
-                        h_min,
-                        config.flux_type,
-                    );
-
-                    // Interior flux F(q⁻)·n of the actual nodal state. It must match the
-                    // volume term for the surface/volume pair to telescope (SBP); using the
-                    // reconstructed state here adds −∮(h⁻ − h*⁻)u⁻·n to the element mass.
-                    let f_int = config.equation.normal_flux(&q_int, normal);
-
-                    // Flux difference for upwind dissipation: (F- - F*)
-                    flux_diff[i] = f_int - f_star;
-
-                    // Well-balancing enters as the Audusse momentum correction ½g(h*⁻² − h⁻²)·n
-                    if let Some(ref reconstruction) = hr {
-                        flux_diff[i] = flux_diff[i]
-                            + reconstruction.pressure_correction(q_int.h, q_int_flux.h, normal);
-                    }
-                }
-
-                // Apply LIFT: rhs += j_inv * LIFT_f * (sJ * flux_diff)
-                for i in 0..n_nodes {
-                    let mut lift_contribution = SWEState2D::zero();
-                    for fi in 0..n_face_nodes {
-                        let lift_coeff = ops.lift[face][(i, fi)];
-                        lift_contribution = lift_contribution + lift_coeff * s_jac * flux_diff[fi];
-                    }
-
-                    // Add contribution (note: j_inv goes here)
-                    let current = rhs.get_state(k, i);
-                    rhs.set_state(k, i, current + j_inv * lift_contribution);
-                }
-            }
-        }
-
-        // 3. Source terms: Legacy Coriolis (for backward compatibility)
-        if config.include_coriolis
-            && config.source_terms.is_none()
-            && (config.equation.f0.abs() > 1e-14 || config.equation.beta.abs() > 1e-14)
-        {
-            for i in 0..n_nodes {
-                let state = q.get_state(k, i);
-                let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-                let [_x, y] = mesh.reference_to_physical(k, r, s);
-
-                let source = config.equation.coriolis_source(&state, y);
-
-                let current = rhs.get_state(k, i);
-                rhs.set_state(k, i, current + source);
-            }
-        }
-
-        // 4. Trait-based source terms (preferred)
-        if let Some(sources) = config.source_terms {
-            for i in 0..n_nodes {
-                let state = q.get_state(k, i);
-                let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-                let [x, y] = mesh.reference_to_physical(k, r, s);
-
-                let (bathy_value, bathy_gradient) = config
-                    .bathymetry
-                    .map(|b| (b.get(k, i), b.get_gradient(k, i)))
-                    .unwrap_or((0.0, (0.0, 0.0)));
-
-                let ctx = SourceContext2D::new(
-                    time,
-                    (x, y),
-                    state,
-                    bathy_value,
-                    bathy_gradient,
-                    g,
-                    h_min,
-                );
-
-                let source = sources.evaluate(&ctx);
-                let current = rhs.get_state(k, i);
-                rhs.set_state(k, i, current + source);
-            }
-        }
-    }
-
-    add_br1_viscosity(&mut rhs, q, mesh, ops, geom, config, time);
-
+    let mut rhs = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    compute_rhs_swe_2d_into(q, mesh, ops, geom, config, time, &mut rhs);
     rhs
+}
+
+/// [`compute_rhs_swe_2d`] into `out`, which is overwritten.
+///
+/// Allocation-free after the first call on a thread (the element workspace
+/// is cached per thread), unless horizontal viscosity is enabled. Gives the same result, bit for bit, as
+/// [`compute_rhs_swe_2d_parallel_into`].
+pub fn compute_rhs_swe_2d_into<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+) {
+    check_rhs_output(out, mesh, ops);
+    let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
+    let n = ops.n_nodes;
+    let [out_h, out_hu, out_hv] = &mut out.data;
+    let mut ws = WorkspaceGuard::take(ops);
+    for (k, ((h, hu), hv)) in out_h
+        .chunks_exact_mut(n)
+        .zip(out_hu.chunks_exact_mut(n))
+        .zip(out_hv.chunks_exact_mut(n))
+        .enumerate()
+    {
+        kernel.element(k, &mut ws, [h, hu, hv]);
+    }
+    add_br1_viscosity(out, q, mesh, ops, geom, config, time);
+}
+
+fn check_rhs_output(out: &SWESolution2D, mesh: &Mesh2D, ops: &DGOperators2D) {
+    assert!(
+        out.n_elements == mesh.n_elements && out.n_nodes == ops.n_nodes,
+        "RHS output is {}×{}, mesh and operators need {}×{}",
+        out.n_elements,
+        out.n_nodes,
+        mesh.n_elements,
+        ops.n_nodes
+    );
 }
 
 /// Compute the stable time step for 2D SWE.
@@ -789,107 +942,8 @@ pub fn compute_dt_viscosity(nu_max: f64, min_h_elem: f64, order: usize, cfl: f64
     cfl * min_h_elem * min_h_elem / (nu_max * dg_factor)
 }
 
-/// Per-thread workspace for parallel RHS computation.
-/// This avoids allocations inside the hot loop.
-#[cfg(all(feature = "parallel", feature = "simd"))]
-struct ThreadWorkspace {
-    // Volume term buffers
-    flux_x_h: Vec<f64>,
-    flux_x_hu: Vec<f64>,
-    flux_x_hv: Vec<f64>,
-    flux_y_h: Vec<f64>,
-    flux_y_hu: Vec<f64>,
-    flux_y_hv: Vec<f64>,
-    dfx_dr_h: Vec<f64>,
-    dfx_dr_hu: Vec<f64>,
-    dfx_dr_hv: Vec<f64>,
-    dfx_ds_h: Vec<f64>,
-    dfx_ds_hu: Vec<f64>,
-    dfx_ds_hv: Vec<f64>,
-    dfy_dr_h: Vec<f64>,
-    dfy_dr_hu: Vec<f64>,
-    dfy_dr_hv: Vec<f64>,
-    dfy_ds_h: Vec<f64>,
-    dfy_ds_hu: Vec<f64>,
-    dfy_ds_hv: Vec<f64>,
-    rhs_h: Vec<f64>,
-    rhs_hu: Vec<f64>,
-    rhs_hv: Vec<f64>,
-    hu_arr: Vec<f64>,
-    hv_arr: Vec<f64>,
-    // Surface term flux difference buffers
-    flux_diff_h: Vec<f64>,
-    flux_diff_hu: Vec<f64>,
-    flux_diff_hv: Vec<f64>,
-    // Surface term state buffers (avoid per-face allocations)
-    int_bathy: Vec<f64>,
-    ext_bathy: Vec<f64>,
-    ext_states_h: Vec<f64>,
-    ext_states_hu: Vec<f64>,
-    ext_states_hv: Vec<f64>,
-    // Split-form kernel scratch (only for the split-form formulations)
-    split_form: Option<SplitFormWorkspace>,
-}
-
-#[cfg(all(feature = "parallel", feature = "simd"))]
-impl ThreadWorkspace {
-    fn new(n_nodes: usize, n_face_nodes: usize, split_form: Option<SplitFormWorkspace>) -> Self {
-        Self {
-            // Volume term buffers
-            flux_x_h: vec![0.0; n_nodes],
-            flux_x_hu: vec![0.0; n_nodes],
-            flux_x_hv: vec![0.0; n_nodes],
-            flux_y_h: vec![0.0; n_nodes],
-            flux_y_hu: vec![0.0; n_nodes],
-            flux_y_hv: vec![0.0; n_nodes],
-            dfx_dr_h: vec![0.0; n_nodes],
-            dfx_dr_hu: vec![0.0; n_nodes],
-            dfx_dr_hv: vec![0.0; n_nodes],
-            dfx_ds_h: vec![0.0; n_nodes],
-            dfx_ds_hu: vec![0.0; n_nodes],
-            dfx_ds_hv: vec![0.0; n_nodes],
-            dfy_dr_h: vec![0.0; n_nodes],
-            dfy_dr_hu: vec![0.0; n_nodes],
-            dfy_dr_hv: vec![0.0; n_nodes],
-            dfy_ds_h: vec![0.0; n_nodes],
-            dfy_ds_hu: vec![0.0; n_nodes],
-            dfy_ds_hv: vec![0.0; n_nodes],
-            rhs_h: vec![0.0; n_nodes],
-            rhs_hu: vec![0.0; n_nodes],
-            rhs_hv: vec![0.0; n_nodes],
-            hu_arr: vec![0.0; n_nodes],
-            hv_arr: vec![0.0; n_nodes],
-            // Surface term flux difference buffers
-            flux_diff_h: vec![0.0; n_face_nodes],
-            flux_diff_hu: vec![0.0; n_face_nodes],
-            flux_diff_hv: vec![0.0; n_face_nodes],
-            // Surface term state buffers
-            int_bathy: vec![0.0; n_face_nodes],
-            ext_bathy: vec![0.0; n_face_nodes],
-            ext_states_h: vec![0.0; n_face_nodes],
-            ext_states_hu: vec![0.0; n_face_nodes],
-            ext_states_hv: vec![0.0; n_face_nodes],
-            split_form,
-        }
-    }
-
-    fn clear_rhs(&mut self) {
-        self.rhs_h.fill(0.0);
-        self.rhs_hu.fill(0.0);
-        self.rhs_hv.fill(0.0);
-    }
-}
-
-/// Parallel + SIMD version with zero-allocation hot path.
-///
-/// Uses `for_each_init` to create per-thread workspaces, eliminating the
-/// allocation overhead that made the naive parallel version slower than serial.
-///
-/// Performance characteristics:
-/// - ~2-4x speedup over serial for meshes with 1000+ elements
-/// - Minimal overhead for small meshes (falls back efficiently)
-/// - Zero allocations in the hot path after initial workspace setup
-#[cfg(all(feature = "parallel", feature = "simd"))]
+/// Parallel version of [`compute_rhs_swe_2d`] (identical result).
+#[cfg(feature = "parallel")]
 pub fn compute_rhs_swe_2d_parallel<BC: SWEBoundaryCondition2D + Sync>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -898,372 +952,39 @@ pub fn compute_rhs_swe_2d_parallel<BC: SWEBoundaryCondition2D + Sync>(
     config: &SWE2DRhsConfig<BC>,
     time: f64,
 ) -> SWESolution2D {
-    use crate::solver::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
+    let mut rhs = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    compute_rhs_swe_2d_parallel_into(q, mesh, ops, geom, config, time, &mut rhs);
+    rhs
+}
+
+/// Parallel version of [`compute_rhs_swe_2d_into`]: the same element kernel
+/// over `par_chunks_mut`, so the result is identical bit for bit.
+#[cfg(feature = "parallel")]
+pub fn compute_rhs_swe_2d_parallel_into<BC: SWEBoundaryCondition2D + Sync>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+) {
     use rayon::prelude::*;
 
-    let n_nodes = ops.n_nodes;
-    let n_face_nodes = ops.n_face_nodes;
-    let n_elements = mesh.n_elements;
-    let g = config.equation.g;
-    let h_min = config.equation.h_min.meters();
-
-    // Pre-allocate output
-    let mut rhs = SWESolution2D::new(n_elements, n_nodes);
-
-    // Split-form (Wintermeyer et al. 2017) volume and surface kernel, if selected
-    let split_form = SplitFormSWE2D::new(q, mesh, ops, geom, config, time);
-
-    // Process elements in parallel, writing directly to output buffers
-    // Uses par_chunks_mut to eliminate intermediate Vec collection and final copy
-    {
-        let [rhs_h, rhs_hu, rhs_hv] = &mut rhs.data;
-        rhs_h
-            .par_chunks_mut(n_nodes)
-            .zip(rhs_hu.par_chunks_mut(n_nodes))
-            .zip(rhs_hv.par_chunks_mut(n_nodes))
-            .enumerate()
-            .for_each_init(
-                || {
-                    ThreadWorkspace::new(
-                        n_nodes,
-                        n_face_nodes,
-                        split_form.as_ref().map(SplitFormSWE2D::workspace),
-                    )
-                },
-                |ws, (k, ((h_chunk, hu_chunk), hv_chunk))| {
-                    let k_idx = ElementIndex::new(k);
-                    let j_inv = geom.det_j_inv[k];
-                    let rx = geom.rx[k];
-                    let ry = geom.ry[k];
-                    let sx = geom.sx[k];
-                    let sy = geom.sy[k];
-
-                    // Clear RHS workspace
-                    ws.clear_rhs();
-
-                    if let Some(split_form) = &split_form {
-                        // 1–2. Split-form volume, bed-slope and surface terms
-                        let split_ws = ws
-                            .split_form
-                            .as_mut()
-                            .expect("split-form workspace is created with the operator");
-                        split_form.element_rhs(
-                            k_idx,
-                            split_ws,
-                            [&mut ws.rhs_h, &mut ws.rhs_hu, &mut ws.rhs_hv],
-                        );
-                        // hu, hv for Coriolis
-                        for i in 0..n_nodes {
-                            let state = q.get_state(k_idx, i);
-                            ws.hu_arr[i] = state.hu;
-                            ws.hv_arr[i] = state.hv;
-                        }
-                    } else {
-                        // 1. Volume term: -(∇ · F)
-                        // Compute fluxes at all nodes and extract to SoA
-                        for i in 0..n_nodes {
-                            let state = q.get_state(k_idx, i);
-                            let fx = config.equation.flux_x(&state);
-                            let fy = config.equation.flux_y(&state);
-                            ws.flux_x_h[i] = fx.h;
-                            ws.flux_x_hu[i] = fx.hu;
-                            ws.flux_x_hv[i] = fx.hv;
-                            ws.flux_y_h[i] = fy.h;
-                            ws.flux_y_hu[i] = fy.hu;
-                            ws.flux_y_hv[i] = fy.hv;
-                            // Also extract hu, hv for Coriolis
-                            ws.hu_arr[i] = state.hu;
-                            ws.hv_arr[i] = state.hv;
-                        }
-
-                        // Apply Dr and Ds to flux_x and flux_y using SIMD kernels
-                        apply_diff_matrix(
-                            &ops.dr_row_major,
-                            &ws.flux_x_h,
-                            &ws.flux_x_hu,
-                            &ws.flux_x_hv,
-                            &mut ws.dfx_dr_h,
-                            &mut ws.dfx_dr_hu,
-                            &mut ws.dfx_dr_hv,
-                            n_nodes,
-                        );
-                        apply_diff_matrix(
-                            &ops.ds_row_major,
-                            &ws.flux_x_h,
-                            &ws.flux_x_hu,
-                            &ws.flux_x_hv,
-                            &mut ws.dfx_ds_h,
-                            &mut ws.dfx_ds_hu,
-                            &mut ws.dfx_ds_hv,
-                            n_nodes,
-                        );
-                        apply_diff_matrix(
-                            &ops.dr_row_major,
-                            &ws.flux_y_h,
-                            &ws.flux_y_hu,
-                            &ws.flux_y_hv,
-                            &mut ws.dfy_dr_h,
-                            &mut ws.dfy_dr_hu,
-                            &mut ws.dfy_dr_hv,
-                            n_nodes,
-                        );
-                        apply_diff_matrix(
-                            &ops.ds_row_major,
-                            &ws.flux_y_h,
-                            &ws.flux_y_hu,
-                            &ws.flux_y_hv,
-                            &mut ws.dfy_ds_h,
-                            &mut ws.dfy_ds_hu,
-                            &mut ws.dfy_ds_hv,
-                            n_nodes,
-                        );
-
-                        // Combine derivatives with geometric factors using SIMD kernel: RHS = -div(F)
-                        combine_derivatives(
-                            &ws.dfx_dr_h,
-                            &ws.dfx_dr_hu,
-                            &ws.dfx_dr_hv,
-                            &ws.dfx_ds_h,
-                            &ws.dfx_ds_hu,
-                            &ws.dfx_ds_hv,
-                            &ws.dfy_dr_h,
-                            &ws.dfy_dr_hu,
-                            &ws.dfy_dr_hv,
-                            &ws.dfy_ds_h,
-                            &ws.dfy_ds_hu,
-                            &ws.dfy_ds_hv,
-                            &mut ws.rhs_h,
-                            &mut ws.rhs_hu,
-                            &mut ws.rhs_hv,
-                            rx,
-                            sx,
-                            ry,
-                            sy,
-                            n_nodes,
-                        );
-
-                        // 2. Surface terms
-                        // Create hydrostatic reconstruction once per element (not per face)
-                        let hr = if config.well_balanced && config.bathymetry.is_some() {
-                            Some(HydrostaticReconstruction2D::new(g, h_min))
-                        } else {
-                            None
-                        };
-
-                        for face in 0..4 {
-                            let normal = geom.normals[k][face];
-                            let s_jac = geom.surface_j[k][face];
-                            let face_nodes = &ops.face_nodes[face];
-
-                            // Get interior bathymetry at face nodes (reuse workspace buffer)
-                            if config.well_balanced && config.bathymetry.is_some() {
-                                let bathy = config.bathymetry.unwrap();
-                                for (i, &node) in face_nodes.iter().enumerate() {
-                                    ws.int_bathy[i] = bathy.get(k_idx, node);
-                                }
-                            } else {
-                                ws.int_bathy[..n_face_nodes].fill(0.0);
-                            }
-
-                            // Get exterior states and bathymetry (reuse workspace buffers)
-                            if let Some(neighbor) = mesh.neighbor(k_idx, face) {
-                                let neighbor_face_nodes = &ops.face_nodes[neighbor.face];
-                                for i in 0..n_face_nodes {
-                                    let state = q.get_state(
-                                        ElementIndex::new(neighbor.element),
-                                        neighbor_face_nodes[n_face_nodes - 1 - i],
-                                    );
-                                    ws.ext_states_h[i] = state.h;
-                                    ws.ext_states_hu[i] = state.hu;
-                                    ws.ext_states_hv[i] = state.hv;
-                                }
-                                if config.well_balanced && config.bathymetry.is_some() {
-                                    let b = config.bathymetry.unwrap();
-                                    for i in 0..n_face_nodes {
-                                        ws.ext_bathy[i] = b.get(
-                                            ElementIndex::new(neighbor.element),
-                                            neighbor_face_nodes[n_face_nodes - 1 - i],
-                                        );
-                                    }
-                                } else {
-                                    ws.ext_bathy[..n_face_nodes].fill(0.0);
-                                }
-                            } else {
-                                // Boundary face: compute ghost states
-                                let boundary_tag = mesh.boundary_tag(k_idx, face);
-                                for i in 0..n_face_nodes {
-                                    let node_idx = face_nodes[i];
-                                    let state = q.get_state(k_idx, node_idx);
-                                    let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
-                                    let [x, y] = mesh.reference_to_physical(k_idx, r, s);
-
-                                    let bathy_value = config
-                                        .bathymetry
-                                        .map(|b| b.get(k_idx, node_idx))
-                                        .unwrap_or(0.0);
-
-                                    let mut ctx = match boundary_tag {
-                                        Some(tag) => BCContext2D::with_tag(
-                                            time,
-                                            (x, y),
-                                            state,
-                                            bathy_value,
-                                            normal,
-                                            g,
-                                            h_min,
-                                            tag,
-                                        ),
-                                        None => BCContext2D::new(
-                                            time,
-                                            (x, y),
-                                            state,
-                                            bathy_value,
-                                            normal,
-                                            g,
-                                            h_min,
-                                        ),
-                                    };
-                                    ctx.dt = config.dt;
-                                    let ghost = config.bc.ghost_state(&ctx);
-                                    ws.ext_states_h[i] = ghost.h;
-                                    ws.ext_states_hu[i] = ghost.hu;
-                                    ws.ext_states_hv[i] = ghost.hv;
-                                }
-                                // For boundary faces, mirror the interior bathymetry
-                                ws.ext_bathy[..n_face_nodes]
-                                    .copy_from_slice(&ws.int_bathy[..n_face_nodes]);
-                            }
-
-                            // Compute numerical flux and flux difference at face nodes
-                            for i in 0..n_face_nodes {
-                                let node_idx = face_nodes[i];
-                                let q_int = q.get_state(k_idx, node_idx);
-                                let q_ext = SWEState2D {
-                                    h: ws.ext_states_h[i],
-                                    hu: ws.ext_states_hu[i],
-                                    hv: ws.ext_states_hv[i],
-                                };
-
-                                let (q_int_flux, q_ext_flux) = if let Some(ref reconstruction) = hr
-                                {
-                                    reconstruction.reconstruct(
-                                        &q_int,
-                                        &q_ext,
-                                        ws.int_bathy[i],
-                                        ws.ext_bathy[i],
-                                    )
-                                } else {
-                                    (q_int, q_ext)
-                                };
-
-                                let f_star = compute_flux_swe_2d(
-                                    &q_int_flux,
-                                    &q_ext_flux,
-                                    normal,
-                                    g,
-                                    h_min,
-                                    config.flux_type,
-                                );
-                                // Interior flux of the actual nodal state (SBP telescoping),
-                                // plus the Audusse momentum correction ½g(h*⁻² − h⁻²)·n.
-                                let f_int = config.equation.normal_flux(&q_int, normal);
-                                let mut flux_diff = f_int - f_star;
-                                if let Some(ref reconstruction) = hr {
-                                    flux_diff = flux_diff
-                                        + reconstruction.pressure_correction(
-                                            q_int.h,
-                                            q_int_flux.h,
-                                            normal,
-                                        );
-                                }
-
-                                ws.flux_diff_h[i] = flux_diff.h;
-                                ws.flux_diff_hu[i] = flux_diff.hu;
-                                ws.flux_diff_hv[i] = flux_diff.hv;
-                            }
-
-                            // Apply LIFT using SIMD kernel
-                            let scale = j_inv * s_jac;
-                            apply_lift(
-                                &ops.lift_row_major[face],
-                                &ws.flux_diff_h,
-                                &ws.flux_diff_hu,
-                                &ws.flux_diff_hv,
-                                &mut ws.rhs_h,
-                                &mut ws.rhs_hu,
-                                &mut ws.rhs_hv,
-                                n_nodes,
-                                n_face_nodes,
-                                scale,
-                            );
-                        }
-                    }
-
-                    // 3. Source terms: Legacy Coriolis
-                    if config.include_coriolis
-                        && config.source_terms.is_none()
-                        && (config.equation.f0.abs() > 1e-14 || config.equation.beta.abs() > 1e-14)
-                    {
-                        if config.equation.beta.abs() < 1e-14 {
-                            coriolis_source(
-                                &ws.hu_arr,
-                                &ws.hv_arr,
-                                &mut ws.rhs_hu,
-                                &mut ws.rhs_hv,
-                                config.equation.f0,
-                                n_nodes,
-                            );
-                        } else {
-                            for i in 0..n_nodes {
-                                let state = q.get_state(k_idx, i);
-                                let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-                                let [_x, y] = mesh.reference_to_physical(k_idx, r, s);
-                                let source = config.equation.coriolis_source(&state, y);
-                                ws.rhs_hu[i] += source.hu;
-                                ws.rhs_hv[i] += source.hv;
-                            }
-                        }
-                    }
-
-                    // 4. Trait-based source terms
-                    if let Some(sources) = config.source_terms {
-                        for i in 0..n_nodes {
-                            let state = q.get_state(k_idx, i);
-                            let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-                            let [x, y] = mesh.reference_to_physical(k_idx, r, s);
-
-                            let (bathy_value, bathy_gradient) = config
-                                .bathymetry
-                                .map(|b| (b.get(k_idx, i), b.get_gradient(k_idx, i)))
-                                .unwrap_or((0.0, (0.0, 0.0)));
-
-                            let ctx = SourceContext2D::new(
-                                time,
-                                (x, y),
-                                state,
-                                bathy_value,
-                                bathy_gradient,
-                                g,
-                                h_min,
-                            );
-                            let source = sources.evaluate(&ctx);
-                            ws.rhs_h[i] += source.h;
-                            ws.rhs_hu[i] += source.hu;
-                            ws.rhs_hv[i] += source.hv;
-                        }
-                    }
-
-                    // Copy workspace results directly to output chunks
-                    h_chunk.copy_from_slice(&ws.rhs_h);
-                    hu_chunk.copy_from_slice(&ws.rhs_hu);
-                    hv_chunk.copy_from_slice(&ws.rhs_hv);
-                },
-            );
-    }
-
-    add_br1_viscosity(&mut rhs, q, mesh, ops, geom, config, time);
-
-    rhs
+    check_rhs_output(out, mesh, ops);
+    let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
+    let n = ops.n_nodes;
+    let [out_h, out_hu, out_hv] = &mut out.data;
+    out_h
+        .par_chunks_exact_mut(n)
+        .zip(out_hu.par_chunks_exact_mut(n))
+        .zip(out_hv.par_chunks_exact_mut(n))
+        .enumerate()
+        .for_each_init(
+            || WorkspaceGuard::take(ops),
+            |ws, (k, ((h, hu), hv))| kernel.element(k, ws, [h, hu, hv]),
+        );
+    add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }
 
 #[cfg(test)]
@@ -1564,6 +1285,57 @@ mod tests {
             compute_dt_swe_2d(&q, &mesh, &geom, &equation, 2, 0.5),
             f64::INFINITY
         );
+    }
+
+    #[test]
+    fn test_rhs_into_overwrites_and_reuses_workspace() {
+        // P1.1: `_into` must overwrite a reused (stale) output buffer and give the
+        // allocating result, for both formulations and repeated evaluations (the
+        // thread-local workspace is reused across them and across orders).
+        let (mesh, ops, geom, bathymetry) = sloped_periodic_setup(2, false);
+        let q = sloped_state(&mesh, &ops, &bathymetry, 0.5);
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let bathy_source = crate::source::BathymetrySource2D::new(G);
+        let standard = SWE2DRhsConfig::new(&equation, &bc)
+            .with_coriolis(false)
+            .with_bathymetry(&bathymetry)
+            .with_source_terms(&bathy_source)
+            .with_well_balanced(true);
+        let split = SWE2DRhsConfig::new(&equation, &bc)
+            .with_coriolis(false)
+            .with_formulation(SWEFormulation2D::EntropyStable)
+            .with_bathymetry(&bathymetry);
+
+        let mut out = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for config in [&standard, &split, &standard] {
+            let expected = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, config, 0.0);
+            for v in out.data.iter_mut().flatten() {
+                *v = 1.0e30;
+            }
+            compute_rhs_swe_2d_into(&q, &mesh, &ops, &geom, config, 0.0, &mut out);
+            assert_eq!(out.data, expected.data);
+            #[cfg(feature = "parallel")]
+            {
+                for v in out.data.iter_mut().flatten() {
+                    *v = -1.0e30;
+                }
+                compute_rhs_swe_2d_parallel_into(&q, &mesh, &ops, &geom, config, 0.0, &mut out);
+                assert_eq!(out.data, expected.data);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "RHS output is")]
+    fn test_rhs_into_rejects_wrong_output_size() {
+        let (mesh, ops, geom) = create_test_setup(2);
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let config = SWE2DRhsConfig::new(&equation, &bc);
+        let q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        let mut out = SWESolution2D::new(mesh.n_elements + 1, ops.n_nodes);
+        compute_rhs_swe_2d_into(&q, &mesh, &ops, &geom, &config, 0.0, &mut out);
     }
 
     #[test]
@@ -2174,7 +1946,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "parallel", feature = "simd"))]
+    #[cfg(feature = "parallel")]
     fn test_parallel_matches_serial() {
         use crate::source::BathymetrySource2D;
 
@@ -2218,9 +1990,31 @@ mod tests {
             &config,
             "cell-averaged bathymetry + reconstruction",
         );
+
+        // Case 3: reflective walls (ghost states), nodal bathymetry, trait sources
+        // including Coriolis, both formulations.
+        let mesh = Mesh2D::uniform_rectangle(0.0, 20_000.0, 0.0, 10_000.0, 6, 3);
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -150.0 + 0.004 * x - 50.0 * (y / 10_000.0).powi(2)
+        });
+        let q = sloped_state(&mesh, &ops, &bathymetry, 0.8);
+        let coriolis = CoriolisSource2D::f_plane(1.2e-4);
+        let sources = crate::source::CombinedSource2D::new(vec![&coriolis, &bathy_source]);
+        let config = SWE2DRhsConfig::new(&equation, &bc)
+            .with_bathymetry(&bathymetry)
+            .with_source_terms(&sources)
+            .with_well_balanced(true);
+        assert_parallel_matches_serial(&q, &mesh, &ops, &geom, &config, "walls + sources");
+        let config = SWE2DRhsConfig::new(&equation, &bc)
+            .with_formulation(SWEFormulation2D::EntropyStable)
+            .with_bathymetry(&bathymetry)
+            .with_source_terms(&coriolis);
+        assert_parallel_matches_serial(&q, &mesh, &ops, &geom, &config, "walls, split form");
     }
 
-    #[cfg(all(feature = "parallel", feature = "simd"))]
+    #[cfg(feature = "parallel")]
     fn assert_parallel_matches_serial(
         q: &SWESolution2D,
         mesh: &Mesh2D,
@@ -2229,31 +2023,18 @@ mod tests {
         config: &SWE2DRhsConfig<Reflective2D>,
         case: &str,
     ) {
+        // P1.1: one element kernel for both drivers, so the results are identical.
         let rhs_serial = compute_rhs_swe_2d(q, mesh, ops, geom, config, 0.0);
         let rhs_parallel = compute_rhs_swe_2d_parallel(q, mesh, ops, geom, config, 0.0);
-
-        // Same arithmetic up to summation order: compare relative to the RHS scale.
-        let tol = 1e-12 * rhs_serial.max_abs().max(1.0);
-        for k in ElementIndex::iter(mesh.n_elements) {
-            for i in 0..ops.n_nodes {
-                let serial = rhs_serial.get_state(k, i);
-                let parallel = rhs_parallel.get_state(k, i);
-                for (name, a, b) in [
-                    ("h", serial.h, parallel.h),
-                    ("hu", serial.hu, parallel.hu),
-                    ("hv", serial.hv, parallel.hv),
-                ] {
-                    assert!(
-                        (a - b).abs() < tol,
-                        "{case}: {name} mismatch at ({k}, {i}): serial={a}, parallel={b}"
-                    );
-                }
-            }
-        }
+        assert!(rhs_serial.max_abs() > 0.0, "{case}: trivial RHS");
+        assert_eq!(
+            rhs_serial.data, rhs_parallel.data,
+            "{case}: serial != parallel"
+        );
     }
 
     #[test]
-    #[cfg(all(feature = "parallel", feature = "simd"))]
+    #[cfg(feature = "parallel")]
     fn test_parallel_with_coriolis() {
         use super::compute_rhs_swe_2d_parallel;
 

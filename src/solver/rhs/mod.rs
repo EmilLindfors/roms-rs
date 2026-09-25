@@ -31,10 +31,12 @@ pub use advection_2d::{
 // 2D SWE
 pub use swe_2d::{
     SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d, compute_dt_viscosity, compute_rhs_swe_2d,
-    positivity_cfl_swe_2d,
+    compute_rhs_swe_2d_into, positivity_cfl_swe_2d,
 };
-#[cfg(all(feature = "parallel", feature = "simd"))]
-pub use swe_2d::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
+#[cfg(feature = "parallel")]
+pub use swe_2d::{
+    compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel, compute_rhs_swe_2d_parallel_into,
+};
 
 // 2D Tracer
 #[cfg(feature = "parallel")]

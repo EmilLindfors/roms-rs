@@ -40,7 +40,7 @@
 //! Wetting and drying are not treated: dry nodes get zero velocity but the
 //! scheme is not positivity preserving by itself.
 
-use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
+use crate::boundary::SWEBoundaryCondition2D;
 use crate::flux::{
     SWENodeState2D, entropy_stable_dissipation_2d, wintermeyer_bed_interface_term_2d,
     wintermeyer_flux_2d,
@@ -60,6 +60,19 @@ pub(super) struct SplitFormWorkspace {
     rhs: Vec<SWEState2D>,
 }
 
+impl SplitFormWorkspace {
+    pub(super) fn new(n_nodes: usize) -> Self {
+        // Unused trailing capacity keeps workspaces of different threads off
+        // shared cache lines (see `padded` in swe_2d.rs).
+        const SLACK: usize = 4;
+        let mut nodes = Vec::with_capacity(n_nodes + SLACK);
+        nodes.resize(n_nodes, SWENodeState2D::default());
+        let mut rhs = Vec::with_capacity(n_nodes + SLACK);
+        rhs.resize(n_nodes, SWEState2D::zero());
+        Self { nodes, rhs }
+    }
+}
+
 /// Split-form operator for one RHS evaluation.
 pub(super) struct SplitFormSWE2D<'a, 'c, BC: SWEBoundaryCondition2D> {
     q: &'a SWESolution2D,
@@ -68,8 +81,6 @@ pub(super) struct SplitFormSWE2D<'a, 'c, BC: SWEBoundaryCondition2D> {
     geom: &'a GeometricFactors2D,
     config: &'a SWE2DRhsConfig<'c, BC>,
     time: f64,
-    /// Row-major 1D GLL differentiation matrix
-    d1: Vec<f64>,
     /// Add entropy-stable dissipation at faces
     dissipative: bool,
 }
@@ -102,14 +113,6 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             config.formulation
         );
 
-        let n1 = ops.n_1d;
-        let mut d1 = vec![0.0; n1 * n1];
-        for a in 0..n1 {
-            for c in 0..n1 {
-                d1[a * n1 + c] = ops.dr_1d[(a, c)];
-            }
-        }
-
         Some(Self {
             q,
             mesh,
@@ -117,16 +120,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             geom,
             config,
             time,
-            d1,
             dissipative,
         })
-    }
-
-    pub(super) fn workspace(&self) -> SplitFormWorkspace {
-        SplitFormWorkspace {
-            nodes: vec![SWENodeState2D::default(); self.ops.n_nodes],
-            rhs: vec![SWEState2D::zero(); self.ops.n_nodes],
-        }
     }
 
     #[inline]
@@ -223,7 +218,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         g: f64,
     ) {
         let n1 = self.ops.n_1d;
-        let d1 = &self.d1;
+        let d1 = &self.ops.dr_1d_row_major;
         for a in 0..n1 {
             let ia = idx(a);
             let q_a = ws.nodes[ia];
@@ -255,23 +250,17 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         node: usize,
         normal: (f64, f64),
     ) -> SWEState2D {
-        let config = self.config;
-        let [x, y] =
-            self.mesh
-                .reference_to_physical(k, self.ops.nodes_r[node], self.ops.nodes_s[node]);
-        let state = self.q.get_state(k, node);
-        let bathy_value = self.bed(k, node);
-        let g = config.equation.g;
-        let h_min = config.equation.h_min.meters();
-
-        let mut ctx = match self.mesh.boundary_tag(k, face) {
-            Some(tag) => {
-                BCContext2D::with_tag(self.time, (x, y), state, bathy_value, normal, g, h_min, tag)
-            }
-            None => BCContext2D::new(self.time, (x, y), state, bathy_value, normal, g, h_min),
-        };
-        ctx.dt = config.dt;
-        config.bc.ghost_state(&ctx)
+        super::swe_2d::boundary_ghost_state(
+            self.q,
+            self.mesh,
+            self.ops,
+            self.config,
+            self.time,
+            k,
+            face,
+            node,
+            normal,
+        )
     }
 }
 
