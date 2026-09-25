@@ -45,6 +45,103 @@ pub enum GeoTiffError {
     /// Unsupported data type
     #[error("Unsupported data type: {0}")]
     UnsupportedDataType(String),
+
+    /// The raster is not in geographic (longitude/latitude) coordinates, or
+    /// is rotated
+    #[error("Unsupported georeferencing: {0}")]
+    UnsupportedGeoreferencing(String),
+}
+
+/// GeoTIFF tags (OGC GeoTIFF 1.1, 19-008r4) and GDAL's no-data tag.
+///
+/// The `tiff` crate decodes these numbers (33550, 33922, 34264, 34735,
+/// 42113) to named variants, so `Tag::Unknown(n)` never matches them: that is
+/// how the loader used to miss every georeferencing tag and fall back to the
+/// bbox hint.
+const MODEL_PIXEL_SCALE: Tag = Tag::ModelPixelScaleTag;
+const MODEL_TIEPOINT: Tag = Tag::ModelTiepointTag;
+const MODEL_TRANSFORMATION: Tag = Tag::ModelTransformationTag;
+const GEO_KEY_DIRECTORY: Tag = Tag::GeoKeyDirectoryTag;
+const GDAL_NODATA: Tag = Tag::GdalNodata;
+
+/// GeoKeys: GTModelTypeGeoKey (2 = geographic) and GTRasterTypeGeoKey
+/// (1 = PixelIsArea, 2 = PixelIsPoint).
+const MODEL_TYPE_KEY: u16 = 1024;
+const RASTER_TYPE_KEY: u16 = 1025;
+const MODEL_TYPE_GEOGRAPHIC: u16 = 2;
+const RASTER_PIXEL_IS_POINT: u16 = 2;
+
+/// Value of `key` in a GeoKeyDirectory (`[version, revision, minor, n,
+/// (key, location, count, value) × n]`), for keys stored inline.
+fn geo_key(directory: &[u16], key: u16) -> Option<u16> {
+    directory
+        .get(4..)?
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .find(|entry| entry[0] == key && entry[1] == 0)
+        .map(|entry| entry[3])
+}
+
+/// Extent (outer pixel edges) of a `width` × `height` north-up raster in
+/// longitude/latitude, from ModelTransformation, or else ModelPixelScale plus
+/// ModelTiepoint. `None` if the raster has neither.
+///
+/// `pixel_is_point`: the tie point refers to a pixel centre instead of its
+/// upper-left corner (GTRasterTypeGeoKey = PixelIsPoint).
+fn raster_extent(
+    width: usize,
+    height: usize,
+    pixel_scale: Option<&[f64]>,
+    tiepoint: Option<&[f64]>,
+    transformation: Option<&[f64]>,
+    pixel_is_point: bool,
+) -> Result<Option<GeoBoundingBox>, GeoTiffError> {
+    // Longitude/latitude of raster (col, row) = (0, 0) and the pixel size
+    // (positive; rows go south)
+    let (lon0, lat0, dlon, dlat) = if let Some(m) = transformation {
+        // Row-major 4×4: lon = m0·col + m1·row + m3, lat = m4·col + m5·row + m7
+        if m.len() < 16 {
+            return Err(GeoTiffError::MissingGeotransform(format!(
+                "ModelTransformation has {} values, expected 16",
+                m.len()
+            )));
+        }
+        if m[1] != 0.0 || m[4] != 0.0 || m[0] <= 0.0 || m[5] >= 0.0 {
+            return Err(GeoTiffError::UnsupportedGeoreferencing(format!(
+                "only north-up, unrotated rasters are supported (ModelTransformation {:?})",
+                &m[..8]
+            )));
+        }
+        (m[3], m[7], m[0], -m[5])
+    } else if let (Some(scale), Some(tie)) = (pixel_scale, tiepoint) {
+        // Tie point [I, J, K, X, Y, Z]: raster (I, J) lies at (X, Y)
+        if tie.len() < 6 || scale.len() < 2 {
+            return Err(GeoTiffError::MissingGeotransform(
+                "ModelTiepoint/ModelPixelScale too short".to_string(),
+            ));
+        }
+        (
+            tie[3] - tie[0] * scale[0],
+            tie[4] + tie[1] * scale[1],
+            scale[0],
+            scale[1],
+        )
+    } else {
+        return Ok(None);
+    };
+
+    let (min_lon, max_lat) = if pixel_is_point {
+        (lon0 - 0.5 * dlon, lat0 + 0.5 * dlat)
+    } else {
+        (lon0, lat0)
+    };
+    Ok(Some(GeoBoundingBox::new(
+        min_lon,
+        max_lat - height as f64 * dlat,
+        min_lon + width as f64 * dlon,
+        max_lat,
+    )))
 }
 
 impl From<tiff::TiffError> for GeoTiffError {
@@ -73,15 +170,17 @@ pub struct GeoTiffBathymetry {
 impl GeoTiffBathymetry {
     /// Load bathymetry from a GeoTIFF file.
     ///
-    /// Extracts geotransform from ModelPixelScale (tag 33550) and
-    /// ModelTiepoint (tag 33922) tags.
+    /// The raster must be north-up in geographic coordinates (e.g. EPSG:4326),
+    /// georeferenced by ModelTransformation (tag 34264) or by ModelPixelScale
+    /// (33550) plus ModelTiepoint (33922). Projected rasters (UTM, …) are
+    /// rejected. GDAL's no-data tag (42113) is honoured.
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, GeoTiffError> {
         Self::load_with_bbox(path, None)
     }
 
-    /// Load bathymetry with an optional bounding box hint.
-    ///
-    /// If the GeoTIFF lacks proper geotransform tags, the bbox hint is used.
+    /// Load bathymetry, with `bbox_hint` as the extent of a plain TIFF that
+    /// has no georeferencing tags. The hint is ignored when the file is
+    /// georeferenced (see [`Self::load`]).
     pub fn load_with_bbox<P: AsRef<Path>>(
         path: P,
         bbox_hint: Option<GeoBoundingBox>,
@@ -91,40 +190,41 @@ impl GeoTiffBathymetry {
 
         let (width, height) = decoder.dimensions()?;
 
-        // Try to read GeoTIFF geotransform tags
-        let pixel_scale = decoder.get_tag_f64_vec(Tag::Unknown(33550)).ok();
-        let model_tiepoint = decoder.get_tag_f64_vec(Tag::Unknown(33922)).ok();
+        let geo_keys = decoder.get_tag_u16_vec(GEO_KEY_DIRECTORY).ok();
+        let key = |key| geo_keys.as_deref().and_then(|keys| geo_key(keys, key));
+        if let Some(model_type) = key(MODEL_TYPE_KEY)
+            && model_type != MODEL_TYPE_GEOGRAPHIC
+        {
+            return Err(GeoTiffError::UnsupportedGeoreferencing(format!(
+                "GTModelTypeGeoKey = {model_type}: only geographic (longitude/latitude) \
+                 rasters are supported; reproject to EPSG:4326 first"
+            )));
+        }
+        let pixel_is_point = key(RASTER_TYPE_KEY) == Some(RASTER_PIXEL_IS_POINT);
 
-        // Calculate bounding box from GeoTIFF tags
-        let bbox = if let (Some(scale), Some(tiepoint)) = (pixel_scale, model_tiepoint) {
-            // ModelTiepoint format: [I, J, K, X, Y, Z]
-            // ModelPixelScale format: [ScaleX, ScaleY, ScaleZ]
-            if tiepoint.len() >= 6 && scale.len() >= 2 {
-                let origin_x = tiepoint[3]; // X coordinate of origin (longitude)
-                let origin_y = tiepoint[4]; // Y coordinate of origin (latitude)
-                let pixel_width = scale[0];
-                let pixel_height = scale[1];
-
-                let min_lon = origin_x;
-                let max_lon = origin_x + (width as f64 * pixel_width);
-                let max_lat = origin_y;
-                let min_lat = origin_y - (height as f64 * pixel_height);
-
-                GeoBoundingBox::new(min_lon, min_lat, max_lon, max_lat)
-            } else if let Some(hint) = bbox_hint {
-                hint
-            } else {
-                return Err(GeoTiffError::MissingGeotransform(
-                    "Invalid GeoTIFF tags and no bbox hint provided".to_string(),
-                ));
-            }
-        } else if let Some(hint) = bbox_hint {
-            hint
-        } else {
-            return Err(GeoTiffError::MissingGeotransform(
-                "No GeoTIFF geotransform found and no bbox hint provided".to_string(),
-            ));
+        let pixel_scale = decoder.get_tag_f64_vec(MODEL_PIXEL_SCALE).ok();
+        let tiepoint = decoder.get_tag_f64_vec(MODEL_TIEPOINT).ok();
+        let transformation = decoder.get_tag_f64_vec(MODEL_TRANSFORMATION).ok();
+        let bbox = match raster_extent(
+            width as usize,
+            height as usize,
+            pixel_scale.as_deref(),
+            tiepoint.as_deref(),
+            transformation.as_deref(),
+            pixel_is_point,
+        )? {
+            Some(bbox) => bbox,
+            None => bbox_hint.ok_or_else(|| {
+                GeoTiffError::MissingGeotransform(
+                    "No GeoTIFF geotransform found and no bbox hint provided".to_string(),
+                )
+            })?,
         };
+        let nodata = decoder
+            .get_tag_ascii_string(GDAL_NODATA)
+            .ok()
+            .and_then(|s| s.trim_matches(char::from(0)).trim().parse::<f32>().ok())
+            .unwrap_or(-9999.0);
 
         // Decode the image
         let result = decoder.read_image()?;
@@ -155,7 +255,7 @@ impl GeoTiffBathymetry {
             bbox,
             width: width as usize,
             height: height as usize,
-            nodata: -9999.0,
+            nodata,
         })
     }
 
@@ -193,17 +293,26 @@ impl GeoTiffBathymetry {
     }
 
     /// Convert lat/lon to fractional pixel coordinates for interpolation.
+    ///
+    /// A pixel's value belongs to its centre, so row/column `i` sits `i + ½`
+    /// pixels from the edge; points in the outer half pixels clamp to the
+    /// outermost centres.
     fn latlon_to_pixel_frac(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
         if !self.bbox.contains(lat, lon) {
             return None;
         }
 
-        let col_frac =
-            (lon - self.bbox.min_lon) / (self.bbox.max_lon - self.bbox.min_lon) * self.width as f64;
+        let col_frac = (lon - self.bbox.min_lon) / (self.bbox.max_lon - self.bbox.min_lon)
+            * self.width as f64
+            - 0.5;
         let row_frac = (self.bbox.max_lat - lat) / (self.bbox.max_lat - self.bbox.min_lat)
-            * self.height as f64;
+            * self.height as f64
+            - 0.5;
 
-        Some((row_frac, col_frac))
+        Some((
+            row_frac.clamp(0.0, (self.height - 1) as f64),
+            col_frac.clamp(0.0, (self.width - 1) as f64),
+        ))
     }
 
     /// Check if a depth value is valid (not nodata, not NaN, not land).
@@ -401,6 +510,109 @@ mod tests {
         assert!(!bbox.contains(65.0, 8.75));
     }
 
-    // Integration tests would require actual GeoTIFF files
-    // These are tested in examples/froya_real_data.rs
+    /// Write a 4 × 3 (width × height) Float32 GeoTIFF with pixel value
+    /// −(10·row + col + 1), the given georeferencing tags and GeoKeys.
+    fn write_geotiff(name: &str, tags: &[(Tag, &[f64])], geo_keys: &[u16]) -> std::path::PathBuf {
+        use tiff::encoder::{TiffEncoder, colortype::Gray32Float};
+        let path = std::env::temp_dir().join(format!("dg_rs_geotiff_{name}.tif"));
+        let data: Vec<f32> = (0..3)
+            .flat_map(|row| (0..4).map(move |col| -((10 * row + col + 1) as f32)))
+            .collect();
+        let mut encoder = TiffEncoder::new(File::create(&path).unwrap()).unwrap();
+        let mut image = encoder.new_image::<Gray32Float>(4, 3).unwrap();
+        for &(tag, value) in tags {
+            image.encoder().write_tag(tag, value).unwrap();
+        }
+        image
+            .encoder()
+            .write_tag(GEO_KEY_DIRECTORY, geo_keys)
+            .unwrap();
+        image.write_data(&data).unwrap();
+        path
+    }
+
+    /// Geographic (EPSG:4326), PixelIsArea
+    const GEOGRAPHIC: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+
+    /// Origin (7°E, 64°N), 0.5° × 0.25° pixels: extent 7–9°E, 63.25–64°N
+    const TRANSFORMATION: [f64; 16] = [
+        0.5, 0.0, 0.0, 7.0, 0.0, -0.25, 0.0, 64.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+
+    /// Centre of pixel (row, col): (lat, lon)
+    fn centre(row: f64, col: f64) -> (f64, f64) {
+        (64.0 - 0.25 * (row + 0.5), 7.0 + 0.5 * (col + 0.5))
+    }
+
+    #[test]
+    fn test_model_transformation_georeferencing() {
+        // Regression: ModelTransformation (tag 34264) was ignored and the
+        // extent silently taken from the bbox hint, which misplaced the
+        // Frøya bathymetry by up to ~20 km
+        let path = write_geotiff(
+            "transformation",
+            &[(MODEL_TRANSFORMATION, &TRANSFORMATION)],
+            &GEOGRAPHIC,
+        );
+        let wrong_hint = GeoBoundingBox::new(7.5, 63.3, 10.0, 64.2);
+        let bathy = GeoTiffBathymetry::load_with_bbox(&path, Some(wrong_hint)).unwrap();
+        let bbox = bathy.bbox();
+        assert_eq!(
+            (bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat),
+            (7.0, 63.25, 9.0, 64.0)
+        );
+
+        // Nearest and bilinear sampling return a pixel's value at its centre
+        for row in 0..3 {
+            for col in 0..4 {
+                let (lat, lon) = centre(row as f64, col as f64);
+                let value = -((10 * row + col + 1) as f64);
+                assert_eq!(bathy.get_depth(lat, lon), Some(value));
+                let bilinear = bathy.get_depth_bilinear(lat, lon).unwrap();
+                assert!(
+                    (bilinear - value).abs() < 1e-12,
+                    "({row}, {col}): {bilinear}"
+                );
+            }
+        }
+        // Halfway between the centres of (1, 1) and (1, 2): their mean
+        let (lat, lon) = centre(1.0, 1.5);
+        let mid = bathy.get_depth_bilinear(lat, lon).unwrap();
+        assert!((mid - (-12.5)).abs() < 1e-12, "{mid}");
+    }
+
+    #[test]
+    fn test_tiepoint_georeferencing_matches_transformation() {
+        let scale: [f64; 3] = [0.5, 0.25, 0.0];
+        // Tie raster (1, 2) to its corner in model space
+        let tiepoint: [f64; 6] = [1.0, 2.0, 0.0, 7.5, 63.5, 0.0];
+        let path = write_geotiff(
+            "tiepoint",
+            &[(MODEL_PIXEL_SCALE, &scale), (MODEL_TIEPOINT, &tiepoint)],
+            &GEOGRAPHIC,
+        );
+        let bathy = GeoTiffBathymetry::load(&path).unwrap();
+        let bbox = bathy.bbox();
+        assert_eq!(
+            (bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat),
+            (7.0, 63.25, 9.0, 64.0)
+        );
+    }
+
+    #[test]
+    fn test_projected_raster_is_rejected() {
+        // GTModelTypeGeoKey = 1 (projected, e.g. UTM 33N): coordinates are in
+        // metres, and reading them as degrees gives nonsense
+        let mut projected = GEOGRAPHIC;
+        projected[7] = 1;
+        let path = write_geotiff(
+            "projected",
+            &[(MODEL_TRANSFORMATION, &TRANSFORMATION)],
+            &projected,
+        );
+        assert!(matches!(
+            GeoTiffBathymetry::load(&path),
+            Err(GeoTiffError::UnsupportedGeoreferencing(_))
+        ));
+    }
 }
