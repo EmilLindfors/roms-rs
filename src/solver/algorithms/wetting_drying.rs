@@ -55,7 +55,10 @@ use crate::types::Depth;
 pub struct WetDryConfig {
     /// Dry threshold and desingularization depth ε (default 1e-3 m): elements
     /// with a smaller mean depth are dry, and nodal velocities are
-    /// desingularized below it.
+    /// desingularized below it. Scale it with the problem: about 1e-4 of a
+    /// characteristic depth. 1 mm suits tidal flats and coastal runs; on
+    /// Thacker's 0.1 m laboratory bowl it dominates the error (7.4 % with
+    /// 1 mm, 4.5 % with 1e-5 m).
     pub h_dry: Depth,
     /// Thin-layer relaxation time τ (s) at h = h_dry/2 (see
     /// [`Self::thin_layer_rate`]).

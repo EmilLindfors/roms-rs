@@ -110,9 +110,10 @@ REVIEW.md §7 (2026-09-25):
    leak.
 2. **Correct 2D barotropic tides** — non-allocating unified RHS first, then
    well-balanced entropy-stable DGSEM (split form done, opt-in
-   `SWEFormulation2D::EntropyStable`) with positivity/wet-dry (done for the
-   collocated form: h ≥ 0, desingularization, point-implicit friction, HLL
-   default; shoreline well-balancing open), η-limiting; isoparametric quads +
+   `SWEFormulation2D::EntropyStable`) with positivity/wet-dry (done: h ≥ 0,
+   desingularization, point-implicit friction, HLL default, and the
+   shoreline-balanced split form `SWEFormulation2D::WetDry`), η-limiting;
+   isoparametric quads +
    triangles; spatially varying
    tides, model clock, proper NorKyst nesting.
 3. **Cheap enough to matter** — per-element dt, sum factorisation, one Riemann

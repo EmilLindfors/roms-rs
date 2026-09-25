@@ -6,6 +6,14 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **`SWEFormulation2D::WetDry`: a wet/dry split form that is exactly well-balanced at shorelines (TODO P1.2, P1.7).**
+  - Faces use HLL on Audusse hydrostatically reconstructed states, which is positivity preserving. The entropy-stable dissipation's mass flux `−½λ[[η]]` drains wet nodes next to dry ones, so it is not used.
+  - Fully wet elements keep the flux-differencing volume term.
+  - Elements with a node shallower than `SWE2DRhsConfig::h_dry` (set from `WetDryConfig::h_dry` by `SWEPhysics2D`) use a first-order finite-volume update on their GLL subcells, with the same reconstructed HLL flux (Hennemann et al. 2021, as in Trixi.jl). The subcell fluxes telescope, so mass is conserved and the element means stay positive.
+  - A shoreline lake at rest is kept to round-off (P1–P4, smooth and rough beds, walls and periodic; 100 s runs through `Simulation`: |u| ≤ 6e-14 m/s). `Standard` leaves 5–11 cm/s where h > 1 cm, and m/s in the film.
+  - Fully wet: N+1 convergence (P2 3.06, P3 4.02), energy dissipated, serial and parallel bitwise identical.
+  - Trade-off: on a moving shoreline `Standard` is about 3× more accurate (Thacker P2, 40²: 1.3 % vs 4.8 %, both converging at about second order), because shoreline elements drop to first order here.
+  - Tests: `test_wet_dry_lake_at_rest_with_shorelines`, `test_wet_dry_mass_conservation_with_dry_regions`, `test_convergence_swe_2d_wet_dry_split_form`; the P1.7 gate `lake_at_rest_with_shoreline_is_exact` is no longer ignored; Thacker and Ritter run under both formulations.
 - **Robust wetting and drying for the 2D SWE (TODO P1.2; REVIEW.md §1.5–§1.7, §1.9).**
   - Positivity towards h ≥ 0 instead of h ≥ h_min. The Zhang–Shu limiter used to raise dry nodes to h_min, which lowered the wet nodes of every shoreline element in every stage. The wet/dry correction used to rescale whole elements. A lake-at-rest shoreline is now left untouched. Elements whose mean depth is below the dry threshold lose their momentum but keep their depths (they used to be flattened). Negative-mean elements are still emptied, but the limiters now return how many (`swe_positivity_limiter_2d` & co. return `usize`, `StandardLimiter2D::apply_counting`, `SWEPhysics2D::negative_depth_clips`). The count stays 0 under the positivity CFL with HLL/Rusanov.
   - Kurganov–Petrova velocity desingularization below `WetDryConfig::h_dry` (default 1 mm): `u = √2 h hu / √(h⁴ + max(h⁴, h_dry⁴))`, then `hu ← h u`. Nodes at least h_dry deep and under the velocity cap are left bitwise unchanged.

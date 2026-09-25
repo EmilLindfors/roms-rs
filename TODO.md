@@ -33,7 +33,8 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
    - Split form done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)). Wet/dry robustness is done for the collocated form: h ≥ 0, desingularization, implicit friction, HLL default and the CFL cap.
-   - Next: shoreline well-balancing, and wet/dry for the split form (HLL + Chen–Noelle surface flux).
+   - `SWEFormulation2D::WetDry` is done: split-form wet/dry that keeps a shoreline lake at rest exactly.
+   - Next: its first-order shoreline elements, η-based limiting, and moving Frøya onto it.
 4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
 
 Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF. Otherwise use `cargo test --no-default-features --features parallel,simd`.
@@ -131,10 +132,16 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - Done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)): opt-in via `SWEFormulation2D::EntropyStable` (`EntropyConservative` for verification). Exact mass conservation, entropy conserved/dissipated to round-off, P2/P3 convergence 3.06/4.00 on a nonlinear manufactured solution with bathymetry.
   - Follow-up: switch `examples/froya_real_data.rs` from cell-averaged B to nodal B + split form.
 - [x] Wet/dry and positivity: Zhang–Shu towards h ≥ 0 (not h_min), Kurganov–Petrova velocity desingularization below `h_dry` (1 mm). Done for the collocated (`Standard`) formulation (`solver/algorithms/wetting_drying.rs`, `limiters/swe_2d.rs`). Gates in `tests/wet_dry_2d_test.rs`: Ritter dry dam break (L1 1.5 %, first order), Thacker's paraboloid (L1 7.4 % after one period, was 9.2 %), shoreline lake at rest (|u| < 0.06 m/s where h > 1 cm, was up to the 20 m/s cap). All conserve mass to round-off with h ≥ 0.
-- [ ] **Shoreline well-balancing.** Partially dry elements are not balanced: at lake at rest the dry nodes have η = B ≠ η₀, so the collocated pressure/bed terms leave a residual at the wet nodes. On a 2 % beach, P2/P3 settle within ~10 s into a stationary circulation in the shoreline element: |hu| ≈ 2e-3 m²/s, |u| up to 1 m/s in the 1 mm – 1 cm film. P1 keeps sloshing, with 4 mm offshore η errors.
-  - Candidate fixes: hydrostatic reconstruction inside the element (the pairwise Audusse / Chen–Noelle reconstruction in the split-form volume term), or subcell FV in partially dry elements (Ersing & Winters; Trixi.jl).
-  - Gate: `lake_at_rest_with_shoreline_is_exact` (ignored until then).
-- [ ] **Wet/dry for the split form.** `EntropyStable` uses entropy-stable interface dissipation, which is not positivity preserving, and it has no hydrostatic reconstruction at wet/dry faces. Add an HLL + Chen–Noelle hydrostatic-reconstruction surface flux as a formulation option; this is what Wintermeyer et al. (2018) and Trixi.jl pair with the flux-differencing volume term. Until then, wet/dry runs must use `Standard` (documented on `SWEPhysics2D`).
+- [x] **Shoreline well-balancing and wet/dry for the split form: `SWEFormulation2D::WetDry`.** HLL on Audusse-reconstructed states at faces, flux differencing in wet elements, and subcell finite volumes with the same flux in partially dry elements.
+  - A shoreline lake at rest is kept to round-off (P1–P4, smooth/rough beds; the P1.7 gate `lake_at_rest_with_shoreline_is_exact` passes).
+  - Fully wet it keeps N+1 (P2 3.06, P3 4.02) and dissipates energy.
+  - `Standard` is still not balanced in partially dry elements: on a 2 % beach it settles into a stationary circulation of ≈ 5 cm/s where h > 1 cm, and 1–4 m/s in the film.
+- [ ] **`WetDry` accuracy on moving shorelines.** Every element the shoreline crosses drops to first-order subcell FV. On Thacker's paraboloid (P2) this gives 4.8 % at 40², against 1.3 % for `Standard`; both converge at ≈ 2nd order. Options:
+  - a second-order (MUSCL) subcell reconstruction that stays positivity preserving and well-balanced;
+  - convex DG/FV blending (Hennemann–Gassner / Rueda-Ramírez subcell limiting) with a balanced DG part;
+  - using FV only in elements with a dry node that is not at rest.
+- [ ] Guide the choice of `h_dry`. It should be about 1e-4 of the characteristic depth: the 1 mm default suits field scale, but it dominates the error of the 0.1 m Thacker case (7.4 % vs 4.5 %). Consider deriving it from the bathymetry range, or making it relative.
+- [ ] The Chen–Noelle (2017) reconstruction instead of Audusse. It is more accurate for bed steps larger than the depth (thin films on steep subcell beds, e.g. fjord walls); it changes only B* and h* (`b* = min(max B, min η)`, `h* = min(η − b*, h)`).
 - [ ] Dry fronts lag: in the Ritter test the h = 1 mm front is at 71.5 m instead of 79.8 m (P2, 1 m elements; the same on `main`). It moves only to 73 m at 0.5 m resolution, or 75 m with h_dry = 1e-5. The thin-layer relaxation plays no role. Suspects: strict Kuzmin at the front, and zeroing the momentum of elements with mean < h_dry. Revisit with η-based limiting.
 - [ ] Positivity alone does not control a dry front: without a slope limiter, P1/P2 dam breaks shed a thin film that runs ahead at the 20 m/s velocity cap. Partially dry cells need limiting (next item).
 - [ ] Limit η (and velocities or characteristic variables), not h, with a troubled-cell indicator (TVB-M/KXRCF). Limit h only in partially dry cells (Vater et al. 2019).
@@ -146,8 +153,8 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - [ ] A second-order IMEX treatment (e.g. an SSP IMEX-RK) if the friction term's first-order error matters in shallow tidal flats.
 - [x] The dt-dependent wet/dry momentum damping is gone. It is replaced by the point-implicit thin-layer relaxation r(h) = (h_dry/h − 1)²/τ, which is zero at h ≥ h_dry.
 - [x] HLL is the default flux for wet/dry runs in `SWEPhysics2DBuilder`. `SWE2DRhsConfig::new` still defaults to Roe (low-level API).
-- [ ] Retire the cell-average/`linearize` workarounds once the split form has wet/dry.
-- [ ] Move `examples/froya_real_data.rs` off the legacy `SWE2DTimeConfig`, which sets `H_MIN` = 5 m and makes land a 5 m film. Use `Simulation` + `with_wet_dry` + `with_implicit_friction` + HLL, and mesh water only (P2.4).
+- [ ] Retire the cell-average/`linearize` workarounds: `WetDry` now covers wet/dry with nodal B.
+- [ ] Move `examples/froya_real_data.rs` off the legacy `SWE2DTimeConfig`, which sets `H_MIN` = 5 m and makes land a 5 m film. Use `Simulation` + `WetDry` (nodal B) + `with_wet_dry` + `with_implicit_friction`, and mesh water only (P2.4).
 - [ ] `SWEPhysics2D::post_process` builds a `LimiterContext2D` every stage, whose `new` computes `mesh.h_min()` (a sqrt per edge over all elements). No limiter reads `LimiterContext2D::h_min`: drop the field or cache it.
 
 ### P1.3 Geometry for real coastlines
@@ -188,10 +195,11 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 
 ### P1.7 Gating tests (write first; most fail today)
 - [ ] Lake-at-rest with steep nodal B (e.g. 30→400 m), p = 1–4, serial and parallel: residual < 1e-10.
-- [ ] Lake-at-rest with face-discontinuous B, and with wet/dry shorelines.
-  - Shoreline: `tests/wet_dry_2d_test.rs::lake_at_rest_with_shoreline_is_exact` (ignored, fails); `…_stays_near_rest` bounds today's error.
-- [ ] Mass conservation with discontinuous B and slope-correlated flow.
-- [x] Thacker parabolic bowl (dynamic wet/dry): `thacker_planar_oscillation_one_period` (planar SWASHES case, L1 < 9 %). Also the Ritter dry dam break.
+- [x] Lake-at-rest with face-discontinuous B, and with wet/dry shorelines.
+  - Face-discontinuous B: split forms, `test_lake_at_rest_any_nodal_bathymetry` (cell-averaged and rough beds, P1–P4).
+  - Shorelines: `WetDry`, `test_wet_dry_lake_at_rest_with_shorelines` (RHS) and `tests/wet_dry_2d_test.rs::lake_at_rest_with_shoreline_is_exact` (100 s runs). `Standard` is bounded by `…_stays_near_rest`.
+- [x] Mass conservation with discontinuous B and slope-correlated flow: split forms `test_mass_conservation`, `WetDry` with dry regions `test_wet_dry_mass_conservation_with_dry_regions`; `Standard` covered by the P0.13 tests.
+- [x] Thacker parabolic bowl (dynamic wet/dry), planar SWASHES case: `thacker_planar_oscillation_converges_{standard,wet_dry}`. Both converge at ≈ 2nd order. Also the Ritter dry dam break, for both formulations.
 - [ ] Outgoing-pulse reflection < 1 %; delivered tidal amplitude.
 - [ ] Nonlinear SWE convergence with bathymetry on curved meshes. Assert N+1: current thresholds 1.5/2.5 are below it (`tests/convergence_test.rs`).
 - [ ] Fix vacuous tests:

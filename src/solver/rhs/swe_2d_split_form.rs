@@ -37,20 +37,60 @@
 //!   `EntropyStable` dissipates it at faces. The split form also removes the
 //!   aliasing of the collocated nonlinear flux derivative (REVIEW.md §1.6).
 //!
-//! Wetting and drying are not treated: dry nodes get zero velocity but the
-//! scheme is not positivity preserving by itself.
+//! # Wetting and drying (`SWEFormulation2D::WetDry`)
+//!
+//! The entropy-stable interface dissipation is not positivity preserving (its
+//! mass component is `−½λ[[η]]`, which drains a wet node next to a dry one),
+//! and the flux-differencing volume term is not balanced in an element with
+//! dry nodes, where η = B ≠ η₀. The wet/dry variant therefore (following
+//! Wintermeyer et al. 2018 and the Trixi.jl shallow-water solvers):
+//!
+//! - uses HLL on Audusse et al. (2004) hydrostatically reconstructed states at
+//!   every face, `F* = F_HLL(q*⁻, q*⁺)·n + ½g(h⁻² − h*⁻²)(0, n)` with
+//!   `h* = max(0, η − max(B⁻, B⁺))`. At lake at rest `F* = F(q⁻)·n`, wet or
+//!   dry, and its mass part is positivity preserving (h* ≤ h);
+//! - replaces the volume term of every element that has a node shallower than
+//!   `h_dry` by a first-order finite-volume update on the GLL subcells
+//!   (Hennemann et al. 2021), with the same reconstructed HLL flux at the
+//!   subcell interfaces and the physical flux `F(q)·m` at the element
+//!   boundary nodes:
+//!
+//!   ```text
+//!   dq_a/dt = −(F̂_{a,a+1} − F̂_{a−1,a}) / w_a   (per GLL line, both directions)
+//!   ```
+//!
+//!   The subcell fluxes telescope, so the element still exchanges exactly
+//!   `∓F*` with its neighbours (mass conservation, and the Zhang–Shu argument
+//!   for the element means). With the bed piecewise constant per subcell, the
+//!   hydrostatic reconstruction alone balances lake at rest, dry subcells
+//!   included.
+//!
+//! Fully wet elements keep the flux-differencing volume term. The positivity
+//! limiter and wet/dry correction (`SWEPhysics2D`) still run after every stage.
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::flux::{
-    SWENodeState2D, entropy_stable_dissipation_2d, wintermeyer_bed_interface_term_2d,
-    wintermeyer_flux_2d,
+    SWENodeState2D, entropy_stable_dissipation_2d, hll_flux_swe_2d,
+    wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
 };
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::{SWESolution2D, SWEState2D};
+use crate::source::HydrostaticReconstruction2D;
 use crate::types::ElementIndex;
 
 use super::swe_2d::{SWE2DRhsConfig, SWEFormulation2D};
+
+/// Interface flux of a split form.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SurfaceFlux {
+    /// Wintermeyer flux plus the bed interface term
+    EntropyConservative,
+    /// The same plus Lax–Friedrichs dissipation in entropy variables
+    EntropyStable,
+    /// HLL on hydrostatically reconstructed states (wet/dry)
+    HydrostaticHll,
+}
 
 /// Per-thread scratch space for [`SplitFormSWE2D::element_rhs`].
 pub(super) struct SplitFormWorkspace {
@@ -81,8 +121,11 @@ pub(super) struct SplitFormSWE2D<'a, 'c, BC: SWEBoundaryCondition2D> {
     geom: &'a GeometricFactors2D,
     config: &'a SWE2DRhsConfig<'c, BC>,
     time: f64,
-    /// Add entropy-stable dissipation at faces
-    dissipative: bool,
+    surface: SurfaceFlux,
+    /// Subcell finite volumes in elements with a node shallower than this
+    /// (`WetDry` only)
+    h_dry: Option<f64>,
+    reconstruction: HydrostaticReconstruction2D,
 }
 
 impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
@@ -99,10 +142,11 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         config: &'a SWE2DRhsConfig<'c, BC>,
         time: f64,
     ) -> Option<Self> {
-        let dissipative = match config.formulation {
+        let (surface, h_dry) = match config.formulation {
             SWEFormulation2D::Standard => return None,
-            SWEFormulation2D::EntropyConservative => false,
-            SWEFormulation2D::EntropyStable => true,
+            SWEFormulation2D::EntropyConservative => (SurfaceFlux::EntropyConservative, None),
+            SWEFormulation2D::EntropyStable => (SurfaceFlux::EntropyStable, None),
+            SWEFormulation2D::WetDry => (SurfaceFlux::HydrostaticHll, Some(config.h_dry)),
         };
         assert!(
             !config
@@ -120,7 +164,12 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             geom,
             config,
             time,
-            dissipative,
+            surface,
+            h_dry,
+            reconstruction: HydrostaticReconstruction2D::new(
+                config.equation.g,
+                config.equation.h_min.meters(),
+            ),
         })
     }
 
@@ -149,13 +198,22 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             ws.rhs[i] = SWEState2D::zero();
         }
 
-        // 1. Flux-differencing volume term and collocated bed slope, line by line.
-        //    Node ordering is i = j·n1 + a (r fastest).
+        // 1. Volume term, line by line (node ordering i = j·n1 + a, r fastest):
+        //    flux differencing with the collocated bed slope, or subcell finite
+        //    volumes in elements with dry nodes.
         let dir_r = (self.geom.rx[ki], self.geom.ry[ki]);
         let dir_s = (self.geom.sx[ki], self.geom.sy[ki]);
+        let subcells = self
+            .h_dry
+            .is_some_and(|h_dry| ws.nodes.iter().any(|n| n.h < h_dry));
         for line in 0..n1 {
-            self.line_volume(ws, |a| line * n1 + a, dir_r, g);
-            self.line_volume(ws, |j| j * n1 + line, dir_s, g);
+            if subcells {
+                self.line_subcells(ws, |a| line * n1 + a, dir_r, g);
+                self.line_subcells(ws, |j| j * n1 + line, dir_s, g);
+            } else {
+                self.line_volume(ws, |a| line * n1 + a, dir_r, g);
+                self.line_volume(ws, |j| j * n1 + line, dir_s, g);
+            }
         }
 
         // 2. Surface terms: J⁻¹ LIFT sJ (F(q⁻)·n − F*). For GLL collocation LIFT
@@ -186,11 +244,22 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
                     ),
                 };
 
-                let mut f_star = wintermeyer_flux_2d(&q_int, &q_ext, normal, g)
-                    + wintermeyer_bed_interface_term_2d(q_int.h, q_int.b, q_ext.b, normal, g);
-                if self.dissipative {
-                    f_star = f_star + entropy_stable_dissipation_2d(&q_int, &q_ext, normal, g);
-                }
+                let f_star = match self.surface {
+                    SurfaceFlux::HydrostaticHll => {
+                        self.hydrostatic_hll(&q_int, &q_ext, normal, g).0
+                    }
+                    surface => {
+                        let f = wintermeyer_flux_2d(&q_int, &q_ext, normal, g)
+                            + wintermeyer_bed_interface_term_2d(
+                                q_int.h, q_int.b, q_ext.b, normal, g,
+                            );
+                        if surface == SurfaceFlux::EntropyStable {
+                            f + entropy_stable_dissipation_2d(&q_int, &q_ext, normal, g)
+                        } else {
+                            f
+                        }
+                    }
+                };
                 let flux_diff = wintermeyer_flux_2d(&q_int, &q_int, normal, g) - f_star;
 
                 ws.rhs[node] = ws.rhs[node] + (scale * ops.lift[face][(node, fi)]) * flux_diff;
@@ -242,6 +311,67 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         }
     }
 
+    /// HLL flux on hydrostatically reconstructed states in direction `m`
+    /// (unit normal or contravariant vector), as seen from side `a` and from
+    /// side `b`: `|m| F_HLL(q*_a, q*_b, m̂) + ½g(h² − h*²)(0, m)`, each with
+    /// its own side's depths. The mass parts are equal (conservative); at lake
+    /// at rest each equals the physical flux `½g h² (0, m)` of its side.
+    #[inline]
+    fn hydrostatic_hll(
+        &self,
+        q_a: &SWENodeState2D,
+        q_b: &SWENodeState2D,
+        m: (f64, f64),
+        g: f64,
+    ) -> (SWEState2D, SWEState2D) {
+        let h_min = self.reconstruction.h_min;
+        let a = SWEState2D::new(q_a.h, q_a.hu, q_a.hv);
+        let b = SWEState2D::new(q_b.h, q_b.hu, q_b.hv);
+        let (a_star, b_star) = self.reconstruction.reconstruct(&a, &b, q_a.b, q_b.b);
+        let norm = m.0.hypot(m.1);
+        let unit = (m.0 / norm, m.1 / norm);
+        let flux = norm * hll_flux_swe_2d(&a_star, &b_star, unit, g, h_min);
+        // Pressure as in F(q)·m = F#(q, q)·m (no dry cutoff)
+        let correction = |h: f64, h_star: f64| {
+            let dp = 0.5 * g * (h * h - h_star * h_star);
+            SWEState2D::new(0.0, dp * m.0, dp * m.1)
+        };
+        (
+            flux + correction(q_a.h, a_star.h),
+            flux + correction(q_b.h, b_star.h),
+        )
+    }
+
+    /// Accumulate the subcell finite-volume update `−(F̂_{a,a+1} − F̂_{a−1,a})/w_a`
+    /// along one line of nodes `idx(0..n1)`: the hydrostatic HLL flux at the
+    /// subcell interfaces and the physical flux `F(q)·dir` at the two ends,
+    /// which the surface term then replaces by `F*`.
+    #[inline]
+    fn line_subcells(
+        &self,
+        ws: &mut SplitFormWorkspace,
+        idx: impl Fn(usize) -> usize,
+        dir: (f64, f64),
+        g: f64,
+    ) {
+        let n1 = self.ops.n_1d;
+        let w = &self.ops.weights_1d;
+
+        let (first, last) = (idx(0), idx(n1 - 1));
+        let (q_first, q_last) = (ws.nodes[first], ws.nodes[last]);
+        ws.rhs[first] =
+            ws.rhs[first] + (1.0 / w[0]) * wintermeyer_flux_2d(&q_first, &q_first, dir, g);
+        ws.rhs[last] =
+            ws.rhs[last] - (1.0 / w[n1 - 1]) * wintermeyer_flux_2d(&q_last, &q_last, dir, g);
+
+        for a in 0..n1 - 1 {
+            let (ia, ib) = (idx(a), idx(a + 1));
+            let (f_a, f_b) = self.hydrostatic_hll(&ws.nodes[ia], &ws.nodes[ib], dir, g);
+            ws.rhs[ia] = ws.rhs[ia] - (1.0 / w[a]) * f_a;
+            ws.rhs[ib] = ws.rhs[ib] + (1.0 / w[a + 1]) * f_b;
+        }
+    }
+
     /// Boundary ghost state from the configured boundary condition.
     fn ghost_state(
         &self,
@@ -278,9 +408,10 @@ mod tests {
 
     const G: f64 = 9.81;
     const L: f64 = 20_000.0;
-    const SPLIT_FORMS: [SWEFormulation2D; 2] = [
+    const SPLIT_FORMS: [SWEFormulation2D; 3] = [
         SWEFormulation2D::EntropyConservative,
         SWEFormulation2D::EntropyStable,
+        SWEFormulation2D::WetDry,
     ];
 
     #[derive(Clone, Copy, Debug)]
@@ -510,15 +641,131 @@ mod tests {
                          dE/dt = {rate:.3e} (scale {scale:.3e})"
                     );
 
-                    let config = config.with_formulation(SWEFormulation2D::EntropyStable);
-                    let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
-                    let (rate, scale) = entropy_rate(&q, &rhs, &bathymetry, &mesh, &ops, &geom);
-                    assert!(
-                        rate < -1e-10 * scale,
-                        "ES p={order}, periodic={periodic}, {bed:?}: \
-                         dE/dt = {rate:.3e} (scale {scale:.3e})"
-                    );
+                    // The hydrostatic-HLL interfaces of WetDry dissipate too
+                    for formulation in [SWEFormulation2D::EntropyStable, SWEFormulation2D::WetDry] {
+                        let config = SWE2DRhsConfig::new(&equation, &bc)
+                            .with_coriolis(false)
+                            .with_formulation(formulation)
+                            .with_bathymetry(&bathymetry);
+                        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+                        let (rate, scale) = entropy_rate(&q, &rhs, &bathymetry, &mesh, &ops, &geom);
+                        assert!(
+                            rate < -1e-10 * scale,
+                            "{formulation:?} p={order}, periodic={periodic}, {bed:?}: \
+                             dE/dt = {rate:.3e} (scale {scale:.3e})"
+                        );
+                    }
                 }
+            }
+        }
+    }
+
+    /// Periodic bed with dry islands and shoreline elements: B = −1 + 1.5
+    /// cos(2πx/L) cos(2πy/L) (plus ±0.2 m per-node noise if `rough`), η = 0.3.
+    fn shoreline_setup(
+        order: usize,
+        periodic: bool,
+        rough: bool,
+    ) -> (Mesh2D, DGOperators2D, GeometricFactors2D, Bathymetry2D) {
+        let (mesh, ops, geom, mut bathymetry) = setup(order, periodic, Bed::Smooth);
+        let tau = 2.0 * std::f64::consts::PI / L;
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let mut b = -1.0 + 1.5 * (tau * x).cos() * (tau * y).cos();
+                if rough {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    b += 0.4 * ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
+                }
+                bathymetry.data[k.as_usize() * ops.n_nodes + i] = b;
+            }
+        }
+        bathymetry.compute_gradients(&ops, &geom);
+        (mesh, ops, geom, bathymetry)
+    }
+
+    /// Lake at rest η = 0.3 over `bathymetry` (h = max(0, η − B)), plus the
+    /// velocity field of [`state`] times `speed` at wet nodes.
+    fn shoreline_state(
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        bathymetry: &Bathymetry2D,
+        speed: f64,
+    ) -> SWESolution2D {
+        let mut q = state(mesh, ops, bathymetry, speed);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let s = q.get_state(k, i);
+                let h = (0.3 - bathymetry.get(k, i)).max(0.0);
+                let scale = if s.h > 0.0 { h / s.h } else { 0.0 };
+                q.set_state(k, i, SWEState2D::new(h, s.hu * scale, s.hv * scale));
+            }
+        }
+        q
+    }
+
+    #[test]
+    fn test_wet_dry_lake_at_rest_with_shorelines() {
+        // Elements cut by the shoreline have dry nodes where η = B ≠ 0.3, so the
+        // flux-differencing volume term is not balanced there; WetDry switches
+        // them to subcell finite volumes with hydrostatic reconstruction.
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        for order in 1..=4 {
+            for periodic in [true, false] {
+                for rough in [false, true] {
+                    let (mesh, ops, geom, bathymetry) = shoreline_setup(order, periodic, rough);
+                    let q = shoreline_state(&mesh, &ops, &bathymetry, 0.0);
+                    assert!(q.h_data().contains(&0.0), "no dry nodes");
+
+                    let config = SWE2DRhsConfig::new(&equation, &bc)
+                        .with_coriolis(false)
+                        .with_formulation(SWEFormulation2D::WetDry)
+                        .with_bathymetry(&bathymetry);
+                    let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+                    let max_h = rhs.data[0].iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+                    let max_mom = max_momentum_rate(&rhs);
+                    assert!(
+                        max_h < 1e-14 && max_mom < 1e-13,
+                        "p={order}, periodic={periodic}, rough={rough}: \
+                         max |dh/dt| = {max_h:.3e}, max |d(hu)/dt| = {max_mom:.3e}"
+                    );
+
+                    // Negative control: the wet-only split form is not balanced
+                    if !rough {
+                        let config = config.with_formulation(SWEFormulation2D::EntropyStable);
+                        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+                        assert!(max_momentum_rate(&rhs) > 1e-6, "p={order}: balanced?");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_wet_dry_mass_conservation_with_dry_regions() {
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        for order in 1..=3 {
+            for rough in [false, true] {
+                let (mesh, ops, geom, bathymetry) = shoreline_setup(order, true, rough);
+                let q = shoreline_state(&mesh, &ops, &bathymetry, 1.0);
+                let mass = integrate(&mesh, &ops, &geom, |k, i| q.get_var(k, i, 0));
+                let config = SWE2DRhsConfig::new(&equation, &bc)
+                    .with_coriolis(false)
+                    .with_formulation(SWEFormulation2D::WetDry)
+                    .with_bathymetry(&bathymetry);
+                let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+                let mass_rate = integrate(&mesh, &ops, &geom, |k, i| rhs.get_var(k, i, 0));
+                // Relative to the mass flux scale ∫|dh/dt|
+                let scale = integrate(&mesh, &ops, &geom, |k, i| rhs.get_var(k, i, 0).abs());
+                assert!(
+                    mass_rate.abs() < 1e-14 * scale,
+                    "p={order}, rough={rough}: d(mass)/dt = {mass_rate:.3e} (scale {scale:.3e}, mass {mass:.3e})"
+                );
             }
         }
     }
@@ -592,6 +839,18 @@ mod tests {
                     "periodic={periodic}, {formulation:?}"
                 );
             }
+
+            // Wet/dry subcells active in the shoreline elements
+            let (mesh, ops, geom, bathymetry) = shoreline_setup(3, periodic, true);
+            let q = shoreline_state(&mesh, &ops, &bathymetry, 1.0);
+            let config = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_formulation(SWEFormulation2D::WetDry)
+                .with_bathymetry(&bathymetry)
+                .with_source_terms(&coriolis);
+            let serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+            let parallel = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, 0.0);
+            assert_eq!(serial.data, parallel.data, "periodic={periodic}, WetDry");
         }
     }
 }
