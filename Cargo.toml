@@ -11,6 +11,10 @@ parallel = ["rayon"]
 netcdf = ["dep:netcdf", "dep:chrono"]
 simd = ["pulp"]
 
+# Native reader for norkyst-client grid parquet (validation ingest).
+# Off by default: pulls the arrow/parquet dependency tree.
+parquet = ["dep:parquet", "dep:arrow"]
+
 # High-performance allocator (can improve performance 5-15%)
 # Use with: cargo build --release --features mimalloc
 mimalloc = ["dep:mimalloc"]
@@ -37,6 +41,10 @@ burn-wgpu = { version = "0.20", optional = true, default-features = false }
 
 # High-performance allocator (alternative to system allocator)
 mimalloc = { version = "0.1", optional = true, default-features = false }
+
+# NorKyst grid parquet ingest (feature = "parquet")
+parquet = { version = "58.0", optional = true }
+arrow = { version = "58.0", optional = true }
 
 # Geographic data I/O
 tiff = "0.9"           # GeoTIFF reading (pure Rust)

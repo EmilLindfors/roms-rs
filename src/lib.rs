@@ -217,6 +217,11 @@ pub use io::{
     GeoTiffError,
     LocalProjection,
     NORWAY_BBOX,
+    // NorKyst text ingest
+    NorKystLevel,
+    NorKystRecord,
+    NorKystTextData,
+    NorKystTextError,
     // Tide gauge I/O
     TideGaugeFile,
     TideGaugeFileError,
@@ -227,8 +232,10 @@ pub use io::{
     constituent_period,
     files_to_observation_map,
     parse_constituents,
+    parse_norkyst_text_str,
     parse_timeseries,
     read_constituent_file,
+    read_norkyst_text_file,
     read_tide_gauge_directory,
     read_tide_gauge_file,
     read_timeseries_file,
@@ -242,6 +249,11 @@ pub use io::{
     FILL_VALUE_F32, FILL_VALUE_F64, ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo,
     NetCDFWriter, NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState, is_valid_f32,
     is_valid_f64,
+};
+#[cfg(feature = "parquet")]
+pub use io::{
+    NorKystGridData, NorKystGridError, NorKystGridRow, read_norkyst_parquet,
+    read_norkyst_parquet_glob,
 };
 
 // Mesh types (additional exports)

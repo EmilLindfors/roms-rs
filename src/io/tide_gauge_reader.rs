@@ -48,6 +48,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
+use super::datetime::parse_datetime_seconds;
 use crate::analysis::{TideGaugeStation, TimeSeries};
 
 /// Error type for tide gauge file operations.
@@ -243,77 +244,24 @@ pub fn read_tide_gauge_file(path: &Path) -> Result<TideGaugeFile, TideGaugeFileE
 ///
 /// Supports:
 /// - Numeric seconds: "3600.0"
-/// - ISO 8601 datetime: "2024-01-01T00:00:00Z" (converted to seconds from epoch)
 /// - Hours: "1.0h" or "1.0H"
+/// - ISO 8601 / RFC3339 datetime: "2024-01-01T00:00:00Z", converted to Unix
+///   seconds by the same exact proleptic-Gregorian parser the NorKyst readers
+///   use, so gauge and model series share one absolute time axis
 fn parse_time_value(s: &str) -> Result<f64, String> {
     let s = s.trim();
 
     // Check for hour suffix
     if s.ends_with('h') || s.ends_with('H') {
-        let num = s.trim_end_matches(|c| c == 'h' || c == 'H');
-        return num
-            .parse::<f64>()
-            .map(|h| h * 3600.0)
-            .map_err(|e| e.to_string());
-    }
-
-    // Try numeric parse first
-    if let Ok(val) = s.parse::<f64>() {
-        return Ok(val);
-    }
-
-    // Try ISO datetime (simplified parsing)
-    // Format: YYYY-MM-DDTHH:MM:SSZ or YYYY-MM-DD HH:MM:SS
-    if s.len() >= 19 && (s.contains('T') || s.contains(' ')) {
-        // Extract components
-        let date_time: Vec<&str> = if s.contains('T') {
-            s.split('T').collect()
-        } else {
-            s.splitn(2, ' ').collect()
+        let num = s.trim_end_matches(['h', 'H']);
+        return match num.parse::<f64>() {
+            Ok(h) if h.is_finite() => Ok(h * 3600.0),
+            Ok(_) => Err(format!("non-finite time {s:?}")),
+            Err(e) => Err(e.to_string()),
         };
-
-        if date_time.len() != 2 {
-            return Err(format!("Invalid datetime format: {}", s));
-        }
-
-        let date_parts: Vec<&str> = date_time[0].split('-').collect();
-        let time_str = date_time[1].trim_end_matches('Z');
-        let time_parts: Vec<&str> = time_str.split(':').collect();
-
-        if date_parts.len() != 3 || time_parts.len() < 2 {
-            return Err(format!("Invalid datetime format: {}", s));
-        }
-
-        let year: i64 = date_parts[0]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let month: i64 = date_parts[1]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let day: i64 = date_parts[2]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let hour: i64 = time_parts[0]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let minute: i64 = time_parts[1]
-            .parse()
-            .map_err(|e: std::num::ParseIntError| e.to_string())?;
-        let second: f64 = if time_parts.len() > 2 {
-            time_parts[2].parse().unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
-        // Simplified conversion to seconds (not accounting for leap years, etc.)
-        // This is relative time, so we just need consistency
-        let days_since_epoch = (year - 1970) * 365 + (month - 1) * 30 + (day - 1);
-        let seconds = days_since_epoch * 86400 + hour * 3600 + minute * 60 + second as i64;
-
-        return Ok(seconds as f64);
     }
 
-    Err(format!("Unable to parse time value: {}", s))
+    parse_datetime_seconds(s).map_err(|e| format!("Unable to parse time value {s:?}: {e}"))
 }
 
 /// Read multiple tide gauge files from a directory.
@@ -423,6 +371,25 @@ mod tests {
         assert!((parse_time_value("0").unwrap() - 0.0).abs() < 1e-10);
         assert!((parse_time_value("1.5h").unwrap() - 5400.0).abs() < 1e-10);
         assert!((parse_time_value("2H").unwrap() - 7200.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_iso_time_is_exact_unix_seconds() {
+        // Regression: the old parser used 365-day years and 30-day months, so
+        // 2024-06-01 came out ~13 days away from the NorKyst readers' value.
+        let expected = 19_875.0 * 86_400.0; // 2024-06-01 00:00:00 UTC
+        let t = parse_time_value("2024-06-01T00:00:00Z").unwrap();
+        assert!((t - expected).abs() < 1e-9, "t = {t}");
+        assert_eq!(
+            t,
+            crate::io::datetime::parse_datetime_seconds("2024-06-01 00:00:00 UTC").unwrap()
+        );
+        // Spacing across a leap day is exact.
+        let feb28 = parse_time_value("2024-02-28T12:00:00Z").unwrap();
+        let mar01 = parse_time_value("2024-03-01T12:00:00Z").unwrap();
+        assert!((mar01 - feb28 - 2.0 * 86_400.0).abs() < 1e-9);
+        assert!(parse_time_value("2024-02-30T00:00:00Z").is_err());
+        assert!(parse_time_value("NaN").is_err());
     }
 
     #[test]
