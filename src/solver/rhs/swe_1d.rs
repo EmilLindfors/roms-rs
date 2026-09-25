@@ -6,7 +6,12 @@
 //! ∂(hu)/∂t + ∂(hu² + gh²/2)/∂x = -gh ∂B/∂x - τ_f
 //!
 //! The DG semi-discrete form is:
-//! dq/dt = -Dr * F(q) / J + LIFT * (F* - F⁻) / J + S(q)
+//! dq/dt = -Dr * F(q) / J + LIFT * (F⁻·n - F*) / J + S(q)
+//!
+//! With hydrostatic reconstruction (Audusse et al. 2004), F* is evaluated on the
+//! reconstructed interface states q*, while F⁻ = F(q⁻) stays the physical flux of
+//! the nodal state (so the surface term telescopes with the volume term and mass
+//! is conserved) and the momentum gets the correction +½g(h*⁻² − h⁻²)·n.
 
 use crate::boundary::{BCContext, SWEBoundaryCondition};
 use crate::equations::{ConservationLaw, ShallowWater1D};
@@ -44,7 +49,14 @@ pub struct SWERhsConfig<'a> {
     pub bathymetry: Option<&'a Bathymetry1D>,
     /// Additional source terms (friction, etc.)
     pub source: Option<&'a dyn SourceTerm>,
-    /// Use well-balanced scheme for bathymetry
+    /// Use well-balanced scheme for bathymetry.
+    ///
+    /// When enabled (the default), the numerical flux is evaluated on Audusse et
+    /// al. (2004) hydrostatically reconstructed interface states and the interior
+    /// side gets the momentum correction ½g(h*² − h²)·n. This balances bathymetry
+    /// *jumps* across element interfaces; the interior flux stays that of the nodal
+    /// state, so mass is conserved exactly. The in-element slope is balanced by the
+    /// built-in volume source −g h ∂B/∂x.
     pub well_balanced: bool,
 }
 
@@ -94,7 +106,7 @@ impl<'a> SWERhsConfig<'a> {
 /// Compute the right-hand side of the SWE DG discretization.
 ///
 /// For dq/dt + dF/dx = S, the DG semi-discrete form is:
-/// dq/dt = -Dr * F(q) / J + LIFT * (F* - F⁻) / J + S
+/// dq/dt = -Dr * F(q) / J + LIFT * (F⁻·n - F*) / J + S
 ///
 /// # Arguments
 /// * `q` - Current solution
@@ -186,7 +198,7 @@ pub fn compute_rhs_swe(
         }
 
         // ============================================
-        // 3. SURFACE TERMS: LIFT * (F* - F⁻) / J
+        // 3. SURFACE TERMS: LIFT * (F⁻·n - F*) / J
         // ============================================
 
         // Left face (local node 0, normal = -1)
@@ -329,7 +341,12 @@ fn get_exterior_bathymetry(
     }
 }
 
-/// Compute flux jump (F* - F⁻) · n at a face.
+/// Compute the surface flux difference F(q⁻)·n − F* at a face.
+///
+/// `F*` is the numerical flux already oriented along the outward normal `n`.
+/// This is the Hesthaven–Warburton strong-form sign: `LIFT` applied to it adds
+/// upwind dissipation, and together with the volume term `−Dr·F` the element
+/// mass rate telescopes to `−[F*]` over the element's faces.
 fn compute_flux_jump(
     q_int: &SWEState,
     q_ext: &SWEState,
@@ -372,12 +389,19 @@ fn compute_flux_jump(
         }
     };
 
-    // Physical flux at interior (using reconstructed state for well-balancing)
-    let f_int = compute_physical_flux(&q_int_star, g, h_min);
-    let f_int_n = SWEState::new(f_int.h * normal, f_int.hu * normal);
+    // Interior flux F(q⁻)·n of the actual nodal state. It must match the volume
+    // term for the surface/volume pair to telescope (SBP); using the reconstructed
+    // state here adds −(h⁻ − h*⁻)u⁻·n to the element mass rate.
+    let f_int = compute_physical_flux(q_int, g, h_min);
+    let diff_h = f_int.h * normal - f_star.h;
+    let mut diff_hu = f_int.hu * normal - f_star.hu;
 
-    // Flux jump
-    (f_star.h - f_int_n.h, f_star.hu - f_int_n.hu)
+    // Well-balancing enters as the Audusse momentum correction ½g(h*⁻² − h⁻²)·n
+    if config.well_balanced {
+        diff_hu += hr.pressure_correction(q_int.h, q_int_star.h, normal).hu;
+    }
+
+    (diff_h, diff_hu)
 }
 
 /// Lax-Friedrichs flux for SWE.
@@ -546,6 +570,179 @@ mod tests {
                     rhs_hu,
                     ki,
                     i
+                );
+            }
+        }
+    }
+
+    /// Periodic 20 km domain with bathymetry B = −200 + 150·sin(2πx/L),
+    /// optionally cell-averaged so that B jumps across every element interface.
+    fn sloped_periodic_setup(
+        order: usize,
+        cell_average: bool,
+    ) -> (Mesh1D, DGOperators1D, Bathymetry1D) {
+        const L: f64 = 20_000.0;
+        let mesh = Mesh1D::uniform_periodic(0.0, L, 16);
+        let ops = DGOperators1D::new(order);
+        let tau = 2.0 * std::f64::consts::PI / L;
+        let mut bathymetry =
+            Bathymetry1D::from_function(&mesh, &ops, |x| -200.0 + 150.0 * (tau * x).sin());
+        if cell_average {
+            // Element mean by GLL quadrature (weights sum to 2); the gradient of a
+            // cell-constant bed is exactly zero.
+            let mut averaged = Bathymetry1D::flat(mesh.n_elements, ops.n_nodes);
+            for ki in 0..mesh.n_elements {
+                let mean = 0.5
+                    * ops
+                        .weights
+                        .iter()
+                        .zip(bathymetry.element(ki))
+                        .map(|(w, b)| w * b)
+                        .sum::<f64>();
+                for i in 0..ops.n_nodes {
+                    averaged.set(ki, i, mean);
+                }
+            }
+            bathymetry = averaged;
+        }
+        (mesh, ops, bathymetry)
+    }
+
+    /// State with free surface η = 0.3 m over `bathymetry` and momentum
+    /// hu = velocity_scale·h·cos(2πx/L).
+    ///
+    /// The velocity is correlated with the bathymetry slope on purpose: a
+    /// uniform velocity hides reconstruction-induced mass errors by symmetry.
+    fn sloped_state(
+        mesh: &Mesh1D,
+        ops: &DGOperators1D,
+        bathymetry: &Bathymetry1D,
+        velocity_scale: f64,
+    ) -> SWESolution {
+        let tau = 2.0 * std::f64::consts::PI / 20_000.0;
+        let mut q = SWESolution::new(mesh.n_elements, ops.n_nodes);
+        for ki in 0..mesh.n_elements {
+            for (i, &r) in ops.nodes.iter().enumerate() {
+                let x = mesh.reference_to_physical(ki, r);
+                let h = 0.3 - bathymetry.get(ki, i);
+                let hu = velocity_scale * h * (tau * x).cos();
+                q.set_state(k(ki), i, SWEState::new(h, hu));
+            }
+        }
+        q
+    }
+
+    const FLUX_TYPES: [SWEFluxType; 3] = [
+        SWEFluxType::Roe,
+        SWEFluxType::Hll,
+        SWEFluxType::LaxFriedrichs,
+    ];
+
+    #[test]
+    fn test_conservation_discontinuous_state_flat_bottom() {
+        // Regression: the surface term was lifted with the wrong sign,
+        // LIFT·(F* − F⁻·n) instead of LIFT·(F⁻·n − F*). Each element's rate then was
+        // 2(F₀ − F_N) + F*_R − F*_L, which only telescopes over the domain when the
+        // state is continuous across interfaces (and the upwind term anti-dissipates).
+        let eq = ShallowWater1D::new(G);
+        let bc = ReflectiveBC::new();
+        const L: f64 = 10.0;
+        let tau = 2.0 * std::f64::consts::PI / L;
+        let mesh = Mesh1D::uniform_periodic(0.0, L, 10);
+
+        for order in 1..=4 {
+            let ops = DGOperators1D::new(order);
+            let mut q = SWESolution::new(mesh.n_elements, ops.n_nodes);
+            for ki in 0..mesh.n_elements {
+                // Element-wise offset: the state jumps at every interface
+                let offset = 0.1 * (ki % 3) as f64;
+                for (i, &r) in ops.nodes.iter().enumerate() {
+                    let x = mesh.reference_to_physical(ki, r);
+                    let h = 2.0 + 0.5 * (tau * x).sin() + offset;
+                    let hu = h * (0.5 * (tau * x).cos() - offset);
+                    q.set_state(k(ki), i, SWEState::new(h, hu));
+                }
+            }
+            let mass = q.integrate_depth(&mesh, &ops);
+
+            for flux_type in FLUX_TYPES {
+                let config = SWERhsConfig::new(&eq, &bc, &bc).with_flux_type(flux_type);
+                let rhs = compute_rhs_swe(&q, &mesh, &ops, &config, 0.0);
+                let mass_rate = rhs.integrate_depth(&mesh, &ops);
+                let momentum_rate = rhs.integrate_momentum(&mesh, &ops);
+
+                assert!(
+                    mass_rate.abs() / mass < 1e-12,
+                    "p={order}, {flux_type:?}: d(mass)/dt / mass = {:.3e}",
+                    mass_rate / mass
+                );
+                // Flat bottom, periodic: momentum is conserved too. The domain
+                // rate is a sum of face fluxes, so compare with the pressure flux ½gh².
+                assert!(
+                    momentum_rate.abs() / (0.5 * G * 2.0 * 2.0) < 1e-12,
+                    "p={order}, {flux_type:?}: d(momentum)/dt = {momentum_rate:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_mass_conservation_hydrostatic_reconstruction_discontinuous_bathymetry() {
+        // Regression: with cell-averaged B the reconstruction is active at every
+        // interface. Evaluating the interior flux on the reconstructed state broke
+        // the SBP telescoping of surface and volume terms and leaked mass.
+        let eq = ShallowWater1D::new(G);
+        let bc = ReflectiveBC::new();
+
+        for order in 1..=4 {
+            for cell_average in [false, true] {
+                let (mesh, ops, bathymetry) = sloped_periodic_setup(order, cell_average);
+                let q = sloped_state(&mesh, &ops, &bathymetry, 1.0);
+                let mass = q.integrate_depth(&mesh, &ops);
+
+                for flux_type in FLUX_TYPES {
+                    let config = SWERhsConfig::new(&eq, &bc, &bc)
+                        .with_bathymetry(&bathymetry)
+                        .with_flux_type(flux_type);
+                    assert!(config.well_balanced);
+
+                    let rhs = compute_rhs_swe(&q, &mesh, &ops, &config, 0.0);
+                    let mass_rate = rhs.integrate_depth(&mesh, &ops);
+
+                    assert!(
+                        mass_rate.abs() / mass < 1e-12,
+                        "p={order}, cell_average={cell_average}, {flux_type:?}: \
+                         d(mass)/dt / mass = {:.3e} (d(mass)/dt = {:.3e} m²/s)",
+                        mass_rate / mass,
+                        mass_rate
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_lake_at_rest_cell_averaged_bathymetry() {
+        // Cell-constant B: zero volume gradient, every bathymetry effect comes from
+        // the hydrostatic interface correction. Must stay balanced to round-off.
+        let eq = ShallowWater1D::new(G);
+        let bc = ReflectiveBC::new();
+
+        for order in 1..=4 {
+            let (mesh, ops, bathymetry) = sloped_periodic_setup(order, true);
+            let q = sloped_state(&mesh, &ops, &bathymetry, 0.0);
+
+            for flux_type in FLUX_TYPES {
+                let config = SWERhsConfig::new(&eq, &bc, &bc)
+                    .with_bathymetry(&bathymetry)
+                    .with_flux_type(flux_type);
+
+                let rhs = compute_rhs_swe(&q, &mesh, &ops, &config, 0.0);
+                let max_rhs = rhs.max_abs();
+                assert!(
+                    max_rhs < 1e-10,
+                    "p={order}, {flux_type:?}: lake at rest over cell-averaged B, \
+                     max RHS = {max_rhs:.3e}"
                 );
             }
         }

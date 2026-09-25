@@ -11,6 +11,7 @@ mod diffusion_2d;
 mod scalar_1d;
 mod swe_1d;
 mod swe_2d;
+mod swe_2d_split_form;
 mod tracer_2d;
 
 // 1D scalar
@@ -28,7 +29,9 @@ pub use advection_2d::{
 };
 
 // 2D SWE
-pub use swe_2d::{SWE2DRhsConfig, compute_dt_swe_2d, compute_dt_viscosity, compute_rhs_swe_2d};
+pub use swe_2d::{
+    SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d, compute_dt_viscosity, compute_rhs_swe_2d,
+};
 #[cfg(all(feature = "parallel", feature = "simd"))]
 pub use swe_2d::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
 

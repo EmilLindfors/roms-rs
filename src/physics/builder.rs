@@ -10,7 +10,7 @@ use crate::flux::StandardFlux2D;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::{
-    Limiter2D, LimiterContext2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
+    Limiter2D, LimiterContext2D, SWEFormulation2D, SWESolution2D, StandardLimiter2D, WetDryConfig,
     apply_wet_dry_correction_all,
 };
 use crate::source::SourceTerm2D;
@@ -51,6 +51,8 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     pub limiter: StandardLimiter2D,
     /// Whether to use well-balanced scheme
     pub well_balanced: bool,
+    /// Spatial formulation of the SWE operator
+    pub formulation: SWEFormulation2D,
     /// Whether to apply wet/dry correction
     pub wet_dry_correction: bool,
     /// Polynomial order
@@ -82,6 +84,7 @@ impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEP
 
         // Build the RHS config
         let mut config = SWE2DRhsConfig::new(&self.equation, &self.bc)
+            .with_formulation(self.formulation)
             .with_flux_type(self.flux.into())
             .with_coriolis(false); // Use source terms instead
 
@@ -171,6 +174,7 @@ pub struct SWEPhysics2DBuilder<BC: SWEBoundaryCondition2D> {
     bathymetry: Option<Arc<Bathymetry2D>>,
     limiter: StandardLimiter2D,
     well_balanced: bool,
+    formulation: SWEFormulation2D,
     wet_dry_correction: bool,
     order: usize,
 }
@@ -196,6 +200,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             bathymetry: None,
             limiter: StandardLimiter2D::default(),
             well_balanced: false,
+            formulation: SWEFormulation2D::default(),
             wet_dry_correction: false,
             order,
         }
@@ -237,6 +242,15 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
         self
     }
 
+    /// Set the spatial formulation of the SWE operator.
+    ///
+    /// The split-form formulations include the bed slope in the operator, so
+    /// the source terms must not contain `BathymetrySource2D`.
+    pub fn with_formulation(mut self, formulation: SWEFormulation2D) -> Self {
+        self.formulation = formulation;
+        self
+    }
+
     /// Enable wet/dry correction.
     pub fn with_wet_dry_correction(mut self, enabled: bool) -> Self {
         self.wet_dry_correction = enabled;
@@ -256,6 +270,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             bathymetry: self.bathymetry,
             limiter: self.limiter,
             well_balanced: self.well_balanced,
+            formulation: self.formulation,
             wet_dry_correction: self.wet_dry_correction,
             order: self.order,
         }
@@ -324,10 +339,12 @@ mod tests {
             .with_flux(StandardFlux2D::HLL)
             .with_limiter(StandardLimiter2D::None)
             .with_well_balanced(true)
+            .with_formulation(SWEFormulation2D::EntropyStable)
             .with_wet_dry_correction(true)
             .build();
 
         assert!(physics.well_balanced);
+        assert_eq!(physics.formulation, SWEFormulation2D::EntropyStable);
         assert!(physics.wet_dry_correction);
     }
 
