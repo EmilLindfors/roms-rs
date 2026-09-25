@@ -72,45 +72,53 @@ impl TidalConstituent {
 
     /// Principal lunar semidiurnal (M2) constituent.
     ///
-    /// Period ≈ 12.42 hours, the dominant tidal constituent in most locations.
+    /// Period 12.4206 h (28.9841042°/h), the dominant tidal constituent in most locations.
     pub fn m2(amplitude: f64, phase: f64) -> Self {
-        Self::new("M2", amplitude, 12.42 * 3600.0, phase)
+        Self::new("M2", amplitude, doodson_period("M2"), phase)
     }
 
     /// Principal solar semidiurnal (S2) constituent.
     ///
-    /// Period = 12 hours exactly.
+    /// Period = 12 hours exactly (30°/h).
     pub fn s2(amplitude: f64, phase: f64) -> Self {
-        Self::new("S2", amplitude, 12.0 * 3600.0, phase)
+        Self::new("S2", amplitude, doodson_period("S2"), phase)
     }
 
     /// Lunar diurnal (K1) constituent.
     ///
-    /// Period ≈ 23.93 hours.
+    /// Period 23.9345 h (15.0410686°/h).
     pub fn k1(amplitude: f64, phase: f64) -> Self {
-        Self::new("K1", amplitude, 23.93 * 3600.0, phase)
+        Self::new("K1", amplitude, doodson_period("K1"), phase)
     }
 
     /// Lunar diurnal (O1) constituent.
     ///
-    /// Period ≈ 25.82 hours.
+    /// Period 25.8193 h (13.9430356°/h).
     pub fn o1(amplitude: f64, phase: f64) -> Self {
-        Self::new("O1", amplitude, 25.82 * 3600.0, phase)
+        Self::new("O1", amplitude, doodson_period("O1"), phase)
     }
 
     /// Larger lunar elliptic semidiurnal (N2) constituent.
     ///
-    /// Period ≈ 12.66 hours.
+    /// Period 12.6583 h (28.4397295°/h).
     pub fn n2(amplitude: f64, phase: f64) -> Self {
-        Self::new("N2", amplitude, 12.66 * 3600.0, phase)
+        Self::new("N2", amplitude, doodson_period("N2"), phase)
     }
 
     /// Lunisolar diurnal (P1) constituent.
     ///
-    /// Period ≈ 24.07 hours.
+    /// Period 24.0659 h (14.9589314°/h).
     pub fn p1(amplitude: f64, phase: f64) -> Self {
-        Self::new("P1", amplitude, 24.07 * 3600.0, phase)
+        Self::new("P1", amplitude, doodson_period("P1"), phase)
     }
+}
+
+/// Exact period (s) of a named constituent from its Doodson angular speed.
+///
+/// Rounded periods are not good enough for harmonic work: 12.42 h for M2
+/// accumulates ≈ 1° of phase error over 60 days and ≈ 6° over a year.
+fn doodson_period(name: &str) -> f64 {
+    crate::tides::constituent_period(name).expect("constituent is in the tides catalogue")
 }
 
 /// Tidal boundary condition.
@@ -500,13 +508,29 @@ mod tests {
         assert!((corrected.phase - raw.phase).abs() < TOL);
     }
 
+    /// Regression: each named constructor must carry the exact period
+    /// 360°/speed of its tabulated Doodson angular speed (Schureman 1958),
+    /// not a two-decimal rounding of it (M2 was 12.42 h instead of
+    /// 12.4206 h, which drifts the phase by ~6° over a year).
     #[test]
-    fn test_m2_period() {
-        let m2 = TidalConstituent::m2(1.0, 0.0);
-
-        // M2 period is about 12.42 hours
-        let expected_period = 12.42 * 3600.0;
-        assert!((m2.period - expected_period).abs() < 1.0);
+    fn test_constructor_periods_match_doodson_speeds() {
+        // (constituent, tabulated speed in °/h)
+        let cases = [
+            (TidalConstituent::m2(1.0, 0.0), 28.984_104_2),
+            (TidalConstituent::s2(1.0, 0.0), 30.0),
+            (TidalConstituent::n2(1.0, 0.0), 28.439_729_5),
+            (TidalConstituent::k1(1.0, 0.0), 15.041_068_6),
+            (TidalConstituent::o1(1.0, 0.0), 13.943_035_6),
+            (TidalConstituent::p1(1.0, 0.0), 14.958_931_4),
+        ];
+        for (c, speed_deg_per_hour) in cases {
+            let speed = c.angular_frequency().to_degrees() * 3600.0;
+            assert!(
+                (speed - speed_deg_per_hour).abs() < 1e-6,
+                "{}: speed {speed} °/h vs tabulated {speed_deg_per_hour} °/h",
+                c.name
+            );
+        }
     }
 
     #[test]

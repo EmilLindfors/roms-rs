@@ -652,6 +652,61 @@ mod tests {
         assert!((r.phase - 1.2).abs() < TOL);
     }
 
+    /// Regression: the analysis templates must sit at the true constituent
+    /// frequencies. Synthesize a tide at the tabulated Doodson angular speeds
+    /// (Schureman 1958; literal values, independent of the crate's
+    /// constructors) and require every fitted phase within 0.1°. The previously
+    /// rounded periods (M2 12.42 h, K1 23.93 h, …) mis-phased the fit by
+    /// degrees: −3.5° for P1 on 60 days, −12.3° for K1 on a year.
+    #[test]
+    fn test_fit_recovers_phase_at_true_frequencies() {
+        // (name, angular speed °/h, amplitude m, phase rad)
+        let truth: [(&str, f64, f64, f64); 6] = [
+            ("M2", 28.984_104_2, 1.00, 0.3),
+            ("S2", 30.0, 0.35, 1.1),
+            ("N2", 28.439_729_5, 0.20, 2.0),
+            ("K1", 15.041_068_6, 0.12, 4.0),
+            ("O1", 13.943_035_6, 0.08, 5.2),
+            ("P1", 14.958_931_4, 0.04, 0.7),
+        ];
+        let synthesize = |n_days: usize, names: &[&str]| {
+            let times: Vec<f64> = (0..n_days * 24).map(|i| i as f64 * 3600.0).collect();
+            let values: Vec<f64> = times
+                .iter()
+                .map(|&t| {
+                    truth
+                        .iter()
+                        .filter(|c| names.contains(&c.0))
+                        .map(|&(_, speed, amp, phase)| {
+                            amp * (speed.to_radians() / 3600.0 * t + phase).cos()
+                        })
+                        .sum()
+                })
+                .collect();
+            make_test_series(&times, &values)
+        };
+
+        for (analysis, n_days) in [
+            (HarmonicAnalysis::norwegian_coast(), 60),
+            (HarmonicAnalysis::standard(), 365),
+        ] {
+            let result = analysis.fit(&synthesize(n_days, &analysis.names()));
+            for &(name, _, amp, phase) in truth.iter().filter(|c| analysis.names().contains(&c.0)) {
+                let fitted = result.get_constituent(name).unwrap();
+                let phase_err_deg = angle_diff(fitted.phase, phase).to_degrees();
+                assert!(
+                    phase_err_deg.abs() < 0.1,
+                    "{name} ({n_days} d): phase error {phase_err_deg:.3}°"
+                );
+                assert!(
+                    (fitted.amplitude - amp).abs() < 1e-3 * amp,
+                    "{name} ({n_days} d): amplitude {} vs {amp}",
+                    fitted.amplitude
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_phase_wrap() {
         // Test that phase is always in [0, 2π)

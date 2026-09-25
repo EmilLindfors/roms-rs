@@ -43,7 +43,9 @@
 //! Each constituent's equilibrium argument is the Doodson combination
 //! `V₀ = c_τ τ + c_s s + c_h h + c_p p + c_p₁ p₁ + offset`, and its nodal factors
 //! `f`, `u` are the Schureman (1958) closed-form approximations in the node
-//! longitude `N`.
+//! longitude `N`. The constituent's angular speed is the time derivative of the
+//! same combination, `ω = c_τ τ′ + c_s s′ + …` ([`angular_speed`],
+//! [`constituent_period`]), so `ω t` and `V₀` advance consistently.
 //!
 //! # References
 //!
@@ -56,6 +58,21 @@
 use std::f64::consts::PI;
 
 const DEG_TO_RAD: f64 = PI / 180.0;
+
+// Secular (linear) rates of Meeus' fundamental arguments, degrees per Julian
+// century. Shared by `AstronomicalArguments::at_julian_date` and the constituent
+// speeds so that ω t advances at the same rate as V₀.
+/// Moon mean longitude `L′` (Meeus 47.1).
+const S_PER_CENTURY: f64 = 481_267.881_234_21;
+/// Sun mean longitude `L₀` (Meeus 25.2).
+const H_PER_CENTURY: f64 = 36_000.769_827_79;
+/// Moon mean anomaly `M′` (Meeus 47.4).
+const MP_PER_CENTURY: f64 = 477_198.867_505_5;
+/// Sun mean anomaly `M` (Meeus 47.3).
+const M_PER_CENTURY: f64 = 35_999.050_290_9;
+
+/// Mean solar hours per Julian century.
+const HOURS_PER_CENTURY: f64 = 36_525.0 * 24.0;
 
 /// Wrap an angle in degrees to `[0, 360)`.
 #[inline]
@@ -99,15 +116,15 @@ impl AstronomicalArguments {
         let t4 = t3 * t;
 
         // Meeus (47.1): Moon mean longitude L′.
-        let s = 218.316_447_7 + 481_267.881_234_21 * t - 0.001_578_6 * t2 + t3 / 538_841.0
+        let s = 218.316_447_7 + S_PER_CENTURY * t - 0.001_578_6 * t2 + t3 / 538_841.0
             - t4 / 65_194_000.0;
         // Meeus (25.2): Sun mean longitude L₀.
-        let h = 280.466_456_7 + 36_000.769_827_79 * t + 0.000_303_2 * t2;
+        let h = 280.466_456_7 + H_PER_CENTURY * t + 0.000_303_2 * t2;
         // Meeus (47.4): Moon mean anomaly M′.
-        let mp = 134.963_396_4 + 477_198.867_505_5 * t + 0.008_741_4 * t2 + t3 / 69_699.0
+        let mp = 134.963_396_4 + MP_PER_CENTURY * t + 0.008_741_4 * t2 + t3 / 69_699.0
             - t4 / 14_712_000.0;
         // Meeus (47.3): Sun mean anomaly M.
-        let m = 357.529_109_2 + 35_999.050_290_9 * t - 0.000_153_6 * t2 + t3 / 24_490_000.0;
+        let m = 357.529_109_2 + M_PER_CENTURY * t - 0.000_153_6 * t2 + t3 / 24_490_000.0;
         // Meeus (47.7): longitude of the ascending node Ω.
         let node = 125.044_547_9 - 1_934.136_289_1 * t + 0.002_075_4 * t2 + t3 / 467_441.0
             - t4 / 60_616_000.0;
@@ -224,6 +241,18 @@ impl Doodson {
                 + self.c_p1 * a.p1
                 + self.offset,
         )
+    }
+
+    /// Angular speed `dV₀/dt` in degrees per mean solar hour, from the secular
+    /// rates of the mean longitudes (`τ = 15°·H_UT + h − s`, so `τ′ = 15 + h′ − s′`).
+    #[inline]
+    fn speed_deg_per_hour(&self) -> f64 {
+        let s = S_PER_CENTURY / HOURS_PER_CENTURY;
+        let h = H_PER_CENTURY / HOURS_PER_CENTURY;
+        let p = (S_PER_CENTURY - MP_PER_CENTURY) / HOURS_PER_CENTURY;
+        let p1 = (H_PER_CENTURY - M_PER_CENTURY) / HOURS_PER_CENTURY;
+        let tau = 15.0 + h - s;
+        self.c_tau * tau + self.c_s * s + self.c_h * h + self.c_p * p + self.c_p1 * p1
     }
 }
 
@@ -407,6 +436,24 @@ pub fn nodal_correction(name: &str, astro: &AstronomicalArguments) -> Option<Nod
     })
 }
 
+/// Angular speed of a named constituent in degrees per mean solar hour.
+///
+/// Derived from the constituent's Doodson argument and the secular rates of the
+/// mean longitudes, i.e. the rate at which its `V₀` advances; agrees with the
+/// tabulated speeds of Schureman (1958) to < 10⁻⁷ °/h (M2 28.9841042°/h,
+/// K1 15.0410686°/h, …). Names and support as for [`nodal_correction`].
+pub fn angular_speed(name: &str) -> Option<f64> {
+    constituent_def(name).map(|def| def.doodson.speed_deg_per_hour())
+}
+
+/// Period of a named constituent in seconds, `360° / speed`.
+///
+/// See [`angular_speed`]. Use this — never a rounded period — for anything
+/// that accumulates phase over a record: a 12.42 h M2 drifts ≈ 6° per year.
+pub fn constituent_period(name: &str) -> Option<f64> {
+    angular_speed(name).map(|speed| 360.0 / speed * 3600.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +533,42 @@ mod tests {
                 "{name}: recovered period {recovered_period} h vs {period_hours} h",
             );
         }
+    }
+
+    /// Constituent speeds match the tabulated Doodson/Schureman (1958) speeds
+    /// (as published by NOAA CO-OPS), and periods are `360°/speed`.
+    #[test]
+    fn angular_speeds_match_tabulated_values() {
+        // (name, tabulated speed in °/h)
+        let cases = [
+            ("M2", 28.984_104_2),
+            ("S2", 30.0),
+            ("N2", 28.439_729_5),
+            ("K2", 30.082_137_3),
+            ("K1", 15.041_068_6),
+            ("O1", 13.943_035_6),
+            ("P1", 14.958_931_4),
+            ("Q1", 13.398_660_9),
+            ("M4", 57.968_208_4),
+            ("MS4", 58.984_104_2),
+            ("MN4", 57.423_833_7),
+            ("M6", 86.952_312_7),
+            ("Mf", 1.098_033_1),
+            ("Mm", 0.544_374_7),
+            ("Ssa", 0.082_137_3),
+        ];
+        for (name, tabulated) in cases {
+            let speed = angular_speed(name).unwrap();
+            assert!(
+                (speed - tabulated).abs() < 1e-6,
+                "{name}: {speed} °/h vs tabulated {tabulated} °/h"
+            );
+            let period = constituent_period(name).unwrap();
+            assert!((period * speed - 360.0 * 3600.0).abs() < 1e-6);
+        }
+        // S2 is exactly two solar cycles per day.
+        assert!((constituent_period("S2").unwrap() - 12.0 * 3600.0).abs() < 1e-9);
+        assert!(angular_speed("XYZ").is_none());
     }
 
     /// S2 is pure solar semidiurnal: V₀ = 30°·H_UT, so it vanishes at UT midnight.

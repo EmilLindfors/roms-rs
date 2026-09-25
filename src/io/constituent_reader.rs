@@ -134,6 +134,8 @@ impl Default for ConstituentData {
 /// Standard tidal constituent periods in seconds.
 ///
 /// Returns the period for common tidal constituents, or None if unknown.
+/// Periods are exact (`360° / speed` of the Doodson angular speed), delegated
+/// to [`crate::tides::constituent_period`].
 ///
 /// # Supported Constituents
 ///
@@ -153,36 +155,14 @@ impl Default for ConstituentData {
 /// - M4: Principal lunar shallow water (6.21 h)
 /// - MS4: Luni-solar shallow water (6.10 h)
 /// - MN4: Lunar shallow water (6.27 h)
+/// - M6: Lunar shallow water (4.14 h)
+///
+/// ## Long period
+/// - Mf: Lunar fortnightly (13.66 d)
+/// - Mm: Lunar monthly (27.55 d)
+/// - Ssa: Solar semiannual (182.6 d)
 pub fn constituent_period(name: &str) -> Option<f64> {
-    // Periods in hours, converted to seconds
-    let hours_to_seconds = 3600.0;
-
-    match name.to_uppercase().as_str() {
-        // Semidiurnal constituents
-        "M2" => Some(12.4206012 * hours_to_seconds),
-        "S2" => Some(12.0 * hours_to_seconds),
-        "N2" => Some(12.6583482 * hours_to_seconds),
-        "K2" => Some(11.9672348 * hours_to_seconds),
-
-        // Diurnal constituents
-        "K1" => Some(23.9344697 * hours_to_seconds),
-        "O1" => Some(25.8193417 * hours_to_seconds),
-        "P1" => Some(24.0658902 * hours_to_seconds),
-        "Q1" => Some(26.8683567 * hours_to_seconds),
-
-        // Shallow water (overtides)
-        "M4" => Some(6.2103006 * hours_to_seconds),
-        "MS4" => Some(6.1033392 * hours_to_seconds),
-        "MN4" => Some(6.2691739 * hours_to_seconds),
-        "M6" => Some(4.1402004 * hours_to_seconds),
-
-        // Long period
-        "MF" => Some(327.8599387 * hours_to_seconds),
-        "MM" => Some(661.3111655 * hours_to_seconds),
-        "SSA" => Some(4382.9052083 * hours_to_seconds),
-
-        _ => None,
-    }
+    crate::tides::constituent_period(name)
 }
 
 /// Read a tidal constituent file.
