@@ -45,7 +45,10 @@ where
     pub forcing: Forcing,
     pub g: f64,
     pub rho0: f64,
+    /// Temperature BC. Not consulted yet: every physical boundary is a closed
+    /// wall in 3D (see `TracerBoundaryCondition3D`).
     pub temp_bc: Arc<dyn TracerBoundaryCondition3D>,
+    /// Salinity BC. Not consulted yet (see `temp_bc`).
     pub salt_bc: Arc<dyn TracerBoundaryCondition3D>,
     pub tracer_limiter: TracerLimiter3DConfig,
     pub w_scratch: Mutex<Vec<f64>>,

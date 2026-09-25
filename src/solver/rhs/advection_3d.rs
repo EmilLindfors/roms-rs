@@ -28,6 +28,13 @@ pub struct TracerBCContext3D {
 }
 
 /// Boundary condition for scalar 3D tracer concentrations.
+///
+/// Currently **not consulted** by [`apply_tracer_advection_3d`]: the 3D layer
+/// has no open boundaries yet. The volume flux Ω (`compute_vertical_velocity`)
+/// and momentum treat every physical boundary as a free-slip wall, and the
+/// tracer flux must match the volume flux (zero), or heat and salt would cross
+/// a boundary that water cannot. Implementations will be used again once 3D
+/// open boundaries carry a volume flux (TODO P1.4/P4).
 pub trait TracerBoundaryCondition3D: Send + Sync {
     fn exterior_value(&self, ctx: &TracerBCContext3D) -> f64;
 }
@@ -358,7 +365,9 @@ fn apply_horizontal_surface_terms(
 /// * `geom`: Geometric factors
 /// * `bathymetry`: Bed elevation field
 /// * `sigma`: Vertical grid
-/// * `bc`: Boundary condition for scalar tracer concentration
+/// * `_bc`: Boundary condition for scalar tracer concentration. Not consulted
+///   yet: the 3D layer closes every physical boundary (see
+///   [`TracerBoundaryCondition3D`]).
 pub fn apply_tracer_advection_3d(
     rhs_tracer: &mut [f64],
     tracer: &[f64],
@@ -368,7 +377,7 @@ pub fn apply_tracer_advection_3d(
     geom: &GeometricFactors2D,
     bathymetry: &Bathymetry2D,
     sigma: &SigmaGrid,
-    bc: &dyn TracerBoundaryCondition3D,
+    _bc: &dyn TracerBoundaryCondition3D,
 ) {
     let n_levels = state.n_levels;
     let n_nodes = ops.n_nodes;
@@ -472,21 +481,17 @@ pub fn apply_tracer_advection_3d(
                         hz_ext[i] = layer_thickness(state, bathymetry, nb_idx, ni, d_sigma[l]);
                     }
                 } else {
-                    let boundary_tag = mesh.boundary_tag(el_idx, face);
+                    // Physical boundary: closed wall, as for the mass flux (Ω)
+                    // and momentum. Mirroring the normal velocity and keeping the
+                    // interior tracer and Hz makes the Rusanov flux exactly zero,
+                    // so tracer inventory cannot cross the coastline while the
+                    // volume flux is zero. A ghost value from `bc` would still
+                    // leak through the dissipation term.
                     for i in 0..n_face_nodes {
-                        let un = u_int[i] * normal.0 + v_int[i] * normal.1;
-                        let ctx = TracerBCContext3D {
-                            element: k,
-                            face,
-                            level: l,
-                            face_node: i,
-                            boundary_tag,
-                            interior_value: phi_int[i],
-                            normal_velocity: un,
-                        };
-                        phi_ext[i] = bc.exterior_value(&ctx);
-                        u_ext[i] = u_int[i];
-                        v_ext[i] = v_int[i];
+                        (u_ext[i], v_ext[i]) = crate::boundary::reflect_velocity(
+                            u_int[i], v_int[i], normal.0, normal.1,
+                        );
+                        phi_ext[i] = phi_int[i];
                         hz_ext[i] = hz_int[i];
                     }
                 }
@@ -810,6 +815,89 @@ mod tests {
         assert_close(bc.exterior_value(&ctx), 8.0);
     }
 
+    /// d/dt ∫ Σ_l Hz φ dA for a tracer tendency `rhs` (GLL quadrature).
+    fn inventory_tendency(
+        rhs: &[f64],
+        state: &Solution3D,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+    ) -> f64 {
+        let mut total = 0.0;
+        for k in 0..mesh.n_elements {
+            let el_idx = ElementIndex::new(k);
+            for i in 0..ops.n_nodes {
+                for level in 0..sigma.n_levels() {
+                    let idx = (k * ops.n_nodes + i) * sigma.n_levels() + level;
+                    let hz = layer_thickness(state, bathymetry, el_idx, i, sigma.d_sigma()[level]);
+                    total += ops.weights[i] * geom.det_j[k] * hz * rhs[idx];
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn horizontal_tracer_advection_closed_basin_conserves_inventory() {
+        // P0.22 regression: at physical boundaries the tracer kernel used the
+        // interior velocity (transmissive) and the BC's exterior value, so heat
+        // and salt crossed the coastline while Ω and momentum saw a wall. With
+        // flow into the walls and a fixed exterior value unlike the interior,
+        // the inventory changed at O(1) of the advective scale.
+        let mesh = Mesh2D::uniform_rectangle(0.0, 2000.0, 0.0, 1000.0, 4, 2);
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let sigma = SigmaGrid::uniform(3);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -20.0 - 0.01 * x);
+
+        let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, sigma.n_levels());
+        state.eta.fill(0.3);
+        let mut scale = 0.0;
+        for k in 0..mesh.n_elements {
+            let el_idx = ElementIndex::new(k);
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(el_idx, ops.nodes_r[i], ops.nodes_s[i]);
+                for level in 0..sigma.n_levels() {
+                    let idx = (k * ops.n_nodes + i) * sigma.n_levels() + level;
+                    state.u[idx] = 0.4 + 0.1 * level as f64;
+                    state.v[idx] = -0.2;
+                    state.salt[idx] = 30.0 + 1e-3 * x - 2e-3 * y + level as f64;
+                    let hz =
+                        layer_thickness(&state, &bathymetry, el_idx, i, sigma.d_sigma()[level]);
+                    scale += ops.weights[i] * geom.det_j[k] * hz * state.salt[idx] * 0.5 / 1000.0;
+                }
+            }
+        }
+
+        let bcs: [&dyn TracerBoundaryCondition3D; 3] = [
+            &ExtrapolationTracerBC3D,
+            &FixedTracerBC3D::new(5.0),
+            &UpwindTracerBC3D::new(5.0),
+        ];
+        for bc in bcs {
+            let mut rhs = vec![0.0; state.salt.len()];
+            apply_tracer_advection_3d(
+                &mut rhs,
+                &state.salt,
+                &state,
+                &mesh,
+                &ops,
+                &geom,
+                &bathymetry,
+                &sigma,
+                bc,
+            );
+            let tendency =
+                inventory_tendency(&rhs, &state, &mesh, &ops, &geom, &bathymetry, &sigma);
+            assert!(
+                tendency.abs() < 1e-12 * scale,
+                "closed-basin inventory tendency {tendency:.3e} (advective scale {scale:.3e})"
+            );
+        }
+    }
+
     #[test]
     fn horizontal_tracer_advection_conserves_total_inventory_on_periodic_mesh() {
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 2, 1);
@@ -848,18 +936,8 @@ mod tests {
             &bc,
         );
 
-        let mut total_inventory_tendency = 0.0;
-        for k in 0..mesh.n_elements {
-            let el_idx = ElementIndex::new(k);
-            for i in 0..ops.n_nodes {
-                for level in 0..sigma.n_levels() {
-                    let idx = (k * ops.n_nodes + i) * sigma.n_levels() + level;
-                    let hz =
-                        layer_thickness(&state, &bathymetry, el_idx, i, sigma.d_sigma()[level]);
-                    total_inventory_tendency += ops.weights[i] * geom.det_j[k] * hz * rhs[idx];
-                }
-            }
-        }
+        let total_inventory_tendency =
+            inventory_tendency(&rhs, &state, &mesh, &ops, &geom, &bathymetry, &sigma);
 
         assert!(
             total_inventory_tendency.abs() < 1e-10,

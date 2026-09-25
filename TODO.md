@@ -93,8 +93,10 @@ All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Ea
 - [ ] `compute_dt_swe_2d` (`swe_2d.rs:582-602`, parallel `:620-650`) pairs the global minimum element size with the global maximum wave speed. Use min over elements of hₖ/λₖ with a direction-aware (anisotropic) length.
 - [ ] `froya_real_data.rs:163` uses CFL = 0.1 where ~0.5 is stable (5× cost). Also respect the DGSEM positivity bound for wet/dry runs (CFL ≤ 0.75/0.42/0.29/0.23 for N = 1–4 in current units).
 
-### P0.22 3D tracer flux leaks through coastal walls (MAJOR, 3D; P0.7 follow-up)
-- [ ] The tracer kernel sets `u_ext = u_int` at physical boundaries (`advection_3d.rs:489-491`), so heat and salt cross the coastline while the mass flux is zero. Use `boundary::reflect_velocity` as for Ω and momentum.
+### P0.22 3D tracer flux leaks through coastal walls (MAJOR, 3D; P0.7 follow-up) — FIXED
+- [x] The tracer kernel sets `u_ext = u_int` at physical boundaries (`advection_3d.rs:489-491`), so heat and salt cross the coastline while the mass flux is zero. Use `boundary::reflect_velocity` as for Ω and momentum.
+  - Done: reflected velocity **and** the interior tracer/Hz at the ghost, so the Rusanov tracer flux is exactly zero like the volume flux (a ghost value from the BC would still leak through the dissipation term). Test: `horizontal_tracer_advection_closed_basin_conserves_inventory` (was −0.39 of the advective scale).
+  - Consequence: `TracerBoundaryCondition3D` (`Hydrostatic3D::temp_bc/salt_bc`) is no longer consulted. It comes back with 3D open boundaries (P4.2).
 
 ### P0.11 Burn GPU RHS is physically wrong (BLOCKER, GPU) — DEFERRED
 Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now (burn-cuda is the stated GPU target).
@@ -255,6 +257,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2; η advanced by the divergence of the same flux.
 - [x] Ω stored at w-points (not layer centres re-averaged to faces) — done in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
 - [ ] Assert Ω(0) = 0 instead of forcing it with the linear correction.
+- [ ] One 3D face-state helper for physical boundaries shared by the Ω, momentum and tracer kernels (today each has its own copy of the wall logic; P0.7/P0.22 were the same bug found twice). It should take the boundary tag, so 3D open boundaries (volume flux from the 2D OBC / nesting, tracer from `TracerBoundaryCondition3D` on inflow) are added in one place for all three.
 - [ ] Step Hz·C and Hz·u (inventory form), then divide by the new Hz. Today a 1 m tide over 20 m of water pumps salinity by about ±1.7 psu.
 
 ### P4.3 Pressure gradient and vertical grid
@@ -277,6 +280,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] EOS: delegate the physics trait to the fixed UNESCO EOS (P0.17) with a linear fast path; TEOS-10 later.
 - [ ] `compute_dt`: internal-wave speed from stratification (not a hardcoded 2 m/s) and the vertical CFL. Relabel or convert Ω vs w in output.
 - [ ] Parallelise the 3D kernels; no `Vec` allocation in inner loops (~186M malloc/free per 3D RHS at 50k × 30).
+  - E.g. `apply_tracer_advection_3d` allocates five `Vec`s per face per level and recomputes `layer_thickness` for every node in the lift loop of every face; hoist both (Hz per element-level once, face buffers in a workspace).
 
 ### P4.6 3D validation (before any NorKyst 3D comparison)
 - [ ] Stratified lake-at-rest: linear N² ≤ 1e-12; tanh pycnocline over a seamount (Beckmann & Haidvogel 1993).
