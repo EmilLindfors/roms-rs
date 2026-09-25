@@ -338,7 +338,7 @@ fn main() {
     //   let builder = TidalSimulationBuilder::closed_basin_stable(amp, h0, sponge_width);
     //   let bc = builder.build_bc();
     let wall_bc = Reflective2D::new();
-    let radiation_bc = Radiation2D::new(h0);
+    let radiation_bc = Radiation2D::still_water();
 
     let tidal_bc = HarmonicTidal2D::new(vec![
         TidalConstituent::m2(avg_m2_amp * amp_scale, avg_m2_phase.to_radians()),
