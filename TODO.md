@@ -6,9 +6,9 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `REVIEW.md`
 - **What is solid:** the DG core (GLL operators, strong-form DGSEM, Roe/HLL, SSP-RK3, SoA/rayon), the tidal astronomy module, and the NorKyst ingest readers. 1,024 lib + 61 integration + 59 doctests pass (`--no-default-features --features parallel,simd`).
 - **What the tests don't cover:** the suite runs in under 2 s, and the physics tests only exercise easy configurations.
 - **What the review found broken:**
-  - Realistic bathymetry is not well-balanced: metre-per-second spurious currents within an hour.
-  - The cell-average workaround leaks mass.
-  - Flather-type open boundaries reflect about 1/3 of outgoing waves.
+  - Realistic bathymetry is not well-balanced: metre-per-second spurious currents within an hour. (Since fixed opt-in by the split-form DGSEM, P1.2.)
+  - The cell-average workaround leaks mass. (Since fixed, P0.13.)
+  - Flather-type open boundaries reflect about 1/3 of outgoing waves. (Since fixed, P0.12.)
   - Coastline-fitted meshes cannot be loaded.
   - Mode splitting is first-order and damps the barotropic mode.
   - The 3D layer is scaffolding with three blocker-level math errors.
@@ -29,8 +29,7 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
 1. **Priority 0 (2026-09-25): confirmed small bugs.**
    - Each needs a regression test that fails before the fix.
    - Review and merge [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2), which covers P0.15–P0.18 (tidal periods, 3D vertical advection ÷Hz with Ω at w-points, EOS units, Chezy units).
-   - Then: P0.12 Flather double application → P0.13 reconstruction mass leak (+ P0.14 docs) → P0.21 time step → the rest.
-   - Suggested-task prompts for P0.12 and P0.13/14 were drafted in the review session.
+   - P0.12 (Flather) and P0.13 (reconstruction mass leak) are fixed. Then: the rest of P0.14 (`linearize` doc) → P0.21 time step → the rest.
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
 4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit once P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) merges: it used the truncated periods.
@@ -43,23 +42,23 @@ Build note: default features need the `roms-rs` conda env (`conda activate roms-
 
 All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Each is small. Each needs a regression test that would have caught it.
 
-### P0.12 Flather characteristic relation applied twice (BLOCKER, open boundaries)
-- [ ] **The bug.** Ghost normal velocity is set to `un_ext + √(g/h)(η_int − η_ext)`, and the Riemann solver then applies the characteristic relation again.
+### P0.12 Flather characteristic relation applied twice (BLOCKER, open boundaries) — FIXED: [PR #4](https://github.com/EmilLindfors/roms-rs/pull/4)
+- [x] **The bug.** Ghost normal velocity is set to `un_ext + √(g/h)(η_int − η_ext)`, and the Riemann solver then applies the characteristic relation again.
   - Result: reflection coefficient ≈ −1/3; a forced tide arrives at ≈ 0.65 amplitude; −0.57 reflection for the `ChapmanFlather2D` defaults.
   - Affected: `Flather2D`, `HarmonicFlather2D` (`boundary_2d.rs:381,821`), `TSTOBC2D` (`tst_obc.rs:347`), `NestingBC2D` (`nesting_bc.rs:189`), `OceanNestingBC2D` (`ocean_nesting.rs:218`), `ChapmanFlather2D` (`chapman.rs:278`).
-- [ ] **Fix.** Ghost = external state (η_ext, u_ext) and let the upwind flux impose Flather. `OceanNestingBC2D::with_flather(false)` is already correct.
-- [ ] **Tests.** Outgoing-pulse reflection < 1 %; delivered progressive-tide amplitude ≥ 0.95.
+- [x] **Fix.** Ghost = external state (η_ext, u_ext) and let the upwind flux impose Flather. `OceanNestingBC2D::with_flather(false)` is already correct.
+- [x] **Tests.** Outgoing-pulse reflection < 1 %; delivered progressive-tide amplitude ≥ 0.95. (`tests/open_boundary_flather_test.rs`: reflection < 1e-5, amplitude 0.997–1.001.)
 
-### P0.13 Hydrostatic reconstruction leaks mass when B jumps across faces (BLOCKER, 2D)
-- [ ] **The bug.** `f_int = normal_flux(&q_int_flux)` uses the *reconstructed* state (`swe_2d.rs:494`, parallel `:1021`). Measured: relative mass change −5.5e-5 per second with cell-averaged B and slope-correlated flow; ~1e-20 with continuous B.
+### P0.13 Hydrostatic reconstruction leaks mass when B jumps across faces (BLOCKER, 2D) — FIXED (2D and 1D, [PR #6](https://github.com/EmilLindfors/roms-rs/pull/6))
+- [x] **The bug.** `f_int = normal_flux(&q_int_flux)` uses the *reconstructed* state (`swe_2d.rs:494`, parallel `:1021`). Measured: relative mass change −5.5e-5 per second with cell-averaged B and slope-correlated flow; ~1e-20 with continuous B.
   - Active in `froya_real_data` (`to_cell_average` + `with_well_balanced(true)`).
-- [ ] **Fix.** Use `normal_flux(&q_int)`, keep F* from the reconstructed states, and add ½g(h*⁻² − h⁻²)n to the momentum components only (DG Audusse / Xing–Shu). Apply identically in serial and parallel.
-- [ ] **Tests.**
+- [x] **Fix.** Use `normal_flux(&q_int)`, keep F* from the reconstructed states, and add ½g(h*⁻² − h⁻²)n to the momentum components only (DG Audusse / Xing–Shu). Apply identically in serial and parallel.
+- [x] **Tests.**
   - A periodic mass-rate test with cell-averaged B and u ∝ cos·cos (a uniform u hides the bug by symmetry).
   - Lake-at-rest with cell-averaged B, serial and parallel.
 
 ### P0.14 Documentation directs users to the unbalanced configuration (MAJOR, 2D)
-- [ ] The `SWE2DRhsConfig::well_balanced` / `with_well_balanced` docs (`swe_2d.rs:50-53,142-153`) say to omit `BathymetrySource2D`. Doing so gives ≈ 0.6 m/s² lake-at-rest residuals with nodal B. The advice holds only for cell-constant B.
+- [x] The `SWE2DRhsConfig::well_balanced` / `with_well_balanced` docs (`swe_2d.rs:50-53,142-153`) say to omit `BathymetrySource2D`. Doing so gives ≈ 0.6 m/s² lake-at-rest residuals with nodal B. The advice holds only for cell-constant B.
 - [ ] The `Bathymetry2D::linearize()` doc says "linear B is well-balanced", which is false at p = 1 (0.07 m/s² measured).
 
 ### P0.15 Truncated tidal constituent periods (MAJOR, tides/analysis) — IN REVIEW: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
@@ -113,7 +112,9 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Route the `Simulation`/`SWEPhysics2D` path through the parallel kernel (`builder.rs:99`).
 
 ### P1.2 Well-balanced, entropy-stable, positivity-preserving DGSEM
-- [ ] Flux-differencing volume term with the Wintermeyer et al. (2017) two-point flux and the g·hᵢ(DB)ᵢ term. It is exactly well-balanced for any nodal B (including face-discontinuous B), conservative, and fixes GLL aliasing.
+- [x] Flux-differencing volume term with the Wintermeyer et al. (2017) two-point flux and the g·hᵢ(DB)ᵢ term. It is exactly well-balanced for any nodal B (including face-discontinuous B), conservative, and fixes GLL aliasing.
+  - Done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)): opt-in via `SWEFormulation2D::EntropyStable` (`EntropyConservative` for verification). Exact mass conservation, entropy conserved/dissipated to round-off, P2/P3 convergence 3.06/4.00 on a nonlinear manufactured solution with bathymetry.
+  - Follow-up: switch `examples/froya_real_data.rs` from cell-averaged B to nodal B + split form.
 - [ ] Wet/dry and positivity per Wintermeyer et al. (2018). Zhang–Shu towards h ≥ 0 (not h_min). Velocity desingularization (Kurganov–Petrova).
 - [ ] Limit η (and velocities or characteristic variables), not h, with a troubled-cell indicator (TVB-M/KXRCF). Limit h only in partially dry cells (Vater et al. 2019).
   - Today, strict Kuzmin on h with cell-average B collapses sloping elements to P0 on every flood/ebb half-cycle.
@@ -318,7 +319,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] IMEX time stepping via diffsol (implicit vertical diffusion / free surface; see P2.5).
 - [ ] Subcell positivity preservation with convex limiting (Wu et al. 2024).
 - [ ] hp-adaptive mesh refinement.
-- Entropy-stable DG, sum factorisation and curved elements are now in P1.2, P2.2 and P1.3.
+- Entropy-stable DG (split form done, see P1.2), sum factorisation and curved elements are now in P1.2, P2.2 and P1.3.
 
 ### Operational
 - [ ] Data assimilation (start with EnKF, then 4D-Var).

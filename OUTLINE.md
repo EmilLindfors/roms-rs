@@ -38,7 +38,8 @@ src/
 │   ├── data/         # Bathymetry, land mask, boundary tags
 │   ├── io/           # Gmsh MSH 2.2 reader
 │   └── traits/       # Mesh traits, Point; MeshGPUData (unimplemented)
-├── flux/             # Upwind, Lax-Friedrichs, Roe, HLL; 2D SWE + tracer fluxes
+├── flux/             # Upwind, Lax-Friedrichs, Roe, HLL; 2D SWE + tracer fluxes;
+│                     # entropy-conservative/-stable SWE fluxes (Wintermeyer)
 │
 │  # ---- Equations & physics ----
 ├── equations/        # ConservationLaw trait; advection 1D/2D, SWE 1D/2D, UNESCO EOS
@@ -51,8 +52,9 @@ src/
 │  # ---- Solver ----
 ├── solver/
 │   ├── state/        # DGSolution1D/2D, SWESolution2D (SoA), Solution3D
-│   ├── rhs/          # RHS kernels: scalar/SWE 1D/2D, tracer, diffusion (BR1),
-│   │                 # 3D advection, baroclinic PGF, 3D RHS assembly
+│   ├── rhs/          # RHS kernels: scalar/SWE 1D/2D (collocated or entropy-stable
+│   │                 # split form), tracer, diffusion (BR1), 3D advection,
+│   │                 # baroclinic PGF, 3D RHS assembly
 │   ├── limiters/     # Zhang-Shu positivity, Kuzmin/TVB slope limiters
 │   ├── algorithms/   # Wetting/drying, tridiagonal (Thomas) solve
 │   ├── simd/         # pulp kernels + batched faer paths (parallel feature)
@@ -86,12 +88,12 @@ are the adapter edge; the DG core must stay free of I/O and feature flags
 | Layer | State |
 |-------|-------|
 | 1D/2D DG core | Solid operators/fluxes/SSP-RK3: verified convergence (P1–P5 1D, P1–P3 2D) on flat/linear-bottom periodic problems, machine-precision conservation for continuous bathymetry, correct Roe/HLL (REVIEW.md §1.10) |
-| Well-balancing | Not well-balanced for realistic nodal bathymetry (m/s spurious currents in 1 h); the cell-average + reconstruction workaround leaks mass. Needs entropy-stable well-balanced DGSEM + η-limiting (REVIEW.md §1.1–§1.5) |
+| Well-balancing | `SWEFormulation2D::EntropyStable` (Wintermeyer split form) is well-balanced for any nodal bathymetry, including face jumps, with exact mass conservation and an entropy inequality; the default collocated form stays balanced only for deg B ≤ p/2. The reconstruction mass leak is fixed (1D and 2D). Open: η-based limiting (REVIEW.md §1.4), wetting/drying for the split form (REVIEW.md §1.5) |
 | Geometry | Affine parallelogram quads only; per-node isoparametric factors + triangles are the strategic unlock (REVIEW.md §4.1) |
 | Time integration | Generic `SSPRK3` over `Integrable` is the real path; five legacy copies pending deletion |
 | Mode splitting | Prototype: Hann filter correct, but the FE subcycle runs inside every RK stage (first-order, damps M2 3–14 %/period), G double-counts advection, stresses never reach the depth mean. Needs a ROMS-style once-per-step forward-backward pass (REVIEW.md §2) |
 | 3D physics | Scaffolding: sigma grid, tridiagonal and implicit diffusion solid; tracers not constancy-preserving, vertical advection ×D (fix in review), non-balanced PGF, no GLS; essentially untested (REVIEW.md §3, §6.1) |
-| Boundaries/nesting | Tidal astronomy correct; Flather applied twice (reflects ≈1/3), spatially uniform tidal forcing, NorKyst nesting lacks CF time/rotation/transport conservation (REVIEW.md §4.2–§4.5) |
+| Boundaries/nesting | Tidal astronomy correct; Flather fixed (ghost = external state, reflection < 1e-5); spatially uniform tidal forcing, NorKyst nesting lacks CF time/rotation/transport conservation (REVIEW.md §4.2–§4.5) |
 | Performance | SoA + rayon workspace pattern correct; ~47× ROMS core-hours as configured (model estimate): dt estimator, dense volume term, land elements, per-step allocations (REVIEW.md §5) |
 | GPU | Burn prototype physically wrong and slower-by-design; fix or replace with custom fused f64 kernels over CSR (REVIEW.md §5; TODO P0.11/P2.7) |
 
@@ -102,13 +104,15 @@ features) are complete; see `TODO.md` for the ledger. The 2026-07-08
 correctness batch is done (Burn deferred). Current direction, from
 REVIEW.md §7 (2026-09-25):
 
-1. **Correctness batch** — the confirmed small bugs (Flather applied twice,
-   reconstruction mass leak, tidal periods, 3D vertical advection, EOS/Chezy
-   units, parallel limiter dry branch, nesting time base, dt estimator).
+1. **Correctness batch** — the confirmed small bugs (tidal periods, 3D
+   vertical advection, EOS/Chezy units, parallel limiter dry branch, nesting
+   time base, dt estimator). Done: Flather applied twice, reconstruction mass
+   leak.
 2. **Correct 2D barotropic tides** — non-allocating unified RHS first, then
-   well-balanced entropy-stable DGSEM with positivity/wet-dry, η-limiting and
-   implicit friction; isoparametric quads + triangles; ghost = external state
-   Flather, spatially varying tides, model clock, proper NorKyst nesting.
+   well-balanced entropy-stable DGSEM (split form done, opt-in
+   `SWEFormulation2D::EntropyStable`) with positivity/wet-dry, η-limiting and
+   implicit friction; isoparametric quads + triangles; spatially varying
+   tides, model clock, proper NorKyst nesting.
 3. **Cheap enough to matter** — per-element dt, sum factorisation, one Riemann
    solve per face, water-only meshes, then local time stepping or an implicit
    free surface.
