@@ -17,6 +17,14 @@ use dg_rs::{
     Reflective2D, SWE2DRhsConfig, SWEFluxType2D, SWESolution2D, ShallowWater2D, compute_dt_swe_2d,
     compute_rhs_swe_2d,
 };
+// SWE 1D imports
+use dg_rs::boundary::ReflectiveBC;
+use dg_rs::source::SourceTerm;
+use dg_rs::time::{SSPRK3, TimeIntegrator};
+use dg_rs::{
+    SWEFluxType, SWERhsConfig, SWESolution, SWEState, ShallowWater1D, compute_dt_swe,
+    compute_rhs_swe,
+};
 use std::f64::consts::PI;
 
 /// Run a single advection simulation and return the L2 error.
@@ -806,4 +814,139 @@ fn test_convergence_swe_2d_p2() {
         "SWE 2D P2 should converge at order > 2.5, observed {:.2}",
         observed_order
     );
+}
+
+// ============================================================================
+// 1D Shallow Water Equations Convergence Tests
+// ============================================================================
+
+/// Manufactured solution for the nonlinear 1D SWE on a flat bottom:
+/// h = H0 + A·sin(k(x − C·t)), u = U (constant), so hu = U·h.
+///
+/// With h_t = −C·h_x, the forcing that makes it exact is
+/// S_h  = h_t + (hu)_x               = (U − C)·h_x
+/// S_hu = (hu)_t + (hu² + ½gh²)_x    = (U² − U·C + g·h)·h_x
+struct SweManufactured1D {
+    g: f64,
+    h0: f64,
+    amplitude: f64,
+    k: f64,
+    c: f64,
+    u: f64,
+}
+
+impl SweManufactured1D {
+    fn depth(&self, x: f64, t: f64) -> f64 {
+        self.h0 + self.amplitude * (self.k * (x - self.c * t)).sin()
+    }
+}
+
+impl SourceTerm for SweManufactured1D {
+    fn evaluate(&self, _state: &SWEState, _db_dx: f64, x: f64, t: f64) -> SWEState {
+        let h = self.depth(x, t);
+        let h_x = self.amplitude * self.k * (self.k * (x - self.c * t)).cos();
+        SWEState::new(
+            (self.u - self.c) * h_x,
+            (self.u * self.u - self.u * self.c + self.g * h) * h_x,
+        )
+    }
+
+    fn name(&self) -> &'static str {
+        "swe_1d_manufactured"
+    }
+}
+
+/// Run the manufactured 1D SWE problem on a periodic domain and return the L2
+/// error in depth at `t_final`.
+///
+/// The solution is exact for the nonlinear equations, so there is no
+/// linearization error floor.
+fn run_swe_1d_convergence(
+    n_elements: usize,
+    order: usize,
+    flux_type: SWEFluxType,
+    t_final: f64,
+    cfl: f64,
+) -> f64 {
+    let l: f64 = 2.0;
+    let mms = SweManufactured1D {
+        g: 9.81,
+        h0: 2.0,
+        amplitude: 0.2,
+        k: 2.0 * PI / l,
+        c: 1.0,
+        u: 0.5,
+    };
+
+    let mesh = Mesh1D::uniform_periodic(0.0, l, n_elements);
+    let ops = DGOperators1D::new(order);
+    let equation = ShallowWater1D::new(mms.g);
+    let bc = ReflectiveBC::new(); // Never called on a periodic mesh
+    let config = SWERhsConfig::new(&equation, &bc, &bc)
+        .with_flux_type(flux_type)
+        .with_source(&mms);
+
+    let mut q = SWESolution::new(mesh.n_elements, ops.n_nodes);
+    q.set_from_functions(&mesh, &ops, |x| mms.depth(x, 0.0), |_| mms.u);
+
+    let dt_init = compute_dt_swe(&q, &mesh, &equation, order, cfl);
+    let n_steps = (t_final / dt_init).ceil() as usize;
+    let dt = t_final / n_steps as f64;
+
+    let mut t = 0.0;
+    for _ in 0..n_steps {
+        SSPRK3.step(&mut q, dt, t, |q, t| {
+            compute_rhs_swe(q, &mesh, &ops, &config, t)
+        });
+        t += dt;
+    }
+
+    q.l2_error_depth(&mesh, &ops, |x| mms.depth(x, t_final))
+}
+
+/// Assert that the 1D SWE solver converges at least at `min_order` for `order`.
+fn check_swe_1d_convergence(order: usize, t_final: f64, cfl: f64, min_order: f64) {
+    for flux_type in [
+        SWEFluxType::Roe,
+        SWEFluxType::Hll,
+        SWEFluxType::LaxFriedrichs,
+    ] {
+        let resolutions = [8, 16, 32];
+        let errors: Vec<f64> = resolutions
+            .iter()
+            .map(|&n| run_swe_1d_convergence(n, order, flux_type, t_final, cfl))
+            .collect();
+
+        println!("\nSWE 1D P{order} convergence ({flux_type:?}):");
+        for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
+            if i > 0 {
+                let observed_order = (errors[i - 1] / err).log2();
+                println!("  n={n:3}: error={err:.4e}, order={observed_order:.2}");
+            } else {
+                println!("  n={n:3}: error={err:.4e}");
+            }
+        }
+
+        let observed_order = (errors[errors.len() - 2] / errors[errors.len() - 1]).log2();
+        assert!(
+            observed_order > min_order,
+            "SWE 1D P{order} ({flux_type:?}) should converge at order > {min_order}, \
+             observed {observed_order:.2} (errors {errors:?})"
+        );
+    }
+}
+
+#[test]
+fn test_convergence_swe_1d_p1() {
+    check_swe_1d_convergence(1, 0.5, 0.3, 1.8);
+}
+
+#[test]
+fn test_convergence_swe_1d_p2() {
+    check_swe_1d_convergence(2, 0.5, 0.2, 2.7);
+}
+
+#[test]
+fn test_convergence_swe_1d_p3() {
+    check_swe_1d_convergence(3, 0.5, 0.1, 3.7);
 }

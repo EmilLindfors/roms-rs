@@ -128,6 +128,35 @@ impl HydrostaticReconstruction {
         )
     }
 
+    /// Hydrostatic interface correction for one side of a face.
+    ///
+    /// Audusse et al. (2004) give the side with nodal depth `h` and reconstructed
+    /// depth `h*` the flux `F*(q*⁻, q*⁺)·n + ½g(h² − h*²)·n` (momentum only).
+    /// In the DG strong form the surface term is `F(q⁻)·n − (that flux)`, where
+    /// `F(q⁻)` must be the physical flux of the actual nodal state so that the
+    /// surface term telescopes with the volume term (SBP property, discrete mass
+    /// conservation). This returns the resulting addition to `F(q⁻)·n − F*`:
+    ///
+    /// ```text
+    /// ½g(h*² − h²)·n   in hu,   0 in h
+    /// ```
+    ///
+    /// The pressure `½gh²` is taken as zero for `h ≤ h_min`, matching the dry-node
+    /// cutoff of the 1D physical flux, so that at lake-at-rest the correction
+    /// cancels `F(q⁻)·n − F*` exactly (also at dry nodes).
+    #[inline]
+    pub fn pressure_correction(&self, h: f64, h_star: f64, normal: f64) -> SWEState {
+        let pressure = |depth: f64| {
+            if depth > self.h_min {
+                0.5 * self.g * depth * depth
+            } else {
+                0.0
+            }
+        };
+        let dp = pressure(h_star) - pressure(h);
+        SWEState::new(0.0, dp * normal)
+    }
+
     /// Compute the well-balanced source term contribution at an interface.
     ///
     /// This computes the correction needed to balance the flux difference
@@ -343,6 +372,47 @@ mod tests {
             "Right should be dry: h_R* = {}",
             q_r_star.h
         );
+    }
+
+    #[test]
+    fn test_pressure_correction_balances_lake_at_rest() {
+        use crate::flux::{hll_flux_swe, roe_flux_swe};
+
+        let hr = HydrostaticReconstruction::new(G, H_MIN);
+        let physical_flux = |q: &SWEState| SWEState::new(q.hu, 0.5 * G * q.h * q.h);
+
+        // Lake at rest across a bathymetry jump, both face orientations
+        let eta = 10.0;
+        let (b_int, b_ext) = (2.0, 5.0);
+        let q_int = SWEState::new(eta - b_int, 0.0);
+        let q_ext = SWEState::new(eta - b_ext, 0.0);
+        let (q_int_star, q_ext_star) = hr.reconstruct(&q_int, &q_ext, b_int, b_ext);
+
+        for normal in [-1.0, 1.0] {
+            for flux in [roe_flux_swe, hll_flux_swe] {
+                // Numerical flux F*·n with the interior state on the `normal` side
+                let f_star = if normal > 0.0 {
+                    flux(&q_int_star, &q_ext_star, G, H_MIN)
+                } else {
+                    let f = flux(&q_ext_star, &q_int_star, G, H_MIN);
+                    SWEState::new(-f.h, -f.hu)
+                };
+                let f_int = physical_flux(&q_int);
+                let correction = hr.pressure_correction(q_int.h, q_int_star.h, normal);
+                let diff_h = f_int.h * normal - f_star.h + correction.h;
+                let diff_hu = f_int.hu * normal - f_star.hu + correction.hu;
+                assert!(diff_h.abs() < TOL, "normal={normal}: h {diff_h:e}");
+                assert!(diff_hu.abs() < TOL, "normal={normal}: hu {diff_hu:e}");
+            }
+        }
+
+        // Continuous bathymetry: reconstruction is the identity, no correction
+        let c = hr.pressure_correction(8.0, 8.0, 1.0);
+        assert_eq!((c.h, c.hu), (0.0, 0.0));
+
+        // Dry on both sides of the reconstruction: no pressure either way
+        let c = hr.pressure_correction(0.5 * H_MIN, 0.0, -1.0);
+        assert_eq!((c.h, c.hu), (0.0, 0.0));
     }
 
     #[test]
