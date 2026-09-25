@@ -7,6 +7,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # `.cargo/config.toml` builds with `-C target-cpu=native`. Hosted runners
+  # vary in CPU, and rust-cache does not key on that file, so a restored cache
+  # could hold proc-macro dylibs (loaded into rustc) with instructions the
+  # current runner lacks: rustc died with SIGILL. RUSTFLAGS overrides the
+  # config's `target.<triple>.rustflags`, and rust-cache includes RUST* env
+  # vars in its key. Build for the portable x86-64 baseline; SIMD paths are
+  # chosen at run time by `pulp`, so this loses no coverage.
+  RUSTFLAGS: "-C target-cpu=x86-64"
 
 jobs:
   # The default feature set pulls in NetCDF, which needs native HDF5/netCDF-C
