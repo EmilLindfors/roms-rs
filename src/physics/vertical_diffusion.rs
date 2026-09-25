@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn diffusion_layer_thickness_is_depth_dependent() {
-        // Regression (REVIEW.md §2.1 / TODO P0.5): `apply_vertical_diffusion`
+        // Regression (2026-07-08 review §2.1 / TODO P0.5): `apply_vertical_diffusion`
         // must build layer thicknesses from the actual water depth (eta - B),
         // not a hardcoded 100 m. Two columns driven by identical surface stress
         // but with 50 m vs 500 m of water respond differently, because the

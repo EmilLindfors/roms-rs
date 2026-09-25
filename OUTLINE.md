@@ -1,12 +1,13 @@
 # Architecture
 
 A DG (Discontinuous Galerkin) solver for Norwegian coastal ocean modeling: a
-feature-complete 2D barotropic SWE solver plus an early-stage ROMS-style 3D
+feature-rich 2D barotropic SWE solver (not yet correct on realistic bathymetry
+and open boundaries; see `REVIEW.md`) plus an early-stage ROMS-style 3D
 layer (2D DG horizontal × finite-difference vertical, sigma coordinates, mode
 splitting).
 
 For the current health assessment and prioritized fix plan, see `REVIEW.md`
-(2026-07-08). For the 3D roadmap, see `3D_TODO.md`. This document describes
+(2026-09-25). For the 3D roadmap, see `3D_TODO.md`. This document describes
 what exists and how it fits together.
 
 ## Design Philosophy
@@ -15,7 +16,7 @@ what exists and how it fits together.
 
 | Principle | Approach |
 |-----------|----------|
-| Single crate (for now) | 17 modules, ~75k LOC; a `dg-core` / `roms-rs` workspace split is the likely end state (REVIEW.md §5.7) |
+| Single crate (for now) | 17 modules, ~75k LOC; a `dg-core` / `roms-rs` workspace split is the likely end state (REVIEW.md §6.2) |
 | Concrete first | `Mesh1D`, `Mesh2D`; generic traits (`Integrable`, `SourceTerm2D`) added once 2+ implementations existed |
 | faer for LA | Dense element-local operators; QR/SVD available for least-squares (harmonic analysis) |
 | f64 everywhere | Coastal stability requires double precision |
@@ -25,13 +26,13 @@ what exists and how it fits together.
 
 ```
 src/
-├── lib.rs            # Public API, re-exports (oversized — REVIEW.md §5.6)
+├── lib.rs            # Public API, re-exports (oversized — REVIEW.md §6.2)
 ├── types/            # Newtypes: indices, bounds, physical (Depth, Sigma), sides
 │
 │  # ---- DG core (dimension/equation-agnostic) ----
 ├── polynomial/       # Legendre P_n, GLL nodes/weights (1D + tensor-product 2D)
 ├── basis/            # Vandermonde matrices, nodal<->modal (1D + 2D)
-├── operators/        # Dr/Ds, mass, LIFT, GeometricFactors2D (affine-only — REVIEW.md §3.1)
+├── operators/        # Dr/Ds, mass, LIFT, GeometricFactors2D (affine-only — REVIEW.md §4.1)
 ├── mesh/
 │   ├── core/         # Mesh1D, Mesh2D (quads), Mesh2DBuilder
 │   ├── data/         # Bathymetry, land mask, boundary tags
@@ -59,10 +60,10 @@ src/
 │   ├── simd/         # pulp kernels + batched faer paths (parallel feature)
 │   ├── diagnostics/  # Runtime diagnostics
 │   └── burn/         # Burn GPU prototype — incomplete, deletion recommended
-│                     # (REVIEW.md §4.2)
+│                     # (REVIEW.md §5; TODO P0.11/P2.7)
 ├── time/             # Integrable + TimeIntegrator traits, generic SSPRK3,
 │                     # mode_split (barotropic subcycling); legacy per-type
-│                     # ssp_rk3_* variants slated for deletion (REVIEW.md §5.3)
+│                     # ssp_rk3_* variants slated for deletion (REVIEW.md §6.2)
 │
 │  # ---- 3D vertical layer ----
 ├── vertical/         # SigmaGrid, Song-Haidvogel / ROMS Vstretching=4
@@ -86,34 +87,40 @@ are the adapter edge; the DG core must stay free of I/O and feature flags
 
 | Layer | State |
 |-------|-------|
-| 1D/2D DG core | Solid: verified convergence (P1–P5 1D, P1–P3 2D), machine-precision conservation, correct Roe/HLL, tested normals/connectivity |
-| Well-balancing | `SWEFormulation2D::EntropyStable` (Wintermeyer split form) is well-balanced for any nodal bathymetry, including face jumps, with exact mass conservation and an entropy inequality; the default collocated form stays balanced only for deg B ≤ p/2. Open: η-based limiting (REVIEW.md §1.4), wetting/drying for the split form |
-| Geometry | Affine parallelogram quads only; per-node isoparametric factors + triangles are the strategic unlock (REVIEW.md §3.1) |
+| 1D/2D DG core | Solid operators/fluxes/SSP-RK3: verified convergence (P1–P5 1D, P1–P3 2D) on flat/linear-bottom periodic problems, machine-precision conservation for continuous bathymetry, correct Roe/HLL (REVIEW.md §1.10) |
+| Well-balancing | `SWEFormulation2D::EntropyStable` (Wintermeyer split form) is well-balanced for any nodal bathymetry, including face jumps, with exact mass conservation and an entropy inequality; the default collocated form stays balanced only for deg B ≤ p/2. The reconstruction mass leak is fixed (1D and 2D). Open: η-based limiting (REVIEW.md §1.4), wetting/drying for the split form (REVIEW.md §1.5) |
+| Geometry | Affine parallelogram quads only; per-node isoparametric factors + triangles are the strategic unlock (REVIEW.md §4.1) |
 | Time integration | Generic `SSPRK3` over `Integrable` is the real path; five legacy copies pending deletion |
-| Mode splitting | Prototype: FE subcycle, flat averaging — needs forward-backward stepper + shaped filter (REVIEW.md §1.5) |
-| 3D physics | Early: sigma grid/stretching/tridiagonal solid; PGF, mixing, wall BCs and coupling have known bugs; essentially untested (REVIEW.md §2, §5.2) |
-| Boundaries/nesting | Coherent Chapman-Flather set; tidal astronomy incomplete, NorKyst ingestion has blocker-level bugs (REVIEW.md §3.3–§3.4) |
-| Performance | SoA layout + rayon workspace pattern correct; RHS-returns-by-value API is the allocation bottleneck (REVIEW.md §4.1) |
-| GPU | Burn prototype physically wrong and slower-by-design; delete, keep SoA/CSR readiness (REVIEW.md §4.2) |
+| Mode splitting | Prototype: Hann filter correct, but the FE subcycle runs inside every RK stage (first-order, damps M2 3–14 %/period), G double-counts advection, stresses never reach the depth mean. Needs a ROMS-style once-per-step forward-backward pass (REVIEW.md §2) |
+| 3D physics | Scaffolding: sigma grid, tridiagonal and implicit diffusion solid; tracers not constancy-preserving, vertical advection ×D (fix in review), non-balanced PGF, no GLS; essentially untested (REVIEW.md §3, §6.1) |
+| Boundaries/nesting | Tidal astronomy correct; Flather fixed (ghost = external state, reflection < 1e-5); spatially uniform tidal forcing, NorKyst nesting lacks CF time/rotation/transport conservation (REVIEW.md §4.2–§4.5) |
+| Performance | SoA + rayon workspace pattern correct; ~47× ROMS core-hours as configured (model estimate): dt estimator, dense volume term, land elements, per-step allocations (REVIEW.md §5) |
+| GPU | Burn prototype physically wrong and slower-by-design; fix or replace with custom fused f64 kernels over CSR (REVIEW.md §5; TODO P0.11/P2.7) |
 
 ## Evolution Path
 
 Historical phases 0–3 (1D advection → 1D SWE → 2D quads → Norwegian coast
-features) are complete; see `TODO.md` for the ledger. Current direction, from
-REVIEW.md §7:
+features) are complete; see `TODO.md` for the ledger. The 2026-07-08
+correctness batch is done (Burn deferred). Current direction, from
+REVIEW.md §7 (2026-09-25):
 
-1. **Correctness batch** — the seven top bugs (hardcoded diffusion depth,
-   barotropic PGF double-count, 3D wall BCs, NorKyst layer index, tidal phase
-   sign, featureless build, Burn RHS).
-2. **Non-allocating RHS** — `compute_rhs_into` + workspace integrator; unify
-   serial/parallel RHS into one per-element kernel.
-3. **Numerics upgrades** — well-balanced entropy-stable DGSEM (done, opt-in
-   `SWEFormulation2D::EntropyStable`) + η-based limiting; forward-backward
-   barotropic mode splitting.
-4. **Geometry generalization** — per-node geometric factors, triangles, CSR
-   connectivity (also the GPU-readiness work).
-5. **3D hardening** — density-Jacobian PGF, GLS mixing, 3D test suite
-   (stratified lake-at-rest, seiche, Thacker bowl, lock exchange).
+1. **Correctness batch** — the confirmed small bugs (tidal periods, 3D
+   vertical advection, EOS/Chezy units, parallel limiter dry branch, nesting
+   time base, dt estimator). Done: Flather applied twice, reconstruction mass
+   leak.
+2. **Correct 2D barotropic tides** — non-allocating unified RHS first, then
+   well-balanced entropy-stable DGSEM (split form done, opt-in
+   `SWEFormulation2D::EntropyStable`) with positivity/wet-dry, η-limiting and
+   implicit friction; isoparametric quads + triangles; spatially varying
+   tides, model clock, proper NorKyst nesting.
+3. **Cheap enough to matter** — per-element dt, sum factorisation, one Riemann
+   solve per face, water-only meshes, then local time stepping or an implicit
+   free surface.
+4. **Validation and the speed claim** — tide gauges/NorKyst skill, and a
+   cost-vs-error benchmark against ROMS 2D on the same hardware.
+5. **3D rebuilt on the ROMS recipe** — once-per-step forward-backward
+   barotropic pass with consistent averaged transport, Hz-weighted fluxes,
+   inventory-form tracers, balanced PGF, GLS mixing, 3D test suite.
 6. **Structure** — delete superseded layers, prune API surface, then the
    `dg-core` / `roms-rs` workspace split.
 
@@ -133,7 +140,7 @@ REVIEW.md §7:
 ## Testing Strategy
 
 Four tiers, all present in the 1D/2D core and mandatory for new
-discretizations (the 3D layer currently fails this bar — REVIEW.md §5.2):
+discretizations (the 3D layer currently fails this bar — REVIEW.md §6.1):
 
 1. **Unit**: operator exactness on polynomials, flux consistency.
 2. **Convergence**: observed order ≥ N+1 on smooth solutions, multiple

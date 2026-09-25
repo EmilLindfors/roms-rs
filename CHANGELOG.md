@@ -24,6 +24,20 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- Replaced `REVIEW.md` with the 2026-09-25 full-crate code and numerics review, which supersedes the 2026-07-08 review (still in git history). Its headline findings:
+  - Realistic nodal bathymetry is not well-balanced (measured: 0.9 m/s spurious currents after 1 h at P3 over a 30→400 m slope).
+  - Hydrostatic reconstruction leaks mass when bathymetry is face-discontinuous (measured).
+  - Flather-type open boundaries apply the characteristic relation twice (reflection ≈ −1/3).
+  - Tidal constituent periods are truncated.
+  - Mode splitting is first-order and damped; the G-term double-counts advection; 3D stresses never reach the depth mean.
+  - 3D tracers are not constancy-preserving; vertical momentum advection is D times too large; the σ pressure-gradient error is comparable to the physical forcing.
+  - The review also includes a cost model versus ROMS for 2D tides (~47× core-hours as configured).
+- Rewrote `TODO.md` around that review:
+  - a new Priority 0 list of confirmed bugs (P0.12–P0.22, with P0.15–P0.18 in review in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2));
+  - phases reordered to a correct 2D barotropic tide model → performance → validation and a cost-vs-accuracy benchmark against ROMS → a 3D rebuild on the ROMS recipe;
+  - resolved history condensed, with corrections to earlier status claims (`ROMSVstretching4` is not ROMS Vstretching 4; "RHS allocations: zero" held only for the element loop);
+  - Key Metrics made evidence-based.
+- Updated `REVIEW.md` section references and the layer-status table in `OUTLINE.md`, plus section references in `CLAUDE.md`, `PROFILE.md` and one test comment.
 - Replaced element-local tracer diffusion with a conservative BR1-style DG diffusion path using lifted gradients and central face fluxes.
 - Replaced element-local SWE momentum viscosity with the shared conservative DG diffusion path.
 - Updated element-level wet/dry correction APIs to receive DG quadrature data, allowing corrected states to preserve weighted element mass.
