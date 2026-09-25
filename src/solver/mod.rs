@@ -80,6 +80,7 @@ pub use rhs::{
     compute_rhs_advection_2d,
     compute_rhs_swe,
     compute_rhs_swe_2d,
+    compute_rhs_swe_2d_into,
     compute_rhs_tracer_2d,
     positivity_cfl_swe_2d,
 };
@@ -154,5 +155,7 @@ pub use limiters::{
     swe_kuzmin_limiter_2d_parallel, swe_positivity_limiter_2d_parallel,
 };
 
-#[cfg(all(feature = "parallel", feature = "simd"))]
-pub use rhs::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
+#[cfg(feature = "parallel")]
+pub use rhs::{
+    compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel, compute_rhs_swe_2d_parallel_into,
+};

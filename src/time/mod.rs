@@ -41,8 +41,8 @@ pub use ssp_rk3_swe_2d::{
 
 // Integrator trait exports
 pub use integrator::{
-    BoxedIntegratorInfo, ForwardEuler, Integrable, IntegratorInfo, SSPRK3, StandardIntegrator,
-    TimeIntegrator, create_integrator_info,
+    BoxedIntegratorInfo, ForwardEuler, Integrable, IntegratorInfo, SSPRK3, StageWorkspace,
+    StandardIntegrator, TimeIntegrator, create_integrator_info,
 };
 
 // Burn GPU time integration exports

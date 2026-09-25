@@ -77,12 +77,11 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModuleInfo for SWEPhysics2D<BC> {
     }
 }
 
-impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEPhysics2D<BC> {
-    fn compute_rhs(&self, state: &SWESolution2D, time: f64) -> SWESolution2D {
+impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
+    /// RHS configuration for this module's components.
+    fn rhs_config(&self) -> crate::solver::SWE2DRhsConfig<'_, BC> {
         use crate::solver::SWE2DRhsConfig;
-        use crate::solver::compute_rhs_swe_2d;
 
-        // Build the RHS config
         let mut config = SWE2DRhsConfig::new(&self.equation, &self.bc)
             .with_formulation(self.formulation)
             .with_flux_type(self.flux.into())
@@ -98,14 +97,36 @@ impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEP
                 config = config.with_well_balanced(true);
             }
         }
+        config
+    }
+}
 
-        compute_rhs_swe_2d(state, &self.mesh, &self.ops, &self.geom, &config, time)
+impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEPhysics2D<BC> {
+    fn compute_rhs(&self, state: &SWESolution2D, time: f64) -> SWESolution2D {
+        let mut out = SWESolution2D::new(self.mesh.n_elements, self.ops.n_nodes);
+        self.compute_rhs_into(state, time, &mut out);
+        out
+    }
+
+    /// Parallel element kernel when `parallel` is enabled (identical result to
+    /// the serial one); allocation-free after the first call.
+    fn compute_rhs_into(&self, state: &SWESolution2D, time: f64, out: &mut SWESolution2D) {
+        #[cfg(not(feature = "parallel"))]
+        use crate::solver::compute_rhs_swe_2d_into as rhs_into;
+        #[cfg(feature = "parallel")]
+        use crate::solver::compute_rhs_swe_2d_parallel_into as rhs_into;
+
+        let config = self.rhs_config();
+        rhs_into(state, &self.mesh, &self.ops, &self.geom, &config, time, out);
     }
 
     fn compute_dt(&self, state: &SWESolution2D, cfl: f64) -> f64 {
-        use crate::solver::compute_dt_swe_2d;
+        #[cfg(not(feature = "parallel"))]
+        use crate::solver::compute_dt_swe_2d as dt;
+        #[cfg(feature = "parallel")]
+        use crate::solver::compute_dt_swe_2d_parallel as dt;
 
-        compute_dt_swe_2d(
+        dt(
             state,
             &self.mesh,
             &self.geom,

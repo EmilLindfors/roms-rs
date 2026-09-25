@@ -3,7 +3,7 @@
 //! Provides a high-level interface for running time-dependent simulations.
 
 use crate::physics::PhysicsModule;
-use crate::time::{Integrable, TimeIntegrator};
+use crate::time::{Integrable, StageWorkspace, TimeIntegrator};
 
 // =============================================================================
 // Simulation Configuration
@@ -223,6 +223,8 @@ where
         let mut dt_min_used = f64::INFINITY;
         let mut dt_max_used: f64 = 0.0;
         let mut last_callback_time = t_start;
+        // Stage buffers reused for the whole run (no per-step allocation)
+        let mut stages = StageWorkspace::new();
 
         // Call initial callback
         callback(state, t);
@@ -278,12 +280,13 @@ where
 
             // Advance the solution. Limiters and wet/dry treatment run after
             // every RK stage, so no RHS evaluation sees an unlimited state.
-            self.integrator.step_with_stage_hook(
+            self.integrator.step_with_workspace(
                 state,
                 dt,
                 t,
-                |s, time| self.physics.compute_rhs(s, time),
+                |s, time, out| self.physics.compute_rhs_into(s, time, out),
                 |s| self.physics.post_process(s),
+                &mut stages,
             );
 
             t += dt;

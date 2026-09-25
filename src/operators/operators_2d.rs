@@ -103,6 +103,10 @@ pub struct DGOperators2D {
     /// Row-major cache for LIFT matrices (for SIMD kernels)
     /// Layout: lift_row_major[face][i * n_face_nodes + fi] = lift[face][(i, fi)]
     pub lift_row_major: [Vec<f64>; 4],
+
+    /// Row-major cache for the 1D differentiation matrix (split-form kernel)
+    /// Layout: dr_1d_row_major[a * n_1d + c] = dr_1d[(a, c)]
+    pub dr_1d_row_major: Vec<f64>,
 }
 
 impl DGOperators2D {
@@ -151,6 +155,7 @@ impl DGOperators2D {
         // Build row-major caches for SIMD kernels
         let dr_row_major = mat_to_row_major(&dr);
         let ds_row_major = mat_to_row_major(&ds);
+        let dr_1d_row_major = mat_to_row_major(&dr_1d);
         let lift_row_major = [
             mat_to_row_major(&lift[0]),
             mat_to_row_major(&lift[1]),
@@ -180,6 +185,7 @@ impl DGOperators2D {
             dr_row_major,
             ds_row_major,
             lift_row_major,
+            dr_1d_row_major,
         }
     }
 

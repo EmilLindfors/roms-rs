@@ -133,6 +133,7 @@ pub use solver::{
     compute_rhs_3d,
     compute_rhs_advection_2d,
     compute_rhs_swe_2d,
+    compute_rhs_swe_2d_into,
     compute_rhs_tracer_2d,
     current_cfl_2d,
     positivity_cfl_swe_2d,
@@ -142,8 +143,10 @@ pub use solver::{
     total_mass_2d,
     total_momentum_2d,
 };
-#[cfg(all(feature = "parallel", feature = "simd"))]
-pub use solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
+#[cfg(feature = "parallel")]
+pub use solver::{
+    compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel, compute_rhs_swe_2d_parallel_into,
+};
 
 // Burn GPU acceleration exports
 #[cfg(feature = "burn")]
