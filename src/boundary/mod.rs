@@ -9,9 +9,9 @@
 //! |---------|-------------|
 //! | `Reflective2D` | Wall (no-flux), tangential velocity preserved |
 //! | `Radiation2D` | Sommerfeld absorbing condition |
-//! | `Chapman2D` | Radiation for sea surface height |
-//! | `Flather2D` | Characteristic-based for velocity |
-//! | `ChapmanFlather2D` | Combined Chapman + Flather |
+//! | `Chapman2D` | Blended sea surface height (reflective in DG, see its docs) |
+//! | `Flather2D` | Characteristic (Flather) open boundary |
+//! | `ChapmanFlather2D` | Flather with time-varying external (η, u_n) |
 //! | `HarmonicTidal2D` | Harmonic constituents (Dirichlet) |
 //! | `HarmonicFlather2D` | Harmonic constituents + Flather |
 //! | `Discharge2D` | Prescribed flow rate |
@@ -22,9 +22,33 @@
 //! | Scenario | Recommended BC | Rationale |
 //! |----------|----------------|-----------|
 //! | Open ocean | `HarmonicFlather2D` | Best wave absorption |
-//! | Closed/semi-closed basin | `HarmonicTidal2D` + sponge | Avoids velocity feedback resonance |
+//! | Closed/semi-closed basin | `HarmonicTidal2D` + sponge | Clamped elevation; sponge absorbs |
 //! | Fjord mouth | `ChapmanFlather2D` | Separates incoming/outgoing waves |
-//! | Nesting from parent | `NestingBC2D` (Flather mode) | Smooth transition |
+//! | Nesting from parent | `NestingBC2D` | Parent signal in, child signal out |
+//!
+//! # Flather-type open boundaries in the weak DG setting
+//!
+//! Boundary conditions only supply a ghost state; the flux through a boundary
+//! face is computed by the same upwind Riemann solver (Roe/HLL/Rusanov) as on
+//! interior faces. That solver takes the outgoing Riemann invariant
+//! `w+ = u_n + sqrt(g/h) η` from the interior and the incoming invariant
+//! `w− = u_n − sqrt(g/h) η` from the ghost. The Flather (1976) relation
+//! `u_n = u_n,ext + sqrt(g/h)(η − η_ext)` is precisely "`w−` from outside,
+//! `w+` from inside", so the Flather-type BCs (`Flather2D`,
+//! `HarmonicFlather2D`, `ChapmanFlather2D`, `TSTOBC2D`, `NestingBC2D`,
+//! `OceanNestingBC2D`) use the external state itself as ghost:
+//! `h = η_ext − B`, `u_n = u_n,ext`, `u_t` from the interior or external data.
+//! Adding the Flather correction to the ghost as well applies it twice and
+//! reflects outgoing waves (coefficient −1/3); see
+//! `tests/open_boundary_flather_test.rs`.
+//!
+//! With zero external velocity (the default for the elevation-only BCs) the
+//! boundary elevation equals η_ext only where the boundary sits at an antinode
+//! of a standing (co-oscillating) tide, the usual case for a coastal domain
+//! much shorter than the tidal wavelength. A progressive wave entering through
+//! the boundary is delivered at η_ext / 2 unless the matching external normal
+//! velocity (`u_n,ext = −sqrt(g/h) η_ext` for inflow) is supplied, e.g. via
+//! `ChapmanFlather2D` or a nesting BC.
 //!
 //! # IMPORTANT: Bathymetry Convention for Flather BCs
 //!
@@ -44,14 +68,14 @@
 //! **Without correct bathymetry** (B = 0):
 //! - Interior η = h = 50m (surface 50m above MSL!)
 //! - Tidal η ≈ 0m
-//! - Flather computes spurious velocity ~20 m/s → blow-up!
+//! - Ghost depth h = η_ext − B ≈ 0 against 50 m inside → dam-break outflow!
 //!
 //! The Flather BCs will emit a one-time warning if misconfiguration is detected.
 //!
 //! # Sponge Layers for Closed Basins
 //!
-//! In closed or semi-closed basins (fjords, bays), Flather BC velocity feedback
-//! can amplify reflected waves, causing instability.
+//! In closed or semi-closed basins (fjords, bays), reflective boundaries such
+//! as `HarmonicTidal2D` trap outgoing energy, which can build up resonance.
 //!
 //! **Recommended pattern:**
 //! ```ignore

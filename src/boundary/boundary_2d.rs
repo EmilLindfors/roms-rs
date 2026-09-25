@@ -39,7 +39,10 @@ pub struct BCContext2D {
     pub h_min: f64,
     /// Optional boundary tag for multi-BC dispatch
     pub boundary_tag: Option<BoundaryTag>,
-    /// Optional time step for boundary conditions that need it (e.g., Chapman radiation)
+    /// Optional time step for boundary conditions that need it (e.g., Chapman radiation).
+    ///
+    /// Populated from `SWE2DRhsConfig::dt`, which is `None` unless the caller
+    /// sets it with `SWE2DRhsConfig::with_dt`.
     pub dt: Option<f64>,
 }
 
@@ -303,11 +306,39 @@ impl SWEBoundaryCondition2D for Radiation2D {
 /// Combines tidal forcing with characteristic-based radiation.
 /// This is the standard open boundary condition for coastal models.
 ///
-/// The Flather condition sets:
-/// - h from prescribed tidal elevation
-/// - u_n from characteristic relation: u_n = u_n_tidal + c * (η - η_tidal) / h_tidal
+/// # Weak (ghost-state) formulation
 ///
-/// This allows prescribed tides while permitting free outflow of waves.
+/// The Flather (1976) relation
+///
+/// ```text
+/// u_n = u_n,ext + sqrt(g/h) (η − η_ext)
+/// ```
+///
+/// is equivalent to prescribing the incoming Riemann invariant
+/// `w− = u_n − sqrt(g/h) η` from the external state while the outgoing
+/// invariant `w+ = u_n + sqrt(g/h) η` is left free. The upwind Riemann solver
+/// used at boundary faces does exactly this — it takes `w+` from the interior
+/// trace and `w−` from the ghost — so the ghost state is simply the external
+/// state:
+///
+/// - h = η_ext − B (depth convention h = η − B)
+/// - u_n = u_n,ext
+/// - u_t from the interior
+///
+/// Applying the Flather relation inside the ghost as well would count the
+/// characteristic correction twice and reflect outgoing waves with
+/// coefficient −1/3 (see `tests/open_boundary_flather_test.rs`).
+///
+/// # External velocity
+///
+/// With `u_external = 0` the incoming invariant is `−sqrt(g/h) η_ext`: the
+/// boundary elevation equals η_ext where the boundary sits at an antinode of a
+/// standing (co-oscillating) tide, which is the usual situation for a small
+/// coastal domain. A *progressive* wave entering through the boundary is
+/// delivered at η_ext / 2 unless the matching external velocity is supplied
+/// (u_n,ext = −sqrt(g/h) η_ext for a wave travelling into the domain); use
+/// [`ChapmanFlather2D`](crate::boundary::ChapmanFlather2D) or a nesting BC for
+/// time-varying external velocity.
 #[derive(Clone, Debug)]
 pub struct Flather2D<F>
 where
@@ -353,7 +384,6 @@ where
         let (x, y) = ctx.position;
         let t = ctx.time;
         let (nx, ny) = ctx.normal;
-        let g = ctx.g;
 
         // Prescribed tidal surface elevation
         let eta_tidal = (self.tidal_elevation)(x, y, t);
@@ -368,17 +398,11 @@ where
             eta_tidal,
         );
 
-        // Wave celerity at tidal state
-        let c_tidal = (g * h_tidal).sqrt();
-
-        // Interior surface elevation
-        let eta_int = ctx.interior_surface_elevation();
-
-        // Flather relation for normal velocity
-        // u_n_ghost = u_n_ext + c * (η_int - η_tidal) / h_tidal
+        // Ghost = external state. The Riemann solver supplies the Flather
+        // relation (incoming invariant from here, outgoing from the interior);
+        // adding sqrt(g/h)(η_int − η_tidal) here would apply it twice.
         let (u_ext, v_ext) = self.u_external;
-        let un_ext = u_ext * nx + v_ext * ny;
-        let un_ghost = un_ext + c_tidal * (eta_int - eta_tidal) / h_tidal;
+        let un_ghost = u_ext * nx + v_ext * ny;
 
         // Preserve tangential velocity from interior
         let ut_ghost = ctx.interior_tangential_velocity();
@@ -620,17 +644,25 @@ fn apply_nodal_corrections(constituents: &mut [TidalConstituent], epoch_jd: f64)
 ///
 /// This ensures η = h + B = h0 + (-h0) = 0 at rest (surface at MSL).
 ///
-/// **Without bathymetry**: η = h = 50m, causing the Flather relation to compute
-/// spurious velocities of ~20 m/s, leading to immediate blow-up!
+/// **Without bathymetry**: the ghost depth h = η_tidal − B collapses to ~0
+/// while the interior holds 50 m, so the boundary behaves like a dam break.
+///
+/// # Weak (ghost-state) formulation
+///
+/// As for [`Flather2D`], the ghost state is the external state
+/// (h = η_tidal − B, u_n = u_n,ext, u_t from the interior); the upwind Riemann
+/// solver at the boundary face applies the Flather relation, radiating
+/// outgoing waves without reflection. See [`Flather2D`] for what the default
+/// `u_external = 0` implies for progressive versus standing tides.
 ///
 /// # Stability Note
 ///
-/// `HarmonicFlather2D` includes velocity feedback from interior elevation.
-/// In semi-closed basins (with reflective walls), this can create resonance.
+/// In semi-closed basins (with reflective walls) the tide can resonate.
 /// Consider using:
-/// - [`HarmonicTidal2D`] for simpler Dirichlet-type forcing (more stable)
+/// - [`HarmonicTidal2D`] for simpler Dirichlet-type forcing
 /// - Sponge layers (`SpongeLayer2D`) to absorb reflected energy
-/// - [`ChapmanFlather2D`] for combined Chapman-Flather treatment
+/// - [`ChapmanFlather2D`](crate::boundary::ChapmanFlather2D) for time-varying
+///   external velocity
 ///
 /// # Example
 ///
@@ -794,7 +826,6 @@ impl SWEBoundaryCondition2D for HarmonicFlather2D {
 
         let t = ctx.time;
         let (nx, ny) = ctx.normal;
-        let g = ctx.g;
 
         // Compute tidal elevation
         let eta_tidal = self.elevation(t);
@@ -809,16 +840,10 @@ impl SWEBoundaryCondition2D for HarmonicFlather2D {
             eta_tidal,
         );
 
-        // Wave celerity
-        let c_tidal = (g * h_tidal).sqrt();
-
-        // Interior surface elevation
-        let eta_int = ctx.interior_surface_elevation();
-
-        // Flather relation
+        // Ghost = external state; the Riemann solver applies the Flather
+        // relation (see `Flather2D`).
         let (u_ext, v_ext) = self.u_external;
-        let un_ext = u_ext * nx + v_ext * ny;
-        let un_ghost = un_ext + c_tidal * (eta_int - eta_tidal) / h_tidal;
+        let un_ghost = u_ext * nx + v_ext * ny;
 
         // Preserve tangential velocity
         let ut_ghost = ctx.interior_tangential_velocity();
@@ -848,10 +873,10 @@ impl SWEBoundaryCondition2D for HarmonicFlather2D {
 ///
 /// # Stability
 ///
-/// This BC is more stable than [`HarmonicFlather2D`] because it doesn't include
-/// velocity feedback. It works well in semi-closed basins where Flather can
-/// cause resonance. However, it doesn't absorb outgoing waves, which can lead
-/// to phase errors from reflections.
+/// This BC clamps the boundary elevation and extrapolates velocity, so in the
+/// weak ghost-state setting it reflects outgoing waves (coefficient ≈ −1),
+/// which can lead to phase errors and trapped energy. Prefer
+/// [`HarmonicFlather2D`] where outgoing waves must leave the domain.
 ///
 /// # IMPORTANT: Bathymetry Convention
 ///
@@ -1248,6 +1273,109 @@ mod tests {
         // Velocity extrapolated from interior
         assert!((ghost.hu / ghost.h - 1.0).abs() < TOL);
         assert!((ghost.hv / ghost.h - 0.5).abs() < TOL);
+    }
+
+    /// Oblique outward normal used by the Flather ghost-state tests.
+    const N_OBLIQUE: (f64, f64) = (0.6, 0.8);
+
+    /// Interior state at depth `h` with normal/tangential velocity (un, ut)
+    /// relative to `N_OBLIQUE`.
+    fn oblique_context(h: f64, un: f64, ut: f64, bathymetry: f64) -> BCContext2D {
+        let (nx, ny) = N_OBLIQUE;
+        let (u, v) = (un * nx - ut * ny, un * ny + ut * nx);
+        BCContext2D::new(
+            0.0,
+            (0.0, 0.0),
+            SWEState2D::from_primitives(h, u, v),
+            bathymetry,
+            N_OBLIQUE,
+            G,
+            H_MIN,
+        )
+    }
+
+    /// Normal and tangential velocity of a state relative to `N_OBLIQUE`.
+    fn oblique_velocity(state: &SWEState2D) -> (f64, f64) {
+        let (nx, ny) = N_OBLIQUE;
+        let (u, v) = (state.hu / state.h, state.hv / state.h);
+        (u * nx + v * ny, -u * ny + v * nx)
+    }
+
+    #[test]
+    fn test_flather_ghost_is_external_state() {
+        // B = −10, η_int = 0.3, η_ext = −0.2; the interior has both normal
+        // and tangential flow. Regression: the ghost normal velocity used to
+        // be u_n,ext + sqrt(g/h)(η_int − η_ext), which double-applies the
+        // Flather relation once the Riemann solver sees it.
+        let (u_ext, v_ext) = (0.05, -0.02);
+        let mut bc = Flather2D::new(|_x, _y, _t| -0.2, 10.0);
+        bc.u_external = (u_ext, v_ext);
+        let ctx = oblique_context(10.3, 0.4, 0.7, -10.0);
+
+        let ghost = bc.ghost_state(&ctx);
+        let (un, ut) = oblique_velocity(&ghost);
+
+        let (nx, ny) = N_OBLIQUE;
+        assert!(
+            (ghost.h - 9.8).abs() < TOL,
+            "h = η_ext − B, got {}",
+            ghost.h
+        );
+        assert!(
+            (un - (u_ext * nx + v_ext * ny)).abs() < TOL,
+            "u_n = u_n,ext"
+        );
+        assert!((ut - 0.7).abs() < TOL, "u_t from interior");
+    }
+
+    #[test]
+    fn test_harmonic_flather_ghost_is_external_state() {
+        let bc = HarmonicFlather2D::m2_only(0.5, 0.0, 10.0);
+        let ctx = oblique_context(10.3, 0.4, 0.7, -10.0);
+
+        let ghost = bc.ghost_state(&ctx);
+        let (un, ut) = oblique_velocity(&ghost);
+
+        // At t = 0 the M2 elevation is +0.5, so h = 0.5 − (−10).
+        assert!(
+            (ghost.h - 10.5).abs() < TOL,
+            "h = η_ext − B, got {}",
+            ghost.h
+        );
+        assert!(un.abs() < TOL, "u_n = u_n,ext = 0, got {un}");
+        assert!((ut - 0.7).abs() < TOL, "u_t from interior");
+    }
+
+    #[test]
+    fn test_flather_relation_applied_once_by_riemann_solver() {
+        // Linearised about rest at depth H: with the external state as ghost,
+        // the upwind boundary state takes the outgoing invariant from the
+        // interior and the incoming one from outside,
+        //   u* + s η* = u_int + s η_int,   u* − s η* = u_ext − s η_ext,
+        // with s = sqrt(g/H), which is exactly the Flather condition. So the
+        // boundary mass flux is H u* with u* the mean of the two invariants.
+        let depth = 10.0;
+        let s = (G / depth).sqrt();
+        let (eta_int, un_int) = (0.01, 0.003);
+        let (eta_ext, un_ext) = (-0.004, 0.002);
+
+        let (nx, ny) = N_OBLIQUE;
+        let mut bc = Flather2D::new(move |_x, _y, _t| eta_ext, depth);
+        bc.u_external = (un_ext * nx, un_ext * ny);
+        let ctx = oblique_context(depth + eta_int, un_int, 0.0, -depth);
+        let ghost = bc.ghost_state(&ctx);
+
+        let flux = crate::flux::roe_flux_swe_2d(&ctx.interior_state, &ghost, N_OBLIQUE, G, H_MIN);
+
+        let u_star = 0.5 * ((un_int + s * eta_int) + (un_ext - s * eta_ext));
+        let expected = depth * u_star;
+        // Quadratic (η·u) terms are ~1e-4 of the linear flux here.
+        assert!(
+            (flux.h - expected).abs() < 1e-3 * expected.abs(),
+            "boundary mass flux {} differs from the Flather value {}",
+            flux.h,
+            expected
+        );
     }
 
     #[test]

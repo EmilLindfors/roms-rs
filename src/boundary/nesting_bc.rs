@@ -12,10 +12,28 @@
 //! - Boundary effects on the parent are negligible
 //! - Computational efficiency is important
 //!
+//! # Weak (ghost-state) formulation
+//!
+//! The ghost state is the interpolated parent state. At the boundary face the
+//! upwind Riemann solver takes the outgoing Riemann invariant
+//! `w+ = u_n + sqrt(g/h) η` from the interior and the incoming invariant
+//! `w− = u_n − sqrt(g/h) η` from the ghost, which is exactly the Flather
+//! (1976) condition: parent signal enters, child signal radiates out.
+//!
+//! Applying the Flather relation `u_n,ext + sqrt(g/h)(η_int − η_ext)` inside
+//! the ghost as well would count the characteristic correction twice and
+//! reflect outgoing waves (coefficient −1/3 at full weight, −0.29 at 0.8).
+//!
 //! # Modes
 //!
-//! - **Dirichlet**: Directly imposes the interpolated state from the parent
-//! - **Flather**: Blends parent data with characteristic radiation for waves
+//! - **Dirichlet**: Imposes the interpolated state from the parent as ghost
+//! - **Flather**: Same ghost state; kept for API compatibility. The Riemann
+//!   solver already applies the Flather relation, so both modes (and every
+//!   `flather_weight`) behave identically.
+//!
+//! The time series stores parent *depth*, which is imposed as the ghost depth
+//! as is; the ghost surface elevation is therefore `h_parent + B_child`, so the
+//! parent and child bathymetry should agree at the boundary.
 //!
 //! # Example
 //!
@@ -42,7 +60,6 @@
 //! ).without_flather();
 //! ```
 
-use crate::boundary::bathymetry_validation::warn_once_if_misconfigured;
 use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
 use crate::io::BoundaryTimeSeries;
 use crate::solver::SWEState2D;
@@ -50,20 +67,21 @@ use crate::types::Depth;
 
 /// Nesting boundary condition from parent model.
 ///
-/// Interpolates time series data from a parent model and applies it
-/// as a boundary condition, optionally with Flather blending for
-/// better wave absorption.
+/// Interpolates time series data from a parent model and imposes it as the
+/// ghost state; the upwind Riemann solver turns that into a Flather-type
+/// open boundary (see the module docs).
 #[derive(Clone, Debug)]
 pub struct NestingBC2D {
     /// Time series from parent model
     time_series: BoundaryTimeSeries,
-    /// Use Flather blending (true) or pure Dirichlet (false)
+    /// Use Flather blending (true) or pure Dirichlet (false).
+    /// Only affects [`name`](SWEBoundaryCondition2D::name).
     use_flather: bool,
-    /// Reference depth for Flather mode
+    /// Reference depth for Flather mode (unused, retained for API compatibility)
     h_ref: f64,
     /// Minimum depth threshold
     h_min: f64,
-    /// Blending weight for Flather mode (0 = pure Dirichlet, 1 = full Flather)
+    /// Blending weight for Flather mode (unused, retained for API compatibility)
     flather_weight: f64,
 }
 
@@ -83,7 +101,8 @@ impl NestingBC2D {
 
     /// Disable Flather blending (pure Dirichlet mode).
     ///
-    /// The interpolated state is directly imposed without modification.
+    /// The interpolated state is directly imposed without modification. This
+    /// is the same ghost state as Flather mode (see the module docs).
     pub fn without_flather(mut self) -> Self {
         self.use_flather = false;
         self
@@ -95,7 +114,7 @@ impl NestingBC2D {
         self
     }
 
-    /// Set the reference depth for Flather mode.
+    /// Set the reference depth for Flather mode (unused, see the module docs).
     pub fn with_h_ref(mut self, h_ref: f64) -> Self {
         self.h_ref = h_ref;
         self
@@ -109,9 +128,10 @@ impl NestingBC2D {
 
     /// Set the Flather blending weight.
     ///
-    /// - 0.0: Pure Dirichlet (ignores internal state)
-    /// - 1.0: Full Flather blending (default)
-    /// - 0.5: Half Flather (smoother transition)
+    /// No longer affects the ghost state: the Dirichlet ghost combined with
+    /// the upwind Riemann solver already is the Flather condition, and
+    /// blending in an extra characteristic correction reflected outgoing
+    /// waves (see the module docs). Retained for API compatibility.
     pub fn with_flather_weight(mut self, weight: f64) -> Self {
         self.flather_weight = weight.clamp(0.0, 1.0);
         self
@@ -143,64 +163,13 @@ impl NestingBC2D {
 
 impl SWEBoundaryCondition2D for NestingBC2D {
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
-        use std::sync::atomic::AtomicBool;
-        static WARNED: AtomicBool = AtomicBool::new(false);
-
-        let t = ctx.time;
-        let (nx, ny) = ctx.normal;
-        let g = ctx.g;
-
-        // Interpolate parent model state at current time
-        let state_ext = self.time_series.interpolate(t);
-
-        // Pure Dirichlet mode: return interpolated state directly
-        if !self.use_flather || self.flather_weight < 1e-10 {
-            return state_ext;
-        }
-
-        // Flather blending mode
-        // Combines parent state with characteristic-based adjustment
-
-        // External (parent) quantities
+        // Ghost = parent state (depth and both velocity components). The
+        // Riemann solver applies the Flather relation; adding
+        // sqrt(g/h)(η_int − η_ext) to u_n here would apply it twice.
+        let state_ext = self.time_series.interpolate(ctx.time);
         let h_ext = state_ext.h.max(self.h_min);
         let (u_ext, v_ext) = state_ext.velocity_simple(Depth::new(self.h_min));
-        let un_ext = u_ext * nx + v_ext * ny;
-        let ut_ext = -u_ext * ny + v_ext * nx;
-        let eta_ext = h_ext + ctx.bathymetry;
-
-        // Validate bathymetry configuration for Flather mode (warns once if misconfigured)
-        // Use eta_ext as the expected elevation since it comes from the parent model
-        warn_once_if_misconfigured(
-            &WARNED,
-            "NestingBC2D (Flather mode)",
-            ctx.interior_state.h,
-            ctx.bathymetry,
-            eta_ext - h_ext, // Expected surface elevation relative to MSL
-        );
-
-        // Interior surface elevation for Flather correction
-        let eta_int = ctx.interior_surface_elevation();
-
-        // Wave celerity at external depth
-        let c_ext = (g * h_ext).sqrt();
-
-        // Flather relation for normal velocity:
-        // u_n_ghost = u_n_ext + c * (η_int - η_ext) / h_ext
-        let un_flather = un_ext + c_ext * (eta_int - eta_ext) / h_ext;
-
-        // Blend between Dirichlet and Flather
-        let w = self.flather_weight;
-        let un_ghost = (1.0 - w) * un_ext + w * un_flather;
-
-        // Keep tangential velocity from external state
-        let ut_ghost = ut_ext;
-
-        // Convert back to (u, v)
-        let u_ghost = un_ghost * nx - ut_ghost * ny;
-        let v_ghost = un_ghost * ny + ut_ghost * nx;
-
-        // Use external depth (from parent model)
-        SWEState2D::from_primitives(h_ext, u_ghost, v_ghost)
+        SWEState2D::from_primitives(h_ext, u_ext, v_ext)
     }
 
     fn name(&self) -> &'static str {
@@ -357,7 +326,7 @@ mod tests {
 
     #[test]
     fn test_flather_elevated_interior() {
-        // When interior is elevated, Flather should add outward velocity
+        // Interior 1 m above the parent (η_ext = 50 + B, η_int = 51 + B).
         let records = vec![
             TimeSeriesRecord {
                 time: 0.0,
@@ -371,15 +340,19 @@ mod tests {
         let ts = BoundaryTimeSeries::from_records(records).unwrap();
         let bc = NestingBC2D::new(ts);
 
-        // Interior is 1m higher than external
-        // η_ext = 50, η_int = 51
-        // c = sqrt(9.81 * 50) ≈ 22.1
-        // u_n_ghost = 0 + 22.1 * 1 / 50 ≈ 0.44
         let ctx = make_context(51.0, 0.0, 0.0, 0.0, 0.0);
         let ghost = bc.ghost_state(&ctx);
 
-        // Should have outward velocity
-        assert!(ghost.hu / ghost.h > 0.3);
+        // The ghost is the parent state. Regression: the old Flather mode
+        // added sqrt(g/h)(η_int − η_ext) ≈ 0.44 m/s to u_n, so the Riemann
+        // solver applied the Flather relation twice and reflected outgoing
+        // waves (coefficient −1/3).
+        assert!((ghost.h - 50.0).abs() < TOL);
+        assert!(ghost.hu.abs() < TOL, "ghost u_n should be u_n,ext = 0");
+
+        // The upwind flux turns the elevation excess into outflow.
+        let flux = crate::flux::roe_flux_swe_2d(&ctx.interior_state, &ghost, ctx.normal, G, H_MIN);
+        assert!(flux.h > 0.0, "expected outward mass flux, got {}", flux.h);
     }
 
     #[test]
@@ -396,32 +369,32 @@ mod tests {
     }
 
     #[test]
-    fn test_flather_weight_half() {
-        // flather_weight = 0.5 should blend Dirichlet and Flather
+    fn test_flather_modes_share_ghost_state() {
+        // Every Flather weight and Dirichlet mode impose the same ghost: the
+        // parent state. The Riemann solver supplies the Flather relation.
         let records = vec![TimeSeriesRecord {
             time: 0.0,
-            state: SWEState2D::from_primitives(50.0, 0.0, 0.0),
+            state: SWEState2D::from_primitives(50.0, 0.2, -0.1),
         }];
         let ts = BoundaryTimeSeries::from_records(records).unwrap();
-        let bc = NestingBC2D::new(ts).with_flather_weight(0.5);
 
-        // Interior elevated by 1m
-        let ctx = make_context(51.0, 0.0, 0.0, 0.0, 0.0);
-        let ghost_half = bc.ghost_state(&ctx);
+        // Interior elevated by 1 m and moving.
+        let ctx = make_context(51.0, 10.0, 3.0, 0.0, 0.0);
+        let reference = NestingBC2D::new(ts.clone())
+            .without_flather()
+            .ghost_state(&ctx);
 
-        // Compare with full Flather
-        let bc_full = NestingBC2D::new(
-            BoundaryTimeSeries::from_records(vec![TimeSeriesRecord {
-                time: 0.0,
-                state: SWEState2D::from_primitives(50.0, 0.0, 0.0),
-            }])
-            .unwrap(),
-        )
-        .with_flather_weight(1.0);
-        let ghost_full = bc_full.ghost_state(&ctx);
-
-        // Half weight should give about half the velocity
-        assert!((ghost_half.hu / ghost_half.h - ghost_full.hu / ghost_full.h * 0.5).abs() < 0.01);
+        for weight in [0.0, 0.5, 0.8, 1.0] {
+            let ghost = NestingBC2D::new(ts.clone())
+                .with_flather_weight(weight)
+                .ghost_state(&ctx);
+            assert!((ghost.h - reference.h).abs() < TOL, "weight {weight}: h");
+            assert!((ghost.hu - reference.hu).abs() < TOL, "weight {weight}: hu");
+            assert!((ghost.hv - reference.hv).abs() < TOL, "weight {weight}: hv");
+        }
+        assert!((reference.h - 50.0).abs() < TOL);
+        assert!((reference.hu - 50.0 * 0.2).abs() < 1e-10);
+        assert!((reference.hv - 50.0 * -0.1).abs() < 1e-10);
     }
 
     #[test]

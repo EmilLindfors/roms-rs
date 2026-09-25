@@ -15,6 +15,20 @@
 //!
 //! where α = 1/(1 + c·dt/dx) is the radiation coefficient.
 //!
+//! # Weak (ghost-state) DG caveat
+//!
+//! Chapman's formula is an implicit finite-difference update of the boundary
+//! value. Used as a DG ghost state (blended η, extrapolated velocity) it is
+//! **not** a radiation condition: the upwind Riemann solver then takes the
+//! incoming Riemann invariant `u_n − sqrt(g/h) η_ghost`, which is pulled
+//! towards η_ext and also re-uses the interior's own incoming invariant. In a
+//! quasi-1D channel test [`Chapman2D`] reflects ~99% of an outgoing pulse for
+//! α ≳ 0.8 (like [`HarmonicTidal2D`](crate::boundary::HarmonicTidal2D)), and
+//! is unstable for α ≲ 0.7 (c·dt/dx ≳ 0.4). For radiating open boundaries use
+//! [`Flather2D`](crate::boundary::Flather2D) or [`ChapmanFlather2D`], whose
+//! ghost is the external state and whose radiation comes from the Riemann
+//! solver.
+//!
 //! # Reference
 //!
 //! Chapman, D.C. (1985): "Numerical treatment of cross-shelf open boundaries
@@ -26,9 +40,22 @@ use crate::solver::SWEState2D;
 
 /// Chapman radiation boundary condition for 2D.
 ///
-/// Allows gravity waves to propagate out of the domain with minimal reflection.
-/// Typically combined with a velocity condition (such as Flather) for complete
-/// specification of the open boundary.
+/// Blends the external and interior surface elevation into the ghost
+/// (`α η_ext + (1 − α) η_int`, α = 1/(1 + c·dt/dx)) and extrapolates the
+/// velocity. In the weak DG setting this behaves as a softened elevation
+/// clamp that reflects outgoing waves, not as a radiation condition, and it
+/// is unstable for small α — see the module docs. It is not affected by the
+/// Flather double-counting fixed in [`ChapmanFlather2D`] because it never
+/// modifies the normal velocity.
+///
+/// # Time step
+///
+/// α needs `dt`, taken from [`BCContext2D::dt`] (set via
+/// `SWE2DRhsConfig::with_dt`) or else from [`Chapman2D::with_dt`] /
+/// [`Chapman2D::set_dt`]. The library's RHS drivers (e.g. `SWEPhysics2D`) do
+/// **not** set `BCContext2D::dt`. When no dt is available α = 1 (pure
+/// elevation clamp, the dt → 0 limit); the previous fallback c·dt/dx = 1
+/// (α = 1/2) made the DG discretisation unstable.
 ///
 /// # Type Parameters
 ///
@@ -61,7 +88,8 @@ where
     pub external_elevation: F,
     /// Characteristic length scale (grid spacing) for radiation
     pub dx: f64,
-    /// Time step for implicit treatment (optional, enhances stability)
+    /// Time step for the radiation coefficient (used when the context has no dt;
+    /// α = 1 if neither is set)
     pub dt: Option<f64>,
     /// Minimum depth threshold
     pub h_min: f64,
@@ -127,9 +155,11 @@ where
 
         // Chapman radiation coefficient
         // α = 1/(1 + c·dt/dx) blends between exterior (α=1) and interior (α=0)
-        // Prefer dt from context (auto-communicated from time integrator),
-        // fall back to stored dt on the BC struct
-        let cfl = ctx.dt.or(self.dt).map_or(1.0, |dt| c * dt / self.dx);
+        // Prefer dt from the context (set via SWE2DRhsConfig::with_dt), fall
+        // back to the dt stored on the BC. Without either, use the dt → 0
+        // limit α = 1: the old cfl = 1 fallback (α = 1/2) is unstable in the
+        // weak DG setting (see module docs).
+        let cfl = ctx.dt.or(self.dt).map_or(0.0, |dt| c * dt / self.dx);
         let alpha = 1.0 / (1.0 + cfl);
 
         // Radiation condition for elevation
@@ -150,12 +180,36 @@ where
 
 /// Combined Chapman (elevation) + Flather (velocity) boundary condition.
 ///
-/// This is the recommended open boundary condition for tidal simulations:
-/// - Chapman condition for sea surface height (radiation)
-/// - Flather condition for normal velocity (characteristic-based)
-/// - Tangential velocity extrapolated from interior
+/// This is the recommended open boundary condition for tidal simulations
+/// with known external elevation *and* normal velocity (e.g. a progressive
+/// tide or parent-model output).
 ///
-/// The combination provides both wave absorption and correct tidal forcing.
+/// # Weak (ghost-state) formulation
+///
+/// In finite-difference models Chapman (radiation of η) and Flather
+/// (characteristic relation for u_n) are two separate boundary updates. In the
+/// weak DG setting the upwind Riemann solver at the boundary face performs
+/// both at once: it takes the outgoing Riemann invariant
+/// `w+ = u_n + sqrt(g/h) η` from the interior trace and the incoming invariant
+/// `w− = u_n − sqrt(g/h) η` from the ghost. The ghost state is therefore just
+/// the external state:
+///
+/// - h = η_ext − B (depth convention h = η − B)
+/// - u_n = u_n,ext
+/// - u_t from the interior
+///
+/// Neither the Chapman blend `α η_ext + (1 − α) η_int` nor the Flather
+/// correction `sqrt(g/h)(η_int − η_ext)` is applied to the ghost: each would
+/// feed the outgoing wave back into the incoming invariant and reflect it
+/// (by `(1 − α)/(1 + α)` and −1/3 respectively). Consequently `dx`, `dt` and
+/// `h_ref` no longer affect the ghost state; they are retained for API
+/// compatibility.
+///
+/// To deliver a progressive wave of amplitude A travelling into the domain,
+/// supply `u_n,ext = −sqrt(g/h) η_ext` (u_n is along the outward normal).
+/// With `u_n,ext = 0` the boundary elevation equals η_ext only where the
+/// boundary sits at an antinode of a standing tide; a progressive wave is then
+/// delivered at A/2.
 ///
 /// # Type Parameters
 ///
@@ -183,11 +237,20 @@ where
 {
     /// External state function returning (η_ext, u_n_ext, u_t_ext) at (x, y, t)
     pub external_state: F,
-    /// Grid spacing for Chapman radiation
+    /// Grid spacing for Chapman radiation.
+    ///
+    /// **Unused**: the Riemann solver provides the radiation (see the type
+    /// docs). Retained for API compatibility.
     pub dx: f64,
-    /// Time step (optional)
+    /// Time step.
+    ///
+    /// **Unused**: the Riemann solver provides the radiation (see the type
+    /// docs). Retained for API compatibility.
     pub dt: Option<f64>,
-    /// Reference depth for Flather
+    /// Reference depth for Flather.
+    ///
+    /// **Unused**: the Riemann solver evaluates the wave speed from the
+    /// boundary states (see the type docs). Retained for API compatibility.
     pub h_ref: f64,
     /// Minimum depth
     pub h_min: f64,
@@ -200,8 +263,9 @@ where
     /// Create a new ChapmanFlather BC.
     ///
     /// # Arguments
-    /// * `external_state` - Function returning (η, u_n, u_t) at (x, y, t)
-    /// * `dx` - Grid spacing for Chapman radiation
+    /// * `external_state` - Function returning (η, u_n, u_t) at (x, y, t),
+    ///   with u_n along the outward normal
+    /// * `dx` - Grid spacing for Chapman radiation (unused, see type docs)
     pub fn new(external_state: F, dx: f64) -> Self {
         Self {
             external_state,
@@ -212,13 +276,13 @@ where
         }
     }
 
-    /// Set reference depth for Flather velocity condition.
+    /// Set reference depth for Flather velocity condition (unused, see type docs).
     pub fn with_h_ref(mut self, h_ref: f64) -> Self {
         self.h_ref = h_ref;
         self
     }
 
-    /// Set time step for Chapman.
+    /// Set time step for Chapman (unused, see type docs).
     pub fn with_dt(mut self, dt: f64) -> Self {
         self.dt = Some(dt);
         self
@@ -242,7 +306,6 @@ where
         let (x, y) = ctx.position;
         let t = ctx.time;
         let (nx, ny) = ctx.normal;
-        let g = ctx.g;
 
         // External state: (η_ext, u_n_ext, u_t_ext)
         let (eta_ext, un_ext, _ut_ext) = (self.external_state)(x, y, t);
@@ -256,26 +319,12 @@ where
             eta_ext,
         );
 
-        // Interior state
-        let eta_int = ctx.interior_surface_elevation();
-        let h_int = ctx.interior_state.h;
-
-        // Wave celerity at interior
-        let c = (g * h_int.max(self.h_min)).sqrt();
-
-        // Chapman for elevation
-        // Prefer dt from context (auto-communicated from time integrator),
-        // fall back to stored dt on the BC struct
-        let cfl = ctx.dt.or(self.dt).map_or(1.0, |dt| c * dt / self.dx);
-        let alpha = 1.0 / (1.0 + cfl);
-        let eta_ghost = alpha * eta_ext + (1.0 - alpha) * eta_int;
-        let h_ghost = (eta_ghost - ctx.bathymetry).max(self.h_min);
-
-        // Flather for normal velocity
-        // u_n_ghost = u_n_ext + (c/h_ref) * (η_int - η_ext)
-        let h_ref = self.h_ref.max(self.h_min);
-        let c_ref = (g * h_ref).sqrt();
-        let un_ghost = un_ext + (c_ref / h_ref) * (eta_int - eta_ext);
+        // Ghost = external state. The Riemann solver radiates the outgoing
+        // invariant from the interior and takes the incoming one from here;
+        // blending η_int into the ghost or adding a Flather correction to
+        // u_n would feed the outgoing wave back in (see type docs).
+        let h_ghost = (eta_ext - ctx.bathymetry).max(self.h_min);
+        let un_ghost = un_ext;
 
         // Tangential velocity from interior (zero-gradient)
         let ut_ghost = ctx.interior_tangential_velocity();
@@ -380,25 +429,44 @@ mod tests {
     }
 
     #[test]
-    fn test_chapman_flather_inflow() {
-        // When interior elevation is higher, Flather should reduce normal velocity
-        let cf = ChapmanFlather2D::new(|_, _, _| (8.0, 0.0, 0.0), 100.0).with_h_ref(10.0);
-
-        // Interior: eta_int = 10, External: eta_ext = 8
-        // Flather: u_n = u_n_ext + c/h_ref * (eta_int - eta_ext)
-        //        = 0 + sqrt(g*h_ref)/h_ref * (10-8)
-        //        = sqrt(g/h_ref) * 2
+    fn test_chapman_flather_ghost_is_external_state() {
+        // Interior η = 10 lies above the external η = 8, with inflow u_n,ext.
+        // The ghost is the external state (h = η_ext − B, u_n = u_n,ext).
+        // Regression: the old ghost added sqrt(g/h_ref)(η_int − η_ext) to
+        // u_n, so the Riemann solver applied the Flather relation twice and
+        // reflected outgoing waves.
+        let cf = ChapmanFlather2D::new(|_, _, _| (8.0, -0.3, 0.0), 100.0).with_h_ref(10.0);
         let ctx = make_context(10.0, 0.0, 0.0, (1.0, 0.0));
         let ghost = cf.ghost_state(&ctx);
 
-        let expected_un = (G / 10.0).sqrt() * 2.0;
-        let u_ghost = ghost.hu / ghost.h;
+        assert!((ghost.h - 8.0).abs() < TOL, "ghost depth: got {}", ghost.h);
+        let un_ghost = ghost.hu / ghost.h;
+        assert!(
+            (un_ghost - (-0.3)).abs() < TOL,
+            "ghost normal velocity should be u_n,ext: got {}",
+            un_ghost
+        );
+
+        // The Flather response comes from the upwind flux: the elevated
+        // interior still drains outward through the boundary.
+        let flux = crate::flux::roe_flux_swe_2d(&ctx.interior_state, &ghost, ctx.normal, G, 1e-6);
+        assert!(flux.h > 0.0, "expected outward mass flux, got {}", flux.h);
+    }
+
+    #[test]
+    fn test_chapman_without_dt_clamps_to_external() {
+        // No dt on the BC or in the context: fall back to α = 1 (the dt → 0
+        // limit). Regression: the old fallback c·dt/dx = 1 gave α = 1/2,
+        // which is unstable in the weak DG setting.
+        let chapman = Chapman2D::new(|_, _, _| 7.0, 100.0);
+        let ctx = make_context(10.0, 0.0, 0.0, (1.0, 0.0)); // η_int = 10
+        assert!(ctx.dt.is_none());
+        let ghost = chapman.ghost_state(&ctx);
 
         assert!(
-            (u_ghost - expected_un).abs() < 0.1,
-            "Flather normal velocity: expected ~{}, got {}",
-            expected_un,
-            u_ghost
+            (ghost.h - 7.0).abs() < TOL,
+            "ghost elevation should be η_ext without dt, got {}",
+            ghost.h
         );
     }
 

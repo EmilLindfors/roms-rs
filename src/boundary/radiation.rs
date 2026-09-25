@@ -111,12 +111,23 @@ impl SWEBoundaryCondition for RadiationBC {
 /// Flather radiation boundary condition.
 ///
 /// A widely-used open boundary condition in ocean modeling that combines
-/// information about both sea surface height and normal velocity.
+/// information about both sea surface height and normal velocity:
 ///
-/// η_b = η_ext + (u_int - u_ext) * sqrt(h/g)
+/// ```text
+/// u_n = u_n,ext + sqrt(g/h) (η − η_ext)
+/// ```
 ///
 /// This is particularly effective for tidal simulations where external
 /// forcing (η_ext, u_ext) is known.
+///
+/// # Weak (ghost-state) formulation
+///
+/// The Flather relation prescribes the incoming Riemann invariant
+/// `u_n − sqrt(g/h) η` from the external state and leaves the outgoing one
+/// free. The upwind Riemann solver at the boundary does exactly that when fed
+/// the external state as ghost, so the ghost is `(h = η_ext − B, u = u_ext)`.
+/// Applying the relation inside the ghost as well would count it twice and
+/// reflect outgoing waves with coefficient −1/3.
 ///
 /// Reference: Flather (1976), "A tidal model of the north-west European
 /// continental shelf"
@@ -124,11 +135,17 @@ impl SWEBoundaryCondition for RadiationBC {
 pub struct FlatherBC {
     /// External (reference) water surface elevation
     pub eta_ext: f64,
-    /// External (reference) normal velocity
+    /// External (reference) velocity along +x
     pub u_ext: f64,
-    /// Bathymetry at boundary (for computing depth from eta)
+    /// Bathymetry at boundary.
+    ///
+    /// **Unused**: the ghost depth uses the context bathymetry,
+    /// `h = η_ext − ctx.bathymetry`. Retained for API compatibility.
     pub bathymetry: f64,
-    /// Gravitational acceleration
+    /// Gravitational acceleration.
+    ///
+    /// **Unused**: the Riemann solver supplies the wave speed. Retained for
+    /// API compatibility.
     pub g: f64,
     /// Minimum depth
     pub h_min: f64,
@@ -164,25 +181,13 @@ impl FlatherBC {
 
 impl SWEBoundaryCondition for FlatherBC {
     fn ghost_state(&self, ctx: &BCContext) -> SWEState {
-        // Use depth at boundary for wave speed
-        let h_boundary = (self.eta_ext - self.bathymetry).max(self.h_min);
-
-        // Flather condition modifies the boundary velocity
-        // The sign depends on boundary orientation
-        let u_ghost = if ctx.normal > 0.0 {
-            // Right boundary: outflow is positive
-            self.u_ext
-                + (ctx.interior_surface_elevation() - self.eta_ext) * (self.g / h_boundary).sqrt()
-        } else {
-            // Left boundary: outflow is negative
-            self.u_ext
-                - (ctx.interior_surface_elevation() - self.eta_ext) * (self.g / h_boundary).sqrt()
-        };
-
-        // Depth from external elevation
+        // Ghost = external state (h = η_ext − B). The Riemann solver takes the
+        // outgoing invariant from the interior and the incoming one from here,
+        // which is the Flather relation; adding sqrt(g/h)(η_int − η_ext) to
+        // the ghost velocity would apply it twice.
         let h_ghost = (self.eta_ext - ctx.bathymetry).max(0.0);
 
-        SWEState::from_primitives(h_ghost, u_ghost)
+        SWEState::from_primitives(h_ghost, self.u_ext)
     }
 
     fn name(&self) -> &'static str {
@@ -351,9 +356,26 @@ mod tests {
         let ctx = make_context(2.5, 0.0, bath, 1.0);
         let ghost = bc.ghost_state(&ctx);
 
-        // Should induce outward flow (positive at right boundary)
-        let u_ghost = ghost.velocity_simple(1e-6);
-        assert!(u_ghost > 0.0, "Higher interior should cause outflow");
+        // The ghost is the external state (h = η_ext − B, u = u_ext).
+        // Regression: the old ghost added sqrt(g/h)(η_int − η_ext) to u, so
+        // the Riemann solver applied the Flather relation twice.
+        assert!((ghost.h - 2.0).abs() < TOL);
+        assert!(ghost.hu.abs() < TOL);
+
+        // Outflow comes from the upwind flux, on either boundary.
+        let flux_right = crate::flux::roe_flux_swe(&ctx.interior_state, &ghost, G, 1e-6);
+        assert!(
+            flux_right.h > 0.0,
+            "Higher interior should drain through the right boundary"
+        );
+
+        let ctx_left = make_context(2.5, 0.0, bath, -1.0);
+        let ghost_left = bc.ghost_state(&ctx_left);
+        let flux_left = crate::flux::roe_flux_swe(&ghost_left, &ctx_left.interior_state, G, 1e-6);
+        assert!(
+            flux_left.h < 0.0,
+            "Higher interior should drain through the left boundary"
+        );
     }
 
     #[test]

@@ -20,7 +20,26 @@
 //!
 //! Boundary conditions:
 //! - Tidal: Flather with prescribed η_tidal and characteristic velocity
-//! - Subtidal: Chapman radiation allowing slow variations to exit
+//! - Subtidal: radiates freely, allowing slow variations to exit
+//!
+//! # Weak (ghost-state) formulation
+//!
+//! The ghost state is the predicted tide, `h = η_tidal − B` with zero normal
+//! velocity (tangential velocity from the interior). The upwind Riemann solver
+//! at the boundary face takes the incoming Riemann invariant
+//! `w− = u_n − sqrt(g/h) η` from the ghost and the outgoing invariant
+//! `w+ = u_n + sqrt(g/h) η` from the interior, so:
+//!
+//! - only the predicted tide enters the domain, and
+//! - everything else — the subtidal residual `η_int − η_tidal` as well as
+//!   reflected tidal energy — leaves through the outgoing invariant.
+//!
+//! The split is by propagation direction, not by frequency, so no explicit
+//! radiation velocity is needed. Adding one (a Flather term
+//! `sqrt(g/h)(η_int − η_tidal)` or a radiation term `c (η_int − η_tidal)/dx`)
+//! would feed the outgoing wave back into the incoming invariant and reflect
+//! it. As a result [`TSTConfig::dx`], [`TSTConfig::h_ref`] and
+//! [`TSTConfig::subtidal_weight`] no longer affect the ghost state.
 //!
 //! # Example
 //!
@@ -123,13 +142,21 @@ pub struct TSTConfig {
     pub mean_elevation: f64,
     /// Tidal constituents
     pub constituents: Vec<TSTConstituent>,
-    /// Reference depth below mean sea level
+    /// Reference depth below mean sea level.
+    ///
+    /// **Unused** by `ghost_state`: depth is `η_tidal − B`. Retained for API
+    /// compatibility.
     pub h_ref: f64,
-    /// Grid spacing for radiation term (dx)
+    /// Grid spacing for radiation term (dx).
+    ///
+    /// **Unused**: the Riemann solver radiates the subtidal residual (see the
+    /// module docs). Retained for API compatibility.
     pub dx: f64,
-    /// Subtidal radiation weight (0-1)
-    /// - 0: Pure tidal (no subtidal radiation)
-    /// - 1: Full subtidal radiation
+    /// Subtidal radiation weight (0-1).
+    ///
+    /// **Unused**: in the weak ghost-state formulation the subtidal residual
+    /// always leaves through the outgoing Riemann invariant (see the module
+    /// docs). Retained for API compatibility.
     pub subtidal_weight: f64,
     /// Minimum depth threshold
     pub h_min: f64,
@@ -242,7 +269,10 @@ impl TSTConfig {
 ///
 /// Separates boundary forcing into:
 /// - Tidal: Prescribed from harmonic constituents (Flather-type)
-/// - Subtidal: Radiates freely (Chapman-type)
+/// - Subtidal: Radiates freely
+///
+/// The ghost state is the predicted tide at rest in the normal direction; the
+/// Riemann solver does the separation (see the module docs).
 #[derive(Clone, Debug)]
 pub struct TSTOBC2D {
     config: TSTConfig,
@@ -307,56 +337,28 @@ impl TSTOBC2D {
 impl SWEBoundaryCondition2D for TSTOBC2D {
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         let t = ctx.time;
-        let g = ctx.g;
         let (nx, ny) = ctx.normal;
 
-        // 1. Predict tidal elevation and corresponding depth
+        // 1. Predict tidal elevation and corresponding depth (h = η − B)
         let eta_tidal = self.predict_tidal_elevation(t);
         let h_tidal = (eta_tidal - ctx.bathymetry).max(self.config.h_min);
 
-        // 2. Interior state
-        let h_int = ctx.interior_state.h;
-        let eta_int = ctx.interior_surface_elevation();
+        // 2. Ghost = predicted tide with zero normal velocity. The Riemann
+        // solver takes the incoming invariant from here (tide in) and the
+        // outgoing invariant from the interior (subtidal residual and
+        // reflected tide out). No Flather or radiation velocity is added:
+        // that would apply the characteristic correction twice.
+        let un_ghost = 0.0;
 
-        // 3. Compute subtidal residual
-        // η_subtidal = η_interior - η_tidal
-        let eta_subtidal = eta_int - eta_tidal;
-
-        // 4. Wave celerities
-        let c_tidal = (g * h_tidal).sqrt();
-        let c_int = (g * h_int.max(self.config.h_min)).sqrt();
-
-        // 5. Tidal component: Flather relation
-        // u_n_tidal = c * (η_int - η_tidal) / h_tidal
-        // This gives zero when interior matches tidal prediction
-        let un_tidal = c_tidal * (eta_int - eta_tidal) / h_tidal;
-
-        // 6. Subtidal component: Chapman radiation
-        // The Chapman condition radiates subtidal residuals
-        // ∂η_subtidal/∂t + c * ∂η_subtidal/∂n = 0
-        //
-        // For outgoing radiation, positive subtidal elevation should
-        // produce outward flow (positive normal velocity) to carry
-        // the perturbation out of the domain.
-        //
-        // u_n_subtidal = c * η_subtidal / dx (radiation velocity)
-        let un_subtidal = c_int * eta_subtidal / self.config.dx;
-
-        // 7. Blend tidal and subtidal velocities
-        let w = self.config.subtidal_weight;
-        let un_ghost = un_tidal + w * un_subtidal;
-
-        // 8. Preserve tangential velocity from interior
+        // 3. Preserve tangential velocity from interior
         let ut_ghost = ctx.interior_tangential_velocity();
 
-        // 9. Convert (un, ut) back to (u, v) in Cartesian coordinates
+        // 4. Convert (un, ut) back to (u, v) in Cartesian coordinates
         // u = un * nx - ut * ny
         // v = un * ny + ut * nx
         let u_ghost = un_ghost * nx - ut_ghost * ny;
         let v_ghost = un_ghost * ny + ut_ghost * nx;
 
-        // 10. Use tidal depth for ghost state
-        // The subtidal adjustment affects velocity, not depth
         SWEState2D::from_primitives(h_tidal, u_ghost, v_ghost)
     }
 
@@ -534,14 +536,16 @@ mod tests {
 
         let ghost = bc.ghost_state(&ctx);
 
-        // Should generate outward velocity to radiate the surge
-        // h_tidal = η_tidal - B = 0 - (-50) = 50
-        // c = sqrt(9.81 * 51) ≈ 22.4 m/s
-        // u_n = c * η_subtidal / dx ≈ 22.4 * 1.0 / 800 ≈ 0.028 m/s (outward)
-        assert!(
-            ghost.hu / ghost.h > 0.0,
-            "Expected positive (outward) velocity"
-        );
+        // The ghost is the predicted tide at rest: h_tidal = η_tidal − B = 50.
+        // Regression: the old ghost added Flather and "subtidal radiation"
+        // velocities driven by η_int − η_tidal, applying the characteristic
+        // correction on top of the Riemann solver and reflecting the surge.
+        assert!((ghost.h - 50.0).abs() < TOL);
+        assert!(ghost.hu.abs() < TOL, "ghost u_n should be zero");
+
+        // The surge radiates through the upwind flux: outward mass flux.
+        let flux = crate::flux::roe_flux_swe_2d(&ctx.interior_state, &ghost, ctx.normal, G, H_MIN);
+        assert!(flux.h > 0.0, "expected outward mass flux, got {}", flux.h);
     }
 
     #[test]
