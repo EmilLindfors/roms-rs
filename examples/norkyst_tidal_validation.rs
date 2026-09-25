@@ -158,9 +158,9 @@ fn real_data_mode(path: &str, lon: f64, lat: f64) {
 
 /// Load a sea-surface-height series from either the text point format or, with
 /// the `parquet` feature, a norkyst-client **grid** parquet file/dataset
-/// (picking the wet cell nearest `(lon, lat)`). Returns `None` (after printing
+/// (picking the wet cell nearest `(lon, lat)`). A multi-site text file is
+/// reduced to the site nearest `(lon, lat)`. Returns `None` (after printing
 /// why) if nothing usable is found.
-#[cfg_attr(not(feature = "parquet"), allow(unused_variables))]
 fn load_zeta(path: &str, lon: f64, lat: f64) -> Option<TimeSeries> {
     let p = std::path::Path::new(path);
     let looks_parquet = p.is_dir() || p.extension().is_some_and(|e| e == "parquet");
@@ -206,7 +206,33 @@ fn load_zeta(path: &str, lon: f64, lat: f64) -> Option<TimeSeries> {
             return None;
         }
     };
-    let zeta = data.sea_surface_height_series();
+    // Site-mode files interleave several stations; keep the one nearest (lon, lat).
+    let data = match data.site_ids().as_slice() {
+        [] | [_] => data,
+        ids => {
+            let dist2 = |id: i64| {
+                let r = data.records_for_site(id).next().expect("site has records");
+                let dlon = (r.lon - lon) * lat.to_radians().cos();
+                dlon * dlon + (r.lat - lat).powi(2)
+            };
+            let id = *ids
+                .iter()
+                .min_by(|&&a, &&b| dist2(a).total_cmp(&dist2(b)))
+                .expect("non-empty");
+            println!(
+                "  {} sites; using site {id}, nearest ({lon}, {lat})",
+                ids.len()
+            );
+            data.for_site(id)
+        }
+    };
+    let zeta = match data.sea_surface_height_series() {
+        Ok(z) => z,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return None;
+        }
+    };
     println!(
         "  {} snapshots, {} with sea-surface height",
         data.len(),
@@ -270,7 +296,9 @@ fn synthetic_self_check() {
     std::fs::write(&file, &text).expect("write temp series");
     println!("Wrote synthetic series: {}", file.display());
     let data = read_norkyst_text_file(&file).expect("read back series");
-    let zeta_series = data.sea_surface_height_series();
+    let zeta_series = data
+        .sea_surface_height_series()
+        .expect("single-site series");
     println!(
         "Read back {} snapshots ({} with zeta)\n",
         data.len(),

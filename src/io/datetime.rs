@@ -1,9 +1,10 @@
-//! Shared date/time parsing for the NorKyst ingest readers.
+//! Shared date/time parsing for the `io` readers.
 //!
-//! Both the text reader (`norkyst_reader`) and the parquet reader
-//! (`norkyst_parquet`) convert timestamp strings to seconds since the Unix
-//! epoch (1970-01-01 00:00:00 UTC) with an exact proleptic-Gregorian
-//! conversion, so the elapsed-time spacing a harmonic fit needs is preserved.
+//! The NorKyst text and parquet readers and the tide-gauge reader all convert
+//! timestamp strings to seconds since the Unix epoch (1970-01-01 00:00:00 UTC)
+//! with one exact proleptic-Gregorian conversion. Model/NorKyst output and gauge
+//! observations therefore land on the same absolute time axis, and the
+//! elapsed-time spacing a harmonic fit needs is preserved.
 
 /// Convert a datetime string to seconds since the Unix epoch.
 ///
@@ -12,10 +13,17 @@
 /// `YYYY-MM-DDTHH:MM:SS[.f](Z | ±HH:MM | ±HHMM)`. A numeric UTC offset is
 /// applied (UTC = local − offset), so `…+00:00` and `…Z` agree. The date→days
 /// conversion is exact proleptic Gregorian.
+///
+/// Out-of-range fields (`2024-02-30`, `25:00`, `:61`) and non-finite numbers
+/// (`NaN`, `inf`) are rejected rather than silently rolled over.
 pub(crate) fn parse_datetime_seconds(s: &str) -> Result<f64, String> {
     let s = s.trim();
     if let Ok(v) = s.parse::<f64>() {
-        return Ok(v);
+        return if v.is_finite() {
+            Ok(v)
+        } else {
+            Err(format!("non-finite time {s:?}"))
+        };
     }
 
     // Strip a trailing `Z` / ` UTC` first — otherwise the `T` in "UTC" would be
@@ -40,7 +48,7 @@ pub(crate) fn parse_datetime_seconds(s: &str) -> Result<f64, String> {
     let year: i64 = d[0].parse().map_err(|_| "bad year".to_string())?;
     let month: i64 = d[1].parse().map_err(|_| "bad month".to_string())?;
     let day: i64 = d[2].parse().map_err(|_| "bad day".to_string())?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || !(1..=days_in_month(year, month)).contains(&day) {
         return Err(format!("date out of range {date_part:?}"));
     }
 
@@ -57,6 +65,14 @@ pub(crate) fn parse_datetime_seconds(s: &str) -> Result<f64, String> {
         minute = t[1].parse().map_err(|_| "bad minute".to_string())?;
         if t.len() > 2 {
             second = t[2].parse().map_err(|_| "bad second".to_string())?;
+        }
+        // `second` may be 60 for a leap second; NaN fails the range check.
+        if t.len() > 3
+            || !(0..=23).contains(&hour)
+            || !(0..=59).contains(&minute)
+            || !(0.0..61.0).contains(&second)
+        {
+            return Err(format!("time out of range {time_str:?}"));
         }
     }
 
@@ -86,11 +102,36 @@ fn split_timezone(time_part: &str) -> Result<(&str, f64), String> {
             None if off.len() >= 4 => (&off[..2], &off[2..4]),
             None => (off, "0"),
         };
-        let oh: f64 = oh.parse().map_err(|_| "bad tz hour".to_string())?;
-        let om: f64 = om.parse().map_err(|_| "bad tz minute".to_string())?;
-        return Ok((time.trim_end(), sign * (oh * 3600.0 + om * 60.0)));
+        let oh: u32 = oh.parse().map_err(|_| "bad tz hour".to_string())?;
+        let om: u32 = om.parse().map_err(|_| "bad tz minute".to_string())?;
+        if oh > 23 || om > 59 {
+            return Err(format!("tz offset out of range {off:?}"));
+        }
+        let offset = f64::from(oh * 3600 + om * 60);
+        return Ok((time.trim_end(), sign * offset));
     }
     Ok((time_part, 0.0))
+}
+
+/// Number of days in `month` (1–12) of proleptic-Gregorian `year`.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Sort `(time, value)` samples by time and drop repeated timestamps.
+///
+/// The sort is stable and the first sample at each time is kept, so input order
+/// decides between duplicates. Duplicates arise when a dataset holds the same
+/// instant twice (overlapping grid selections, a month fetched twice); a
+/// harmonic fit fed a repeated time sees a zero step and conflicting equations.
+pub(crate) fn sort_dedup_by_time<T>(samples: &mut Vec<(f64, T)>) {
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    samples.dedup_by(|b, a| a.0 == b.0);
 }
 
 /// Days from 1970-01-01 to the given proleptic-Gregorian date.
@@ -148,5 +189,42 @@ mod tests {
         // Compact ±HHMM form.
         let compact = parse_datetime_seconds("2024-01-01T03:00:00+0200").unwrap();
         assert!((compact - utc).abs() < TOL);
+    }
+
+    #[test]
+    fn out_of_range_fields_are_rejected() {
+        // Regression: these used to roll over into the next day/month.
+        for bad in [
+            "2024-02-30T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "2024-04-31T00:00:00Z",
+            "2024-01-01T24:00:00Z",
+            "2024-01-01T25:61:00Z",
+            "2024-01-01T00:60:00Z",
+            "2024-01-01T00:00:61Z",
+            "2024-01-01T00:00:NaNZ",
+            "2024-01-01T00:00:00+24:00",
+            "2024-01-01T00:00:00:00Z",
+        ] {
+            assert!(parse_datetime_seconds(bad).is_err(), "accepted {bad:?}");
+        }
+        // Leap days that exist are fine.
+        assert!(parse_datetime_seconds("2024-02-29T00:00:00Z").is_ok());
+        assert!(parse_datetime_seconds("2000-02-29T00:00:00Z").is_ok());
+        assert!(parse_datetime_seconds("1900-02-29T00:00:00Z").is_err());
+    }
+
+    #[test]
+    fn non_finite_numeric_times_are_rejected() {
+        for bad in ["NaN", "nan", "inf", "-inf", "infinity"] {
+            assert!(parse_datetime_seconds(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn sort_dedup_keeps_first_of_each_time() {
+        let mut s = vec![(3.0, 'c'), (1.0, 'a'), (3.0, 'x'), (2.0, 'b'), (1.0, 'y')];
+        sort_dedup_by_time(&mut s);
+        assert_eq!(s, vec![(1.0, 'a'), (2.0, 'b'), (3.0, 'c')]);
     }
 }

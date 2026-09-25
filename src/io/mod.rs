@@ -74,13 +74,13 @@
 mod adcp_reader;
 mod coastline;
 mod constituent_reader;
+mod datetime;
 mod geotiff;
 #[cfg(feature = "netcdf")]
 mod netcdf_io;
 #[cfg(feature = "parquet")]
 mod norkyst_parquet;
 mod norkyst_reader;
-mod norkyst_time;
 mod projection;
 mod tide_gauge_reader;
 mod timeseries_reader;

@@ -10,9 +10,10 @@
 //!
 //! # Text format
 //!
-//! Each snapshot is one block: an optional `site_id:` line, a `time=…` line, a
-//! `surface …` line carrying sea-surface height (`zeta`) and bottom depth, then
-//! one `depth=…` line per vertical level:
+//! Each snapshot is one block: a `time=…` line, a `surface …` line carrying
+//! sea-surface height (`zeta`) and bottom depth, then one `depth=…` line per
+//! vertical level. A `site_id:` line applies to every following block until the
+//! next `site_id:` line:
 //!
 //! ```text
 //! site_id: 10362
@@ -35,13 +36,11 @@
 //! Older builds that omitted it yield records with `sea_surface_height = None`;
 //! [`NorKystTextData::sea_surface_height_series`] then returns an empty series.
 
-use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::Path;
 
 use thiserror::Error;
 
-use super::norkyst_time::parse_datetime_seconds;
+use super::datetime::{parse_datetime_seconds, sort_dedup_by_time};
 use crate::analysis::TimeSeries;
 
 /// Error type for parsing norkyst-client text output.
@@ -63,6 +62,16 @@ pub enum NorKystTextError {
     /// No time snapshots were found in the input.
     #[error("no NorKyst records found in input")]
     Empty,
+
+    /// A single-location series was requested from records at several locations.
+    #[error(
+        "records span more than one location (site ids {site_ids:?}); \
+         select one with NorKystTextData::for_site"
+    )]
+    MultipleLocations {
+        /// Distinct site identifiers present, in first-seen order.
+        site_ids: Vec<i64>,
+    },
 }
 
 /// A single vertical level within a snapshot.
@@ -117,10 +126,11 @@ impl NorKystRecord {
 ///
 /// Typical use is a single point extraction (one location, many times), but a
 /// site-mode file can interleave several locations; use [`site_ids`] /
-/// [`records_for_site`] to split when needed.
+/// [`for_site`] to split when needed. The series extractors refuse mixed-location
+/// input rather than silently interleaving stations.
 ///
 /// [`site_ids`]: NorKystTextData::site_ids
-/// [`records_for_site`]: NorKystTextData::records_for_site
+/// [`for_site`]: NorKystTextData::for_site
 #[derive(Clone, Debug, Default)]
 pub struct NorKystTextData {
     /// All snapshots, in file order.
@@ -158,51 +168,83 @@ impl NorKystTextData {
             .filter(move |r| r.site_id == Some(site_id))
     }
 
+    /// The subset of snapshots belonging to one site, as its own data set.
+    ///
+    /// Use this to split site-mode input before extracting a series.
+    pub fn for_site(&self, site_id: i64) -> NorKystTextData {
+        NorKystTextData {
+            records: self.records_for_site(site_id).cloned().collect(),
+        }
+    }
+
+    /// `Err(MultipleLocations)` unless every record shares the first record's
+    /// site id and coordinates.
+    fn check_single_location(&self) -> Result<(), NorKystTextError> {
+        let Some(first) = self.records.first() else {
+            return Ok(());
+        };
+        const COORD_TOL: f64 = 1e-9;
+        let same = |r: &NorKystRecord| {
+            r.site_id == first.site_id
+                && (r.lat - first.lat).abs() <= COORD_TOL
+                && (r.lon - first.lon).abs() <= COORD_TOL
+        };
+        if self.records.iter().all(same) {
+            Ok(())
+        } else {
+            Err(NorKystTextError::MultipleLocations {
+                site_ids: self.site_ids(),
+            })
+        }
+    }
+
     /// Sea-surface height (`zeta`) time series over all snapshots that have it.
     ///
     /// This is the series to feed the tidal validation path
     /// (`HarmonicAnalysis::fit` → `reference_constants` → catalogue compare).
-    /// Assumes a single location; for multi-site input, filter with
-    /// [`records_for_site`](Self::records_for_site) first.
-    pub fn sea_surface_height_series(&self) -> TimeSeries {
-        let (times, values): (Vec<f64>, Vec<f64>) = self
+    /// Samples are sorted by time and repeated timestamps are dropped (first
+    /// kept). Errors with [`NorKystTextError::MultipleLocations`] if the records
+    /// span several sites or coordinates; split with [`for_site`](Self::for_site).
+    pub fn sea_surface_height_series(&self) -> Result<TimeSeries, NorKystTextError> {
+        self.check_single_location()?;
+        let mut samples: Vec<(f64, f64)> = self
             .records
             .iter()
             .filter_map(|r| r.sea_surface_height.map(|z| (r.time, z)))
-            .unzip();
-        TimeSeries::new(&times, &values)
+            .collect();
+        sort_dedup_by_time(&mut samples);
+        let (times, values): (Vec<f64>, Vec<f64>) = samples.into_iter().unzip();
+        Ok(TimeSeries::new(&times, &values))
     }
 
     /// Surface (shallowest) current time series `(u, v)` in m/s.
     ///
     /// Each snapshot contributes its shallowest level that has both components;
     /// snapshots without currents are skipped. Useful for a first comparison
-    /// against ADCP surface currents.
-    pub fn surface_current_series(&self) -> (TimeSeries, TimeSeries) {
-        let mut times = Vec::new();
-        let mut us = Vec::new();
-        let mut vs = Vec::new();
-        for r in &self.records {
-            if let Some(level) = r.surface_level() {
-                // surface_level guarantees both are Some.
-                times.push(r.time);
-                us.push(level.u_current.unwrap());
-                vs.push(level.v_current.unwrap());
-            }
-        }
-        (TimeSeries::new(&times, &us), TimeSeries::new(&times, &vs))
+    /// against ADCP surface currents. Sorting, de-duplication and the
+    /// single-location check are as for
+    /// [`sea_surface_height_series`](Self::sea_surface_height_series).
+    pub fn surface_current_series(&self) -> Result<(TimeSeries, TimeSeries), NorKystTextError> {
+        self.check_single_location()?;
+        let mut samples: Vec<(f64, (f64, f64))> = self
+            .records
+            .iter()
+            .filter_map(|r| {
+                let level = r.surface_level()?;
+                Some((r.time, (level.u_current?, level.v_current?)))
+            })
+            .collect();
+        sort_dedup_by_time(&mut samples);
+        let times: Vec<f64> = samples.iter().map(|s| s.0).collect();
+        let us: Vec<f64> = samples.iter().map(|s| s.1.0).collect();
+        let vs: Vec<f64> = samples.iter().map(|s| s.1.1).collect();
+        Ok((TimeSeries::new(&times, &us), TimeSeries::new(&times, &vs)))
     }
 }
 
 /// Read norkyst-client text output from a file.
 pub fn read_norkyst_text_file(path: &Path) -> Result<NorKystTextData, NorKystTextError> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut lines = Vec::new();
-    for line in reader.lines() {
-        lines.push(line?);
-    }
-    parse_norkyst_text(lines.iter().map(|s| s.as_str()))
+    parse_norkyst_text_str(&std::fs::read_to_string(path)?)
 }
 
 /// Parse norkyst-client text output from an in-memory string.
@@ -215,7 +257,8 @@ fn parse_norkyst_text<'a>(
     lines: impl IntoIterator<Item = &'a str>,
 ) -> Result<NorKystTextData, NorKystTextError> {
     let mut records: Vec<NorKystRecord> = Vec::new();
-    let mut pending_site_id: Option<i64> = None;
+    // Sticky: applies to every following `time=` block until replaced.
+    let mut site_id: Option<i64> = None;
     let mut current: Option<NorKystRecord> = None;
 
     for (idx, raw) in lines.into_iter().enumerate() {
@@ -226,15 +269,14 @@ fn parse_norkyst_text<'a>(
         }
 
         if let Some(rest) = line.strip_prefix("site_id:") {
-            pending_site_id =
-                Some(
-                    rest.trim()
-                        .parse()
-                        .map_err(|_| NorKystTextError::ParseError {
-                            line: line_no,
-                            message: format!("invalid site_id: {rest:?}"),
-                        })?,
-                );
+            site_id = Some(
+                rest.trim()
+                    .parse()
+                    .map_err(|_| NorKystTextError::ParseError {
+                        line: line_no,
+                        message: format!("invalid site_id: {rest:?}"),
+                    })?,
+            );
             continue;
         }
 
@@ -247,7 +289,7 @@ fn parse_norkyst_text<'a>(
                 time,
                 lat,
                 lon,
-                site_id: pending_site_id.take(),
+                site_id,
                 sea_surface_height: None,
                 bottom_depth: None,
                 profile: Vec::new(),
@@ -474,7 +516,7 @@ depth=0 temperature=Some(8.6) salinity=Some(34.0) u_current=Some(0.15) v_current
     #[test]
     fn sea_surface_height_series_extracts_zeta() {
         let data = parse_norkyst_text_str(SAMPLE).unwrap();
-        let ts = data.sea_surface_height_series();
+        let ts = data.sea_surface_height_series().unwrap();
         assert_eq!(ts.len(), 2);
         assert!((ts.values()[0] - 0.42).abs() < TOL);
         assert!((ts.values()[1] - 0.55).abs() < TOL);
@@ -484,7 +526,7 @@ depth=0 temperature=Some(8.6) salinity=Some(34.0) u_current=Some(0.15) v_current
     #[test]
     fn surface_current_uses_shallowest_level_and_skips_missing() {
         let data = parse_norkyst_text_str(SAMPLE).unwrap();
-        let (u, v) = data.surface_current_series();
+        let (u, v) = data.surface_current_series().unwrap();
         // Second snapshot's shallowest level has v_current=None, so it is skipped.
         assert_eq!(u.len(), 1);
         assert_eq!(v.len(), 1);
@@ -512,6 +554,99 @@ surface sea_surface_height=Some(0.2) bottom_depth=Some(80.0)
     }
 
     #[test]
+    fn site_id_applies_to_all_following_blocks() {
+        // Regression: the documented format has one `site_id:` line followed by
+        // several `time=` blocks; only the first block used to get the id.
+        let text = "\
+site_id: 10362
+time=2024-01-01 00:00:00 UTC lat=63.44 lon=10.39
+surface sea_surface_height=Some(0.42) bottom_depth=Some(120.0)
+time=2024-01-01 01:00:00 UTC lat=63.44 lon=10.39
+surface sea_surface_height=Some(0.55) bottom_depth=Some(120.0)
+site_id: 7
+time=2024-01-01 00:00:00 UTC lat=60.00 lon=5.00
+surface sea_surface_height=Some(0.10) bottom_depth=Some(50.0)
+time=2024-01-01 01:00:00 UTC lat=60.00 lon=5.00
+surface sea_surface_height=Some(0.20) bottom_depth=Some(50.0)
+";
+        let data = parse_norkyst_text_str(text).unwrap();
+        assert!(data.records.iter().all(|r| r.site_id.is_some()));
+        assert_eq!(data.records_for_site(10362).count(), 2);
+        assert_eq!(data.records_for_site(7).count(), 2);
+        assert_eq!(data.site_ids(), vec![10362, 7]);
+    }
+
+    #[test]
+    fn mixed_site_series_is_rejected_until_split() {
+        // Regression: interleaved site-mode output used to be merged into one
+        // zeta series alternating between stations, with repeated timestamps.
+        let text = "\
+site_id: 1
+time=2024-01-01 00:00:00 UTC lat=60.0 lon=5.0
+surface sea_surface_height=Some(0.1) bottom_depth=Some(50.0)
+site_id: 2
+time=2024-01-01 00:00:00 UTC lat=61.0 lon=6.0
+surface sea_surface_height=Some(0.2) bottom_depth=Some(80.0)
+site_id: 1
+time=2024-01-01 01:00:00 UTC lat=60.0 lon=5.0
+surface sea_surface_height=Some(0.3) bottom_depth=Some(50.0)
+site_id: 2
+time=2024-01-01 01:00:00 UTC lat=61.0 lon=6.0
+surface sea_surface_height=Some(0.4) bottom_depth=Some(80.0)
+";
+        let data = parse_norkyst_text_str(text).unwrap();
+        assert!(matches!(
+            data.sea_surface_height_series(),
+            Err(NorKystTextError::MultipleLocations { ref site_ids }) if site_ids == &[1, 2]
+        ));
+        assert!(data.surface_current_series().is_err());
+
+        let site2 = data.for_site(2).sea_surface_height_series().unwrap();
+        assert_eq!(site2.values(), vec![0.2, 0.4]);
+        assert!((site2.duration() - 3600.0).abs() < TOL);
+    }
+
+    #[test]
+    fn coordinate_change_without_site_ids_is_rejected() {
+        let text = "\
+time=2024-01-01 00:00:00 UTC lat=60.0 lon=5.0
+surface sea_surface_height=Some(0.1) bottom_depth=Some(50.0)
+time=2024-01-01 00:00:00 UTC lat=61.0 lon=6.0
+surface sea_surface_height=Some(0.2) bottom_depth=Some(80.0)
+";
+        let data = parse_norkyst_text_str(text).unwrap();
+        assert!(data.sea_surface_height_series().is_err());
+    }
+
+    #[test]
+    fn series_are_time_sorted_and_deduplicated() {
+        // Out-of-order blocks and a repeated timestamp (e.g. concatenated
+        // overlapping fetches) give a strictly increasing series.
+        let text = "\
+time=2024-01-01 02:00:00 UTC lat=60.0 lon=5.0
+surface sea_surface_height=Some(0.3) bottom_depth=Some(50.0)
+depth=0 u_current=Some(0.03) v_current=Some(-0.03)
+time=2024-01-01 00:00:00 UTC lat=60.0 lon=5.0
+surface sea_surface_height=Some(0.1) bottom_depth=Some(50.0)
+depth=0 u_current=Some(0.01) v_current=Some(-0.01)
+time=2024-01-01 01:00:00 UTC lat=60.0 lon=5.0
+surface sea_surface_height=Some(0.2) bottom_depth=Some(50.0)
+depth=0 u_current=Some(0.02) v_current=Some(-0.02)
+time=2024-01-01 01:00:00 UTC lat=60.0 lon=5.0
+surface sea_surface_height=Some(9.9) bottom_depth=Some(50.0)
+depth=0 u_current=Some(9.9) v_current=Some(9.9)
+";
+        let data = parse_norkyst_text_str(text).unwrap();
+        let zeta = data.sea_surface_height_series().unwrap();
+        assert_eq!(zeta.values(), vec![0.1, 0.2, 0.3]);
+        assert!(zeta.times().windows(2).all(|w| w[1] - w[0] == 3600.0));
+
+        let (u, v) = data.surface_current_series().unwrap();
+        assert_eq!(u.values(), vec![0.01, 0.02, 0.03]);
+        assert_eq!(v.values(), vec![-0.01, -0.02, -0.03]);
+    }
+
+    #[test]
     fn missing_surface_line_yields_empty_zeta_series() {
         // Simulates output from an older client that omitted the surface line.
         let text = "\
@@ -521,7 +656,7 @@ depth=0 temperature=Some(8.0) salinity=Some(34.0) u_current=Some(0.1) v_current=
         let data = parse_norkyst_text_str(text).unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data.records[0].sea_surface_height, None);
-        assert!(data.sea_surface_height_series().is_empty());
+        assert!(data.sea_surface_height_series().unwrap().is_empty());
     }
 
     #[test]
