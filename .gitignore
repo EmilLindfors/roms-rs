@@ -6,3 +6,6 @@ target
 data/*
 output
 perf.data.old
+
+# Personal Claude Code settings (shared settings go in .claude/settings.json)
+.claude/settings.local.json
