@@ -6,6 +6,10 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **`Mesh2D::retain_elements`: water-only meshes (TODO P2.4).** Keeps the elements a predicate selects, renumbers vertices and edges, and turns faces towards dropped elements into boundary faces with a given tag (walls for a coastline). Original boundary tags are kept. It returns the index map to the original elements. Tests cover connectivity and tags on an L-shaped submesh, and `WetDry` lake at rest plus mass conservation on a mesh with an island cut out.
+- **`SWEPhysics2DBuilder` plumbing.**
+  - `with_source` and `with_source_arc` now add up: repeated calls combine through the new owned `source::SourceTerms2D`. Before, each call replaced the previous source.
+  - The `PhysicsModule` impl of `SWEPhysics2D` no longer requires `BC: 'static`, so borrowing boundary conditions such as `MultiBoundaryCondition2D<'a>` work with `Simulation`.
 - **Second-order subcell finite volumes for `SWEFormulation2D::WetDry` (TODO P1.2).**
   - Partially dry elements reconstruct `h`, `η`, `u` and `v` linearly on their GLL subcells, with a monotonized-central limiter on the non-uniform subcells. The end subcells take their outer slope neighbour from the adjacent element. Faces use the hydrostatic HLL flux on the reconstructed states, plus the second-order Audusse et al. (2004) bed term `−½g(h_L + h_R)(B_R − B_L)` (Rueda-Ramírez et al. 2021 for subcell reconstruction).
   - Face depths stay between neighbouring node values (h ≥ 0). A shoreline lake at rest is still kept to round-off, and mass is conserved exactly.
@@ -57,6 +61,15 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **`examples/froya_real_data.rs` rewritten on the production path (TODO P1.2, P6).**
+  - It uses `Simulation` + `SSPRK3` + `SWEPhysics2D` with the wet/dry defaults (`WetDry`, HLL, positivity, implicit Manning friction), nodal bathymetry and a water-only mesh.
+  - Before, it used the legacy `ssp_rk3_swe_2d` stepper, cell-averaged bathymetry, `H_MIN` = 5 m (land as a 5 m water film, and water shallower than 5 m masked as land), and walls on the south and east sides, which cut through open water.
+  - A node is water where GSHHS and the (now correctly georeferenced) GeoTIFF agree. Land nodes of shoreline elements get B = +5 m. All four sides are open.
+  - Options are `key=value` arguments (resolution, order, duration, lake-at-rest hours, output interval, wind, NorKyst file). A synthetic basin with an island and a beach is used when the data are missing.
+  - Default run, 120 × 90 grid, P2 → 9,653 water elements:
+    - lake at rest over the real bathymetry: max |u| 1.5e-10 m/s after 1 h;
+    - one M2 cycle: stable, 0 negative-depth clips, 68k steps at dt 0.65 s, 11.4 min wall (10 ms per step), with wetting and drying of about 650 nodes over the tide.
+  - The uniform-phase M2 forcing leaves boundary jets of up to 2.5 m/s (TODO P1.4).
 - API (wet/dry, breaking; TODO P1.2):
   - `TimeIntegrator::step_with_relaxation` is now the one required method; `step_with_workspace` calls it with a no-op relaxation.
   - `WetDryConfig`:
@@ -101,6 +114,17 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **GeoTIFF georeferencing was never read (io, TODO P1.6).**
+  - `GeoTiffBathymetry` looked up the GeoTIFF tags as `Tag::Unknown(33550)` and friends. The `tiff` crate decodes those numbers to named variants (`ModelPixelScaleTag`, …), so no lookup ever matched, and every file silently took its extent from the bbox hint. The loader also knew nothing of `ModelTransformation` (tag 34264).
+  - `froya_smola_hitra.tif` is georeferenced by `ModelTransformation` (7.27–10.03°E, 62.88–64.32°N). The example's hint (7.5–10.0°E, 63.3–64.2°N) squeezed the latitude span by 40 %, so the Frøya bathymetry was misplaced by several km, up to ~20 km. Agreement with the GSHHS land mask was 72 % unshifted and peaked at 88 % under a 4 km / 13 km shift. It is now 93 % unshifted, and zero shift is the best.
+  - The loader now:
+    - reads `ModelTransformation`, or else `ModelPixelScale` plus `ModelTiepoint` (honouring the tie raster point);
+    - rejects projected (e.g. UTM) and rotated rasters with the new `GeoTiffError::UnsupportedGeoreferencing`;
+    - handles `PixelIsPoint`;
+    - reads GDAL's no-data tag;
+    - samples values at pixel centres, which moved bilinear sampling by half a pixel;
+    - uses the bbox hint only for files without georeferencing tags.
+  - Tests write small GeoTIFFs and check the extent, centre sampling, and the tie-point path, plus rejection of projected rasters.
 - **NorKyst nesting time base and ingest (io/boundary, TODO P0.20):**
   - `OceanModelReader` returned the raw time values, and time interpolation clamped out-of-range times to the first or last snapshot, so `OceanNestingBC2D` (which passed simulation seconds straight in) froze the forcing at one snapshot for any file not stored in "seconds since" the run start. `OceanModelReader::time` is now Unix seconds decoded from the CF `units` (`seconds`/`minutes`/`hours`/`days since <date>`) and `calendar` attributes (new `parse_cf_time_units`). A time variable without units, a non-Gregorian calendar, or non-increasing times is an error. `get_state_interpolated` returns `None` outside the file instead of clamping; new `time_range()` and `covers_time()`.
   - `OceanNestingBC2D` maps simulation time `t` to the parent instant `epoch + t`. The epoch defaults to the first snapshot and is set with `with_epoch(unix_seconds)`. `check_time_coverage(t_start, t_end)` validates a run up front, `ghost_state` panics with the covered range instead of freezing, and `simulation_time_range()` reports coverage in simulation time (`time_range()` stays in Unix seconds). `examples/froya_real_data.rs` checks coverage before running; `examples/test_norkyst.rs` queries simulation time 0 instead of the raw file time.

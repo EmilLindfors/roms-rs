@@ -24,7 +24,7 @@ use crate::solver::{
     apply_implicit_damping_2d_parallel as implicit_damping,
     apply_wet_dry_correction_all_parallel as wet_dry_correction,
 };
-use crate::source::{BottomFriction2D, SourceTerm2D};
+use crate::source::{BottomFriction2D, SourceTerm2D, SourceTerms2D};
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -167,7 +167,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     }
 }
 
-impl<BC: SWEBoundaryCondition2D + 'static> PhysicsModule<SWESolution2D> for SWEPhysics2D<BC> {
+impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<BC> {
     fn compute_rhs(&self, state: &SWESolution2D, time: f64) -> SWESolution2D {
         let mut out = SWESolution2D::new(self.mesh.n_elements, self.ops.n_nodes);
         self.compute_rhs_into(state, time, &mut out);
@@ -269,7 +269,7 @@ pub struct SWEPhysics2DBuilder<BC: SWEBoundaryCondition2D> {
     equation: ShallowWater2D,
     bc: BC,
     flux: Option<StandardFlux2D>,
-    source: Option<Arc<dyn SourceTerm2D>>,
+    sources: Vec<Arc<dyn SourceTerm2D>>,
     bathymetry: Option<Arc<Bathymetry2D>>,
     limiter: StandardLimiter2D,
     well_balanced: bool,
@@ -296,7 +296,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             equation,
             bc,
             flux: None,
-            source: None,
+            sources: Vec::new(),
             bathymetry: None,
             limiter: StandardLimiter2D::default(),
             well_balanced: false,
@@ -317,15 +317,14 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
         self
     }
 
-    /// Set the source terms.
-    pub fn with_source<S: SourceTerm2D + 'static>(mut self, source: S) -> Self {
-        self.source = Some(Arc::new(source));
-        self
+    /// Add a source term; repeated calls add up (Coriolis, wind, …).
+    pub fn with_source<S: SourceTerm2D + 'static>(self, source: S) -> Self {
+        self.with_source_arc(Arc::new(source))
     }
 
-    /// Set the source terms from an Arc.
+    /// Add a source term held by an `Arc`.
     pub fn with_source_arc(mut self, source: Arc<dyn SourceTerm2D>) -> Self {
-        self.source = Some(source);
+        self.sources.push(source);
         self
     }
 
@@ -394,13 +393,17 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
     /// bed slope twice.
     pub fn build(self) -> SWEPhysics2D<BC> {
         let wetting_drying = self.wet_dry.is_some() || self.limiter.preserves_positivity();
+        let source: Option<Arc<dyn SourceTerm2D>> = match self.sources.len() {
+            0 => None,
+            1 => self.sources.first().cloned(),
+            _ => Some(Arc::new(SourceTerms2D::new(self.sources))),
+        };
         let formulation = self.formulation.unwrap_or_else(|| {
             if !wetting_drying {
                 return SWEFormulation2D::Standard;
             }
             assert!(
-                !self
-                    .source
+                !source
                     .as_ref()
                     .is_some_and(|s| s.includes_bathymetry_slope()),
                 "wet/dry runs default to SWEFormulation2D::WetDry, which includes the \
@@ -428,7 +431,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             equation: self.equation,
             flux,
             bc: self.bc,
-            source: self.source,
+            source,
             bathymetry: self.bathymetry,
             limiter: self.limiter,
             well_balanced: self.well_balanced,
