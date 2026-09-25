@@ -364,6 +364,20 @@ fn constituent_def(name: &str) -> Option<ConstituentDef> {
     Some(def)
 }
 
+/// Names of the supported constituents, in their conventional spelling.
+pub const CONSTITUENT_NAMES: [&str; 15] = [
+    "M2", "S2", "N2", "K2", "K1", "O1", "P1", "Q1", "M4", "MS4", "MN4", "M6", "Mf", "Mm", "Ssa",
+];
+
+/// The conventional (`'static`) spelling of a supported constituent name,
+/// matched case-insensitively (`"mf"` → `"Mf"`); `None` if unsupported.
+pub fn canonical_name(name: &str) -> Option<&'static str> {
+    CONSTITUENT_NAMES
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case(name.trim()))
+        .copied()
+}
+
 /// Schureman `f`/`u` for the M2 species (also N2), given node longitude `N` (rad).
 fn nodal_m2(n_rad: f64) -> (f64, f64) {
     let f = 1.0004 - 0.0373 * n_rad.cos() + 0.0002 * (2.0 * n_rad).cos();
@@ -459,6 +473,15 @@ mod tests {
     use super::*;
 
     const DAY_SECONDS: f64 = 86_400.0;
+
+    #[test]
+    fn canonical_names_cover_the_catalogue() {
+        for name in CONSTITUENT_NAMES {
+            assert!(constituent_def(name).is_some(), "{name}");
+            assert_eq!(canonical_name(&name.to_lowercase()), Some(name));
+        }
+        assert_eq!(canonical_name("XX9"), None);
+    }
 
     /// Mean longitudes at J2000.0 are the constant terms of Meeus' arguments.
     /// These are textbook values (Meeus ch. 22, 47) and validate the polynomials.

@@ -74,7 +74,7 @@
 mod adcp_reader;
 mod coastline;
 mod constituent_reader;
-mod datetime;
+pub(crate) mod datetime;
 mod geotiff;
 #[cfg(feature = "netcdf")]
 mod netcdf_io;

@@ -12,7 +12,7 @@
 //! collocated form below, and the entropy-stable, well-balanced split form of
 //! Wintermeyer et al. (2017) in `swe_2d_split_form.rs`.
 
-use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
+use crate::boundary::{BCContext2D, BoundaryState, SWEBoundaryCondition2D};
 use crate::equations::ShallowWater2D;
 use crate::flux::{SWEFluxType2D, compute_flux_swe_2d};
 use crate::mesh::{Bathymetry2D, Mesh2D};
@@ -132,14 +132,6 @@ pub struct SWE2DRhsConfig<'a, BC: SWEBoundaryCondition2D> {
     /// gradients, then differentiate viscous fluxes), following the same pattern
     /// as tracer diffusion.
     pub viscosity: Option<&'a HorizontalViscosity2D>,
-    /// Optional time step to pass to boundary conditions (e.g., Chapman radiation).
-    ///
-    /// When set, the dt value is propagated to `BCContext2D` so that
-    /// `Chapman2D` can use the current time step without manual `set_dt()`
-    /// calls. The library's own drivers (e.g. `SWEPhysics2D`) build the config
-    /// without a dt, so callers that rely on it must set it themselves (see
-    /// `Chapman2D` for the fallback when it is unset).
-    pub dt: Option<f64>,
     /// Depth (m) below which a node counts as dry for
     /// [`SWEFormulation2D::WetDry`]: elements with such a node use the subcell
     /// finite-volume update. Default 1 mm (`WetDryConfig::DEFAULT_H_DRY`).
@@ -159,7 +151,6 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
             bathymetry: None,
             well_balanced: false,
             viscosity: None,
-            dt: None,
             h_dry: crate::solver::WetDryConfig::DEFAULT_H_DRY,
         }
     }
@@ -278,22 +269,14 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
         self.h_dry = h_dry;
         self
     }
-
-    /// Set the time step for boundary condition propagation.
-    ///
-    /// When set, the dt is passed to `BCContext2D` so that `Chapman2D` can use
-    /// the current time step. Not called by the library's own drivers.
-    pub fn with_dt(mut self, dt: f64) -> Self {
-        self.dt = Some(dt);
-        self
-    }
 }
 
-/// Ghost state from the configured boundary condition at `node` of boundary
-/// face `face` of element `k`. Shared by the standard and split-form kernels
-/// and the viscous boundary terms.
+/// Boundary state from the configured boundary condition at `node` of
+/// boundary face `face` of element `k`: a ghost state for the Riemann solver,
+/// or the state on the boundary whose physical flux is the face flux. Shared
+/// by the standard and split-form kernels and the viscous boundary terms.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn boundary_ghost_state<BC: SWEBoundaryCondition2D>(
+pub(super) fn boundary_state<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
@@ -303,19 +286,19 @@ pub(super) fn boundary_ghost_state<BC: SWEBoundaryCondition2D>(
     face: usize,
     node: usize,
     normal: (f64, f64),
-) -> SWEState2D {
+) -> BoundaryState {
     let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
     let state = q.get_state(k, node);
     let bathy_value = config.bathymetry.map_or(0.0, |b| b.get(k, node));
     let g = config.equation.g;
     let h_min = config.equation.h_min.meters();
 
-    let mut ctx = match mesh.boundary_tag(k, face) {
+    let ctx = match mesh.boundary_tag(k, face) {
         Some(tag) => BCContext2D::with_tag(time, (x, y), state, bathy_value, normal, g, h_min, tag),
         None => BCContext2D::new(time, (x, y), state, bathy_value, normal, g, h_min),
-    };
-    ctx.dt = config.dt;
-    config.bc.ghost_state(&ctx)
+    }
+    .with_node_index(k.as_usize() * ops.n_nodes + node);
+    config.bc.boundary_state(&ctx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -333,7 +316,7 @@ fn boundary_velocity_component<BC: SWEBoundaryCondition2D>(
     node: usize,
 ) -> f64 {
     let normal = geom.normals[k.as_usize()][face];
-    let ghost = boundary_ghost_state(q, mesh, ops, config, time, k, face, node, normal);
+    let ghost = boundary_state(q, mesh, ops, config, time, k, face, node, normal).state();
     if ghost.h <= visc_h_min {
         return 0.0;
     }
@@ -438,6 +421,9 @@ struct ElementWorkspace {
     flux_diff: [Vec<f64>; 3],
     /// Exterior (neighbour or ghost) states at the face nodes
     ext: [Vec<f64>; 3],
+    /// Face nodes whose exterior state is a boundary state `q_b` with flux
+    /// `F(q_b)·n` ([`BoundaryState::Exact`])
+    ext_exact: Vec<bool>,
     int_bathy: Vec<f64>,
     ext_bathy: Vec<f64>,
     split_form: SplitFormWorkspace,
@@ -478,6 +464,7 @@ impl ElementWorkspace {
             momentum: [padded(n_nodes), padded(n_nodes)],
             flux_diff: face(),
             ext: face(),
+            ext_exact: vec![false; n_face_nodes],
             int_bathy: padded(n_face_nodes),
             ext_bathy: padded(n_face_nodes),
             split_form: SplitFormWorkspace::new(n_nodes),
@@ -667,6 +654,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
             }
 
             // Exterior states and bathymetry: neighbour (face nodes reversed) or ghost
+            ws.ext_exact.fill(false);
             if let Some(neighbor) = mesh.neighbor(k, face) {
                 let nb = ElementIndex::new(neighbor.element);
                 let nb_face_nodes = &ops.face_nodes[neighbor.face];
@@ -678,9 +666,15 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                 }
             } else {
                 for (fi, &node) in face_nodes.iter().enumerate() {
-                    let ghost = boundary_ghost_state(
+                    let ghost = match boundary_state(
                         q, mesh, ops, config, self.time, k, face, node, normal,
-                    );
+                    ) {
+                        BoundaryState::Ghost(ghost) => ghost,
+                        BoundaryState::Exact(q_b) => {
+                            ws.ext_exact[fi] = true;
+                            q_b
+                        }
+                    };
                     (ext_h[fi], ext_hu[fi], ext_hv[fi]) = (ghost.h, ghost.hu, ghost.hv);
                 }
                 // Boundary faces mirror the interior bathymetry
@@ -692,6 +686,14 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
             for (fi, &node) in face_nodes.iter().enumerate() {
                 let q_int = q.get_state(k, node);
                 let q_ext = SWEState2D::new(ext_h[fi], ext_hu[fi], ext_hv[fi]);
+
+                // Boundary state q_b: the face flux is its physical flux F(q_b)·n
+                if ws.ext_exact[fi] {
+                    let diff = config.equation.normal_flux(&q_int, normal)
+                        - config.equation.normal_flux(&q_ext, normal);
+                    (diff_h[fi], diff_hu[fi], diff_hv[fi]) = (diff.h, diff.hu, diff.hv);
+                    continue;
+                }
 
                 // Hydrostatically reconstructed states for F* (if enabled)
                 let (q_int_flux, q_ext_flux) = match &hr {

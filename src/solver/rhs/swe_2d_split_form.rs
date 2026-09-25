@@ -79,7 +79,7 @@
 //! Fully wet elements keep the flux-differencing volume term. The positivity
 //! limiter and wet/dry correction (`SWEPhysics2D`) still run after every stage.
 
-use crate::boundary::SWEBoundaryCondition2D;
+use crate::boundary::{BoundaryState, SWEBoundaryCondition2D};
 use crate::flux::{
     SWENodeState2D, entropy_stable_dissipation_2d, hll_flux_swe_2d,
     wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
@@ -327,25 +327,26 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
 
             for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
                 let q_int = ws.nodes[node];
-                let q_ext = match neighbor {
+                let (q_ext, exact) = match neighbor {
                     Some(nb) => {
                         let nb_k = ElementIndex::new(nb.element);
                         let nb_node = ops.face_nodes[nb.face][n_face_nodes - 1 - fi];
-                        SWENodeState2D::new(
-                            &self.q.get_state(nb_k, nb_node),
-                            self.bed(nb_k, nb_node),
-                            h_min,
-                        )
+                        let state = self.q.get_state(nb_k, nb_node);
+                        (SWENodeState2D::new(&state, self.bed(nb_k, nb_node), h_min), false)
                     }
-                    // Ghost state with mirrored bathymetry: no bed step at boundaries
-                    None => SWENodeState2D::new(
-                        &self.ghost_state(k, face, node, normal),
-                        q_int.b,
-                        h_min,
-                    ),
+                    // Boundary state with mirrored bathymetry: no bed step at boundaries
+                    None => {
+                        let (state, exact) = match self.boundary_state(k, face, node, normal) {
+                            BoundaryState::Ghost(q) => (q, false),
+                            BoundaryState::Exact(q) => (q, true),
+                        };
+                        (SWENodeState2D::new(&state, q_int.b, h_min), exact)
+                    }
                 };
 
                 let f_star = match self.surface {
+                    // State on the boundary: its physical flux F(q_b)·n
+                    _ if exact => wintermeyer_flux_2d(&q_ext, &q_ext, normal, g),
                     SurfaceFlux::HydrostaticHll => {
                         self.hydrostatic_hll(&q_int, &q_ext, normal, g).0
                     }
@@ -558,15 +559,15 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         }
     }
 
-    /// Boundary ghost state from the configured boundary condition.
-    fn ghost_state(
+    /// Boundary state from the configured boundary condition.
+    fn boundary_state(
         &self,
         k: ElementIndex,
         face: usize,
         node: usize,
         normal: (f64, f64),
-    ) -> SWEState2D {
-        super::swe_2d::boundary_ghost_state(
+    ) -> BoundaryState {
+        super::swe_2d::boundary_state(
             self.q,
             self.mesh,
             self.ops,

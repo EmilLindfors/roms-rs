@@ -7,16 +7,19 @@
 //!
 //! Available boundary conditions:
 //! - Reflective (wall): no-flux through boundary, tangential velocity preserved
-//! - Radiation (absorbing): Sommerfeld radiation condition
-//! - Flather: characteristic-based open boundary (combines radiation and tidal)
-//! - Tidal: prescribed water surface elevation
+//! - Tidal / harmonic tidal: prescribed (clamped) water surface elevation
 //! - Discharge: prescribed normal flow rate
+//! - Extrapolation and fixed state
+//!
+//! Open boundaries (radiation, tides, nesting) are
+//! [`CharacteristicOBC`](crate::boundary::CharacteristicOBC).
 
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
 use crate::types::Depth;
 
-use super::bathymetry_validation::warn_once_if_misconfigured;
+use super::HarmonicTide;
+use crate::time::ModelClock;
 
 /// Context for 2D boundary condition evaluation.
 ///
@@ -39,11 +42,10 @@ pub struct BCContext2D {
     pub h_min: f64,
     /// Optional boundary tag for multi-BC dispatch
     pub boundary_tag: Option<BoundaryTag>,
-    /// Optional time step for boundary conditions that need it (e.g., Chapman radiation).
-    ///
-    /// Populated from `SWE2DRhsConfig::dt`, which is `None` unless the caller
-    /// sets it with `SWE2DRhsConfig::with_dt`.
-    pub dt: Option<f64>,
+    /// Flat nodal index `k · n_nodes + i` of the boundary node, when known
+    /// (set by the RHS kernels). Lets boundary data precomputed per node be
+    /// looked up without searching by position.
+    pub node_index: Option<usize>,
 }
 
 impl BCContext2D {
@@ -68,7 +70,7 @@ impl BCContext2D {
             g,
             h_min,
             boundary_tag: None,
-            dt: None,
+            node_index: None,
         }
     }
 
@@ -92,8 +94,14 @@ impl BCContext2D {
             g,
             h_min,
             boundary_tag: Some(boundary_tag),
-            dt: None,
+            node_index: None,
         }
+    }
+
+    /// Set the flat nodal index of the boundary node.
+    pub fn with_node_index(mut self, index: usize) -> Self {
+        self.node_index = Some(index);
+        self
     }
 
     /// Water surface elevation at the interior: η = h + B
@@ -126,6 +134,26 @@ impl BCContext2D {
     }
 }
 
+/// What a boundary condition supplies at a boundary face node.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BoundaryState {
+    /// An exterior state: the face flux is the Riemann solver's `F*(q_int, q_ghost)`.
+    Ghost(SWEState2D),
+    /// The state on the boundary itself: the face flux is its physical flux
+    /// `F(q_b)·n`, whatever the Riemann solver (see
+    /// [`CharacteristicOBC`](crate::boundary::CharacteristicOBC)).
+    Exact(SWEState2D),
+}
+
+impl BoundaryState {
+    /// The state, either kind.
+    pub fn state(&self) -> SWEState2D {
+        match *self {
+            Self::Ghost(q) | Self::Exact(q) => q,
+        }
+    }
+}
+
 /// Trait for 2D shallow water boundary conditions.
 ///
 /// Implementations compute a "ghost" state that represents the exterior
@@ -140,6 +168,14 @@ pub trait SWEBoundaryCondition2D: Send + Sync {
     /// # Returns
     /// The ghost (exterior) state to use in flux computation
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D;
+
+    /// The boundary state used by the face flux: the ghost state for the
+    /// Riemann solver by default; boundary conditions that construct the state
+    /// on the boundary (characteristic OBCs) return [`BoundaryState::Exact`].
+    /// Wrappers that dispatch to other boundary conditions must forward this.
+    fn boundary_state(&self, ctx: &BCContext2D) -> BoundaryState {
+        BoundaryState::Ghost(self.ghost_state(ctx))
+    }
 
     /// Name of this boundary condition for debugging/logging.
     fn name(&self) -> &'static str;
@@ -215,219 +251,6 @@ impl SWEBoundaryCondition2D for Reflective2D {
 
     fn allows_outflow(&self) -> bool {
         false
-    }
-}
-
-/// Radiation (absorbing) boundary condition for 2D.
-///
-/// Lets outgoing waves leave while holding the far field at a fixed
-/// reference state (η_ext, u_ext), usually still water at mean sea level.
-///
-/// # Weak (ghost-state) formulation
-///
-/// At a subcritical boundary the upwind Riemann solver takes the outgoing
-/// Riemann invariant `w+ = u_n + sqrt(g/h) η` from the interior trace and the
-/// incoming one `w− = u_n − sqrt(g/h) η` from the ghost. A radiation
-/// condition prescribes `w−` from the reference state, so the ghost is simply
-/// that state:
-///
-/// - h = η_ext − B (depth convention h = η − B, so the reference level is
-///   the same over any bathymetry)
-/// - u_n = u_n,ext
-/// - u_t from the interior
-///
-/// This is [`Flather2D`] with a constant external elevation.
-///
-/// Returning the interior state as the ghost (zero-gradient extrapolation)
-/// takes `w−` from the interior as well. Nothing then pins the far-field
-/// level: an outgoing pulse reflected ~10% and the channel grew to ~50× the
-/// pulse amplitude within 200 s (see `tests/open_boundary_flather_test.rs`).
-#[derive(Clone, Debug)]
-pub struct Radiation2D {
-    /// External (far-field) surface elevation η_ext (m)
-    pub eta_external: f64,
-    /// External (far-field) velocity (typically zero)
-    pub u_external: (f64, f64),
-    /// Minimum depth
-    pub h_min: f64,
-}
-
-impl Radiation2D {
-    /// Radiate towards still water at mean sea level (η_ext = 0, u_ext = 0).
-    pub fn still_water() -> Self {
-        Self::with_elevation(0.0)
-    }
-
-    /// Radiate towards still water at surface elevation `eta_external`.
-    pub fn with_elevation(eta_external: f64) -> Self {
-        Self {
-            eta_external,
-            u_external: (0.0, 0.0),
-            h_min: 1e-6,
-        }
-    }
-
-    /// Set the far-field velocity (u, v).
-    pub fn with_external_velocity(mut self, u_external: (f64, f64)) -> Self {
-        self.u_external = u_external;
-        self
-    }
-}
-
-impl Default for Radiation2D {
-    fn default() -> Self {
-        Self::still_water()
-    }
-}
-
-impl SWEBoundaryCondition2D for Radiation2D {
-    fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
-        use std::sync::atomic::AtomicBool;
-        static WARNED: AtomicBool = AtomicBool::new(false);
-
-        let (nx, ny) = ctx.normal;
-
-        warn_once_if_misconfigured(
-            &WARNED,
-            "Radiation2D",
-            ctx.interior_state.h,
-            ctx.bathymetry,
-            self.eta_external,
-        );
-
-        // Ghost = external state; the Riemann solver takes the outgoing
-        // invariant from the interior and the incoming one from here.
-        let h_ghost = (self.eta_external - ctx.bathymetry).max(self.h_min);
-        let (u_ext, v_ext) = self.u_external;
-        let un_ghost = u_ext * nx + v_ext * ny;
-        let ut_ghost = ctx.interior_tangential_velocity();
-
-        let u_ghost = un_ghost * nx - ut_ghost * ny;
-        let v_ghost = un_ghost * ny + ut_ghost * nx;
-
-        SWEState2D::from_primitives(h_ghost, u_ghost, v_ghost)
-    }
-
-    fn name(&self) -> &'static str {
-        "radiation_2d"
-    }
-}
-
-/// Flather boundary condition for 2D.
-///
-/// Combines tidal forcing with characteristic-based radiation.
-/// This is the standard open boundary condition for coastal models.
-///
-/// # Weak (ghost-state) formulation
-///
-/// The Flather (1976) relation
-///
-/// ```text
-/// u_n = u_n,ext + sqrt(g/h) (η − η_ext)
-/// ```
-///
-/// is equivalent to prescribing the incoming Riemann invariant
-/// `w− = u_n − sqrt(g/h) η` from the external state while the outgoing
-/// invariant `w+ = u_n + sqrt(g/h) η` is left free. The upwind Riemann solver
-/// used at boundary faces does exactly this — it takes `w+` from the interior
-/// trace and `w−` from the ghost — so the ghost state is simply the external
-/// state:
-///
-/// - h = η_ext − B (depth convention h = η − B)
-/// - u_n = u_n,ext
-/// - u_t from the interior
-///
-/// Applying the Flather relation inside the ghost as well would count the
-/// characteristic correction twice and reflect outgoing waves with
-/// coefficient −1/3 (see `tests/open_boundary_flather_test.rs`).
-///
-/// # External velocity
-///
-/// With `u_external = 0` the incoming invariant is `−sqrt(g/h) η_ext`: the
-/// boundary elevation equals η_ext where the boundary sits at an antinode of a
-/// standing (co-oscillating) tide, which is the usual situation for a small
-/// coastal domain. A *progressive* wave entering through the boundary is
-/// delivered at η_ext / 2 unless the matching external velocity is supplied
-/// (u_n,ext = −sqrt(g/h) η_ext for a wave travelling into the domain); use
-/// [`ChapmanFlather2D`](crate::boundary::ChapmanFlather2D) or a nesting BC for
-/// time-varying external velocity.
-#[derive(Clone, Debug)]
-pub struct Flather2D<F>
-where
-    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
-{
-    /// Function returning tidal elevation η(x, y, t)
-    pub tidal_elevation: F,
-    /// External reference depth (below tidal datum)
-    pub h_ref: f64,
-    /// External velocity (typically zero)
-    pub u_external: (f64, f64),
-    /// Minimum depth
-    pub h_min: f64,
-}
-
-impl<F> Flather2D<F>
-where
-    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
-{
-    /// Create a new Flather BC.
-    ///
-    /// # Arguments
-    /// * `tidal_elevation` - Function η(x, y, t) returning surface elevation
-    /// * `h_ref` - Reference depth below mean sea level
-    pub fn new(tidal_elevation: F, h_ref: f64) -> Self {
-        Self {
-            tidal_elevation,
-            h_ref,
-            u_external: (0.0, 0.0),
-            h_min: 1e-6,
-        }
-    }
-}
-
-impl<F> SWEBoundaryCondition2D for Flather2D<F>
-where
-    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
-{
-    fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
-        use std::sync::atomic::AtomicBool;
-        static WARNED: AtomicBool = AtomicBool::new(false);
-
-        let (x, y) = ctx.position;
-        let t = ctx.time;
-        let (nx, ny) = ctx.normal;
-
-        // Prescribed tidal surface elevation
-        let eta_tidal = (self.tidal_elevation)(x, y, t);
-        let h_tidal = (eta_tidal - ctx.bathymetry).max(self.h_min);
-
-        // Validate bathymetry configuration (warns once if misconfigured)
-        warn_once_if_misconfigured(
-            &WARNED,
-            "Flather2D",
-            ctx.interior_state.h,
-            ctx.bathymetry,
-            eta_tidal,
-        );
-
-        // Ghost = external state. The Riemann solver supplies the Flather
-        // relation (incoming invariant from here, outgoing from the interior);
-        // adding sqrt(g/h)(η_int − η_tidal) here would apply it twice.
-        let (u_ext, v_ext) = self.u_external;
-        let un_ghost = u_ext * nx + v_ext * ny;
-
-        // Preserve tangential velocity from interior
-        let ut_ghost = ctx.interior_tangential_velocity();
-
-        // Convert back to (u, v)
-        let u_ghost = un_ghost * nx - ut_ghost * ny;
-        let v_ghost = un_ghost * ny + ut_ghost * nx;
-
-        SWEState2D::from_primitives(h_tidal, u_ghost, v_ghost)
-    }
-
-    fn name(&self) -> &'static str {
-        "flather_2d"
     }
 }
 
@@ -618,316 +441,45 @@ impl SWEBoundaryCondition2D for FixedState2D {
 /// This is a re-export for convenience; see [`super::TidalConstituent`] for details.
 pub use super::TidalConstituent;
 
-/// Apply Doodson/Schureman nodal corrections to a set of constituents in place,
-/// evaluated at the prediction epoch `epoch_jd` (Julian Date, UTC).
+/// Harmonic tidal elevation clamped at the boundary (Dirichlet for elevation).
 ///
-/// Each constituent's amplitude is scaled by its nodal factor `f` and its phase
-/// is shifted by the equilibrium argument plus nodal phase `(V₀ + u)`.
-/// Constituents whose names are not recognised by
-/// [`nodal_correction`](crate::tides::nodal_correction) are left unchanged
-/// (identity correction). Shared by the epoch-aware builders on
-/// [`HarmonicFlather2D`] and [`HarmonicTidal2D`].
-fn apply_nodal_corrections(constituents: &mut [TidalConstituent], epoch_jd: f64) {
-    use crate::tides::{AstronomicalArguments, NodalCorrection, nodal_correction};
-
-    let astro = AstronomicalArguments::at_julian_date(epoch_jd);
-    for c in constituents.iter_mut() {
-        let correction = nodal_correction(c.name, &astro).unwrap_or(NodalCorrection::IDENTITY);
-        *c = c.with_nodal_correction(&correction);
-    }
-}
-
-/// Flather radiation BC with harmonic tidal forcing (non-generic version).
-///
-/// This is a convenience struct that stores tidal constituents directly,
-/// avoiding the need for closures in common cases.
-///
-/// Supports smooth ramp-up to prevent initial impulse from tidal forcing.
-///
-/// # IMPORTANT: Bathymetry Convention
-///
-/// This BC uses surface elevation η = h + B where B is bathymetry (negative below MSL).
-/// **You MUST set bathymetry correctly** in `SWE2DRhsConfig` for this BC to work properly.
-///
-/// For a domain with mean depth h0 (e.g., 50m), set:
-/// ```text
-/// bathymetry = Bathymetry2D::constant(n_elements, n_nodes, -h0);
-/// ```
-///
-/// This ensures η = h + B = h0 + (-h0) = 0 at rest (surface at MSL).
-///
-/// **Without bathymetry**: the ghost depth h = η_tidal − B collapses to ~0
-/// while the interior holds 50 m, so the boundary behaves like a dam break.
-///
-/// # Weak (ghost-state) formulation
-///
-/// As for [`Flather2D`], the ghost state is the external state
-/// (h = η_tidal − B, u_n = u_n,ext, u_t from the interior); the upwind Riemann
-/// solver at the boundary face applies the Flather relation, radiating
-/// outgoing waves without reflection. See [`Flather2D`] for what the default
-/// `u_external = 0` implies for progressive versus standing tides.
-///
-/// # Stability Note
-///
-/// In semi-closed basins (with reflective walls) the tide can resonate.
-/// Consider using:
-/// - [`HarmonicTidal2D`] for simpler Dirichlet-type forcing
-/// - Sponge layers (`SpongeLayer2D`) to absorb reflected energy
-/// - [`ChapmanFlather2D`](crate::boundary::ChapmanFlather2D) for time-varying
-///   external velocity
-///
-/// # Example
-///
-/// ```
-/// use dg_rs::boundary::{HarmonicFlather2D, TidalConstituent};
-///
-/// // Create Flather BC with M2 tide and 6-hour ramp-up
-/// let m2 = TidalConstituent::m2(0.5, 0.0); // 0.5m amplitude, 0 phase
-/// let bc = HarmonicFlather2D::new(vec![m2], 50.0) // 50m reference depth
-///     .with_ramp_up(6.0 * 3600.0);
-///
-/// // IMPORTANT: Also set bathymetry in config:
-/// // let bathymetry = Bathymetry2D::constant(n_elements, n_nodes, -50.0);
-/// // let config = SWE2DRhsConfig::new(&eq, &bc).with_bathymetry(&bathymetry);
-/// ```
-#[derive(Clone, Debug)]
-pub struct HarmonicFlather2D {
-    /// Mean surface elevation
-    pub mean_elevation: f64,
-    /// Tidal constituents
-    pub constituents: Vec<TidalConstituent>,
-    /// Reference depth (below mean sea level).
-    ///
-    /// **Deprecated**: This field is no longer used in depth computation.
-    /// Depth is now computed as `h = η_tidal - bathymetry`, which correctly
-    /// derives depth from the surface elevation and bed elevation without
-    /// double-counting. The `h_ref` field is retained for API compatibility
-    /// but ignored in `ghost_state`.
-    pub h_ref: f64,
-    /// External velocity (typically zero)
-    pub u_external: (f64, f64),
-    /// Minimum depth
-    pub h_min: f64,
-    /// Ramp-up duration in seconds (None = no ramp-up)
-    pub ramp_duration: Option<f64>,
-}
-
-impl HarmonicFlather2D {
-    /// Create a new harmonic Flather BC.
-    ///
-    /// # Arguments
-    /// * `constituents` - List of tidal constituents
-    /// * `h_ref` - Reference depth below mean sea level
-    pub fn new(constituents: Vec<TidalConstituent>, h_ref: f64) -> Self {
-        Self {
-            mean_elevation: 0.0,
-            constituents,
-            h_ref,
-            u_external: (0.0, 0.0),
-            h_min: 1e-6,
-            ramp_duration: None,
-        }
-    }
-
-    /// Create with mean elevation offset.
-    pub fn with_mean_elevation(mut self, mean: f64) -> Self {
-        self.mean_elevation = mean;
-        self
-    }
-
-    /// Create with external velocity.
-    pub fn with_external_velocity(mut self, u: f64, v: f64) -> Self {
-        self.u_external = (u, v);
-        self
-    }
-
-    /// Create M2-only tidal forcing.
-    ///
-    /// # Arguments
-    /// * `amplitude` - M2 tidal amplitude (m)
-    /// * `phase` - M2 tidal phase (radians)
-    /// * `h_ref` - Reference depth (m)
-    pub fn m2_only(amplitude: f64, phase: f64, h_ref: f64) -> Self {
-        Self::new(vec![TidalConstituent::m2(amplitude, phase)], h_ref)
-    }
-
-    /// Create with M2 and S2 constituents (spring-neap cycle).
-    pub fn m2_s2(m2_amp: f64, s2_amp: f64, h_ref: f64) -> Self {
-        Self::new(
-            vec![
-                TidalConstituent::m2(m2_amp, 0.0),
-                TidalConstituent::s2(s2_amp, 0.0),
-            ],
-            h_ref,
-        )
-    }
-
-    /// Enable smooth ramp-up of tidal forcing.
-    ///
-    /// The ramp gradually increases tidal amplitudes from 0 to full amplitude
-    /// over the specified duration. This prevents initial impulse from
-    /// causing spurious oscillations.
-    ///
-    /// # Arguments
-    /// * `duration` - Ramp-up period in seconds (typically 1-3 tidal periods)
-    pub fn with_ramp_up(mut self, duration: f64) -> Self {
-        self.ramp_duration = Some(duration);
-        self
-    }
-
-    /// Apply Doodson/Schureman nodal corrections at a prediction epoch.
-    ///
-    /// Scales each constituent's amplitude by its nodal factor `f` and shifts its
-    /// phase by the equilibrium argument plus nodal phase `(V₀ + u)`, so the
-    /// prescribed elevation becomes the astronomically complete
-    ///
-    /// ```text
-    /// η(t) = η₀ + Σ fᵢ Aᵢ cos(ωᵢ t + (V₀ + u)ᵢ − Gᵢ)
-    /// ```
-    ///
-    /// where `t` is elapsed simulation time (seconds) from `epoch_jd`
-    /// (Julian Date, UTC; see [`julian_date`](crate::tides::julian_date)).
-    /// Apply **once**, after all constituents are set; unrecognised constituent
-    /// names are left uncorrected.
-    pub fn with_nodal_corrections(mut self, epoch_jd: f64) -> Self {
-        apply_nodal_corrections(&mut self.constituents, epoch_jd);
-        self
-    }
-
-    /// Compute ramp factor at time t.
-    ///
-    /// Returns:
-    /// - 0 at t=0
-    /// - 1 for t >= ramp_duration
-    /// - Smooth Hermite interpolation in between: 3t² - 2t³
-    pub fn ramp_factor(&self, t: f64) -> f64 {
-        match self.ramp_duration {
-            None => 1.0,
-            Some(duration) if duration <= 0.0 => 1.0,
-            Some(duration) => {
-                if t <= 0.0 {
-                    0.0
-                } else if t >= duration {
-                    1.0
-                } else {
-                    let tau = t / duration;
-                    tau * tau * (3.0 - 2.0 * tau)
-                }
-            }
-        }
-    }
-
-    /// Evaluate tidal elevation at time t.
-    ///
-    /// If ramp-up is enabled, the tidal constituents are scaled by the
-    /// ramp factor. The mean elevation is NOT ramped.
-    pub fn elevation(&self, t: f64) -> f64 {
-        let ramp = self.ramp_factor(t);
-        let mut eta = self.mean_elevation;
-        for c in &self.constituents {
-            eta += ramp * c.evaluate(t);
-        }
-        eta
-    }
-}
-
-impl SWEBoundaryCondition2D for HarmonicFlather2D {
-    fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
-        use std::sync::atomic::AtomicBool;
-        static WARNED: AtomicBool = AtomicBool::new(false);
-
-        let t = ctx.time;
-        let (nx, ny) = ctx.normal;
-
-        // Compute tidal elevation
-        let eta_tidal = self.elevation(t);
-        let h_tidal = (eta_tidal - ctx.bathymetry).max(self.h_min);
-
-        // Validate bathymetry configuration (warns once if misconfigured)
-        warn_once_if_misconfigured(
-            &WARNED,
-            "HarmonicFlather2D",
-            ctx.interior_state.h,
-            ctx.bathymetry,
-            eta_tidal,
-        );
-
-        // Ghost = external state; the Riemann solver applies the Flather
-        // relation (see `Flather2D`).
-        let (u_ext, v_ext) = self.u_external;
-        let un_ghost = u_ext * nx + v_ext * ny;
-
-        // Preserve tangential velocity
-        let ut_ghost = ctx.interior_tangential_velocity();
-
-        // Convert back to (u, v)
-        let u_ghost = un_ghost * nx - ut_ghost * ny;
-        let v_ghost = un_ghost * ny + ut_ghost * nx;
-
-        SWEState2D::from_primitives(h_tidal, u_ghost, v_ghost)
-    }
-
-    fn name(&self) -> &'static str {
-        "harmonic_flather_2d"
-    }
-
-    fn allows_outflow(&self) -> bool {
-        true
-    }
-}
-
-/// Tidal BC with harmonic forcing (non-generic, Dirichlet for elevation).
-///
-/// Prescribes water surface elevation from harmonic constituents.
-/// Extrapolates velocity from interior.
-///
-/// Supports smooth ramp-up to prevent initial impulse from tidal forcing.
+/// Prescribes the elevation of a [`HarmonicTide`] and extrapolates the
+/// interior velocity.
 ///
 /// # Stability
 ///
 /// This BC clamps the boundary elevation and extrapolates velocity, so in the
 /// weak ghost-state setting it reflects outgoing waves (coefficient ≈ −1),
-/// which can lead to phase errors and trapped energy. Prefer
-/// [`HarmonicFlather2D`] where outgoing waves must leave the domain.
+/// which can lead to phase errors and trapped energy. Prefer a
+/// [`CharacteristicOBC`](crate::boundary::CharacteristicOBC) with the same
+/// tide where outgoing waves must leave the domain.
 ///
-/// # IMPORTANT: Bathymetry Convention
+/// # Bathymetry convention
 ///
-/// This BC computes depth as `h_ghost = η_tidal - bathymetry`. For proper
-/// behavior, ensure bathymetry is set correctly in `SWE2DRhsConfig`:
-///
-/// ```text
-/// // For mean depth h0 = 50m:
-/// let bathymetry = Bathymetry2D::constant(n_elements, n_nodes, -50.0);
-/// let config = config.with_bathymetry(&bathymetry);
-/// ```
-///
-/// This ensures h_ghost = 0 - (-50) = 50m when η_tidal = 0 (surface at MSL).
+/// The ghost depth is `η_tide − B`; with B = −h₀ for a basin of depth h₀ it
+/// is h₀ at mean sea level.
 #[derive(Clone, Debug)]
 pub struct HarmonicTidal2D {
-    /// Mean surface elevation
-    pub mean_elevation: f64,
-    /// Tidal constituents
-    pub constituents: Vec<TidalConstituent>,
+    /// The prescribed tide.
+    pub tide: HarmonicTide,
     /// Minimum depth
     pub h_min: f64,
-    /// Ramp-up duration in seconds (None = no ramp-up)
-    pub ramp_duration: Option<f64>,
 }
 
 impl HarmonicTidal2D {
     /// Create a new harmonic tidal BC.
     pub fn new(constituents: Vec<TidalConstituent>) -> Self {
-        Self {
-            mean_elevation: 0.0,
-            constituents,
-            h_min: 1e-6,
-            ramp_duration: None,
-        }
+        Self::from_tide(HarmonicTide::new(constituents))
+    }
+
+    /// Clamp the elevation to `tide`.
+    pub fn from_tide(tide: HarmonicTide) -> Self {
+        Self { tide, h_min: 1e-6 }
     }
 
     /// Create with mean elevation.
     pub fn with_mean_elevation(mut self, mean: f64) -> Self {
-        self.mean_elevation = mean;
+        self.tide.mean_elevation = mean;
         self
     }
 
@@ -942,67 +494,22 @@ impl HarmonicTidal2D {
         self
     }
 
-    /// Enable smooth ramp-up of tidal forcing.
-    ///
-    /// The ramp gradually increases tidal amplitudes from 0 to full amplitude
-    /// over the specified duration. This prevents initial impulse from
-    /// causing spurious oscillations.
-    ///
-    /// # Arguments
-    /// * `duration` - Ramp-up period in seconds (typically 1-3 tidal periods)
+    /// Ramp the tide up over `duration` seconds.
     pub fn with_ramp_up(mut self, duration: f64) -> Self {
-        self.ramp_duration = Some(duration);
+        self.tide.ramp_duration = Some(duration);
         self
     }
 
-    /// Apply Doodson/Schureman nodal corrections at a prediction epoch.
-    ///
-    /// Scales each constituent's amplitude by its nodal factor `f` and shifts its
-    /// phase by the equilibrium argument plus nodal phase `(V₀ + u)`, so the
-    /// prescribed elevation becomes the astronomically complete
-    ///
-    /// ```text
-    /// η(t) = η₀ + Σ fᵢ Aᵢ cos(ωᵢ t + (V₀ + u)ᵢ − Gᵢ)
-    /// ```
-    ///
-    /// where `t` is elapsed simulation time (seconds) from `epoch_jd`
-    /// (Julian Date, UTC; see [`julian_date`](crate::tides::julian_date)).
-    /// Apply **once**, after all constituents are set; unrecognised constituent
-    /// names are left uncorrected.
-    pub fn with_nodal_corrections(mut self, epoch_jd: f64) -> Self {
-        apply_nodal_corrections(&mut self.constituents, epoch_jd);
+    /// Nodal corrections for a run on `clock`; see
+    /// [`HarmonicTide::with_nodal_corrections`].
+    pub fn with_nodal_corrections(mut self, clock: &ModelClock, t_mid: f64) -> Self {
+        self.tide = self.tide.with_nodal_corrections(clock, t_mid);
         self
     }
 
-    /// Compute ramp factor at time t.
-    pub fn ramp_factor(&self, t: f64) -> f64 {
-        match self.ramp_duration {
-            None => 1.0,
-            Some(duration) if duration <= 0.0 => 1.0,
-            Some(duration) => {
-                if t <= 0.0 {
-                    0.0
-                } else if t >= duration {
-                    1.0
-                } else {
-                    let tau = t / duration;
-                    tau * tau * (3.0 - 2.0 * tau)
-                }
-            }
-        }
-    }
-
-    /// Evaluate tidal elevation.
-    ///
-    /// If ramp-up is enabled, the tidal constituents are scaled by the
-    /// ramp factor. The mean elevation is NOT ramped.
+    /// Surface elevation η(t).
     pub fn elevation(&self, t: f64) -> f64 {
-        let ramp = self.ramp_factor(t);
-        let mut eta = self.mean_elevation;
-        for c in &self.constituents {
-            eta += ramp * c.evaluate(t);
-        }
-        eta
+        self.tide.elevation(t)
     }
 }
 
@@ -1100,60 +607,6 @@ mod tests {
             G,
             H_MIN,
         )
-    }
-
-    #[test]
-    fn test_harmonic_flather_nodal_corrections_applied() {
-        use crate::tides::{AstronomicalArguments, julian_date, nodal_correction};
-
-        // K1 shows the large diurnal nodal modulation, so it is the clearest
-        // witness that the correction was baked into amplitude and phase.
-        let raw = TidalConstituent::k1(0.10, 0.30);
-        let epoch_jd = julian_date(2024, 1, 1, 0, 0, 0.0);
-        let astro = AstronomicalArguments::at_julian_date(epoch_jd);
-        let corr = nodal_correction("K1", &astro).unwrap();
-
-        let bc = HarmonicFlather2D::new(vec![raw.clone()], 50.0).with_nodal_corrections(epoch_jd);
-        let c = &bc.constituents[0];
-
-        assert!((c.amplitude - corr.f * 0.10).abs() < TOL);
-        assert!((c.phase - (0.30 + corr.phase_offset_rad())).abs() < TOL);
-        // The correction is material (f ≠ 1, V₀+u ≠ 0).
-        assert!((c.amplitude - raw.amplitude).abs() > 1e-3);
-        assert!((c.phase - raw.phase).abs() > 1e-3);
-        // Frequency untouched.
-        assert!((c.period - raw.period).abs() < TOL);
-    }
-
-    #[test]
-    fn test_harmonic_tidal_nodal_corrections_applied() {
-        use crate::tides::{AstronomicalArguments, julian_date, nodal_correction};
-
-        let raw = TidalConstituent::m2(0.50, 0.0);
-        let epoch_jd = julian_date(2024, 6, 1, 0, 0, 0.0);
-        let astro = AstronomicalArguments::at_julian_date(epoch_jd);
-        let corr = nodal_correction("M2", &astro).unwrap();
-
-        let bc = HarmonicTidal2D::new(vec![raw.clone()]).with_nodal_corrections(epoch_jd);
-        let c = &bc.constituents[0];
-
-        assert!((c.amplitude - corr.f * 0.50).abs() < TOL);
-        assert!((c.phase - (0.0 + corr.phase_offset_rad())).abs() < TOL);
-        // M2 nodal factor stays within a few percent of unity.
-        assert!((corr.f - 1.0).abs() < 0.05 && (corr.f - 1.0).abs() > 1e-6);
-    }
-
-    #[test]
-    fn test_nodal_corrections_pass_through_unknown() {
-        use crate::tides::julian_date;
-
-        // "simple" is not in the astronomy table → identity correction.
-        let raw = TidalConstituent::new("simple", 0.4, 3600.0, 0.7);
-        let epoch_jd = julian_date(2024, 1, 1, 0, 0, 0.0);
-        let bc = HarmonicTidal2D::new(vec![raw.clone()]).with_nodal_corrections(epoch_jd);
-        let c = &bc.constituents[0];
-        assert!((c.amplitude - 0.4).abs() < TOL);
-        assert!((c.phase - 0.7).abs() < TOL);
     }
 
     #[test]
@@ -1287,109 +740,6 @@ mod tests {
         assert!((ghost.hv / ghost.h - 0.5).abs() < TOL);
     }
 
-    /// Oblique outward normal used by the Flather ghost-state tests.
-    const N_OBLIQUE: (f64, f64) = (0.6, 0.8);
-
-    /// Interior state at depth `h` with normal/tangential velocity (un, ut)
-    /// relative to `N_OBLIQUE`.
-    fn oblique_context(h: f64, un: f64, ut: f64, bathymetry: f64) -> BCContext2D {
-        let (nx, ny) = N_OBLIQUE;
-        let (u, v) = (un * nx - ut * ny, un * ny + ut * nx);
-        BCContext2D::new(
-            0.0,
-            (0.0, 0.0),
-            SWEState2D::from_primitives(h, u, v),
-            bathymetry,
-            N_OBLIQUE,
-            G,
-            H_MIN,
-        )
-    }
-
-    /// Normal and tangential velocity of a state relative to `N_OBLIQUE`.
-    fn oblique_velocity(state: &SWEState2D) -> (f64, f64) {
-        let (nx, ny) = N_OBLIQUE;
-        let (u, v) = (state.hu / state.h, state.hv / state.h);
-        (u * nx + v * ny, -u * ny + v * nx)
-    }
-
-    #[test]
-    fn test_flather_ghost_is_external_state() {
-        // B = −10, η_int = 0.3, η_ext = −0.2; the interior has both normal
-        // and tangential flow. Regression: the ghost normal velocity used to
-        // be u_n,ext + sqrt(g/h)(η_int − η_ext), which double-applies the
-        // Flather relation once the Riemann solver sees it.
-        let (u_ext, v_ext) = (0.05, -0.02);
-        let mut bc = Flather2D::new(|_x, _y, _t| -0.2, 10.0);
-        bc.u_external = (u_ext, v_ext);
-        let ctx = oblique_context(10.3, 0.4, 0.7, -10.0);
-
-        let ghost = bc.ghost_state(&ctx);
-        let (un, ut) = oblique_velocity(&ghost);
-
-        let (nx, ny) = N_OBLIQUE;
-        assert!(
-            (ghost.h - 9.8).abs() < TOL,
-            "h = η_ext − B, got {}",
-            ghost.h
-        );
-        assert!(
-            (un - (u_ext * nx + v_ext * ny)).abs() < TOL,
-            "u_n = u_n,ext"
-        );
-        assert!((ut - 0.7).abs() < TOL, "u_t from interior");
-    }
-
-    #[test]
-    fn test_harmonic_flather_ghost_is_external_state() {
-        let bc = HarmonicFlather2D::m2_only(0.5, 0.0, 10.0);
-        let ctx = oblique_context(10.3, 0.4, 0.7, -10.0);
-
-        let ghost = bc.ghost_state(&ctx);
-        let (un, ut) = oblique_velocity(&ghost);
-
-        // At t = 0 the M2 elevation is +0.5, so h = 0.5 − (−10).
-        assert!(
-            (ghost.h - 10.5).abs() < TOL,
-            "h = η_ext − B, got {}",
-            ghost.h
-        );
-        assert!(un.abs() < TOL, "u_n = u_n,ext = 0, got {un}");
-        assert!((ut - 0.7).abs() < TOL, "u_t from interior");
-    }
-
-    #[test]
-    fn test_flather_relation_applied_once_by_riemann_solver() {
-        // Linearised about rest at depth H: with the external state as ghost,
-        // the upwind boundary state takes the outgoing invariant from the
-        // interior and the incoming one from outside,
-        //   u* + s η* = u_int + s η_int,   u* − s η* = u_ext − s η_ext,
-        // with s = sqrt(g/H), which is exactly the Flather condition. So the
-        // boundary mass flux is H u* with u* the mean of the two invariants.
-        let depth = 10.0;
-        let s = (G / depth).sqrt();
-        let (eta_int, un_int) = (0.01, 0.003);
-        let (eta_ext, un_ext) = (-0.004, 0.002);
-
-        let (nx, ny) = N_OBLIQUE;
-        let mut bc = Flather2D::new(move |_x, _y, _t| eta_ext, depth);
-        bc.u_external = (un_ext * nx, un_ext * ny);
-        let ctx = oblique_context(depth + eta_int, un_int, 0.0, -depth);
-        let ghost = bc.ghost_state(&ctx);
-
-        let flux = crate::flux::roe_flux_swe_2d(&ctx.interior_state, &ghost, N_OBLIQUE, G, H_MIN);
-
-        let u_star = 0.5 * ((un_int + s * eta_int) + (un_ext - s * eta_ext));
-        let expected = depth * u_star;
-        // Quadratic (η·u) terms are ~1e-4 of the linear flux here.
-        assert!(
-            (flux.h - expected).abs() < 1e-3 * expected.abs(),
-            "boundary mass flux {} differs from the Flather value {}",
-            flux.h,
-            expected
-        );
-    }
-
     #[test]
     fn test_discharge() {
         // Constant discharge of 5 m²/s
@@ -1431,101 +781,26 @@ mod tests {
         assert!((ctx.interior_celerity() - (G * 2.0_f64).sqrt()).abs() < TOL);
     }
 
-    // ====================================================================
-    // Radiation2D tests
-    // ====================================================================
 
-    fn radiation_context(
-        h: f64,
-        u: f64,
-        v: f64,
-        bathymetry: f64,
-        normal: (f64, f64),
-    ) -> BCContext2D {
-        BCContext2D::new(
+    #[test]
+    fn test_harmonic_tidal_clamps_elevation() {
+        let clock = ModelClock::at_datetime(2024, 6, 1, 0, 0);
+        let bc = HarmonicTidal2D::m2_only(0.5, 0.0)
+            .with_mean_elevation(0.1)
+            .with_nodal_corrections(&clock, 0.0);
+        let n = clock.nodal_correction("M2", 0.0).unwrap();
+        let eta = 0.1 + n.f * 0.5 * n.phase_offset_rad().cos();
+        let ctx = BCContext2D::new(
             0.0,
             (0.0, 0.0),
-            SWEState2D::from_primitives(h, u, v),
-            bathymetry,
-            normal,
+            SWEState2D::from_primitives(20.0, 0.3, -0.2),
+            -20.0,
+            (1.0, 0.0),
             G,
             H_MIN,
-        )
-    }
-
-    #[test]
-    fn test_radiation_still_water_is_balanced_over_any_bed() {
-        // Interior at rest at mean sea level: the ghost must equal the
-        // interior, so the boundary flux carries no spurious wave.
-        let bc = Radiation2D::still_water();
-        for bed in [-2.0, -50.0, -400.0] {
-            let ctx = radiation_context(-bed, 0.0, 0.0, bed, (1.0, 0.0));
-            let ghost = bc.ghost_state(&ctx);
-            assert!(
-                (ghost.h + bed).abs() < TOL,
-                "bed {bed}: ghost h {}",
-                ghost.h
-            );
-            assert!(ghost.hu.abs() < TOL);
-            assert!(ghost.hv.abs() < TOL);
-        }
-    }
-
-    #[test]
-    fn test_radiation_ghost_depth_from_reference_elevation() {
-        // h_ghost = η_ext − B, independent of the interior elevation.
-        let bc = Radiation2D::with_elevation(0.3);
-        for eta_int in [-0.5, 0.0, 1.2] {
-            let ctx = radiation_context(50.0 + eta_int, 0.0, 0.0, -50.0, (1.0, 0.0));
-            let ghost = bc.ghost_state(&ctx);
-            assert!(
-                (ghost.h - 50.3).abs() < TOL,
-                "η_int {eta_int}: ghost h {}",
-                ghost.h
-            );
-        }
-    }
-
-    /// Regression: the old ghost was the interior state whenever
-    /// `u_n + c > 0`, i.e. zero-gradient extrapolation for any subcritical
-    /// flow, so the incoming invariant came from the interior.
-    #[test]
-    fn test_radiation_does_not_extrapolate_interior() {
-        let bc = Radiation2D::still_water();
-        // Outflow at 0.5 m/s with a 0.2 m raised surface over a 10 m bed.
-        let ctx = radiation_context(10.2, 0.5, 0.0, -10.0, (1.0, 0.0));
+        );
         let ghost = bc.ghost_state(&ctx);
-        assert!((ghost.h - 10.0).abs() < TOL);
-        assert!(ghost.hu.abs() < TOL, "ghost normal momentum {}", ghost.hu);
-    }
-
-    #[test]
-    fn test_radiation_velocity_decomposition() {
-        let sqrt2_inv = 1.0 / 2.0_f64.sqrt();
-        let (nx, ny) = (sqrt2_inv, sqrt2_inv);
-        let bc = Radiation2D::still_water().with_external_velocity((1.0, 0.0));
-        // Interior u = (-10, 3): tangential component 13/√2.
-        let ctx = radiation_context(2.0, -10.0, 3.0, -2.0, (nx, ny));
-        let ghost = bc.ghost_state(&ctx);
-
-        let u_ghost = ghost.hu / ghost.h;
-        let v_ghost = ghost.hv / ghost.h;
-        let un_ghost = u_ghost * nx + v_ghost * ny;
-        let ut_ghost = -u_ghost * ny + v_ghost * nx;
-
-        // Normal component from the external velocity, tangential from the
-        // interior.
-        assert!((un_ghost - sqrt2_inv).abs() < TOL, "u_n {un_ghost}");
-        assert!((ut_ghost - 13.0 * sqrt2_inv).abs() < TOL, "u_t {ut_ghost}");
-    }
-
-    #[test]
-    fn test_radiation_dry_reference_clamps_depth() {
-        // Reference level below the bed: ghost depth clamps to h_min.
-        let bc = Radiation2D::with_elevation(-3.0);
-        let ctx = radiation_context(1.0, 0.0, 0.0, -1.0, (1.0, 0.0));
-        let ghost = bc.ghost_state(&ctx);
-        assert!(ghost.h > 0.0 && ghost.h <= 1e-6 + TOL);
-        assert!(ghost.hu.abs() < TOL);
+        assert!((ghost.h - (20.0 + eta)).abs() < TOL);
+        assert!((ghost.hu / ghost.h - 0.3).abs() < TOL);
     }
 }

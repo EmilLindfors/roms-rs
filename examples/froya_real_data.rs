@@ -41,9 +41,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(feature = "netcdf")]
-use dg_rs::boundary::OceanNestingBC2D;
+use dg_rs::boundary::OceanModelState;
 use dg_rs::boundary::{
-    HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D,
+    CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D,
+    SWEBoundaryCondition2D,
 };
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::io::{
@@ -375,16 +376,17 @@ fn lake_at_rest(domain: &Domain, hours: f64) {
 fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let t_end = opts.hours * 3600.0;
     let wall = Reflective2D::new();
-    let tide = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0).with_ramp_up(TIDAL_RAMP);
+    let tide = CharacteristicOBC::new(HarmonicTide::m2(M2_AMPLITUDE, 0.0).with_ramp_up(TIDAL_RAMP));
 
     #[cfg(feature = "netcdf")]
     let nesting = match (&opts.norkyst, &domain.projection) {
         (Some(path), Some(projection)) => {
             let reader = Arc::new(OceanModelReader::from_file(Path::new(path))?);
             println!("  NorKyst: {}", reader.summary());
-            let bc = OceanNestingBC2D::new(reader, *projection).with_reference_level(0.0);
-            bc.check_time_coverage(0.0, t_end)?;
-            Some(bc)
+            let clock = OceanModelState::<LocalProjection>::first_snapshot(&reader);
+            let parent = OceanModelState::new(reader, *projection, clock);
+            parent.check_time_coverage(0.0, t_end)?;
+            Some(CharacteristicOBC::new(parent))
         }
         _ => None,
     };

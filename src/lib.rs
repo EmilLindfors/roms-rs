@@ -65,21 +65,21 @@ pub use solver::{
 #[cfg(feature = "parallel")]
 pub use solver::compute_rhs_parallel;
 pub use time::{
-    SWETimeConfig, compute_dt, run_swe_simulation, ssp_rk3_step, ssp_rk3_step_timed,
+    ModelClock, SWETimeConfig, compute_dt, run_swe_simulation, ssp_rk3_step, ssp_rk3_step_timed,
     ssp_rk3_swe_step, ssp_rk3_swe_step_timed, total_energy, total_mass, total_momentum,
 };
 
 // 2D types
 pub use basis::Vandermonde2D;
 #[cfg(feature = "netcdf")]
-pub use boundary::OceanNestingBC2D;
+pub use boundary::OceanModelState;
 pub use boundary::{
-    BCContext2D, BathymetryValidationConfig, BathymetryValidationResult, Chapman2D,
-    ChapmanFlather2D, ConstantDischarge2D, Discharge2D, Extrapolation2D, FixedState2D, Flather2D,
-    HarmonicFlather2D, HarmonicTidal2D, NestingBC2D, Radiation2D, Reflective2D,
-    SWEBoundaryCondition2D, SpongeConfig, TSTConfig, TSTConstituent, TSTOBC2D, Tidal2D,
-    TidalBCType, TidalConstituent, TidalSimulationBuilder, format_bathymetry_warning,
-    validate_bathymetry_convention,
+    BCContext2D, BathymetryValidationConfig, BathymetryValidationResult, BoundaryState,
+    BoundaryTides, CharacteristicOBC, ConstantDischarge2D, Discharge2D, ElevationOnly,
+    ExternalState, ExternalStateProvider, Extrapolation2D, FixedState2D, HarmonicTidal2D,
+    HarmonicTide, ParentTimeSeries, Reflective2D, SWEBoundaryCondition2D, SpongeConfig,
+    StillWater, TidalAtlas, Tidal2D, TidalBCType, TidalConstituent, TidalSimulationBuilder,
+    format_bathymetry_warning, validate_bathymetry_convention,
 };
 pub use equations::Advection2D;
 pub use mesh::{BoundaryConfig, BoundaryTag, Mesh2D, Mesh2DBuilder};

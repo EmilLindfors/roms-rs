@@ -106,7 +106,7 @@ pub fn validate_bathymetry_convention(
 ///
 /// # Arguments
 ///
-/// * `bc_name` - Name of the boundary condition (e.g., "HarmonicFlather2D")
+/// * `bc_name` - Name of the boundary condition (e.g., "CharacteristicOBC")
 /// * `result` - Validation result from `validate_bathymetry_convention`
 pub fn format_bathymetry_warning(bc_name: &str, result: &BathymetryValidationResult) -> String {
     format!(

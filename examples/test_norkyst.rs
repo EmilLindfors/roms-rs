@@ -4,7 +4,10 @@
 
 #[cfg(feature = "netcdf")]
 fn main() {
-    use dg_rs::boundary::{BCContext2D, OceanNestingBC2D, SWEBoundaryCondition2D};
+    use dg_rs::boundary::{
+        BCContext2D, CharacteristicOBC, ExternalStateProvider, OceanModelState,
+        SWEBoundaryCondition2D,
+    };
     use dg_rs::io::{LocalProjection, OceanModelReader};
     use dg_rs::solver::SWEState2D;
     use std::sync::Arc;
@@ -49,10 +52,10 @@ fn main() {
             }
 
             // =====================================================
-            // Demonstrate OceanNestingBC2D for boundary conditions
+            // Demonstrate NorKyst as open-boundary data
             // =====================================================
             println!("\n{}", "=".repeat(60));
-            println!("OceanNestingBC2D Boundary Condition Demo");
+            println!("OceanModelState + CharacteristicOBC demo");
             println!("{}", "=".repeat(60));
 
             // Create projection centered on Frøya
@@ -61,22 +64,21 @@ fn main() {
             // Wrap reader in Arc for sharing
             let reader = Arc::new(reader);
 
-            // Create ocean nesting BC with Flather blending
-            let bc = OceanNestingBC2D::new(Arc::clone(&reader), projection)
-                .with_reference_level(0.0) // MSL reference
-                .with_flather(true)
-                .with_flather_weight(1.0);
-
-            println!("BC name: {}", bc.name());
-            if let (Some((t0, t1)), Some((s0, s1))) = (bc.time_range(), bc.simulation_time_range())
+            // Parent state on a clock starting at the first snapshot
+            let clock = OceanModelState::<LocalProjection>::first_snapshot(&reader);
+            let parent = OceanModelState::new(Arc::clone(&reader), projection, clock);
+            if let (Some((t0, t1)), Some((s0, s1))) =
+                (parent.time_range(), parent.simulation_time_range())
             {
                 println!("Time range: {t0:.0} - {t1:.0} Unix s (simulation {s0:.0} - {s1:.0} s)");
             }
-            println!("Spatial bounds: {:?}", bc.spatial_bounds());
+            println!("Spatial bounds: {:?}", parent.spatial_bounds());
+            let bc = CharacteristicOBC::new(parent.clone());
+            println!("BC name: {}", bc.name());
 
             // Simulate a boundary node query
             // At origin (0, 0) in local coords = center lat/lon
-            let bathymetry = 50.0; // 50m depth
+            let bathymetry = -50.0; // bed 50 m below MSL
             let interior_state = SWEState2D::from_primitives(50.0, 0.0, 0.0); // Still water
             let time = 0.0; // Simulation time; t = 0 is the first snapshot by default
 
@@ -90,8 +92,9 @@ fn main() {
                 1e-6,       // h_min
             );
 
+            println!("\nParent state at origin: {:?}", parent.external_state(&ctx));
             let ghost = bc.ghost_state(&ctx);
-            println!("\nBoundary ghost state at origin:");
+            println!("Boundary state at origin:");
             println!("  h: {:.3} m", ghost.h);
             println!("  u: {:.4} m/s", ghost.hu / ghost.h.max(1e-6));
             println!("  v: {:.4} m/s", ghost.hv / ghost.h.max(1e-6));
@@ -107,17 +110,11 @@ fn main() {
                 1e-6,
             );
 
-            if bc.contains_position(5000.0, 0.0) {
-                let ghost_east = bc.ghost_state(&ctx_east);
-                println!("\nBoundary ghost state 5km east:");
-                println!("  h: {:.3} m", ghost_east.h);
-                println!("  u: {:.4} m/s", ghost_east.hu / ghost_east.h.max(1e-6));
-                println!("  v: {:.4} m/s", ghost_east.hv / ghost_east.h.max(1e-6));
-            } else {
-                println!("\nPoint 5km east is outside ocean model domain");
-            }
-
-            println!("\nOceanNestingBC2D ready for use in simulations!");
+            let ghost_east = bc.ghost_state(&ctx_east);
+            println!("\nBoundary state 5 km east:");
+            println!("  h: {:.3} m", ghost_east.h);
+            println!("  u: {:.4} m/s", ghost_east.hu / ghost_east.h.max(1e-6));
+            println!("  v: {:.4} m/s", ghost_east.hv / ghost_east.h.max(1e-6));
         }
         Err(e) => {
             eprintln!("Failed to load: {}", e);

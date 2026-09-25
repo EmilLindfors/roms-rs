@@ -11,6 +11,7 @@
 //!
 //! The [`Integrable`] trait marks solution types that can be time-stepped.
 
+mod clock;
 mod coupled_swe_tracer;
 pub mod integrator;
 pub mod mode_split;
@@ -28,6 +29,7 @@ pub use coupled_swe_tracer::{
     run_coupled_simulation_limited, ssp_rk3_coupled_step, ssp_rk3_coupled_step_limited,
     ssp_rk3_coupled_step_timed, total_mass as total_mass_coupled, total_tracer,
 };
+pub use clock::ModelClock;
 pub use mode_split::{ModeSplitIntegrator, SplitMethod};
 pub use ssp_rk3::{compute_dt, ssp_rk3_step, ssp_rk3_step_timed};
 pub use ssp_rk3_2d::{run_advection_2d, ssp_rk3_step_2d, ssp_rk3_step_2d_timed};

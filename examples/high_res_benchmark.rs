@@ -24,7 +24,7 @@ use std::time::Instant;
 #[cfg(feature = "parallel")]
 use rayon;
 
-use dg_rs::boundary::{HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D};
+use dg_rs::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D};
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
@@ -246,7 +246,8 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
 
     // Boundary conditions
     let wall_bc = Reflective2D::new();
-    let tidal_bc = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0).with_ramp_up(RAMP_DURATION);
+    let tidal_bc =
+        CharacteristicOBC::new(HarmonicTide::m2(M2_AMPLITUDE, 0.0).with_ramp_up(RAMP_DURATION));
     let bc = MultiBoundaryCondition2D::new(&wall_bc).with_open(&tidal_bc);
 
     // Equation and time config

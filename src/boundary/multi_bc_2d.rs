@@ -23,7 +23,7 @@
 //! let config = SWE2DRhsConfig::new(&equation, &multi_bc);
 //! ```
 
-use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
+use crate::boundary::{BCContext2D, BoundaryState, SWEBoundaryCondition2D};
 use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
 
@@ -124,14 +124,23 @@ impl<'a> MultiBoundaryCondition2D<'a> {
             BoundaryTag::Neumann => self.default_bc,
         }
     }
+
+    /// The BC for the boundary tag of `ctx` (the default without a tag).
+    fn bc_for_context(&self, ctx: &BCContext2D) -> &dyn SWEBoundaryCondition2D {
+        match &ctx.boundary_tag {
+            Some(tag) => self.bc_for_tag(tag),
+            None => self.default_bc,
+        }
+    }
 }
 
 impl<'a> SWEBoundaryCondition2D for MultiBoundaryCondition2D<'a> {
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
-        match &ctx.boundary_tag {
-            Some(tag) => self.bc_for_tag(tag).ghost_state(ctx),
-            None => self.default_bc.ghost_state(ctx),
-        }
+        self.bc_for_context(ctx).ghost_state(ctx)
+    }
+
+    fn boundary_state(&self, ctx: &BCContext2D) -> BoundaryState {
+        self.bc_for_context(ctx).boundary_state(ctx)
     }
 
     fn name(&self) -> &'static str {
