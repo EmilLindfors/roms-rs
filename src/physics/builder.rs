@@ -59,8 +59,10 @@ use super::traits::{PhysicsModule, PhysicsModuleInfo};
 /// Elements whose mean depth went negative anyway are emptied (creating mass)
 /// and counted in [`SWEPhysics2D::negative_depth_clips`].
 ///
-/// The split-form formulations have no wet/dry interface treatment yet: use
-/// `SWEFormulation2D::Standard` with hydrostatic reconstruction for wet/dry runs.
+/// For wet/dry runs use `SWEFormulation2D::WetDry` (well-balanced at shorelines;
+/// its dry-node threshold is `WetDryConfig::h_dry`), or `Standard` with
+/// hydrostatic reconstruction. `EntropyStable`/`EntropyConservative` have no
+/// wet/dry interface treatment.
 pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     /// The mesh
     pub mesh: Arc<Mesh2D>,
@@ -154,6 +156,9 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
             if self.well_balanced {
                 config = config.with_well_balanced(true);
             }
+        }
+        if let Some(ref wet_dry) = self.wet_dry {
+            config = config.with_dry_threshold(wet_dry.h_dry.meters());
         }
         config
     }

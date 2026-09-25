@@ -1019,9 +1019,14 @@ impl dg_rs::SourceTerm2D for ManufacturedSource {
     }
 }
 
-/// L2 depth error of the entropy-stable split form on an n×n periodic mesh.
-fn run_swe_2d_split_form_manufactured(n: usize, order: usize, t_final: f64, cfl: f64) -> f64 {
-    use dg_rs::SWEFormulation2D;
+/// L2 depth error of a split form on an n×n periodic mesh.
+fn run_swe_2d_split_form_manufactured(
+    formulation: dg_rs::SWEFormulation2D,
+    n: usize,
+    order: usize,
+    t_final: f64,
+    cfl: f64,
+) -> f64 {
     use dg_rs::mesh::Bathymetry2D;
     use manufactured::{G, U, V, bed, depth};
 
@@ -1035,7 +1040,7 @@ fn run_swe_2d_split_form_manufactured(n: usize, order: usize, t_final: f64, cfl:
     let source = ManufacturedSource;
     let config = SWE2DRhsConfig::new(&equation, &bc)
         .with_coriolis(false)
-        .with_formulation(SWEFormulation2D::EntropyStable)
+        .with_formulation(formulation)
         .with_bathymetry(&bathymetry)
         .with_source_terms(&source);
 
@@ -1070,15 +1075,20 @@ fn run_swe_2d_split_form_manufactured(n: usize, order: usize, t_final: f64, cfl:
     q.l2_error_depth(&mesh, &ops, &geom, |x, y| depth(x, y, t_final))
 }
 
-fn check_split_form_convergence(order: usize, cfl: f64, min_order: f64) {
+fn check_split_form_convergence(
+    formulation: dg_rs::SWEFormulation2D,
+    order: usize,
+    cfl: f64,
+    min_order: f64,
+) {
     let t_final = 0.1;
     let resolutions = [4, 8, 16];
     let errors: Vec<f64> = resolutions
         .iter()
-        .map(|&n| run_swe_2d_split_form_manufactured(n, order, t_final, cfl))
+        .map(|&n| run_swe_2d_split_form_manufactured(formulation, n, order, t_final, cfl))
         .collect();
 
-    println!("\nSWE 2D entropy-stable split form P{order} (manufactured, bathymetry):");
+    println!("\nSWE 2D split form {formulation:?} P{order} (manufactured, bathymetry):");
     for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
         if i > 0 {
             let observed = (errors[i - 1] / err).log2();
@@ -1091,18 +1101,25 @@ fn check_split_form_convergence(order: usize, cfl: f64, min_order: f64) {
     let observed = (errors[errors.len() - 2] / errors[errors.len() - 1]).log2();
     assert!(
         observed > min_order,
-        "Split-form SWE 2D P{order} should converge at order > {min_order}, observed {observed:.2}"
+        "Split-form SWE 2D {formulation:?} P{order} should converge at order > {min_order}, observed {observed:.2}"
     );
 }
 
 #[test]
 fn test_convergence_swe_2d_split_form_p2() {
     // P2 → 3rd order expected
-    check_split_form_convergence(2, 0.1, 2.5);
+    check_split_form_convergence(dg_rs::SWEFormulation2D::EntropyStable, 2, 0.1, 2.5);
 }
 
 #[test]
 fn test_convergence_swe_2d_split_form_p3() {
     // P3 → 4th order expected
-    check_split_form_convergence(3, 0.05, 3.5);
+    check_split_form_convergence(dg_rs::SWEFormulation2D::EntropyStable, 3, 0.05, 3.5);
+}
+
+#[test]
+fn test_convergence_swe_2d_wet_dry_split_form() {
+    // Fully wet: flux differencing with hydrostatic-HLL faces keeps N+1
+    check_split_form_convergence(dg_rs::SWEFormulation2D::WetDry, 2, 0.1, 2.5);
+    check_split_form_convergence(dg_rs::SWEFormulation2D::WetDry, 3, 0.05, 3.5);
 }

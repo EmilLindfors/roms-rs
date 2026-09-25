@@ -58,8 +58,30 @@ pub enum SWEFormulation2D {
     /// (energy) inequality. The bed slope is part of the operator: `flux_type`
     /// and `well_balanced` are ignored, and `source_terms` must not contain
     /// `BathymetrySource2D` (the RHS panics if it does). Assumes wet nodes; there
-    /// is no wetting/drying treatment. See `solver/rhs/swe_2d_split_form.rs`.
+    /// is no wetting/drying treatment (use [`Self::WetDry`]). See
+    /// `solver/rhs/swe_2d_split_form.rs`.
     EntropyStable,
+    /// Split form for wetting and drying:
+    /// - fully wet elements use the flux-differencing volume term of
+    ///   [`Self::EntropyStable`];
+    /// - elements with a node shallower than `SWE2DRhsConfig::h_dry` use a
+    ///   first-order finite-volume update on their GLL subcells;
+    /// - every interface, faces and subcell faces alike, uses HLL on
+    ///   Audusse et al. (2004) hydrostatically reconstructed states.
+    ///
+    /// Well-balanced at lake at rest also across wet/dry shorelines,
+    /// mass-conservative, and positivity preserving for the element means under
+    /// `positivity_cfl_swe_2d` (with the positivity limiter). Like the other
+    /// split forms the bed slope is part of the operator: no
+    /// `BathymetrySource2D`; `flux_type` and `well_balanced` are ignored.
+    ///
+    /// Trade-off against [`Self::Standard`] with hydrostatic reconstruction:
+    /// that one leaves a stationary spurious circulation at a lake-at-rest
+    /// shoreline (≈ 5 cm/s where h > 1 cm on a 2 % beach), but on a moving
+    /// shoreline it is about 3× more accurate, because here every element the
+    /// shoreline crosses is first order (Thacker's paraboloid, P2: 4.8 % vs
+    /// 1.3 % at 40², both converging; `tests/wet_dry_2d_test.rs`).
+    WetDry,
 }
 
 /// Configuration for 2D SWE RHS computation.
@@ -116,6 +138,10 @@ pub struct SWE2DRhsConfig<'a, BC: SWEBoundaryCondition2D> {
     /// without a dt, so callers that rely on it must set it themselves (see
     /// `Chapman2D` for the fallback when it is unset).
     pub dt: Option<f64>,
+    /// Depth (m) below which a node counts as dry for
+    /// [`SWEFormulation2D::WetDry`]: elements with such a node use the subcell
+    /// finite-volume update. Default 1 mm (`WetDryConfig::DEFAULT_H_DRY`).
+    pub h_dry: f64,
 }
 
 impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
@@ -132,6 +158,7 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
             well_balanced: false,
             viscosity: None,
             dt: None,
+            h_dry: crate::solver::WetDryConfig::DEFAULT_H_DRY,
         }
     }
 
@@ -240,6 +267,13 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
     /// and take `dt = dt_advective.min(dt_viscous)`.
     pub fn with_viscosity(mut self, visc: &'a HorizontalViscosity2D) -> Self {
         self.viscosity = Some(visc);
+        self
+    }
+
+    /// Set the dry-node depth of [`SWEFormulation2D::WetDry`].
+    pub fn with_dry_threshold(mut self, h_dry: f64) -> Self {
+        assert!(h_dry >= 0.0, "dry threshold must be non-negative");
+        self.h_dry = h_dry;
         self
     }
 
