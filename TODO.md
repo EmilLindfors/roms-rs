@@ -28,11 +28,11 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
 
 1. **Priority 0 (2026-09-25): confirmed small bugs.**
    - Each needs a regression test that fails before the fix.
-   - Review and merge [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2), which covers P0.15–P0.18 (tidal periods, 3D vertical advection ÷Hz with Ω at w-points, EOS units, Chezy units).
+   - P0.15–P0.18 (tidal periods, 3D vertical advection ÷Hz with Ω at w-points, EOS units, Chezy units) are fixed in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
    - P0.12 (Flather) and P0.13 (reconstruction mass leak) are fixed. Then: the rest of P0.14 (`linearize` doc) → P0.21 time step → the rest.
 2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
 3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
-4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit once P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) merges: it used the truncated periods.
+4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
 
 Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF. Otherwise use `cargo test --no-default-features --features parallel,simd`.
 
@@ -61,24 +61,24 @@ All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Ea
 - [x] The `SWE2DRhsConfig::well_balanced` / `with_well_balanced` docs (`swe_2d.rs:50-53,142-153`) say to omit `BathymetrySource2D`. Doing so gives ≈ 0.6 m/s² lake-at-rest residuals with nodal B. The advice holds only for cell-constant B.
 - [ ] The `Bathymetry2D::linearize()` doc says "linear B is well-balanced", which is false at p = 1 (0.07 m/s² measured).
 
-### P0.15 Truncated tidal constituent periods (MAJOR, tides/analysis) — IN REVIEW: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
-- [ ] **The bug.** `TidalConstituent::{m2,k1,o1,n2,p1}` (`boundary/tidal.rs:76-113`) use 12.42 / 23.93 / 25.82 / 12.66 / 24.07 h. They feed `HarmonicAnalysis::standard()`/`norwegian_coast()` and the harmonic BCs.
+### P0.15 Truncated tidal constituent periods (MAJOR, tides/analysis) — FIXED: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
+- [x] **The bug.** `TidalConstituent::{m2,k1,o1,n2,p1}` (`boundary/tidal.rs:76-113`) use 12.42 / 23.93 / 25.82 / 12.66 / 24.07 h. They feed `HarmonicAnalysis::standard()`/`norwegian_coast()` and the harmonic BCs.
   - Phase error on a 60-day fit: ~1° (M2) to ~7° (P1); >10° over a year.
-- [ ] **Fix.** Use `constituent_period()` (`constituent_reader.rs:156`) or Doodson speeds.
-- [ ] **Test.** Fit a *true-frequency* synthetic signal; the phase error must be < 0.1°. The current round-trips synthesise with the same truncated periods.
+- [x] **Fix.** Use `constituent_period()` (`constituent_reader.rs:156`) or Doodson speeds.
+- [x] **Test.** Fit a *true-frequency* synthetic signal; the phase error must be < 0.1°. The current round-trips synthesise with the same truncated periods.
 
-### P0.16 3D vertical momentum advection too large by a factor of D (BLOCKER, 3D) — IN REVIEW: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
-- [ ] `apply_vertical_advection_field` divides the Ω·u flux difference by Δσ (`advection_3d.rs:641`). Ω is in m/s, so the divisor must be Hz = D·Δσ; the tracer version (`:688`) already does this.
-- [ ] Test: a column with known linear Ω and u(σ) at D = 200 m, compared analytically.
+### P0.16 3D vertical momentum advection too large by a factor of D (BLOCKER, 3D) — FIXED: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
+- [x] `apply_vertical_advection_field` divides the Ω·u flux difference by Δσ (`advection_3d.rs:641`). Ω is in m/s, so the divisor must be Hz = D·Δσ; the tracer version (`:688`) already does this.
+- [x] Test: a column with known linear Ω and u(σ) at D = 200 m, compared analytically.
 - [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2) also moves Ω to w-points (`n_levels + 1` interface values), which covers the w-point item in P4.2.
 
-### P0.17 UNESCO EOS pressure units (MEDIUM, latent) — IN REVIEW: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
-- [ ] `EquationOfState::density`/`secant_bulk_modulus` (`equation_of_state.rs:144-160,281-307`) feed dbar into the bar-based formula. ρ(5 °C, 35, 1000 dbar) ≈ 1069.5 instead of ≈ 1032.3. Convert p_bar = p_dbar / 10.
-- [ ] Test against the UNESCO check values (ρ(35, 25 °C, 1000 bar) = 1062.53817; ρ(35, 5 °C, 0) = 1027.67547).
+### P0.17 UNESCO EOS pressure units (MEDIUM, latent) — FIXED: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
+- [x] `EquationOfState::density`/`secant_bulk_modulus` (`equation_of_state.rs:144-160,281-307`) feed dbar into the bar-based formula. ρ(5 °C, 35, 1000 dbar) ≈ 1069.5 instead of ≈ 1032.3. Convert p_bar = p_dbar / 10.
+- [x] Test against the UNESCO check values (ρ(35, 25 °C, 1000 bar) = 1062.53817; ρ(35, 5 °C, 0) = 1027.67547).
 
-### P0.18 Chezy friction units (MEDIUM, 2D + 1D) — IN REVIEW: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
-- [ ] `ChezyFriction2D` (`friction.rs:200-239`) and the 1D Chezy compute −C_D|u|u/h with dimensionless C_D. The momentum source is −C_D|u|u (currently 50× too weak in 50 m of water).
-- [ ] Test the magnitude, not just the sign.
+### P0.18 Chezy friction units (MEDIUM, 2D + 1D) — FIXED: [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)
+- [x] `ChezyFriction2D` (`friction.rs:200-239`) and the 1D Chezy compute −C_D|u|u/h with dimensionless C_D. The momentum source is −C_D|u|u (currently 50× too weak in 50 m of water).
+- [x] Test the magnitude, not just the sign.
 
 ### P0.19 Limiter plumbing (MAJOR, 2D)
 - [ ] The parallel fused Kuzmin+positivity limiter (`limiters/swe_2d.rs:686-703`) lacks the serial dry-element branch (`:118-129`): dry cells keep momentum and negative means survive. Add the branch plus a serial-vs-parallel equivalence test with dry cells.
@@ -247,7 +247,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 
 ### P4.2 Consistent continuity, tracers and momentum
 - [ ] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2; η advanced by the divergence of the same flux.
-- [ ] Ω stored at w-points (not layer centres re-averaged to faces) — in review in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
+- [x] Ω stored at w-points (not layer centres re-averaged to faces) — done in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
 - [ ] Assert Ω(0) = 0 instead of forcing it with the linear correction.
 - [ ] Step Hz·C and Hz·u (inventory form), then divide by the new Hz. Today a 1 m tide over 20 m of water pumps salinity by about ±1.7 psu.
 

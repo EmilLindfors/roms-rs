@@ -42,7 +42,8 @@ pub struct Rhs3DConfig<'a> {
 /// # Arguments
 /// * `rhs` - Accumulator for RHS tendencies (will be overwritten/added to)
 /// * `state` - Current state
-/// * `w_vel` - Vertical velocity field (diagnostic)
+/// * `w_vel` - Sigma-coordinate vertical velocity Ω (diagnostic) at the w-points,
+///   `n_levels + 1` values per column (see [`crate::physics::compute_vertical_velocity`])
 /// * `config` - Static configuration and auxiliary data
 pub fn compute_rhs_3d(
     rhs: &mut Solution3D,

@@ -52,7 +52,7 @@ Every problem has a known fix in the literature, so the track is recoverable. Bu
 | 9 | NorKyst nesting time read raw and clamped. The forcing freezes at the first snapshot | `netcdf_io.rs:1226-1236`, `find_bracket` | [V] §4.5 |
 | 10 | `compute_dt_swe_2d` combines the global minimum element size with the global maximum wave speed; Frøya runs at CFL 0.1 | `swe_2d.rs:582-602`, `froya_real_data.rs:163` | [V] §5.3 |
 
-**Status:** fixes for #4–#7 are in review in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2). It also moves Ω to w-points (§3.1b). Line references in this document are to commit `8679825`, before that PR.
+**Status:** fixes for #4–#7 are merged in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2). It also moves Ω to w-points (§3.1b). Line references in this document are to commit `8679825`, before that PR.
 
 ---
 

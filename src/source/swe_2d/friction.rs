@@ -201,10 +201,12 @@ impl SourceTerm2D for ManningFriction2D {
 /// Chezy friction formulation for 2D.
 ///
 /// Alternative to Manning, with constant friction coefficient:
-/// S_hu = -C_D |u| u / h
-/// S_hv = -C_D |u| v / h
+/// S_hu = -C_D |u| u
+/// S_hv = -C_D |u| v
 ///
-/// where C_D is the drag coefficient (dimensionless).
+/// where C_D is the drag coefficient (dimensionless), so the bed stress is
+/// τ_b = ρ C_D |u| u. In terms of the Chezy coefficient C (m^{1/2}/s),
+/// C_D = g / C²; Manning's n corresponds to C_D = g n² / h^{1/3}.
 #[derive(Clone, Debug)]
 pub struct ChezyFriction2D {
     /// Drag coefficient (dimensionless)
@@ -235,8 +237,8 @@ impl ChezyFriction2D {
 
         SWEState2D {
             h: 0.0,
-            hu: -self.c_d * speed * u / state.h,
-            hv: -self.c_d * speed * v / state.h,
+            hu: -self.c_d * speed * u,
+            hv: -self.c_d * speed * v,
         }
     }
 }
@@ -528,6 +530,39 @@ mod tests {
         assert!(s.h.abs() < TOL);
         assert!(s.hu < 0.0, "hu friction should oppose flow");
         assert!(s.hv < 0.0, "hv friction should oppose flow");
+    }
+
+    /// Regression: quadratic drag on the depth-integrated momentum is
+    /// `S_hu = −c_d |u| u` (m²/s²) with dimensionless `c_d`; it previously
+    /// carried an extra `1/h`, making it depth-dependent and wrong in magnitude.
+    #[test]
+    fn test_chezy_friction_magnitude() {
+        let c_d = 0.0025;
+        let chezy = ChezyFriction2D::new(c_d);
+        let (u, v): (f64, f64) = (2.0, 1.0);
+        let speed = (u * u + v * v).sqrt();
+
+        for h in [0.5, 2.0, 50.0] {
+            let s = chezy.evaluate(&make_context(h, h * u, h * v));
+            assert!(
+                (s.hu - (-c_d * speed * u)).abs() < TOL,
+                "h={h}: hu {}",
+                s.hu
+            );
+            assert!(
+                (s.hv - (-c_d * speed * v)).abs() < TOL,
+                "h={h}: hv {}",
+                s.hv
+            );
+        }
+
+        // Chezy with c_d = g n² / h^{1/3} is Manning at that depth.
+        let (n, h) = (0.03, 7.0);
+        let manning = ManningFriction2D::new(G, n);
+        let chezy = ChezyFriction2D::new(manning.friction_coefficient(h));
+        let ctx = make_context(h, h * u, h * v);
+        let (s_c, s_m) = (chezy.evaluate(&ctx), manning.evaluate(&ctx));
+        assert!((s_c.hu - s_m.hu).abs() < TOL && (s_c.hv - s_m.hv).abs() < TOL);
     }
 
     #[test]

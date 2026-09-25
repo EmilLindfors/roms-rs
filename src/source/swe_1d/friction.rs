@@ -142,9 +142,11 @@ impl SourceTerm for ManningFriction {
 /// Chezy friction formulation.
 ///
 /// Alternative to Manning, with constant friction coefficient:
-/// S_hu = -C_D |u| u / h
+/// S_hu = -C_D |u| u
 ///
-/// where C_D is the drag coefficient (dimensionless).
+/// where C_D is the drag coefficient (dimensionless), so the bed stress is
+/// τ_b = ρ C_D |u| u. In terms of the Chezy coefficient C (m^{1/2}/s),
+/// C_D = g / C²; Manning's n corresponds to C_D = g n² / h^{1/3}.
 #[derive(Clone, Debug)]
 pub struct ChezyFriction {
     /// Drag coefficient (dimensionless)
@@ -166,7 +168,7 @@ impl ChezyFriction {
         }
 
         let u = state.hu / state.h;
-        let s_hu = -self.c_d * u.abs() * u / state.h;
+        let s_hu = -self.c_d * u.abs() * u;
 
         SWEState::new(0.0, s_hu)
     }
@@ -325,6 +327,27 @@ mod tests {
 
         assert!(s.h.abs() < TOL);
         assert!(s.hu < 0.0, "Friction should oppose motion");
+    }
+
+    /// Regression: `S_hu = −c_d |u| u` with dimensionless `c_d`, independent of
+    /// depth at fixed velocity (it previously carried an extra `1/h`).
+    #[test]
+    fn test_chezy_friction_magnitude() {
+        let c_d = 0.0025;
+        let chezy = ChezyFriction::new(c_d);
+        for (h, u) in [(0.5, 2.0), (2.0, 2.0), (50.0, -1.5)] {
+            let s = chezy.evaluate(&SWEState::new(h, h * u), 0.0, 0.0, 0.0);
+            assert!((s.hu - (-c_d * u.abs() * u)).abs() < TOL, "h={h}: {}", s.hu);
+        }
+
+        // Chezy with c_d = g n² / h^{1/3} is Manning at that depth.
+        let (n, h) = (0.03, 7.0);
+        let manning = ManningFriction::new(G, n);
+        let chezy = ChezyFriction::new(manning.friction_coefficient(h));
+        let state = SWEState::new(h, h * 1.3);
+        let s_c = chezy.evaluate(&state, 0.0, 0.0, 0.0);
+        let s_m = manning.evaluate(&state, 0.0, 0.0, 0.0);
+        assert!((s_c.hu - s_m.hu).abs() < TOL);
     }
 
     #[test]

@@ -353,6 +353,8 @@ S = (0, -C_D*|u|*u/h, -C_D*|u|*v/h)
 
 **Assessment:** CORRECT. Note the source term is already divided by h (S_hu = -C_D |u| u / h), which means the momentum equation source is tau_b / (rho * h). This is consistent with the depth-integrated momentum equation form.
 
+> **Correction (2026-09):** this assessment was wrong. The source acts on the depth-integrated momentum `hu`, so it is `-tau_b/rho = -C_D |u| u` with dimensionless `C_D` (as for Manning, `-g n^2 |u| u / h^{1/3}`); `tau_b/(rho h)` is the form for the velocity equation. The extra `/h` has been removed — see `CHANGELOG.md`.
+
 ### 8.3 Bathymetry Source (`src/source/swe_2d/bathymetry.rs`)
 
 **Implementation:** S = (0, -gh * dB/dx, -gh * dB/dy) computed at each node.

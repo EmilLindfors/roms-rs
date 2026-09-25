@@ -30,7 +30,10 @@
 
 pub mod astronomy;
 
-pub use astronomy::{AstronomicalArguments, NodalCorrection, julian_date, nodal_correction};
+pub use astronomy::{
+    AstronomicalArguments, NodalCorrection, angular_speed, constituent_period, julian_date,
+    nodal_correction,
+};
 
 /// Apply a nodal correction to a raw `(amplitude, internal_phase)` pair.
 ///
