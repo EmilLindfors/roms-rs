@@ -807,3 +807,159 @@ fn test_convergence_swe_2d_p2() {
         observed_order
     );
 }
+
+// ============================================================================
+// 2D SWE split-form (Wintermeyer et al. 2017) convergence with bathymetry
+// ============================================================================
+
+/// Manufactured nonlinear solution over variable bathymetry on [0, √2]²:
+/// H = h + b = 7 + cos(ω x)·sin(ω y)·cos(2πt), ω = 2π√2,
+/// b = 2 + ½ sin(√2 π x) + ½ sin(√2 π y), (u, v) = (½, 3/2).
+mod manufactured {
+    use std::f64::consts::{PI, SQRT_2};
+
+    pub const G: f64 = 9.81;
+    pub const U: f64 = 0.5;
+    pub const V: f64 = 1.5;
+    const OMEGA_X: f64 = 2.0 * PI * SQRT_2;
+    const OMEGA_T: f64 = 2.0 * PI;
+
+    pub fn bed(x: f64, y: f64) -> f64 {
+        2.0 + 0.5 * (SQRT_2 * PI * x).sin() + 0.5 * (SQRT_2 * PI * y).sin()
+    }
+
+    fn bed_gradient(x: f64, y: f64) -> (f64, f64) {
+        let c = 0.5 * SQRT_2 * PI;
+        (c * (SQRT_2 * PI * x).cos(), c * (SQRT_2 * PI * y).cos())
+    }
+
+    fn surface(x: f64, y: f64, t: f64) -> f64 {
+        7.0 + (OMEGA_X * x).cos() * (OMEGA_X * y).sin() * (OMEGA_T * t).cos()
+    }
+
+    pub fn depth(x: f64, y: f64, t: f64) -> f64 {
+        surface(x, y, t) - bed(x, y)
+    }
+
+    /// S = ∂q/∂t + ∇·F(q) + g h (0, ∇b) for the exact solution:
+    /// S_h = H_t + u h_x + v h_y, S_hu = u S_h + g h H_x, S_hv = v S_h + g h H_y.
+    pub fn source(x: f64, y: f64, t: f64) -> (f64, f64, f64) {
+        let (cx, sx) = ((OMEGA_X * x).cos(), (OMEGA_X * x).sin());
+        let (cy, sy) = ((OMEGA_X * y).cos(), (OMEGA_X * y).sin());
+        let (ct, st) = ((OMEGA_T * t).cos(), (OMEGA_T * t).sin());
+        let h_t = -OMEGA_T * cx * sy * st;
+        let surface_x = -OMEGA_X * sx * sy * ct;
+        let surface_y = OMEGA_X * cx * cy * ct;
+        let (b_x, b_y) = bed_gradient(x, y);
+        let h = depth(x, y, t);
+
+        let s_h = h_t + U * (surface_x - b_x) + V * (surface_y - b_y);
+        (
+            s_h,
+            U * s_h + G * h * surface_x,
+            V * s_h + G * h * surface_y,
+        )
+    }
+}
+
+struct ManufacturedSource;
+
+impl dg_rs::SourceTerm2D for ManufacturedSource {
+    fn evaluate(&self, ctx: &dg_rs::SourceContext2D) -> dg_rs::SWEState2D {
+        let (x, y) = ctx.position;
+        let (s_h, s_hu, s_hv) = manufactured::source(x, y, ctx.time);
+        dg_rs::SWEState2D::new(s_h, s_hu, s_hv)
+    }
+
+    fn name(&self) -> &'static str {
+        "manufactured_swe_2d"
+    }
+}
+
+/// L2 depth error of the entropy-stable split form on an n×n periodic mesh.
+fn run_swe_2d_split_form_manufactured(n: usize, order: usize, t_final: f64, cfl: f64) -> f64 {
+    use dg_rs::SWEFormulation2D;
+    use dg_rs::mesh::Bathymetry2D;
+    use manufactured::{G, U, V, bed, depth};
+
+    let l = std::f64::consts::SQRT_2;
+    let mesh = Mesh2D::uniform_periodic(0.0, l, 0.0, l, n, n);
+    let ops = DGOperators2D::new(order);
+    let geom = GeometricFactors2D::compute(&mesh);
+    let equation = ShallowWater2D::new(G);
+    let bc = Reflective2D::new(); // Never called on periodic mesh
+    let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+    let source = ManufacturedSource;
+    let config = SWE2DRhsConfig::new(&equation, &bc)
+        .with_coriolis(false)
+        .with_formulation(SWEFormulation2D::EntropyStable)
+        .with_bathymetry(&bathymetry)
+        .with_source_terms(&source);
+
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    q.set_from_functions(&mesh, &ops, |x, y| depth(x, y, 0.0), |_, _| U, |_, _| V);
+
+    let dt_init = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
+    let n_steps = (t_final / dt_init).ceil() as usize;
+    let dt = t_final / n_steps as f64;
+
+    // SSP-RK3 with the correct stage times for the time-dependent source
+    let mut t = 0.0;
+    for _ in 0..n_steps {
+        let q0 = q.clone();
+
+        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, t);
+        q.axpy(dt, &rhs);
+
+        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, t + dt);
+        q.axpy(dt, &rhs);
+        q.scale(0.25);
+        q.axpy(0.75, &q0);
+
+        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, t + 0.5 * dt);
+        q.axpy(dt, &rhs);
+        q.scale(2.0 / 3.0);
+        q.axpy(1.0 / 3.0, &q0);
+
+        t += dt;
+    }
+
+    q.l2_error_depth(&mesh, &ops, &geom, |x, y| depth(x, y, t_final))
+}
+
+fn check_split_form_convergence(order: usize, cfl: f64, min_order: f64) {
+    let t_final = 0.1;
+    let resolutions = [4, 8, 16];
+    let errors: Vec<f64> = resolutions
+        .iter()
+        .map(|&n| run_swe_2d_split_form_manufactured(n, order, t_final, cfl))
+        .collect();
+
+    println!("\nSWE 2D entropy-stable split form P{order} (manufactured, bathymetry):");
+    for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
+        if i > 0 {
+            let observed = (errors[i - 1] / err).log2();
+            println!("  n={n:3}: error={err:.4e}, order={observed:.2}");
+        } else {
+            println!("  n={n:3}: error={err:.4e}");
+        }
+    }
+
+    let observed = (errors[errors.len() - 2] / errors[errors.len() - 1]).log2();
+    assert!(
+        observed > min_order,
+        "Split-form SWE 2D P{order} should converge at order > {min_order}, observed {observed:.2}"
+    );
+}
+
+#[test]
+fn test_convergence_swe_2d_split_form_p2() {
+    // P2 → 3rd order expected
+    check_split_form_convergence(2, 0.1, 2.5);
+}
+
+#[test]
+fn test_convergence_swe_2d_split_form_p3() {
+    // P3 → 4th order expected
+    check_split_form_convergence(3, 0.05, 3.5);
+}

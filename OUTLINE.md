@@ -37,7 +37,8 @@ src/
 │   ├── data/         # Bathymetry, land mask, boundary tags
 │   ├── io/           # Gmsh MSH 2.2 reader
 │   └── traits/       # Mesh traits, Point; MeshGPUData (unimplemented)
-├── flux/             # Upwind, Lax-Friedrichs, Roe, HLL; 2D SWE + tracer fluxes
+├── flux/             # Upwind, Lax-Friedrichs, Roe, HLL; 2D SWE + tracer fluxes;
+│                     # entropy-conservative/-stable SWE fluxes (Wintermeyer)
 │
 │  # ---- Equations & physics ----
 ├── equations/        # ConservationLaw trait; advection 1D/2D, SWE 1D/2D, UNESCO EOS
@@ -50,8 +51,9 @@ src/
 │  # ---- Solver ----
 ├── solver/
 │   ├── state/        # DGSolution1D/2D, SWESolution2D (SoA), Solution3D
-│   ├── rhs/          # RHS kernels: scalar/SWE 1D/2D, tracer, diffusion (BR1),
-│   │                 # 3D advection, baroclinic PGF, 3D RHS assembly
+│   ├── rhs/          # RHS kernels: scalar/SWE 1D/2D (collocated or entropy-stable
+│   │                 # split form), tracer, diffusion (BR1), 3D advection,
+│   │                 # baroclinic PGF, 3D RHS assembly
 │   ├── limiters/     # Zhang-Shu positivity, Kuzmin/TVB slope limiters
 │   ├── algorithms/   # Wetting/drying, tridiagonal (Thomas) solve
 │   ├── simd/         # pulp kernels + batched faer paths (parallel feature)
@@ -85,7 +87,7 @@ are the adapter edge; the DG core must stay free of I/O and feature flags
 | Layer | State |
 |-------|-------|
 | 1D/2D DG core | Solid: verified convergence (P1–P5 1D, P1–P3 2D), machine-precision conservation, correct Roe/HLL, tested normals/connectivity |
-| Well-balancing | Works only for low-degree bathymetry; needs Audusse/entropy-stable DGSEM rework (REVIEW.md §1.1–§1.4) |
+| Well-balancing | `SWEFormulation2D::EntropyStable` (Wintermeyer split form) is well-balanced for any nodal bathymetry, including face jumps, with exact mass conservation and an entropy inequality; the default collocated form stays balanced only for deg B ≤ p/2. Open: η-based limiting (REVIEW.md §1.4), wetting/drying for the split form |
 | Geometry | Affine parallelogram quads only; per-node isoparametric factors + triangles are the strategic unlock (REVIEW.md §3.1) |
 | Time integration | Generic `SSPRK3` over `Integrable` is the real path; five legacy copies pending deletion |
 | Mode splitting | Prototype: FE subcycle, flat averaging — needs forward-backward stepper + shaped filter (REVIEW.md §1.5) |
@@ -105,8 +107,9 @@ REVIEW.md §7:
    sign, featureless build, Burn RHS).
 2. **Non-allocating RHS** — `compute_rhs_into` + workspace integrator; unify
    serial/parallel RHS into one per-element kernel.
-3. **Numerics upgrades** — well-balanced entropy-stable DGSEM + η-based
-   limiting; forward-backward barotropic mode splitting.
+3. **Numerics upgrades** — well-balanced entropy-stable DGSEM (done, opt-in
+   `SWEFormulation2D::EntropyStable`) + η-based limiting; forward-backward
+   barotropic mode splitting.
 4. **Geometry generalization** — per-node geometric factors, triangles, CSR
    connectivity (also the GPU-readiness work).
 5. **3D hardening** — density-Jacobian PGF, GLS mixing, 3D test suite

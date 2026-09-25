@@ -60,6 +60,7 @@ pub use rhs::{
     // 2D SWE
     SWE2DRhsConfig,
     SWEFluxType,
+    SWEFormulation2D,
     SWERhsConfig,
     Tracer2DRhsConfig,
     TracerBCContext2D,
