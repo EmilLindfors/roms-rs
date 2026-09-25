@@ -28,7 +28,7 @@ use dg_rs::boundary::{HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D}
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_dt_swe_2d_parallel;
 use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d};
 
@@ -263,9 +263,9 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
     let mut max_velocity = 0.0_f64;
 
     while t < T_END {
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", feature = "simd"))]
         let dt = compute_dt_swe_2d_parallel(&state, &mesh, &geom, &equation, order, cfl);
-        #[cfg(not(feature = "parallel"))]
+        #[cfg(not(all(feature = "parallel", feature = "simd")))]
         let dt = compute_dt_swe_2d(&state, &mesh, &geom, &equation, order, cfl);
         let dt = dt.min(T_END - t);
 

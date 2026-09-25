@@ -23,9 +23,9 @@ use dg_rs::solver::compute_rhs_swe_2d;
 #[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_rhs_swe_2d_parallel;
 
-#[cfg(not(feature = "parallel"))]
+#[cfg(not(all(feature = "parallel", feature = "simd")))]
 use dg_rs::solver::compute_dt_swe_2d;
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_dt_swe_2d_parallel;
 
 fn k(idx: usize) -> ElementIndex {
@@ -80,9 +80,9 @@ fn main() {
     println!("\n--- compute_dt timing ---");
     for i in 0..3 {
         let t0 = Instant::now();
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", feature = "simd"))]
         let dt = compute_dt_swe_2d_parallel(&state, &mesh, &geom, &equation, ops.order, 0.2);
-        #[cfg(not(feature = "parallel"))]
+        #[cfg(not(all(feature = "parallel", feature = "simd")))]
         let dt = compute_dt_swe_2d(&state, &mesh, &geom, &equation, ops.order, 0.2);
         println!("  dt computation {}: {:?} (dt={:.6})", i, t0.elapsed(), dt);
     }
@@ -105,9 +105,9 @@ fn main() {
     println!("\n--- Full RK3 step timing ---");
     let mut t = 0.0;
     for i in 0..5 {
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", feature = "simd"))]
         let dt = compute_dt_swe_2d_parallel(&state, &mesh, &geom, &equation, ops.order, 0.2);
-        #[cfg(not(feature = "parallel"))]
+        #[cfg(not(all(feature = "parallel", feature = "simd")))]
         let dt = compute_dt_swe_2d(&state, &mesh, &geom, &equation, ops.order, 0.2);
 
         let rhs_fn = |s: &SWESolution2D, time: f64| {

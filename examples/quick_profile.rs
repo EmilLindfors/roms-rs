@@ -38,12 +38,12 @@ use dg_rs::solver::SWE2DRhsConfig;
 use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
 
 #[cfg(all(
-    not(feature = "parallel"),
+    not(all(feature = "parallel", feature = "simd")),
     not(any(feature = "burn-cuda", feature = "burn-wgpu"))
 ))]
 use dg_rs::solver::{compute_dt_swe_2d, compute_rhs_swe_2d};
 #[cfg(all(
-    feature = "parallel",
+    all(feature = "parallel", feature = "simd"),
     not(any(feature = "burn-cuda", feature = "burn-wgpu"))
 ))]
 use dg_rs::solver::{compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel};
@@ -255,9 +255,9 @@ fn run_cpu_benchmark(
 
     // Run 20 steps
     for step in 0..20 {
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", feature = "simd"))]
         let dt = compute_dt_swe_2d_parallel(&state, mesh, geom, &equation, ops.order, 0.2);
-        #[cfg(not(feature = "parallel"))]
+        #[cfg(not(all(feature = "parallel", feature = "simd")))]
         let dt = compute_dt_swe_2d(&state, mesh, geom, &equation, ops.order, 0.2);
 
         let rhs_fn = |s: &SWESolution2D, time: f64| {
@@ -266,11 +266,11 @@ fn run_cpu_benchmark(
                 .with_bathymetry(&bathymetry)
                 .with_well_balanced(true);
 
-            #[cfg(feature = "parallel")]
+            #[cfg(all(feature = "parallel", feature = "simd"))]
             {
                 compute_rhs_swe_2d_parallel(s, mesh, ops, geom, &config, time)
             }
-            #[cfg(not(feature = "parallel"))]
+            #[cfg(not(all(feature = "parallel", feature = "simd")))]
             {
                 compute_rhs_swe_2d(s, mesh, ops, geom, &config, time)
             }

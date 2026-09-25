@@ -47,16 +47,33 @@ jobs:
       - name: cargo check
         run: cargo check ${{ matrix.features }}
 
+  # `cargo check` above skips test code, so feature-gated test code can rot
+  # unnoticed (the `parallel`-only test build was broken since at least July
+  # 2026). Build and run the tests under every feature combination.
   test:
-    name: test (parallel+simd)
+    name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            features: "--no-default-features"
+          - name: parallel+simd
+            features: "--no-default-features --features parallel,simd"
+          - name: parallel-only
+            features: "--no-default-features --features parallel"
+          - name: simd-only
+            features: "--no-default-features --features simd"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.name }}
       - uses: taiki-e/install-action@nextest
       - name: cargo nextest run
-        run: cargo nextest run --no-default-features --features parallel,simd
+        run: cargo nextest run ${{ matrix.features }}
 
   clippy:
     name: clippy (parallel+simd)
