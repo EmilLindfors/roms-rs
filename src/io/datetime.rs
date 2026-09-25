@@ -134,6 +134,47 @@ pub(crate) fn sort_dedup_by_time<T>(samples: &mut Vec<(f64, T)>) {
     samples.dedup_by(|b, a| a.0 == b.0);
 }
 
+/// Parse CF time `units` (`"<unit> since <reference datetime>"`).
+///
+/// Returns `(seconds_per_unit, reference_unix_seconds)`, so a stored value `v`
+/// is the instant `reference + v·seconds_per_unit` in Unix seconds. Units:
+/// seconds, minutes, hours and days (CF/UDUNITS spellings, singular or
+/// plural). The reference accepts what [`parse_datetime_seconds`] accepts,
+/// including CF's unpadded `1970-1-1 0:0:0`.
+///
+/// Only the Gregorian calendars are supported; `calendar` is the variable's
+/// `calendar` attribute, if any. `noleap`, `360_day` and the like are
+/// rejected rather than misread.
+#[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
+pub(crate) fn parse_cf_time_units(
+    units: &str,
+    calendar: Option<&str>,
+) -> Result<(f64, f64), String> {
+    if let Some(cal) = calendar {
+        let cal = cal.trim().to_ascii_lowercase();
+        if !matches!(
+            cal.as_str(),
+            "standard" | "gregorian" | "proleptic_gregorian"
+        ) {
+            return Err(format!("unsupported calendar {cal:?}"));
+        }
+    }
+
+    let (unit, reference) = units
+        .split_once(" since ")
+        .ok_or_else(|| format!("time units {units:?} are not \"<unit> since <date>\""))?;
+    let seconds_per_unit = match unit.trim().to_ascii_lowercase().as_str() {
+        "seconds" | "second" | "secs" | "sec" | "s" => 1.0,
+        "minutes" | "minute" | "mins" | "min" => 60.0,
+        "hours" | "hour" | "hrs" | "hr" | "h" => 3600.0,
+        "days" | "day" | "d" => 86_400.0,
+        other => return Err(format!("unsupported time unit {other:?}")),
+    };
+    let reference = parse_datetime_seconds(reference)
+        .map_err(|e| format!("bad reference time in {units:?}: {e}"))?;
+    Ok((seconds_per_unit, reference))
+}
+
 /// Days from 1970-01-01 to the given proleptic-Gregorian date.
 ///
 /// Howard Hinnant's `days_from_civil` (public-domain), exact for all valid dates.
@@ -152,6 +193,36 @@ mod tests {
     use super::*;
 
     const TOL: f64 = 1e-9;
+
+    #[test]
+    fn cf_time_units_scale_and_reference() {
+        let (scale, reference) =
+            parse_cf_time_units("seconds since 1970-01-01 00:00:00", None).unwrap();
+        assert_eq!((scale, reference), (1.0, 0.0));
+
+        // NorKyst v3 / ROMS style
+        let (scale, reference) =
+            parse_cf_time_units("hours since 2024-01-30 06:00:00", Some("gregorian")).unwrap();
+        assert_eq!(scale, 3600.0);
+        assert!((reference - 1_706_594_400.0).abs() < TOL);
+
+        let (scale, reference) =
+            parse_cf_time_units("days since 1970-1-1 0:0:0", Some("proleptic_gregorian")).unwrap();
+        assert_eq!((scale, reference), (86_400.0, 0.0));
+
+        let (_, reference) =
+            parse_cf_time_units("seconds since 2024-01-30T06:00:00Z", None).unwrap();
+        assert!((reference - 1_706_594_400.0).abs() < TOL);
+    }
+
+    #[test]
+    fn cf_time_units_rejects_unknown_forms() {
+        assert!(parse_cf_time_units("seconds", None).is_err());
+        assert!(parse_cf_time_units("fortnights since 1970-01-01", None).is_err());
+        assert!(parse_cf_time_units("days since 1970-01-01", Some("noleap")).is_err());
+        assert!(parse_cf_time_units("days since 1970-01-01", Some("360_day")).is_err());
+        assert!(parse_cf_time_units("days since yesterday", None).is_err());
+    }
 
     #[test]
     fn days_from_civil_reference_points() {

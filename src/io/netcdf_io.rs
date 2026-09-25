@@ -979,7 +979,9 @@ pub struct OceanModelReader {
     pub lat: Vec<Vec<f64>>,
     /// Longitude array [n_y][n_x] or [n_lon] for regular
     pub lon: Vec<Vec<f64>>,
-    /// Time values (seconds since reference or hours)
+    /// Snapshot times in seconds since the Unix epoch (UTC), decoded from the
+    /// time variable's CF `units`. Strictly increasing. A file without a time
+    /// variable holds one time-invariant snapshot, `[0.0]`.
     pub time: Vec<f64>,
     /// Sea surface height [time][y][x]
     pub ssh: Option<Vec<Vec<Vec<f32>>>>,
@@ -1065,7 +1067,8 @@ impl OceanModelReader {
         // Read variables with automatic name detection
         let ssh = Self::read_variable(
             &file,
-            &["zeta", "ssh", "sea_surface_height", "h"],
+            // Not "h": in ROMS/NorKyst files that is the bathymetry.
+            &["zeta", "ssh", "sea_surface_height"],
             n_time,
             n_y,
             n_x,
@@ -1222,13 +1225,38 @@ impl OceanModelReader {
         ))
     }
 
-    /// Read time coordinate.
+    /// Read the time coordinate as Unix seconds (UTC).
+    ///
+    /// Values are decoded with the CF `units` (`"<unit> since <date>"`) and
+    /// `calendar` attributes. A time variable without `units`, with an
+    /// unsupported calendar, or with non-increasing values is an error: raw
+    /// values in an unknown unit silently mis-time the forcing. A file without a
+    /// time variable is one time-invariant snapshot.
     fn read_time(file: &netcdf::File) -> Result<Vec<f64>, NetCDFError> {
         let time_names = ["time", "ocean_time", "Time"];
         for name in time_names {
             if let Some(var) = file.variable(name) {
-                let data: Vec<f64> = var.get_values(..)?;
-                return Ok(data);
+                let invalid = |msg: String| {
+                    NetCDFError::InvalidData(format!("time variable {name:?}: {msg}"))
+                };
+                let units = Self::get_attr_string(&var, "units")
+                    .ok_or_else(|| invalid("no `units` attribute".to_string()))?;
+                let calendar = Self::get_attr_string(&var, "calendar");
+                let (seconds_per_unit, reference) =
+                    super::datetime::parse_cf_time_units(&units, calendar.as_deref())
+                        .map_err(invalid)?;
+
+                let raw: Vec<f64> = var.get_values(..)?;
+                let time: Vec<f64> = raw
+                    .iter()
+                    .map(|&v| reference + v * seconds_per_unit)
+                    .collect();
+                if time.iter().any(|t| !t.is_finite()) || time.windows(2).any(|w| w[1] <= w[0]) {
+                    return Err(invalid(
+                        "values must be finite and strictly increasing".to_string(),
+                    ));
+                }
+                return Ok(time);
             }
         }
         // No time dimension - return single time step
@@ -1245,39 +1273,39 @@ impl OceanModelReader {
     ) -> Option<Vec<Vec<Vec<f32>>>> {
         for name in names {
             if let Some(var) = file.variable(name) {
-                // Get scale_factor and add_offset
-                let scale = Self::get_attr_f64(&var, "scale_factor").unwrap_or(1.0);
-                let offset = Self::get_attr_f64(&var, "add_offset").unwrap_or(0.0);
-                let fill_i16 = Self::get_attr_i16(&var, "_FillValue").unwrap_or(i16::MAX);
-                let fill_f32 = Self::get_attr_f32(&var, "_FillValue").unwrap_or(FILL_VALUE_F32);
-
-                let dims = var.dimensions();
-                let _total_size: usize = dims.iter().map(|d| d.len()).product();
-
-                // Try reading as i16 (packed) first, then f32
-                let flat: Vec<f32> = if let Ok(raw) = var.get_values::<i16, _>(..) {
-                    raw.iter()
-                        .map(|&v| {
-                            if v == fill_i16 {
-                                f32::NAN
-                            } else {
-                                (v as f64 * scale + offset) as f32
-                            }
-                        })
-                        .collect()
-                } else if let Ok(raw) = var.get_values::<f32, _>(..) {
-                    raw.iter()
-                        .map(|&v| {
-                            if !v.is_finite() || v == fill_f32 || v.abs() > 1e30 {
-                                f32::NAN
-                            } else {
-                                (v as f64 * scale + offset) as f32
-                            }
-                        })
-                        .collect()
-                } else {
+                // Read by the *declared* type. Everything numeric is read as f64,
+                // which is exact for integers up to 32 bits and for f32. (Asking
+                // the library for i16 first made it convert unpacked floats to
+                // integers, truncating e.g. 0.37 m of SSH to 0.)
+                let packed_integer = match var.vartype() {
+                    netcdf::types::NcVariableType::Int(int_type) => Some(int_type),
+                    netcdf::types::NcVariableType::Float(_) => None,
+                    _ => continue,
+                };
+                let Ok(raw) = var.get_values::<f64, _>(..) else {
                     continue;
                 };
+
+                // CF packing: value = packed·scale_factor + add_offset, with
+                // _FillValue / missing_value given in the packed type.
+                let scale = Self::get_attr_f64(&var, "scale_factor").unwrap_or(1.0);
+                let offset = Self::get_attr_f64(&var, "add_offset").unwrap_or(0.0);
+                let fill = Self::get_attr_f64(&var, "_FillValue")
+                    .or_else(|| packed_integer.and_then(default_integer_fill));
+                let missing = Self::get_attr_f64(&var, "missing_value");
+                let flat: Vec<f32> = raw
+                    .iter()
+                    .map(|&v| {
+                        if !v.is_finite() || Some(v) == fill || Some(v) == missing || v.abs() > 1e30
+                        {
+                            f32::NAN
+                        } else {
+                            (v * scale + offset) as f32
+                        }
+                    })
+                    .collect();
+
+                let dims = var.dimensions();
 
                 // Reshape to [time][y][x], taking the surface layer if 4D.
                 let n_dims = dims.len();
@@ -1307,35 +1335,30 @@ impl OceanModelReader {
         None
     }
 
-    /// Get f64 attribute value.
+    /// Get a numeric attribute value as f64.
     fn get_attr_f64(var: &netcdf::Variable, name: &str) -> Option<f64> {
+        use netcdf::AttributeValue as A;
         var.attribute_value(name)
             .and_then(|r| r.ok())
             .and_then(|v| match v {
-                netcdf::AttributeValue::Double(d) => Some(d),
-                netcdf::AttributeValue::Float(f) => Some(f as f64),
+                A::Double(d) => Some(d),
+                A::Float(f) => Some(f as f64),
+                A::Schar(x) => Some(x as f64),
+                A::Uchar(x) => Some(x as f64),
+                A::Short(x) => Some(x as f64),
+                A::Ushort(x) => Some(x as f64),
+                A::Int(x) => Some(x as f64),
+                A::Uint(x) => Some(x as f64),
                 _ => None,
             })
     }
 
-    /// Get i16 attribute value.
-    fn get_attr_i16(var: &netcdf::Variable, name: &str) -> Option<i16> {
+    /// Get a string attribute value.
+    fn get_attr_string(var: &netcdf::Variable, name: &str) -> Option<String> {
         var.attribute_value(name)
             .and_then(|r| r.ok())
             .and_then(|v| match v {
-                netcdf::AttributeValue::Short(s) => Some(s),
-                netcdf::AttributeValue::Int(i) => Some(i as i16),
-                _ => None,
-            })
-    }
-
-    /// Get f32 attribute value.
-    fn get_attr_f32(var: &netcdf::Variable, name: &str) -> Option<f32> {
-        var.attribute_value(name)
-            .and_then(|r| r.ok())
-            .and_then(|v| match v {
-                netcdf::AttributeValue::Float(f) => Some(f),
-                netcdf::AttributeValue::Double(d) => Some(d as f32),
+                netcdf::AttributeValue::Str(s) => Some(s),
                 _ => None,
             })
     }
@@ -1483,7 +1506,11 @@ impl OceanModelReader {
         })
     }
 
-    /// Get state with time interpolation.
+    /// Get state with linear interpolation in time.
+    ///
+    /// `time` is in Unix seconds, like [`Self::time`]. Returns `None` outside
+    /// the file's time range (there is no clamping to the first or last
+    /// snapshot) and where the location has no valid data.
     pub fn get_state_interpolated(&self, lon: f64, lat: f64, time: f64) -> Option<OceanState> {
         if self.time.is_empty() {
             return None;
@@ -1642,7 +1669,18 @@ impl OceanModelReader {
 
     /// Find time index and interpolation factor.
     fn find_time_index(&self, time: f64) -> Option<(usize, usize, f64)> {
-        find_bracket(&self.time, time)
+        bracket_time(&self.time, time)
+    }
+
+    /// First and last snapshot time (Unix seconds), `None` for an empty file.
+    pub fn time_range(&self) -> Option<(f64, f64)> {
+        Some((*self.time.first()?, *self.time.last()?))
+    }
+
+    /// Whether `time` (Unix seconds) can be interpolated without extrapolating.
+    /// Always true for a single, time-invariant snapshot.
+    pub fn covers_time(&self, time: f64) -> bool {
+        self.find_time_index(time).is_some()
     }
 
     /// Bilinear interpolation on 2D grid.
@@ -1738,6 +1776,43 @@ fn reshape_2d(flat: &[f64], n_y: usize, n_x: usize) -> Vec<Vec<f64>> {
     result
 }
 
+/// NetCDF default fill value of an integer type (`NC_FILL_*`), used when a
+/// packed variable has no `_FillValue` attribute.
+#[cfg(feature = "netcdf")]
+fn default_integer_fill(int_type: netcdf::types::IntType) -> Option<f64> {
+    use netcdf::types::IntType;
+    match int_type {
+        IntType::I8 => Some(-127.0),
+        IntType::I16 => Some(-32_767.0),
+        IntType::I32 => Some(-2_147_483_647.0),
+        IntType::U8 => Some(255.0),
+        IntType::U16 => Some(65_535.0),
+        IntType::U32 => Some(4_294_967_295.0),
+        IntType::I64 | IntType::U64 => None,
+    }
+}
+
+/// Snapshots bracketing `time` in strictly increasing `times`:
+/// `(i0, i1, weight of i1)`.
+///
+/// `None` outside `[times[0], times[last]]`; unlike [`find_bracket`] this never
+/// clamps, so forcing cannot silently freeze at the first or last snapshot. A
+/// single snapshot is time-invariant and brackets every time.
+fn bracket_time(times: &[f64], time: f64) -> Option<(usize, usize, f64)> {
+    match times {
+        [] => None,
+        [_] => Some((0, 0, 0.0)),
+        [first, .., last] => {
+            if !(time >= *first && time <= *last) {
+                return None;
+            }
+            let i1 = times.partition_point(|&t| t < time).max(1);
+            let i0 = i1 - 1;
+            Some((i0, i1, (time - times[i0]) / (times[i1] - times[i0])))
+        }
+    }
+}
+
 /// Helper: find bracket indices and interpolation factor.
 fn find_bracket(coords: &[f64], value: f64) -> Option<(usize, usize, f64)> {
     if coords.is_empty() {
@@ -1779,6 +1854,86 @@ fn find_bracket(coords: &[f64], value: f64) -> Option<(usize, usize, f64)> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+/// Small parent-model files for reader and nesting tests.
+#[cfg(all(test, feature = "netcdf"))]
+pub(crate) mod test_files {
+    use std::path::{Path, PathBuf};
+
+    /// 2024-01-30 06:00:00 UTC in Unix seconds.
+    pub const T0: f64 = 1_706_594_400.0;
+    /// Cell centre of the 2×2 grid (lat 63.0–63.1, lon 8.0–8.1).
+    pub const CENTRE: (f64, f64) = (63.05, 8.05);
+
+    /// How the `zeta` variable is stored.
+    #[derive(Clone, Copy)]
+    pub enum Zeta {
+        /// Unpacked f32 values
+        Float,
+        /// i16 packed with scale_factor 0.001 and _FillValue −32767 at (0, 0, 0)
+        PackedI16,
+        /// No `zeta` at all
+        Absent,
+    }
+
+    /// Write a regular 2×2 grid with hourly snapshots of uniform `ssh[t]` and
+    /// uniform velocity `(0.2, −0.1)`, plus bathymetry `h` = 50 m.
+    pub fn write(dir: &Path, time_units: Option<&str>, ssh: &[f64], zeta: Zeta) -> PathBuf {
+        let path = dir.join("parent.nc");
+        let n_t = ssh.len();
+        let mut file = netcdf::create(&path).unwrap();
+        file.add_dimension("time", n_t).unwrap();
+        file.add_dimension("lat", 2).unwrap();
+        file.add_dimension("lon", 2).unwrap();
+
+        let mut lat = file.add_variable::<f64>("lat", &["lat"]).unwrap();
+        lat.put_values(&[63.0, 63.1], ..).unwrap();
+        let mut lon = file.add_variable::<f64>("lon", &["lon"]).unwrap();
+        lon.put_values(&[8.0, 8.1], ..).unwrap();
+
+        let mut time = file.add_variable::<f64>("time", &["time"]).unwrap();
+        if let Some(units) = time_units {
+            time.put_attribute("units", units).unwrap();
+        }
+        let hours: Vec<f64> = (0..n_t).map(|t| t as f64).collect();
+        time.put_values(&hours, ..).unwrap();
+
+        let mut h = file.add_variable::<f32>("h", &["lat", "lon"]).unwrap();
+        h.put_values(&[50.0_f32; 4], ..).unwrap();
+
+        let field =
+            |value: f64| -> Vec<f64> { (0..n_t).flat_map(|t| [value * ssh[t]; 4]).collect() };
+        match zeta {
+            Zeta::Float => {
+                let mut z = file
+                    .add_variable::<f32>("zeta", &["time", "lat", "lon"])
+                    .unwrap();
+                let values: Vec<f32> = field(1.0).iter().map(|&v| v as f32).collect();
+                z.put_values(&values, ..).unwrap();
+            }
+            Zeta::PackedI16 => {
+                let mut z = file
+                    .add_variable::<i16>("zeta", &["time", "lat", "lon"])
+                    .unwrap();
+                z.put_attribute("scale_factor", 0.001_f64).unwrap();
+                z.put_attribute("add_offset", 0.0_f64).unwrap();
+                z.put_attribute("_FillValue", -32_767_i16).unwrap();
+                let mut values: Vec<i16> =
+                    field(1000.0).iter().map(|&v| v.round() as i16).collect();
+                values[0] = -32_767;
+                z.put_values(&values, ..).unwrap();
+            }
+            Zeta::Absent => {}
+        }
+        for (name, value) in [("ubar_eastward", 0.2_f32), ("vbar_northward", -0.1_f32)] {
+            let mut var = file
+                .add_variable::<f32>(name, &["time", "lat", "lon"])
+                .unwrap();
+            var.put_values(&vec![value; 4 * n_t], ..).unwrap();
+        }
+        path
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1962,6 +2117,8 @@ mod tests {
             let mut lon = file.add_variable::<f64>("lon", &["lon"]).unwrap();
             lon.put_values(&[5.0_f64, 5.1], ..).unwrap();
             let mut time = file.add_variable::<f64>("time", &["time"]).unwrap();
+            time.put_attribute("units", "seconds since 1970-01-01 00:00:00")
+                .unwrap();
             time.put_values(&[0.0_f64], ..).unwrap();
 
             // Depth-averaged barotropic velocity: 3D [time][lat][lon].
@@ -2002,5 +2159,85 @@ mod tests {
             "expected depth-averaged ubar {ubar_val}, got {} (surface-layer leak?)",
             u[0][0][0]
         );
+    }
+
+    #[cfg(feature = "netcdf")]
+    mod reader {
+        use super::super::test_files::{self, CENTRE, T0, Zeta};
+        use super::super::*;
+
+        const HOURS: &str = "hours since 2024-01-30 06:00:00";
+
+        fn read(
+            units: Option<&str>,
+            ssh: &[f64],
+            zeta: Zeta,
+        ) -> Result<OceanModelReader, NetCDFError> {
+            let dir = tempfile::tempdir().unwrap();
+            let path = test_files::write(dir.path(), units, ssh, zeta);
+            OceanModelReader::from_file(path)
+        }
+
+        #[test]
+        fn time_is_decoded_from_cf_units() {
+            // P0.20: raw values were returned, so "hours since …" files were
+            // compared against simulation seconds.
+            let reader = read(Some(HOURS), &[0.1, 0.2, 0.3], Zeta::Float).unwrap();
+            assert_eq!(reader.time, vec![T0, T0 + 3600.0, T0 + 7200.0]);
+            assert_eq!(reader.time_range(), Some((T0, T0 + 7200.0)));
+        }
+
+        #[test]
+        fn time_without_units_is_an_error() {
+            assert!(matches!(
+                read(None, &[0.1, 0.2], Zeta::Float),
+                Err(NetCDFError::InvalidData(_))
+            ));
+        }
+
+        #[test]
+        fn time_interpolation_does_not_clamp() {
+            // P0.20: out-of-range times clamped to the first/last snapshot, so
+            // the forcing froze silently.
+            let reader = read(Some(HOURS), &[0.1, 0.3], Zeta::Float).unwrap();
+            let (lat, lon) = CENTRE;
+            let mid = reader
+                .get_state_interpolated(lon, lat, T0 + 1800.0)
+                .unwrap();
+            assert!((mid.ssh - 0.2).abs() < 1e-6, "ssh = {}", mid.ssh);
+            assert!(reader.get_state_interpolated(lon, lat, T0 - 1.0).is_none());
+            assert!(
+                reader
+                    .get_state_interpolated(lon, lat, T0 + 3601.0)
+                    .is_none()
+            );
+            assert!(reader.covers_time(T0) && reader.covers_time(T0 + 3600.0));
+        }
+
+        #[test]
+        fn float_ssh_is_not_truncated() {
+            // P0.20: i16 was tried first, and netCDF converts floats to shorts on
+            // request, so 0.37 m became 0.
+            let reader = read(Some(HOURS), &[0.37], Zeta::Float).unwrap();
+            let (lat, lon) = CENTRE;
+            let ssh = reader.get_state(lon, lat, 0).unwrap().ssh;
+            assert!((ssh - 0.37).abs() < 1e-6, "ssh = {ssh}");
+        }
+
+        #[test]
+        fn packed_i16_ssh_is_unpacked_with_fill() {
+            let reader = read(Some(HOURS), &[0.37, -0.25], Zeta::PackedI16).unwrap();
+            let ssh = reader.ssh.as_ref().unwrap();
+            assert!(ssh[0][0][0].is_nan(), "fill value must become NaN");
+            assert!((ssh[0][1][1] - 0.37).abs() < 1e-6);
+            assert!((ssh[1][0][0] + 0.25).abs() < 1e-6);
+        }
+
+        #[test]
+        fn bathymetry_h_is_not_read_as_ssh() {
+            // P0.20: "h" was an SSH candidate; in ROMS/NorKyst it is the depth.
+            let reader = read(Some(HOURS), &[0.1], Zeta::Absent).unwrap();
+            assert!(reader.ssh.is_none());
+        }
     }
 }
