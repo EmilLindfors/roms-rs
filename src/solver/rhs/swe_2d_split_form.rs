@@ -986,6 +986,43 @@ mod tests {
     }
 
     #[test]
+    fn test_wet_dry_on_submesh_with_new_walls() {
+        // A water-only submesh (Mesh2D::retain_elements) with an island cut out
+        // of the middle: the new faces are walls, and the operator stays
+        // conservative and well-balanced there
+        use crate::mesh::BoundaryTag;
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let full = Mesh2D::uniform_rectangle(0.0, L, 0.0, L, 8, 8);
+        let island = |k: ElementIndex| {
+            let [x, y] = full.reference_to_physical(k, 0.0, 0.0);
+            (0.3 * L..0.6 * L).contains(&x) && (0.4 * L..0.7 * L).contains(&y)
+        };
+        let (mesh, _) = full.retain_elements(|k| !island(k), BoundaryTag::Wall);
+        assert!(mesh.n_elements < full.n_elements);
+        let ops = DGOperators2D::new(3);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, smooth_bed);
+        let config = SWE2DRhsConfig::new(&equation, &bc)
+            .with_coriolis(false)
+            .with_formulation(SWEFormulation2D::WetDry)
+            .with_bathymetry(&bathymetry);
+
+        let rest = state(&mesh, &ops, &bathymetry, 0.0);
+        let rhs = compute_rhs_swe_2d(&rest, &mesh, &ops, &geom, &config, 0.0);
+        assert!(rhs.max_abs() < 1e-9, "lake at rest: {:.3e}", rhs.max_abs());
+
+        let q = state(&mesh, &ops, &bathymetry, 1.0);
+        let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+        let mass_rate = integrate(&mesh, &ops, &geom, |k, i| rhs.get_var(k, i, 0));
+        let scale = integrate(&mesh, &ops, &geom, |k, i| rhs.get_var(k, i, 0).abs());
+        assert!(
+            mass_rate.abs() < 1e-14 * scale,
+            "d(mass)/dt = {mass_rate:.3e} (scale {scale:.3e})"
+        );
+    }
+
+    #[test]
     fn test_uniform_flow_flat_bottom_is_steady() {
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();

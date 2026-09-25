@@ -8,6 +8,8 @@
 //!
 //! Source terms are evaluated at each quadrature node and added to the RHS.
 
+use std::sync::Arc;
+
 use crate::solver::SWEState2D;
 
 /// Context for 2D source term evaluation.
@@ -152,6 +154,56 @@ impl<'a> SourceTerm2D for CombinedSource2D<'a> {
 
     fn name(&self) -> &'static str {
         "combined_2d"
+    }
+
+    fn is_stiff(&self) -> bool {
+        self.sources.iter().any(|s| s.is_stiff())
+    }
+
+    fn includes_bathymetry_slope(&self) -> bool {
+        self.sources.iter().any(|s| s.includes_bathymetry_slope())
+    }
+}
+
+/// Owned counterpart of [`CombinedSource2D`]: sums source terms held by
+/// `Arc`, so the combination can be stored in `'static` contexts such as
+/// `SWEPhysics2D` (`SWEPhysics2DBuilder::with_source` builds one).
+#[derive(Clone, Default)]
+pub struct SourceTerms2D {
+    sources: Vec<Arc<dyn SourceTerm2D>>,
+}
+
+impl SourceTerms2D {
+    /// Combine `sources`.
+    pub fn new(sources: Vec<Arc<dyn SourceTerm2D>>) -> Self {
+        Self { sources }
+    }
+
+    /// Add a source term to the combination.
+    pub fn push(&mut self, source: Arc<dyn SourceTerm2D>) {
+        self.sources.push(source);
+    }
+
+    /// Number of source terms in the combination.
+    pub fn len(&self) -> usize {
+        self.sources.len()
+    }
+
+    /// Whether the combination is empty.
+    pub fn is_empty(&self) -> bool {
+        self.sources.is_empty()
+    }
+}
+
+impl SourceTerm2D for SourceTerms2D {
+    fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
+        self.sources
+            .iter()
+            .fold(SWEState2D::zero(), |total, s| total + s.evaluate(ctx))
+    }
+
+    fn name(&self) -> &'static str {
+        "source_terms_2d"
     }
 
     fn is_stiff(&self) -> bool {

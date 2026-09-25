@@ -870,6 +870,87 @@ impl Mesh2D {
         self.elements[k.as_usize()]
     }
 
+    /// The submesh of the elements for which `keep` is true, e.g. the water
+    /// elements of a rectangular grid over a coastline (TODO P2.4).
+    ///
+    /// Kept elements keep their vertices (renumbered), orientation and face
+    /// order; boundary faces keep their tags. A face whose neighbour is dropped
+    /// becomes a boundary face tagged `new_boundary`.
+    ///
+    /// Returns the submesh and, for each of its elements, the index of that
+    /// element in `self`.
+    pub fn retain_elements(
+        &self,
+        keep: impl Fn(ElementIndex) -> bool,
+        new_boundary: BoundaryTag,
+    ) -> (Mesh2D, Vec<usize>) {
+        let kept: Vec<usize> = (0..self.n_elements)
+            .filter(|&k| keep(ElementIndex::new(k)))
+            .collect();
+        let mut new_element = vec![None; self.n_elements];
+        for (new, &old) in kept.iter().enumerate() {
+            new_element[old] = Some(new);
+        }
+
+        let mut new_vertex = vec![None; self.n_vertices];
+        let mut vertices = Vec::new();
+        let elements: Vec<[usize; 4]> = kept
+            .iter()
+            .map(|&old| {
+                self.elements[old].map(|v| {
+                    *new_vertex[v].get_or_insert_with(|| {
+                        vertices.push(self.vertices[v]);
+                        vertices.len() - 1
+                    })
+                })
+            })
+            .collect();
+
+        let mut edges = Vec::new();
+        let mut element_edges = vec![[usize::MAX; 4]; kept.len()];
+        let map_face =
+            |ef: ElementFace| new_element[ef.element].map(|k| ElementFace::new(k, ef.face));
+        for edge in &self.edges {
+            let left = map_face(edge.left);
+            let right = edge.right.and_then(map_face);
+            let (left, right, boundary_tag) = match (left, right) {
+                (Some(l), Some(r)) => (l, Some(r), None),
+                (Some(side), None) | (None, Some(side)) => {
+                    (side, None, Some(edge.boundary_tag.unwrap_or(new_boundary)))
+                }
+                (None, None) => continue,
+            };
+            for face in std::iter::once(left).chain(right) {
+                element_edges[face.element][face.face] = edges.len();
+            }
+            let (v0, v1) = (
+                new_vertex[edge.vertices.0].expect("vertex of a kept element"),
+                new_vertex[edge.vertices.1].expect("vertex of a kept element"),
+            );
+            edges.push(Edge {
+                vertices: (v0.min(v1), v0.max(v1)),
+                left,
+                right,
+                boundary_tag,
+            });
+        }
+
+        let n_vertices = vertices.len();
+        let mesh = Mesh2D {
+            vertex_to_elements: Self::build_vertex_to_elements(&elements, n_vertices),
+            vertices,
+            n_elements: elements.len(),
+            elements,
+            n_edges: edges.len(),
+            n_boundary_edges: edges.iter().filter(|e| e.is_boundary()).count(),
+            edges,
+            element_edges,
+            edge_orientation: kept.iter().map(|&old| self.edge_orientation[old]).collect(),
+            n_vertices,
+        };
+        (mesh, kept)
+    }
+
     /// Build vertex-to-element connectivity from element-vertex connectivity.
     pub(crate) fn build_vertex_to_elements(
         elements: &[[usize; 4]],
@@ -1106,6 +1187,83 @@ mod tests {
 
     fn k(idx: usize) -> ElementIndex {
         ElementIndex::new(idx)
+    }
+
+    /// Every interior face points back at itself; every boundary face has a
+    /// tag; element_edges and edges agree.
+    fn assert_consistent(mesh: &Mesh2D) {
+        for ki in 0..mesh.n_elements {
+            for face in 0..4 {
+                let edge = &mesh.edges[mesh.edge_for_face(k(ki), face)];
+                let me = ElementFace::new(ki, face);
+                assert!(edge.left == me || edge.right == Some(me));
+                match mesh.neighbor(k(ki), face) {
+                    Some(nb) => {
+                        let back = mesh.neighbor(k(nb.element), nb.face);
+                        assert_eq!(back, Some(me), "element {ki} face {face}");
+                    }
+                    None => assert!(mesh.boundary_tag(k(ki), face).is_some()),
+                }
+            }
+            for v in mesh.elements[ki] {
+                assert!(mesh.vertex_to_elements[v].contains(&ki));
+            }
+        }
+        assert_eq!(
+            mesh.n_boundary_edges,
+            mesh.edges.iter().filter(|e| e.is_boundary()).count()
+        );
+    }
+
+    #[test]
+    fn test_retain_elements() {
+        // 4 × 3 grid, open on the west side; drop the top-right 2 × 2 block
+        // to leave an L shape
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 4.0, 0.0, 3.0, 4, 3);
+        for edge in mesh.edges.iter_mut().filter(|e| e.is_boundary()) {
+            let x = 0.5 * (mesh.vertices[edge.vertices.0][0] + mesh.vertices[edge.vertices.1][0]);
+            if x == 0.0 {
+                edge.boundary_tag = Some(BoundaryTag::Open);
+            }
+        }
+        let dropped = |k: ElementIndex| {
+            let [x, y] = mesh.reference_to_physical(k, 0.0, 0.0);
+            x > 2.0 && y > 1.0
+        };
+        let (sub, old) = mesh.retain_elements(|k| !dropped(k), BoundaryTag::Wall);
+
+        assert_eq!(sub.n_elements, 8);
+        assert_eq!(old.len(), 8);
+        assert!(old.iter().all(|&o| !dropped(k(o))));
+        // No kept element uses the vertices with x ∈ {3, 4}, y ∈ {2, 3}
+        assert_eq!(sub.n_vertices, mesh.n_vertices - 4);
+        // Perimeter of the L: 4 + 1 + 2 + 2 + 2 + 3 unit edges
+        assert_eq!(sub.n_boundary_edges, 14);
+        assert_consistent(&sub);
+
+        for (new, &o) in old.iter().enumerate() {
+            assert_eq!(sub.element_vertices(k(new)), mesh.element_vertices(k(o)));
+            for face in 0..4 {
+                let tag = sub.boundary_tag(k(new), face);
+                match mesh.neighbor(k(o), face) {
+                    // Faces to dropped elements become walls
+                    Some(nb) if dropped(k(nb.element)) => assert_eq!(tag, Some(BoundaryTag::Wall)),
+                    // Interior faces stay interior, with the same neighbour
+                    Some(nb) => {
+                        let sub_nb = sub.neighbor(k(new), face).unwrap();
+                        assert_eq!((old[sub_nb.element], sub_nb.face), (nb.element, nb.face));
+                    }
+                    // Original boundary faces keep their tags (open in the west)
+                    None => assert_eq!(tag, mesh.boundary_tag(k(o), face)),
+                }
+            }
+        }
+
+        // Keeping everything reproduces the mesh
+        let (all, _) = mesh.retain_elements(|_| true, BoundaryTag::Wall);
+        assert_eq!(all.n_edges, mesh.n_edges);
+        assert_eq!(all.element_edges, mesh.element_edges);
+        assert_consistent(&all);
     }
 
     #[test]

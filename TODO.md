@@ -24,19 +24,12 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `REVIEW.md`
 
 ## ▶ Next session — start here
 
-Last reviewed: 2026-09-25 (`REVIEW.md`). Pick up in this order:
+Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the deferred P0.11 GPU), P1.1 for the `Simulation` path, and the P1.2 core (split form; `WetDry` with second-order shoreline subcells as the wet/dry default). Frøya now runs on `Simulation` + `WetDry` on a water-only mesh, with correctly georeferenced bathymetry: the GeoTIFF reader had ignored its georeferencing. Lake at rest over the real bathymetry holds to 1.5e-10 m/s for 1 h. A full M2 cycle at 9,653 P2 elements is stable, with 0 clips, in 11.4 min. Pick up in this order:
 
-1. **Priority 0 (2026-09-25): confirmed small bugs.**
-   - Each needs a regression test that fails before the fix.
-   - P0.15–P0.18 (tidal periods, 3D vertical advection ÷Hz with Ω at w-points, EOS units, Chezy units) are fixed in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
-   - P0.12 (Flather), P0.13 (reconstruction mass leak), P0.14 (docs), P0.19 (limiter plumbing), P0.20 (NorKyst time base), P0.21 (time step) and P0.22 (3D tracer wall flux) are fixed. Priority 0 is done apart from the deferred P0.11 (GPU); next is P1.1.
-2. **P1.1 non-allocating RHS + unified serial/parallel kernel.** Do this before any numerics rewrite, so the new formulation is written once in the right shape.
-3. **P1.2 well-balanced entropy-stable DGSEM** (Wintermeyer et al. 2017/2018). This is the foundational numerics change. Write the P1.7 gating tests first.
-   - Split form done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)). Wet/dry robustness is done for the collocated form: h ≥ 0, desingularization, implicit friction, HLL default and the CFL cap.
-   - `SWEFormulation2D::WetDry` is done: split-form wet/dry that keeps a shoreline lake at rest exactly. Its shoreline elements are now second order, and it is more accurate than `Standard` on Thacker at P1–P4.
-   - `WetDry` is now the `SWEPhysics2DBuilder` default for wet/dry runs.
-   - Next: η-based limiting, and moving Frøya onto `WetDry`.
-4. **P3.1 validation.** The data pipeline works, but re-run the Bergen NorKyst fit now that P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)) is merged: it used the truncated periods.
+1. **P1.4 tidal forcing.** One characteristic OBC, boundary tides from NorKyst harmonics, and a `ModelClock`. The Frøya M2 run shows what the uniform-phase Flather forcing does (details under P1.4).
+2. **P3.1 validation.** A multi-day Frøya run with harmonic analysis at gauges against NorKyst and Kartverket. Re-run the Bergen NorKyst fit too: it used the truncated periods fixed in P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)).
+3. **Let the error budget choose next:** geometry (P1.3) if the coastline dominates the error, cost (P2, profile first) if run time does.
+4. **η-based limiting is on hold.** The subcells limit the partially dry elements, and tides are smooth. Revisit only if a real run shows oscillations.
 
 Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF. Otherwise use `cargo test --no-default-features --features parallel,simd`.
 
@@ -131,7 +124,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 ### P1.2 Well-balanced, entropy-stable, positivity-preserving DGSEM
 - [x] Flux-differencing volume term with the Wintermeyer et al. (2017) two-point flux and the g·hᵢ(DB)ᵢ term. It is exactly well-balanced for any nodal B (including face-discontinuous B), conservative, and fixes GLL aliasing.
   - Done ([PR #5](https://github.com/EmilLindfors/roms-rs/pull/5)): opt-in via `SWEFormulation2D::EntropyStable` (`EntropyConservative` for verification). Exact mass conservation, entropy conserved/dissipated to round-off, P2/P3 convergence 3.06/4.00 on a nonlinear manufactured solution with bathymetry.
-  - Follow-up: switch `examples/froya_real_data.rs` from cell-averaged B to nodal B + split form.
+  - Follow-up done: `examples/froya_real_data.rs` uses nodal B and `WetDry`.
 - [x] Wet/dry and positivity: Zhang–Shu towards h ≥ 0 (not h_min), Kurganov–Petrova velocity desingularization below `h_dry` (1 mm). Done for the collocated (`Standard`) formulation (`solver/algorithms/wetting_drying.rs`, `limiters/swe_2d.rs`). Gates in `tests/wet_dry_2d_test.rs`: Ritter dry dam break (L1 1.5 %, first order), Thacker's paraboloid (L1 7.4 % after one period, was 9.2 %), shoreline lake at rest (|u| < 0.06 m/s where h > 1 cm, was up to the 20 m/s cap). All conserve mass to round-off with h ≥ 0.
 - [x] **Shoreline well-balancing and wet/dry for the split form: `SWEFormulation2D::WetDry`.** HLL on Audusse-reconstructed states at faces, flux differencing in wet elements, and subcell finite volumes with the same flux in partially dry elements.
   - A shoreline lake at rest is kept to round-off (P1–P4, smooth/rough beds; the P1.7 gate `lake_at_rest_with_shoreline_is_exact` passes).
@@ -162,7 +155,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [x] The dt-dependent wet/dry momentum damping is gone. It is replaced by the point-implicit thin-layer relaxation r(h) = (h_dry/h − 1)²/τ, which is zero at h ≥ h_dry.
 - [x] HLL is the default flux for wet/dry runs in `SWEPhysics2DBuilder`. `SWE2DRhsConfig::new` still defaults to Roe (low-level API).
 - [ ] Retire the cell-average/`linearize` workarounds: `WetDry` now covers wet/dry with nodal B.
-- [ ] Move `examples/froya_real_data.rs` off the legacy `SWE2DTimeConfig`, which sets `H_MIN` = 5 m and makes land a 5 m film. Use `Simulation` + `WetDry` (nodal B) + `with_wet_dry` + `with_implicit_friction`, and mesh water only (P2.4).
+- [x] Move `examples/froya_real_data.rs` off the legacy `SWE2DTimeConfig` (`H_MIN` = 5 m, land as a 5 m film, cell-averaged B). It now uses `Simulation` + `WetDry` (nodal B) + `with_wet_dry` + `with_implicit_friction` on a water-only mesh, with all four sides open.
 - [ ] `SWEPhysics2D::post_process` builds a `LimiterContext2D` every stage, whose `new` computes `mesh.h_min()` (a sqrt per edge over all elements). No limiter reads `LimiterContext2D::h_min`: drop the field or cache it.
 
 ### P1.3 Geometry for real coastlines
@@ -172,6 +165,13 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] CSR connectivity. Make `MeshGPUData` the single representation.
 
 ### P1.4 Open boundaries and tidal forcing
+- **Evidence from Frøya** (`examples/froya_real_data.rs`, 120 × 90 grid, P2, one M2 cycle; M2 of 0.8 m in one phase on all four open sides, 1 h ramp):
+  - a 2.5 m/s jet in 40 m of water at the southern open boundary (the Frøya–Hitra channel) on the flood;
+  - η up to +1.36 m at t = 1 h against 0.7 m of forcing;
+  - basins that stay at ≈ +1.04 m through low tide, apparently water trapped behind sills that dry out at this resolution;
+  - 2.8 m/s over 1 m-deep draining flats.
+
+  Only walls on the south and east sides were worse (3.4 m/s at the wall). Recheck these with NorKyst boundary harmonics before tuning anything else.
 - [ ] Spatially varying tidal forcing: a TPXO/FES reader, or boundary harmonics from NorKyst. Uniform-phase forcing is wrong by ~30° of M2 phase along 200 km.
 - [ ] A `ModelClock { epoch_unix }` threaded through BCs (`OceanNestingBC2D::with_epoch` is the first per-BC epoch; fold it in), forcing, NetCDF output (writer time units, `netcdf_io.rs:241` vs `:397`) and validation (`tide_gauge.rs:234-239` compares by length only).
 - [ ] Nodal f/u at the run or record midpoint, not frozen at the epoch; guard against double application.
@@ -193,8 +193,11 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Flatten parent fields to strided `[time, y, x]` arrays and precompute per-boundary-node stencils at setup (no per-stage RwLock HashMap).
 
 ### P1.6 Real-domain inputs
-- [ ] GeoTIFF: check the CRS (UTM33 grids silently give B = 0 today), use pixel-centre interpolation, and do L2/area projection instead of point sampling (`geotiff.rs:99-113`).
-- [ ] Land/nodata must not become B = 0 (`bathymetry_2d.rs:133`). Use the land mask in the solver or mesh water only.
+- [x] GeoTIFF georeferencing: the tags were looked up as `Tag::Unknown(n)`, which never matches the `tiff` crate's named variants, so every file silently used the bbox hint. `ModelTransformation` was not supported at all. Frøya's bathymetry was misplaced by up to ~20 km. Fixed, with a CRS check (projected/rotated rasters are rejected), `PixelIsPoint`, GDAL no-data and pixel-centre sampling.
+- [ ] GeoTIFF: L2/area projection onto the element nodes instead of point sampling. The Frøya GeoTIFF has 0.002° pixels (≈ 100 × 230 m), so elements coarser than that alias the bathymetry.
+- [ ] Land/nodata must not become B = 0 in `Bathymetry2D::from_geotiff` (`bathymetry_2d.rs:133`). Frøya now builds its bed itself, meshes water only and gives land nodes a positive elevation. Move that into the library (bed from GeoTIFF + coastline) and drop `from_geotiff`'s `unwrap_or(0.0)`.
+- [ ] `LandMask2D::from_coastline_and_bathymetry` counts water shallower than `min_depth` as land (the old Frøya run used 5 m, dropping every tidal flat) and uses nearest sampling. It is unused now; fix or delete it.
+- [ ] The Frøya GeoTIFF stores land as 0 and has no land elevations, so there are no intertidal flats: land is a wall at mean sea level (given `LAND_ELEVATION` = 5 m in the example). Real wetting/drying needs a merged DEM (e.g. Kartverket's) for the foreshore.
 - [ ] GSHHS inner rings (holes) and a spatial index for point-in-polygon (`coastline.rs:81-95`).
 - [ ] f(latitude) and β helpers. Fix `norwegian_coast_beta()` (β = 1.6e-11 is the 45°N value; 60°N ≈ 1.14e-11). UTM33 / Lambert for coast-scale domains.
 - [ ] Atmospheric forcing reader for MET Nordic / MEPS / AROME-Arctic (Lambert grid, 2D lat/lon, grid-relative winds, CF time), wired to `WindStress2D`/`AtmosphericPressure2D`.
@@ -236,7 +239,8 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - Limiters done (P0.19: in-place `par_chunks_exact_mut` over the SoA fields). The `wetting_drying.rs` parallel path is done too (P1.2: in place, plus a node-parallel implicit damping pass). Still open: the per-stage `Vec` of cell averages and vertex bounds (move to a workspace with P1.1). Then fuse the limiter, the wet/dry correction and the implicit damping into one pass.
 
 ### P2.4 Water-only work
-- [ ] Mesh water only, or keep an active-element set (41 % of Frøya's elements are land). Limit only troubled cells.
+- [x] Mesh water only: `Mesh2D::retain_elements` (faces towards dropped elements become coastline walls). Frøya keeps only elements with a water node.
+- [ ] Limit only troubled cells.
 
 ### P2.5 Local time stepping or implicit free surface
 - [ ] One 250 m element in 1300 m water forces ~22× more global steps. Multirate/LTS SSP-RK or semi-implicit free surface (SLIM/Thetis practice): 2–20×.
@@ -355,7 +359,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 
 ## Priority 6: Tech Debt and Structure (`REVIEW.md` §6.2)
 
-- [ ] Move `examples/froya_real_data.rs` (and the other examples) from the legacy `ssp_rk3_swe_2d` stepper and its `SWE2DTimeConfig` onto `Simulation` + `SWEPhysics2D`; this is the precondition for deleting the legacy integrators below. The two paths currently duplicate limiter and wet/dry dispatch.
+- [ ] Move the remaining examples (`profile_cpu`, `quick_profile`, `high_res_benchmark`; Frøya is done) from the legacy `ssp_rk3_swe_2d` stepper and its `SWE2DTimeConfig` onto `Simulation` + `SWEPhysics2D`. This is the precondition for deleting the legacy integrators below. The two paths currently duplicate limiter and wet/dry dispatch.
 - [ ] Delete the legacy integrators (`ssp_rk3*.rs`, three `coupled_swe_tracer` variants, `burn_ssp_rk3.rs`; ~2.4k lines). Make `CoupledState2D` implement `Integrable`; one time loop (fold `Simulation3D::run_with_callback`).
 - [ ] Collapse the duplicate config enums (`SWEFluxType2D` vs `StandardFlux2D`; three limiter enums).
 - [ ] Prune ~200 root re-exports to a `prelude`; export `Simulation3D`.
@@ -439,15 +443,15 @@ Details are in `CHANGELOG.md` and git history. Caveats found on 2026-09-25 are n
 
 | Metric | Current (2026-09-25) | Target (2D operational) |
 |---|---|---|
-| Tests | 1,024 lib + 61 integration + 59 doc (no-default); suite < 2 s | + the P1.7 gating physics tests |
-| Lake-at-rest, steep nodal B (30→400 m, 1.25 km, 1 h) | **Fails**: 0.9 m/s (P3), 2.3 m/s (P2), blow-up (P1) | residual < 1e-10, p = 1–4 |
-| Mass conservation, face-discontinuous B | **Fails**: −5.5e-5 relative per second | machine precision |
-| Open-boundary reflection (Flather) | ≈ 33 % | < 1 % |
+| Tests | 1,090 lib + 88 integration + 59 doc (no-default) | + the P1.7 gating physics tests |
+| Lake-at-rest, steep nodal B | Split forms: RHS ≤ 4e-12 for any nodal B, P1–P4. Real Frøya bathymetry (0–404 m, `WetDry`, P2): max \|u\| 1.5e-10 m/s after 1 h (the collocated scheme: 0.9–2.3 m/s or blow-up) | residual < 1e-10, p = 1–4 |
+| Mass conservation, face-discontinuous B | Machine precision (P0.13; split forms by construction) | machine precision |
+| Open-boundary reflection (Flather) | < 1e-5 (P0.12, `tests/open_boundary_flather_test.rs`) | < 1 % |
 | SWE convergence | P1 1.67, P2 3.02 (linearised, flat, periodic; thresholds 1.5/2.5) | N+1, nonlinear, bathymetry, curved |
 | Allocations per 2D step (production stepper) | `Simulation` path: 0 B warm (without limiter/viscosity); legacy `ssp_rk3_swe_2d`: ~33 full-field arrays | 0 |
 | 2D tidal cost vs ROMS (model estimate) | ~47× core-hours | ≤ 1× per unit accuracy (P3.2) |
 | Validated against observations | No (NorKyst Bergen harmonic fit only) | 5+ tide gauges, ADCP |
-| Multi-day stability | 316 s tested | 30+ days, real domain |
+| Multi-day stability | One M2 cycle on Frøya (9,653 P2 elements, 11.4 min wall, 0 clips) | 30+ days, real domain |
 | 3D | Scaffolding; 3 blockers (tracer constancy, vertical advection ×D, PGF) | stratified lake-at-rest, constancy, lock exchange |
 | GPU | Non-functional (P0.11) | fixed or replaced (P2.7) |
 
