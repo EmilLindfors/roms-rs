@@ -138,7 +138,21 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
     /// * `rhs` - Function computing the RHS: f(state, time) -> time_derivative
     fn step<F>(&self, state: &mut S, dt: f64, t: f64, rhs: F)
     where
-        F: FnMut(&S, f64) -> S;
+        F: FnMut(&S, f64) -> S,
+    {
+        self.step_with_stage_hook(state, dt, t, rhs, |_| {});
+    }
+
+    /// Advance one step, applying `stage_hook` to every stage value, including
+    /// the final one, before it is used.
+    ///
+    /// This is where nonlinear projections (positivity and slope limiters,
+    /// wet/dry correction) belong: the Zhang–Shu positivity guarantee for SSP
+    /// methods holds only if every RHS evaluation sees a limited state.
+    fn step_with_stage_hook<F, H>(&self, state: &mut S, dt: f64, t: f64, rhs: F, stage_hook: H)
+    where
+        F: FnMut(&S, f64) -> S,
+        H: FnMut(&mut S);
 }
 
 // =============================================================================
@@ -161,12 +175,30 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SSPRK3;
 
-impl SSPRK3 {
-    /// Advance one step while applying a hook after each intermediate RK stage.
-    ///
-    /// This is useful for nonlinear projections such as positivity or bounds
-    /// limiters that must run before the next RHS evaluation.
-    pub fn step_with_stage_hook<S, F, H>(
+impl IntegratorInfo for SSPRK3 {
+    fn name(&self) -> &'static str {
+        "ssp-rk3"
+    }
+
+    fn order(&self) -> usize {
+        3
+    }
+
+    fn n_stages(&self) -> usize {
+        3
+    }
+
+    fn is_ssp(&self) -> bool {
+        true
+    }
+
+    fn stage_times(&self, dt: f64) -> Vec<f64> {
+        vec![0.0, dt, 0.5 * dt]
+    }
+}
+
+impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
+    fn step_with_stage_hook<F, H>(
         &self,
         state: &mut S,
         dt: f64,
@@ -174,7 +206,6 @@ impl SSPRK3 {
         mut rhs: F,
         mut stage_hook: H,
     ) where
-        S: Integrable,
         F: FnMut(&S, f64) -> S,
         H: FnMut(&mut S),
     {
@@ -200,55 +231,6 @@ impl SSPRK3 {
         state.axpy(2.0 / 3.0, &u2);
         state.axpy(2.0 / 3.0 * dt, &l_u2);
         stage_hook(state);
-    }
-}
-
-impl IntegratorInfo for SSPRK3 {
-    fn name(&self) -> &'static str {
-        "ssp-rk3"
-    }
-
-    fn order(&self) -> usize {
-        3
-    }
-
-    fn n_stages(&self) -> usize {
-        3
-    }
-
-    fn is_ssp(&self) -> bool {
-        true
-    }
-
-    fn stage_times(&self, dt: f64) -> Vec<f64> {
-        vec![0.0, dt, 0.5 * dt]
-    }
-}
-
-impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
-    fn step<F>(&self, state: &mut S, dt: f64, t: f64, mut rhs: F)
-    where
-        F: FnMut(&S, f64) -> S,
-    {
-        // Stage 1: u1 = u + dt * L(u, t)
-        let l_u = rhs(state, t);
-        let mut u1 = state.clone();
-        u1.axpy(dt, &l_u);
-
-        // Stage 2: u2 = 3/4 * u + 1/4 * u1 + 1/4 * dt * L(u1, t + dt)
-        let t1 = t + dt;
-        let l_u1 = rhs(&u1, t1);
-        let mut u2 = state.clone();
-        u2.scale(0.75);
-        u2.axpy(0.25, &u1);
-        u2.axpy(0.25 * dt, &l_u1);
-
-        // Stage 3: u_new = 1/3 * u + 2/3 * u2 + 2/3 * dt * L(u2, t + dt/2)
-        let t2 = t + 0.5 * dt;
-        let l_u2 = rhs(&u2, t2);
-        state.scale(1.0 / 3.0);
-        state.axpy(2.0 / 3.0, &u2);
-        state.axpy(2.0 / 3.0 * dt, &l_u2);
     }
 }
 
@@ -289,12 +271,20 @@ impl IntegratorInfo for ForwardEuler {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for ForwardEuler {
-    fn step<F>(&self, state: &mut S, dt: f64, t: f64, mut rhs: F)
-    where
+    fn step_with_stage_hook<F, H>(
+        &self,
+        state: &mut S,
+        dt: f64,
+        t: f64,
+        mut rhs: F,
+        mut stage_hook: H,
+    ) where
         F: FnMut(&S, f64) -> S,
+        H: FnMut(&mut S),
     {
         let l_u = rhs(state, t);
         state.axpy(dt, &l_u);
+        stage_hook(state);
     }
 }
 
@@ -350,13 +340,18 @@ impl IntegratorInfo for StandardIntegrator {
 }
 
 impl<S: Integrable> TimeIntegrator<S> for StandardIntegrator {
-    fn step<F>(&self, state: &mut S, dt: f64, t: f64, rhs: F)
+    fn step_with_stage_hook<F, H>(&self, state: &mut S, dt: f64, t: f64, rhs: F, stage_hook: H)
     where
         F: FnMut(&S, f64) -> S,
+        H: FnMut(&mut S),
     {
         match self {
-            StandardIntegrator::SSPRK3 => SSPRK3.step(state, dt, t, rhs),
-            StandardIntegrator::ForwardEuler => ForwardEuler.step(state, dt, t, rhs),
+            StandardIntegrator::SSPRK3 => {
+                SSPRK3.step_with_stage_hook(state, dt, t, rhs, stage_hook)
+            }
+            StandardIntegrator::ForwardEuler => {
+                ForwardEuler.step_with_stage_hook(state, dt, t, rhs, stage_hook)
+            }
         }
     }
 }

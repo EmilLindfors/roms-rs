@@ -1,7 +1,18 @@
 //! Standard limiter implementations and composition utilities.
 
 use super::super::state::SWESolution2D;
-use super::swe_2d::{swe_kuzmin_limiter_2d, swe_positivity_limiter_2d};
+// Serial and parallel limiters run the same element kernels and agree bitwise,
+// so use the parallel ones whenever they are compiled in.
+#[cfg(not(feature = "parallel"))]
+use super::swe_2d::{
+    apply_swe_limiters_kuzmin_2d as kuzmin_with_positivity, swe_kuzmin_limiter_2d as kuzmin,
+    swe_positivity_limiter_2d as positivity,
+};
+#[cfg(feature = "parallel")]
+use super::swe_2d::{
+    apply_swe_limiters_kuzmin_2d_parallel as kuzmin_with_positivity,
+    swe_kuzmin_limiter_2d_parallel as kuzmin, swe_positivity_limiter_2d_parallel as positivity,
+};
 use super::tracer_2d::KuzminParameter2D;
 use super::traits::{BoxedLimiter2D, Limiter2D, LimiterContext2D};
 
@@ -37,7 +48,7 @@ impl KuzminLimiter2D {
 
 impl Limiter2D for KuzminLimiter2D {
     fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
-        swe_kuzmin_limiter_2d(solution, ctx.mesh, ctx.ops, &self.param);
+        kuzmin(solution, ctx.mesh, ctx.ops, &self.param);
     }
 
     fn name(&self) -> &'static str {
@@ -66,7 +77,7 @@ impl PositivityLimiter2D {
 
 impl Limiter2D for PositivityLimiter2D {
     fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
-        swe_positivity_limiter_2d(solution, ctx.ops, self.h_min);
+        positivity(solution, ctx.ops, self.h_min);
     }
 
     fn name(&self) -> &'static str {
@@ -185,14 +196,13 @@ impl Limiter2D for StandardLimiter2D {
         match self {
             StandardLimiter2D::None => {}
             StandardLimiter2D::Kuzmin(param) => {
-                swe_kuzmin_limiter_2d(solution, ctx.mesh, ctx.ops, param);
+                kuzmin(solution, ctx.mesh, ctx.ops, param);
             }
             StandardLimiter2D::Positivity(h_min) => {
-                swe_positivity_limiter_2d(solution, ctx.ops, *h_min);
+                positivity(solution, ctx.ops, *h_min);
             }
             StandardLimiter2D::KuzminWithPositivity { kuzmin, h_min } => {
-                swe_kuzmin_limiter_2d(solution, ctx.mesh, ctx.ops, kuzmin);
-                swe_positivity_limiter_2d(solution, ctx.ops, *h_min);
+                kuzmin_with_positivity(solution, ctx.mesh, ctx.ops, kuzmin, *h_min);
             }
         }
     }

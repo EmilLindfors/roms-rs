@@ -46,7 +46,9 @@ use dg_rs::mesh::{Bathymetry2D, BoundaryTag, LandMask2D, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 #[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_rhs_swe_2d_parallel;
-use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d};
+use dg_rs::solver::{
+    SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d, compute_rhs_swe_2d, positivity_cfl_swe_2d,
+};
 use dg_rs::source::{
     AtmosphericPressure2D, BathymetrySource2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
     ManningFriction2D, WindStress2D,
@@ -159,8 +161,9 @@ const ENABLE_OCEAN_NESTING: bool = true;
 #[cfg(feature = "netcdf")]
 const NORKYST_PATH: &str = "/home/emil/aqc/aqc-h3o/data/norkyst_v3/norkyst_v3_norkystv3_800m_m00_be_20240130_0600_stuv_bbox_7p8_62p8_8p9_64p1.nc";
 
-/// CFL number for time stepping
-const CFL: f64 = 0.1;
+/// CFL number for time stepping: the DGSEM positivity bound for wet/dry runs
+/// (5/12 at N = 2 with the Rusanov flux; see `positivity_cfl_swe_2d`)
+const CFL: f64 = positivity_cfl_swe_2d(N_POLY);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=================================================================");
