@@ -90,9 +90,9 @@ src/
 The 3D solver is ROMS-style: 2D DG horizontal × finite-difference vertical on
 sigma coordinates with mode splitting (see `3D_TODO.md`). When working there:
 - Depth convention is `h = eta - B` with `B` = bed elevation (negative under water) — everywhere
-- New vertical/3D discretizations need convergence + conservation tests before merge (the layer is currently under-tested; see `REVIEW.md` §5.2, §6)
+- New vertical/3D discretizations need convergence + conservation tests before merge (the layer is currently under-tested; see `REVIEW.md` §6.1)
 - Layer-thickness (Hz) weighted fluxes for anything advected; divide back to concentration/velocity after
-- Known open numerics: balanced baroclinic PGF, forward-backward barotropic subcycling (`REVIEW.md` §2.2, §1.5)
+- Known open numerics: tracer constancy / consistent 2D–3D transport (`REVIEW.md` §3.1), balanced baroclinic PGF (§3.3), once-per-step forward-backward barotropic subcycling and a `rufrc`-style G-term (§2)
 
 ## Norwegian Coast Specifics
 
