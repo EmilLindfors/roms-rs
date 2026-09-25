@@ -4,6 +4,8 @@
 //! - Scalar fluxes: upwind, Lax-Friedrichs
 //! - Shallow water fluxes: Roe, HLL/HLLC
 //! - 2D shallow water fluxes with rotation to face-aligned coordinates
+//! - Entropy-conservative/-stable two-point fluxes for the split-form 2D SWE
+//!   DGSEM with bathymetry (Wintermeyer et al. 2017)
 //! - Tracer fluxes: upwind-based for temperature and salinity
 //!
 //! # Flux Trait
@@ -21,6 +23,7 @@
 mod hll;
 mod roe;
 mod swe_2d;
+mod swe_2d_entropy;
 mod tracer_2d;
 pub mod traits;
 mod upwind;
@@ -29,6 +32,10 @@ pub use hll::{hll_flux_jump_swe, hll_flux_swe, hll_flux_swe_normal, hllc_flux_sw
 pub use roe::{roe_flux_jump_swe, roe_flux_swe, roe_flux_swe_normal};
 pub use swe_2d::{
     SWEFluxType2D, compute_flux_swe_2d, hll_flux_swe_2d, roe_flux_swe_2d, rusanov_flux_swe_2d,
+};
+pub use swe_2d_entropy::{
+    SWENodeState2D, entropy_stable_dissipation_2d, swe_entropy_2d, swe_entropy_variables_2d,
+    wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
 };
 pub use tracer_2d::{
     TracerFluxType, lax_friedrichs_tracer_flux, roe_tracer_flux, tracer_numerical_flux,

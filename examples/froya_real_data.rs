@@ -435,7 +435,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         OceanNestingBC2D::new(Arc::clone(reader), projection.clone())
             .with_reference_level(0.0)
             .with_flather(true)
-            .with_flather_weight(0.8) // Blend with some radiation
     });
 
     // Use ocean BC if available, otherwise fall back to tidal

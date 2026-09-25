@@ -9,8 +9,18 @@
 //! - Spatially-varying boundary conditions from parent ocean model
 //! - Automatic coordinate transformation (mesh coords → lat/lon)
 //! - Time interpolation within the ocean model data
-//! - Flather blending for wave absorption at open boundaries
+//! - Flather-type open boundary (wave absorption) via the Riemann solver
 //! - Handles SSH → water depth conversion with bathymetry
+//!
+//! # Weak (ghost-state) formulation
+//!
+//! The ghost state is the parent state, `h = η_ext − B` with the parent
+//! velocity. The upwind Riemann solver at the boundary face takes the outgoing
+//! Riemann invariant from the interior and the incoming one from the ghost,
+//! which is the Flather (1976) condition. Adding the Flather correction
+//! `sqrt(g/h)(η_int − η_ext)` to the ghost normal velocity as well would count
+//! it twice and reflect outgoing waves, so `with_flather` and
+//! `with_flather_weight` no longer change the ghost state.
 //!
 //! # Example
 //!
@@ -33,7 +43,6 @@
 use crate::boundary::{BCContext2D, SWEBoundaryCondition2D};
 use crate::io::{CoordinateProjection, OceanModelReader, OceanState};
 use crate::solver::SWEState2D;
-use crate::types::Depth;
 use std::sync::Arc;
 
 /// Ocean model nesting boundary condition.
@@ -48,9 +57,10 @@ pub struct OceanNestingBC2D<P: CoordinateProjection> {
     projection: P,
     /// Reference sea level (η₀) - typically 0 for MSL
     reference_level: f64,
-    /// Use Flather blending for wave absorption
+    /// Use Flather blending for wave absorption.
+    /// Only affects [`name`](SWEBoundaryCondition2D::name).
     use_flather: bool,
-    /// Flather blending weight (0 = Dirichlet, 1 = full Flather)
+    /// Flather blending weight (unused, retained for API compatibility)
     flather_weight: f64,
     /// Minimum depth threshold
     h_min: f64,
@@ -87,8 +97,9 @@ impl<P: CoordinateProjection> OceanNestingBC2D<P> {
 
     /// Enable or disable Flather blending.
     ///
-    /// Flather blending combines the parent model state with a radiation
-    /// condition to allow outgoing waves to exit cleanly.
+    /// No longer affects the ghost state: the parent-state ghost combined
+    /// with the upwind Riemann solver already lets outgoing waves exit cleanly
+    /// (see the module docs). Retained for API compatibility.
     pub fn with_flather(mut self, enable: bool) -> Self {
         self.use_flather = enable;
         self
@@ -96,8 +107,8 @@ impl<P: CoordinateProjection> OceanNestingBC2D<P> {
 
     /// Set Flather blending weight.
     ///
-    /// - 0.0: Pure Dirichlet (directly impose parent state)
-    /// - 1.0: Full Flather blending (default)
+    /// No longer affects the ghost state (see [`with_flather`](Self::with_flather)).
+    /// Retained for API compatibility.
     pub fn with_flather_weight(mut self, weight: f64) -> Self {
         self.flather_weight = weight.clamp(0.0, 1.0);
         self
@@ -177,8 +188,6 @@ impl<P: CoordinateProjection + Send + Sync> SWEBoundaryCondition2D for OceanNest
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         let (x, y) = ctx.position;
         let t = ctx.time;
-        let g = ctx.g;
-        let (nx, ny) = ctx.normal;
 
         // Try to get ocean state at this position and time
         let ocean_state = match self.get_ocean_state(x, y, t) {
@@ -191,42 +200,10 @@ impl<P: CoordinateProjection + Send + Sync> SWEBoundaryCondition2D for OceanNest
             }
         };
 
-        // Convert to SWE state
-        let state_ext = self.ocean_to_swe(&ocean_state, ctx.bathymetry);
-
-        // Pure Dirichlet mode: return external state directly
-        if !self.use_flather || self.flather_weight < 1e-10 {
-            return state_ext;
-        }
-
-        // Flather blending mode
-        let h_ext = state_ext.h.max(self.h_min);
-        let (u_ext, v_ext) = state_ext.velocity_simple(Depth::new(self.h_min));
-
-        // Normal and tangential velocities (external)
-        let un_ext = u_ext * nx + v_ext * ny;
-        let ut_ext = -u_ext * ny + v_ext * nx;
-
-        // Surface elevations
-        let eta_ext = h_ext + ctx.bathymetry;
-        let eta_int = ctx.interior_surface_elevation();
-
-        // Wave celerity
-        let c_ext = (g * h_ext).sqrt();
-
-        // Flather relation: u_n = u_n_ext + c * (η_int - η_ext) / h
-        let un_flather = un_ext + c_ext * (eta_int - eta_ext) / h_ext;
-
-        // Blend Dirichlet and Flather
-        let w = self.flather_weight;
-        let un_ghost = (1.0 - w) * un_ext + w * un_flather;
-        let ut_ghost = ut_ext; // Tangential from external
-
-        // Convert back to (u, v)
-        let u_ghost = un_ghost * nx - ut_ghost * ny;
-        let v_ghost = un_ghost * ny + ut_ghost * nx;
-
-        SWEState2D::from_primitives(h_ext, u_ghost, v_ghost)
+        // Ghost = parent state, h = η_ext − B (clamped to h_min). The Riemann
+        // solver applies the Flather relation; adding
+        // sqrt(g/h)(η_int − η_ext) to u_n here would apply it twice.
+        self.ocean_to_swe(&ocean_state, ctx.bathymetry)
     }
 
     fn name(&self) -> &'static str {
