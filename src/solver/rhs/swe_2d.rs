@@ -43,13 +43,20 @@ pub struct SWE2DRhsConfig<'a, BC: SWEBoundaryCondition2D> {
     pub bathymetry: Option<&'a Bathymetry2D>,
     /// Enable hydrostatic reconstruction for well-balanced treatment of bathymetry.
     ///
-    /// When enabled, interface states are modified using Audusse et al. (2004)
-    /// hydrostatic reconstruction to ensure lake-at-rest is preserved to machine
-    /// precision regardless of bathymetry gradient.
+    /// When enabled, the numerical flux is evaluated on Audusse et al. (2004)
+    /// hydrostatically reconstructed interface states and the interior side gets
+    /// the momentum correction ½g(h*² − h²)·n. This balances the bathymetry
+    /// *jumps* across faces; the interior flux stays that of the nodal state, so
+    /// mass is conserved exactly.
     ///
-    /// Requires `bathymetry` to be set. When using this option, do NOT include
-    /// `BathymetrySource2D` in `source_terms` as the bathymetry effect is handled
-    /// through the flux reconstruction.
+    /// Requires `bathymetry` to be set. The in-element slope ∂B still has to be
+    /// balanced by `BathymetrySource2D` in `source_terms`:
+    /// - cell-constant B (`Bathymetry2D::to_cell_average`): the source is zero and
+    ///   may be omitted; lake-at-rest is preserved to round-off;
+    /// - nodal (non-constant) B: **include** `BathymetrySource2D`, otherwise the
+    ///   volume term leaves an unbalanced `g h ∂B/∂x` (O(1) m/s² accelerations).
+    ///   Even with the source, lake-at-rest is exact only if `½gh²` is resolved by
+    ///   the element polynomials (deg B ≤ p/2).
     pub well_balanced: bool,
     /// Optional horizontal viscosity for momentum diffusion.
     ///
@@ -135,21 +142,29 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
 
     /// Enable hydrostatic reconstruction for well-balanced treatment of bathymetry.
     ///
-    /// When enabled, interface states are modified using the Audusse et al. (2004)
-    /// method to ensure lake-at-rest (η = h + B = const, u = v = 0) is preserved
-    /// to machine precision regardless of bathymetry gradient.
+    /// Uses the Audusse et al. (2004) hydrostatic reconstruction at element faces,
+    /// which balances bathymetry *jumps* across faces while keeping discrete mass
+    /// conservation exact. Lake-at-rest (η = h + B = const, u = v = 0) is preserved
+    /// to machine precision when the in-element bathymetry is also balanced, see
+    /// the requirements below.
     ///
     /// # Requirements
     /// - `bathymetry` must be set via `with_bathymetry()`
-    /// - Do NOT include `BathymetrySource2D` in `source_terms`
+    /// - For nodal (non-constant within elements) bathymetry, **include**
+    ///   `BathymetrySource2D` in `source_terms`; it balances the volume pressure
+    ///   term. Only for cell-constant bathymetry (`Bathymetry2D::to_cell_average`),
+    ///   whose gradient is zero, is the source term a no-op that may be omitted.
+    /// - Even with the source term, nodal bathymetry is balanced exactly only when
+    ///   deg B ≤ p/2 in each element.
     ///
     /// # Example
     /// ```ignore
     /// // Well-balanced scheme for steep Norwegian bathymetry
+    /// let bathy_source = BathymetrySource2D::new(g);
     /// let config = SWE2DRhsConfig::new(&equation, &bc)
     ///     .with_bathymetry(&bathymetry)
+    ///     .with_source_terms(&bathy_source)
     ///     .with_well_balanced(true);
-    /// // Note: Do NOT add BathymetrySource2D here
     /// ```
     pub fn with_well_balanced(mut self, enable: bool) -> Self {
         self.well_balanced = enable;
@@ -490,11 +505,19 @@ pub fn compute_rhs_swe_2d<BC: SWEBoundaryCondition2D>(
                     config.flux_type,
                 );
 
-                // Interior flux F- · n using reconstructed interior state
-                let f_int = config.equation.normal_flux(&q_int_flux, normal);
+                // Interior flux F(q⁻)·n of the actual nodal state. It must match the
+                // volume term for the surface/volume pair to telescope (SBP); using the
+                // reconstructed state here adds −∮(h⁻ − h*⁻)u⁻·n to the element mass.
+                let f_int = config.equation.normal_flux(&q_int, normal);
 
                 // Flux difference for upwind dissipation: (F- - F*)
                 flux_diff[i] = f_int - f_star;
+
+                // Well-balancing enters as the Audusse momentum correction ½g(h*⁻² − h⁻²)·n
+                if let Some(ref reconstruction) = hr {
+                    flux_diff[i] = flux_diff[i]
+                        + reconstruction.pressure_correction(q_int.h, q_int_flux.h, normal);
+                }
             }
 
             // Apply LIFT: rhs += j_inv * LIFT_f * (sJ * flux_diff)
@@ -1018,8 +1041,18 @@ pub fn compute_rhs_swe_2d_parallel<BC: SWEBoundaryCondition2D + Sync>(
                                 h_min,
                                 config.flux_type,
                             );
-                            let f_int = config.equation.normal_flux(&q_int_flux, normal);
-                            let flux_diff = f_int - f_star;
+                            // Interior flux of the actual nodal state (SBP telescoping),
+                            // plus the Audusse momentum correction ½g(h*⁻² − h⁻²)·n.
+                            let f_int = config.equation.normal_flux(&q_int, normal);
+                            let mut flux_diff = f_int - f_star;
+                            if let Some(ref reconstruction) = hr {
+                                flux_diff = flux_diff
+                                    + reconstruction.pressure_correction(
+                                        q_int.h,
+                                        q_int_flux.h,
+                                        normal,
+                                    );
+                            }
 
                             ws.flux_diff_h[i] = flux_diff.h;
                             ws.flux_diff_hu[i] = flux_diff.hu;
@@ -1688,19 +1721,154 @@ mod tests {
         );
     }
 
+    /// Periodic 20 km domain with smooth bathymetry of large amplitude.
+    ///
+    /// B = −200 + 150·sin(2πx/L)·cos(2πy/L), optionally cell-averaged so that B
+    /// jumps across every element face (as `examples/froya_real_data.rs` does).
+    fn sloped_periodic_setup(
+        order: usize,
+        cell_average: bool,
+    ) -> (Mesh2D, DGOperators2D, GeometricFactors2D, Bathymetry2D) {
+        const L: f64 = 20_000.0;
+        let mesh = Mesh2D::uniform_periodic(0.0, L, 0.0, L, 12, 12);
+        let ops = DGOperators2D::new(order);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let tau = 2.0 * std::f64::consts::PI / L;
+        let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -200.0 + 150.0 * (tau * x).sin() * (tau * y).cos()
+        });
+        if cell_average {
+            bathymetry.to_cell_average();
+        }
+        (mesh, ops, geom, bathymetry)
+    }
+
+    /// State with free surface η = 0.3 m over `bathymetry` and momentum
+    /// hu = velocity_scale·h·cos(2πx/L)·cos(2πy/L), hv = 0.
+    ///
+    /// The velocity is correlated with the bathymetry slope on purpose: a
+    /// uniform velocity hides reconstruction-induced mass errors by symmetry.
+    fn sloped_state(
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        bathymetry: &Bathymetry2D,
+        velocity_scale: f64,
+    ) -> SWESolution2D {
+        let tau = 2.0 * std::f64::consts::PI / 20_000.0;
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let h = 0.3 - bathymetry.get(k, i);
+                let hu = velocity_scale * h * (tau * x).cos() * (tau * y).cos();
+                q.set_state(k, i, SWEState2D::new(h, hu, 0.0));
+            }
+        }
+        q
+    }
+
+    /// ∫ q_var dA using the GLL quadrature.
+    fn integrate_var(
+        q: &SWESolution2D,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        var: usize,
+    ) -> f64 {
+        let mut integral = 0.0;
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let j = geom.det_j[k.as_usize()];
+            for (i, &w) in ops.weights.iter().enumerate() {
+                integral += w * j * q.get_var(k, i, var);
+            }
+        }
+        integral
+    }
+
+    #[test]
+    fn test_mass_conservation_hydrostatic_reconstruction_discontinuous_bathymetry() {
+        // Regression (REVIEW.md §1.3): with cell-averaged B the reconstruction is
+        // active at every face. Evaluating the interior flux on the reconstructed
+        // state broke the SBP telescoping and leaked ≈5e-5 of the total mass per
+        // second on this configuration.
+        use crate::source::BathymetrySource2D;
+
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let bathy_source = BathymetrySource2D::new(G);
+
+        for order in 1..=3 {
+            for cell_average in [false, true] {
+                let (mesh, ops, geom, bathymetry) = sloped_periodic_setup(order, cell_average);
+                let q = sloped_state(&mesh, &ops, &bathymetry, 1.0);
+                let config = SWE2DRhsConfig::new(&equation, &bc)
+                    .with_coriolis(false)
+                    .with_bathymetry(&bathymetry)
+                    .with_source_terms(&bathy_source)
+                    .with_well_balanced(true);
+
+                let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+                let mass = integrate_var(&q, &mesh, &ops, &geom, 0);
+                let mass_rate = integrate_var(&rhs, &mesh, &ops, &geom, 0);
+
+                assert!(
+                    mass_rate.abs() / mass < 1e-12,
+                    "p={order}, cell_average={cell_average}: \
+                     d(mass)/dt / mass = {:.3e} (d(mass)/dt = {:.3e} m³/s)",
+                    mass_rate / mass,
+                    mass_rate
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lake_at_rest_cell_averaged_bathymetry() {
+        // Cell-constant B: zero volume gradient, every bathymetry effect comes from
+        // the hydrostatic interface correction. Must stay balanced to round-off.
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+
+        for order in 1..=3 {
+            let (mesh, ops, geom, bathymetry) = sloped_periodic_setup(order, true);
+            let q = sloped_state(&mesh, &ops, &bathymetry, 0.0);
+            let config = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_bathymetry(&bathymetry)
+                .with_well_balanced(true);
+
+            let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+            let max_rhs = rhs.max_abs();
+            assert!(
+                max_rhs < 1e-10,
+                "p={order}: lake at rest over cell-averaged B, max RHS = {max_rhs:.3e}"
+            );
+
+            #[cfg(all(feature = "parallel", feature = "simd"))]
+            {
+                let rhs_par = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, 0.0);
+                let max_rhs_par = rhs_par.max_abs();
+                assert!(
+                    max_rhs_par < 1e-10,
+                    "p={order}: parallel lake at rest over cell-averaged B, \
+                     max RHS = {max_rhs_par:.3e}"
+                );
+            }
+        }
+    }
+
     #[test]
     #[cfg(all(feature = "parallel", feature = "simd"))]
     fn test_parallel_matches_serial() {
-        use super::compute_rhs_swe_2d_parallel;
+        use crate::source::BathymetrySource2D;
 
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+
+        // Case 1: flat bottom, non-uniform flow.
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(3);
         let geom = GeometricFactors2D::compute(&mesh);
-        let equation = ShallowWater2D::new(G);
-        let bc = Reflective2D::new();
-        let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
-
-        // Non-uniform initial condition
         let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
         for k in ElementIndex::iter(mesh.n_elements) {
             for i in 0..ops.n_nodes {
@@ -1713,47 +1881,57 @@ mod tests {
                 q.set_state(k, i, SWEState2D::from_primitives(h, u, v));
             }
         }
+        let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
+        assert_parallel_matches_serial(&q, &mesh, &ops, &geom, &config, "flat bottom");
 
-        let rhs_serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
-        let rhs_parallel = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, 0.0);
+        // Case 2: cell-averaged (face-discontinuous) bathymetry with hydrostatic
+        // reconstruction active at every face and a slope-correlated flow.
+        let (mesh, ops, geom, bathymetry) = sloped_periodic_setup(3, true);
+        let q = sloped_state(&mesh, &ops, &bathymetry, 1.0);
+        let bathy_source = BathymetrySource2D::new(G);
+        let config = SWE2DRhsConfig::new(&equation, &bc)
+            .with_coriolis(false)
+            .with_bathymetry(&bathymetry)
+            .with_source_terms(&bathy_source)
+            .with_well_balanced(true);
+        assert_parallel_matches_serial(
+            &q,
+            &mesh,
+            &ops,
+            &geom,
+            &config,
+            "cell-averaged bathymetry + reconstruction",
+        );
+    }
 
-        // Results should be identical
+    #[cfg(all(feature = "parallel", feature = "simd"))]
+    fn assert_parallel_matches_serial(
+        q: &SWESolution2D,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        config: &SWE2DRhsConfig<Reflective2D>,
+        case: &str,
+    ) {
+        let rhs_serial = compute_rhs_swe_2d(q, mesh, ops, geom, config, 0.0);
+        let rhs_parallel = compute_rhs_swe_2d_parallel(q, mesh, ops, geom, config, 0.0);
+
+        // Same arithmetic up to summation order: compare relative to the RHS scale.
+        let tol = 1e-12 * rhs_serial.max_abs().max(1.0);
         for k in ElementIndex::iter(mesh.n_elements) {
             for i in 0..ops.n_nodes {
                 let serial = rhs_serial.get_state(k, i);
                 let parallel = rhs_parallel.get_state(k, i);
-
-                let diff_h = (serial.h - parallel.h).abs();
-                let diff_hu = (serial.hu - parallel.hu).abs();
-                let diff_hv = (serial.hv - parallel.hv).abs();
-
-                assert!(
-                    diff_h < 1e-10,
-                    "h mismatch at ({}, {}): serial={}, parallel={}, diff={}",
-                    k,
-                    i,
-                    serial.h,
-                    parallel.h,
-                    diff_h
-                );
-                assert!(
-                    diff_hu < 1e-10,
-                    "hu mismatch at ({}, {}): serial={}, parallel={}, diff={}",
-                    k,
-                    i,
-                    serial.hu,
-                    parallel.hu,
-                    diff_hu
-                );
-                assert!(
-                    diff_hv < 1e-10,
-                    "hv mismatch at ({}, {}): serial={}, parallel={}, diff={}",
-                    k,
-                    i,
-                    serial.hv,
-                    parallel.hv,
-                    diff_hv
-                );
+                for (name, a, b) in [
+                    ("h", serial.h, parallel.h),
+                    ("hu", serial.hu, parallel.hu),
+                    ("hv", serial.hv, parallel.hv),
+                ] {
+                    assert!(
+                        (a - b).abs() < tol,
+                        "{case}: {name} mismatch at ({k}, {i}): serial={a}, parallel={b}"
+                    );
+                }
             }
         }
     }
