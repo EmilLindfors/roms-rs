@@ -174,6 +174,18 @@ impl ConstituentComparison {
         self.phase_error.to_degrees()
     }
 
+    /// Complex difference `|A_m e^{iφ_m} − A_o e^{iφ_o}|`: the RMS over a
+    /// period of the difference between the two constituent signals, times
+    /// √2. It weighs amplitude and phase errors by their effect on the
+    /// water level (a 10° lag on 1 m counts 0.17 m), so it is the standard
+    /// single-number skill per constituent (e.g. Cummins & Oey 1997).
+    pub fn complex_difference(&self) -> f64 {
+        let (a, b) = (self.model_amplitude, self.obs_amplitude);
+        (a * a + b * b - 2.0 * a * b * self.phase_error.cos())
+            .max(0.0)
+            .sqrt()
+    }
+
     /// Check if amplitude is within tolerance (ratio between 0.9 and 1.1).
     pub fn amplitude_within_10_percent(&self) -> bool {
         self.amplitude_ratio > 0.9 && self.amplitude_ratio < 1.1
@@ -383,5 +395,19 @@ mod tests {
         let comp2 = ConstituentComparison::new("M2", 1.0, 0.5, 1.5, 0.1);
         assert!(!comp2.amplitude_within_10_percent());
         assert!(!comp2.phase_within_10_degrees());
+    }
+
+    /// The complex difference is the amplitude error in phase, the chord of
+    /// the phase error at equal amplitudes, and wrap-safe.
+    #[test]
+    fn test_complex_difference() {
+        let d = |a, pa: f64, b, pb: f64| {
+            ConstituentComparison::new("M2", a, pa.to_radians(), b, pb.to_radians())
+                .complex_difference()
+        };
+        assert!((d(1.1, 30.0, 1.0, 30.0) - 0.1).abs() < TOL);
+        assert!((d(1.0, 10.0, 1.0, 0.0) - 2.0 * 5.0_f64.to_radians().sin()).abs() < TOL);
+        assert!((d(1.0, 359.0, 1.0, 1.0) - d(1.0, 2.0, 1.0, 0.0)).abs() < TOL);
+        assert!((d(0.0, 0.0, 0.5, 123.0) - 0.5).abs() < TOL);
     }
 }

@@ -130,7 +130,6 @@ pub fn read_tide_gauge_file(path: &Path) -> Result<TideGaugeFile, TideGaugeFileE
     let mut metadata: HashMap<String, String> = HashMap::new();
     let mut times: Vec<f64> = Vec::new();
     let mut values: Vec<f64> = Vec::new();
-    let mut has_header = false;
     let mut is_csv = false;
 
     for (line_num, line_result) in reader.lines().enumerate() {
@@ -153,7 +152,6 @@ pub fn read_tide_gauge_file(path: &Path) -> Result<TideGaugeFile, TideGaugeFileE
 
         // Check for CSV header
         if line_num < 5 && line.contains(',') && line.chars().any(|c| c.is_alphabetic()) {
-            has_header = true;
             is_csv = true;
             continue;
         }

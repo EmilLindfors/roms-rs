@@ -255,6 +255,61 @@ impl TidalAtlas {
             .unwrap_or_default()
     }
 
+    /// Replace (or add) constituent `name` at every point by `from` scaled by
+    /// `ratio` and lagged by `lag_offset_deg`, for elevation and velocity
+    /// alike: inference, for a constituent the source misrepresents but
+    /// whose ratio to a neighbour in frequency is known (e.g. from a long
+    /// gauge record). Constituents close in frequency share their spatial
+    /// structure, so one ratio serves a small domain.
+    pub fn infer(
+        &mut self,
+        name: &str,
+        from: &str,
+        ratio: f64,
+        lag_offset_deg: f64,
+    ) -> Result<(), TidalAtlasError> {
+        let name = canonical_name(name)
+            .ok_or_else(|| TidalAtlasError::Inconsistent(format!("unknown constituent {name}")))?;
+        let scaled = |(amp, lag): Harmonic| (ratio * amp, (lag + lag_offset_deg).rem_euclid(360.0));
+        for p in &mut self.points {
+            let source = p
+                .constituents
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(from))
+                .ok_or_else(|| {
+                    TidalAtlasError::Inconsistent(format!(
+                        "{name} is inferred from {from}, which is missing"
+                    ))
+                })?;
+            let inferred = AtlasConstituent {
+                name,
+                eta: scaled(source.eta),
+                velocity: source.velocity.map(|(u, v)| (scaled(u), scaled(v))),
+            };
+            match p.constituents.iter_mut().find(|c| c.name == name) {
+                Some(c) => *c = inferred,
+                None => p.constituents.push(inferred),
+            }
+        }
+        Ok(())
+    }
+
+    /// The point nearest to (`lon`, `lat`) and its distance (m, spherical
+    /// earth); `None` for an empty atlas.
+    pub fn nearest(&self, lon: f64, lat: f64) -> Option<(&AtlasPoint, f64)> {
+        const EARTH_RADIUS: f64 = 6_371_000.0;
+        let distance = |p: &AtlasPoint| {
+            let (la1, la2) = (lat.to_radians(), p.lat.to_radians());
+            let dlon = (p.lon - lon).to_radians();
+            let c = la1.sin() * la2.sin() + la1.cos() * la2.cos() * dlon.cos();
+            EARTH_RADIUS * c.clamp(-1.0, 1.0).acos()
+        };
+        self.points
+            .iter()
+            .map(|p| (p, distance(p)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+    }
+
     /// Whether the atlas has velocities.
     pub fn has_velocity(&self) -> bool {
         self.points
@@ -604,6 +659,37 @@ mod tests {
         assert_eq!(atlas.header[0], "test atlas");
         let again = TidalAtlas::parse(&atlas.to_text()).unwrap();
         assert_eq!(again.points, atlas.points);
+    }
+
+    /// Inference replaces a constituent (or adds a new one) at every point,
+    /// velocities included, and needs its source.
+    #[test]
+    fn inference_replaces_and_adds_constituents() {
+        let mut atlas = TidalAtlas::parse(ATLAS).unwrap();
+        atlas.infer("S2", "M2", 0.2, -30.0).unwrap();
+        let s2 = atlas.points[0].constituents[1];
+        assert_eq!(s2.name, "S2");
+        assert!((s2.eta.0 - 0.2).abs() < 1e-12 && (s2.eta.1 - 320.0).abs() < 1e-12);
+        let ((ua, ug), _) = s2.velocity.unwrap();
+        assert!((ua - 0.02).abs() < 1e-12 && (ug - 50.0).abs() < 1e-12);
+        // Wraps past 360°
+        assert!((atlas.points[1].constituents[1].eta.1 - 340.0).abs() < 1e-12);
+
+        atlas.infer("n2", "M2", 0.19, 0.0).unwrap();
+        assert_eq!(atlas.names(), vec!["M2", "S2", "N2"]);
+        atlas.validate().unwrap();
+        assert!(atlas.infer("Q1", "O1", 0.19, 0.0).is_err());
+    }
+
+    /// 0.1° of longitude at 63° N is ≈ 5.05 km.
+    #[test]
+    fn nearest_point_and_distance() {
+        let atlas = TidalAtlas::parse(ATLAS).unwrap();
+        let (p, d) = atlas.nearest(8.07, 63.0).unwrap();
+        assert_eq!(p.lon, 8.1);
+        let expected = 6_371_000.0 * 0.03_f64.to_radians() * 63.0_f64.to_radians().cos();
+        assert!((d - expected).abs() < 1.0, "{d} vs {expected}");
+        assert!(TidalAtlas::default().nearest(8.0, 63.0).is_none());
     }
 
     #[test]

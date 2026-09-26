@@ -15,6 +15,10 @@
 //!    record midpoint), inferring P1 from K1 and K2 from S2.
 //! 5. Write the atlas (text format of `dg_rs::boundary::TidalAtlas`).
 //!
+//! `points=lon,lat;lon,lat…` also fits those points (e.g. tide gauges inside
+//! the domain, for validation), snapped to the nearest wet cell, into a
+//! second atlas `points_out`. `spacing_km=0` skips the perimeter.
+//!
 //! NorKyst's aggregation has no `ubar`/`vbar`; its z-levels stop at 300 m, so
 //! deeper columns extend the 300 m velocity to the bed. Tidal currents on the
 //! shelf are close to depth-uniform, so the error is small, but the transports
@@ -25,7 +29,8 @@
 //! ```bash
 //! cargo run --release --example norkyst_boundary_tides -- \
 //!     [bbox=8.0,63.6,9.2,64.0] [start=2025-06-01] [days=30] [spacing_km=1.0] \
-//!     [out=data/froya_boundary_tides.txt] [url=<OPeNDAP URL>]
+//!     [out=data/froya_boundary_tides.txt] [url=<OPeNDAP URL>] \
+//!     [points=8.665231,63.869331] [points_out=data/froya_station_tides.txt]
 //! ```
 //!
 //! Requires the `netcdf` feature (default) with a DAP-enabled netCDF-C.
@@ -71,6 +76,8 @@ mod app {
         spacing_km: f64,
         out: PathBuf,
         url: String,
+        points: Vec<(f64, f64)>,
+        points_out: PathBuf,
     }
 
     impl Options {
@@ -101,6 +108,20 @@ mod app {
                     .get("out")
                     .map_or("data/froya_boundary_tides.txt".into(), PathBuf::from),
                 url: args.get("url").cloned().unwrap_or(URL.into()),
+                points: args
+                    .get("points")
+                    .map_or("", String::as_str)
+                    .split(';')
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| {
+                        let (lon, lat) = p.split_once(',').ok_or(format!("bad point {p}"))?;
+                        let num = |v: &str| v.trim().parse().map_err(|_| format!("bad point {p}"));
+                        Ok((num(lon)?, num(lat)?))
+                    })
+                    .collect::<Result<_, String>>()?,
+                points_out: args
+                    .get("points_out")
+                    .map_or("data/froya_station_tides.txt".into(), PathBuf::from),
             })
         }
     }
@@ -163,6 +184,8 @@ mod app {
         lon: f64,
         lat: f64,
         depth: f64,
+        /// A requested point (`points=`), not a perimeter sample
+        station: bool,
         eta: Vec<f64>,
         u: Vec<f64>,
         v: Vec<f64>,
@@ -273,36 +296,56 @@ mod app {
             (min_lon, max_lat),
         ];
         let mut cells: Vec<Cell> = Vec::new();
-        for side in 0..4 {
-            let (a, b) = (corners[side], corners[(side + 1) % 4]);
-            let n = (distance(a, b) / (1000.0 * opts.spacing_km)).ceil() as usize;
-            for s in 0..n {
-                let f = s as f64 / n as f64;
-                let p = (a.0 + f * (b.0 - a.0), a.1 + f * (b.1 - a.1));
-                let nearest = (0..lon.len())
-                    .filter(|&k| wet[k])
-                    .map(|k| (distance(p, (lon[k], lat[k])), k))
-                    .min_by(|x, y| x.0.total_cmp(&y.0));
-                let Some((d, k)) = nearest.filter(|&(d, _)| d <= MAX_SNAP) else {
-                    continue;
-                };
-                let _ = d;
-                let (j, i) = (k / win.nx, k % win.nx);
-                if !cells.iter().any(|c| (c.j, c.i) == (j, i)) {
-                    cells.push(Cell {
-                        j,
-                        i,
-                        lon: lon[k],
-                        lat: lat[k],
-                        depth: h[k],
-                        eta: Vec::with_capacity(hours),
-                        u: Vec::with_capacity(hours),
-                        v: Vec::with_capacity(hours),
-                    });
+        // Snap `p` to the nearest wet cell within MAX_SNAP and add it once
+        let mut add = |p: (f64, f64), station: bool| -> Option<f64> {
+            let (d, k) = (0..lon.len())
+                .filter(|&k| wet[k])
+                .map(|k| (distance(p, (lon[k], lat[k])), k))
+                .min_by(|x, y| x.0.total_cmp(&y.0))
+                .filter(|&(d, _)| d <= MAX_SNAP)?;
+            let (j, i) = (k / win.nx, k % win.nx);
+            if !cells
+                .iter()
+                .any(|c| (c.j, c.i, c.station) == (j, i, station))
+            {
+                cells.push(Cell {
+                    j,
+                    i,
+                    lon: lon[k],
+                    lat: lat[k],
+                    depth: h[k],
+                    station,
+                    eta: Vec::with_capacity(hours),
+                    u: Vec::with_capacity(hours),
+                    v: Vec::with_capacity(hours),
+                });
+            }
+            Some(d)
+        };
+        if opts.spacing_km > 0.0 {
+            for side in 0..4 {
+                let (a, b) = (corners[side], corners[(side + 1) % 4]);
+                let n = (distance(a, b) / (1000.0 * opts.spacing_km)).ceil() as usize;
+                for s in 0..n {
+                    let f = s as f64 / n as f64;
+                    add((a.0 + f * (b.0 - a.0), a.1 + f * (b.1 - a.1)), false);
                 }
             }
         }
-        println!("  {} wet boundary cells", cells.len());
+        for &p in &opts.points {
+            match add(p, true) {
+                Some(d) => println!("  point ({:.4}, {:.4}): wet cell {d:.0} m away", p.0, p.1),
+                None => eprintln!(
+                    "  point ({:.4}, {:.4}): no wet cell within {MAX_SNAP} m",
+                    p.0, p.1
+                ),
+            }
+        }
+        let n_perimeter = cells.iter().filter(|c| !c.station).count();
+        println!(
+            "  {n_perimeter} wet boundary cells, {} points",
+            cells.len() - n_perimeter
+        );
 
         // Hourly data, one day per request
         let depth_var = var("depth")?;
@@ -366,23 +409,29 @@ mod app {
             );
         }
 
-        // Harmonic fits
+        // Harmonic fits: perimeter cells into `atlas`, requested points into
+        // `stations`
+        let header = vec![
+            "dg-rs tidal atlas: reference constants (H, Greenwich lag G)".to_string(),
+            format!("source: NorKyst-800 {}", opts.url),
+            format!(
+                "record: {} + {} days hourly; fit {} with {} inferred",
+                ModelClock::new(times[0]).format(0.0),
+                opts.days,
+                NAMES.join(" "),
+                INFERRED.map(|i| format!("{} from {}", i.name, i.from)).join(", ")
+            ),
+            "velocity: z-level u_eastward/v_northward averaged over the column (levels end at 300 m)".into(),
+        ];
         let mut atlas = TidalAtlas {
             points: Vec::new(),
-            header: vec![
-                "dg-rs tidal atlas: reference constants (H, Greenwich lag G)".into(),
-                format!("source: NorKyst-800 {}", opts.url),
-                format!(
-                    "record: {} + {} days hourly; fit {} with {} inferred",
-                    ModelClock::new(times[0]).format(0.0),
-                    opts.days,
-                    NAMES.join(" "),
-                    INFERRED.map(|i| format!("{} from {}", i.name, i.from)).join(", ")
-                ),
-                "velocity: z-level u_eastward/v_northward averaged over the column (levels end at 300 m)".into(),
-            ],
+            header: header.clone(),
         };
-        let mut r2 = Vec::new();
+        let mut stations = TidalAtlas {
+            points: Vec::new(),
+            header,
+        };
+        let (mut r2, mut r2_stations) = (Vec::new(), Vec::new());
         for cell in &cells {
             let fit = |values: &[f64]| -> Result<ReferenceFit, String> {
                 let (t, x): (Vec<f64>, Vec<f64>) = times
@@ -406,7 +455,6 @@ mod app {
                     continue;
                 }
             };
-            r2.push(eta.r_squared);
             let constituents = eta
                 .constants
                 .iter()
@@ -418,7 +466,13 @@ mod app {
                     velocity: Some(((u.amplitude, u.lag_deg), (v.amplitude, v.lag_deg))),
                 })
                 .collect();
-            atlas.points.push(AtlasPoint {
+            let (target, r2) = if cell.station {
+                (&mut stations, &mut r2_stations)
+            } else {
+                (&mut atlas, &mut r2)
+            };
+            r2.push(eta.r_squared);
+            target.points.push(AtlasPoint {
                 lon: cell.lon,
                 lat: cell.lat,
                 depth: cell.depth,
@@ -426,25 +480,29 @@ mod app {
                 constituents,
             });
         }
-        r2.sort_by(f64::total_cmp);
-        let median = r2.get(r2.len() / 2).copied().unwrap_or(f64::NAN);
-        atlas.header.push(format!(
-            "eta R^2: min {:.3}, median {:.3} over {} points",
-            r2.first().copied().unwrap_or(f64::NAN),
-            median,
-            r2.len()
-        ));
 
-        summarize(&atlas);
-        if let Some(dir) = opts.out.parent() {
-            std::fs::create_dir_all(dir)?;
+        for (atlas, mut r2, out) in [
+            (atlas, r2, &opts.out),
+            (stations, r2_stations, &opts.points_out),
+        ] {
+            if atlas.points.is_empty() {
+                continue;
+            }
+            r2.sort_by(f64::total_cmp);
+            let mut atlas = atlas;
+            atlas.header.push(format!(
+                "eta R^2: min {:.3}, median {:.3} over {} points",
+                r2[0],
+                r2[r2.len() / 2],
+                r2.len()
+            ));
+            summarize(&atlas);
+            if let Some(dir) = out.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            atlas.write(out)?;
+            println!("Wrote {} points to {}", atlas.points.len(), out.display());
         }
-        atlas.write(&opts.out)?;
-        println!(
-            "Wrote {} points to {}",
-            atlas.points.len(),
-            opts.out.display()
-        );
         Ok(())
     }
 

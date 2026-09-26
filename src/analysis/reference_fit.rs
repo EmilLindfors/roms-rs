@@ -60,6 +60,76 @@ impl Inference {
         amplitude_ratio: 0.272,
         lag_offset_deg: 0.0,
     };
+
+    /// N2 from M2 with the equilibrium amplitude ratio 0.191 and equal lag
+    /// (separable only from 27.6 days).
+    pub const N2_FROM_M2: Self = Self {
+        name: "N2",
+        from: "M2",
+        amplitude_ratio: 0.191,
+        lag_offset_deg: 0.0,
+    };
+
+    /// Q1 from O1 with the equilibrium amplitude ratio 0.191 and equal lag
+    /// (separable only from 27.6 days).
+    pub const Q1_FROM_O1: Self = Self {
+        name: "Q1",
+        from: "O1",
+        amplitude_ratio: 0.191,
+        lag_offset_deg: 0.0,
+    };
+
+    /// The equilibrium inferences above.
+    pub const EQUILIBRIUM: [Self; 4] = [
+        Self::P1_FROM_K1,
+        Self::K2_FROM_S2,
+        Self::N2_FROM_M2,
+        Self::Q1_FROM_O1,
+    ];
+
+    /// `name` from `from` with the ratio and lag offset of a reference fit
+    /// (e.g. a long record at a nearby gauge), which beats the equilibrium
+    /// values wherever the shelf response differs between the two; `None`
+    /// if the reference lacks either constituent.
+    pub fn from_reference(
+        name: &'static str,
+        from: &'static str,
+        reference: &ReferenceFit,
+    ) -> Option<Self> {
+        let (a, b) = (reference.get(name)?, reference.get(from)?);
+        Some(Self {
+            name,
+            from,
+            amplitude_ratio: a.amplitude / b.amplitude,
+            lag_offset_deg: a.lag_deg - b.lag_deg,
+        })
+    }
+}
+
+/// The longest prefix-greedy subset of `candidates` a record of `length`
+/// seconds can separate: each candidate, in priority order, is kept if the
+/// record is at least `rayleigh` times its synodic period with every kept
+/// one (`rayleigh` = 1 is the classical criterion). Unknown names are skipped.
+pub fn resolvable_constituents(
+    candidates: &[&'static str],
+    length: f64,
+    rayleigh: f64,
+) -> Vec<&'static str> {
+    let mut kept: Vec<(&'static str, f64)> = Vec::new();
+    for &name in candidates {
+        let Some(period) = constituent_period(name) else {
+            continue;
+        };
+        let omega = 2.0 * std::f64::consts::PI / period;
+        let separable = kept.iter().all(|&(_, other)| {
+            let synodic = 2.0 * std::f64::consts::PI / (omega - other).abs();
+            length >= rayleigh * synodic
+        });
+        if separable {
+            kept.push((name, omega));
+        }
+    }
+    kept.into_iter().map(|(name, _)| name).collect()
 }
 
 /// A fitted or inferred reference constant.
@@ -92,6 +162,40 @@ impl ReferenceFit {
     /// The constant of constituent `name`.
     pub fn get(&self, name: &str) -> Option<&ReferenceConstant> {
         self.constants.iter().find(|c| c.name == name)
+    }
+
+    /// The tidal prediction `Z₀ + Σⱼ fⱼ Hⱼ cos(ωⱼ (t − t₀) + V₀ⱼ + uⱼ − Gⱼ)`
+    /// at `times_unix` (fitted and inferred constants), with `V₀` at the
+    /// first time and `f`, `u` at the middle of the span: the fit's own
+    /// convention, so any record is predicted as it would be fitted.
+    pub fn predict(&self, times_unix: &[f64]) -> Vec<f64> {
+        let (Some(&t0), Some(&t1)) = (times_unix.first(), times_unix.last()) else {
+            return Vec::new();
+        };
+        let clock = ModelClock::new(t0);
+        let terms: Vec<(f64, f64, f64)> = self
+            .constants
+            .iter()
+            .filter_map(|c| {
+                let omega = 2.0 * std::f64::consts::PI / constituent_period(c.name)?;
+                let n = clock.nodal_correction(c.name, 0.5 * (t1 - t0))?;
+                Some((
+                    omega,
+                    n.f * c.amplitude,
+                    n.phase_offset_rad() - c.lag_deg.to_radians(),
+                ))
+            })
+            .collect();
+        times_unix
+            .iter()
+            .map(|&t| {
+                self.mean
+                    + terms
+                        .iter()
+                        .map(|&(omega, amp, phase)| amp * (omega * (t - t0) + phase).cos())
+                        .sum::<f64>()
+            })
+            .collect()
     }
 }
 
@@ -298,6 +402,58 @@ mod tests {
             );
         }
         assert!(fit.get("P1").unwrap().inferred);
+
+        // The prediction reproduces the record, inferred constituents included
+        let predicted = fit.predict(&times);
+        for (p, v) in predicted.iter().zip(&values) {
+            assert!((p - v).abs() < 1e-8, "{p} vs {v}");
+        }
+    }
+
+    /// Two weeks resolve M2/S2 and K1/O1 but not N2 (27.6 d) or P1 (182 d);
+    /// a month adds N2 and Q1; a year everything.
+    #[test]
+    fn resolvable_constituents_follow_the_rayleigh_criterion() {
+        let names = [
+            "M2", "S2", "K1", "O1", "N2", "Q1", "P1", "K2", "M4", "MS4", "MN4",
+        ];
+        let day = 86_400.0;
+        assert_eq!(
+            resolvable_constituents(&names, 15.0 * day, 1.0),
+            ["M2", "S2", "K1", "O1", "M4", "MS4"]
+        );
+        assert_eq!(
+            resolvable_constituents(&names, 30.0 * day, 1.0),
+            ["M2", "S2", "K1", "O1", "N2", "Q1", "M4", "MS4", "MN4"]
+        );
+        assert_eq!(resolvable_constituents(&names, 366.0 * day, 1.0), names);
+        // Stricter factor drops the pairs that barely separate
+        assert_eq!(
+            resolvable_constituents(&names, 30.0 * day, 1.5),
+            ["M2", "S2", "K1", "O1", "M4", "MS4"]
+        );
+    }
+
+    /// An inference from a reference fit carries the reference's ratio and
+    /// lag difference.
+    #[test]
+    fn inference_from_reference_fit() {
+        let constant = |name, amplitude, lag_deg| ReferenceConstant {
+            name,
+            amplitude,
+            lag_deg,
+            inferred: false,
+        };
+        let reference = ReferenceFit {
+            mean: 0.0,
+            constants: vec![constant("M2", 0.8, 300.0), constant("N2", 0.16, 280.0)],
+            r_squared: 1.0,
+            residual_rms: 0.0,
+        };
+        let inf = Inference::from_reference("N2", "M2", &reference).unwrap();
+        assert!((inf.amplitude_ratio - 0.2).abs() < 1e-12);
+        assert!((inf.lag_offset_deg + 20.0).abs() < 1e-12);
+        assert!(Inference::from_reference("Q1", "O1", &reference).is_none());
     }
 
     /// K1 and P1 cannot be fitted independently from a month.

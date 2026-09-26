@@ -66,7 +66,9 @@ pub use harmonic::{ConstituentResult, HarmonicAnalysis, HarmonicResult};
 pub use metrics::{
     ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary, compare_harmonics,
 };
-pub use reference_fit::{Inference, ReferenceConstant, ReferenceFit, fit_reference_constants};
+pub use reference_fit::{
+    Inference, ReferenceConstant, ReferenceFit, fit_reference_constants, resolvable_constituents,
+};
 pub use stability::{StabilityMonitor, StabilityStatus, StabilityThresholds, StabilityWarning};
 pub use tide_gauge::{
     ModelExtractor, PrecomputedExtractor, StationValidationResult, TideGaugeStation,
