@@ -156,24 +156,7 @@ where
             self.physics.update_density(state);
 
             // One barotropic pass and one 3D SSP-RK3 step
-            self.integrator.step(
-                state,
-                &self.physics.sigma,
-                &self.physics.bathymetry,
-                dt,
-                t,
-                &self.physics.forcing,
-                &self.physics.mixing,
-                &self.physics.swe_physics,
-                |s, t_loc, out| self.physics.compute_rhs_3d_into(s, t_loc, out),
-                // Limit tracers and refresh the density at every stage, so the
-                // baroclinic pressure gradient of the next stage is current
-                |s| {
-                    if !self.physics.apply_tracer_limiters(s).changed() {
-                        self.physics.update_density(s);
-                    }
-                },
-            );
+            self.integrator.step(state, &self.physics, dt, t);
 
             t += dt;
             n_steps += 1;
@@ -214,8 +197,8 @@ mod tests {
     use super::*;
     use crate::boundary::Reflective2D;
     use crate::equations::ShallowWater2D;
-    use crate::mesh::Mesh2D;
     use crate::mesh::data::Bathymetry2D;
+    use crate::mesh::{Mesh2D, Mesh2DBuilder};
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::physics::vertical_mixing::{ConstantMixing, Forcing};
     use crate::physics::{Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D};
@@ -229,8 +212,52 @@ mod tests {
     use std::sync::Arc;
 
     const G: f64 = 9.81;
+    const RHO0: f64 = 1025.0;
 
     type Physics = Hydrostatic3D<LinearEOS, ConstantMixing, Reflective2D>;
+
+    fn no_stress() -> Forcing {
+        Forcing {
+            surface_stress: [0.0, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        }
+    }
+
+    /// Three uniform σ-levels, Coriolis `f`, constant viscosity.
+    #[allow(clippy::too_many_arguments)]
+    fn hydrostatic(
+        mesh: &Arc<Mesh2D>,
+        ops: &Arc<DGOperators2D>,
+        geom: &Arc<GeometricFactors2D>,
+        bathymetry: &Arc<Bathymetry2D>,
+        swe: SWEPhysics2D<Reflective2D>,
+        forcing: Forcing,
+        viscosity: f64,
+        f: f64,
+    ) -> Physics {
+        Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(SigmaGrid::new(3, UniformStretching)),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(f)),
+            // Density independent of T and S: the 3D tracers are not yet
+            // constancy-preserving (TODO P4.2), so under the tide T and S
+            // drift with η and would feed a spurious baroclinic PGF into G.
+            LinearEOS {
+                alpha: 0.0,
+                beta: 0.0,
+                ..LinearEOS::default()
+            },
+            ConstantMixing::new(viscosity, viscosity),
+            swe,
+            forcing,
+            G,
+            RHO0,
+        )
+    }
 
     /// Closed basin `L × width`, 10 m deep, one element across, with the
     /// fundamental seiche `η = A cos(πx/L)` at rest. Period `T = 2L/√(gH)`.
@@ -282,30 +309,19 @@ mod tests {
         }
 
         fn hydrostatic(&self) -> Physics {
-            Hydrostatic3D::new(
-                self.mesh.clone(),
-                self.ops.clone(),
-                self.geom.clone(),
-                Arc::new(SigmaGrid::new(3, UniformStretching)),
-                self.bathymetry.clone(),
-                Arc::new(CoriolisSource2D::f_plane(0.0)),
-                // Density independent of T and S: the 3D tracers are not yet
-                // constancy-preserving (TODO P4.2), so under the tide T and S
-                // drift with η and would feed a spurious baroclinic PGF into G.
-                LinearEOS {
-                    alpha: 0.0,
-                    beta: 0.0,
-                    ..LinearEOS::default()
-                },
-                ConstantMixing::new(1e-4, 1e-4),
+            self.hydrostatic_forced(no_stress(), 1e-4)
+        }
+
+        fn hydrostatic_forced(&self, forcing: Forcing, viscosity: f64) -> Physics {
+            hydrostatic(
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                &self.bathymetry,
                 self.swe(),
-                Forcing {
-                    surface_stress: [0.0, 0.0],
-                    bottom_stress: [0.0, 0.0],
-                    surface_buoyancy_flux: 0.0,
-                },
-                G,
-                1025.0,
+                forcing,
+                viscosity,
+                0.0,
             )
         }
 
@@ -478,6 +494,173 @@ mod tests {
             (volume - volume0).abs() / (seiche.depth * area) < 1e-11,
             "volume drift {:.3e} m³",
             volume - volume0
+        );
+    }
+
+    /// TODO P4.1 gate: without vertical shear or stratification the mode-split
+    /// model is the 2D model. A nonlinear seiche (η/H = 0.05) must match the
+    /// pure 2D run over two periods: G must not count the mean-flow advection
+    /// a second time.
+    #[test]
+    fn unsheared_flow_matches_the_2d_model() {
+        let mut seiche = Seiche::new(10, 2, 10.0);
+        seiche.amplitude = 0.5;
+        let period = seiche.period();
+        let t_end = 2.0 * period;
+        let dt = period / 50.0;
+
+        let mut q = seiche.state_2d();
+        let result = Simulation::new(seiche.swe(), SSPRK3)
+            .with_cfl(0.5)
+            .run(&mut q, 0.0, t_end);
+        assert!(result.success, "2D reference failed: {:?}", result.error);
+
+        let physics = seiche.hydrostatic();
+        let mut state = seiche.state_3d(&physics);
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+            .with_cfl(10.0)
+            .with_dt_max(dt);
+        let result = sim.run(&mut state, 0.0, t_end);
+        assert!(result.success, "mode-split run failed: {:?}", result.error);
+
+        let max_diff = q.data[SWE_VAR_H]
+            .iter()
+            .zip(&state.eta.data)
+            .map(|(h, eta)| (h - seiche.depth - eta).abs())
+            .fold(0.0_f64, f64::max);
+        // 1.8e-3 of the amplitude at 50 steps per period, falling with dt (the
+        // filter acting on the harmonics of the steepening wave); PR 1's G,
+        // which counted the mean-flow advection twice: 0.14.
+        assert!(
+            max_diff < 4e-3 * seiche.amplitude,
+            "η differs from the 2D model by {max_diff:.3e} m ({:.2e} of the amplitude)",
+            max_diff / seiche.amplitude
+        );
+    }
+
+    /// TODO P4.1 gate: the wind stress reaches the depth mean. In a closed
+    /// basin the steady surface slope is `∂η/∂x = τ/(ρ₀ g D)`. Starting from
+    /// rest, the basin seiches about the setup, so η is averaged over whole
+    /// seiche periods (every basin mode's period divides the fundamental one).
+    /// Before, the 3D stress never reached the barotropic mode: no setup.
+    #[test]
+    fn wind_setup_balances_the_surface_stress() {
+        let mut seiche = Seiche::new(10, 2, 10.0);
+        seiche.amplitude = 0.0;
+        let period = seiche.period();
+        let tau = 0.02;
+        let forcing = Forcing {
+            surface_stress: [tau, 0.0],
+            ..no_stress()
+        };
+        // Viscous enough that the wind-driven shear, and with it the momentum
+        // dispersion −∇·⟨u′u′⟩ at the end walls, stays small
+        let physics = seiche.hydrostatic_forced(forcing, 0.05);
+        let mut state = seiche.state_3d(&physics);
+
+        let dt = period / 50.0;
+        let (t_avg0, t_avg1) = (2.0 * period, 6.0 * period);
+        let mut eta_sum = vec![0.0; state.eta.data.len()];
+        let mut weight = 0.0;
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+            .with_cfl(10.0)
+            .with_dt_max(dt);
+        let result = sim.run_with_callback(&mut state, 0.0, t_avg1, |s, t| {
+            if t > t_avg0 + 0.5 * dt {
+                for (sum, eta) in eta_sum.iter_mut().zip(&s.eta.data) {
+                    *sum += eta;
+                }
+                weight += 1.0;
+            }
+        });
+        assert!(result.success, "wind run failed: {:?}", result.error);
+
+        // Least-squares slope of the mean η against x
+        let xs: Vec<f64> = (0..seiche.mesh.n_elements)
+            .flat_map(|k| {
+                let mesh = &seiche.mesh;
+                let ops = &seiche.ops;
+                (0..ops.n_nodes).map(move |i| {
+                    mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
+                        [0]
+                })
+            })
+            .collect();
+        let n = xs.len() as f64;
+        let x_mean = xs.iter().sum::<f64>() / n;
+        let eta_mean: Vec<f64> = eta_sum.iter().map(|e| e / weight).collect();
+        let e_mean = eta_mean.iter().sum::<f64>() / n;
+        let slope = xs
+            .iter()
+            .zip(&eta_mean)
+            .map(|(x, e)| (x - x_mean) * (e - e_mean))
+            .sum::<f64>()
+            / xs.iter().map(|x| (x - x_mean).powi(2)).sum::<f64>();
+
+        let expected = tau / (RHO0 * G * seiche.depth);
+        // Measured 1.0001 × the expected slope; 0 without the stress in G
+        assert!(
+            (slope - expected).abs() < 5e-3 * expected,
+            "wind setup slope {slope:.4e} vs τ/(ρ₀gD) = {expected:.4e}"
+        );
+    }
+
+    /// TODO P4.1 gate: wind over a rotating, horizontally uniform ocean. The
+    /// depth-integrated transport obeys `dU/dt = fV + τ/ρ₀`, `dV/dt = −fU`:
+    /// from rest `U = (τ/ρ₀f) sin ft`, `V = −(τ/ρ₀f)(1 − cos ft)`, whose
+    /// average is the Ekman transport `τ/(ρ₀f)` to the right of the wind. The
+    /// 2D module carries the Coriolis force of the mean flow and G the stress;
+    /// before, the stress never reached the depth mean.
+    #[test]
+    fn wind_drives_the_ekman_inertial_transport() {
+        let (f, tau, depth) = (1.2e-4, 0.1, 50.0);
+        let mesh = Arc::new(
+            Mesh2DBuilder::new(0.0, 40e3, 0.0, 40e3)
+                .with_resolution(4, 4)
+                .fully_periodic()
+                .build(),
+        );
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_source(CoriolisSource2D::f_plane(f))
+        .build();
+        let forcing = Forcing {
+            surface_stress: [tau, 0.0],
+            ..no_stress()
+        };
+        let physics = hydrostatic(&mesh, &ops, &geom, &bathymetry, swe, forcing, 0.01, f);
+        let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, 3);
+        physics.update_density(&mut state);
+
+        let inertial = 2.0 * std::f64::consts::PI / f;
+        let scale = tau / (RHO0 * f);
+        let mut max_err: f64 = 0.0;
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new().with_min_substeps(20))
+            .with_cfl(10.0)
+            .with_dt_max(600.0);
+        let result = sim.run_with_callback(&mut state, 0.0, 1.5 * inertial, |s, t| {
+            let (u, v) = ((f * t).sin(), -(1.0 - (f * t).cos()));
+            for idx in 0..s.eta.data.len() {
+                let d = depth + s.eta.data[idx];
+                max_err = max_err
+                    .max((d * s.ubar.data[idx] / scale - u).abs())
+                    .max((d * s.vbar.data[idx] / scale - v).abs());
+            }
+        });
+        assert!(result.success, "Ekman run failed: {:?}", result.error);
+        // Measured 3.9e-4; 2.0 without the stress in G
+        assert!(
+            max_err < 1e-3,
+            "transport off the inertial-Ekman solution by {max_err:.2e} of τ/(ρ₀f)"
         );
     }
 }

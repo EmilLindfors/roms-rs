@@ -17,6 +17,10 @@ use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
 /// Apply vertical mixing and diffusion to the 3D state.
+///
+/// The surface and bottom stresses enter as the momentum fluxes `τ/ρ₀` at the
+/// column ends, so over `dt` the depth-integrated velocity of every column
+/// changes by `dt·(τ_s − τ_b)/ρ₀`.
 pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     state: &mut Solution3D,
     sigma: &SigmaGrid,
@@ -24,6 +28,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     dt: f64,
     mixing: &M,
     forcing: &Forcing,
+    rho0: f64,
 ) {
     let n_levels = state.n_levels;
     let mut a = vec![0.0; n_levels];
@@ -85,8 +90,8 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 &av,
                 &dz,
                 dt,
-                forcing.surface_stress[0] / 1025.0, // kinematic
-                forcing.bottom_stress[0] / 1025.0,
+                forcing.surface_stress[0] / rho0, // kinematic
+                forcing.bottom_stress[0] / rho0,
                 &mut a,
                 &mut b,
                 &mut c,
@@ -102,8 +107,8 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 &av,
                 &dz,
                 dt,
-                forcing.surface_stress[1] / 1025.0,
-                forcing.bottom_stress[1] / 1025.0,
+                forcing.surface_stress[1] / rho0,
+                forcing.bottom_stress[1] / rho0,
                 &mut a,
                 &mut b,
                 &mut c,
@@ -352,7 +357,15 @@ mod tests {
         let run = |bed_elevation: f64| {
             let mut state = Solution3D::new(1, 1, n_levels);
             let bathymetry = Bathymetry2D::constant(1, 1, bed_elevation);
-            apply_vertical_diffusion(&mut state, &sigma, &bathymetry, dt, &mixing, &forcing);
+            apply_vertical_diffusion(
+                &mut state,
+                &sigma,
+                &bathymetry,
+                dt,
+                &mixing,
+                &forcing,
+                1025.0,
+            );
             state.u_column(ElementIndex::new(0), 0).to_vec()
         };
 
@@ -369,6 +382,53 @@ mod tests {
             max_diff > 1e-6,
             "50 m and 500 m columns gave identical velocity profiles \
              (max diff {max_diff:.3e}); depth is likely still hardcoded"
+        );
+    }
+
+    /// The stresses are momentum fluxes at the column ends: one implicit step
+    /// changes the depth-integrated velocity by exactly `dt·(τ_s − τ_b)/ρ₀`,
+    /// on a stretched grid and with any viscosity.
+    #[test]
+    fn column_momentum_changes_by_the_stress_impulse() {
+        use crate::mesh::data::Bathymetry2D;
+        use crate::types::ElementIndex;
+        use crate::vertical::{SigmaGrid, SongHaidvogelStretching};
+
+        let sigma = SigmaGrid::new(
+            12,
+            SongHaidvogelStretching {
+                theta_s: 5.0,
+                theta_b: 0.4,
+                hc: 10.0,
+            },
+        );
+        let mixing = ConstantMixing::new(0.02, 0.01);
+        let forcing = Forcing {
+            surface_stress: [0.12, -0.05],
+            bottom_stress: [0.03, 0.01],
+            surface_buoyancy_flux: 0.0,
+        };
+        let (dt, rho0, depth) = (300.0, 1027.0, 40.0);
+
+        let mut state = Solution3D::new(1, 1, 12);
+        let bathymetry = Bathymetry2D::constant(1, 1, -depth);
+        let mut dz = vec![0.0; 12];
+        sigma.layer_thicknesses_into(0.0, depth, &mut dz);
+        let transport = |col: &[f64]| -> f64 { col.iter().zip(&dz).map(|(u, h)| u * h).sum() };
+        apply_vertical_diffusion(&mut state, &sigma, &bathymetry, dt, &mixing, &forcing, rho0);
+
+        let el = ElementIndex::new(0);
+        let du = transport(state.u_column(el, 0));
+        let dv = transport(state.v_column(el, 0));
+        let expect_u = dt * (0.12 - 0.03) / rho0;
+        let expect_v = dt * (-0.05 - 0.01) / rho0;
+        assert!(
+            (du - expect_u).abs() < 1e-12 * expect_u.abs(),
+            "{du} vs {expect_u}"
+        );
+        assert!(
+            (dv - expect_v).abs() < 1e-12 * expect_v.abs(),
+            "{dv} vs {expect_v}"
         );
     }
 }

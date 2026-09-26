@@ -2,6 +2,31 @@
 //!
 //! Handles the full 3D primitive equations with hydrostatic approximation.
 //! Contains the 2D barotropic physics module as a sub-component.
+//!
+//! # Barotropic coupling
+//!
+//! Under mode splitting ([`crate::time::ModeSplitIntegrator`]) the 2D module
+//! owns the depth-mean flow: the barotropic pressure gradient (with the DG face
+//! coupling of `η`), advection of `ū`, Coriolis on `ū`, and any bottom friction
+//! on `ū`. Configure it with the same Coriolis parameter as the 3D model
+//! (`with_source(CoriolisSource2D::…)`), and without wind or friction sources
+//! that duplicate [`Forcing`]. The slow forcing it receives
+//! ([`ModeSplitPhysics::slow_forcing_into`]) is
+//!
+//! ```text
+//!     G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀
+//! ```
+//!
+//! `⟨R₃D(u)⟩` is the depth mean of the 3D momentum tendency (baroclinic PGF,
+//! advection, Coriolis). `R_adv+Cor(ū)` is the same horizontal advection and
+//! Coriolis operator applied to columns of uniform `ū`, the part the 2D module
+//! already has. What remains is the depth-mean baroclinic PGF and the momentum
+//! dispersion of the vertical shear, `−∇·⟨u′u′⟩`. For flow without shear, `G`
+//! reduces to the stresses exactly. Coriolis is pointwise and linear, so its
+//! share cancels exactly.
+//!
+//! The 3D PGF stays baroclinic-only: it has no face coupling of `η` (TODO
+//! P4.3), so the barotropic pressure gradient must come from the 2D module.
 
 use std::sync::{Arc, Mutex};
 
@@ -12,14 +37,20 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::SWEPhysics2D;
 use crate::physics::eos::EquationOfState;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
+use crate::physics::vertical_diffusion::apply_vertical_diffusion;
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::physics::vertical_velocity::compute_vertical_velocity;
+use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
-    ExtrapolationTracerBC3D, Rhs3DConfig, TracerBoundaryCondition3D, compute_rhs_3d,
+    ExtrapolationTracerBC3D, Rhs3DConfig, TracerBoundaryCondition3D, apply_coriolis_3d,
+    apply_horizontal_advection_3d, compute_rhs_3d,
 };
 use crate::solver::state::Solution3D;
+use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
 use crate::source::CoriolisSource2D;
+use crate::time::ModeSplitPhysics;
+use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
 /// Hydrostatic 3D Physics Module.
@@ -50,6 +81,9 @@ where
     pub salt_bc: Arc<dyn TracerBoundaryCondition3D>,
     pub tracer_limiter: TracerLimiter3DConfig,
     pub w_scratch: Mutex<Vec<f64>>,
+    /// One-level states for the mean-flow part of the slow forcing:
+    /// `(uniform ū columns, their advection + Coriolis tendency)`.
+    mean_flow_scratch: Mutex<Option<(Solution3D, Solution3D)>>,
 }
 
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
@@ -92,6 +126,7 @@ where
             salt_bc: Arc::new(ExtrapolationTracerBC3D),
             tracer_limiter: TracerLimiter3DConfig::none(),
             w_scratch: Mutex::new(vec![0.0; n_w]),
+            mean_flow_scratch: Mutex::new(None),
         }
     }
 
@@ -301,5 +336,94 @@ where
 
         // Could also apply equation of state update here to ensure rho is fresh
         // self.eos.update_density(state);
+    }
+}
+
+impl<EOS, MIX, BC> ModeSplitPhysics for Hydrostatic3D<EOS, MIX, BC>
+where
+    EOS: EquationOfState,
+    MIX: VerticalMixing,
+    SWEPhysics2D<BC>: PhysicsModule<SWESolution2D>,
+    BC: Clone + Send + Sync + SWEBoundaryCondition2D,
+{
+    type Barotropic = SWEPhysics2D<BC>;
+
+    fn barotropic(&self) -> &SWEPhysics2D<BC> {
+        &self.swe_physics
+    }
+
+    fn sigma(&self) -> &SigmaGrid {
+        &self.sigma
+    }
+
+    fn bathymetry(&self) -> &Bathymetry2D {
+        &self.bathymetry
+    }
+
+    fn rhs_3d_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {
+        self.compute_rhs_3d_into(state, t, out);
+    }
+
+    /// `G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀` (see the module docs).
+    fn slow_forcing_into(
+        &self,
+        state: &Solution3D,
+        rhs: &Solution3D,
+        _t: f64,
+        g: &mut SWESolution2D,
+    ) {
+        let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
+
+        // Advection + Coriolis of uniform ū columns, on one level
+        let mut scratch = self
+            .mean_flow_scratch
+            .lock()
+            .expect("Failed to lock mean_flow_scratch");
+        let (bar, bar_rhs) =
+            scratch.get_or_insert_with(|| (Solution3D::new(ne, nn, 1), Solution3D::new(ne, nn, 1)));
+        bar.u.copy_from_slice(&state.ubar.data);
+        bar.v.copy_from_slice(&state.vbar.data);
+        bar_rhs.u.fill(0.0);
+        bar_rhs.v.fill(0.0);
+        apply_horizontal_advection_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.geom);
+        apply_coriolis_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.coriolis);
+
+        let [tau_sx, tau_sy] = self.forcing.surface_stress;
+        let [tau_bx, tau_by] = self.forcing.bottom_stress;
+        let stress_x = (tau_sx - tau_bx) / self.rho0;
+        let stress_y = (tau_sy - tau_by) / self.rho0;
+
+        g.data[SWE_VAR_H].fill(0.0);
+        for k in 0..ne {
+            let bed = self.bathymetry.element(ElementIndex::new(k));
+            for (i, &b) in bed.iter().enumerate() {
+                let idx = k * nn + i;
+                let columns = idx * nl..(idx + 1) * nl;
+                let depth = state.eta.data[idx] - b;
+                let mean_u = self.sigma.depth_average(&rhs.u[columns.clone()]);
+                let mean_v = self.sigma.depth_average(&rhs.v[columns]);
+                g.data[SWE_VAR_HU][idx] = depth * (mean_u - bar_rhs.u[idx]) + stress_x;
+                g.data[SWE_VAR_HV][idx] = depth * (mean_v - bar_rhs.v[idx]) + stress_y;
+            }
+        }
+    }
+
+    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64) {
+        apply_vertical_diffusion(
+            state,
+            &self.sigma,
+            &self.bathymetry,
+            dt,
+            &self.mixing,
+            &self.forcing,
+            self.rho0,
+        );
+    }
+
+    /// Tracer limiters, then the density of the limited tracers.
+    fn post_stage(&self, state: &mut Solution3D) {
+        if !self.apply_tracer_limiters(state).changed() {
+            self.update_density(state);
+        }
     }
 }

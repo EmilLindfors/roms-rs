@@ -333,11 +333,12 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 ### P4.1 Mode splitting
 
 **Before PR 1:** SSP-RK3 wrapped a Forward Euler barotropic subcycle that ran in every stage. It was first-order, M2 lost 3–14 % per period, and it cost 6·n_bt 2D RHS per step (Shchepetkin & McWilliams 2005; `REVIEW.md` §2).
-**After PR 1:** one filtered pass per step, 0.02–0.1 % barotropic amplitude loss per period, ≈ 3.9·n_bt 2D RHS per step. The slow coupling stays first order (G frozen at tⁿ), and G still double-counts advection/Coriolis, until PR 2.
+**After PR 1:** one filtered pass per step, 0.02–0.1 % barotropic amplitude loss per period, ≈ 3.9·n_bt 2D RHS per step.
+**After PR 2:** G holds only what the 2D module cannot compute: the baroclinic PGF, the shear dispersion and the 3D stresses. Its step average is AB3-extrapolated, and the slow coupling is second order.
 
 **Target step n → n+1 (plan of 2026-09-26):**
 1. One 3D RHS at tⁿ, after refreshing density. It is reused as the first 3D RK stage.
-2. Slow forcing, the `rufrc` construction: G = ∫R₃D dz + (τ_s − τ_b)/ρ₀ − R₂D(q̄ⁿ). Extrapolate it to n+½ with AB3 from the stored G of previous steps (lower order on the first two steps).
+2. Slow forcing G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀ (see the design decisions). Its step average comes from Gⁿ, Gⁿ⁻¹, Gⁿ⁻² by AB3 with variable steps (lower order on the first two steps).
 3. One barotropic pass over [t, ≈ t + 1.5·dt] with n_bt = ⌈dt/dt_bt,max⌉ from the 2D CFL. Accumulate:
    - the primary-weighted η̄ and transport (DU_avg1), which become the new barotropic state;
    - the secondary-weighted face-flux transport (DU_avg2), for P4.2.
@@ -350,10 +351,14 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
   - The Zhang–Shu positivity guarantee that wet/dry relies on needs an SSP scheme.
   - Cost is about 4.5·n_bt RHS per step (vs 6·n_bt today) at the DG CFL. It reuses `SWEPhysics2D` (wet/dry, limiter, `compute_rhs_into`).
   - FB can come later as an optimisation once the coupling is verified.
-- **The 3D RHS carries the full PGF** (`rho_ref = 0`, not ρ₀).
-  - With the `rufrc` G, subtracting R₂D(q̄ⁿ) removes the −g∇η double count that P0.6 avoided with the baroclinic-only PGF. It also removes the advection and Coriolis double counts, with no term-by-term splitting of the DG flux.
-  - Rule: every term the 2D module computes (friction, wind, Coriolis) must also appear in ∫R₃D + stresses, and vice versa.
-  - Risk: the 3D surface gradient does not lift η/pressure jumps at element faces (P4.3), so ∫R₃D − R₂D(q̄) can carry a spurious slow forcing. Probe it on Frøya bathymetry, at rest and in a seiche, before relying on it.
+- **G is Thetis-style, not the ROMS `rufrc`** (revised 2026-09-26, PR 2). The plan was the full PGF in the 3D RHS with G = ∫R₃D dz − R₂D(q̄ⁿ) + stresses. It was dropped as structurally unsound here:
+  - In that construction each step's fast pass adds only R₂D(q) − R₂D(qⁿ). The bulk of the pressure force on the slow barotropic mode (tides, seiches) would come from ∫R₃D.
+  - The 3D PGF (`compute_pressure_gradient`) differentiates η within each element and never lifts the jumps at element faces (P4.3). So the slow mode would lose the DG pressure coupling between elements.
+  - Instead, the 2D module owns the depth-mean flow: −g∇η with its DG face coupling, advection of ū, Coriolis on ū, and its friction on ū.
+  - G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀: the same 3D advection + Coriolis operator applied to columns of uniform ū removes the mean-flow part. What is left is the baroclinic PGF, the shear dispersion −∇·⟨u′u′⟩ and the stresses. For unsheared flow G is exactly the stress.
+  - The 3D PGF stays baroclinic-only (P0.6).
+  - Rule: configure the 2D module with the same Coriolis parameter, and without wind/friction sources that duplicate `Forcing` (`Hydrostatic3D` module docs).
+  - Revisit the ROMS form once P4.3 lifts the 3D pressure/η jumps at faces.
 
 **PR 1: one barotropic pass** — done on `feat/p4-1-barotropic-pass`
 - [x] The fast pass steps transport (h, hu, hv) in a `SWESolution2D` through `SWEPhysics2D`: positivity, limiter, wet/dry and implicit damping at every stage. The unguarded 1/h (`Hydrostatic3D::compute_rhs_2d`) is gone.
@@ -368,20 +373,26 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [x] Gate: `seiche_amplitude_is_kept_by_the_mode_split`. It loses 0.035 % per period more than the 2D model at n_bt = 23 (was ≈ 23 % per period), and conserves volume to round-off.
   - The 100-period form was cut to 10 periods: the loss per period is constant, and the test must stay cheap in debug CI (16 s).
 
-**PR 2: consistent slow forcing**
-- [ ] G-term = ∫R₃D dz − R₂D(q̄ⁿ) (`rufrc`) with AB3 extrapolation. Today it double-counts advection and Coriolis.
-- [ ] Surface and bottom stress into G, with τ_b from the bottom-layer velocity. Today the 3D `Forcing` never reaches the depth mean, so there is no wind setup or Ekman transport.
-- [ ] Full PGF in the 3D RHS (see the design decisions).
+**PR 2: consistent slow forcing** — done on `feat/p4-1-slow-forcing`
+- [x] G without the double count: D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) instead of D·⟨R₃D(u)⟩, with AB3 step averages (`step_average_weights`, variable steps; the history restarts when a run does not continue).
+  - In a nonlinear unsheared seiche the old G drifted from the 2D model by 0.14 of the amplitude in two periods; the new G drifts by 1.8e-3, falling with dt.
+- [x] Surface and bottom stress into G, as (τ_s − τ_b)/ρ₀ from `Forcing`. The vertical diffusion now also divides by the model's ρ₀, not 1025, so G and the columns agree.
+  - τ_b is still the user's constant; a quadratic drag from the bottom-layer velocity, consistent with the 2D friction, is P4.4.
+- [x] ~~Full PGF in the 3D RHS~~: dropped, see the design decisions.
+- [x] `ModeSplitPhysics` trait: the splitter's view of the 3D model (2D module, 3D RHS, slow forcing, implicit vertical terms, stage hook). `Hydrostatic3D` implements it; `ModeSplitIntegrator::step(state, physics, dt, t)`.
 
 **PR 3: transport for 3D continuity**
 - [ ] Accumulate the secondary-weighted barotropic transport (DU_avg2) through a hook in the 2D kernel. It covers the volume transport at the nodes and the numerical face fluxes, with RK stage weights inside each sub-step, so that η̄ⁿ⁺¹ = ηⁿ − dt·div_DG(DU_avg2) exactly.
   - Open: the wet/dry positivity limiter changes nodal h without a matching flux.
 
-**Gate tests** (none exist today; the P0.6 seiche checks only the period, to 15 %):
-- [ ] 2D–3D equivalence: unstratified, no vertical shear, nonlinear flow. The mode-split run must reproduce the pure 2D model to discretisation error. This catches any advection/Coriolis double count directly.
-- [ ] Seiche over 100 periods: amplitude/energy loss < 1 % (today ≈ 23 % per period).
-- [ ] Temporal convergence of the coupled scheme, order ≥ 2.
-- [ ] Wind setup τ/(ρgD); Ekman transport τ/(ρ₀f).
+**Gate tests:**
+- [x] 2D–3D equivalence: `unsheared_flow_matches_the_2d_model`. A nonlinear seiche (η/H = 0.05) over two periods: 1.8e-3 of the amplitude at 50 steps per period (old G: 0.14).
+- [x] Seiche amplitude: `seiche_amplitude_is_kept_by_the_mode_split`. The filtered splitting loses 0.035 % per period more than the 2D model, measured over 10 periods (was ≈ 23 % per period).
+  - The "< 1 % over 100 periods" target was too strict for any filtered-reset splitting. The loss is ≈ μ₂ω²/2 per step, first order in Δt with a constant ≈ 1e-3 of a plain average's. For M2 at Δt = 300 s it is ≈ 0.008 % per period.
+- [x] Temporal convergence: `slow_forcing_is_integrated_to_second_order`. The AB3 steps are third order; the two starting steps set second order globally (measured ratios 4.5 → 4.1). The filter's μ₂ term is separate: see the previous item.
+- [x] Wind setup: `wind_setup_balances_the_surface_stress`, slope 1.0001 × τ/(ρ₀gD).
+- [x] Ekman: `wind_drives_the_ekman_inertial_transport`, 3.9e-4 of τ/(ρ₀f) from the inertial-Ekman solution.
+- [x] Column momentum after one implicit diffusion step = Δt·(τ_s − τ_b)/ρ₀: `column_momentum_changes_by_the_stress_impulse`.
 
 ### P4.2 Consistent continuity, tracers and momentum
 - [ ] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2; η advanced by the divergence of the same flux.
@@ -401,7 +412,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] GLS k-ε (NorKyst's closure) as a per-column solve reusing the tridiagonal solver (Umlauf & Burchard 2003; Warner et al. 2005). KPP as an alternative.
 - [ ] Convective adjustment (low-shear unstable columns currently get background mixing).
 - [ ] Implicit quadratic bottom drag with a log-layer Cd; consistent with 2D friction.
-- [ ] Surface heat flux Q_net/(ρ₀c_p) (currently fed a buoyancy flux); remove the hardcoded ρ₀ = 1025.
+- [ ] Surface heat flux Q_net/(ρ₀c_p) (currently fed a buoyancy flux). The momentum stresses use the model's ρ₀ since P4.1 PR 2; the heat flux still needs it.
 - [ ] Surface heat-flux budget (shortwave, longwave, sensible/latent) for multi-day SST evolution (formerly "P3.1 Surface Heat Flux Budget").
 
 ### P4.5 Remaining 3D physics and numerics
@@ -416,8 +427,8 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 ### P4.6 3D validation (before any NorKyst 3D comparison)
 - [ ] Stratified lake-at-rest: linear N² ≤ 1e-12; tanh pycnocline over a seamount (Beckmann & Haidvogel 1993).
 - [ ] Constant-T preservation under tide over a sloping bed; Hz·T inventory conservation.
-- [ ] Wind setup τ/(ρgD); Ekman transport τ/(ρ₀f); column momentum after one implicit diffusion step = Δt·τ/ρ₀.
-- [ ] Temporal convergence of the coupled scheme; 100-period barotropic energy decay.
+- [x] Wind setup τ/(ρgD); Ekman transport τ/(ρ₀f); column momentum after one implicit diffusion step = Δt·τ/ρ₀ (P4.1 gate tests).
+- [x] Temporal convergence of the coupled scheme; barotropic energy decay (P4.1 gate tests).
 - [ ] Lock exchange; mode-1 internal-wave speed; idealised fjord estuarine circulation (Sognefjord-like).
 - [ ] Comparison with NorKyst-800 3D fields.
 
@@ -534,7 +545,7 @@ Details are in `CHANGELOG.md` and git history. Caveats found on 2026-09-25 are n
 | 2D tidal cost vs ROMS (model estimate) | ~47× core-hours | ≤ 1× per unit accuracy (P3.2) |
 | Validated against observations | Mausund (Kartverket MSU), 15 days at 1 km: M2 1.03×, +5.4° (≈ +2.3° at 500 m); tidal-prediction RMSE 9.8 cm | 5+ tide gauges, ADCP |
 | Multi-day stability | One M2 cycle on Frøya (9,653 P2 elements, 11.4 min wall, 0 clips) | 30+ days, real domain |
-| 3D | Scaffolding; 2 blockers (tracer constancy P4.2, σ PGF P4.3); vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting: one filtered barotropic pass, 0.035 % seiche damping per period (P4.1 PR 1); slow coupling first-order until PR 2 | stratified lake-at-rest, constancy, lock exchange |
+| 3D | Scaffolding; 2 blockers (tracer constancy P4.2, σ PGF P4.3); vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting: one filtered barotropic pass (0.035 % seiche damping per period), second-order slow coupling, wind setup/Ekman to < 0.1 % (P4.1 PR 1–2; DU_avg2 is PR 3) | stratified lake-at-rest, constancy, lock exchange |
 | GPU | Non-functional (P0.11) | fixed or replaced (P2.7) |
 
 ---

@@ -89,6 +89,10 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **API (3D, breaking): `ModeSplitPhysics` (TODO P4.1, PR 2).**
+  - `ModeSplitIntegrator::step(state, physics, dt, t)` takes the 3D model as a `ModeSplitPhysics`: the 2D module, the 3D RHS, the slow forcing, the implicit vertical terms and the per-stage hook. `Hydrostatic3D` implements it. New: `step_average_weights`.
+  - `apply_vertical_diffusion` takes `rho0` and divides the surface and bottom stresses by it instead of a hardcoded 1025.
+  - `ModeSplitIntegrator::order()` is 2.
 - **API (3D, breaking): one barotropic pass per baroclinic step (TODO P4.1, PR 1).**
   - `ModeSplitIntegrator::new()` takes no arguments; `n_bt` follows from the 2D CFL every step (`with_barotropic_cfl`, default 0.5, capped by the 2D module's `max_cfl`; `with_min_substeps`, at least `MIN_BAROTROPIC_SUBSTEPS` = 4). `last_substeps()` reports the last step's `n_bt`.
   - `ModeSplitIntegrator::step` takes the 2D module (`&impl PhysicsModule<SWESolution2D>`) instead of an (η, ū, v̄) RHS closure, and a 3D RHS that writes into a buffer. It replaces `step` + `step_with_stage_hook`; the stage hook is always passed.
@@ -175,6 +179,16 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Mode-split slow forcing (3D, TODO P4.1, PR 2).**
+  - **Double counting.** `G` was the depth integral of the whole 3D momentum tendency, so the mean-flow advection and Coriolis the 2D module already computes were counted twice. A nonlinear unsheared seiche drifted from the pure 2D model by 0.14 of its amplitude in two periods.
+    - `G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀` now subtracts the same 3D operator applied to columns of uniform `ū`. The remainder is the baroclinic PGF and the momentum dispersion of the vertical shear.
+    - The drift is 1.8e-3 of the amplitude and falls with dt. Test: `unsheared_flow_matches_the_2d_model`.
+  - **Stresses.** The surface and bottom stresses never reached the depth mean: the reconciliation reset every column to the 2D `ū`, which had no stress. There was no wind setup and no Ekman transport. Now they enter `G`.
+    - Wind setup matches τ/(ρ₀gD) to 1e-4 (`wind_setup_balances_the_surface_stress`).
+    - The inertial-Ekman transport matches the analytic solution to 3.9e-4 of τ/(ρ₀f) (`wind_drives_the_ekman_inertial_transport`).
+    - One implicit diffusion step changes the column momentum by exactly Δt·(τ_s − τ_b)/ρ₀ (`column_momentum_changes_by_the_stress_impulse`).
+  - **Time accuracy.** `G` was frozen at tⁿ (first order). The pass now uses its AB3 step average with variable steps: second order globally, third order after the two starting steps (`slow_forcing_is_integrated_to_second_order`).
+  - **Planned design dropped.** The TODO's plan, the full PGF in the 3D RHS with the ROMS `rufrc` G, was not implemented. The 3D PGF does not lift η jumps at element faces, so the slow barotropic mode would have lost its DG pressure coupling between elements.
 - **Mode splitting damped the barotropic mode (3D, TODO P4.1).**
   - SSP-RK3 wrapped a Forward Euler barotropic subcycle that ran in every stage, and advanced η/ū through the RK combination of the filtered stage maps. That is first order, and a seiche lost about 23 % of its amplitude per period (M2 3–14 %, `REVIEW.md` §2.1). It cost 6·n_bt 2D RHS per step.
   - Now one SSP-RK3 barotropic pass per step steps the transport (h, hu, hv) through `SWEPhysics2D`, with its limiter, wet/dry and implicit damping at every stage. The pass covers ≈ 1.3·dt and costs ≈ 3.9·n_bt RHS.
