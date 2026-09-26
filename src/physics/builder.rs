@@ -24,7 +24,7 @@ use crate::solver::{
     apply_implicit_damping_2d_parallel as implicit_damping,
     apply_wet_dry_correction_all_parallel as wet_dry_correction,
 };
-use crate::source::{BottomFriction2D, SourceTerm2D, SourceTerms2D};
+use crate::source::{BottomFriction2D, CageDrag2D, SourceTerm2D, SourceTerms2D};
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -41,7 +41,7 @@ use super::traits::{PhysicsModule, PhysicsModuleInfo};
 /// - Boundary conditions
 /// - Source terms
 /// - Limiters
-/// - Wetting/drying and point-implicit bottom friction
+/// - Wetting/drying, point-implicit bottom friction and net-cage drag
 ///
 /// # Wetting and drying
 ///
@@ -53,8 +53,9 @@ use super::traits::{PhysicsModule, PhysicsModuleInfo};
 /// - `max_cfl` reports `positivity_cfl_swe_2d(N)`, which `Simulation` enforces;
 /// - after every RK stage, depths are limited to h ≥ 0 and near-dry velocities
 ///   desingularized ([`crate::solver::apply_wet_dry_correction_all`]);
-/// - in every RK stage, bottom friction (`with_implicit_friction`)
-///   and the thin-layer relaxation are applied point-implicitly
+/// - in every RK stage, bottom friction (`with_implicit_friction`), net-cage
+///   drag (`with_cage_drag`) and the thin-layer relaxation are applied
+///   point-implicitly
 ///   ([`crate::solver::apply_implicit_damping_2d`]).
 ///
 /// Elements whose mean depth went negative anyway are emptied (creating mass)
@@ -93,6 +94,8 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     pub wet_dry: Option<WetDryConfig>,
     /// Bottom friction applied point-implicitly, if any
     pub friction: Option<Arc<dyn BottomFriction2D>>,
+    /// Net-cage drag applied point-implicitly, if any
+    pub cages: Option<Arc<CageDrag2D>>,
     /// Polynomial order
     pub order: usize,
     /// Elements emptied because their mean depth was negative
@@ -136,6 +139,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     fn damping(&self) -> ImplicitDamping2D<'_> {
         ImplicitDamping2D {
             friction: self.friction.as_deref(),
+            cages: self.cages.as_deref(),
             wet_dry: self.wet_dry.as_ref(),
             h_min: self.equation.h_min,
         }
@@ -226,7 +230,7 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
         }
     }
 
-    /// Point-implicit bottom friction and thin-layer relaxation.
+    /// Point-implicit bottom friction, cage drag and thin-layer relaxation.
     fn implicit_damping(&self, stage: &mut SWESolution2D, from: &SWESolution2D, dt: f64) {
         implicit_damping(stage, from, dt, &self.damping());
     }
@@ -313,6 +317,7 @@ pub struct SWEPhysics2DBuilder<BC: SWEBoundaryCondition2D> {
     formulation: Option<SWEFormulation2D>,
     wet_dry: Option<WetDryConfig>,
     friction: Option<Arc<dyn BottomFriction2D>>,
+    cages: Option<Arc<CageDrag2D>>,
     order: usize,
 }
 
@@ -340,6 +345,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             formulation: None,
             wet_dry: None,
             friction: None,
+            cages: None,
             order,
         }
     }
@@ -422,6 +428,17 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
         self
     }
 
+    /// Apply the drag of fish-farm net cages point-implicitly in every RK
+    /// stage, together with the bottom friction (see
+    /// [`crate::source::CageDrag2D`]).
+    ///
+    /// # Panics
+    /// At the first step, if `cages` was built for another mesh or order.
+    pub fn with_cage_drag(mut self, cages: CageDrag2D) -> Self {
+        self.cages = (!cages.is_empty()).then(|| Arc::new(cages));
+        self
+    }
+
     /// Build the physics module.
     ///
     /// # Panics
@@ -475,6 +492,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             formulation,
             wet_dry: self.wet_dry,
             friction: self.friction,
+            cages: self.cages,
             order: self.order,
             negative_depth_clips: AtomicUsize::new(0),
         }

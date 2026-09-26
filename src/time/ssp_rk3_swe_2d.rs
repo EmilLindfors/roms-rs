@@ -214,6 +214,7 @@ pub fn ssp_rk3_swe_2d_step_limited<F>(
 {
     let damping = ImplicitDamping2D {
         friction: None,
+        cages: None,
         wet_dry: config.wet_dry.as_ref(),
         h_min: Depth::new(config.h_min),
     };

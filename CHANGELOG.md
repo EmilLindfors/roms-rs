@@ -6,6 +6,17 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Drag of fish-farm net cages, 2D form (TODO F.1).** A net cage is a porous momentum sink, S = −½ C_d a |u| u per unit volume, integrated over the net depth: ∂(hu)/∂t = −½ C_d a min(d, h) |u| u.
+  - `NetCage` (footprint, net depth, C_d·a) with `CageFootprint::Circle`/`Polygon`; `NetCage::circular(center, radius, net_depth, solidity)` takes C_d from Løland (1991) at normal incidence (`loland_drag_coefficient`) and a = 4/(πR) (the current crosses the net twice).
+  - `CageDrag2D::new(mesh, ops, cages)` weights each cage onto the nodes it overlaps, by the area of the node's GLL subcell inside the footprint over w·J. Adaptive bisection on the footprint's signed distance computes that area, so Σ w J φ is the footprint area on any quadrilateral and the cage's total drag does not depend on where the cage sits in the mesh. Sparse and sorted by node.
+  - `SWEPhysics2DBuilder::with_cage_drag` applies it point-implicitly in every RK stage, in the same update as the bottom friction (`ImplicitDamping2D::cages`), so it never limits Δt or flips the momentum. **API:** `ImplicitDamping2D` has a new field `cages`.
+  - Gates (`tests/cage_drag_test.rs`):
+    - The footprint weights integrate to the cage area within 5e-5, for circles and polygons at P1–P4, at any offset and on distorted quadrilaterals.
+    - A body force balanced by a domain-wide cage reaches the analytic speed u² = 2Gh/(C_d a min(d, h)) within 1e-6, for nets shorter and longer than the water column.
+    - Decay of uniform flow converges at first order to u₀/(1 + k u₀ t).
+    - A porous band across a periodic channel: the loss of momentum flux plus pressure across the band equals the drag minus the forcing within 1e-3, and the total drag equals the total forcing within 1e-4.
+    - Mass is conserved, a lake at rest over a rough bed with cages holds to 1e-10, and the parallel damping is bit-identical to the serial one across chunk boundaries.
+
 - **Gmsh MSH 4.1 meshes (TODO P1.3; REVIEW.md §3.6).** Coastline-fitted all-quad meshes from Gmsh load into `Mesh2D`; `docs/gmsh-meshes.md` shows how to make them.
   - `read_gmsh_mesh` reads MSH 4.1 ASCII and binary (either byte order, parametric nodes) and MSH 2.2 ASCII; new `parse_gmsh_mesh(&[u8])`. The old reader accepted MSH 4 headers but parsed the body as 2.2, panicked on malformed element lines, and dropped triangles and unknown elements silently.
   - Node tags may be sparse; unused nodes are dropped. Clockwise quads are reordered counter-clockwise. Errors, with the Gmsh tags and coordinates in the message: unsupported element types (triangles, high order, 3D; with the Gmsh options for an all-quad mesh), degenerate or non-convex quads, edges shared by more than two elements, overlapping neighbours, undefined or duplicate nodes, line elements off the mesh, conflicting boundary tags, periodic and partitioned files, MSH 4.0 and binary MSH 2. Malformed or truncated files give a `ParseError` with the line, never a panic. Unknown sections are skipped.

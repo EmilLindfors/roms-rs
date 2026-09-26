@@ -381,6 +381,13 @@ impl AffineMetric {
     }
 }
 
+/// Jacobian determinant `x_r y_s − x_s y_r` of the bilinear map of the
+/// quadrilateral `verts` (counter-clockwise from `(r, s) = (−1, −1)`) at the
+/// reference point `(r, s)`.
+pub(crate) fn bilinear_jacobian(verts: &[[f64; 2]; 4], r: f64, s: f64) -> f64 {
+    BilinearMetric::at(verts, r, s).det
+}
+
 /// Derivatives of the bilinear map at a reference point.
 struct BilinearMetric {
     x_r: f64,

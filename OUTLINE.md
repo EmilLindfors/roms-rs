@@ -44,8 +44,8 @@ src/
 │  # ---- Equations & physics ----
 ├── equations/        # ConservationLaw trait; advection 1D/2D, SWE 1D/2D, UNESCO EOS
 ├── source/           # SourceTerm1D/2D traits; Coriolis, friction, wind, tidal
-│                     # potential, viscosity, bathymetry, sponge; well-balanced
-│                     # hydrostatic reconstruction
+│                     # potential, viscosity, bathymetry, sponge; net-cage drag
+│                     # (point-implicit); well-balanced hydrostatic reconstruction
 ├── boundary/         # CharacteristicOBC + external-state providers (still
 │                     # water, harmonic tide, tidal atlas, NorKyst parent,
 │                     # inverse barometer), reflective, clamped tidal,

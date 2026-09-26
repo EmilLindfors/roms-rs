@@ -12,6 +12,7 @@ mod mass;
 mod operators_2d;
 
 pub use differentiation::{differentiation_matrix, strong_differentiation_matrix};
+pub(crate) use geometric::bilinear_jacobian;
 pub use geometric::{AffineMetric, ElementGeometry, GeometricFactors2D};
 pub use lift::lift_matrix;
 pub use mass::{mass_matrix, mass_matrix_inv};

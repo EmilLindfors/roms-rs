@@ -31,8 +31,8 @@
 //!    and r = 0 for h ≥ h_dry, discretized as `hu ← hu / (1 + Δt r(h))`. It
 //!    replaces multiplying hu by a blending factor α(h) after every stage,
 //!    whose damping per unit time grew as Δt shrank and which erased currents
-//!    up to 10·h_min deep (REVIEW.md §1.7). Bottom friction laws are applied in
-//!    the same implicit update.
+//!    up to 10·h_min deep (REVIEW.md §1.7). Bottom friction laws and net-cage
+//!    drag (`CageDrag2D`) are applied in the same implicit update.
 //!
 //! Water at least h_dry deep is never touched by 2. or 3.
 //!
@@ -47,7 +47,7 @@ use crate::operators::GeometricFactors2D;
 use crate::solver::SWESolution2D;
 use crate::solver::limiters::{element_mass, element_mean, positivity_limit_element};
 use crate::solver::state::SWEState2D;
-use crate::source::BottomFriction2D;
+use crate::source::{BottomFriction2D, CageDrag2D, CageNode};
 use crate::types::Depth;
 
 /// Configuration for wetting/drying treatment.
@@ -256,12 +256,14 @@ pub fn apply_wet_dry_correction_all_parallel(
         .sum()
 }
 
-/// Stiff momentum damping applied point-implicitly: bottom friction and the
-/// wet/dry thin-layer relaxation.
+/// Stiff momentum damping applied point-implicitly: bottom friction, net-cage
+/// drag and the wet/dry thin-layer relaxation.
 #[derive(Clone, Copy)]
 pub struct ImplicitDamping2D<'a> {
     /// Bottom friction law, if any
     pub friction: Option<&'a dyn BottomFriction2D>,
+    /// Net-cage drag, if any
+    pub cages: Option<&'a CageDrag2D>,
     /// Wet/dry configuration (thin-layer relaxation and desingularization), if any
     pub wet_dry: Option<&'a WetDryConfig>,
     /// Desingularization depth for the friction velocity without `wet_dry`
@@ -271,28 +273,39 @@ pub struct ImplicitDamping2D<'a> {
 impl ImplicitDamping2D<'_> {
     /// Whether this applies any damping at all.
     pub fn is_active(&self) -> bool {
-        self.friction.is_some() || self.wet_dry.is_some()
+        self.friction.is_some() || self.wet_dry.is_some() || self.cages.is_some()
     }
 
     /// Damp the momentum of one node of a stage value with depth `h`, whose
-    /// RHS was evaluated at `from`.
+    /// RHS was evaluated at `from`; `cages` are the node's cage-drag entries.
     #[inline]
-    fn damp_node(&self, h: f64, hu: &mut f64, hv: &mut f64, from: SWEState2D, dt: f64) {
+    fn damp_node(
+        &self,
+        h: f64,
+        hu: &mut f64,
+        hv: &mut f64,
+        from: SWEState2D,
+        dt: f64,
+        cages: &[CageNode],
+    ) {
         if h <= 0.0 {
             *hu = 0.0;
             *hv = 0.0;
             return;
         }
         let mut rate = 0.0;
-        if let Some(friction) = self.friction {
-            // |u| frozen at the RHS input keeps friction balances exact
+        if self.friction.is_some() || !cages.is_empty() {
+            // |u| frozen at the RHS input keeps drag balances exact
             let (u, v) = match self.wet_dry {
                 Some(wd) => wd.desingularized_velocity(from.h, from.hu, from.hv),
                 None => from.velocity(self.h_min),
             };
             let speed = (u * u + v * v).sqrt();
             if speed > 0.0 {
-                rate += friction.damping_rate(h, speed);
+                if let Some(friction) = self.friction {
+                    rate += friction.damping_rate(h, speed);
+                }
+                rate += CageDrag2D::damping_rate(cages, h, speed);
             }
         }
         if let Some(wet_dry) = self.wet_dry {
@@ -309,7 +322,7 @@ impl ImplicitDamping2D<'_> {
 /// `stage`, whose RHS was evaluated at `from` with weight `dt`:
 ///
 /// ```text
-/// (hu, hv) ← (hu, hv) / (1 + dt·Λ),   Λ = Λ_friction(h, |u_from|) + r(h)
+/// (hu, hv) ← (hu, hv) / (1 + dt·Λ),   Λ = Λ_friction(h, |u_from|) + Λ_cage(h, |u_from|) + r(h)
 /// ```
 ///
 /// with h the stage depth. Momentum is only ever shrunk, never sign-flipped,
@@ -325,9 +338,22 @@ pub fn apply_implicit_damping_2d(
     if !damping.is_active() {
         return;
     }
+    check_cage_mesh(stage, damping);
     let [h, hu, hv] = &mut stage.data;
     let [fh, fhu, fhv] = &from.data;
-    damp_nodes(h, hu, hv, (fh, fhu, fhv), dt, damping);
+    damp_nodes(h, hu, hv, (fh, fhu, fhv), 0, dt, damping);
+}
+
+/// The cage drag must come from the stage's mesh and order.
+#[inline]
+fn check_cage_mesh(stage: &SWESolution2D, damping: &ImplicitDamping2D) {
+    if let Some(cages) = damping.cages {
+        assert_eq!(
+            cages.n_total_nodes(),
+            stage.h_data().len(),
+            "CageDrag2D was built for a different mesh or order"
+        );
+    }
 }
 
 /// Parallel version of [`apply_implicit_damping_2d`] (identical result).
@@ -344,6 +370,7 @@ pub fn apply_implicit_damping_2d_parallel(
     if !damping.is_active() {
         return;
     }
+    check_cage_mesh(stage, damping);
     let [h, hu, hv] = &mut stage.data;
     let [fh, fhu, fhv] = &from.data;
     h.par_chunks(CHUNK)
@@ -352,23 +379,40 @@ pub fn apply_implicit_damping_2d_parallel(
         .zip(fh.par_chunks(CHUNK))
         .zip(fhu.par_chunks(CHUNK))
         .zip(fhv.par_chunks(CHUNK))
-        .for_each(|(((((h, hu), hv), fh), fhu), fhv)| {
-            damp_nodes(h, hu, hv, (fh, fhu, fhv), dt, damping);
+        .enumerate()
+        .for_each(|(c, (((((h, hu), hv), fh), fhu), fhv))| {
+            damp_nodes(h, hu, hv, (fh, fhu, fhv), c * CHUNK, dt, damping);
         });
 }
 
+/// Damp the nodes `offset..offset + h.len()` (global node numbering).
 #[inline]
 fn damp_nodes(
     h: &[f64],
     hu: &mut [f64],
     hv: &mut [f64],
     (fh, fhu, fhv): (&[f64], &[f64], &[f64]),
+    offset: usize,
     dt: f64,
     damping: &ImplicitDamping2D,
 ) {
+    // Cursor into the sparse, node-sorted cage entries
+    let cage_nodes = damping.cages.map_or(&[][..], |c| c.nodes());
+    let mut next = damping.cages.map_or(0, |c| c.first_at_or_after(offset));
     for i in 0..h.len() {
+        let start = next;
+        while next < cage_nodes.len() && cage_nodes[next].node == offset + i {
+            next += 1;
+        }
         let from = SWEState2D::new(fh[i], fhu[i], fhv[i]);
-        damping.damp_node(h[i], &mut hu[i], &mut hv[i], from, dt);
+        damping.damp_node(
+            h[i],
+            &mut hu[i],
+            &mut hv[i],
+            from,
+            dt,
+            &cage_nodes[start..next],
+        );
     }
 }
 
@@ -563,6 +607,7 @@ mod tests {
         let friction = ManningFriction2D::new(9.81, 0.03);
         let damping = ImplicitDamping2D {
             friction: Some(&friction),
+            cages: None,
             wet_dry: None,
             h_min: Depth::new(1e-6),
         };
@@ -591,6 +636,7 @@ mod tests {
         let config = WetDryConfig::new(Depth::new(1e-3), 9.81);
         let damping = ImplicitDamping2D {
             friction: None,
+            cages: None,
             wet_dry: Some(&config),
             h_min: Depth::new(1e-6),
         };
