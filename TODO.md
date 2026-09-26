@@ -31,7 +31,29 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the def
    cargo run --release --no-default-features --features parallel,simd --example froya_real_data -- \
        start=2025-05-31T00:00:00Z hours=720 ramp_hours=3 spinup_hours=24 output_minutes=1440
    ```
-   It prints the per-constituent comparison against the gauge and NorKyst. 29 days after spin-up resolve N2 and Q1; 15 days (`hours=384`, ≈ 5 h) resolve M2/S2/K1/O1. A 30 h, 1 km smoke run gave M2 1.10× the gauge at +3°, with S2 still aliased at that length.
+   It prints the per-constituent comparison against the gauge and NorKyst. 29 days after spin-up resolve N2 and Q1; 15 days (`hours=384`) resolve M2/S2/K1/O1.
+   - **First results (2026-09-26), from 2025-06-01, 1 day spin-up:**
+     - Run cost (plugged in, 24 threads): 1 km (`nx=60 ny=45`) 2.0 ms/step, so 16 days take 35 min; 500 m (default) 4.7 ms/step, so 3 days take 31 min and 30 days ≈ 5 h. Progress lines in a redirected log appear in bursts, so judge progress from the process, not the log.
+     - **1 km, 15 days analysed.** Model against the gauge:
+       - M2 1.033×, **+5.4°** (7.4 cm); S2 1.095×, +7.2°; K1 1.35×, +11.8°; O1 0.92×, −19.6°; M4 1.23×.
+       - Complex-difference RSS 9.5 cm (NorKyst 16.6 cm, mostly its N2).
+       - Against the gauge's tidal prediction: RMSE 9.8 cm (centred 7.0 cm), correlation 0.990.
+       - NorKyst's own M2 matches the gauge at −0.5°, so the phase lag builds up inside our model between the boundary and Mausund.
+     - **Resolution explains most of it.** The 500 m run (3 days) is 6.4 min earlier (−3.1° of M2) and 1.3 % lower than 1 km at Mausund, so ≈ 1.02×, +2.3° at 500 m. Against the gauge's tidal prediction over hours 24–72, centred RMSE is 4.1 cm at 1 km and 2.9 cm at 500 m. The station nodes differ too: at 1 km the node is 325 m away and 16.4 m deep; at 500 m, 199 m away and 7.6 m deep.
+     - `land_elevation=1.5` against 5 m: 0.3 mm RMS at Mausund. The shoreline cliffs are local and do not reach the gauge.
+     - **P3 at 1 km against P2 at 500 m (3 days, hours 24–72 compared):**
+       - Setups:
+         - 1 km P2: 22k nodes, dt 1.31 s, 1.9 ms/step (≈ 6 min).
+         - 1 km P3: 40k nodes, dt 0.66 s (positivity CFL), 3.0 ms/step (20 min).
+         - 500 m P2: 87k nodes, dt 0.65 s, 4.7 ms/step (31 min).
+       - Centred RMSE against the gauge's tidal prediction: 4.1 / 3.3 / 2.9 cm. Shift against 1 km P2: — / −4.3 / −6.4 min.
+       - P3 at 1 km gets about two thirds of the gain of halving the mesh for about two thirds of its cost: roughly break-even here. The cheapest setup by far is 1 km P2 (≈ 5× less than 500 m P2 per simulated hour).
+       - Confounded: each setup samples a different node (325 m / 16 m deep, 259 m / 27 m, 199 m / 7.6 m). Interpolate at the gauge position before comparing further.
+       - The positivity CFL (0.29 at P3 against 0.42 at P2) costs P3 a factor of ≈ 1.45 in dt. Relaxing it (a subcell bound, or limiting only near dry fronts) would favour higher order.
+     - Next steps:
+       - The 500 m, 15-day run (≈ 2.5 h) for the harmonic numbers at resolution.
+       - Station interpolation at the gauge position, instead of the nearest node ≥ 3 m deep.
+       - Friction (Manning n = 0.025 everywhere) and GeoTIFF point sampling (P1.6) are the other phase suspects.
    - **Finding: NorKyst-800 has almost no N2 here.** At Mausund over June 2025, N2 is 0.027 m in NorKyst against 0.156 m observed (both 30-day fits; the year fit gives 0.154 m). Q1 is 1.9× the observed, K1 and S2 are 12–21 % high, M4 is 5× too weak, and M2 agrees (1.026, −0.5°). NorKyst's own complex-difference RSS against the gauge is 0.14 m, 0.13 m of it from N2. The Frøya run therefore re-infers the boundary atlas's N2 and Q1 from M2/O1 with Mausund's ratios (`gauge_ratios=N2,Q1`, the default). Report the N2 deficiency to MET, and check other NorKyst gauges (Bergen) for it.
    - Re-run the Bergen NorKyst fit too: it used the truncated periods fixed in P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)).
 2. **Shoreline cliffs (P1.6).** Lone wet nodes next to land nodes at `LAND_ELEVATION` = +5 m carry η jumps of ~1 m and 1–2.8 m/s through the tide (details under P1.4). They dominate the Frøya extremes; a foreshore DEM, or a gentler land elevation, is the likely fix.
@@ -466,7 +488,7 @@ Details are in `CHANGELOG.md` and git history. Caveats found on 2026-09-25 are n
 | SWE convergence | P1 1.67, P2 3.02 (linearised, flat, periodic; thresholds 1.5/2.5) | N+1, nonlinear, bathymetry, curved |
 | Allocations per 2D step (production stepper) | `Simulation` path: 0 B warm (without limiter/viscosity); legacy `ssp_rk3_swe_2d`: ~33 full-field arrays | 0 |
 | 2D tidal cost vs ROMS (model estimate) | ~47× core-hours | ≤ 1× per unit accuracy (P3.2) |
-| Validated against observations | No (NorKyst Bergen harmonic fit only) | 5+ tide gauges, ADCP |
+| Validated against observations | Mausund (Kartverket MSU), 15 days at 1 km: M2 1.03×, +5.4° (≈ +2.3° at 500 m); tidal-prediction RMSE 9.8 cm | 5+ tide gauges, ADCP |
 | Multi-day stability | One M2 cycle on Frøya (9,653 P2 elements, 11.4 min wall, 0 clips) | 30+ days, real domain |
 | 3D | Scaffolding; 3 blockers (tracer constancy, vertical advection ×D, PGF) | stratified lake-at-rest, constancy, lock exchange |
 | GPU | Non-functional (P0.11) | fixed or replaced (P2.7) |
