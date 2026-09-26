@@ -41,9 +41,17 @@ Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the def
        - NorKyst's own M2 matches the gauge at −0.5°, so the phase lag builds up inside our model between the boundary and Mausund.
      - **Resolution explains most of it.** The 500 m run (3 days) is 6.4 min earlier (−3.1° of M2) and 1.3 % lower than 1 km at Mausund, so ≈ 1.02×, +2.3° at 500 m. Against the gauge's tidal prediction over hours 24–72, centred RMSE is 4.1 cm at 1 km and 2.9 cm at 500 m. The station nodes differ too: at 1 km the node is 325 m away and 16.4 m deep; at 500 m, 199 m away and 7.6 m deep.
      - `land_elevation=1.5` against 5 m: 0.3 mm RMS at Mausund. The shoreline cliffs are local and do not reach the gauge.
+     - **P3 at 1 km against P2 at 500 m (3 days, hours 24–72 compared):**
+       - Setups:
+         - 1 km P2: 22k nodes, dt 1.31 s, 1.9 ms/step (≈ 6 min).
+         - 1 km P3: 40k nodes, dt 0.66 s (positivity CFL), 3.0 ms/step (20 min).
+         - 500 m P2: 87k nodes, dt 0.65 s, 4.7 ms/step (31 min).
+       - Centred RMSE against the gauge's tidal prediction: 4.1 / 3.3 / 2.9 cm. Shift against 1 km P2: — / −4.3 / −6.4 min.
+       - P3 at 1 km gets about two thirds of the gain of halving the mesh for about two thirds of its cost: roughly break-even here. The cheapest setup by far is 1 km P2 (≈ 5× less than 500 m P2 per simulated hour).
+       - Confounded: each setup samples a different node (325 m / 16 m deep, 259 m / 27 m, 199 m / 7.6 m). Interpolate at the gauge position before comparing further.
+       - The positivity CFL (0.29 at P3 against 0.42 at P2) costs P3 a factor of ≈ 1.45 in dt. Relaxing it (a subcell bound, or limiting only near dry fronts) would favour higher order.
      - Next steps:
        - The 500 m, 15-day run (≈ 2.5 h) for the harmonic numbers at resolution.
-       - A P3 1 km run, for accuracy per degree of freedom against 500 m P2 (P3.2).
        - Station interpolation at the gauge position, instead of the nearest node ≥ 3 m deep.
        - Friction (Manning n = 0.025 everywhere) and GeoTIFF point sampling (P1.6) are the other phase suspects.
    - **Finding: NorKyst-800 has almost no N2 here.** At Mausund over June 2025, N2 is 0.027 m in NorKyst against 0.156 m observed (both 30-day fits; the year fit gives 0.154 m). Q1 is 1.9× the observed, K1 and S2 are 12–21 % high, M4 is 5× too weak, and M2 agrees (1.026, −0.5°). NorKyst's own complex-difference RSS against the gauge is 0.14 m, 0.13 m of it from N2. The Frøya run therefore re-infers the boundary atlas's N2 and Q1 from M2/O1 with Mausund's ratios (`gauge_ratios=N2,Q1`, the default). Report the N2 deficiency to MET, and check other NorKyst gauges (Bergen) for it.
