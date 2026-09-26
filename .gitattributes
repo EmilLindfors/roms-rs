@@ -1,0 +1,2 @@
+# Gmsh fixtures are byte-exact (one is binary MSH 4.1)
+*.msh -text

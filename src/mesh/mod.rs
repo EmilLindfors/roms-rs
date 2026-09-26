@@ -35,7 +35,7 @@ pub use data::{
 };
 
 // Re-export I/O types
-pub use io::{GmshError, read_gmsh_mesh, write_gmsh_mesh};
+pub use io::{GmshError, parse_gmsh_mesh, read_gmsh_mesh, write_gmsh_mesh};
 
 // Re-export trait types
 pub use traits::{

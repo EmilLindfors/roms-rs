@@ -77,7 +77,7 @@ Every problem has a known fix in the literature, so the track is recoverable. Bu
 | §3.3 OBC labels (Chapman, TST, Radiation), Chapman `dt` never set | **Open.** `SWE2DRhsConfig::with_dt` has no callers (§4.6) |
 | §3.4 Nesting | Layer index and ubar/vbar **fixed**. CF time, rotation, bilinear weights, relaxation zone and stencil performance **open** (§4.5) |
 | §3.5 Coastline holes / no spatial index / hardcoded f | **Open** (§4.8) |
-| §3.6 Gmsh (MSH 4 claimed, 2.2 parsed; `unwrap`s; triangles dropped) | **Open** |
+| §3.6 Gmsh (MSH 4 claimed, 2.2 parsed; `unwrap`s; triangles dropped) | **Fixed** (2026-09-26): MSH 4.1 ASCII/binary and 2.2, validated, unsupported elements are errors (TODO P1.3) |
 | §4.1 RHS-by-value API allocations | **Open, and undercounted.** About 33 full-field arrays per production step (§5.3) |
 | §4.2–4.5 Burn, serial `Simulation` RHS, duplicated serial/parallel RHS, minor kernels | **All open** |
 | §5.3 Legacy integrators and run loops | **Open.** About 2.4k lines still exported |
@@ -378,11 +378,11 @@ P0.7 fixed Ω and momentum. The tracer kernel still sets `u_ext = u_int` at phys
 
 ### 4.1 [BLOCKER] Geometry: coastline-fitted meshes cannot be loaded
 
-*Status (2026-09-26): the per-node isoparametric metrics are done for the 2D kernels (TODO P1.3; general straight-sided quadrilaterals, verified free-stream preserving, well-balanced and conservative). Triangles, MSH 4.1, CSR and the 3D kernels remain.*
+*Status (2026-09-26): the per-node isoparametric metrics are done for the 2D kernels (TODO P1.3; general straight-sided quadrilaterals, verified free-stream preserving, well-balanced and conservative). All-quad Gmsh MSH 4.1/2.2 meshes load, validated (same date). Triangles, CSR and the 3D kernels remain.*
 
 - `geometric.rs:82,160-186` still panics on any non-parallelogram quad, and the Jacobian is one constant per element.
 - There is no triangle type, and 4 faces are hardcoded in the RHS (`swe_2d.rs:386,908`).
-- The Gmsh reader claims MSH 4 but parses 2.2 (`gmsh.rs:133`), has `.unwrap()` on untrusted input (`:254-257`), and silently drops triangles (`:273-275`).
+- ~~The Gmsh reader claims MSH 4 but parses 2.2 (`gmsh.rs:133`), has `.unwrap()` on untrusted input (`:254-257`), and silently drops triangles (`:273-275`).~~ Fixed 2026-09-26: MSH 4.1 (ASCII, binary) and 2.2, no panics on malformed input, unsupported element types are an error.
 - **Fix:** per-node isoparametric metrics (arrays go `[K]` → `[K × n_nodes]`), triangles (or quad-dominant Gmsh meshes), MSH 4.1, and CSR connectivity. The Wintermeyer formulation (§1.1) is already written for curvilinear meshes.
 
 ### 4.2 [BLOCKER] Flather applied twice [V]
