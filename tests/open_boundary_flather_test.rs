@@ -83,7 +83,7 @@ struct Domain {
 impl Domain {
     fn new(mesh: Mesh2D) -> Self {
         let ops = DGOperators2D::new(ORDER);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -H0);
         Self {
             mesh,

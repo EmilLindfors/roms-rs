@@ -247,13 +247,11 @@ fn combine_divergence(
     n_nodes: usize,
     rhs: &mut [f64],
 ) {
-    let n_elements = geom.rx.len();
+    let n_elements = geom.n_elements;
 
     for k in 0..n_elements {
-        let rx = geom.rx[k];
-        let ry = geom.ry[k];
-        let sx = geom.sx[k];
-        let sy = geom.sy[k];
+        let metric = geom.affine_metric(k);
+        let (rx, ry, sx, sy) = (metric.rx, metric.ry, metric.sx, metric.sy);
 
         let base = k * n_nodes;
         for i in 0..n_nodes {
@@ -292,6 +290,7 @@ pub fn compute_volume_terms_batched(
     rhs_hu: &mut [f64],
     rhs_hv: &mut [f64],
 ) {
+    geom.assert_affine("compute_volume_terms_batched");
     let g = equation.g;
     let h_min = equation.h_min.meters();
 
@@ -446,7 +445,7 @@ mod tests {
         // Create a simple 2x2 mesh
         let mesh = Mesh2D::uniform_rectangle(0.0, 100.0, 0.0, 100.0, 2, 2);
         let ops = DGOperators2D::new(2); // P2 = 9 nodes
-        let geom = crate::operators::GeometricFactors2D::compute(&mesh);
+        let geom = crate::operators::GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(9.81);
 
         let n_elements = mesh.n_elements;
@@ -512,7 +511,7 @@ mod tests {
         // Create a mesh and operators
         let mesh = Mesh2D::uniform_rectangle(0.0, 100.0, 0.0, 100.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = crate::operators::GeometricFactors2D::compute(&mesh);
+        let geom = crate::operators::GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(9.81);
 
         let n_elements = mesh.n_elements;
@@ -641,10 +640,8 @@ mod tests {
             );
 
             // Combine with geometric factors
-            let rx = geom.rx[k];
-            let ry = geom.ry[k];
-            let sx = geom.sx[k];
-            let sy = geom.sy[k];
+            let metric = geom.affine_metric(k);
+            let (rx, ry, sx, sy) = (metric.rx, metric.ry, metric.sx, metric.sy);
 
             for i in 0..n_nodes {
                 let div_h =

@@ -278,7 +278,7 @@ mod tests {
             let depth = 10.0;
             let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, nx, 1));
             let ops = Arc::new(DGOperators2D::new(order));
-            let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
             let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
             Self {
                 mesh,
@@ -626,7 +626,7 @@ mod tests {
                 .build(),
         );
         let ops = Arc::new(DGOperators2D::new(1));
-        let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
         let swe = PhysicsBuilder::swe_2d(
             mesh.clone(),

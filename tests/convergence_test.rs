@@ -406,16 +406,16 @@ fn test_conservation_nonzero_integral() {
 
 /// Run a 2D advection simulation with periodic BCs and return L2 error.
 fn run_advection_2d(
-    n_x: usize,
-    n_y: usize,
+    n: usize,
+    distorted: bool,
     order: usize,
     t_final: f64,
     a: (f64, f64),
     cfl: f64,
 ) -> f64 {
-    let mesh = Mesh2D::uniform_periodic(0.0, 2.0, 0.0, 2.0, n_x, n_y);
+    let mesh = periodic_mesh(2.0, n, distorted);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = Advection2D::new(a.0, a.1);
 
     // Initial condition: sin(π x) * sin(π y)
@@ -471,7 +471,7 @@ fn test_convergence_2d_p2() {
     let resolutions = [4, 8, 16];
     let errors: Vec<f64> = resolutions
         .iter()
-        .map(|&n| run_advection_2d(n, n, order, t_final, a, cfl))
+        .map(|&n| run_advection_2d(n, false, order, t_final, a, cfl))
         .collect();
 
     println!("\n2D P2 convergence:");
@@ -510,7 +510,7 @@ fn test_convergence_2d_p3() {
     let resolutions = [4, 8, 16];
     let errors: Vec<f64> = resolutions
         .iter()
-        .map(|&n| run_advection_2d(n, n, order, t_final, a, cfl))
+        .map(|&n| run_advection_2d(n, false, order, t_final, a, cfl))
         .collect();
 
     println!("\n2D P3 convergence:");
@@ -549,7 +549,7 @@ fn test_conservation_2d_periodic() {
 
     let mesh = Mesh2D::uniform_periodic(0.0, 2.0, 0.0, 2.0, n, n);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = Advection2D::new(a.0, a.1);
 
     // Initial condition with non-zero integral
@@ -616,7 +616,7 @@ fn test_advection_2d_x_direction_only() {
 
     let mesh = Mesh2D::uniform_periodic(0.0, 2.0, 0.0, 2.0, n, n);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = Advection2D::new(a.0, a.1);
 
     // Initial condition: sin(π x) (varies only in x)
@@ -686,7 +686,7 @@ fn run_swe_2d_convergence(nx: usize, ny: usize, order: usize, t_final: f64, cfl:
     // Setup
     let mesh = Mesh2D::uniform_periodic(0.0, l, 0.0, l, nx, ny);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(g);
     let bc = Reflective2D::new(); // Never called on periodic mesh
     let config = SWE2DRhsConfig::new(&equation, &bc)
@@ -1019,11 +1019,31 @@ impl dg_rs::SourceTerm2D for ManufacturedSource {
     }
 }
 
+/// An n×n periodic mesh of [0, l]², uniform or with its vertices moved by a
+/// smooth periodic field (general quadrilaterals, TODO P1.3).
+fn periodic_mesh(l: f64, n: usize, distorted: bool) -> Mesh2D {
+    let mut mesh = Mesh2D::uniform_periodic(0.0, l, 0.0, l, n, n);
+    if distorted {
+        let tau = 2.0 * PI / l;
+        let a = 0.04 * l;
+        for v in &mut mesh.vertices {
+            let [x, y] = *v;
+            let (sx, sy) = ((tau * x).sin(), (tau * y).sin());
+            *v = [
+                x + a * sx * sy + 0.5 * a * (tau * y).sin(),
+                y - 0.7 * a * sx * sy + 0.4 * a * (tau * x).sin(),
+            ];
+        }
+    }
+    mesh
+}
+
 /// L2 depth error of a split form on an n×n periodic mesh (`WetDry`: subcell
 /// finite volumes in elements with a node shallower than `h_dry`).
 fn run_swe_2d_split_form_manufactured(
     formulation: dg_rs::SWEFormulation2D,
     h_dry: f64,
+    distorted: bool,
     n: usize,
     order: usize,
     t_final: f64,
@@ -1033,9 +1053,9 @@ fn run_swe_2d_split_form_manufactured(
     use manufactured::{G, U, V, bed, depth};
 
     let l = std::f64::consts::SQRT_2;
-    let mesh = Mesh2D::uniform_periodic(0.0, l, 0.0, l, n, n);
+    let mesh = periodic_mesh(l, n, distorted);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new(); // Never called on periodic mesh
     let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
@@ -1084,12 +1104,13 @@ fn check_split_form_convergence(
     cfl: f64,
     min_order: f64,
 ) {
-    check_split_form_convergence_with(formulation, 0.0, &[4, 8, 16], order, cfl, min_order);
+    check_split_form_convergence_with(formulation, 0.0, false, &[4, 8, 16], order, cfl, min_order);
 }
 
 fn check_split_form_convergence_with(
     formulation: dg_rs::SWEFormulation2D,
     h_dry: f64,
+    distorted: bool,
     resolutions: &[usize],
     order: usize,
     cfl: f64,
@@ -1098,11 +1119,22 @@ fn check_split_form_convergence_with(
     let t_final = 0.1;
     let errors: Vec<f64> = resolutions
         .iter()
-        .map(|&n| run_swe_2d_split_form_manufactured(formulation, h_dry, n, order, t_final, cfl))
+        .map(|&n| {
+            run_swe_2d_split_form_manufactured(
+                formulation,
+                h_dry,
+                distorted,
+                n,
+                order,
+                t_final,
+                cfl,
+            )
+        })
         .collect();
 
     println!(
-        "\nSWE 2D split form {formulation:?} P{order}, h_dry = {h_dry:e} (manufactured, bathymetry):"
+        "\nSWE 2D split form {formulation:?} P{order}, h_dry = {h_dry:e}, distorted = {distorted} \
+         (manufactured, bathymetry):"
     );
     for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
         if i > 0 {
@@ -1150,10 +1182,83 @@ fn test_convergence_swe_2d_wet_dry_subcells() {
         check_split_form_convergence_with(
             dg_rs::SWEFormulation2D::WetDry,
             f64::INFINITY,
+            false,
             &[4, 8, 16],
             order,
             0.2,
             1.7,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// General (non-parallelogram) quadrilaterals, TODO P1.3
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_convergence_swe_2d_split_form_distorted_mesh() {
+    // Metric at every node, curvilinear split form (Wintermeyer et al. 2017):
+    // N+1 on distorted periodic meshes as on uniform ones. Measured 8 → 16:
+    // EntropyStable P2 2.95, P3 3.88; WetDry (fully wet) P2 2.95, P3 3.89
+    for (formulation, order, cfl, min_order) in [
+        (dg_rs::SWEFormulation2D::EntropyStable, 2, 0.1, 2.5),
+        (dg_rs::SWEFormulation2D::EntropyStable, 3, 0.05, 3.5),
+        (dg_rs::SWEFormulation2D::WetDry, 2, 0.1, 2.5),
+        (dg_rs::SWEFormulation2D::WetDry, 3, 0.05, 3.5),
+    ] {
+        check_split_form_convergence_with(
+            formulation,
+            0.0,
+            true,
+            &[4, 8, 16],
+            order,
+            cfl,
+            min_order,
+        );
+    }
+}
+
+#[test]
+fn test_convergence_swe_2d_wet_dry_subcells_distorted_mesh() {
+    // Subcells in every element with the interface metrics and the metric
+    // balance term: second order on distorted meshes. Measured 8 → 16:
+    // P1 1.92, P2 1.74, P3 1.86; P2 16 → 32: 1.91 (uniform mesh: 1.90)
+    for order in 1..=3 {
+        check_split_form_convergence_with(
+            dg_rs::SWEFormulation2D::WetDry,
+            f64::INFINITY,
+            true,
+            &[4, 8, 16],
+            order,
+            0.2,
+            1.7,
+        );
+    }
+}
+
+#[test]
+fn test_convergence_advection_2d_distorted_mesh() {
+    // Conservative form with the metric at every node: N+1 on distorted
+    // periodic meshes
+    for (order, t_final, cfl, min_order) in [(2, 0.5, 0.2, 2.5), (3, 0.2, 0.1, 3.5)] {
+        let resolutions = [4, 8, 16];
+        let errors: Vec<f64> = resolutions
+            .iter()
+            .map(|&n| run_advection_2d(n, true, order, t_final, (1.0, 0.5), cfl))
+            .collect();
+        println!("\n2D advection P{order}, distorted mesh:");
+        for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
+            let rate = if i > 0 {
+                (errors[i - 1] / err).log2()
+            } else {
+                f64::NAN
+            };
+            println!("  n={n:3}: error={err:.4e}, order={rate:.2}");
+        }
+        let observed = (errors[1] / errors[2]).log2();
+        assert!(
+            observed > min_order,
+            "2D advection P{order} on a distorted mesh: order {observed:.2} ≤ {min_order}"
         );
     }
 }

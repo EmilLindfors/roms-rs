@@ -30,7 +30,7 @@ fn setup_problem(
 ) {
     let mesh = Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 1000.0, nx, ny);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
 
     // Initialize with uniform flow

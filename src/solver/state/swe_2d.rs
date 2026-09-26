@@ -352,8 +352,8 @@ impl SWESolution2D {
     pub fn integrate_depth(&self, ops: &DGOperators2D, geom: &GeometricFactors2D) -> f64 {
         let mut integral = 0.0;
         for k in ElementIndex::iter(self.n_elements) {
-            let j = geom.det_j[k.as_usize()];
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(k.as_usize(), i);
                 let h = self.get_var(k, i, 0);
                 integral += w * h * j;
             }
@@ -365,8 +365,8 @@ impl SWESolution2D {
     pub fn integrate_x_momentum(&self, ops: &DGOperators2D, geom: &GeometricFactors2D) -> f64 {
         let mut integral = 0.0;
         for k in ElementIndex::iter(self.n_elements) {
-            let j = geom.det_j[k.as_usize()];
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(k.as_usize(), i);
                 let hu = self.get_var(k, i, 1);
                 integral += w * hu * j;
             }
@@ -378,8 +378,8 @@ impl SWESolution2D {
     pub fn integrate_y_momentum(&self, ops: &DGOperators2D, geom: &GeometricFactors2D) -> f64 {
         let mut integral = 0.0;
         for k in ElementIndex::iter(self.n_elements) {
-            let j = geom.det_j[k.as_usize()];
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(k.as_usize(), i);
                 let hv = self.get_var(k, i, 2);
                 integral += w * hv * j;
             }
@@ -400,8 +400,8 @@ impl SWESolution2D {
     {
         let mut error_sq = 0.0;
         for k in ElementIndex::iter(mesh.n_elements) {
-            let j = geom.det_j[k.as_usize()];
             for i in 0..self.n_nodes {
+                let j = geom.jacobian(k.as_usize(), i);
                 let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
                 let [x, y] = mesh.reference_to_physical(k, r, s);
                 let h = self.get_var(k, i, 0);

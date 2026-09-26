@@ -236,7 +236,7 @@ impl Bathymetry2D {
             // Transform to physical derivatives and store
             let start = ki * n;
             for i in 0..n {
-                let (db_dx, db_dy) = geom.transform_derivatives(ki, db_dr[i], db_ds[i]);
+                let (db_dx, db_dy) = geom.transform_derivatives(ki, i, db_dr[i], db_ds[i]);
                 self.gradient_x[start + i] = db_dx;
                 self.gradient_y[start + i] = db_dy;
             }
@@ -741,7 +741,7 @@ mod tests {
     fn make_mesh_and_ops() -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         (mesh, ops, geom)
     }
 

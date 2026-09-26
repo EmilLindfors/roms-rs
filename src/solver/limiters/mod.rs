@@ -33,7 +33,7 @@ pub use swe_2d::{
     swe_positivity_limiter_2d,
 };
 // Element kernels shared with the wet/dry correction
-pub(crate) use swe_2d::{element_mean, positivity_limit_element};
+pub(crate) use swe_2d::{element_mass, element_mean, positivity_limit_element};
 
 // Parallel 2D SWE limiters
 #[cfg(feature = "parallel")]

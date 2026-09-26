@@ -112,10 +112,8 @@ pub fn compute_pressure_gradient(
         // Transform to physical gradients
         // We need geometric factors for this element
         // geom arrays are per-element (affine assumption)
-        let rx = geom.rx[k];
-        let ry = geom.ry[k];
-        let sx = geom.sx[k];
-        let sy = geom.sy[k];
+        let metric = geom.affine_metric(k);
+        let (rx, ry, sx, sy) = (metric.rx, metric.ry, metric.sx, metric.sy);
 
         for i in 0..n_nodes {
             d_eta_dx[i] = rx * dr_vals[i] + sx * ds_vals[i];
@@ -231,7 +229,7 @@ mod tests {
     ) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 1000.0, nx, ny);
         let ops = DGOperators2D::new(order);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let sigma = SigmaGrid::new(n_levels, UniformStretching);
         let state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
         // Default flat bed elevation B = -100.0, i.e. 100 m depth at eta = 0.

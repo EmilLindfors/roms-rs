@@ -190,6 +190,36 @@ Nonlinear manufactured solution over variable bathymetry on [0, √2]²
 | P2 | 2.64e-1 | 3.94e-2 | 4.74e-3 | 3.06 |
 | P3 | 3.98e-2 | 3.17e-3 | 1.98e-4 | 4.00 |
 
+### General (Non-Parallelogram) Quadrilaterals
+
+Coastline-fitted meshes consist of general quadrilaterals, whose bilinear map
+has a Jacobian that varies over the element. `GeometricFactors2D` stores the
+metric at every node, and the 2D kernels use the conservative (divergence)
+form, the curvilinear split form of Wintermeyer et al. (2017), and subcell
+interface metrics that telescope the flux-differencing term. Test meshes: the
+vertices of a periodic mesh moved by a smooth periodic field (bilinear term
+≈ 10 % of the element size; `tests/curvilinear_2d_test.rs`,
+`tests/convergence_test.rs`).
+
+| Property (distorted periodic mesh, P1–P4) | Result |
+|-------------------------------------------|--------|
+| Discrete metric identities D_r(J r_x) + D_s(J s_x) = 0 | < 1e-13 (P1–P5) |
+| Uniform flow (free stream), all formulations incl. forced subcells | < 1e-12 of g h²/Δx |
+| Lake at rest, rough face-discontinuous bed, split forms and subcells | < 1e-11 of the bed forcing |
+| Lake at rest across shorelines (`WetDry`) | < 1e-11 of the bed forcing |
+| Mass rate, all formulations; momentum rate on a flat bed | < 1e-12 relative |
+| Entropy rate, `EntropyConservative` / `EntropyStable` | < 1e-11 relative / ≤ 0 |
+| Tracer content hT, hS (advection + diffusion); viscous momentum | < 1e-12 / < 1e-11 relative |
+
+Convergence on the distorted meshes (8 → 16 elements per side):
+
+| Case | Observed order |
+|------|----------------|
+| 2D advection P2 / P3 | 2.80 / 3.88 |
+| SWE manufactured, `EntropyStable` P2 / P3 | 2.95 / 3.88 |
+| SWE manufactured, `WetDry` fully wet P2 / P3 | 2.95 / 3.89 |
+| SWE manufactured, `WetDry` subcells forced P1 / P2 / P3 | 1.92 / 1.74 / 1.86 (P2 16 → 32: 1.91; uniform mesh 1.90) |
+
 ### Numerical Flux Comparison
 
 For smooth solutions, all flux types produce similar results:

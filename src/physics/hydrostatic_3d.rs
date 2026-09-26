@@ -107,6 +107,7 @@ where
         g: f64,
         rho0: f64,
     ) -> Self {
+        geom.assert_affine("Hydrostatic3D (the 3D horizontal kernels)");
         // Omega lives at the w-points: n_levels + 1 interfaces per column.
         let n_w = mesh.n_elements * ops.n_nodes * (sigma.n_levels() + 1);
         Self {
@@ -269,7 +270,7 @@ where
         let mut min_dt = f64::INFINITY;
 
         for k in 0..self.mesh.n_elements {
-            let j_inv = self.geom.det_j_inv[k];
+            let j_inv = self.geom.affine_metric(k).det_j_inv;
             // length scale h ~ 1/sqrt(J_inv) ?
             // For parallelogram: Area = J. h ~ sqrt(Area).
             let h_len = 1.0 / j_inv.sqrt(); // Approx element size

@@ -370,7 +370,7 @@ mod tests {
     fn create_test_setup() -> (crate::physics::SWEPhysics2D<Reflective2D>, SWESolution2D) {
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2));
         let ops = Arc::new(DGOperators2D::new(2));
-        let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let equation = ShallowWater2D::with_h_min(9.81, Depth::new(1e-6));
         let bc = Reflective2D::default();
 
@@ -521,7 +521,7 @@ mod tests {
         // (here h = 0.5 − 1 = −0.5), voiding the Zhang–Shu positivity guarantee.
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
         let ops = DGOperators2D::new(1);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let mut state = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
         state.h_data_mut().fill(0.5);
         let physics = DrainingPhysics {

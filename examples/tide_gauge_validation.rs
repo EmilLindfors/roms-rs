@@ -170,21 +170,21 @@ fn ssp_rk3_step<BC: dg_rs::SWEBoundaryCondition2D>(
     let rhs1 = compute_rhs_swe_2d(q, mesh, ops, geom, config, time);
     let mut q1 = q.clone();
     q1.axpy(dt, &rhs1);
-    swe_positivity_limiter_2d(&mut q1, ops, h_min);
+    swe_positivity_limiter_2d(&mut q1, geom, h_min);
 
     // Stage 2
     let rhs2 = compute_rhs_swe_2d(&q1, mesh, ops, geom, config, time + dt);
     let mut q2 = q.clone();
     q2.axpy(0.25 * dt, &rhs1);
     q2.axpy(0.25 * dt, &rhs2);
-    swe_positivity_limiter_2d(&mut q2, ops, h_min);
+    swe_positivity_limiter_2d(&mut q2, geom, h_min);
 
     // Stage 3
     let rhs3 = compute_rhs_swe_2d(&q2, mesh, ops, geom, config, time + 0.5 * dt);
     q.scale(1.0 / 3.0);
     q.axpy(2.0 / 3.0, &q2);
     q.axpy(2.0 / 3.0 * dt, &rhs3);
-    swe_positivity_limiter_2d(q, ops, h_min);
+    swe_positivity_limiter_2d(q, geom, h_min);
 }
 
 fn main() {
@@ -295,7 +295,7 @@ fn main() {
     let mesh =
         Mesh2D::uniform_rectangle_with_sides(0.0, domain_size, 0.0, domain_size, nx, ny, bc_tags);
     let ops = DGOperators2D::new(n_poly);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     println!(
         "  Mesh: {} elements, {} boundary edges",

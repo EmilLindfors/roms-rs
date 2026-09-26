@@ -152,10 +152,11 @@ impl AdvectionBoundaryCondition2D for ConstantBC2D {
 
 /// Compute the right-hand side for 2D advection.
 ///
-/// Implements the DG weak form:
-/// du/dt = -1/J * [Dr * (ar) + Ds * (as)] * u + 1/J * Σ_f LIFT_f * sJ_f * (F* - F-)
+/// Implements the strong DG form in conservative (divergence) form, with the
+/// metric at every node:
+/// du/dt = -1/J * [Dr * (ãr u) + Ds * (ãs u)] + 1/J * Σ_f LIFT_f * sJ_f * (F- - F*)
 ///
-/// where ar = a_x * rx + a_y * ry and as = a_x * sx + a_y * sy.
+/// where ãr = a · J∇r and ãs = a · J∇s are the contravariant velocities.
 pub fn compute_rhs_advection_2d<BC: AdvectionBoundaryCondition2D>(
     u: &DGSolution2D,
     mesh: &Mesh2D,
@@ -173,34 +174,29 @@ pub fn compute_rhs_advection_2d<BC: AdvectionBoundaryCondition2D>(
     for k in ElementIndex::iter(mesh.n_elements) {
         let ki = k.as_usize();
         let u_k = u.element(k);
-        let j_inv = geom.det_j_inv[ki];
-
-        // Compute velocity components in reference space
-        // ar = a · ∇r = a_x * rx + a_y * ry (transforms a to reference coords)
         let (a_x, a_y) = equation.velocity();
-        let ar = a_x * geom.rx[ki] + a_y * geom.ry[ki];
-        let as_ = a_x * geom.sx[ki] + a_y * geom.sy[ki];
 
-        // 1. Volume term: -(a · ∇u) = -(ar * ∂u/∂r + as * ∂u/∂s)
-        // No j_inv here because collocation mass matrix M = J * diag(w),
-        // and M^{-1} * M cancels the Jacobian in the volume integral.
+        // Contravariant fluxes ã·u at the nodes
+        let (mut flux_r, mut flux_s) = (vec![0.0; n_nodes], vec![0.0; n_nodes]);
+        for i in 0..n_nodes {
+            let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(ki, i);
+            flux_r[i] = (a_x * ar_x + a_y * ar_y) * u_k[i];
+            flux_s[i] = (a_x * as_x + a_y * as_y) * u_k[i];
+        }
+
+        // 1. Volume term: -∇·(a u) = -J⁻¹[∂r(ãr u) + ∂s(ãs u)]
         let rhs_k = rhs.element_mut(k);
 
         for i in 0..n_nodes {
-            let mut du_dr = 0.0;
-            let mut du_ds = 0.0;
+            let mut div = 0.0;
             for j in 0..n_nodes {
-                du_dr += ops.dr[(i, j)] * u_k[j];
-                du_ds += ops.ds[(i, j)] * u_k[j];
+                div += ops.dr[(i, j)] * flux_r[j] + ops.ds[(i, j)] * flux_s[j];
             }
-            rhs_k[i] = -(ar * du_dr + as_ * du_ds);
+            rhs_k[i] = -geom.jacobian_inv(ki, i) * div;
         }
 
-        // 2. Surface terms: 1/J * LIFT_f * sJ_f * (F* - F-)
+        // 2. Surface terms: LIFT_f (sJ/J) (F- - F*) at every face node
         for face in 0..4 {
-            let normal = geom.normals[ki][face];
-            let s_jac = geom.surface_j[ki][face];
-
             // Get interior face values
             let face_nodes = &ops.face_nodes[face];
 
@@ -222,6 +218,7 @@ pub fn compute_rhs_advection_2d<BC: AdvectionBoundaryCondition2D>(
                 let mut ext = vec![0.0; n_face_nodes];
                 for i in 0..n_face_nodes {
                     let node_idx = face_nodes[i];
+                    let normal = geom.normal(ki, face, i);
                     let u_int = u_k[node_idx];
                     let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
                     let [x, y] = mesh.reference_to_physical(k, r, s);
@@ -234,6 +231,7 @@ pub fn compute_rhs_advection_2d<BC: AdvectionBoundaryCondition2D>(
             let mut flux_jump = vec![0.0; n_face_nodes];
             for i in 0..n_face_nodes {
                 let node_idx = face_nodes[i];
+                let normal = geom.normal(ki, face, i);
                 let u_int = u_k[node_idx];
                 let u_exterior = u_ext[i];
 
@@ -251,14 +249,14 @@ pub fn compute_rhs_advection_2d<BC: AdvectionBoundaryCondition2D>(
                 // Flux difference: (F^- - F*) for upwind dissipation
                 // Note: This sign convention matches the 1D implementation
                 // and ensures dissipation (energy decay) rather than growth
-                flux_jump[i] = f_int - f_star;
+                flux_jump[i] = geom.lift_scale(ki, face, i, node_idx) * (f_int - f_star);
             }
 
-            // Apply LIFT: rhs += j_inv * LIFT_f * (sJ * flux_jump)
+            // Apply LIFT: rhs += LIFT_f * ((sJ/J) flux_jump)
             // LIFT has shape (n_nodes, n_face_nodes)
             for i in 0..n_nodes {
                 for fi in 0..n_face_nodes {
-                    rhs_k[i] += j_inv * ops.lift[face][(i, fi)] * s_jac * flux_jump[fi];
+                    rhs_k[i] += ops.lift[face][(i, fi)] * flux_jump[fi];
                 }
             }
         }
@@ -286,9 +284,8 @@ pub fn compute_dt_advection_2d(
     // Find minimum element size
     let mut h_min = f64::INFINITY;
     for k in 0..mesh.n_elements {
-        // Use Jacobian to estimate element size
-        // For uniform mesh: h ≈ sqrt(det_J) * 2
-        let h_k = geom.det_j[k].sqrt() * 2.0;
+        // Element size from its area (2√J on affine elements)
+        let h_k = geom.element_size(k);
         h_min = h_min.min(h_k);
     }
 
@@ -311,7 +308,7 @@ mod tests {
     fn create_test_setup(order: usize) -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(order);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         (mesh, ops, geom)
     }
 
@@ -358,7 +355,7 @@ mod tests {
         // Use a fine mesh and high order
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 8, 8);
         let ops = DGOperators2D::new(4);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
 
         let a_x = 1.0;
         let a_y = 0.0;
@@ -415,7 +412,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
 
         let equation = Advection2D::new(1.0, 0.0);
         let bc = PeriodicBC2D;
@@ -471,7 +468,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
 
         let equation = Advection2D::new(1.0, 0.0);
         let bc = PeriodicBC2D;
@@ -607,7 +604,7 @@ mod tests {
         // Non-periodic mesh with Dirichlet BC
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
 
         // Velocity pointing into domain from left
         let equation = Advection2D::new(1.0, 0.0);

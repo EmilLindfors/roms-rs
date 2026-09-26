@@ -56,7 +56,7 @@ fn ssp_rk3_step_with_sources<BC: dg_rs::SWEBoundaryCondition2D>(
 fn test_circular_dam_break_mass_conservation() {
     let mesh = Mesh2D::uniform_periodic(0.0, 100.0, 0.0, 100.0, 10, 10);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
@@ -127,7 +127,7 @@ fn test_standing_wave_period() {
     // Channel mesh (periodic in x, walls in y)
     let mesh = Mesh2D::channel_periodic_x(0.0, lx, 0.0, ly, nx, ny);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     let h0 = 10.0; // Mean depth
     let amplitude = 0.1;
@@ -208,7 +208,7 @@ fn test_geostrophic_balance() {
 
     let mesh = Mesh2D::uniform_periodic(0.0, lx, 0.0, ly, 10, 10);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     let f = 1.0e-4; // Coriolis parameter
     let h0 = 100.0; // Mean depth
@@ -294,7 +294,7 @@ fn test_sponge_layer_absorption() {
 
     let mesh = Mesh2D::channel_periodic_x(0.0, lx, 0.0, ly, 20, 5);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     let h0 = 10.0;
     let equation = ShallowWater2D::new(G);
@@ -361,8 +361,8 @@ fn test_sponge_layer_absorption() {
     let mut energy_with_sponge = 0.0;
 
     for ki in 0..mesh.n_elements {
-        let j = geom.det_j[ki];
         for (i, &w) in ops.weights.iter().enumerate() {
+            let j = geom.jacobian(ki, i);
             let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
             let [x, _y] = mesh.reference_to_physical(k(ki), r, s);
 
@@ -392,7 +392,7 @@ fn test_sponge_layer_absorption() {
 fn test_combined_source_terms() {
     let mesh = Mesh2D::uniform_periodic(0.0, 100.0, 0.0, 100.0, 5, 5);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();

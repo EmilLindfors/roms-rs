@@ -116,10 +116,10 @@ impl DGSolution2D {
         let mut error_sq = 0.0;
 
         for k in ElementIndex::iter(mesh.n_elements) {
-            let j = geom.det_j[k.as_usize()];
             let u_k = self.element(k);
 
             for i in 0..self.n_nodes {
+                let j = geom.jacobian(k.as_usize(), i);
                 let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
                 let [x, y] = mesh.reference_to_physical(k, r, s);
                 let u_exact = exact(x, y);
@@ -202,10 +202,10 @@ impl DGSolution2D {
         let mut integral = 0.0;
 
         for k in ElementIndex::iter(self.n_elements) {
-            let j = geom.det_j[k.as_usize()];
             let u_k = self.element(k);
 
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(k.as_usize(), i);
                 integral += w * u_k[i] * j;
             }
         }
@@ -235,7 +235,7 @@ mod tests {
     fn create_test_setup() -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         (mesh, ops, geom)
     }
 

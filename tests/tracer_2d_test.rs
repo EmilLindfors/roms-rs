@@ -37,7 +37,7 @@ fn create_periodic_setup(
 ) -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
     let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, nx, ny);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     (mesh, ops, geom)
 }
 
@@ -49,7 +49,7 @@ fn create_wall_setup(
 ) -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
     let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, nx, ny);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     (mesh, ops, geom)
 }
 
@@ -189,8 +189,8 @@ fn test_tracer_diffusion_is_conservative_across_element_jumps() {
     let mut integral_h_s = 0.0;
     let mut max_rhs: f64 = 0.0;
     for ki in 0..n_elements {
-        let j = geom.det_j[ki];
         for (i, &w) in ops.weights.iter().enumerate() {
+            let j = geom.jacobian(ki, i);
             let state = rhs.get_conservative(k(ki), i);
             integral_h_t += w * state.h_t * j;
             integral_h_s += w * state.h_s * j;

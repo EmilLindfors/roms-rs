@@ -1,458 +1,668 @@
-//! Geometric factors for 2D elements.
+//! Geometric factors for 2D quadrilateral elements, at every node.
 //!
-//! For affine quadrilateral elements, the Jacobian is constant per element.
-//! The geometric factors transform derivatives from reference to physical space:
+//! Each element is the bilinear (isoparametric, straight-sided) image of the
+//! reference square [-1, 1]² through its four vertices,
 //!
-//! ∂u/∂x = rx * ∂u/∂r + sx * ∂u/∂s
-//! ∂u/∂y = ry * ∂u/∂r + sy * ∂u/∂s
+//! ```text
+//! x(r, s) = ¼[(1−r)(1−s) x₀ + (1+r)(1−s) x₁ + (1+r)(1+s) x₂ + (1−r)(1+s) x₃]
+//! ```
 //!
-//! where (rx, ry, sx, sy) are the entries of the inverse Jacobian matrix.
+//! so the Jacobian varies over a general quadrilateral and is constant only on
+//! parallelograms. The factors are therefore stored per node (Hesthaven &
+//! Warburton 2008, §6.6; Kopriva 2009, ch. 6):
+//!
+//! - the inverse metric `(r_x, r_y, s_x, s_y)` and `J = x_r y_s − x_s y_r`,
+//!   so that `∂u/∂x = r_x ∂u/∂r + s_x ∂u/∂s` (chain rule) at each node;
+//! - the contravariant vectors `J∇r = (y_s, −x_s)` and `J∇s = (−y_r, x_r)`,
+//!   used by the conservative (divergence) form of the volume terms,
+//!   `∇·F = J⁻¹[∂_r(J∇r·F) + ∂_s(J∇s·F)]`;
+//! - at every face node, the outward unit normal `n` and surface Jacobian
+//!   `sJ`, taken from the same metric: `sJ n = ±J∇r` on the faces `r = ±1`
+//!   and `±J∇s` on `s = ±1`, so the volume and surface terms agree at the
+//!   element boundary.
+//!
+//! # Metric identities
+//!
+//! The bilinear map gives `J∇r` linear in `r` only and `J∇s` linear in `s` only
+//! (`∂_r(y_s) = −∂_s(−y_r)`), so the discrete metric identities
+//! `D_r(J r_x) + D_s(J s_x) = 0`, `D_r(J r_y) + D_s(J s_y) = 0` hold to round-off
+//! for any order `N ≥ 1`. That is what makes the conservative form preserve a
+//! uniform flow (free-stream preservation) and the split forms well-balanced
+//! on non-affine elements (Kopriva 2006; Wintermeyer et al. 2017).
+//!
+//! Curved (higher-order) element boundaries would compute the same fields from
+//! the derivatives of an interpolated high-order map; the layout does not change.
 
 use crate::mesh::Mesh2D;
+use crate::operators::DGOperators2D;
 use crate::types::ElementIndex;
 
-/// Geometric factors for 2D elements.
+/// Geometric factors for 2D quadrilateral elements, per node.
 ///
-/// For each element, stores the Jacobian information needed for
-/// DG operations in physical space.
-///
-/// # Affine element assumption
-///
-/// This implementation assumes affine (parallelogram) elements where the
-/// Jacobian is constant per element. Each entry (`rx`, `ry`, `sx`, `sy`,
-/// `det_j`, `det_j_inv`) stores a single scalar per element, not per node.
-/// For curved/non-affine elements (e.g., isoparametric mappings), these
-/// would need to be stored per-node and operations like cell averaging
-/// would need per-node Jacobian weighting.
+/// Volume fields are indexed `[k * n_nodes + i]` (see [`Self::node_index`]),
+/// face fields `[(k * 4 + face) * n_face_nodes + fi]`, with `fi` in the face-node
+/// order of [`DGOperators2D::face_nodes`] (see [`Self::face_node_index`]).
 #[derive(Clone)]
 pub struct GeometricFactors2D {
-    /// dr/dx for each element (inverse Jacobian entry)
+    /// ∂r/∂x at every node
     pub rx: Vec<f64>,
 
-    /// dr/dy for each element
+    /// ∂r/∂y at every node
     pub ry: Vec<f64>,
 
-    /// ds/dx for each element
+    /// ∂s/∂x at every node
     pub sx: Vec<f64>,
 
-    /// ds/dy for each element
+    /// ∂s/∂y at every node
     pub sy: Vec<f64>,
 
-    /// Jacobian determinant for each element: det(J) = x_r * y_s - x_s * y_r
+    /// Jacobian determinant at every node: J = x_r y_s − x_s y_r
     pub det_j: Vec<f64>,
 
-    /// Inverse Jacobian determinant: 1/det(J)
+    /// 1/J at every node
     pub det_j_inv: Vec<f64>,
 
-    /// Surface Jacobian for each face of each element: surface_j[k][f]
-    /// This is the ratio of physical to reference edge length.
-    pub surface_j: Vec<[f64; 4]>,
+    /// Diagonal of the element mass matrix: GLL weight × J at every node, so
+    /// that `∫_k u ≈ Σ_i mass[k·n + i] u_i` (exact for polynomials of degree
+    /// 2N − 1 times J)
+    pub mass: Vec<f64>,
 
-    /// Outward unit normal for each face of each element: normals[k][f] = (nx, ny)
-    pub normals: Vec<[(f64, f64); 4]>,
+    /// Element areas `Σ_i mass`, one per element
+    pub area: Vec<f64>,
+
+    /// Surface Jacobian (physical / reference edge length) at every face node
+    pub surface_j: Vec<f64>,
+
+    /// Outward unit normal at every face node
+    pub normals: Vec<(f64, f64)>,
 
     /// Number of elements
     pub n_elements: usize,
+
+    /// Nodes per element
+    pub n_nodes: usize,
+
+    /// Nodes per face
+    pub n_face_nodes: usize,
+
+    /// Per element, densely packed: whether it is a parallelogram, and its
+    /// metric and face geometry at node 0 / face node 0. That is the whole
+    /// geometry of a parallelogram, which the affine fast paths read instead
+    /// of the (strided) node-0 entries of the per-node fields.
+    elements: Vec<ElementGeometry>,
+
+    /// Whether every element is a parallelogram
+    affine: bool,
+}
+
+/// The geometry of one element at node 0 and face node 0, which is all of it
+/// for a parallelogram; see [`GeometricFactors2D::element_geometry`].
+#[derive(Clone, Copy, Debug)]
+pub struct ElementGeometry {
+    /// Whether the element is a parallelogram (constant metric)
+    pub affine: bool,
+    /// Metric at node 0
+    pub metric: AffineMetric,
+    /// Outward unit normal and surface Jacobian of each face at its node 0
+    pub faces: [((f64, f64), f64); 4],
 }
 
 impl GeometricFactors2D {
-    /// Compute geometric factors from a mesh.
+    /// Compute the geometric factors of every element of `mesh` at the nodes
+    /// of `ops`.
     ///
-    /// For affine quadrilaterals, the Jacobian is constant per element.
-    /// The mapping from reference (r, s) to physical (x, y) is:
-    ///
-    /// x(r, s) = a0 + a1*r + a2*s + a3*r*s
-    /// y(r, s) = b0 + b1*r + b2*s + b3*r*s
-    ///
-    /// For parallelograms (affine), a3 = b3 = 0 and the Jacobian is constant.
-    pub fn compute(mesh: &Mesh2D) -> Self {
+    /// # Panics
+    /// If the Jacobian is not positive and finite at every node (a degenerate,
+    /// non-convex or clockwise element).
+    pub fn compute(mesh: &Mesh2D, ops: &DGOperators2D) -> Self {
         let n_elements = mesh.n_elements;
+        let n_nodes = ops.n_nodes;
+        let n_face_nodes = ops.n_face_nodes;
 
-        let mut rx = Vec::with_capacity(n_elements);
-        let mut ry = Vec::with_capacity(n_elements);
-        let mut sx = Vec::with_capacity(n_elements);
-        let mut sy = Vec::with_capacity(n_elements);
-        let mut det_j = Vec::with_capacity(n_elements);
-        let mut det_j_inv = Vec::with_capacity(n_elements);
-        let mut surface_j = Vec::with_capacity(n_elements);
-        let mut normals = Vec::with_capacity(n_elements);
+        let n_vol = n_elements * n_nodes;
+        let n_face = n_elements * 4 * n_face_nodes;
+        let mut geom = Self {
+            rx: Vec::with_capacity(n_vol),
+            ry: Vec::with_capacity(n_vol),
+            sx: Vec::with_capacity(n_vol),
+            sy: Vec::with_capacity(n_vol),
+            det_j: Vec::with_capacity(n_vol),
+            det_j_inv: Vec::with_capacity(n_vol),
+            mass: Vec::with_capacity(n_vol),
+            area: Vec::with_capacity(n_elements),
+            surface_j: Vec::with_capacity(n_face),
+            normals: Vec::with_capacity(n_face),
+            n_elements,
+            n_nodes,
+            n_face_nodes,
+            elements: Vec::with_capacity(n_elements),
+            affine: true,
+        };
 
         for k in ElementIndex::iter(n_elements) {
             let verts = mesh.element_vertices(k);
-            assert_affine_quadrilateral(k.as_usize(), &verts);
+            let affine = is_parallelogram(&verts);
+            geom.affine &= affine;
 
-            // Compute Jacobian for this element
-            let (jac, s_jac, norm) = compute_element_jacobian(&verts);
-            assert!(
-                jac.det.is_finite() && jac.det > 0.0,
-                "GeometricFactors2D requires a positive finite Jacobian; element {} has det(J) = {}",
-                k.as_usize(),
-                jac.det
-            );
+            let mut area = 0.0;
+            for i in 0..n_nodes {
+                let m = BilinearMetric::at(&verts, ops.nodes_r[i], ops.nodes_s[i]);
+                assert!(
+                    m.det.is_finite() && m.det > 0.0,
+                    "GeometricFactors2D requires a positive finite Jacobian; element {} has \
+                     det(J) = {} at node {} (degenerate, non-convex or clockwise element)",
+                    k.as_usize(),
+                    m.det,
+                    i
+                );
+                geom.rx.push(m.y_s / m.det);
+                geom.ry.push(-m.x_s / m.det);
+                geom.sx.push(-m.y_r / m.det);
+                geom.sy.push(m.x_r / m.det);
+                geom.det_j.push(m.det);
+                geom.det_j_inv.push(1.0 / m.det);
+                let mass = ops.weights[i] * m.det;
+                geom.mass.push(mass);
+                area += mass;
+            }
+            geom.area.push(area);
 
-            rx.push(jac.rx);
-            ry.push(jac.ry);
-            sx.push(jac.sx);
-            sy.push(jac.sy);
-            det_j.push(jac.det);
-            det_j_inv.push(1.0 / jac.det);
-            surface_j.push(s_jac);
-            normals.push(norm);
+            for face in 0..4 {
+                for &node in &ops.face_nodes[face] {
+                    let m = BilinearMetric::at(&verts, ops.nodes_r[node], ops.nodes_s[node]);
+                    // sJ n = outward contravariant vector of the face
+                    let (vx, vy) = match face {
+                        0 => (m.y_r, -m.x_r), // −J∇s
+                        1 => (m.y_s, -m.x_s), // +J∇r
+                        2 => (-m.y_r, m.x_r), // +J∇s
+                        _ => (-m.y_s, m.x_s), // −J∇r
+                    };
+                    let s_j = (vx * vx + vy * vy).sqrt();
+                    geom.surface_j.push(s_j);
+                    geom.normals.push((vx / s_j, vy / s_j));
+                }
+            }
+
+            let ki = k.as_usize();
+            let n0 = geom.node_index(ki, 0);
+            let metric = AffineMetric {
+                rx: geom.rx[n0],
+                ry: geom.ry[n0],
+                sx: geom.sx[n0],
+                sy: geom.sy[n0],
+                det_j: geom.det_j[n0],
+                det_j_inv: geom.det_j_inv[n0],
+            };
+            let faces = std::array::from_fn(|face| {
+                let f0 = geom.face_node_index(ki, face, 0);
+                (geom.normals[f0], geom.surface_j[f0])
+            });
+            geom.elements.push(ElementGeometry {
+                affine,
+                metric,
+                faces,
+            });
         }
 
-        Self {
-            rx,
-            ry,
-            sx,
-            sy,
-            det_j,
-            det_j_inv,
-            surface_j,
-            normals,
-            n_elements,
-        }
+        geom
     }
 
-    /// Get the Jacobian determinant for an element.
+    /// Whether every element is a parallelogram, i.e. every metric term is
+    /// constant within its element.
     #[inline]
-    pub fn jacobian(&self, k: usize) -> f64 {
-        self.det_j[k]
+    pub fn is_affine(&self) -> bool {
+        self.affine
     }
 
-    /// Get the inverse Jacobian determinant for an element.
+    /// Whether element `k` is a parallelogram: its metric is constant (to
+    /// round-off), so kernels may use the values at node 0 throughout.
     #[inline]
-    pub fn jacobian_inv(&self, k: usize) -> f64 {
-        self.det_j_inv[k]
+    pub fn element_is_affine(&self, k: usize) -> bool {
+        self.elements[k].affine
     }
 
-    /// Get the surface Jacobian for a face.
+    /// Node-0 geometry of element `k` from a dense per-element array: for a
+    /// parallelogram ([`ElementGeometry::affine`]) its whole geometry.
     #[inline]
-    pub fn surface_jacobian(&self, k: usize, face: usize) -> f64 {
-        self.surface_j[k][face]
+    pub fn element_geometry(&self, k: usize) -> &ElementGeometry {
+        &self.elements[k]
     }
 
-    /// Get the outward unit normal for a face.
+    /// Index of node `i` of element `k` in the volume fields.
     #[inline]
-    pub fn normal(&self, k: usize, face: usize) -> (f64, f64) {
-        self.normals[k][face]
+    pub fn node_index(&self, k: usize, i: usize) -> usize {
+        k * self.n_nodes + i
     }
 
-    /// Transform reference derivatives to physical derivatives.
-    ///
-    /// Given ∂u/∂r and ∂u/∂s, compute ∂u/∂x and ∂u/∂y.
+    /// Index of face node `fi` of face `face` of element `k` in the face fields.
     #[inline]
-    pub fn transform_derivatives(&self, k: usize, du_dr: f64, du_ds: f64) -> (f64, f64) {
-        let du_dx = self.rx[k] * du_dr + self.sx[k] * du_ds;
-        let du_dy = self.ry[k] * du_dr + self.sy[k] * du_ds;
+    pub fn face_node_index(&self, k: usize, face: usize, fi: usize) -> usize {
+        (k * 4 + face) * self.n_face_nodes + fi
+    }
+
+    /// Jacobian determinant at node `i` of element `k`.
+    #[inline]
+    pub fn jacobian(&self, k: usize, i: usize) -> f64 {
+        self.det_j[self.node_index(k, i)]
+    }
+
+    /// Inverse Jacobian determinant at node `i` of element `k`.
+    #[inline]
+    pub fn jacobian_inv(&self, k: usize, i: usize) -> f64 {
+        self.det_j_inv[self.node_index(k, i)]
+    }
+
+    /// `∇r = (r_x, r_y)` at node `i` of element `k`.
+    #[inline]
+    pub fn grad_r(&self, k: usize, i: usize) -> (f64, f64) {
+        let n = self.node_index(k, i);
+        (self.rx[n], self.ry[n])
+    }
+
+    /// `∇s = (s_x, s_y)` at node `i` of element `k`.
+    #[inline]
+    pub fn grad_s(&self, k: usize, i: usize) -> (f64, f64) {
+        let n = self.node_index(k, i);
+        (self.sx[n], self.sy[n])
+    }
+
+    /// Contravariant vectors `(J∇r, J∇s)` at node `i` of element `k`.
+    #[inline]
+    pub fn contravariant(&self, k: usize, i: usize) -> ((f64, f64), (f64, f64)) {
+        let n = self.node_index(k, i);
+        let j = self.det_j[n];
+        (
+            (j * self.rx[n], j * self.ry[n]),
+            (j * self.sx[n], j * self.sy[n]),
+        )
+    }
+
+    /// Surface Jacobian at face node `fi` of face `face` of element `k`.
+    #[inline]
+    pub fn surface_jacobian(&self, k: usize, face: usize, fi: usize) -> f64 {
+        self.surface_j[self.face_node_index(k, face, fi)]
+    }
+
+    /// Outward unit normal at face node `fi` of face `face` of element `k`.
+    #[inline]
+    pub fn normal(&self, k: usize, face: usize, fi: usize) -> (f64, f64) {
+        self.normals[self.face_node_index(k, face, fi)]
+    }
+
+    /// Scale of the GLL lift at face node `fi`: `sJ / J` at the face node,
+    /// with `J` at the volume node `node` the face node coincides with.
+    #[inline]
+    pub fn lift_scale(&self, k: usize, face: usize, fi: usize, node: usize) -> f64 {
+        self.surface_jacobian(k, face, fi) * self.jacobian_inv(k, node)
+    }
+
+    /// Transform reference derivatives at node `i` of element `k` to physical
+    /// derivatives: `(∂u/∂x, ∂u/∂y)` from `(∂u/∂r, ∂u/∂s)`.
+    #[inline]
+    pub fn transform_derivatives(&self, k: usize, i: usize, du_dr: f64, du_ds: f64) -> (f64, f64) {
+        let n = self.node_index(k, i);
+        let du_dx = self.rx[n] * du_dr + self.sx[n] * du_ds;
+        let du_dy = self.ry[n] * du_dr + self.sy[n] * du_ds;
         (du_dx, du_dy)
+    }
+
+    /// Mass-weighted mean of the nodal values `u` of element `k`:
+    /// `Σ_i w_i J_i u_i / Σ_i w_i J_i`, the element mean of the discrete solution.
+    #[inline]
+    pub fn element_mean(&self, k: usize, u: &[f64]) -> f64 {
+        let mass = &self.mass[self.node_index(k, 0)..][..self.n_nodes];
+        mass.iter().zip(u).map(|(m, u)| m * u).sum::<f64>() / self.area[k]
+    }
+
+    /// `∫_k u = Σ_i w_i J_i u_i` of the nodal values `u` of element `k`.
+    #[inline]
+    pub fn integrate_element(&self, k: usize, u: &[f64]) -> f64 {
+        let mass = &self.mass[self.node_index(k, 0)..][..self.n_nodes];
+        mass.iter().zip(u).map(|(m, u)| m * u).sum()
+    }
+
+    /// Size of element `k` from its area, `√area` (for affine elements
+    /// `2√J`).
+    #[inline]
+    pub fn element_size(&self, k: usize) -> f64 {
+        self.area[k].sqrt()
+    }
+
+    /// The constant metric of element `k`, for kernels that still assume
+    /// parallelogram elements (the 3D horizontal kernels, the batched SIMD and
+    /// Burn prototypes). Their callers must check [`Self::is_affine`] (see
+    /// [`Self::assert_affine`]); on other elements it is the value at node 0.
+    #[inline]
+    pub fn affine_metric(&self, k: usize) -> AffineMetric {
+        debug_assert!(
+            self.elements[k].affine,
+            "affine_metric on a non-affine element"
+        );
+        self.elements[k].metric
+    }
+
+    /// The constant outward normal and surface Jacobian of face `face` of
+    /// element `k` (a straight face); see [`Self::affine_metric`].
+    #[inline]
+    pub fn affine_face(&self, k: usize, face: usize) -> ((f64, f64), f64) {
+        self.elements[k].faces[face]
+    }
+
+    /// Panic unless every element is a parallelogram, naming the component
+    /// that still needs constant per-element metrics.
+    pub fn assert_affine(&self, component: &str) {
+        assert!(
+            self.affine,
+            "{component} assumes parallelogram (affine) elements, but the mesh has general \
+             quadrilaterals; only the 2D SWE, tracer, advection and diffusion kernels support \
+             them so far (TODO P1.3)"
+        );
     }
 }
 
-/// Internal struct for Jacobian entries.
-struct ElementJacobian {
-    rx: f64,
-    ry: f64,
-    sx: f64,
-    sy: f64,
+/// Constant metric of a parallelogram element; see
+/// [`GeometricFactors2D::affine_metric`].
+#[derive(Clone, Copy, Debug)]
+pub struct AffineMetric {
+    pub rx: f64,
+    pub ry: f64,
+    pub sx: f64,
+    pub sy: f64,
+    pub det_j: f64,
+    pub det_j_inv: f64,
+}
+
+impl AffineMetric {
+    /// Contravariant vectors `(J∇r, J∇s)`.
+    #[inline]
+    pub fn contravariant(&self) -> ((f64, f64), (f64, f64)) {
+        let j = self.det_j;
+        ((j * self.rx, j * self.ry), (j * self.sx, j * self.sy))
+    }
+}
+
+/// Derivatives of the bilinear map at a reference point.
+struct BilinearMetric {
+    x_r: f64,
+    x_s: f64,
+    y_r: f64,
+    y_s: f64,
     det: f64,
 }
 
-fn assert_affine_quadrilateral(element: usize, verts: &[[f64; 2]; 4]) {
-    let [x0, y0] = verts[0];
-    let [x1, y1] = verts[1];
-    let [x2, y2] = verts[2];
-    let [x3, y3] = verts[3];
+impl BilinearMetric {
+    /// Vertices counter-clockwise from `(r, s) = (−1, −1)`.
+    fn at(verts: &[[f64; 2]; 4], r: f64, s: f64) -> Self {
+        let [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = *verts;
+        let x_r = 0.25 * ((1.0 - s) * (x1 - x0) + (1.0 + s) * (x2 - x3));
+        let y_r = 0.25 * ((1.0 - s) * (y1 - y0) + (1.0 + s) * (y2 - y3));
+        let x_s = 0.25 * ((1.0 - r) * (x3 - x0) + (1.0 + r) * (x2 - x1));
+        let y_s = 0.25 * ((1.0 - r) * (y3 - y0) + (1.0 + r) * (y2 - y1));
+        Self {
+            x_r,
+            x_s,
+            y_r,
+            y_s,
+            det: x_r * y_s - x_s * y_r,
+        }
+    }
+}
 
-    let bilinear_x = x0 - x1 + x2 - x3;
-    let bilinear_y = y0 - y1 + y2 - y3;
-    let bilinear_norm = (bilinear_x * bilinear_x + bilinear_y * bilinear_y).sqrt();
-
-    let mut scale: f64 = 1.0;
+/// Whether the quadrilateral is a parallelogram (zero bilinear term
+/// `x₀ − x₁ + x₂ − x₃`), relative to its size.
+fn is_parallelogram(verts: &[[f64; 2]; 4]) -> bool {
+    let [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = *verts;
+    let (bx, by) = (x0 - x1 + x2 - x3, y0 - y1 + y2 - y3);
+    let mut scale: f64 = 0.0;
     for i in 0..4 {
         let [xa, ya] = verts[i];
         let [xb, yb] = verts[(i + 1) % 4];
-        let edge_len = ((xb - xa) * (xb - xa) + (yb - ya) * (yb - ya)).sqrt();
-        scale = scale.max(edge_len).max(xa.abs()).max(ya.abs());
+        scale = scale.max((xb - xa).hypot(yb - ya));
     }
-
-    let tol = 1.0e-12 * scale;
-    assert!(
-        bilinear_norm <= tol,
-        "GeometricFactors2D only supports affine/parallelogram quadrilaterals; element {} has nonzero bilinear mapping term {} (tolerance {})",
-        element,
-        bilinear_norm,
-        tol
-    );
-}
-
-/// Compute Jacobian for an affine quadrilateral element.
-///
-/// For a quadrilateral with vertices v0, v1, v2, v3 in counter-clockwise order:
-/// - v0 at (r, s) = (-1, -1)
-/// - v1 at (r, s) = (+1, -1)
-/// - v2 at (r, s) = (+1, +1)
-/// - v3 at (r, s) = (-1, +1)
-///
-/// The bilinear mapping is:
-/// x(r, s) = (1-r)(1-s)/4 * x0 + (1+r)(1-s)/4 * x1 + (1+r)(1+s)/4 * x2 + (1-r)(1+s)/4 * x3
-///
-/// For affine quads (parallelograms), we use the linear approximation:
-/// x_r = (x1 - x0 + x2 - x3) / 4
-/// x_s = (x3 - x0 + x2 - x1) / 4
-fn compute_element_jacobian(verts: &[[f64; 2]; 4]) -> (ElementJacobian, [f64; 4], [(f64, f64); 4]) {
-    let [x0, y0] = verts[0];
-    let [x1, y1] = verts[1];
-    let [x2, y2] = verts[2];
-    let [x3, y3] = verts[3];
-
-    // Jacobian entries: J = [[x_r, x_s], [y_r, y_s]]
-    // For affine elements (parallelograms), these are constant
-    let x_r = (x1 - x0 + x2 - x3) / 4.0;
-    let x_s = (x3 - x0 + x2 - x1) / 4.0;
-    let y_r = (y1 - y0 + y2 - y3) / 4.0;
-    let y_s = (y3 - y0 + y2 - y1) / 4.0;
-
-    // Jacobian determinant
-    let det = x_r * y_s - x_s * y_r;
-
-    // Inverse Jacobian: J^{-1} = [[r_x, r_y], [s_x, s_y]] = (1/det) * [[y_s, -x_s], [-y_r, x_r]]
-    let rx = y_s / det;
-    let ry = -x_s / det;
-    let sx = -y_r / det;
-    let sy = x_r / det;
-
-    // Compute surface Jacobians and normals for each face
-    let mut surface_j = [0.0; 4];
-    let mut normals = [(0.0, 0.0); 4];
-
-    // Face 0 (bottom): from v0 to v1, s = -1
-    {
-        let dx = x1 - x0;
-        let dy = y1 - y0;
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        surface_j[0] = edge_len / 2.0; // Reference edge has length 2
-
-        // Outward normal (pointing down, -s direction)
-        let nx = dy / edge_len;
-        let ny = -dx / edge_len;
-        normals[0] = (nx, ny);
-    }
-
-    // Face 1 (right): from v1 to v2, r = +1
-    {
-        let dx = x2 - x1;
-        let dy = y2 - y1;
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        surface_j[1] = edge_len / 2.0;
-
-        // Outward normal (pointing right, +r direction)
-        let nx = dy / edge_len;
-        let ny = -dx / edge_len;
-        normals[1] = (nx, ny);
-    }
-
-    // Face 2 (top): from v2 to v3, s = +1
-    {
-        let dx = x3 - x2;
-        let dy = y3 - y2;
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        surface_j[2] = edge_len / 2.0;
-
-        // Outward normal (pointing up, +s direction)
-        let nx = dy / edge_len;
-        let ny = -dx / edge_len;
-        normals[2] = (nx, ny);
-    }
-
-    // Face 3 (left): from v3 to v0, r = -1
-    {
-        let dx = x0 - x3;
-        let dy = y0 - y3;
-        let edge_len = (dx * dx + dy * dy).sqrt();
-        surface_j[3] = edge_len / 2.0;
-
-        // Outward normal (pointing left, -r direction)
-        let nx = dy / edge_len;
-        let ny = -dx / edge_len;
-        normals[3] = (nx, ny);
-    }
-
-    (
-        ElementJacobian {
-            rx,
-            ry,
-            sx,
-            sy,
-            det,
-        },
-        surface_j,
-        normals,
-    )
+    bx.hypot(by) <= 1.0e-12 * scale
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn create_unit_square_mesh() -> Mesh2D {
-        Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2)
+    /// A general (non-parallelogram) quadrilateral mesh: the interior vertices
+    /// of a uniform `n × n` mesh of the unit square moved by a smooth field.
+    fn distorted_mesh(n: usize, amplitude: f64) -> Mesh2D {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, n, n);
+        for v in &mut mesh.vertices {
+            let [x, y] = *v;
+            let bump =
+                amplitude * (std::f64::consts::PI * x).sin() * (std::f64::consts::PI * y).sin();
+            *v = [x + bump * (2.0 * y - 1.0), y + 0.7 * bump * (1.0 - 2.0 * x)];
+        }
+        mesh
+    }
+
+    fn setup(mesh: &Mesh2D, order: usize) -> (DGOperators2D, GeometricFactors2D) {
+        let ops = DGOperators2D::new(order);
+        let geom = GeometricFactors2D::compute(mesh, &ops);
+        (ops, geom)
     }
 
     #[test]
     fn test_geometric_factors_dimensions() {
-        let mesh = create_unit_square_mesh();
-        let geom = GeometricFactors2D::compute(&mesh);
+        let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2);
+        let (ops, geom) = setup(&mesh, 2);
 
+        let n_vol = mesh.n_elements * ops.n_nodes;
         assert_eq!(geom.n_elements, mesh.n_elements);
-        assert_eq!(geom.rx.len(), mesh.n_elements);
-        assert_eq!(geom.det_j.len(), mesh.n_elements);
-        assert_eq!(geom.surface_j.len(), mesh.n_elements);
-        assert_eq!(geom.normals.len(), mesh.n_elements);
+        assert_eq!(geom.rx.len(), n_vol);
+        assert_eq!(geom.det_j.len(), n_vol);
+        assert_eq!(geom.mass.len(), n_vol);
+        assert_eq!(geom.area.len(), mesh.n_elements);
+        assert_eq!(geom.surface_j.len(), mesh.n_elements * 4 * ops.n_face_nodes);
+        assert_eq!(geom.normals.len(), mesh.n_elements * 4 * ops.n_face_nodes);
+        assert!(geom.is_affine());
     }
 
     #[test]
     fn test_unit_square_jacobian() {
-        // Single element from (0,0) to (1,1)
+        // [0, 1]² from [-1, 1]²: x = (1 + r)/2, so J = 1/4, rx = sy = 2
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let (ops, geom) = setup(&mesh, 3);
 
-        // For a unit square mapped from [-1,1]² to [0,1]²:
-        // x = (1 + r) / 2, y = (1 + s) / 2
-        // x_r = 1/2, x_s = 0, y_r = 0, y_s = 1/2
-        // det = 1/4
-        // rx = y_s / det = 2, ry = 0, sx = 0, sy = 2
-
-        assert!((geom.det_j[0] - 0.25).abs() < 1e-14, "det_J should be 0.25");
-        assert!((geom.rx[0] - 2.0).abs() < 1e-14, "rx should be 2");
-        assert!(geom.ry[0].abs() < 1e-14, "ry should be 0");
-        assert!(geom.sx[0].abs() < 1e-14, "sx should be 0");
-        assert!((geom.sy[0] - 2.0).abs() < 1e-14, "sy should be 2");
+        for i in 0..ops.n_nodes {
+            assert!((geom.jacobian(0, i) - 0.25).abs() < 1e-14);
+            assert!((geom.grad_r(0, i).0 - 2.0).abs() < 1e-14);
+            assert!(geom.grad_r(0, i).1.abs() < 1e-14);
+            assert!(geom.grad_s(0, i).0.abs() < 1e-14);
+            assert!((geom.grad_s(0, i).1 - 2.0).abs() < 1e-14);
+        }
+        assert!((geom.area[0] - 1.0).abs() < 1e-14);
     }
 
     #[test]
     fn test_scaled_rectangle_jacobian() {
-        // Rectangle [0, 2] × [0, 1]
+        // [0, 2] × [0, 1]: J = 1 · 1/2
         let mesh = Mesh2D::uniform_rectangle(0.0, 2.0, 0.0, 1.0, 1, 1);
-        let geom = GeometricFactors2D::compute(&mesh);
-
-        // For a 2×1 rectangle:
-        // x = (1 + r), y = (1 + s) / 2
-        // x_r = 1, x_s = 0, y_r = 0, y_s = 1/2
-        // det = 1/2
-
-        assert!((geom.det_j[0] - 0.5).abs() < 1e-14, "det_J should be 0.5");
+        let (_, geom) = setup(&mesh, 2);
+        assert!(geom.det_j.iter().all(|j| (j - 0.5).abs() < 1e-14));
     }
 
     #[test]
-    fn test_surface_jacobian_unit_square() {
+    fn test_surface_jacobian_and_normals_unit_square() {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let (ops, geom) = setup(&mesh, 2);
+        let expected = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)];
 
-        // For a unit square, each edge has length 1
-        // Surface Jacobian = physical_length / reference_length = 1 / 2 = 0.5
-        for face in 0..4 {
-            assert!(
-                (geom.surface_j[0][face] - 0.5).abs() < 1e-14,
-                "Surface Jacobian for face {} should be 0.5",
-                face
-            );
+        for (face, &(ex, ey)) in expected.iter().enumerate() {
+            for fi in 0..ops.n_face_nodes {
+                // Edge length 1 over reference length 2
+                assert!((geom.surface_jacobian(0, face, fi) - 0.5).abs() < 1e-14);
+                let (nx, ny) = geom.normal(0, face, fi);
+                assert!((nx - ex).abs() < 1e-14 && (ny - ey).abs() < 1e-14);
+            }
         }
-    }
-
-    #[test]
-    fn test_normals_unit_square() {
-        let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
-        let geom = GeometricFactors2D::compute(&mesh);
-
-        // Check that normals are unit vectors
-        for face in 0..4 {
-            let (nx, ny) = geom.normals[0][face];
-            let len = (nx * nx + ny * ny).sqrt();
-            assert!(
-                (len - 1.0).abs() < 1e-14,
-                "Normal for face {} should be unit vector",
-                face
-            );
-        }
-
-        // Check normal directions for axis-aligned square
-        // Face 0 (bottom): should point in -y direction
-        assert!((geom.normals[0][0].0).abs() < 1e-14);
-        assert!((geom.normals[0][0].1 - (-1.0)).abs() < 1e-14);
-
-        // Face 1 (right): should point in +x direction
-        assert!((geom.normals[0][1].0 - 1.0).abs() < 1e-14);
-        assert!((geom.normals[0][1].1).abs() < 1e-14);
-
-        // Face 2 (top): should point in +y direction
-        assert!((geom.normals[0][2].0).abs() < 1e-14);
-        assert!((geom.normals[0][2].1 - 1.0).abs() < 1e-14);
-
-        // Face 3 (left): should point in -x direction
-        assert!((geom.normals[0][3].0 - (-1.0)).abs() < 1e-14);
-        assert!((geom.normals[0][3].1).abs() < 1e-14);
     }
 
     #[test]
     fn test_transform_derivatives() {
+        // Unit square: du/dx = 2 du/dr, du/dy = 2 du/ds
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
-        let geom = GeometricFactors2D::compute(&mesh);
-
-        // For unit square: rx = sy = 2, ry = sx = 0
-        // So: du/dx = 2 * du/dr, du/dy = 2 * du/ds
-
-        let du_dr = 1.0;
-        let du_ds = 2.0;
-        let (du_dx, du_dy) = geom.transform_derivatives(0, du_dr, du_ds);
-
+        let (_, geom) = setup(&mesh, 1);
+        let (du_dx, du_dy) = geom.transform_derivatives(0, 0, 1.0, 2.0);
         assert!((du_dx - 2.0).abs() < 1e-14);
         assert!((du_dy - 4.0).abs() < 1e-14);
     }
 
     #[test]
-    fn test_positive_jacobian() {
-        // All elements should have positive Jacobian (counter-clockwise orientation)
-        let mesh = Mesh2D::uniform_rectangle(0.0, 2.0, 0.0, 1.0, 3, 2);
-        let geom = GeometricFactors2D::compute(&mesh);
-
-        for k in 0..mesh.n_elements {
-            assert!(
-                geom.det_j[k] > 0.0,
-                "Element {} should have positive Jacobian",
-                k
-            );
-        }
-    }
-
-    #[test]
     fn test_jacobian_inverse_consistency() {
-        let mesh = Mesh2D::uniform_rectangle(0.0, 2.0, 0.0, 1.0, 2, 2);
-        let geom = GeometricFactors2D::compute(&mesh);
-
-        for k in 0..mesh.n_elements {
-            assert!(
-                (geom.det_j[k] * geom.det_j_inv[k] - 1.0).abs() < 1e-14,
-                "det_J * det_J_inv should be 1"
-            );
+        let mesh = distorted_mesh(3, 0.1);
+        let (_, geom) = setup(&mesh, 3);
+        for (j, j_inv) in geom.det_j.iter().zip(&geom.det_j_inv) {
+            assert!(*j > 0.0);
+            assert!((j * j_inv - 1.0).abs() < 1e-14);
         }
     }
 
     #[test]
-    fn test_skewed_parallelogram_is_supported() {
+    fn test_skewed_parallelogram_is_affine() {
         let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
         mesh.vertices[2] = [0.25, 1.0];
         mesh.vertices[3] = [1.25, 1.0];
 
-        let geom = GeometricFactors2D::compute(&mesh);
-        assert!((geom.det_j[0] - 0.25).abs() < 1e-14);
+        let (_, geom) = setup(&mesh, 2);
+        assert!(geom.is_affine());
+        assert!(geom.det_j.iter().all(|j| (j - 0.25).abs() < 1e-14));
+    }
+
+    /// A trapezoid: the Jacobian varies over the element, and the element
+    /// area is its exact polygon area (J is bilinear, integrated exactly).
+    #[test]
+    fn test_non_affine_quad_has_varying_jacobian() {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
+        // Vertices (0,0), (1,0), (1.25,1), (0,1): area = (1 + 1.25)/2
+        let top_right = mesh.elements[0][2];
+        mesh.vertices[top_right] = [1.25, 1.0];
+        let (ops, geom) = setup(&mesh, 2);
+
+        assert!(!geom.is_affine());
+        let (j_min, j_max) = geom
+            .det_j
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(lo, hi), &j| (lo.min(j), hi.max(j)));
+        assert!(j_max - j_min > 0.05, "J should vary: {j_min} .. {j_max}");
+        assert!((geom.area[0] - 1.125).abs() < 1e-14);
+
+        // The right face is the segment (1,0)–(1.25,1): length √(1 + 1/16)
+        let (nx, ny) = geom.normal(0, 1, 0);
+        let len = (1.0f64 + 0.0625).sqrt();
+        assert!((nx - 1.0 / len).abs() < 1e-14 && (ny + 0.25 / len).abs() < 1e-14);
+        for fi in 0..ops.n_face_nodes {
+            assert!((geom.surface_jacobian(0, 1, fi) - 0.5 * len).abs() < 1e-14);
+        }
+    }
+
+    /// The element areas of a distorted mesh sum to the domain area.
+    #[test]
+    fn test_distorted_mesh_areas_sum_to_domain() {
+        let mesh = distorted_mesh(4, 0.15);
+        for order in 1..=4 {
+            let (_, geom) = setup(&mesh, order);
+            assert!(!geom.is_affine());
+            let total: f64 = geom.area.iter().sum();
+            assert!((total - 1.0).abs() < 1e-13, "P{order}: area {total}");
+        }
+    }
+
+    /// Discrete metric identities: D_r(J r_x) + D_s(J s_x) = 0 and the same for
+    /// y, at every node, for every order. They make the conservative form
+    /// preserve a uniform state on non-affine elements.
+    #[test]
+    fn test_discrete_metric_identities() {
+        let mesh = distorted_mesh(3, 0.15);
+        for order in 1..=5 {
+            let (ops, geom) = setup(&mesh, order);
+            let n = ops.n_nodes;
+            for k in 0..mesh.n_elements {
+                let comp =
+                    |f: fn(&GeometricFactors2D, usize, usize) -> ((f64, f64), (f64, f64)),
+                     which: usize| {
+                        let (mut ar, mut as_) = (vec![0.0; n], vec![0.0; n]);
+                        for i in 0..n {
+                            let (a_r, a_s) = f(&geom, k, i);
+                            ar[i] = if which == 0 { a_r.0 } else { a_r.1 };
+                            as_[i] = if which == 0 { a_s.0 } else { a_s.1 };
+                        }
+                        (ops.apply_dr(&ar), ops.apply_ds(&as_))
+                    };
+                for which in 0..2 {
+                    let (dr, ds) = comp(GeometricFactors2D::contravariant, which);
+                    for i in 0..n {
+                        assert!(
+                            (dr[i] + ds[i]).abs() < 1e-13,
+                            "P{order} element {k} node {i}: metric identity {}",
+                            dr[i] + ds[i]
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// At every face node, sJ·n equals the outward contravariant vector of
+    /// the volume node there, so the volume and surface terms telescope.
+    #[test]
+    fn test_face_normals_match_contravariant_vectors() {
+        let mesh = distorted_mesh(3, 0.15);
+        let (ops, geom) = setup(&mesh, 3);
+        for k in 0..mesh.n_elements {
+            for face in 0..4 {
+                for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
+                    let (a_r, a_s) = geom.contravariant(k, node);
+                    let (vx, vy) = match face {
+                        0 => (-a_s.0, -a_s.1),
+                        1 => a_r,
+                        2 => a_s,
+                        _ => (-a_r.0, -a_r.1),
+                    };
+                    let (nx, ny) = geom.normal(k, face, fi);
+                    let s_j = geom.surface_jacobian(k, face, fi);
+                    assert!((s_j * nx - vx).abs() < 1e-14 && (s_j * ny - vy).abs() < 1e-14);
+                }
+            }
+        }
+    }
+
+    /// Neighbours see the same face: equal sJ and opposite normals at the
+    /// matching (reversed) face nodes.
+    #[test]
+    fn test_shared_faces_agree_between_neighbours() {
+        let mesh = distorted_mesh(4, 0.15);
+        let (ops, geom) = setup(&mesh, 3);
+        let nfp = ops.n_face_nodes;
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for face in 0..4 {
+                let Some(nb) = mesh.neighbor(k, face) else {
+                    continue;
+                };
+                for fi in 0..nfp {
+                    let nfi = nfp - 1 - fi;
+                    let (nx, ny) = geom.normal(k.as_usize(), face, fi);
+                    let (mx, my) = geom.normal(nb.element, nb.face, nfi);
+                    assert!((nx + mx).abs() < 1e-13 && (ny + my).abs() < 1e-13);
+                    let sj = geom.surface_jacobian(k.as_usize(), face, fi);
+                    let sj_nb = geom.surface_jacobian(nb.element, nb.face, nfi);
+                    assert!((sj - sj_nb).abs() < 1e-14);
+                }
+            }
+        }
     }
 
     #[test]
-    #[should_panic(expected = "only supports affine/parallelogram quadrilaterals")]
-    fn test_non_affine_quad_is_rejected() {
+    #[should_panic(expected = "positive finite Jacobian")]
+    fn test_non_convex_quad_is_rejected() {
         let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
-        mesh.vertices[3] = [1.25, 1.0];
-
-        let _ = GeometricFactors2D::compute(&mesh);
+        // Pull the top-right vertex past the diagonal: a non-convex "dart"
+        let top_right = mesh.elements[0][2];
+        mesh.vertices[top_right] = [0.2, 0.2];
+        let ops = DGOperators2D::new(2);
+        let _ = GeometricFactors2D::compute(&mesh, &ops);
     }
 }

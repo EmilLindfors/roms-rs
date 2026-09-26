@@ -143,8 +143,9 @@ impl BarotropicTransport {
         }
     }
 
-    /// The DG divergence of the transport, in the strong form of the 2D
-    /// kernel: `∇·(hu, hv) − J⁻¹ Σ_f LIFT_f sJ_f ((hu, hv)·n − F*_h)`.
+    /// The DG divergence of the transport, in the strong (conservative) form
+    /// of the 2D kernel: `J⁻¹[Dr·(J∇r·q) + Ds·(J∇s·q)] − J⁻¹ Σ_f LIFT_f sJ_f
+    /// (q·n − F*_h)` with `q = (hu, hv)`.
     pub fn divergence_into(
         &self,
         ops: &DGOperators2D,
@@ -156,21 +157,21 @@ impl BarotropicTransport {
             let hu = &self.hu.data[k * nn..(k + 1) * nn];
             let hv = &self.hv.data[k * nn..(k + 1) * nn];
             let div = &mut out.data[k * nn..(k + 1) * nn];
-            let (rx, ry, sx, sy) = (geom.rx[k], geom.ry[k], geom.sx[k], geom.sy[k]);
             for (i, d) in div.iter_mut().enumerate() {
                 let (mut dr, mut ds) = (0.0, 0.0);
                 for j in 0..nn {
-                    let (fr, fs) = (rx * hu[j] + ry * hv[j], sx * hu[j] + sy * hv[j]);
+                    let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
+                    let (fr, fs) = (ar_x * hu[j] + ar_y * hv[j], as_x * hu[j] + as_y * hv[j]);
                     dr += ops.dr[(i, j)] * fr;
                     ds += ops.ds[(i, j)] * fs;
                 }
-                *d = dr + ds;
+                *d = geom.jacobian_inv(k, i) * (dr + ds);
             }
             for face in 0..4 {
-                let (nx, ny) = geom.normals[k][face];
-                let scale = geom.det_j_inv[k] * geom.surface_j[k][face];
                 let f_star = &self.face[(k * 4 + face) * nfn..][..nfn];
                 for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
+                    let (nx, ny) = geom.normal(k, face, fi);
+                    let scale = geom.lift_scale(k, face, fi, node);
                     let jump = nx * hu[node] + ny * hv[node] - f_star[fi];
                     for (i, d) in div.iter_mut().enumerate() {
                         *d -= scale * ops.lift[face][(i, fi)] * jump;
@@ -925,7 +926,7 @@ mod tests {
                     .build(),
             );
             let ops = Arc::new(DGOperators2D::new(1));
-            let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
             let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -10.0);
             let swe = PhysicsBuilder::swe_2d(
                 mesh.clone(),
@@ -962,7 +963,7 @@ mod tests {
             let length = 1000.0;
             let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 100.0, 10, 1));
             let ops = Arc::new(DGOperators2D::new(2));
-            let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
             let bathymetry =
                 Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -2.0 + 4.0 * x / length);
             let mut eta = Vec::with_capacity(mesh.n_elements * ops.n_nodes);
@@ -1088,13 +1089,7 @@ mod tests {
         let dt = 10.0;
 
         let element_integral = |field: &[f64], k: usize| -> f64 {
-            let values = &field[k * ops.n_nodes..(k + 1) * ops.n_nodes];
-            geom.det_j[k]
-                * values
-                    .iter()
-                    .zip(&ops.weights)
-                    .map(|(v, w)| v * w)
-                    .sum::<f64>()
+            geom.integrate_element(k, &field[k * ops.n_nodes..(k + 1) * ops.n_nodes])
         };
         let mut shoreline_elements = 0;
         for n in 0..10 {

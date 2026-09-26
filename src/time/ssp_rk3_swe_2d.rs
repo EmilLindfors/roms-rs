@@ -14,11 +14,11 @@
 //! let config = SWE2DTimeConfig::new(0.3, 9.81, 0.01)
 //!     .with_kuzmin_limiters(1.0);
 //!
-//! ssp_rk3_swe_2d_step_limited(&mut state, dt, t, &mesh, &ops, &rhs_fn, &config);
+//! ssp_rk3_swe_2d_step_limited(&mut state, dt, t, &mesh, &ops, &geom, &rhs_fn, &config);
 //! ```
 
 use crate::mesh::Mesh2D;
-use crate::operators::DGOperators2D;
+use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::{ImplicitDamping2D, KuzminParameter2D, SWESolution2D, WetDryConfig};
 #[cfg(not(feature = "parallel"))]
 use crate::solver::{
@@ -135,6 +135,7 @@ fn apply_configured_limiter(
     swe: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     config: &SWE2DTimeConfig,
 ) {
     // Apply slope/positivity limiters first
@@ -143,10 +144,17 @@ fn apply_configured_limiter(
     match config.limiter_type {
         SWELimiterType::None => {}
         SWELimiterType::Kuzmin => {
-            apply_swe_limiters_kuzmin_2d_parallel(swe, mesh, ops, &config.kuzmin, config.h_min);
+            apply_swe_limiters_kuzmin_2d_parallel(
+                swe,
+                mesh,
+                ops,
+                geom,
+                &config.kuzmin,
+                config.h_min,
+            );
         }
         SWELimiterType::PositivityOnly => {
-            swe_positivity_limiter_2d_parallel(swe, ops, config.h_min);
+            swe_positivity_limiter_2d_parallel(swe, geom, config.h_min);
         }
     }
 
@@ -154,20 +162,20 @@ fn apply_configured_limiter(
     match config.limiter_type {
         SWELimiterType::None => {}
         SWELimiterType::Kuzmin => {
-            apply_swe_limiters_kuzmin_2d(swe, mesh, ops, &config.kuzmin, config.h_min);
+            apply_swe_limiters_kuzmin_2d(swe, mesh, ops, geom, &config.kuzmin, config.h_min);
         }
         SWELimiterType::PositivityOnly => {
-            swe_positivity_limiter_2d(swe, ops, config.h_min);
+            swe_positivity_limiter_2d(swe, geom, config.h_min);
         }
     }
 
     // Apply wet/dry treatment (positivity, desingularization, velocity cap)
     if let Some(ref wet_dry) = config.wet_dry {
         #[cfg(feature = "parallel")]
-        apply_wet_dry_correction_all_parallel(swe, ops, wet_dry);
+        apply_wet_dry_correction_all_parallel(swe, geom, wet_dry);
 
         #[cfg(not(feature = "parallel"))]
-        apply_wet_dry_correction_all(swe, ops, wet_dry);
+        apply_wet_dry_correction_all(swe, geom, wet_dry);
     }
 }
 
@@ -189,6 +197,7 @@ fn apply_configured_limiter(
 /// * `t` - Current time
 /// * `mesh` - 2D mesh
 /// * `ops` - DG operators
+/// * `geom` - Geometric factors (element means for the limiters)
 /// * `rhs_fn` - Function that computes RHS given solution and time
 /// * `config` - Time configuration with limiter settings
 pub fn ssp_rk3_swe_2d_step_limited<F>(
@@ -197,6 +206,7 @@ pub fn ssp_rk3_swe_2d_step_limited<F>(
     t: f64,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     rhs_fn: F,
     config: &SWE2DTimeConfig,
 ) where
@@ -213,7 +223,7 @@ pub fn ssp_rk3_swe_2d_step_limited<F>(
         t,
         |q, time, out: &mut SWESolution2D| *out = rhs_fn(q, time),
         |stage, from, dt| implicit_damping(stage, from, dt, &damping),
-        |q| apply_configured_limiter(q, mesh, ops, config),
+        |q| apply_configured_limiter(q, mesh, ops, geom, config),
         &mut StageWorkspace::new(),
     );
 }
@@ -225,6 +235,7 @@ pub fn ssp_rk3_swe_2d_step_limited<F>(
 /// * `t_end` - Final simulation time
 /// * `mesh` - 2D mesh
 /// * `ops` - DG operators
+/// * `geom` - Geometric factors (element means for the limiters)
 /// * `rhs_fn` - Function computing RHS given solution and time
 /// * `dt_fn` - Function computing time step from current state
 /// * `config` - Time configuration with limiter settings
@@ -237,6 +248,7 @@ pub fn run_swe_2d_simulation<F, D, C>(
     t_end: f64,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     rhs_fn: F,
     dt_fn: D,
     config: &SWE2DTimeConfig,
@@ -257,7 +269,7 @@ where
             dt = t_end - t;
         }
 
-        ssp_rk3_swe_2d_step_limited(state, dt, t, mesh, ops, &rhs_fn, config);
+        ssp_rk3_swe_2d_step_limited(state, dt, t, mesh, ops, geom, &rhs_fn, config);
 
         t += dt;
         n_steps += 1;

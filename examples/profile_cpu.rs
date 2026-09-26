@@ -57,7 +57,7 @@ fn main() {
         Mesh2D::uniform_rectangle_with_bc(0.0, 10000.0, 0.0, 5000.0, nx, ny, BoundaryTag::Wall);
 
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let n_elements = mesh.n_elements;
     let n_nodes = ops.n_nodes;
 
@@ -127,7 +127,7 @@ fn main() {
         };
 
         let t0 = Instant::now();
-        ssp_rk3_swe_2d_step_limited(&mut state, dt, t, &mesh, &ops, rhs_fn, &time_config);
+        ssp_rk3_swe_2d_step_limited(&mut state, dt, t, &mesh, &ops, &geom, rhs_fn, &time_config);
         println!("  RK3 step {}: {:?} (dt={:.6})", i, t0.elapsed(), dt);
         t += dt;
     }

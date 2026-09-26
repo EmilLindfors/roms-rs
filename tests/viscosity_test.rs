@@ -67,7 +67,7 @@ fn test_viscosity_exponential_decay() {
 
     let mesh = Mesh2D::uniform_periodic(0.0, l, 0.0, l, nx, ny);
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     // Use low gravity to minimize wave effects relative to diffusion
     let equation = ShallowWater2D::new(0.1);
@@ -99,7 +99,7 @@ fn test_viscosity_exponential_decay() {
     let cfl_visc = 0.2;
 
     let min_h_elem = (0..mesh.n_elements)
-        .map(|k_elem| geom.det_j[k_elem].sqrt() * 2.0)
+        .map(|k_elem| geom.element_size(k_elem))
         .fold(f64::INFINITY, f64::min);
 
     while time < t_final {
@@ -143,7 +143,7 @@ fn test_viscosity_exponential_decay() {
 fn test_smagorinsky_smoke() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 6, 6);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(9.81);
     let bc = Reflective2D::new();
 
@@ -173,7 +173,7 @@ fn test_smagorinsky_smoke() {
     // Take 20 time steps
     let cfl = 0.2;
     let min_h_elem = (0..mesh.n_elements)
-        .map(|k_elem| geom.det_j[k_elem].sqrt() * 2.0)
+        .map(|k_elem| geom.element_size(k_elem))
         .fold(f64::INFINITY, f64::min);
 
     let mut time = 0.0;
@@ -209,7 +209,7 @@ fn test_viscosity_mass_conservation() {
     let l = 2.0 * PI;
     let mesh = Mesh2D::uniform_periodic(0.0, l, 0.0, l, 4, 4);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(9.81);
     let bc = Reflective2D::new();
 
@@ -232,7 +232,7 @@ fn test_viscosity_mass_conservation() {
 
     // Take a few steps
     let min_h_elem = (0..mesh.n_elements)
-        .map(|k_elem| geom.det_j[k_elem].sqrt() * 2.0)
+        .map(|k_elem| geom.element_size(k_elem))
         .fold(f64::INFINITY, f64::min);
 
     let mut time = 0.0;
@@ -280,7 +280,7 @@ fn test_viscosity_parallel_consistency() {
 
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(9.81);
     let bc = Reflective2D::new();
 

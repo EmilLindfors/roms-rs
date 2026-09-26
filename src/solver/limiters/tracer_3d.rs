@@ -313,7 +313,7 @@ fn apply_horizontal_bounds_field(
 
     for k in 0..n_elements {
         let element = ElementIndex::new(k);
-        let jac = geom.det_j[k];
+        let jac = geom.affine_metric(k).det_j;
         for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
             let mut weight_sum = 0.0;
             let mut inventory = 0.0;
@@ -391,7 +391,7 @@ fn apply_vertical_column_bounds_field(
     for k in 0..n_elements {
         let element = ElementIndex::new(k);
         for i in 0..n_nodes {
-            let horizontal_weight = ops.weights[i] * geom.det_j[k];
+            let horizontal_weight = ops.weights[i] * geom.affine_metric(k).det_j;
             let mut weight_sum = 0.0;
             let mut inventory = 0.0;
             let mut min_value = f64::INFINITY;
@@ -525,7 +525,7 @@ fn horizontal_layer_averages(
 
     for k in 0..n_elements {
         let element = ElementIndex::new(k);
-        let jac = geom.det_j[k];
+        let jac = geom.affine_metric(k).det_j;
         for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
             let mut weight_sum = 0.0;
             let mut inventory = 0.0;
@@ -658,7 +658,7 @@ mod tests {
     ) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, nx, ny);
         let ops = DGOperators2D::new(order);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -10.0);
         let sigma = SigmaGrid::uniform(n_levels);
         let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
@@ -682,7 +682,7 @@ mod tests {
             for i in 0..state.n_nodes {
                 for (level, &ds) in sigma.d_sigma().iter().enumerate() {
                     let weight = ops.weights[i]
-                        * geom.det_j[k]
+                        * geom.affine_metric(k).det_j
                         * layer_thickness(&state.eta, bathymetry, element, i, ds);
                     total += weight * field[index(k, i, level, state.n_nodes, state.n_levels)];
                 }

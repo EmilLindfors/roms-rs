@@ -262,7 +262,7 @@ mod tests {
         let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let device = burn_ndarray::NdArrayDevice::Cpu;
 
         let burn_geom = BurnGeometricFactors2D::<NdArray<f64>>::from_cpu(&geom, &device);
@@ -290,7 +290,7 @@ mod tests {
         let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let device = burn_ndarray::NdArrayDevice::Cpu;
 
         let burn_ops = BurnOperators2D::<NdArray<f64>>::from_cpu(&ops, &device);

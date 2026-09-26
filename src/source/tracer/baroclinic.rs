@@ -345,10 +345,8 @@ pub fn compute_tracer_gradients_node(
     // Transform to physical coordinates using geometric factors
     // ∂/∂x = rx * ∂/∂r + sx * ∂/∂s
     // ∂/∂y = ry * ∂/∂r + sy * ∂/∂s
-    let rx = geom.rx[ki];
-    let ry = geom.ry[ki];
-    let sx = geom.sx[ki];
-    let sy = geom.sy[ki];
+    let (rx, ry) = geom.grad_r(ki, i);
+    let (sx, sy) = geom.grad_s(ki, i);
 
     let dt_dx = rx * dt_dr + sx * dt_ds;
     let dt_dy = ry * dt_dr + sy * dt_ds;
@@ -402,14 +400,10 @@ pub fn compute_tracer_gradients(
             s_vals[j] = tracers.salinity;
         }
 
-        // Geometric factors for this element
-        let rx = geom.rx[ki];
-        let ry = geom.ry[ki];
-        let sx = geom.sx[ki];
-        let sy = geom.sy[ki];
-
         // Compute gradients at each node
         for i in 0..n_nodes {
+            let (rx, ry) = geom.grad_r(ki, i);
+            let (sx, sy) = geom.grad_s(ki, i);
             let mut dt_dr = 0.0;
             let mut dt_ds_ref = 0.0;
             let mut ds_dr = 0.0;

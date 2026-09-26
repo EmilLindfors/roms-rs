@@ -52,7 +52,7 @@ fn simulation_steps_do_not_allocate_state_sized_buffers() {
         0.0, 20_000.0, 0.0, 20_000.0, 24, 24,
     ));
     let ops = Arc::new(DGOperators2D::new(3));
-    let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+    let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
     // Dry beyond x ≈ 15.4 km, so WetDry runs its subcells at the shoreline
     let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
         -100.0 + 130.0 * (x / 20_000.0) - 20.0 * (y / 20_000.0).powi(2)

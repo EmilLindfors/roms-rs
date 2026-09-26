@@ -130,11 +130,8 @@ where
         ];
 
         for k in 0..n_elements {
-            let j = geom.det_j[k];
-            let rx = geom.rx[k];
-            let ry = geom.ry[k];
-            let sx = geom.sx[k];
-            let sy = geom.sy[k];
+            let metric = geom.affine_metric(k);
+            let (j, rx, ry, sx, sy) = (metric.det_j, metric.rx, metric.ry, metric.sx, metric.sy);
 
             for face in 0..4 {
                 let (nr, ns) = ref_normals[face];
@@ -264,7 +261,7 @@ mod tests {
         let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let device = burn_ndarray::NdArrayDevice::Cpu;
 
         let conn = BurnConnectivity::<NdArray<f64>>::from_mesh(
