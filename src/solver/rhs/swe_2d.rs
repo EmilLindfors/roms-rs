@@ -641,22 +641,31 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
 
     /// Volume, surface and source terms of element `k`, written (not added)
     /// to `out = [h, hu, hv]`; `faces` from [`Self::face_fluxes`].
+    ///
+    /// `face_mass`, if given (`4 · n_face_nodes` values), receives the mass
+    /// component of `F*` at every face node of the element, along its outward
+    /// normal (see [`compute_rhs_swe_2d_face_mass_into`]).
     fn element(
         &self,
         k: usize,
         ws: &mut ElementWorkspace,
         faces: &[SWEState2D],
         out: [&mut [f64]; 3],
+        face_mass: Option<&mut [f64]>,
     ) {
         let k_idx = ElementIndex::new(k);
         let [out_h, out_hu, out_hv] = out;
 
         // 1–2. Volume and surface terms
         match &self.split_form {
-            Some(split_form) => {
-                split_form.element_rhs(k_idx, &mut ws.split_form, faces, [out_h, out_hu, out_hv])
-            }
-            None => self.collocated_terms(k_idx, ws, [out_h, out_hu, out_hv]),
+            Some(split_form) => split_form.element_rhs(
+                k_idx,
+                &mut ws.split_form,
+                faces,
+                [out_h, out_hu, out_hv],
+                face_mass,
+            ),
+            None => self.collocated_terms(k_idx, ws, [out_h, out_hu, out_hv], face_mass),
         }
 
         // 3–4. Source terms
@@ -666,7 +675,13 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     /// Collocated nodal DG volume and surface terms:
     ///   −J⁻¹[Dr·Fr + Ds·Fs] + J⁻¹ Σ_f LIFT_f sJ_f (F(q⁻)·n − F*)
     /// with Fr = F·∇r, Fs = F·∇s.
-    fn collocated_terms(&self, k: ElementIndex, ws: &mut ElementWorkspace, out: [&mut [f64]; 3]) {
+    fn collocated_terms(
+        &self,
+        k: ElementIndex,
+        ws: &mut ElementWorkspace,
+        out: [&mut [f64]; 3],
+        mut face_mass: Option<&mut [f64]>,
+    ) {
         let (q, mesh, ops, geom, config) = (self.q, self.mesh, self.ops, self.geom, self.config);
         let ki = k.as_usize();
         let n_nodes = ops.n_nodes;
@@ -775,8 +790,11 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
 
                 // Boundary state q_b: the face flux is its physical flux F(q_b)·n
                 if ws.ext_exact[fi] {
-                    let diff = config.equation.normal_flux(&q_int, normal)
-                        - config.equation.normal_flux(&q_ext, normal);
+                    let f_b = config.equation.normal_flux(&q_ext, normal);
+                    if let Some(face_mass) = face_mass.as_deref_mut() {
+                        face_mass[face * n_face_nodes + fi] = f_b.h;
+                    }
+                    let diff = config.equation.normal_flux(&q_int, normal) - f_b;
                     (diff_h[fi], diff_hu[fi], diff_hv[fi]) = (diff.h, diff.hu, diff.hv);
                     continue;
                 }
@@ -794,6 +812,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                     h_min,
                     config.flux_type,
                 );
+                if let Some(face_mass) = face_mass.as_deref_mut() {
+                    face_mass[face * n_face_nodes + fi] = f_star.h;
+                }
 
                 // Interior flux F(q⁻)·n of the actual nodal state. It must match the
                 // volume term for the surface/volume pair to telescope (SBP); using the
@@ -909,11 +930,67 @@ pub fn compute_rhs_swe_2d_into<BC: SWEBoundaryCondition2D>(
     time: f64,
     out: &mut SWESolution2D,
 ) {
+    rhs_serial(q, mesh, ops, geom, config, time, out, None);
+}
+
+/// [`compute_rhs_swe_2d_into`] that also writes the numerical mass flux of
+/// every element face into `face_mass`.
+///
+/// Layout: `face_mass[(k · 4 + face) · n_face_nodes + fi]` is the mass
+/// component of `F*` at face node `fi` of face `face` of element `k`, along
+/// the element's outward normal (m²/s; [`face_mass_len`] values). With the
+/// nodal `(hu, hv)` it is the transport whose DG divergence is the mass
+/// tendency: `dh/dt = −(∇·(hu, hv) − J⁻¹ Σ_f LIFT_f sJ_f ((hu, hv)·n − F*_h))`
+/// for the collocated and flux-differencing volume terms (the mass part of
+/// the two-point flux is the mean of `(hu, hv)`). In `WetDry` elements with a
+/// dry node the volume term is a subcell finite-volume update; there only the
+/// element balance `∫ dh/dt = −∮ F*_h` holds.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_rhs_swe_2d_face_mass_into<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+    face_mass: &mut [f64],
+) {
+    rhs_serial(q, mesh, ops, geom, config, time, out, Some(face_mass));
+}
+
+/// Length of the face mass flux buffer of
+/// [`compute_rhs_swe_2d_face_mass_into`]: four faces of `n_face_nodes` per
+/// element.
+pub fn face_mass_len(mesh: &Mesh2D, ops: &DGOperators2D) -> usize {
+    mesh.n_elements * 4 * ops.n_face_nodes
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rhs_serial<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+    face_mass: Option<&mut [f64]>,
+) {
     check_rhs_output(out, mesh, ops);
     let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
     let mut faces = FaceFluxGuard::take();
     kernel.face_fluxes(&mut faces);
     let n = ops.n_nodes;
+    let per_element = 4 * ops.n_face_nodes;
+    let mut face_mass = face_mass.map(|fm| {
+        assert_eq!(
+            fm.len(),
+            face_mass_len(mesh, ops),
+            "face mass flux buffer length"
+        );
+        fm.chunks_exact_mut(per_element)
+    });
     let [out_h, out_hu, out_hv] = &mut out.data;
     let mut ws = WorkspaceGuard::take(ops);
     for (k, ((h, hu), hv)) in out_h
@@ -922,7 +999,8 @@ pub fn compute_rhs_swe_2d_into<BC: SWEBoundaryCondition2D>(
         .zip(out_hv.chunks_exact_mut(n))
         .enumerate()
     {
-        kernel.element(k, &mut ws, &faces, [h, hu, hv]);
+        let fm = face_mass.as_mut().and_then(Iterator::next);
+        kernel.element(k, &mut ws, &faces, [h, hu, hv], fm);
     }
     add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }
@@ -1088,6 +1166,38 @@ pub fn compute_rhs_swe_2d_parallel_into<BC: SWEBoundaryCondition2D + Sync>(
     time: f64,
     out: &mut SWESolution2D,
 ) {
+    rhs_parallel(q, mesh, ops, geom, config, time, out, None);
+}
+
+/// Parallel version of [`compute_rhs_swe_2d_face_mass_into`] (identical
+/// result).
+#[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_rhs_swe_2d_parallel_face_mass_into<BC: SWEBoundaryCondition2D + Sync>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+    face_mass: &mut [f64],
+) {
+    rhs_parallel(q, mesh, ops, geom, config, time, out, Some(face_mass));
+}
+
+#[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
+fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+    face_mass: Option<&mut [f64]>,
+) {
     use rayon::prelude::*;
 
     check_rhs_output(out, mesh, ops);
@@ -1097,15 +1207,32 @@ pub fn compute_rhs_swe_2d_parallel_into<BC: SWEBoundaryCondition2D + Sync>(
     let faces: &[SWEState2D] = &faces;
     let n = ops.n_nodes;
     let [out_h, out_hu, out_hv] = &mut out.data;
-    out_h
+    let elements = out_h
         .par_chunks_exact_mut(n)
         .zip(out_hu.par_chunks_exact_mut(n))
         .zip(out_hv.par_chunks_exact_mut(n))
-        .enumerate()
-        .for_each_init(
+        .enumerate();
+    match face_mass {
+        Some(face_mass) => {
+            assert_eq!(
+                face_mass.len(),
+                face_mass_len(mesh, ops),
+                "face mass flux buffer length"
+            );
+            elements
+                .zip(face_mass.par_chunks_exact_mut(4 * ops.n_face_nodes))
+                .for_each_init(
+                    || WorkspaceGuard::take(ops),
+                    |ws, ((k, ((h, hu), hv)), fm)| {
+                        kernel.element(k, ws, faces, [h, hu, hv], Some(fm))
+                    },
+                );
+        }
+        None => elements.for_each_init(
             || WorkspaceGuard::take(ops),
-            |ws, (k, ((h, hu), hv))| kernel.element(k, ws, faces, [h, hu, hv]),
-        );
+            |ws, (k, ((h, hu), hv))| kernel.element(k, ws, faces, [h, hu, hv], None),
+        ),
+    }
     add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }
 
@@ -1116,6 +1243,105 @@ mod tests {
     use crate::source::CoriolisSource2D;
 
     const G: f64 = 10.0;
+
+    /// The face mass flux output (mode splitting, TODO P4.1) leaves the RHS
+    /// unchanged bit for bit, is the same serial and parallel, and balances
+    /// every element, `∫_K dh/dt = −∮_K F*_h`, for every formulation, with
+    /// a dry region (the `WetDry` subcells included).
+    #[test]
+    fn face_mass_flux_balances_each_element() {
+        let (mesh, ops, geom) = create_test_setup(2);
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -1.0 + 2.0 * x);
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let eta = 0.2 + 0.05 * (2.0 * std::f64::consts::PI * x).sin();
+                let h = (eta - bathymetry.get(k, i)).max(0.0);
+                let (u, v) = (
+                    0.2 * (std::f64::consts::PI * y).cos(),
+                    0.1 * (std::f64::consts::PI * x).sin(),
+                );
+                q.set_state(k, i, SWEState2D::new(h, h * u, h * v));
+            }
+        }
+        let n_face = ops.n_face_nodes;
+
+        for formulation in [
+            SWEFormulation2D::Standard,
+            SWEFormulation2D::EntropyStable,
+            SWEFormulation2D::WetDry,
+        ] {
+            let config = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_formulation(formulation)
+                .with_bathymetry(&bathymetry)
+                .with_flux_type(SWEFluxType2D::HLL);
+            let plain = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+            let mut rhs = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+            let mut face_mass = vec![f64::NAN; face_mass_len(&mesh, &ops)];
+            compute_rhs_swe_2d_face_mass_into(
+                &q,
+                &mesh,
+                &ops,
+                &geom,
+                &config,
+                0.0,
+                &mut rhs,
+                &mut face_mass,
+            );
+            assert_eq!(
+                rhs.data, plain.data,
+                "{formulation:?}: the face output changed the RHS"
+            );
+            assert!(
+                face_mass.iter().all(|f| f.is_finite()),
+                "{formulation:?}: face slots not all written"
+            );
+
+            #[cfg(feature = "parallel")]
+            {
+                let mut rhs_par = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                let mut face_par = vec![f64::NAN; face_mass.len()];
+                compute_rhs_swe_2d_parallel_face_mass_into(
+                    &q,
+                    &mesh,
+                    &ops,
+                    &geom,
+                    &config,
+                    0.0,
+                    &mut rhs_par,
+                    &mut face_par,
+                );
+                assert_eq!(rhs_par.data, rhs.data, "{formulation:?}: parallel RHS");
+                assert_eq!(face_par, face_mass, "{formulation:?}: parallel face fluxes");
+            }
+
+            let mut max_inflow: f64 = 0.0;
+            for k in 0..mesh.n_elements {
+                let dh = &rhs.data[0][k * ops.n_nodes..(k + 1) * ops.n_nodes];
+                let volume: f64 =
+                    geom.det_j[k] * dh.iter().zip(&ops.weights).map(|(d, w)| d * w).sum::<f64>();
+                let outflow: f64 = (0..4)
+                    .map(|face| {
+                        let f = &face_mass[(k * 4 + face) * n_face..][..n_face];
+                        geom.surface_j[k][face]
+                            * f.iter()
+                                .zip(&ops.weights_1d)
+                                .map(|(f, w)| f * w)
+                                .sum::<f64>()
+                    })
+                    .sum();
+                max_inflow = max_inflow.max(outflow.abs());
+                assert!(
+                    (volume + outflow).abs() < 1e-12 * max_inflow.max(1e-3),
+                    "{formulation:?}, element {k}: ∫dh/dt = {volume:.3e}, ∮F* = {outflow:.3e}"
+                );
+            }
+        }
+    }
 
     fn create_test_setup(order: usize) -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 4, 4);

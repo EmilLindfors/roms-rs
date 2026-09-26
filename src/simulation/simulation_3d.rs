@@ -204,7 +204,7 @@ mod tests {
     use crate::physics::{Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D};
     use crate::simulation::Simulation;
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
-    use crate::solver::{DGSolution2D, SWESolution2D};
+    use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D};
     use crate::source::CoriolisSource2D;
     use crate::time::{ModeSplitIntegrator, SSPRK3};
     use crate::types::ElementIndex;
@@ -297,6 +297,10 @@ mod tests {
         }
 
         fn swe(&self) -> SWEPhysics2D<Reflective2D> {
+            self.swe_with(SWEFormulation2D::Standard)
+        }
+
+        fn swe_with(&self, formulation: SWEFormulation2D) -> SWEPhysics2D<Reflective2D> {
             PhysicsBuilder::swe_2d(
                 self.mesh.clone(),
                 self.ops.clone(),
@@ -305,6 +309,7 @@ mod tests {
                 Reflective2D::default(),
             )
             .with_bathymetry(self.bathymetry.clone())
+            .with_formulation(formulation)
             .build()
         }
 
@@ -662,5 +667,49 @@ mod tests {
             max_err < 1e-3,
             "transport off the inertial-Ekman solution by {max_err:.2e} of τ/(ρ₀f)"
         );
+    }
+
+    /// TODO P4.1 gate (PR 3): the barotropic transport of each step (DU_avg2)
+    /// is exactly the transport that moved the free surface,
+    /// `η̄ − ηⁿ = −Δt ∇·DU_avg2` at every node, for the collocated and the
+    /// entropy-stable split form (nonlinear seiche, walls).
+    #[test]
+    fn barotropic_transport_moves_the_free_surface() {
+        for formulation in [SWEFormulation2D::Standard, SWEFormulation2D::EntropyStable] {
+            let mut seiche = Seiche::new(10, 2, 10.0);
+            seiche.amplitude = 0.5;
+            let physics = hydrostatic(
+                &seiche.mesh,
+                &seiche.ops,
+                &seiche.geom,
+                &seiche.bathymetry,
+                seiche.swe_with(formulation),
+                no_stress(),
+                1e-4,
+                0.0,
+            );
+            let mut state = seiche.state_3d(&physics);
+            let mut integrator = ModeSplitIntegrator::new();
+            let dt = seiche.period() / 50.0;
+            let mut div = DGSolution2D::new(seiche.mesh.n_elements, seiche.ops.n_nodes);
+
+            for n in 0..10 {
+                let eta0 = state.eta.data.clone();
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                let transport = integrator.barotropic_transport().expect("after a step");
+                transport.divergence_into(&seiche.ops, &seiche.geom, &mut div);
+
+                let (mut change, mut residual) = (0.0_f64, 0.0_f64);
+                for ((eta, eta0), d) in state.eta.data.iter().zip(&eta0).zip(&div.data) {
+                    change = change.max((eta - eta0).abs());
+                    residual = residual.max((eta - eta0 + dt * d).abs());
+                }
+                assert!(
+                    residual < 1e-11 * change,
+                    "{formulation:?}, step {n}: η̄ − ηⁿ + Δt∇·DU_avg2 = {residual:.2e} \
+                     (η change {change:.2e})"
+                );
+            }
+        }
     }
 }

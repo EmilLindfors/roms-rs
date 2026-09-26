@@ -31,8 +31,8 @@ pub use coupled_swe_tracer::{
     ssp_rk3_coupled_step_timed, total_mass as total_mass_coupled, total_tracer,
 };
 pub use mode_split::{
-    BarotropicFilter, MIN_BAROTROPIC_SUBSTEPS, ModeSplitIntegrator, ModeSplitPhysics, SplitMethod,
-    step_average_weights,
+    BarotropicFilter, BarotropicPhysics, BarotropicTransport, MIN_BAROTROPIC_SUBSTEPS,
+    ModeSplitIntegrator, ModeSplitPhysics, SplitMethod, step_average_weights,
 };
 pub use ssp_rk3::{compute_dt, ssp_rk3_step, ssp_rk3_step_timed};
 pub use ssp_rk3_2d::{run_advection_2d, ssp_rk3_step_2d, ssp_rk3_step_2d_timed};

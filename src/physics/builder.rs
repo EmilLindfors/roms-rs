@@ -254,6 +254,32 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
     }
 }
 
+impl<BC: SWEBoundaryCondition2D> crate::time::BarotropicPhysics for SWEPhysics2D<BC>
+where
+    SWEPhysics2D<BC>: PhysicsModule<SWESolution2D>,
+{
+    /// [`PhysicsModule::compute_rhs_into`] that also writes the numerical mass
+    /// flux of every element face (layout of
+    /// [`crate::solver::compute_rhs_swe_2d_face_mass_into`]).
+    fn compute_rhs_face_mass_into(
+        &self,
+        state: &SWESolution2D,
+        time: f64,
+        out: &mut SWESolution2D,
+        face_mass: &mut [f64],
+    ) {
+        #[cfg(not(feature = "parallel"))]
+        use crate::solver::compute_rhs_swe_2d_face_mass_into as rhs_into;
+        #[cfg(feature = "parallel")]
+        use crate::solver::compute_rhs_swe_2d_parallel_face_mass_into as rhs_into;
+
+        let config = self.rhs_config();
+        rhs_into(
+            state, &self.mesh, &self.ops, &self.geom, &config, time, out, face_mass,
+        );
+    }
+}
+
 // =============================================================================
 // SWE Physics 2D Builder
 // =============================================================================
