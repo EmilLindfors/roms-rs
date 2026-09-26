@@ -20,6 +20,33 @@
 use crate::solver::SWEState2D;
 use crate::source::{SourceContext2D, SourceTerm2D};
 
+/// Cube root of `x`, within 2 ulp of `f64::cbrt`, about twice as fast as the
+/// MSVC C runtime's `cbrt`. Manning friction takes one per node and RK
+/// stage, which made it a tenth of the Frøya step.
+///
+/// The exponent divided by 3 in the bit pattern gives a guess within a few
+/// percent, and three Halley iterations `y ← y + y (x − y³)/(2y³ + x)`
+/// (cubic convergence) take it to round-off. In this correction form the
+/// last rounding is that of a small update, so the result stays within
+/// 2 ulp (the product form `y (y³ + 2x)/(2y³ + x)` reaches 2.1); the ratio
+/// is taken before the product so that `y (x − y³)` cannot underflow for
+/// tiny `x`. Zero, subnormal, negative and non-finite inputs go to
+/// `f64::cbrt`.
+#[inline]
+pub(crate) fn cbrt(x: f64) -> f64 {
+    if !(x >= f64::MIN_POSITIVE && x.is_finite()) {
+        return x.cbrt();
+    }
+    // 0x2A9F7893782DA1CE: (1023 − 1023/3) in the exponent field, with the
+    // mantissa offset that minimises the guess error (Kahan)
+    let mut y = f64::from_bits(x.to_bits() / 3 + 0x2A9F_7893_782D_A1CE);
+    for _ in 0..3 {
+        let y3 = y * y * y;
+        y += y * ((x - y3) / (2.0 * y3 + x));
+    }
+    y
+}
+
 /// A bottom-friction law written as a linear damping of the momentum,
 ///
 /// ```text
@@ -111,8 +138,7 @@ impl ManningFriction2D {
     #[inline]
     pub fn friction_coefficient(&self, h: f64) -> f64 {
         let h_eff = h.max(self.h_min);
-        // Use cbrt() instead of powf(1.0/3.0) - 2-3x faster
-        self.g * self.manning_n * self.manning_n / h_eff.cbrt()
+        self.g * self.manning_n * self.manning_n / cbrt(h_eff)
     }
 
     /// Compute friction source term explicitly.
@@ -123,7 +149,7 @@ impl ManningFriction2D {
         }
 
         let h_inv = 1.0 / state.h;
-        let speed = (state.hu * h_inv).hypot(state.hv * h_inv);
+        let speed = (state.hu * state.hu + state.hv * state.hv).sqrt() * h_inv;
         if speed < 1e-14 {
             return SWEState2D::zero();
         }
@@ -160,7 +186,7 @@ impl ManningFriction2D {
             return *state;
         }
 
-        let speed = (state.hu / state.h).hypot(state.hv / state.h);
+        let speed = (state.hu * state.hu + state.hv * state.hv).sqrt() / state.h;
         if speed < 1e-14 {
             return *state;
         }
@@ -181,7 +207,7 @@ impl ManningFriction2D {
             return false;
         }
 
-        let speed = (state.hu / state.h).hypot(state.hv / state.h);
+        let speed = (state.hu * state.hu + state.hv * state.hv).sqrt() / state.h;
         dt * self.damping_rate(state.h, speed) > 1.0
     }
 }
@@ -190,7 +216,8 @@ impl BottomFriction2D for ManningFriction2D {
     /// Λ = C_f |u| / h = g n² |u| / h^{4/3}.
     #[inline]
     fn damping_rate(&self, h: f64, speed: f64) -> f64 {
-        self.friction_coefficient(h) * speed / h.max(self.h_min)
+        let h_eff = h.max(self.h_min);
+        self.g * self.manning_n * self.manning_n * speed / (cbrt(h_eff) * h_eff)
     }
 }
 
@@ -238,7 +265,7 @@ impl ChezyFriction2D {
             return SWEState2D::zero();
         }
 
-        let speed = (state.hu / state.h).hypot(state.hv / state.h);
+        let speed = (state.hu * state.hu + state.hv * state.hv).sqrt() / state.h;
         if speed < 1e-14 {
             return SWEState2D::zero();
         }
@@ -345,8 +372,7 @@ where
         }
 
         let h_eff = ctx.state.h.max(self.h_min);
-        // Use cbrt() instead of powf(1.0/3.0) - 2-3x faster
-        let c_f = self.g * n * n / h_eff.cbrt();
+        let c_f = self.g * n * n / cbrt(h_eff);
 
         SWEState2D {
             h: 0.0,
@@ -370,6 +396,34 @@ mod tests {
 
     const G: f64 = 10.0;
     const TOL: f64 = 1e-10;
+
+    /// The fast cube root is within 2 ulp of `f64::cbrt` over the whole
+    /// normal range, exact on perfect cubes, and defers the edge cases.
+    #[test]
+    fn cbrt_matches_std() {
+        let mut worst: f64 = 0.0;
+        let mut x = f64::MIN_POSITIVE;
+        while x < 1e300 {
+            for m in [1.0, 1.37, 2.0, 2.9, 4.0, 5.5, 7.99] {
+                let v = x * m;
+                worst = worst.max((cbrt(v) - v.cbrt()).abs() / v.cbrt());
+            }
+            x *= 1.7;
+        }
+        assert!(
+            worst <= 2.0 * f64::EPSILON,
+            "worst relative error {worst:e}"
+        );
+        // Exact binary cubes (0.001 is not one)
+        for c in [1.0, 8.0, 27.0, 3.375, 0.125, 1e9] {
+            assert_eq!(cbrt(c), c.cbrt(), "{c}");
+        }
+        assert_eq!(cbrt(0.0), 0.0);
+        assert_eq!(cbrt(-8.0), -2.0);
+        assert!(cbrt(f64::NAN).is_nan());
+        assert_eq!(cbrt(f64::INFINITY), f64::INFINITY);
+        assert_eq!(cbrt(1e-310), 1e-310_f64.cbrt());
+    }
 
     fn make_context(h: f64, hu: f64, hv: f64) -> SourceContext2D {
         SourceContext2D::new(

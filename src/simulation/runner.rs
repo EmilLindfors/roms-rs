@@ -156,8 +156,11 @@ where
         self
     }
 
-    /// Set the callback interval.
+    /// Call back at `t_start + k·interval` exactly (the step before each
+    /// callback is shortened to land on it), e.g. for regularly sampled
+    /// station series and output times. Without an interval, every step.
     pub fn with_callback_interval(mut self, interval: f64) -> Self {
+        assert!(interval > 0.0, "callback interval must be positive");
         self.config.callback_interval = Some(interval);
         self
     }
@@ -222,7 +225,14 @@ where
         let mut n_steps = 0;
         let mut dt_min_used = f64::INFINITY;
         let mut dt_max_used: f64 = 0.0;
-        let mut last_callback_time = t_start;
+        // Callbacks fall exactly on t_start + k·interval: the step before
+        // one is shortened to land on it (k counts, so no drift accumulates)
+        let mut callbacks_done = 0_u64;
+        let next_callback = |k: u64| {
+            self.config
+                .callback_interval
+                .map(|interval| t_start + (k + 1) as f64 * interval)
+        };
         // Stage buffers reused for the whole run (no per-step allocation)
         let mut stages = StageWorkspace::new();
         // e.g. the positivity bound of a wet/dry scheme
@@ -281,9 +291,11 @@ where
                 );
             }
 
-            // Don't overshoot end time
-            if t + dt > t_end {
-                dt = t_end - t;
+            // Don't overshoot the end time or the next callback time
+            let target = next_callback(callbacks_done).map_or(t_end, |c| c.min(t_end));
+            let landed = t + dt >= target;
+            if landed {
+                dt = target - t;
             }
 
             // Track dt statistics
@@ -304,19 +316,18 @@ where
                 &mut stages,
             );
 
-            t += dt;
+            // Exact landing: no round-off drift from t + (target − t)
+            t = if landed { target } else { t + dt };
             n_steps += 1;
 
-            // Callback at configured interval
-            let should_callback = if let Some(interval) = self.config.callback_interval {
-                t - last_callback_time >= interval
-            } else {
-                true
-            };
-
-            if should_callback {
-                callback(state, t);
-                last_callback_time = t;
+            // Callback at the configured interval, or every step
+            match next_callback(callbacks_done) {
+                Some(c) if t >= c => {
+                    callback(state, t);
+                    callbacks_done += 1;
+                }
+                Some(_) => {}
+                None => callback(state, t),
             }
 
             // Progress output
@@ -403,6 +414,31 @@ mod tests {
 
         assert!(result.success);
         assert!(callback_count > 0);
+    }
+
+    /// An interval that is not a multiple of dt: callbacks land exactly on
+    /// t_start + k·interval (they used to fire at the first step past it and
+    /// drift by up to one dt per interval), and the run still ends at t_end.
+    #[test]
+    fn callbacks_land_on_the_interval() {
+        let (physics, mut state) = create_test_setup();
+        let sim = Simulation::new(physics, SSPRK3)
+            .with_cfl(0.5)
+            .with_callback_interval(0.0037);
+        let (t0, t_end) = (0.5, 0.52);
+        let mut times = Vec::new();
+        let result = sim.run_with_callback(&mut state, t0, t_end, |_, t| times.push(t));
+
+        assert!(result.success);
+        assert_eq!(result.final_time, t_end);
+        assert_eq!(times.len(), 6, "{times:?}"); // t0 and 5 intervals
+        for (k, &t) in times.iter().enumerate() {
+            let expected = t0 + k as f64 * 0.0037;
+            assert!(
+                (t - expected).abs() < 1e-15,
+                "callback {k} at {t}, expected {expected}"
+            );
+        }
     }
 
     #[test]

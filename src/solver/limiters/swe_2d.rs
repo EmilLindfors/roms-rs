@@ -228,9 +228,11 @@ pub fn swe_positivity_limiter_2d(
     ops: &DGOperators2D,
     h_dry: f64,
 ) -> usize {
-    let averages = swe_cell_averages_2d(swe, ops);
-    for_each_element(swe, |k, h, hu, hv| {
-        positivity_limit_element(h, hu, hv, averages[k], h_dry) as usize
+    // Each element needs only its own mean: no separate pass, no allocation
+    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
+    for_each_element(swe, |_, h, hu, hv| {
+        let avg = element_mean(h, hu, hv, &ops.weights, inv_total_weight);
+        positivity_limit_element(h, hu, hv, avg, h_dry) as usize
     })
 }
 
@@ -451,9 +453,10 @@ pub fn swe_positivity_limiter_2d_parallel(
     ops: &DGOperators2D,
     h_dry: f64,
 ) -> usize {
-    let averages = swe_cell_averages_2d_parallel(swe, ops);
-    par_for_each_element(swe, |k, h, hu, hv| {
-        positivity_limit_element(h, hu, hv, averages[k], h_dry) as usize
+    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
+    par_for_each_element(swe, |_, h, hu, hv| {
+        let avg = element_mean(h, hu, hv, &ops.weights, inv_total_weight);
+        positivity_limit_element(h, hu, hv, avg, h_dry) as usize
     })
 }
 

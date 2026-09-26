@@ -6,6 +6,15 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Tide-gauge validation of the Frøya run (TODO P3.1).**
+  - `scripts/kartverket_gauge.sh`: Kartverket water levels (observations or predictions) at a gauge, from the tide API, into the text format of `read_tide_gauge_file`. Mausund (MSU, 63.87° N 8.67° E) is the permanent gauge inside the Frøya domain; Heimsjø and Kristiansund, named in the TODO, are outside it. `data/tide_gauges/mausund_obs.txt` holds a year of hourly observations (2024-07 to 2025-07).
+  - `examples/froya_real_data.rs` samples η every `station_minutes` at the nearest node ≥ 3 m deep to each gauge (`gauges=`), writes the station series, and after `spinup_hours` compares the model's reference constants with the gauge's whole-record fit and with NorKyst at the gauge (`station_atlas=`): amplitude ratio, phase difference and complex difference per constituent, their root sum of squares, and RMSE against the observations and against the gauge's tidal prediction.
+  - `examples/tide_gauge_fit.rs`: reference constants of a gauge record over a window, every constituent the record resolves, optionally against the nearest point of a tidal atlas.
+  - `examples/norkyst_boundary_tides.rs` fits NorKyst at extra points (`points=`, `points_out=`, `spacing_km=0` to skip the perimeter); `data/froya_station_tides.txt` is NorKyst at Mausund, June 2025.
+- `analysis::resolvable_constituents`: the constituents a record of a given length separates (greedy Rayleigh criterion over a priority list). `Inference::N2_FROM_M2`, `Q1_FROM_O1`, `EQUILIBRIUM`, and `Inference::from_reference` (the ratio and lag offset of a longer record). `ReferenceFit::predict`: the tidal prediction of a fit at any times.
+- `ConstituentComparison::complex_difference`: `|A_m e^{iφ_m} − A_o e^{iφ_o}|`, the single-number constituent skill.
+- `TidalAtlas::nearest` (nearest point and its distance) and `TidalAtlas::infer` (replace or add a constituent at every point as a ratio of another, elevation and velocity).
+
 - **One characteristic open boundary, `CharacteristicOBC` (TODO P1.4).**
   - The boundary state takes the outgoing Riemann invariant `w+ = u_n + 2c` from the interior and the incoming `w− = u_n − 2c` from external data: `u_n,b = ½(w+ + w−)`, `c_b = ¼(w+ − w−)`, tangential velocity from the upwind side. Supercritical flow takes a whole side. A dry side gives the sonic state of the rarefaction into it.
   - The face flux is the physical flux `F(q_b)·n` (new `BoundaryState::Exact` from `SWEBoundaryCondition2D::boundary_state`, honoured by the standard and split-form kernels). The boundary no longer depends on the Riemann solver: the old ghost = external state was exact only for Roe.
@@ -135,8 +144,27 @@ All notable changes to this project should be documented in this file.
 - Boundary conditions: because the Riemann solver now supplies the Flather relation, several knobs no longer affect the ghost state and are kept only for API compatibility (documented as unused): `NestingBC2D::{with_flather, without_flather, with_flather_weight, with_h_ref}`, `OceanNestingBC2D::{with_flather, with_flather_weight}` (Flather and Dirichlet modes now coincide), `ChapmanFlather2D::{dx, dt, h_ref}` / `with_dt` / `with_h_ref`, `TSTConfig::{dx, h_ref, subtidal_weight}`, and the 1D `FlatherBC::{bathymetry, g}`.
 - API (io, breaking): `NorKystTextData::sea_surface_height_series` and `surface_current_series` now return `Result` and fail with the new `NorKystTextError::MultipleLocations` when the records span several sites/coordinates; split with the new `NorKystTextData::for_site(id)`. `examples/norkyst_tidal_validation.rs` picks the site nearest the requested `(lon, lat)`. The shared time parser moved from `io/norkyst_time.rs` to `io/datetime.rs`.
 
+### Performance
+
+- **Cheaper wet/dry stage work on the Frøya case (TODO P2.2, P2.3).** Measured with the new `froya_real_data profile=N` phase timer, single thread; on battery power, so indicative only.
+  - Point-implicit Manning damping: 3.5 → 1.3 ms per call. `hypot` became `sqrt(x² + y²)` (MSVC's `hypot` is a C runtime call), and a Halley `cbrt` (≤ 2 ulp of `f64::cbrt`, 2× faster than the CRT's) replaced the CRT `cbrt`.
+  - Post-processing: 0.84 → 0.41 ms per call.
+    - The positivity limiter takes each element mean inside its element kernel, with no separate pass or allocation.
+    - `SWEPhysics2D::post_process` skips a `Positivity(h ≤ h_dry)` limiter when wet/dry is on: the wet/dry correction applies the same limiter to every element it would change, so the result is bitwise identical.
+    - `LimiterContext2D` no longer computes the unused `h_min`, a serial sqrt per edge every stage.
+  - The WetDry hydrostatic HLL passes the node velocities to a face-aligned HLL core (`hll_flux_face_aligned`) instead of rebuilding momenta and dividing them back out. `hll_flux_swe_2d` is bitwise unchanged.
+  - Profile findings (TODO P2): HLL is about a third of the single-thread time (every face is solved twice), and scaling stops at about 8 threads on the test laptop (4 Zen 5 + 8 Zen 5c cores).
+- **One numerical flux per interior face for the split forms (TODO P2.2).**
+  - A face pass (`SplitFormSWE2D::edge_fluxes`, parallel over edges) evaluates F* once for both sides into a thread-cached buffer, and the element loop reads it.
+  - The two-point flux and the entropy dissipation are exactly antisymmetric, so only the bed and hydrostatic terms are evaluated per side. Neighbours now exchange exactly opposite mass fluxes (`test_face_pass_exchanges_opposite_mass_fluxes`).
+  - The RHS equals the old one to round-off (≤ 4e-19 on the snapshot cases).
+  - Frøya, single thread, pinned, on mains power: RHS 5.3 → 4.85 ms. The face-aligned HLL core had already taken it from ≈ 5.9 ms. Neutral at 24 threads.
+  - `SWEState2D` implements `Neg`.
+- API (breaking, minor): `LimiterContext2D::h_min` and `LimiterContext2D::with_h_min` are removed.
+
 ### Fixed
 
+- **`Simulation` callbacks drifted off their interval (simulation).** `with_callback_interval` fired at the first step past each interval, so callback (and output) times drifted by up to one dt per interval: hourly output at dt ≈ 0.7 s wandered off the hour. The step before each callback is now shortened to land on `t_start + k·interval` exactly. Test: `callbacks_land_on_the_interval`.
 - **NetCDF output time units (io, TODO P1.4).** `NetCDFWriter` labelled its `time` variable `seconds since 1970-01-01` but wrote simulation seconds, so every output file claimed to be from January 1970. The units now name the `ModelClock` epoch (`NetCDFWriterConfig::with_clock`; the default clock keeps Unix time). Test: `writer_time_units_name_the_model_epoch`.
 - **GeoTIFF georeferencing was never read (io, TODO P1.6).**
   - `GeoTiffBathymetry` looked up the GeoTIFF tags as `Tag::Unknown(33550)` and friends. The `tiff` crate decodes those numbers to named variants (`ModelPixelScaleTag`, …), so no lookup ever matched, and every file silently took its extent from the bbox hint. The loader also knew nothing of `ModelTransformation` (tag 34264).

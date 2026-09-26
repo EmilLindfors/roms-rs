@@ -5,7 +5,7 @@
 //! - hu = x-momentum (h * u)
 //! - hv = y-momentum (h * v)
 
-use std::ops::{Add, Mul, Sub};
+use std::ops::{Add, Mul, Neg, Sub};
 
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
@@ -157,6 +157,18 @@ impl Sub for SWEState2D {
             h: self.h - other.h,
             hu: self.hu - other.hu,
             hv: self.hv - other.hv,
+        }
+    }
+}
+
+impl Neg for SWEState2D {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        Self {
+            h: -self.h,
+            hu: -self.hu,
+            hv: -self.hv,
         }
     }
 }

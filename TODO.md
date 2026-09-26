@@ -26,7 +26,14 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `REVIEW.md`
 
 Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the deferred P0.11 GPU), P1.1 for the `Simulation` path, and the P1.2 core (split form; `WetDry` with second-order shoreline subcells as the wet/dry default). Frøya now runs on `Simulation` + `WetDry` on a water-only mesh, with correctly georeferenced bathymetry: the GeoTIFF reader had ignored its georeferencing. Lake at rest over the real bathymetry holds to 1.5e-10 m/s for 1 h. P1.4 is done: one characteristic OBC (`CharacteristicOBC` + external-state providers), NorKyst-800 boundary tides from a harmonic atlas, and a `ModelClock`. A full M2 cycle with NorKyst boundary tides at 9,653 P2 elements is stable, with 0 clips, in 6 min. Pick up in this order:
 
-1. **P3.1 validation.** The Frøya boundary forcing is now real (`data/froya_boundary_tides.txt`; regenerate with `examples/norkyst_boundary_tides.rs`, ~10 min over OPeNDAP). Run several days (`ramp_hours=3`) and fit `analysis::fit_reference_constants` at gauges (Heimsjø, Kristiansund) against NorKyst and Kartverket. Re-run the Bergen NorKyst fit too: it used the truncated periods fixed in P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)).
+1. **P3.1 validation: the tooling is done; the month-long run is still to do.** Heimsjø and Kristiansund lie outside the Frøya domain. Mausund (Kartverket MSU) is the gauge inside it, with a year of observations in `data/tide_gauges/mausund_obs.txt` and NorKyst at the gauge in `data/froya_station_tides.txt`. Both are untracked, like all of `data/`. Regenerate them with `./scripts/kartverket_gauge.sh Mausund 63.869331 8.665231 2024-07-01 2025-07-01` and `norkyst_boundary_tides -- spacing_km=0 points=8.665231,63.869331 out=/dev/null` (≈ 20 min). The run takes ≈ 9 h at 8.2 ms/step, so it waits until P2 makes it cheaper, or is started overnight:
+   ```
+   cargo run --release --no-default-features --features parallel,simd --example froya_real_data -- \
+       start=2025-05-31T00:00:00Z hours=720 ramp_hours=3 spinup_hours=24 output_minutes=1440
+   ```
+   It prints the per-constituent comparison against the gauge and NorKyst. 29 days after spin-up resolve N2 and Q1; 15 days (`hours=384`, ≈ 5 h) resolve M2/S2/K1/O1. A 30 h, 1 km smoke run gave M2 1.10× the gauge at +3°, with S2 still aliased at that length.
+   - **Finding: NorKyst-800 has almost no N2 here.** At Mausund over June 2025, N2 is 0.027 m in NorKyst against 0.156 m observed (both 30-day fits; the year fit gives 0.154 m). Q1 is 1.9× the observed, K1 and S2 are 12–21 % high, M4 is 5× too weak, and M2 agrees (1.026, −0.5°). NorKyst's own complex-difference RSS against the gauge is 0.14 m, 0.13 m of it from N2. The Frøya run therefore re-infers the boundary atlas's N2 and Q1 from M2/O1 with Mausund's ratios (`gauge_ratios=N2,Q1`, the default). Report the N2 deficiency to MET, and check other NorKyst gauges (Bergen) for it.
+   - Re-run the Bergen NorKyst fit too: it used the truncated periods fixed in P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)).
 2. **Shoreline cliffs (P1.6).** Lone wet nodes next to land nodes at `LAND_ELEVATION` = +5 m carry η jumps of ~1 m and 1–2.8 m/s through the tide (details under P1.4). They dominate the Frøya extremes; a foreshore DEM, or a gentler land elevation, is the likely fix.
 3. **Then let the error budget choose:** geometry (P1.3) if the coastline dominates the error, cost (P2, profile first) if run time does.
 4. **η-based limiting is on hold.** The subcells limit the partially dry elements, and tides are smooth. Revisit only if a real run shows oscillations.
@@ -156,7 +163,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [x] HLL is the default flux for wet/dry runs in `SWEPhysics2DBuilder`. `SWE2DRhsConfig::new` still defaults to Roe (low-level API).
 - [ ] Retire the cell-average/`linearize` workarounds: `WetDry` now covers wet/dry with nodal B.
 - [x] Move `examples/froya_real_data.rs` off the legacy `SWE2DTimeConfig` (`H_MIN` = 5 m, land as a 5 m film, cell-averaged B). It now uses `Simulation` + `WetDry` (nodal B) + `with_wet_dry` + `with_implicit_friction` on a water-only mesh, with all four sides open.
-- [ ] `SWEPhysics2D::post_process` builds a `LimiterContext2D` every stage, whose `new` computes `mesh.h_min()` (a sqrt per edge over all elements). No limiter reads `LimiterContext2D::h_min`: drop the field or cache it.
+- [x] `SWEPhysics2D::post_process` built a `LimiterContext2D` every stage, whose `new` computed `mesh.h_min()` serially (a sqrt per edge). No limiter read it: the field is gone (2026-09-26).
 
 ### P1.3 Geometry for real coastlines
 - [ ] Per-node isoparametric geometric factors (`[K]` → `[K × n_nodes]`). Remove the parallelogram-only panic (`geometric.rs:160-186`).
@@ -192,7 +199,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Land/nodata must not become B = 0 in `Bathymetry2D::from_geotiff` (`bathymetry_2d.rs:133`). Frøya now builds its bed itself, meshes water only and gives land nodes a positive elevation. Move that into the library (bed from GeoTIFF + coastline) and drop `from_geotiff`'s `unwrap_or(0.0)`.
 - [ ] `LandMask2D::from_coastline_and_bathymetry` counts water shallower than `min_depth` as land (the old Frøya run used 5 m, dropping every tidal flat) and uses nearest sampling. It is unused now; fix or delete it.
 - [ ] The Frøya GeoTIFF stores land as 0 and has no land elevations, so there are no intertidal flats: land is a wall at mean sea level (given `LAND_ELEVATION` = 5 m in the example). Real wetting/drying needs a merged DEM (e.g. Kartverket's) for the foreshore.
-  - Measured cost (P1.4 Frøya run): a wet node whose element neighbours are land at +5 m (a 5–10 m step within one P2 element) carries an η discontinuity of 0.8–1.0 m against the adjacent element at the same vertex, and 1–2.8 m/s, through the whole tide. These nodes set the run's η maximum and fastest current. Until a DEM exists, try a land elevation just above the highest tide (≈ +1.5 m) or a bed smoothed across the coastline.
+  - Measured cost (P1.4 Frøya run): a wet node whose element neighbours are land at +5 m (a 5–10 m step within one P2 element) carries an η discontinuity of 0.8–1.0 m against the adjacent element at the same vertex, and 1–2.8 m/s, through the whole tide. These nodes set the run's η maximum and fastest current. Until a DEM exists, try a land elevation just above the highest tide (≈ +1.5 m) or a bed smoothed across the coastline. `froya_real_data land_elevation=1.5` tries the former.
 - [ ] GSHHS inner rings (holes) and a spatial index for point-in-polygon (`coastline.rs:81-95`).
 - [ ] f(latitude) and β helpers. Fix `norwegian_coast_beta()` (β = 1.6e-11 is the 45°N value; 60°N ≈ 1.14e-11). UTM33 / Lambert for coast-scale domains.
 - [ ] Atmospheric forcing reader for MET Nordic / MEPS / AROME-Arctic (Lambert grid, 2D lat/lon, grid-relative winds, CF time), wired to `WindStress2D`/`AtmosphericPressure2D`.
@@ -226,12 +233,18 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 ### P2.2 Kernels
 - [ ] Sum-factorised contravariant volume term. Currently 4 dense (p+1)⁴ mat-vecs per element (`swe_2d.rs:835-874`): 2.6× fewer flops at P2, 3.5× at P3.
 - [ ] Diagonal LIFT (GLL mass is diagonal; `kernels.rs:490-517` applies it densely).
-- [ ] One Riemann solve per interior face (each is currently solved twice).
-- [ ] SIMD Manning; drop per-node `reference_to_physical` and `dyn` dispatch in the RHS.
+- [x] One Riemann solve per interior face, for the split forms (2026-09-26). A face pass (`SplitFormSWE2D::edge_fluxes`, parallel over edges) evaluates F* once per interior face for both sides into a thread-cached buffer, and the element loop reads it. The RHS matches the old one to round-off (21 of 52,920 values differ, by ≤ 4e-19), and the mass fluxes of neighbours are now exactly opposite (`test_face_pass_exchanges_opposite_mass_fluxes`). Frøya, pinned single thread on mains power: RHS 5.3 → 4.85 ms (−9 %); at 24 threads it is neutral (0.62 ms, the extra fork/join costs what it saves).
+  - [ ] The collocated (`Standard`) kernel still solves every face twice.
+  - [ ] The face pass rebuilds `SWENodeState2D` (two divisions) for both face nodes, and the element pass rebuilds them again for its own nodes. Fusing the pass into the element loop (each element computing the faces it owns, e.g. its right and top edges, with a coloured or two-phase schedule) would save the second pass over memory, which is what cancels the gain at 24 threads.
+- [ ] Drop per-node `reference_to_physical` and `dyn` dispatch in the RHS source loop: Coriolis alone was 5 % of single-thread time (2 FMAs per node behind a context build and two virtual calls).
+- [x] 2026-09-26: `hypot` → `sqrt(x² + y²)` in the hot paths (MSVC `hypot` is a C runtime call); a Halley `cbrt` for Manning (2× the CRT's, ≤ 2 ulp); the WetDry HLL takes the node velocities through a face-aligned core (`hll_flux_face_aligned`) instead of dividing momenta back out. Implicit damping 3.5 → 1.3 ms, post-processing 0.84 → 0.41 ms (single thread).
+- [x] The face-aligned HLL core, measured on mains power pinned to a Zen 5 core: RHS 5.8–6.7 → 5.4–5.7 ms (≈ 7 %). Benchmark this laptop only on mains power, pinned (logical CPUs 0–7 are Zen 5, 8–23 the slower Zen 5c); on battery everything runs ≈ 2× slower and noisier.
+- [ ] Explicit SIMD (`pulp`, or fearless_simd) pays only once kernels vectorise across nodes or elements: the node passes (damping, positivity, wet/dry) first, then batched face fluxes. faer is not on the hot path (element-local 9-node operators).
 
 ### P2.3 Fused in-place stepper
 - [ ] Limiter, positivity and wet/dry in one parallel in-place pass. Today the "parallel" paths `to_vec` every field, allocate per element, and copy back serially (`limiters/swe_2d.rs:626-725`, `wetting_drying.rs:526-541`): 1.5–2.5× of wall time.
   - Limiters done (P0.19: in-place `par_chunks_exact_mut` over the SoA fields). The `wetting_drying.rs` parallel path is done too (P1.2: in place, plus a node-parallel implicit damping pass). Still open: the per-stage `Vec` of cell averages and vertex bounds (move to a workspace with P1.1). Then fuse the limiter, the wet/dry correction and the implicit damping into one pass.
+  - 2026-09-26: the positivity limiter computes each element mean in its element kernel (no separate pass or `Vec`), and `post_process` skips a `Positivity(h ≤ h_dry)` limiter when wet/dry is on, since the wet/dry correction applies the same limiter to every element it would change (bitwise identical; `redundant_positivity_pass_is_skipped_exactly`). The Kuzmin paths still allocate averages and vertex bounds per stage.
 
 ### P2.4 Water-only work
 - [x] Mesh water only: `Mesh2D::retain_elements` (faces towards dropped elements become coastline walls). Frøya keeps only elements with a water node.
@@ -241,6 +254,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] One 250 m element in 1300 m water forces ~22× more global steps. Multirate/LTS SSP-RK or semi-implicit free surface (SLIM/Thetis practice): 2–20×.
 
 ### P2.6 Benchmarks (was P1.6)
+- Measured 2026-09-26: Frøya, 9,653 P2 elements (87k nodes), dt ≈ 0.65 s: 8.2 ms/step on 24 threads, so a 30-day validation run takes ≈ 9 h. Scaling stops at ≈ 8 threads (44.6 → 9 ms from 1 to 8–24 threads): the laptop's 4 Zen 5 + 8 Zen 5c cores and its power limit, not serial code. `froya_real_data profile=N` times each phase (RHS, post-processing, damping, dt) at 1 and all threads; single-thread RHS ≈ 85 % of the step.
 - [ ] Full-RHS and full-step throughput vs mesh size at realistic size (≥ 100k elements, bathymetry, limiter, open BCs), not cache-resident micro-cases.
 - [ ] DOFs/second; parallel scaling 1–16 cores; memory-bandwidth utilisation; allocation counting in CI.
 - [ ] Reconcile PERFORMANCE.md vs PROFILE.md: the same 65k run is recorded as 70.5 s and 217 s, and some cited RHS variants no longer exist.
@@ -269,11 +283,17 @@ The tidal-comparison code path is complete: fit with `HarmonicAnalysis` → `Har
     - Real 2-month Bergen fetch: M2 H ≈ 0.427 m, G ≈ 278°; S2 H ≈ 0.117 m; R² ≈ 0.97 over 61 days. P1 aliases into K1 at 61 days; ~6 months are needed to separate them.
     - **Phases carry the P0.15 period error (~1° for M2 at 61 days).**
   - **End-to-end example (DONE 2026-07-16):** `examples/norkyst_tidal_validation.rs` (synthetic round-trip by default, or a real file as argument). Recipe: shift the series to t = 0 and take `AstronomicalArguments` at the first sample before `reference_constants`.
-- [ ] Real Kartverket (H, G) for Bergen, Stavanger, Trondheim, Kristiansund. Drop records into `data/tide_gauges/` (only a synthetic `heimsjo.txt` ships). Longer fetch for the diurnal band.
+- [x] **Gauge validation path (2026-09-26).**
+  - `scripts/kartverket_gauge.sh` fetches Kartverket observations (the tide API serves a year of hourly data in one request; it has no harmonic constants, so fit the record).
+  - `examples/tide_gauge_fit.rs` fits a gauge record and compares it with an atlas point.
+  - `froya_real_data` samples stations and reports constituent and time-series skill.
+  - `norkyst_boundary_tides points=` fits NorKyst at the gauges.
+- [ ] Real Kartverket (H, G) for Bergen, Stavanger, Trondheim, Kristiansund: `./scripts/kartverket_gauge.sh <name> <lat> <lon> 2024-07-01 2025-07-01` (codes and positions from `tide_request=stationlist`). Only Mausund and a synthetic `heimsjo.txt` ship. `norwegian_stations` positions are approximate (Heimsjø is at 63.425, 9.102).
 - [ ] Run the model against NorKyst-800 barotropic tides for a test period. This needs P0.12, P0.20, P1.3–P1.5.
 - [ ] Compare with ADCP currents (`analysis/adcp.rs`). Add a tidal-ellipse fit and a complex-difference skill metric.
 - [ ] Document skill scores (RMSE, bias, correlation) per station.
-- [ ] Harmonic analysis: `fit_reference_constants` now has a Rayleigh check, P1/K2 inference and error returns (P1.4); `HarmonicAnalysis::fit` still has none of them. Port its callers or give it the same guard; an `AnalysisError` type instead of asserts and `String` errors.
+- [ ] Harmonic analysis: `fit_reference_constants` now has a Rayleigh check, inference (equilibrium or from a reference fit), `resolvable_constituents` and `predict`; `HarmonicAnalysis::fit` still has none of them. Port its callers (`StationValidationResult::compute_with_harmonics`, `validate_stations`) or give it the same guard; an `AnalysisError` type instead of asserts and `String` errors.
+- [ ] Station series are η only. Add depth-averaged velocity, which the ADCP comparison and the tidal-ellipse fit need. Sample at the gauge position by interpolating in the element, not at the nearest node ≥ 3 m deep (Mausund's node is 199 m away, and 7.6 m deep).
 
 ### P3.2 Cost-vs-accuracy benchmark against ROMS
 - [ ] Pareto benchmark on the same hardware: M2/S2/K1/O1 error at tide gauges vs core-hours, ROMS 2D at 800/400/200 m vs DG P1–P4. This is what settles "faster than ROMS" (`REVIEW.md` §5.5).
@@ -355,7 +375,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 ## Priority 6: Tech Debt and Structure (`REVIEW.md` §6.2)
 
 - [ ] Move the remaining examples (`profile_cpu`, `quick_profile`, `high_res_benchmark`; Frøya is done) from the legacy `ssp_rk3_swe_2d` stepper and its `SWE2DTimeConfig` onto `Simulation` + `SWEPhysics2D`. This is the precondition for deleting the legacy integrators below. The two paths currently duplicate limiter and wet/dry dispatch.
-- [ ] Delete the legacy integrators (`ssp_rk3*.rs`, three `coupled_swe_tracer` variants, `burn_ssp_rk3.rs`; ~2.4k lines). Make `CoupledState2D` implement `Integrable`; one time loop (fold `Simulation3D::run_with_callback`).
+- [ ] Delete the legacy integrators (`ssp_rk3*.rs`, three `coupled_swe_tracer` variants, `burn_ssp_rk3.rs`; ~2.4k lines). Make `CoupledState2D` implement `Integrable`; one time loop (fold `Simulation3D::run_with_callback`). `Simulation3D` still fires callbacks at the first step past each interval (drift); `Simulation` now lands on them exactly.
 - [ ] Collapse the duplicate config enums (`SWEFluxType2D` vs `StandardFlux2D`; three limiter enums).
 - [ ] Prune ~200 root re-exports to a `prelude`; export `Simulation3D`.
 - [ ] Error handling:

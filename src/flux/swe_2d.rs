@@ -34,7 +34,7 @@ fn rotate_to_normal(state: &SWEState2D, nx: f64, ny: f64) -> SWEState2D {
 /// - F_x = F_n * nx - F_t * ny
 /// - F_y = F_n * ny + F_t * nx
 #[inline]
-fn rotate_from_normal(flux: &SWEState2D, nx: f64, ny: f64) -> SWEState2D {
+pub(crate) fn rotate_from_normal(flux: &SWEState2D, nx: f64, ny: f64) -> SWEState2D {
     SWEState2D {
         h: flux.h,
         hu: flux.hu * nx - flux.hv * ny,
@@ -204,52 +204,86 @@ pub fn hll_flux_swe_2d(
 ) -> SWEState2D {
     let (nx, ny) = normal;
 
-    let h_l = q_l.h;
-    let h_r = q_r.h;
+    // Rotate to face-aligned coordinates
+    let q_l_rot = rotate_to_normal(q_l, nx, ny);
+    let q_r_rot = rotate_to_normal(q_r, nx, ny);
+
+    // Normal and tangential velocities
+    let velocity = |q: &SWEState2D| {
+        if q.h > h_min {
+            (q.hu / q.h, q.hv / q.h)
+        } else {
+            (0.0, 0.0)
+        }
+    };
+    let flux_rot = hll_flux_face_aligned(
+        HllSide::new(&q_l_rot, velocity(&q_l_rot)),
+        HllSide::new(&q_r_rot, velocity(&q_r_rot)),
+        g,
+        h_min,
+    );
+    rotate_from_normal(&flux_rot, nx, ny)
+}
+
+/// One side of a face for [`hll_flux_face_aligned`], in face-aligned
+/// components: depth, normal and tangential momentum, and the velocities the
+/// wave speeds and fluxes use (zero on a side at or below `h_min`; the
+/// momenta still enter the dissipation term).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HllSide {
+    pub h: f64,
+    pub hun: f64,
+    pub hut: f64,
+    pub un: f64,
+    pub ut: f64,
+}
+
+impl HllSide {
+    #[inline]
+    fn new(q_rot: &SWEState2D, (un, ut): (f64, f64)) -> Self {
+        Self {
+            h: q_rot.h,
+            hun: q_rot.hu,
+            hut: q_rot.hv,
+            un,
+            ut,
+        }
+    }
+}
+
+/// The HLL flux of [`hll_flux_swe_2d`] in face-aligned components (mass,
+/// normal and tangential momentum), from sides whose velocities are already
+/// known, so that callers holding velocities (the split-form kernel) skip
+/// the divisions.
+pub(crate) fn hll_flux_face_aligned(l: HllSide, r: HllSide, g: f64, h_min: f64) -> SWEState2D {
+    let (h_l, h_r) = (l.h, r.h);
 
     // Handle dry cells
     if h_l <= h_min && h_r <= h_min {
         return SWEState2D::zero();
     }
 
-    // Rotate to face-aligned coordinates
-    let q_l_rot = rotate_to_normal(q_l, nx, ny);
-    let q_r_rot = rotate_to_normal(q_r, nx, ny);
-
-    // Normal and tangential velocities
-    let (un_l, ut_l) = if h_l > h_min {
-        (q_l_rot.hu / h_l, q_l_rot.hv / h_l)
-    } else {
-        (0.0, 0.0)
-    };
-
-    let (un_r, ut_r) = if h_r > h_min {
-        (q_r_rot.hu / h_r, q_r_rot.hv / h_r)
-    } else {
-        (0.0, 0.0)
-    };
-
     let c_l = (g * h_l.max(0.0)).sqrt();
     let c_r = (g * h_r.max(0.0)).sqrt();
 
     // Wave speed estimates (Einfeldt)
-    let (s_l, s_r) = einfeldt_speeds_2d(h_l, h_r, un_l, un_r, c_l, c_r, g, h_min);
+    let (s_l, s_r) = einfeldt_speeds_2d(h_l, h_r, l.un, r.un, c_l, c_r, g, h_min);
 
     // Physical fluxes in rotated coordinates
     let f_l = SWEState2D {
-        h: h_l * un_l,
-        hu: h_l * un_l * un_l + 0.5 * g * h_l * h_l,
-        hv: h_l * un_l * ut_l,
+        h: h_l * l.un,
+        hu: h_l * l.un * l.un + 0.5 * g * h_l * h_l,
+        hv: h_l * l.un * l.ut,
     };
 
     let f_r = SWEState2D {
-        h: h_r * un_r,
-        hu: h_r * un_r * un_r + 0.5 * g * h_r * h_r,
-        hv: h_r * un_r * ut_r,
+        h: h_r * r.un,
+        hu: h_r * r.un * r.un + 0.5 * g * h_r * h_r,
+        hv: h_r * r.un * r.ut,
     };
 
     // HLL flux in rotated coordinates
-    let flux_rot = if s_l >= 0.0 {
+    if s_l >= 0.0 {
         f_l
     } else if s_r <= 0.0 {
         f_r
@@ -257,12 +291,10 @@ pub fn hll_flux_swe_2d(
         let inv_ds = 1.0 / (s_r - s_l);
         SWEState2D {
             h: inv_ds * (s_r * f_l.h - s_l * f_r.h + s_l * s_r * (h_r - h_l)),
-            hu: inv_ds * (s_r * f_l.hu - s_l * f_r.hu + s_l * s_r * (q_r_rot.hu - q_l_rot.hu)),
-            hv: inv_ds * (s_r * f_l.hv - s_l * f_r.hv + s_l * s_r * (q_r_rot.hv - q_l_rot.hv)),
+            hu: inv_ds * (s_r * f_l.hu - s_l * f_r.hu + s_l * s_r * (r.hun - l.hun)),
+            hv: inv_ds * (s_r * f_l.hv - s_l * f_r.hv + s_l * s_r * (r.hut - l.hut)),
         }
-    };
-
-    rotate_from_normal(&flux_rot, nx, ny)
+    }
 }
 
 /// Einfeldt wave speed estimates for 2D.
