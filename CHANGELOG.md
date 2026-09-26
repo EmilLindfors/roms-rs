@@ -89,6 +89,11 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **Barotropic transport for the 3D continuity (TODO P4.1, PR 3).**
+  - `ModeSplitIntegrator::barotropic_transport()`: the `BarotropicTransport` (DU_avg2 of Shchepetkin & McWilliams 2005) of the last step. It is the nodal (hu, hv) and the face mass flux F*_h of every RK stage of the barotropic pass, weighted by the filter's secondary weights and the SSP-RK3 stage weights.
+  - `BarotropicTransport::divergence_into` gives its DG divergence; η̄ − ηⁿ = −Δt·∇·DU_avg2 to round-off for `Standard` and `EntropyStable`. In `WetDry` elements with a dry node, and where the positivity limiter acts, only the element balance ∫(η̄ − ηⁿ) = −Δt∮F*_h holds.
+  - 2D kernel: `compute_rhs_swe_2d_face_mass_into` and `compute_rhs_swe_2d_parallel_face_mass_into` also write F*_h at every element face node (`face_mass_len` values); the plain RHS is unchanged bit for bit.
+  - API (breaking): `ModeSplitPhysics::Barotropic` must implement `BarotropicPhysics`, which `SWEPhysics2D` does.
 - **API (3D, breaking): `ModeSplitPhysics` (TODO P4.1, PR 2).**
   - `ModeSplitIntegrator::step(state, physics, dt, t)` takes the 3D model as a `ModeSplitPhysics`: the 2D module, the 3D RHS, the slow forcing, the implicit vertical terms and the per-stage hook. `Hydrostatic3D` implements it. New: `step_average_weights`.
   - `apply_vertical_diffusion` takes `rho0` and divides the surface and bottom stresses by it instead of a hardcoded 1025.
@@ -179,6 +184,7 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Mode splitting emptied dry elements at round-off (3D, TODO P4.1, PR 3).** η at the end of a step came from the RK combination of constant barotropic rates, which can leave a dry node a hair below its bed. The next barotropic pass then started from h ≈ −1e-16, and the positivity limiter emptied the element, counted as a negative-depth clip (15 clips in 10 steps on a beach). Now η = h̄ + B and ū = D̄ū/D̄ are taken exactly from the filtered state. Test: `barotropic_transport_balances_every_element_with_wetting_and_drying` (0 clips).
 - **Mode-split slow forcing (3D, TODO P4.1, PR 2).**
   - **Double counting.** `G` was the depth integral of the whole 3D momentum tendency, so the mean-flow advection and Coriolis the 2D module already computes were counted twice. A nonlinear unsheared seiche drifted from the pure 2D model by 0.14 of its amplitude in two periods.
     - `G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀` now subtracts the same 3D operator applied to columns of uniform `ū`. The remainder is the baroclinic PGF and the momentum dispersion of the vertical shear.

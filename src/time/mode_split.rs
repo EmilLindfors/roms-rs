@@ -16,7 +16,9 @@
 //!    `[tⁿ, tⁿ + M*·Δt/n_bt]`, `M* ≈ 1.3·n_bt`. `n_bt` follows from the 2D CFL
 //!    every step. The substep states are averaged with the power-law weights of
 //!    [`BarotropicFilter`], centred on `tⁿ⁺¹`; the average `(η̄, D̄ū)` is the new
-//!    barotropic state, with `ū = D̄ū / D̄`.
+//!    barotropic state, with `ū = D̄ū / D̄`. The fluxes of every RK stage are
+//!    accumulated with the secondary weights into the transport that moved
+//!    `η` over the step, `η̄ − ηⁿ = −Δt·∇·DU_avg2` ([`BarotropicTransport`]).
 //! 3. **3D stages.** SSP-RK3 on the 3D fields. In every stage the depth mean of
 //!    the velocity tendency is replaced by the constant rate `(ūⁿ⁺¹ − ūⁿ)/Δt`,
 //!    and `η, ū, v̄` get the same constant rates. SSP-RK3 reproduces a
@@ -50,6 +52,7 @@
 //! - `R₃D` is still evaluated into a freshly allocated state (TODO P4.5).
 
 use crate::mesh::data::Bathymetry2D;
+use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -62,10 +65,126 @@ use crate::vertical::SigmaGrid;
 /// weights cannot be centred on `tⁿ⁺¹`.
 pub const MIN_BAROTROPIC_SUBSTEPS: usize = 4;
 
+/// The fast-mode module: a 2D shallow-water RHS in transport form that can
+/// also report the numerical mass flux at every element face.
+pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
+    /// [`PhysicsModule::compute_rhs_into`], also writing the mass component
+    /// of `F*` at every element face node along its outward normal into
+    /// `face_mass` (layout of
+    /// [`crate::solver::compute_rhs_swe_2d_face_mass_into`]).
+    fn compute_rhs_face_mass_into(
+        &self,
+        state: &SWESolution2D,
+        time: f64,
+        out: &mut SWESolution2D,
+        face_mass: &mut [f64],
+    );
+}
+
+/// The barotropic transport of one baroclinic step: the fluxes that moved the
+/// free surface, integrated over the barotropic pass with the filter's
+/// secondary weights (`DU_avg2` of Shchepetkin & McWilliams 2005).
+///
+/// With the substep states averaged with primary weights `w_m`, and substep
+/// `j` advancing `h` by `−Δt_bt Σ_s b_s ∇·F_{j,s}` (SSP-RK3 stages
+/// `b = (1/6, 1/6, 2/3)`),
+///
+/// ```text
+///     η̄ − ηⁿ = −Δt ∇·DU_avg2,    DU_avg2 = (1/n_bt) Σ_j W_j Σ_s b_s F_{j,s},
+///     W_j = Σ_{m ≥ j} w_m.
+/// ```
+///
+/// The DG divergence is linear in the nodal `(hu, hv)` and the face mass flux
+/// `F*_h`, so both are accumulated ([`Self::divergence_into`]). The identity is
+/// exact to round-off for the collocated and flux-differencing forms. Two
+/// cases only keep the element balance `∫ (η̄ − ηⁿ) = −Δt ∮ F*_h`, not the
+/// nodal identity:
+/// - `WetDry` elements with a dry node, where the volume term is a subcell
+///   finite-volume update;
+/// - elements the positivity limiter or wet/dry correction changed (they
+///   keep the element mean).
+///
+/// Mass sources in the 2D module are not part of the transport.
+pub struct BarotropicTransport {
+    /// Nodal transport `hu` (m²/s).
+    pub hu: DGSolution2D,
+    /// Nodal transport `hv` (m²/s).
+    pub hv: DGSolution2D,
+    /// Mass flux out of every element face node (m²/s), laid out as
+    /// `(k · 4 + face) · n_face_nodes + fi`.
+    pub face: Vec<f64>,
+}
+
+impl BarotropicTransport {
+    fn new(n_elements: usize, n_nodes: usize, n_face_values: usize) -> Self {
+        Self {
+            hu: DGSolution2D::new(n_elements, n_nodes),
+            hv: DGSolution2D::new(n_elements, n_nodes),
+            face: vec![0.0; n_face_values],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.hu.fill(0.0);
+        self.hv.fill(0.0);
+        self.face.fill(0.0);
+    }
+
+    /// Add `c ×` the nodal transport of `state` and the face fluxes `face`.
+    fn accumulate(&mut self, c: f64, state: &SWESolution2D, face: &[f64]) {
+        for (a, b) in self.hu.data.iter_mut().zip(&state.data[SWE_VAR_HU]) {
+            *a += c * b;
+        }
+        for (a, b) in self.hv.data.iter_mut().zip(&state.data[SWE_VAR_HV]) {
+            *a += c * b;
+        }
+        for (a, b) in self.face.iter_mut().zip(face) {
+            *a += c * b;
+        }
+    }
+
+    /// The DG divergence of the transport, in the strong form of the 2D
+    /// kernel: `∇·(hu, hv) − J⁻¹ Σ_f LIFT_f sJ_f ((hu, hv)·n − F*_h)`.
+    pub fn divergence_into(
+        &self,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        out: &mut DGSolution2D,
+    ) {
+        let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
+        for k in 0..out.n_elements {
+            let hu = &self.hu.data[k * nn..(k + 1) * nn];
+            let hv = &self.hv.data[k * nn..(k + 1) * nn];
+            let div = &mut out.data[k * nn..(k + 1) * nn];
+            let (rx, ry, sx, sy) = (geom.rx[k], geom.ry[k], geom.sx[k], geom.sy[k]);
+            for (i, d) in div.iter_mut().enumerate() {
+                let (mut dr, mut ds) = (0.0, 0.0);
+                for j in 0..nn {
+                    let (fr, fs) = (rx * hu[j] + ry * hv[j], sx * hu[j] + sy * hv[j]);
+                    dr += ops.dr[(i, j)] * fr;
+                    ds += ops.ds[(i, j)] * fs;
+                }
+                *d = dr + ds;
+            }
+            for face in 0..4 {
+                let (nx, ny) = geom.normals[k][face];
+                let scale = geom.det_j_inv[k] * geom.surface_j[k][face];
+                let f_star = &self.face[(k * 4 + face) * nfn..][..nfn];
+                for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
+                    let jump = nx * hu[node] + ny * hv[node] - f_star[fi];
+                    for (i, d) in div.iter_mut().enumerate() {
+                        *d -= scale * ops.lift[face][(i, fi)] * jump;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The 3D model as the mode splitter sees it.
 pub trait ModeSplitPhysics {
     /// The 2D shallow-water module of the fast mode, in transport form.
-    type Barotropic: PhysicsModule<SWESolution2D>;
+    type Barotropic: BarotropicPhysics;
 
     /// The fast-mode module.
     fn barotropic(&self) -> &Self::Barotropic;
@@ -224,6 +343,9 @@ pub enum SplitMethod {
 pub struct BarotropicFilter {
     n_bt: usize,
     weights: Vec<f64>,
+    /// `W_j = Σ_{m ≥ j} w_m`, the weight of substep `j`'s fluxes in the
+    /// filtered state.
+    secondary: Vec<f64>,
 }
 
 impl BarotropicFilter {
@@ -257,7 +379,15 @@ impl BarotropicFilter {
             }
             scale *= centroid / n;
         }
-        Self { n_bt, weights }
+        let mut secondary = weights.clone();
+        for m in (0..secondary.len().saturating_sub(1)).rev() {
+            secondary[m] += secondary[m + 1];
+        }
+        Self {
+            n_bt,
+            weights,
+            secondary,
+        }
     }
 
     /// Substeps per baroclinic step (`Δt/Δt_bt`).
@@ -269,6 +399,11 @@ impl BarotropicFilter {
     /// window length `M*` is `weights().len()`.
     pub fn weights(&self) -> &[f64] {
         &self.weights
+    }
+
+    /// Secondary weight `W_j = Σ_{m ≥ j} w_m` of substep `j`, at index `j − 1`.
+    pub fn secondary_weights(&self) -> &[f64] {
+        &self.secondary
     }
 
     fn centroid(weights: &[f64]) -> f64 {
@@ -292,6 +427,10 @@ struct Buffers {
     forcing: SWESolution2D,
     /// `G` of the last steps, for the step average.
     history: SlowForcingHistory,
+    /// DU_avg2 of the last step.
+    transport: BarotropicTransport,
+    /// Face mass fluxes of one 2D RHS evaluation.
+    face_mass: Vec<f64>,
     /// Depth means of the u/v tendency (or of u/v after diffusion).
     mean_u: DGSolution2D,
     mean_v: DGSolution2D,
@@ -302,14 +441,17 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn new(state: &Solution3D) -> Self {
+    fn new(state: &Solution3D, n_face_nodes: usize) -> Self {
         let (ne, nn) = (state.n_elements, state.n_nodes);
+        let n_face_values = ne * 4 * n_face_nodes;
         Self {
             rhs_n: Solution3D::new(ne, nn, state.n_levels),
             q: SWESolution2D::new(ne, nn),
             q_avg: SWESolution2D::new(ne, nn),
             forcing: SWESolution2D::new(ne, nn),
             history: SlowForcingHistory::new(ne, nn),
+            transport: BarotropicTransport::new(ne, nn, n_face_values),
+            face_mass: vec![0.0; n_face_values],
             mean_u: DGSolution2D::new(ne, nn),
             mean_v: DGSolution2D::new(ne, nn),
             rate_eta: DGSolution2D::new(ne, nn),
@@ -375,6 +517,11 @@ impl ModeSplitIntegrator {
         self
     }
 
+    /// The barotropic transport (DU_avg2) of the last step, if any.
+    pub fn barotropic_transport(&self) -> Option<&BarotropicTransport> {
+        self.buffers.as_ref().map(|b| &b.transport)
+    }
+
     /// Barotropic substeps per baroclinic step used by the last step (0 before
     /// the first step).
     pub fn last_substeps(&self) -> usize {
@@ -398,12 +545,16 @@ impl ModeSplitIntegrator {
             q_avg,
             forcing: g_term,
             history,
+            transport,
+            face_mass,
             mean_u,
             mean_v,
             rate_eta,
             rate_ubar,
             rate_vbar,
-        } = self.buffers.get_or_insert_with(|| Buffers::new(state));
+        } = self
+            .buffers
+            .get_or_insert_with(|| Buffers::new(state, barotropic.operators().n_face_nodes));
 
         // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3)
         physics.rhs_3d_into(state, t, rhs_n);
@@ -427,15 +578,27 @@ impl ModeSplitIntegrator {
         let filter = self.filter.as_ref().expect("filter was just set");
         let dt_bt = dt / n_bt as f64;
 
+        // SSP-RK3 in Butcher form: u + dt (k₁ + k₂ + 4k₃)/6
+        const STAGE_WEIGHTS: [f64; 3] = [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0];
         q_avg.fill(0.0);
-        for (m, &w) in filter.weights().iter().enumerate() {
+        transport.clear();
+        for (m, (&w, &w_secondary)) in filter
+            .weights()
+            .iter()
+            .zip(filter.secondary_weights())
+            .enumerate()
+        {
+            let mut stage = 0;
             SSPRK3.step_with_relaxation(
                 q,
                 dt_bt,
                 t + m as f64 * dt_bt,
                 |s, time, out| {
-                    barotropic.compute_rhs_into(s, time, out);
+                    barotropic.compute_rhs_face_mass_into(s, time, out, face_mass);
                     out.axpy(1.0, g_term);
+                    let c = w_secondary * STAGE_WEIGHTS[stage] / n_bt as f64;
+                    transport.accumulate(c, s, face_mass);
+                    stage += 1;
                 },
                 |stage, from, dt_stage| barotropic.implicit_damping(stage, from, dt_stage),
                 |s| barotropic.post_process(s),
@@ -451,16 +614,8 @@ impl ModeSplitIntegrator {
             let bed = bathymetry.element(ElementIndex::new(k));
             for (i, &b) in bed.iter().enumerate() {
                 let idx = k * state.n_nodes + i;
-                let h = q_avg.data[SWE_VAR_H][idx];
-                let (ubar, vbar) = if h > 0.0 {
-                    (
-                        q_avg.data[SWE_VAR_HU][idx] / h,
-                        q_avg.data[SWE_VAR_HV][idx] / h,
-                    )
-                } else {
-                    (0.0, 0.0)
-                };
-                rate_eta.data[idx] = (h + b - state.eta.data[idx]) / dt;
+                let (eta, ubar, vbar) = filtered_barotropic_state(q_avg, idx, b);
+                rate_eta.data[idx] = (eta - state.eta.data[idx]) / dt;
                 rate_ubar.data[idx] = (ubar - state.ubar.data[idx]) / dt;
                 rate_vbar.data[idx] = (vbar - state.vbar.data[idx]) / dt;
             }
@@ -491,6 +646,21 @@ impl ModeSplitIntegrator {
             &mut self.stages_3d,
         );
 
+        // The RK combination of the constant rates reproduces the filtered
+        // state only up to round-off, which can leave a dry node a hair below
+        // its bed (η < B) and the next pass with a negative depth. Take it
+        // exactly: for h̄ ≥ 0, (h̄ + B) − B ≥ 0 in floating point.
+        for k in 0..state.n_elements {
+            let bed = bathymetry.element(ElementIndex::new(k));
+            for (i, &b) in bed.iter().enumerate() {
+                let idx = k * state.n_nodes + i;
+                let (eta, ubar, vbar) = filtered_barotropic_state(q_avg, idx, b);
+                state.eta.data[idx] = eta;
+                state.ubar.data[idx] = ubar;
+                state.vbar.data[idx] = vbar;
+            }
+        }
+
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the
         // barotropic mode: reset it to ū.
@@ -499,6 +669,22 @@ impl ModeSplitIntegrator {
         depth_average(sigma, &state.v, mean_v);
         shift_columns(&mut state.u, state.n_levels, mean_u, &state.ubar);
         shift_columns(&mut state.v, state.n_levels, mean_v, &state.vbar);
+    }
+}
+
+/// `(η, ū, v̄)` at node `idx` of the filtered transport, over bed `b`
+/// (`ū = 0` where the filtered depth is not positive).
+fn filtered_barotropic_state(q_avg: &SWESolution2D, idx: usize, b: f64) -> (f64, f64, f64) {
+    let h = q_avg.data[SWE_VAR_H][idx];
+    if h > 0.0 {
+        let inv_h = 1.0 / h;
+        (
+            h + b,
+            q_avg.data[SWE_VAR_HU][idx] * inv_h,
+            q_avg.data[SWE_VAR_HV][idx] * inv_h,
+        )
+    } else {
+        (h + b, 0.0, 0.0)
     }
 }
 
@@ -760,6 +946,58 @@ mod tests {
             };
             (physics, state)
         }
+
+        /// A beach: the bed rises from −2 m to +2 m along a 1 km channel,
+        /// water sloshing up it from `η = 0.3 cos(πx/L)`, with the `WetDry`
+        /// formulation, its positivity limiter and wet/dry correction. No
+        /// slow forcing.
+        fn beach() -> (Self, Solution3D) {
+            use crate::boundary::Reflective2D;
+            use crate::equations::ShallowWater2D;
+            use crate::mesh::Mesh2D;
+            use crate::operators::{DGOperators2D, GeometricFactors2D};
+            use crate::physics::PhysicsBuilder;
+            use std::sync::Arc;
+
+            let length = 1000.0;
+            let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 100.0, 10, 1));
+            let ops = Arc::new(DGOperators2D::new(2));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+            let bathymetry =
+                Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -2.0 + 4.0 * x / length);
+            let mut eta = Vec::with_capacity(mesh.n_elements * ops.n_nodes);
+            for k in 0..mesh.n_elements {
+                for i in 0..ops.n_nodes {
+                    let [x, _] = mesh.reference_to_physical(
+                        ElementIndex::new(k),
+                        ops.nodes_r[i],
+                        ops.nodes_s[i],
+                    );
+                    let b = bathymetry.get(ElementIndex::new(k), i);
+                    eta.push((0.3 * (std::f64::consts::PI * x / length).cos()).max(b));
+                }
+            }
+            let swe = PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom,
+                ShallowWater2D::new(9.81),
+                Reflective2D::default(),
+            )
+            .with_bathymetry(Arc::new(bathymetry.clone()))
+            .with_wet_dry_correction(true)
+            .build();
+            let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, 2);
+            state.eta.data = eta;
+            let physics = Self {
+                swe,
+                sigma: SigmaGrid::uniform(2),
+                bathymetry,
+                omega: 0.0,
+                amplitude: 0.0,
+            };
+            (physics, state)
+        }
     }
 
     impl ModeSplitPhysics for Forced {
@@ -833,5 +1071,69 @@ mod tests {
             assert!(order > 1.9, "order {order:.2} (errors {errors:?})");
         }
         assert!(errors[3] < 1e-3, "errors {errors:?}");
+    }
+
+    /// TODO P4.1 gate (PR 3): with wetting and drying the transport still
+    /// balances every element, `∫_K (η̄ − ηⁿ) = −Δt ∮_K F*_h`, although dry
+    /// elements use subcell finite volumes and the positivity limiter and
+    /// wet/dry correction change nodal depths (they keep element means).
+    #[test]
+    fn barotropic_transport_balances_every_element_with_wetting_and_drying() {
+        let (physics, mut state) = Forced::beach();
+        let ops = physics.swe.operators().clone();
+        let geom = physics.swe.geometry().clone();
+        let h_dry = crate::solver::WetDryConfig::DEFAULT_H_DRY;
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut div = DGSolution2D::new(state.n_elements, state.n_nodes);
+        let dt = 10.0;
+
+        let element_integral = |field: &[f64], k: usize| -> f64 {
+            let values = &field[k * ops.n_nodes..(k + 1) * ops.n_nodes];
+            geom.det_j[k]
+                * values
+                    .iter()
+                    .zip(&ops.weights)
+                    .map(|(v, w)| v * w)
+                    .sum::<f64>()
+        };
+        let mut shoreline_elements = 0;
+        for n in 0..10 {
+            let eta0 = state.eta.data.clone();
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            integrator
+                .barotropic_transport()
+                .expect("after a step")
+                .divergence_into(&ops, &geom, &mut div);
+
+            let change: Vec<f64> = state
+                .eta
+                .data
+                .iter()
+                .zip(&eta0)
+                .map(|(a, b)| a - b)
+                .collect();
+            let scale = (0..state.n_elements)
+                .map(|k| element_integral(&change, k).abs())
+                .fold(0.0, f64::max);
+            for k in 0..state.n_elements {
+                let residual = element_integral(&change, k) + dt * element_integral(&div.data, k);
+                assert!(
+                    residual.abs() < 1e-12 * scale,
+                    "step {n}, element {k}: ∫(η̄ − ηⁿ) + Δt∮F* = {residual:.2e} (scale {scale:.2e})"
+                );
+                let bed = physics.bathymetry.element(ElementIndex::new(k));
+                let eta = &state.eta.data[k * ops.n_nodes..(k + 1) * ops.n_nodes];
+                if eta.iter().zip(bed).any(|(e, b)| e - b < h_dry)
+                    && eta.iter().zip(bed).any(|(e, b)| e - b > 0.1)
+                {
+                    shoreline_elements += 1;
+                }
+            }
+        }
+        assert!(
+            shoreline_elements > 0,
+            "test regime: no element straddled the shoreline"
+        );
+        assert_eq!(physics.swe.negative_depth_clips(), 0);
     }
 }

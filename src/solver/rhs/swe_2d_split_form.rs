@@ -353,13 +353,15 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// Volume, bed-slope and surface terms of element `k`, written to `out`
     /// (`[h, hu, hv]`, `n_nodes` values each), with interior-face fluxes from
     /// `faces` (filled by [`Self::edge_fluxes`]). Source terms are not
-    /// included.
+    /// included. `face_mass`, if given, receives the mass component of `F*` at
+    /// every face node (outward normal, `face · n_face_nodes + fi`).
     pub(super) fn element_rhs(
         &self,
         k: ElementIndex,
         ws: &mut SplitFormWorkspace,
         faces: &[SWEState2D],
         out: [&mut [f64]; 3],
+        mut face_mass: Option<&mut [f64]>,
     ) {
         let ops = self.ops;
         let n1 = ops.n_1d;
@@ -432,6 +434,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
                         }
                     },
                 };
+                if let Some(face_mass) = face_mass.as_deref_mut() {
+                    face_mass[face * n_face_nodes + fi] = f_star.h;
+                }
                 let flux_diff = wintermeyer_flux_2d(&q_int, &q_int, normal, g) - f_star;
 
                 ws.rhs[node] = ws.rhs[node] + (scale * ops.lift[face][(node, fi)]) * flux_diff;

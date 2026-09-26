@@ -31,11 +31,13 @@ pub use advection_2d::{
 // 2D SWE
 pub use swe_2d::{
     SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d, compute_dt_viscosity, compute_rhs_swe_2d,
-    compute_rhs_swe_2d_into, positivity_cfl_swe_2d,
+    compute_rhs_swe_2d_face_mass_into, compute_rhs_swe_2d_into, face_mass_len,
+    positivity_cfl_swe_2d,
 };
 #[cfg(feature = "parallel")]
 pub use swe_2d::{
-    compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel, compute_rhs_swe_2d_parallel_into,
+    compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel,
+    compute_rhs_swe_2d_parallel_face_mass_into, compute_rhs_swe_2d_parallel_into,
 };
 
 // 2D Tracer

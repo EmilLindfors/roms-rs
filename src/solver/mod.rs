@@ -80,8 +80,10 @@ pub use rhs::{
     compute_rhs_advection_2d,
     compute_rhs_swe,
     compute_rhs_swe_2d,
+    compute_rhs_swe_2d_face_mass_into,
     compute_rhs_swe_2d_into,
     compute_rhs_tracer_2d,
+    face_mass_len,
     positivity_cfl_swe_2d,
 };
 
@@ -160,5 +162,6 @@ pub use limiters::{
 
 #[cfg(feature = "parallel")]
 pub use rhs::{
-    compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel, compute_rhs_swe_2d_parallel_into,
+    compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel,
+    compute_rhs_swe_2d_parallel_face_mass_into, compute_rhs_swe_2d_parallel_into,
 };

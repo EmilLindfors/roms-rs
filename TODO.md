@@ -335,6 +335,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 **Before PR 1:** SSP-RK3 wrapped a Forward Euler barotropic subcycle that ran in every stage. It was first-order, M2 lost 3–14 % per period, and it cost 6·n_bt 2D RHS per step (Shchepetkin & McWilliams 2005; `REVIEW.md` §2).
 **After PR 1:** one filtered pass per step, 0.02–0.1 % barotropic amplitude loss per period, ≈ 3.9·n_bt 2D RHS per step.
 **After PR 2:** G holds only what the 2D module cannot compute: the baroclinic PGF, the shear dispersion and the 3D stresses. Its step average is AB3-extrapolated, and the slow coupling is second order.
+**After PR 3:** each step also records DU_avg2, the transport that moved η (η̄ − ηⁿ = −Δt∇·DU_avg2), for the 3D continuity of P4.2.
 
 **Target step n → n+1 (plan of 2026-09-26):**
 1. One 3D RHS at tⁿ, after refreshing density. It is reused as the first 3D RK stage.
@@ -381,9 +382,13 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [x] ~~Full PGF in the 3D RHS~~: dropped, see the design decisions.
 - [x] `ModeSplitPhysics` trait: the splitter's view of the 3D model (2D module, 3D RHS, slow forcing, implicit vertical terms, stage hook). `Hydrostatic3D` implements it; `ModeSplitIntegrator::step(state, physics, dt, t)`.
 
-**PR 3: transport for 3D continuity**
-- [ ] Accumulate the secondary-weighted barotropic transport (DU_avg2) through a hook in the 2D kernel. It covers the volume transport at the nodes and the numerical face fluxes, with RK stage weights inside each sub-step, so that η̄ⁿ⁺¹ = ηⁿ − dt·div_DG(DU_avg2) exactly.
-  - Open: the wet/dry positivity limiter changes nodal h without a matching flux.
+**PR 3: transport for 3D continuity** — done on `feat/p4-1-du-avg2`
+- [x] DU_avg2 (`BarotropicTransport`, `ModeSplitIntegrator::barotropic_transport`): the nodal (hu, hv) and the face mass flux F*_h of every RK stage of the pass, weighted by W_j·b_s/n_bt (secondary filter weights W_j = Σ_{m≥j} w_m, SSP-RK3 weights b = (1/6, 1/6, 2/3)).
+  - The 2D kernel writes F*_h per element face node on request (`compute_rhs_swe_2d_face_mass_into`, serial and parallel; `BarotropicPhysics`). The plain RHS is unchanged bit for bit.
+  - `BarotropicTransport::divergence_into` is the kernel's strong-form divergence. η̄ − ηⁿ = −Δt·∇·DU_avg2 holds to 4e-13 of the η change for `Standard` and `EntropyStable`: the mass part of the two-point flux is {{hu}}, so the flux-differencing volume term is the nodal D·(hu, hv).
+  - `WetDry` elements with a dry node use subcell finite volumes, and the positivity limiter and wet/dry correction change nodal depths. There only the element balance ∫(η̄ − ηⁿ) = −Δt∮F*_h holds, to round-off. P4.2's per-level correction has to work with that: in those elements, correct at the element (or subcell) level, not the nodal one.
+- [x] Fixed on the way (PR 1 bug): η at the end of a step came from the RK combination of constant rates, which can leave a dry node a hair below its bed. The next pass then started from h ≈ −1e-16 and the positivity limiter "emptied" the element (15 clips in 10 steps on a beach). Now η = h̄ + B and ū = D̄ū/D̄ are set exactly from the filtered state; for h̄ ≥ 0, (h̄ + B) − B ≥ 0 in floating point.
+- Gate tests: `barotropic_transport_moves_the_free_surface` (nodal identity, both formulations; with primary weights or without the face flux it fails by O(1)), `barotropic_transport_balances_every_element_with_wetting_and_drying` (beach, 0 clips), `face_mass_flux_balances_each_element` (kernel: RHS unchanged, serial = parallel, ∫dh/dt = −∮F*_h for all three formulations).
 
 **Gate tests:**
 - [x] 2D–3D equivalence: `unsheared_flow_matches_the_2d_model`. A nonlinear seiche (η/H = 0.05) over two periods: 1.8e-3 of the amplitude at 50 steps per period (old G: 0.14).
@@ -395,7 +400,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [x] Column momentum after one implicit diffusion step = Δt·(τ_s − τ_b)/ρ₀: `column_momentum_changes_by_the_stress_impulse`.
 
 ### P4.2 Consistent continuity, tracers and momentum
-- [ ] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2; η advanced by the divergence of the same flux.
+- [ ] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2 (available since P4.1 PR 3: `ModeSplitIntegrator::barotropic_transport`, nodal + face parts, see its docs for the `WetDry` caveat); η advanced by the divergence of the same flux.
 - [x] Ω stored at w-points (not layer centres re-averaged to faces) — done in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
 - [ ] Assert Ω(0) = 0 instead of forcing it with the linear correction.
 - [ ] One 3D face-state helper for physical boundaries shared by the Ω, momentum and tracer kernels (today each has its own copy of the wall logic; P0.7/P0.22 were the same bug found twice). It should take the boundary tag, so 3D open boundaries (volume flux from the 2D OBC / nesting, tracer from `TracerBoundaryCondition3D` on inflow) are added in one place for all three.
