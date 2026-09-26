@@ -54,6 +54,7 @@
 mod adcp;
 mod harmonic;
 mod metrics;
+mod reference_fit;
 mod stability;
 mod tide_gauge;
 
@@ -65,6 +66,7 @@ pub use harmonic::{ConstituentResult, HarmonicAnalysis, HarmonicResult};
 pub use metrics::{
     ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary, compare_harmonics,
 };
+pub use reference_fit::{Inference, ReferenceConstant, ReferenceFit, fit_reference_constants};
 pub use stability::{StabilityMonitor, StabilityStatus, StabilityThresholds, StabilityWarning};
 pub use tide_gauge::{
     ModelExtractor, PrecomputedExtractor, StationValidationResult, TideGaugeStation,

@@ -1,43 +1,42 @@
-//! Regression tests for Flather-type open boundary conditions.
+//! Gate tests for the characteristic open boundary (`CharacteristicOBC`).
 //!
-//! In the weak (ghost-state + upwind flux) DG setting, the boundary flux is
-//! computed by the Riemann solver from the interior trace and the ghost state.
-//! For the linearised 1D problem with Riemann invariants
+//! The boundary state takes the outgoing Riemann invariant from the interior
+//! and the incoming one from the external data, and the boundary flux is its
+//! physical flux, so every Riemann solver and every spatial formulation must
+//! give the same boundary behaviour. For the linearised problem the condition
+//! is Flather's `u_n = u_n,ext + sqrt(g/H)(η − η_ext)`.
 //!
-//! ```text
-//! w± = u_n ± sqrt(g/H) η
-//! ```
+//! The history: the Flather-type BCs used to build the ghost normal velocity
+//! as `u_n,ext + sqrt(g/H)(η_int − η_ext)` and let the Riemann solver apply
+//! the relation again, reflecting outgoing waves with coefficient −1/3
+//! (P0.12). The ghost = external state fix was exact only for Roe.
 //!
-//! the upwind flux takes the outgoing invariant `w+` from the interior and the
-//! incoming invariant `w−` from the ghost. The Flather (1976) condition
-//! `u_n = u_n,ext + sqrt(g/H) (η − η_ext)` is exactly the statement
-//! `w− = w−_ext`, so the correct ghost is simply the external state
-//! `(η_ext, u_n,ext)`.
+//! Checked here, for Roe, HLL, Rusanov and the split forms:
 //!
-//! The Flather-type BCs used to build the ghost normal velocity as
-//! `u_n,ext + sqrt(g/H) (η_int − η_ext)`, which applies the characteristic
-//! relation a second time. The incoming invariant then picks up
-//! `sqrt(g/H) (η_int − η_ext)`, giving a reflection coefficient of −1/3 for an
-//! outgoing wave (−0.29 at a nesting weight of 0.8).
-//!
-//! These tests run a quasi-1D channel (one element across, free-slip walls on
-//! the sides) and check that
-//!
-//! 1. an outgoing pulse leaves through the open boundary with < 1% reflection,
-//! 2. a progressive wave forced through the open boundary is delivered at the
-//!    prescribed amplitude everywhere in the channel.
+//! 1. an outgoing pulse leaves with < 1 % reflection, and nothing grows after;
+//! 2. a progressive wave forced through the boundary is delivered at the
+//!    prescribed amplitude, from full external data, from elevation-only data
+//!    as an incoming wave, and from a parent time series; elevation-only data
+//!    at rest delivers half;
+//! 3. a plane wave at 45° to the boundary normal reflects with the linear
+//!    coefficient (1 − cos θ)/(1 + cos θ) ≈ 0.17 of a 1D characteristic OBC;
+//! 4. the boundary flux does not depend on the Riemann solver;
+//! 5. lake at rest over varying bathymetry is exact with open boundaries.
+
+use std::f64::consts::PI;
 
 use dg_rs::boundary::{
-    Chapman2D, ChapmanFlather2D, Flather2D, HarmonicFlather2D, MultiBoundaryCondition2D,
-    NestingBC2D, Radiation2D, Reflective2D, SWEBoundaryCondition2D, TSTConfig, TSTOBC2D,
+    CharacteristicOBC, ElevationOnly, ExternalState, MultiBoundaryCondition2D, ParentTimeSeries,
+    Reflective2D, SWEBoundaryCondition2D, StillWater,
 };
+use dg_rs::flux::SWEFluxType2D;
 use dg_rs::io::{BoundaryTimeSeries, TimeSeriesRecord};
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag};
 use dg_rs::time::{SSPRK3, TimeIntegrator};
 use dg_rs::types::ElementIndex;
 use dg_rs::{
-    DGOperators2D, GeometricFactors2D, Mesh2D, SWE2DRhsConfig, SWESolution2D, SWEState2D,
-    ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
+    DGOperators2D, GeometricFactors2D, Mesh2D, SWE2DRhsConfig, SWEFormulation2D, SWESolution2D,
+    SWEState2D, ShallowWater2D, compute_dt_swe_2d, compute_rhs_swe_2d,
 };
 
 const G: f64 = 9.81;
@@ -57,8 +56,23 @@ fn celerity() -> f64 {
     (G * H0).sqrt()
 }
 
-/// Quasi-1D channel `[0, LENGTH] × [0, DX]` with walls on the long sides.
-struct Channel {
+/// A spatial discretization: collocated DG with a Riemann solver, or a split form.
+#[derive(Clone, Copy, Debug)]
+enum Scheme {
+    Flux(SWEFluxType2D),
+    Split(SWEFormulation2D),
+}
+
+const SCHEMES: [Scheme; 5] = [
+    Scheme::Flux(SWEFluxType2D::Roe),
+    Scheme::Flux(SWEFluxType2D::HLL),
+    Scheme::Flux(SWEFluxType2D::Rusanov),
+    Scheme::Split(SWEFormulation2D::EntropyStable),
+    Scheme::Split(SWEFormulation2D::WetDry),
+];
+
+/// A mesh with flat bed B = −H0 and the solver pieces.
+struct Domain {
     mesh: Mesh2D,
     ops: DGOperators2D,
     geom: GeometricFactors2D,
@@ -66,12 +80,25 @@ struct Channel {
     bathymetry: Bathymetry2D,
 }
 
-impl Channel {
-    /// Build the channel with the given tags on the west (x = 0) and east
-    /// (x = LENGTH) ends.
-    fn new(west: BoundaryTag, east: BoundaryTag) -> Self {
+impl Domain {
+    fn new(mesh: Mesh2D) -> Self {
+        let ops = DGOperators2D::new(ORDER);
+        let geom = GeometricFactors2D::compute(&mesh);
+        let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -H0);
+        Self {
+            mesh,
+            ops,
+            geom,
+            equation: ShallowWater2D::new(G),
+            bathymetry,
+        }
+    }
+
+    /// Quasi-1D channel `[0, LENGTH] × [0, DX]` with walls on the long sides
+    /// and the given tags on the west (x = 0) and east (x = LENGTH) ends.
+    fn channel(west: BoundaryTag, east: BoundaryTag) -> Self {
         // Side order: [south, east, north, west]
-        let mesh = Mesh2D::uniform_rectangle_with_sides(
+        Self::new(Mesh2D::uniform_rectangle_with_sides(
             0.0,
             LENGTH,
             0.0,
@@ -79,40 +106,42 @@ impl Channel {
             NX,
             1,
             [BoundaryTag::Wall, east, BoundaryTag::Wall, west],
-        );
-        let ops = DGOperators2D::new(ORDER);
-        let geom = GeometricFactors2D::compute(&mesh);
-        let equation = ShallowWater2D::new(G);
-        let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -H0);
-        Self {
-            mesh,
-            ops,
-            geom,
-            equation,
-            bathymetry,
-        }
+        ))
     }
 
-    fn x(&self, k: usize, i: usize) -> f64 {
+    fn nodes(&self) -> impl Iterator<Item = (ElementIndex, usize)> + '_ {
+        ElementIndex::iter(self.mesh.n_elements)
+            .flat_map(|k| (0..self.ops.n_nodes).map(move |i| (k, i)))
+    }
+
+    fn xy(&self, k: ElementIndex, i: usize) -> [f64; 2] {
         let (r, s) = (self.ops.nodes_r[i], self.ops.nodes_s[i]);
-        self.mesh.reference_to_physical(ElementIndex::new(k), r, s)[0]
+        self.mesh.reference_to_physical(k, r, s)
     }
 
-    /// Initial state with surface elevation η(x) and velocity u(x).
-    fn initial_state(&self, eta: impl Fn(f64) -> f64, u: impl Fn(f64) -> f64) -> SWESolution2D {
+    /// State with surface elevation η and velocity (u, v) given per point.
+    fn state(&self, f: impl Fn(f64, f64) -> (f64, f64, f64)) -> SWESolution2D {
         let mut q = SWESolution2D::new(self.mesh.n_elements, self.ops.n_nodes);
-        for k in 0..self.mesh.n_elements {
-            for i in 0..self.ops.n_nodes {
-                let x = self.x(k, i);
-                let h = H0 + eta(x);
-                q.set_state(
-                    ElementIndex::new(k),
-                    i,
-                    SWEState2D::from_primitives(h, u(x), 0.0),
-                );
-            }
+        for (k, i) in self.nodes() {
+            let [x, y] = self.xy(k, i);
+            let (eta, u, v) = f(x, y);
+            q.set_state(k, i, SWEState2D::from_primitives(H0 + eta, u, v));
         }
         q
+    }
+
+    fn config<'a, BC: SWEBoundaryCondition2D>(
+        &'a self,
+        bc: &'a BC,
+        scheme: Scheme,
+    ) -> SWE2DRhsConfig<'a, BC> {
+        let config = SWE2DRhsConfig::new(&self.equation, bc)
+            .with_coriolis(false)
+            .with_bathymetry(&self.bathymetry);
+        match scheme {
+            Scheme::Flux(flux) => config.with_flux_type(flux),
+            Scheme::Split(formulation) => config.with_formulation(formulation),
+        }
     }
 
     /// Advance `q` from t = 0 to `t_end` with SSP-RK3, calling `observe`
@@ -120,14 +149,12 @@ impl Channel {
     fn run<BC: SWEBoundaryCondition2D>(
         &self,
         bc: &BC,
+        scheme: Scheme,
         q: &mut SWESolution2D,
         t_end: f64,
         mut observe: impl FnMut(&SWESolution2D, f64),
     ) {
-        let config = SWE2DRhsConfig::new(&self.equation, bc)
-            .with_coriolis(false)
-            .with_bathymetry(&self.bathymetry);
-
+        let config = self.config(bc, scheme);
         // The linear-regime wave speed is ~constant, so a single dt suffices.
         let dt_cfl = compute_dt_swe_2d(q, &self.mesh, &self.geom, &self.equation, ORDER, CFL);
         let n_steps = (t_end / dt_cfl).ceil() as usize;
@@ -142,59 +169,16 @@ impl Channel {
             observe(q, t);
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Outgoing pulse: reflection coefficient
-// ---------------------------------------------------------------------------
-
-/// Pulse amplitude (m). a/H = 1e-3 keeps the problem in the linear regime.
-const PULSE_AMP: f64 = 0.01;
-const PULSE_X0: f64 = 250.0;
-const PULSE_WIDTH: f64 = 30.0;
-
-/// Launch a right-going Gaussian pulse from mid-channel and return the largest
-/// |η| left in the channel (relative to the pulse amplitude) once the pulse has
-/// fully left through the east boundary. Any remaining signal is reflection.
-///
-/// Both channel ends carry `BoundaryTag::Open`, handled by `bc`.
-fn outgoing_pulse_reflection<BC: SWEBoundaryCondition2D>(bc: &BC) -> f64 {
-    let ch = Channel::new(BoundaryTag::Open, BoundaryTag::Open);
-
-    // Exact right-going simple wave: the left-going invariant
-    // u − 2 sqrt(g h) is uniform, so no left-going signal is launched.
-    let eta0 = |x: f64| PULSE_AMP * (-((x - PULSE_X0) / PULSE_WIDTH).powi(2)).exp();
-    let u0 = |x: f64| 2.0 * ((G * (H0 + eta0(x))).sqrt() - celerity());
-    let mut q = ch.initial_state(eta0, u0);
-
-    // The pulse centre reaches the east end at ~25 s and its tail
-    // (4 widths behind) has left by ~37 s. By 50 s a reflected pulse would
-    // sit near mid-channel.
-    let t_end = 50.0;
-    ch.run(bc, &mut q, t_end, |_, _| {});
-
-    let mut max_eta: f64 = 0.0;
-    for k in 0..ch.mesh.n_elements {
-        for i in 0..ch.ops.n_nodes {
-            let eta = q.get_state(ElementIndex::new(k), i).h - H0;
-            max_eta = max_eta.max(eta.abs());
-        }
+    /// Largest |η| over the nodes (NaN counts as unbounded).
+    fn max_abs_eta(&self, q: &SWESolution2D) -> f64 {
+        self.nodes()
+            .map(|(k, i)| (q.get_state(k, i).h - H0).abs())
+            .fold(
+                0.0,
+                |m, e| if e.is_nan() { f64::INFINITY } else { m.max(e) },
+            )
     }
-    max_eta / PULSE_AMP
-}
-
-/// Maximum allowed reflected amplitude (fraction of the incident pulse).
-const MAX_REFLECTION: f64 = 0.01;
-
-fn assert_no_reflection(name: &str, reflection: f64) {
-    println!("{name}: reflected amplitude = {:.4}%", 100.0 * reflection);
-    assert!(
-        reflection < MAX_REFLECTION,
-        "{name}: outgoing pulse reflected with {:.1}% of its amplitude \
-         (limit {:.1}%) — ghost state double-applies the Flather relation?",
-        100.0 * reflection,
-        100.0 * MAX_REFLECTION
-    );
 }
 
 fn with_walls(open: &dyn SWEBoundaryCondition2D) -> MultiBoundaryCondition2D<'_> {
@@ -202,190 +186,64 @@ fn with_walls(open: &dyn SWEBoundaryCondition2D) -> MultiBoundaryCondition2D<'_>
     MultiBoundaryCondition2D::new(&WALL).with_open(open)
 }
 
-#[test]
-fn flather2d_outgoing_pulse_does_not_reflect() {
-    let flather = Flather2D::new(|_, _, _| 0.0, H0);
-    let bc = with_walls(&flather);
-    assert_no_reflection("Flather2D", outgoing_pulse_reflection(&bc));
-}
-
-#[test]
-fn harmonic_flather2d_outgoing_pulse_does_not_reflect() {
-    let flather = HarmonicFlather2D::new(vec![], H0);
-    let bc = with_walls(&flather);
-    assert_no_reflection("HarmonicFlather2D", outgoing_pulse_reflection(&bc));
-}
-
-#[test]
-fn chapman_flather2d_outgoing_pulse_does_not_reflect() {
-    // Library defaults (h_ref = 10 m, no dt) with the grid spacing as dx.
-    let cf = ChapmanFlather2D::new(|_, _, _| (0.0, 0.0, 0.0), DX);
-    let bc = with_walls(&cf);
-    assert_no_reflection("ChapmanFlather2D", outgoing_pulse_reflection(&bc));
-}
-
-#[test]
-fn tst_obc_outgoing_pulse_does_not_reflect() {
-    let tst = TSTOBC2D::new(TSTConfig {
-        mean_elevation: 0.0,
-        constituents: vec![],
-        h_ref: H0,
-        dx: DX,
-        subtidal_weight: 1.0,
-        h_min: 1e-6,
-    });
-    let bc = with_walls(&tst);
-    assert_no_reflection("TSTOBC2D", outgoing_pulse_reflection(&bc));
-}
-
-/// Parent model at rest: h = H0 (η = 0), zero velocity.
-fn parent_at_rest() -> BoundaryTimeSeries {
-    BoundaryTimeSeries::from_records(vec![
-        TimeSeriesRecord::from_primitives(0.0, H0, 0.0, 0.0),
-        TimeSeriesRecord::from_primitives(1.0e6, H0, 0.0, 0.0),
-    ])
-    .unwrap()
-}
-
-#[test]
-fn nesting_bc_outgoing_pulse_does_not_reflect() {
-    // Default Flather mode (weight 1.0) and the 0.8 weight used by the
-    // Frøya example must both be non-reflecting, as must Dirichlet mode.
-    for (name, nesting) in [
-        (
-            "NestingBC2D (weight 1.0)",
-            NestingBC2D::new(parent_at_rest()),
-        ),
-        (
-            "NestingBC2D (weight 0.8)",
-            NestingBC2D::new(parent_at_rest()).with_flather_weight(0.8),
-        ),
-        (
-            "NestingBC2D (Dirichlet)",
-            NestingBC2D::new(parent_at_rest()).without_flather(),
-        ),
-    ] {
-        let bc = with_walls(&nesting);
-        assert_no_reflection(name, outgoing_pulse_reflection(&bc));
-    }
-}
-
-#[test]
-fn radiation2d_outgoing_pulse_does_not_reflect() {
-    let radiation = Radiation2D::still_water();
-    let bc = with_walls(&radiation);
-    assert_no_reflection("Radiation2D", outgoing_pulse_reflection(&bc));
-}
-
 // ---------------------------------------------------------------------------
-// Long run after the pulse has left: no late reflection, no growth
+// Outgoing pulse: reflection
 // ---------------------------------------------------------------------------
 
+/// Pulse amplitude (m). a/H = 1e-3 keeps the problem in the linear regime.
+const PULSE_AMP: f64 = 0.01;
+const PULSE_X0: f64 = 250.0;
+const PULSE_WIDTH: f64 = 30.0;
 /// By this time the pulse (and its tail) has left through the east end.
 const PULSE_EXIT_TIME: f64 = 50.0;
-/// Three channel crossings after the pulse has left. A boundary that takes
-/// the incoming Riemann invariant from the interior instead of from outside
-/// has no restoring mechanism, so small errors drift or grow unchecked.
+/// Three channel crossings after the pulse has left.
 const QUIET_T_END: f64 = 200.0;
+/// Maximum allowed reflected amplitude (fraction of the incident pulse).
+const MAX_REFLECTION: f64 = 0.01;
 
-/// Launch the right-going pulse and return the largest |η| in the channel
-/// over `[PULSE_EXIT_TIME, QUIET_T_END]`, relative to the pulse amplitude.
-/// NaN counts as unbounded.
-fn max_eta_after_pulse_exit<BC: SWEBoundaryCondition2D>(bc: &BC) -> f64 {
-    let ch = Channel::new(BoundaryTag::Open, BoundaryTag::Open);
+/// Launch a right-going pulse from mid-channel (both ends open, still water
+/// outside) and return the largest |η| left in the channel, relative to the
+/// pulse, at `PULSE_EXIT_TIME` and over `[PULSE_EXIT_TIME, QUIET_T_END]`.
+fn outgoing_pulse(bc: &dyn SWEBoundaryCondition2D, scheme: Scheme) -> (f64, f64) {
+    let ch = Domain::channel(BoundaryTag::Open, BoundaryTag::Open);
+    // Exact right-going simple wave: the left-going invariant
+    // u − 2 sqrt(g h) is uniform, so no left-going signal is launched.
     let eta0 = |x: f64| PULSE_AMP * (-((x - PULSE_X0) / PULSE_WIDTH).powi(2)).exp();
-    let u0 = |x: f64| 2.0 * ((G * (H0 + eta0(x))).sqrt() - celerity());
-    let mut q = ch.initial_state(eta0, u0);
-
-    let mut max_eta: f64 = 0.0;
-    ch.run(bc, &mut q, QUIET_T_END, |q, t| {
-        if t < PULSE_EXIT_TIME {
-            return;
-        }
-        for k in 0..ch.mesh.n_elements {
-            for i in 0..ch.ops.n_nodes {
-                let eta = q.get_state(ElementIndex::new(k), i).h - H0;
-                max_eta = if eta.is_nan() {
-                    f64::INFINITY
-                } else {
-                    max_eta.max(eta.abs())
-                };
-            }
-        }
-    });
-    max_eta / PULSE_AMP
-}
-
-fn assert_stays_quiet(name: &str, after_exit: f64) {
-    println!(
-        "{name}: max |η| over [{PULSE_EXIT_TIME}, {QUIET_T_END}] s = {after_exit:.2e} × pulse"
-    );
-    assert!(
-        after_exit < MAX_REFLECTION,
-        "{name}: |η| reached {after_exit:.3e} × the pulse amplitude between \
-         {PULSE_EXIT_TIME} s and {QUIET_T_END} s (limit {MAX_REFLECTION})"
-    );
-}
-
-/// Regression: `Radiation2D` returned the interior state as the ghost whenever
-/// `u_n + c > 0`, i.e. for every subcritical flow. That is zero-gradient
-/// extrapolation: the incoming invariant comes from the interior, so nothing
-/// pins the far-field level.
-#[test]
-fn radiation2d_stays_quiet_after_pulse_exits() {
-    let radiation = Radiation2D::still_water();
-    let bc = with_walls(&radiation);
-    assert_stays_quiet("Radiation2D", max_eta_after_pulse_exit(&bc));
-}
-
-#[test]
-fn flather2d_stays_quiet_after_pulse_exits() {
-    let flather = Flather2D::new(|_, _, _| 0.0, H0);
-    let bc = with_walls(&flather);
-    assert_stays_quiet("Flather2D", max_eta_after_pulse_exit(&bc));
-}
-
-/// `Chapman2D` is not a Flather BC (it never touches the normal velocity),
-/// but its ghost blends interior elevation into the incoming Riemann
-/// invariant. With the old fallback for a missing time step (c·dt/dx = 1,
-/// α = 1/2) that feedback made the discretisation blow up within ~75 s here.
-/// Without a dt it must now fall back to a stable elevation clamp (α = 1),
-/// which reflects the pulse (≈ −1) but keeps it bounded.
-#[test]
-fn chapman2d_without_dt_stays_bounded() {
-    let chapman = Chapman2D::new(|_, _, _| 0.0, DX);
-    let bc = with_walls(&chapman);
-
-    let ch = Channel::new(BoundaryTag::Open, BoundaryTag::Open);
-    let eta0 = |x: f64| PULSE_AMP * (-((x - PULSE_X0) / PULSE_WIDTH).powi(2)).exp();
-    let u0 = |x: f64| 2.0 * ((G * (H0 + eta0(x))).sqrt() - celerity());
-    let mut q = ch.initial_state(eta0, u0);
-
-    // Three boundary encounters of the (reflected) pulse.
-    let mut max_eta: f64 = 0.0;
-    ch.run(&bc, &mut q, 100.0, |q, _| {
-        for k in 0..ch.mesh.n_elements {
-            for i in 0..ch.ops.n_nodes {
-                let eta = q.get_state(ElementIndex::new(k), i).h - H0;
-                // NaN must fail the bound below.
-                max_eta = if eta.is_nan() {
-                    f64::INFINITY
-                } else {
-                    max_eta.max(eta.abs())
-                };
-            }
-        }
+    let mut q = ch.state(|x, _| {
+        let eta = eta0(x);
+        (eta, 2.0 * ((G * (H0 + eta)).sqrt() - celerity()), 0.0)
     });
 
-    println!(
-        "Chapman2D (no dt): max |η| = {:.3} × pulse amplitude",
-        max_eta / PULSE_AMP
-    );
-    assert!(
-        max_eta <= 1.05 * PULSE_AMP,
-        "Chapman2D without dt grew to {:.3e} × the pulse amplitude",
-        max_eta / PULSE_AMP
-    );
+    let bc = with_walls(bc);
+    let (mut at_exit, mut after) = (f64::NAN, 0.0_f64);
+    ch.run(&bc, scheme, &mut q, QUIET_T_END, |q, t| {
+        if t >= PULSE_EXIT_TIME {
+            let eta = ch.max_abs_eta(q);
+            if at_exit.is_nan() {
+                at_exit = eta;
+            }
+            after = after.max(eta);
+        }
+    });
+    (at_exit / PULSE_AMP, after / PULSE_AMP)
+}
+
+#[test]
+fn outgoing_pulse_leaves_for_every_scheme() {
+    let bc = CharacteristicOBC::still_water();
+    for scheme in SCHEMES {
+        let (reflection, after) = outgoing_pulse(&bc, scheme);
+        println!(
+            "{scheme:?}: reflected {:.4} %, max |η| after exit {:.2e} × pulse",
+            100.0 * reflection,
+            after
+        );
+        assert!(
+            reflection < MAX_REFLECTION && after < MAX_REFLECTION,
+            "{scheme:?}: reflected {reflection:.3e}, max after exit {after:.3e} × pulse \
+             (limit {MAX_REFLECTION})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,10 +259,10 @@ fn wave_period() -> f64 {
     WAVELENGTH / celerity()
 }
 
-/// External state of an eastward progressive wave at the west end (x = 0):
-/// η_ext = A sin(ωt), u_ext = sqrt(g/H) η_ext for t ≥ 0, at rest before.
+/// Eastward progressive wave at the west end (x = 0): η = A sin(ωt) for
+/// t ≥ 0, at rest before; returns (η, u).
 fn eastward_wave_at_west(t: f64) -> (f64, f64) {
-    let omega = 2.0 * std::f64::consts::PI / wave_period();
+    let omega = 2.0 * PI / wave_period();
     let eta = if t > 0.0 {
         WAVE_AMP * (omega * t).sin()
     } else {
@@ -413,40 +271,36 @@ fn eastward_wave_at_west(t: f64) -> (f64, f64) {
     (eta, (G / H0).sqrt() * eta)
 }
 
-/// Force an eastward progressive wave through the west boundary (tag
-/// `TidalForcing`) of a channel whose east end is a radiating open boundary
-/// (tag `Open`), and return the (min, max) over the channel interior of the
-/// wave amplitude, relative to the prescribed amplitude, over the last period.
-///
-/// A correct Flather BC delivers the prescribed amplitude and lets it leave
-/// through the east end, so the channel carries a clean progressive wave of
-/// uniform amplitude. Reflections at either end superpose a standing
+/// Force an eastward progressive wave through the west end (tag
+/// `TidalForcing`, boundary condition `forcing`) of a channel whose east end
+/// radiates to still water, and return the (min, max) over the channel
+/// interior of the wave amplitude relative to the prescribed one, over the
+/// last period. Reflections at either end would superpose a standing
 /// component whose envelope varies along the channel.
-fn delivered_amplitude_range<BC: SWEBoundaryCondition2D>(bc: &BC) -> (f64, f64) {
-    let ch = Channel::new(BoundaryTag::TidalForcing, BoundaryTag::Open);
-    let mut q = ch.initial_state(|_| 0.0, |_| 0.0);
+fn delivered_amplitude(forcing: &dyn SWEBoundaryCondition2D, scheme: Scheme) -> (f64, f64) {
+    let ch = Domain::channel(BoundaryTag::TidalForcing, BoundaryTag::Open);
+    let mut q = ch.state(|_, _| (0.0, 0.0, 0.0));
 
-    // Let the wave cross the channel, reflect off the east end if the BC is
-    // reflective, and come back across once more before measuring.
     let period = wave_period();
     let t_end = 2.0 * LENGTH / celerity() + 3.0 * period;
     let t_measure = t_end - period;
 
-    // Sample the interior away from the boundaries (50 m ≤ x ≤ 450 m).
-    let samples: Vec<(usize, usize)> = (0..ch.mesh.n_elements)
-        .flat_map(|k| (0..ch.ops.n_nodes).map(move |i| (k, i)))
-        .filter(|&(k, i)| {
-            let x = ch.x(k, i);
-            (50.0..=450.0).contains(&x)
-        })
+    // Interior away from the boundaries (50 m ≤ x ≤ 450 m)
+    let samples: Vec<_> = ch
+        .nodes()
+        .filter(|&(k, i)| (50.0..=450.0).contains(&ch.xy(k, i)[0]))
         .collect();
     let mut amplitude = vec![0.0_f64; samples.len()];
 
-    ch.run(bc, &mut q, t_end, |q, t| {
+    static WALL: Reflective2D = Reflective2D { h_min: 1e-6 };
+    let radiating = CharacteristicOBC::still_water();
+    let bc = MultiBoundaryCondition2D::new(&WALL)
+        .with_tidal(forcing)
+        .with_open(&radiating);
+    ch.run(&bc, scheme, &mut q, t_end, |q, t| {
         if t >= t_measure {
             for (a, &(k, i)) in amplitude.iter_mut().zip(&samples) {
-                let eta = q.get_state(ElementIndex::new(k), i).h - H0;
-                *a = a.max(eta.abs());
+                *a = a.max((q.get_state(k, i).h - H0).abs());
             }
         }
     });
@@ -456,57 +310,282 @@ fn delivered_amplitude_range<BC: SWEBoundaryCondition2D>(bc: &BC) -> (f64, f64) 
     (min / WAVE_AMP, max / WAVE_AMP)
 }
 
-fn assert_full_amplitude(name: &str, (min, max): (f64, f64)) {
-    println!("{name}: delivered amplitude in [{min:.3}, {max:.3}] × prescribed");
+fn assert_amplitude(name: &str, scheme: Scheme, (min, max): (f64, f64), expected: f64) {
+    println!("{name}, {scheme:?}: delivered amplitude in [{min:.3}, {max:.3}] × prescribed");
     assert!(
-        min >= 0.95 && max <= 1.05,
-        "{name}: delivered amplitude ranges over [{min:.3}, {max:.3}] of the \
-         prescribed amplitude (expected within [0.95, 1.05])"
+        min >= expected - 0.05 && max <= expected + 0.05,
+        "{name}, {scheme:?}: delivered amplitude ranges over [{min:.3}, {max:.3}] of the \
+         prescribed amplitude (expected {expected} ± 0.05)"
     );
 }
 
 #[test]
-fn chapman_flather2d_delivers_prescribed_progressive_wave() {
-    // One BC for both ends: forcing at the west end, quiescent sea at the
-    // east end. External state is (η, u_n, u_t) with u_n along the outward
-    // normal, which points in −x at the west end.
-    let cf = ChapmanFlather2D::new(
-        |x, _y, t| {
-            if x < 0.5 * LENGTH {
-                let (eta, u) = eastward_wave_at_west(t);
-                (eta, -u, 0.0)
-            } else {
-                (0.0, 0.0, 0.0)
-            }
-        },
-        DX,
-    )
-    .with_h_ref(H0);
-    static WALL: Reflective2D = Reflective2D { h_min: 1e-6 };
-    let bc = MultiBoundaryCondition2D::new(&WALL)
-        .with_tidal(&cf)
-        .with_open(&cf);
-    assert_full_amplitude("ChapmanFlather2D", delivered_amplitude_range(&bc));
+fn full_external_state_delivers_the_wave_for_every_scheme() {
+    // u_n along the outward normal, which points in −x at the west end
+    let forcing = CharacteristicOBC::new(|_, _, t| {
+        let (eta, u) = eastward_wave_at_west(t);
+        ExternalState::new(eta, u, 0.0)
+    });
+    for scheme in SCHEMES {
+        assert_amplitude("(η, u)", scheme, delivered_amplitude(&forcing, scheme), 1.0);
+    }
 }
 
 #[test]
-fn nesting_bc_delivers_prescribed_progressive_wave() {
-    // Parent model output sampled every 0.1 s at the west end.
+fn elevation_only_forcing_as_incoming_wave_delivers_the_wave() {
+    let forcing =
+        CharacteristicOBC::new(|_, _, t| ExternalState::elevation(eastward_wave_at_west(t).0))
+            .with_incoming_wave();
+    for scheme in [SCHEMES[0], SCHEMES[2], SCHEMES[4]] {
+        assert_amplitude(
+            "η, incoming",
+            scheme,
+            delivered_amplitude(&forcing, scheme),
+            1.0,
+        );
+    }
+}
+
+/// With the external velocity taken at rest, a progressive wave arrives at
+/// half amplitude (the boundary is then an antinode of the external state).
+#[test]
+fn elevation_only_forcing_at_rest_delivers_half() {
+    let forcing =
+        CharacteristicOBC::new(|_, _, t| ExternalState::elevation(eastward_wave_at_west(t).0))
+            .with_elevation_only(ElevationOnly::AtRest);
+    assert_amplitude(
+        "η, at rest",
+        SCHEMES[0],
+        delivered_amplitude(&forcing, SCHEMES[0]),
+        0.5,
+    );
+}
+
+#[test]
+fn parent_time_series_delivers_the_wave() {
     let t_end = 2.0 * LENGTH / celerity() + 4.0 * wave_period();
-    let n_records = (t_end / 0.1).ceil() as usize + 1;
-    let records = (0..n_records)
+    let records = (0..=(t_end / 0.1).ceil() as usize)
         .map(|n| {
             let t = n as f64 * 0.1;
             let (eta, u) = eastward_wave_at_west(t);
             TimeSeriesRecord::from_primitives(t, H0 + eta, u, 0.0)
         })
         .collect();
-    let forcing = NestingBC2D::new(BoundaryTimeSeries::from_records(records).unwrap());
-    let radiating = NestingBC2D::new(parent_at_rest());
+    let parent = ParentTimeSeries::new(BoundaryTimeSeries::from_records(records).unwrap(), H0);
+    let forcing = CharacteristicOBC::new(parent);
+    assert_amplitude(
+        "parent series",
+        SCHEMES[1],
+        delivered_amplitude(&forcing, SCHEMES[1]),
+        1.0,
+    );
+}
 
+// ---------------------------------------------------------------------------
+// Oblique incidence
+// ---------------------------------------------------------------------------
+
+/// Reflection coefficient of a plane wave at angle `theta` from the normal
+/// of the north boundary (still water outside), measured from the standing
+/// pattern of the steady state.
+///
+/// The domain is periodic in x with one x-wavelength across and one
+/// y-wavelength high. The south boundary forces the incident plane wave
+/// (full external state); whatever it does to the returning wave, the ratio
+/// of the southward to the northward wave in the interior is the north
+/// boundary's reflection coefficient |R| = (E_max − E_min)/(E_max + E_min),
+/// with E(y) the local amplitude.
+fn oblique_reflection(theta: f64) -> f64 {
+    let lx = 200.0;
+    let kx = 2.0 * PI / lx;
+    let k = kx / theta.sin();
+    let ky = k * theta.cos();
+    let ly = 2.0 * PI / ky;
+    let omega = celerity() * k;
+    let (n_elem_x, n_elem_y) = (10, (10.0 * ly / lx).round() as usize);
+
+    let mut mesh = Mesh2D::channel_periodic_x(0.0, lx, 0.0, ly, n_elem_x, n_elem_y);
+    for edge in mesh.edges.iter_mut().filter(|e| e.is_boundary()) {
+        let y = mesh.vertices[edge.vertices.0][1];
+        edge.boundary_tag = Some(if y < 0.5 * ly {
+            BoundaryTag::TidalForcing
+        } else {
+            BoundaryTag::Open
+        });
+    }
+    let domain = Domain::new(mesh);
+
+    // Incident wave A cos(kx x + ky y − ωt), ramped in over two periods
+    let period = 2.0 * PI / omega;
+    let incident = move |x: f64, y: f64, t: f64| {
+        let ramp = (t / (2.0 * period)).clamp(0.0, 1.0);
+        let eta = ramp * WAVE_AMP * (kx * x + ky * y - omega * t).cos();
+        let speed = (G / H0).sqrt() * eta;
+        ExternalState::new(eta, speed * theta.sin(), speed * theta.cos())
+    };
+    let forcing = CharacteristicOBC::new(incident);
+    let open = CharacteristicOBC::still_water();
     static WALL: Reflective2D = Reflective2D { h_min: 1e-6 };
     let bc = MultiBoundaryCondition2D::new(&WALL)
         .with_tidal(&forcing)
-        .with_open(&radiating);
-    assert_full_amplitude("NestingBC2D", delivered_amplitude_range(&bc));
+        .with_open(&open);
+
+    let t_end = 12.0 * period;
+    let t_measure = t_end - period;
+    let mut envelope = vec![0.0_f64; domain.mesh.n_elements * domain.ops.n_nodes];
+    let mut q = domain.state(|_, _| (0.0, 0.0, 0.0));
+    let n_nodes = domain.ops.n_nodes;
+    domain.run(&bc, SCHEMES[0], &mut q, t_end, |q, t| {
+        if t >= t_measure {
+            for (k, i) in domain.nodes() {
+                let e = &mut envelope[k.as_usize() * n_nodes + i];
+                *e = e.max((q.get_state(k, i).h - H0).abs());
+            }
+        }
+    });
+    let e_max = envelope.iter().copied().fold(0.0, f64::max);
+    let e_min = envelope.iter().copied().fold(f64::INFINITY, f64::min);
+    (e_max - e_min) / (e_max + e_min)
+}
+
+#[test]
+fn oblique_plane_wave_reflects_as_a_1d_characteristic_condition() {
+    let theta = PI / 4.0;
+    let expected = (1.0 - theta.cos()) / (1.0 + theta.cos());
+    let measured = oblique_reflection(theta);
+    println!("45°: |R| = {measured:.4} (theory {expected:.4})");
+    assert!(
+        (measured - expected).abs() < 0.02,
+        "reflection at 45°: {measured:.4}, theory {expected:.4}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Flux independence and lake at rest
+// ---------------------------------------------------------------------------
+
+/// One element, all faces open: the RHS consists of the volume term and the
+/// boundary flux alone, and must be the same for every Riemann solver.
+#[test]
+fn boundary_flux_does_not_depend_on_the_riemann_solver() {
+    let domain = Domain::new(Mesh2D::uniform_rectangle_with_bc(
+        0.0,
+        100.0,
+        0.0,
+        80.0,
+        1,
+        1,
+        BoundaryTag::Open,
+    ));
+    let q = domain.state(|x, y| {
+        (
+            0.3 * (x / 40.0).sin() * (y / 30.0).cos(),
+            0.4 + 0.2 * (y / 25.0).sin(),
+            -0.3 + 0.1 * (x / 35.0).cos(),
+        )
+    });
+    let obc = CharacteristicOBC::new(|x: f64, y: f64, t: f64| {
+        ExternalState::new(0.2 * (x / 50.0 + t).cos(), 0.1 * (y / 20.0).sin(), -0.2)
+    });
+
+    let rhs = |flux| {
+        let config = domain.config(&obc, Scheme::Flux(flux));
+        compute_rhs_swe_2d(&q, &domain.mesh, &domain.ops, &domain.geom, &config, 0.7)
+    };
+    let roe = rhs(SWEFluxType2D::Roe);
+    for flux in [SWEFluxType2D::HLL, SWEFluxType2D::Rusanov] {
+        let other = rhs(flux);
+        let diff = (0..3)
+            .flat_map(|v| roe.data[v].iter().zip(&other.data[v]))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            diff < 1e-11 * roe.max_abs(),
+            "{flux:?} differs from Roe by {diff:.3e} (|rhs| {:.3e})",
+            roe.max_abs()
+        );
+    }
+}
+
+/// Lake at rest over a rough bed with every side open to still water at the
+/// same level: the RHS vanishes for every scheme.
+#[test]
+fn lake_at_rest_is_exact_with_open_boundaries() {
+    let mut domain = Domain::new(Mesh2D::uniform_rectangle_with_bc(
+        0.0,
+        400.0,
+        0.0,
+        300.0,
+        4,
+        3,
+        BoundaryTag::Open,
+    ));
+    let (mesh, ops, geom) = (&domain.mesh, &domain.ops, &domain.geom);
+    let mut bathymetry = Bathymetry2D::flat(mesh.n_elements, ops.n_nodes);
+    for k in ElementIndex::iter(mesh.n_elements) {
+        for i in 0..ops.n_nodes {
+            let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+            // Smooth relief plus a step per element (face-discontinuous bed)
+            let step = 0.4 * (k.as_usize() % 3) as f64;
+            let b = -H0 + 3.0 * (x / 60.0).sin() * (y / 45.0).cos() + step;
+            bathymetry.set(k, i, b);
+        }
+    }
+    bathymetry.compute_gradients(ops, geom);
+    domain.bathymetry = bathymetry;
+
+    let eta0 = 0.25;
+    let mut q = SWESolution2D::new(domain.mesh.n_elements, domain.ops.n_nodes);
+    for (k, i) in domain.nodes() {
+        let h = eta0 - domain.bathymetry.get(k, i);
+        q.set_state(k, i, SWEState2D::new(h, 0.0, 0.0));
+    }
+    let obc = CharacteristicOBC::new(StillWater::at(eta0));
+    for scheme in [
+        Scheme::Split(SWEFormulation2D::EntropyStable),
+        Scheme::Split(SWEFormulation2D::WetDry),
+    ] {
+        let config = domain.config(&obc, scheme);
+        let rhs = compute_rhs_swe_2d(&q, &domain.mesh, &domain.ops, &domain.geom, &config, 0.0);
+        println!("{scheme:?}: max |rhs| = {:.2e}", rhs.max_abs());
+        assert!(rhs.max_abs() < 1e-10, "{scheme:?}: {:.3e}", rhs.max_abs());
+    }
+}
+
+/// A uniform atmospheric pressure gradient over a basin open on all sides:
+/// the sea at its inverse-barometer level is at rest (the pressure force
+/// balances the surface slope) only if the open boundaries carry that level
+/// too; still water at mean sea level outside drives flow through them.
+#[test]
+fn inverse_barometer_at_open_boundaries_keeps_the_sea_at_rest() {
+    use dg_rs::boundary::InverseBarometer;
+    use dg_rs::source::AtmosphericPressure2D;
+
+    let domain = Domain::new(Mesh2D::uniform_rectangle_with_bc(
+        0.0,
+        400.0,
+        0.0,
+        300.0,
+        4,
+        3,
+        BoundaryTag::Open,
+    ));
+    let pressure = AtmosphericPressure2D::uniform_gradient(2e-2, -1e-2);
+    let q = domain.state(|x, y| (pressure.inverse_barometer(x, y, 0.0), 0.0, 0.0));
+
+    let rhs_with = |bc: &dyn SWEBoundaryCondition2D| {
+        let bc = with_walls(bc);
+        let config = domain
+            .config(&bc, Scheme::Split(SWEFormulation2D::EntropyStable))
+            .with_source_terms(&pressure);
+        compute_rhs_swe_2d(&q, &domain.mesh, &domain.ops, &domain.geom, &config, 0.0).max_abs()
+    };
+    let with_ib = rhs_with(&CharacteristicOBC::new(InverseBarometer::new(
+        StillWater::default(),
+        |x, y, t| pressure.inverse_barometer(x, y, t),
+    )));
+    let without = rhs_with(&CharacteristicOBC::still_water());
+    println!("max |rhs|: {with_ib:.2e} with the IB level outside, {without:.2e} without");
+    assert!(with_ib < 1e-12, "{with_ib:.3e}");
+    assert!(without > 1e-6, "{without:.3e}");
 }

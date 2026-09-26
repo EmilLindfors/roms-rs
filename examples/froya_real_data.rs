@@ -14,10 +14,14 @@
 //! 2. **Lake at rest.** Walls everywhere, no forcing: the largest spurious
 //!    current and surface error after `rest_hours` (exact balance keeps both
 //!    at round-off; the collocated scheme reached m/s on steep beds).
-//! 3. **Tides.** M2 at the open boundaries (`HarmonicFlather2D`, one phase
-//!    along the whole boundary: see TODO P1.4), Coriolis, Manning friction,
-//!    optionally wind and an atmospheric pressure gradient, or NorKyst nesting
-//!    (`--features netcdf`, `norkyst=<file>`).
+//! 3. **Tides.** A characteristic open boundary (`CharacteristicOBC`) forced
+//!    by NorKyst-800 boundary tides (`BoundaryTides` from the tidal atlas
+//!    `tides=<file>`, made by `examples/norkyst_boundary_tides.rs`: η, ū, v̄ of
+//!    10 constituents plus P1 and K2, varying along the boundary), on a
+//!    `ModelClock` starting at `start`. Coriolis, Manning friction, optionally
+//!    wind and an atmospheric pressure gradient (with the inverse-barometer
+//!    level at the open boundaries), or NorKyst nesting (`norkyst=<file>`).
+//!    Without an atlas: M2 of `M2_AMPLITUDE` in one phase along the boundary.
 //!
 //! Without the data files it runs a synthetic basin with an island and a
 //! beach.
@@ -26,13 +30,15 @@
 //!
 //! ```bash
 //! cargo run --release --example froya_real_data -- [nx=120] [ny=90] [order=2] \
-//!     [hours=12.42] [rest_hours=1] [output_minutes=60] [wind] [norkyst=<file>]
+//!     [hours=12.42] [rest_hours=1] [ramp_hours=1] [output_minutes=60] [wind] \
+//!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>]
 //! ```
 //!
 //! ## Data files in ./data/
 //!
 //! - froya_smola_hitra.tif (bathymetry)
 //! - GSHHS_f_L1.shp (coastline)
+//! - froya_boundary_tides.txt (tidal atlas, optional)
 
 use std::collections::HashMap;
 use std::fs;
@@ -41,9 +47,10 @@ use std::sync::Arc;
 use std::time::Instant;
 
 #[cfg(feature = "netcdf")]
-use dg_rs::boundary::OceanNestingBC2D;
+use dg_rs::boundary::OceanModelState;
 use dg_rs::boundary::{
-    HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D,
+    BoundaryTides, CharacteristicOBC, ExternalStateProvider, HarmonicTide, InverseBarometer,
+    MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
 };
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::io::{
@@ -60,7 +67,7 @@ use dg_rs::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
 use dg_rs::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, ManningFriction2D, WindStress2D,
 };
-use dg_rs::time::SSPRK3;
+use dg_rs::time::{ModelClock, SSPRK3};
 #[cfg(feature = "netcdf")]
 use dg_rs::types::Depth;
 use dg_rs::types::ElementIndex;
@@ -77,8 +84,10 @@ const LAND_ELEVATION: f64 = 5.0;
 /// M2 period (s) and a typical amplitude on this coast (m)
 const M2_PERIOD: f64 = 12.420_601 * 3600.0;
 const M2_AMPLITUDE: f64 = 0.8;
-/// Tidal ramp-up (s)
-const TIDAL_RAMP: f64 = 3600.0;
+/// Default tidal ramp-up (h)
+const TIDAL_RAMP_HOURS: f64 = 1.0;
+/// Largest distance (m) from an open-boundary node to a tidal-atlas point
+const ATLAS_COVERAGE: f64 = 5000.0;
 
 /// Wind (m/s, from °) and atmospheric pressure gradient (Pa/m, from °)
 const WIND_SPEED: f64 = 8.0;
@@ -93,8 +102,11 @@ struct Options {
     order: usize,
     hours: f64,
     rest_hours: f64,
+    ramp_hours: f64,
     output_minutes: f64,
     wind: bool,
+    start: String,
+    tides: String,
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     norkyst: Option<String>,
 }
@@ -119,17 +131,28 @@ impl Options {
             order: get("order", 2.0)? as usize,
             hours: get("hours", M2_PERIOD / 3600.0)?,
             rest_hours: get("rest_hours", 1.0)?,
+            ramp_hours: get("ramp_hours", TIDAL_RAMP_HOURS)?,
             output_minutes: get("output_minutes", 60.0)?,
             wind: args.contains_key("wind"),
+            start: args
+                .get("start")
+                .cloned()
+                .unwrap_or("2025-06-15T00:00:00Z".into()),
+            tides: args
+                .get("tides")
+                .cloned()
+                .unwrap_or("data/froya_boundary_tides.txt".into()),
             norkyst: args.get("norkyst").cloned(),
         })
     }
 }
 
-/// Surface range, largest speed where h > 10 cm (and where: x, y, h), and
-/// the number of wet nodes (h > 1 mm).
+/// Surface range (and where the highest wet node is: x, y, h), largest speed
+/// where h > 10 cm (and where: x, y, h), and the number of wet nodes
+/// (h > 1 mm).
 struct Stats {
     eta: (f64, f64),
+    highest: (f64, f64, f64),
     speed: f64,
     fastest: (f64, f64, f64),
     wet: usize,
@@ -286,6 +309,7 @@ impl Domain {
     fn stats(&self, q: &SWESolution2D) -> Stats {
         let mut stats = Stats {
             eta: (f64::MAX, f64::MIN),
+            highest: (0.0, 0.0, 0.0),
             speed: 0.0,
             fastest: (0.0, 0.0, 0.0),
             wet: 0,
@@ -296,6 +320,14 @@ impl Domain {
                 if s.h > WetDryConfig::DEFAULT_H_DRY {
                     stats.wet += 1;
                     let eta = s.h + self.bathymetry.get(k, i);
+                    if eta > stats.eta.1 {
+                        let [x, y] = self.mesh.reference_to_physical(
+                            k,
+                            self.ops.nodes_r[i],
+                            self.ops.nodes_s[i],
+                        );
+                        stats.highest = (x, y, s.h);
+                    }
                     stats.eta = (stats.eta.0.min(eta), stats.eta.1.max(eta));
                 }
                 let speed = s.hu.hypot(s.hv) / s.h;
@@ -375,26 +407,9 @@ fn lake_at_rest(domain: &Domain, hours: f64) {
 fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::Error>> {
     let t_end = opts.hours * 3600.0;
     let wall = Reflective2D::new();
-    let tide = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, 0.0).with_ramp_up(TIDAL_RAMP);
-
-    #[cfg(feature = "netcdf")]
-    let nesting = match (&opts.norkyst, &domain.projection) {
-        (Some(path), Some(projection)) => {
-            let reader = Arc::new(OceanModelReader::from_file(Path::new(path))?);
-            println!("  NorKyst: {}", reader.summary());
-            let bc = OceanNestingBC2D::new(reader, *projection).with_reference_level(0.0);
-            bc.check_time_coverage(0.0, t_end)?;
-            Some(bc)
-        }
-        _ => None,
-    };
-    #[cfg(feature = "netcdf")]
-    let bc = match &nesting {
-        Some(nesting) => MultiBoundaryCondition2D::new(&wall).with_open(nesting),
-        None => MultiBoundaryCondition2D::new(&wall).with_open(&tide),
-    };
-    #[cfg(not(feature = "netcdf"))]
-    let bc = MultiBoundaryCondition2D::new(&wall).with_open(&tide);
+    let (open, clock, forcing) = open_boundary(domain, opts, t_end)?;
+    println!("  Clock: t = 0 at {} UTC", clock.format(0.0));
+    let bc = MultiBoundaryCondition2D::new(&wall).with_open(open.as_ref());
 
     let mut builder = domain.builder(bc);
     if opts.wind {
@@ -403,10 +418,7 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
                 WindStress2D::from_direction(WIND_SPEED, WIND_DIRECTION)
                     .with_drag(DragCoefficient::LargePond),
             )
-            .with_source(AtmosphericPressure2D::from_direction(
-                PRESSURE_GRADIENT,
-                PRESSURE_DIRECTION,
-            ));
+            .with_source(pressure());
     }
     let physics: SWEPhysics2D<_> = builder.build();
 
@@ -417,20 +429,21 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
         Some(projection) => Some(NetCDFWriter::create(
             NetCDFWriterConfig::new(output_dir.join("froya.nc").to_string_lossy())
                 .with_title("Frøya–Smøla–Hitra tidal run")
-                .with_institution("dg-rs"),
+                .with_institution("dg-rs")
+                .with_clock(clock),
             &netcdf_mesh_info(domain, projection),
         )?),
         None => None,
     };
 
     println!(
-        "\nTides: M2 {M2_AMPLITUDE} m at the open boundaries, {:.2} h{} → {}",
+        "\nTides: {forcing}, {:.2} h{} → {}",
         opts.hours,
         if opts.wind { ", wind and pressure" } else { "" },
         output_dir.display()
     );
     println!(
-        "  time  |  η range (m)     | max |u| (m/s) at (x, y km; h m) | wet nodes | volume change"
+        "  time  |  η range (m)     | η max at (x, y km; h m) | max |u| (m/s) at (x, y km; h m) | wet nodes | volume change"
     );
 
     let mut q = domain.at_rest();
@@ -446,10 +459,13 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
         let stats = domain.stats(q);
         let (x, y, h) = stats.fastest;
         println!(
-            "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {:9} | {:+.3e}",
+            "{:6.2} h | [{:+.3}, {:+.3}] | ({:6.1}, {:6.1}; {:.3}) | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {:9} | {:+.3e}",
             t / 3600.0,
             stats.eta.0,
             stats.eta.1,
+            stats.highest.0 / 1e3,
+            stats.highest.1 / 1e3,
+            stats.highest.2,
             stats.speed,
             x / 1e3,
             y / 1e3,
@@ -498,6 +514,105 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
     }
     println!("Visualize with ParaView: {}/*.vtu", output_dir.display());
     Ok(())
+}
+
+/// The atmospheric pressure gradient of the `wind` option.
+fn pressure() -> AtmosphericPressure2D {
+    AtmosphericPressure2D::from_direction(PRESSURE_GRADIENT, PRESSURE_DIRECTION)
+}
+
+/// Characteristic OBC with external data from `provider`, raised by the
+/// inverse-barometer level of the pressure forcing when `wind` is on.
+fn characteristic<P: ExternalStateProvider + 'static>(
+    provider: P,
+    wind: bool,
+) -> Box<dyn SWEBoundaryCondition2D> {
+    if wind {
+        let p = pressure();
+        let level = move |x, y, t| p.inverse_barometer(x, y, t);
+        Box::new(CharacteristicOBC::new(InverseBarometer::new(
+            provider, level,
+        )))
+    } else {
+        Box::new(CharacteristicOBC::new(provider))
+    }
+}
+
+type OpenBoundary = (Box<dyn SWEBoundaryCondition2D>, ModelClock, String);
+
+/// Open-boundary condition, model clock and a description of the forcing:
+/// NorKyst nesting (`norkyst=`), else atlas tides (`tides=`), else uniform M2.
+fn open_boundary(
+    domain: &Domain,
+    opts: &Options,
+    t_end: f64,
+) -> Result<OpenBoundary, Box<dyn std::error::Error>> {
+    #[cfg(feature = "netcdf")]
+    if let (Some(path), Some(projection)) = (&opts.norkyst, &domain.projection) {
+        let reader = Arc::new(OceanModelReader::from_file(Path::new(path))?);
+        println!("  NorKyst: {}", reader.summary());
+        let clock = OceanModelState::<LocalProjection>::first_snapshot(&reader);
+        let parent = OceanModelState::new(reader, *projection, clock);
+        parent.check_time_coverage(0.0, t_end)?;
+        return Ok((
+            characteristic(parent, opts.wind),
+            clock,
+            "NorKyst nesting".into(),
+        ));
+    }
+
+    let clock = ModelClock::parse(&opts.start)?;
+    let atlas_path = Path::new(&opts.tides);
+    if let (Some(projection), true) = (&domain.projection, atlas_path.exists()) {
+        let atlas = TidalAtlas::read(atlas_path)?;
+        let tides = atlas
+            .boundary_tides(
+                &domain.mesh,
+                &domain.ops,
+                projection,
+                BoundaryTag::Open,
+                &clock,
+                t_end,
+                ATLAS_COVERAGE,
+            )?
+            .with_ramp_up(3600.0 * opts.ramp_hours);
+        let description = describe(&tides, atlas_path);
+        return Ok((characteristic(tides, opts.wind), clock, description));
+    }
+
+    println!("  No tidal atlas at {}: uniform M2", opts.tides);
+    let tide = HarmonicTide::m2(M2_AMPLITUDE, 0.0)
+        .with_ramp_up(3600.0 * opts.ramp_hours)
+        .with_nodal_corrections(&clock, 0.5 * t_end);
+    let description = format!("M2 of {M2_AMPLITUDE} m in one phase at the open boundaries");
+    Ok((characteristic(tide, opts.wind), clock, description))
+}
+
+/// Constituents, forced nodes, and the M2 amplitude range and phase spread
+/// along the open boundary.
+fn describe(tides: &BoundaryTides, path: &Path) -> String {
+    let mut text = format!(
+        "{} constituents from {} at {} open-boundary nodes",
+        tides.names().len(),
+        path.display(),
+        tides.n_nodes()
+    );
+    if let Some(m2) = tides.names().iter().position(|&n| n == "M2") {
+        let constants: Vec<(f64, f64)> = (0..tides.n_nodes())
+            .map(|slot| tides.elevation_constants(slot, m2))
+            .collect();
+        let (lo, hi) = constants.iter().fold((f64::MAX, f64::MIN), |(lo, hi), c| {
+            (lo.min(c.0), hi.max(c.0))
+        });
+        // Phases relative to the first node, in (−180°, 180°]
+        let relative = constants
+            .iter()
+            .map(|c| (c.1 - constants[0].1 + 180.0).rem_euclid(360.0) - 180.0);
+        let (p_lo, p_hi) =
+            relative.fold((f64::MAX, f64::MIN), |(lo, hi), p| (lo.min(p), hi.max(p)));
+        text += &format!("; M2 {lo:.3}–{hi:.3} m, phase spread {:.1}°", p_hi - p_lo);
+    }
+    text
 }
 
 #[cfg(feature = "netcdf")]

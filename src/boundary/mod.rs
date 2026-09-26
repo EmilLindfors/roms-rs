@@ -1,117 +1,72 @@
 //! Boundary conditions for shallow water equations.
 //!
-//! Boundary conditions specify how to compute the "ghost" state outside
-//! the domain for flux evaluation at boundary faces.
+//! Boundary conditions supply the state outside (or on) the domain boundary
+//! for the face flux.
 //!
-//! # Available Boundary Conditions
+//! # 2D boundary conditions
 //!
 //! | BC Type | Description |
 //! |---------|-------------|
 //! | `Reflective2D` | Wall (no-flux), tangential velocity preserved |
-//! | `Radiation2D` | Characteristic radiation towards still water at η_ext |
-//! | `Chapman2D` | Blended sea surface height (reflective in DG, see its docs) |
-//! | `Flather2D` | Characteristic (Flather) open boundary |
-//! | `ChapmanFlather2D` | Flather with time-varying external (η, u_n) |
-//! | `HarmonicTidal2D` | Harmonic constituents (Dirichlet) |
-//! | `HarmonicFlather2D` | Harmonic constituents + Flather |
-//! | `Discharge2D` | Prescribed flow rate |
-//! | `NestingBC2D` | One-way nesting from parent model |
+//! | `CharacteristicOBC` | Open boundary: incoming Riemann invariant from external data |
+//! | `HarmonicTidal2D`, `Tidal2D` | Clamped elevation (Dirichlet; reflects) |
+//! | `Discharge2D`, `ConstantDischarge2D` | Prescribed flow rate |
+//! | `MultiBoundaryCondition2D` | Per-tag dispatch |
 //!
-//! # BC Selection Guide for Tidal Simulations
+//! # Open boundaries
 //!
-//! | Scenario | Recommended BC | Rationale |
-//! |----------|----------------|-----------|
-//! | Open ocean | `HarmonicFlather2D` | Best wave absorption |
-//! | Closed/semi-closed basin | `HarmonicTidal2D` + sponge | Clamped elevation; sponge absorbs |
-//! | Fjord mouth | `ChapmanFlather2D` | Separates incoming/outgoing waves |
-//! | Nesting from parent | `NestingBC2D` | Parent signal in, child signal out |
+//! Radiation, tidal (Flather) and nesting boundaries differ only in the
+//! external data that fixes the incoming Riemann invariant, so they are one
+//! [`CharacteristicOBC`] with an [`ExternalStateProvider`]:
 //!
-//! # Flather-type open boundaries in the weak DG setting
+//! | External data | Provider |
+//! |---------------|----------|
+//! | Still water (radiation) | [`StillWater`] |
+//! | Uniform harmonic tide | [`HarmonicTide`] |
+//! | Spatially varying tides (NorKyst, TPXO) | [`BoundaryTides`] from a [`TidalAtlas`] |
+//! | Parent model at one point | [`ParentTimeSeries`] |
+//! | Parent model output (NetCDF) | `OceanModelState` (feature `netcdf`) |
+//! | Anything else | a closure `(x, y, t) → ExternalState` |
 //!
-//! Boundary conditions only supply a ghost state; the flux through a boundary
-//! face is computed by the same upwind Riemann solver (Roe/HLL/Rusanov) as on
-//! interior faces. That solver takes the outgoing Riemann invariant
-//! `w+ = u_n + sqrt(g/h) η` from the interior and the incoming invariant
-//! `w− = u_n − sqrt(g/h) η` from the ghost. The Flather (1976) relation
-//! `u_n = u_n,ext + sqrt(g/h)(η − η_ext)` is precisely "`w−` from outside,
-//! `w+` from inside", so the Flather-type BCs (`Flather2D`,
-//! `HarmonicFlather2D`, `ChapmanFlather2D`, `TSTOBC2D`, `NestingBC2D`,
-//! `OceanNestingBC2D`) use the external state itself as ghost:
-//! `h = η_ext − B`, `u_n = u_n,ext`, `u_t` from the interior or external data.
-//! Adding the Flather correction to the ghost as well applies it twice and
-//! reflects outgoing waves (coefficient −1/3); see
-//! `tests/open_boundary_flather_test.rs`.
+//! The boundary state is built from the invariants and the face flux is its
+//! physical flux, so it does not depend on the Riemann solver; see
+//! [`characteristic`](CharacteristicOBC) for the formulation, elevation-only
+//! data and oblique incidence. Time-dependent data refers to a
+//! [`ModelClock`](crate::time::ModelClock).
 //!
-//! With zero external velocity (the default for the elevation-only BCs) the
-//! boundary elevation equals η_ext only where the boundary sits at an antinode
-//! of a standing (co-oscillating) tide, the usual case for a coastal domain
-//! much shorter than the tidal wavelength. A progressive wave entering through
-//! the boundary is delivered at η_ext / 2 unless the matching external normal
-//! velocity (`u_n,ext = −sqrt(g/h) η_ext` for inflow) is supplied, e.g. via
-//! `ChapmanFlather2D` or a nesting BC.
+//! # Bathymetry convention
 //!
-//! # IMPORTANT: Bathymetry Convention for Flather BCs
-//!
-//! Flather-type BCs (`Flather2D`, `HarmonicFlather2D`, `ChapmanFlather2D`) use
-//! surface elevation η = h + B where B is bathymetry.
-//!
-//! **You MUST set bathymetry correctly** to avoid spurious velocities:
+//! Depth is `h = η − B` with `B` the bed elevation (negative under water), so
+//! external elevations are levels, not depths. For a basin of depth h₀ set
+//! `B = −h₀`:
 //!
 //! ```text
-//! For a domain with mean depth h0 (e.g., 50m):
-//!   bathymetry = Bathymetry2D::constant(n_elements, n_nodes, -h0);
-//!
-//! This ensures:
-//!   η = h + B = 50 + (-50) = 0 (surface at MSL)
+//! bathymetry = Bathymetry2D::constant(n_elements, n_nodes, -h0);
 //! ```
 //!
-//! **Without correct bathymetry** (B = 0):
-//! - Interior η = h = 50m (surface 50m above MSL!)
-//! - Tidal η ≈ 0m
-//! - Ghost depth h = η_ext − B ≈ 0 against 50 m inside → dam-break outflow!
+//! With B = 0 by mistake, the interior surface sits h₀ above the external
+//! level and the boundary drains the domain like a dam break;
+//! [`CharacteristicOBC`] warns once when it sees that configuration.
 //!
-//! The Flather BCs will emit a one-time warning if misconfiguration is detected.
+//! # Sponge layers
 //!
-//! # Sponge Layers for Closed Basins
-//!
-//! In closed or semi-closed basins (fjords, bays), reflective boundaries such
-//! as `HarmonicTidal2D` trap outgoing energy, which can build up resonance.
-//!
-//! **Recommended pattern:**
-//! ```ignore
-//! // Use Dirichlet BC (no velocity feedback)
-//! let tidal_bc = HarmonicTidal2D::new(constituents).with_ramp_up(3600.0);
-//!
-//! // Add sponge layer to absorb outgoing waves
-//! let sponge = SpongeLayer2D::rectangular(
-//!     |_, _, _| SWEState2D::from_primitives(h0, 0.0, 0.0),
-//!     0.01,  // gamma_max
-//!     SpongeProfile::Cosine,
-//!     (x_min, x_max), (y_min, y_max),
-//!     5000.0,  // sponge width
-//!     [false, true, false, false],  // right boundary only
-//! );
-//! ```
-//!
-//! Or use the `TidalSimulationBuilder`:
-//! ```ignore
-//! let builder = TidalSimulationBuilder::closed_basin_stable(0.5, 50.0, 5000.0);
-//! let bc = builder.build_bc();
-//! let sponge = builder.build_sponge((x_min, x_max), (y_min, y_max));
-//! ```
+//! Clamped-elevation boundaries (`HarmonicTidal2D`) reflect outgoing waves; in
+//! closed basins add a sponge (`SpongeLayer2D`, or
+//! [`TidalSimulationBuilder::closed_basin_stable`]) or use a
+//! [`CharacteristicOBC`].
 
 pub mod bathymetry_validation;
 mod boundary_2d;
-mod chapman;
+mod characteristic;
+mod harmonic_tide;
 mod multi_bc_2d;
-mod nesting_bc;
 #[cfg(feature = "netcdf")]
 mod ocean_nesting;
 mod radiation;
 mod reflective;
 mod tidal;
+mod tidal_atlas;
 mod tidal_config;
-mod tst_obc;
 
 // 1D boundary conditions
 pub use radiation::{FlatherBC, RadiationBC, SpongeLayer};
@@ -120,16 +75,19 @@ pub use tidal::{InterpolatedTidalBC, TidalBC, TidalConstituent};
 
 // 2D boundary conditions
 pub use boundary_2d::{
-    BCContext2D, ConstantDischarge2D, Discharge2D, Extrapolation2D, FixedState2D, Flather2D,
-    HarmonicFlather2D, HarmonicTidal2D, Radiation2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
+    BCContext2D, BoundaryState, ConstantDischarge2D, Discharge2D, Extrapolation2D, FixedState2D,
+    HarmonicTidal2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
 };
-pub use chapman::{Chapman2D, ChapmanFlather2D};
+pub use characteristic::{
+    CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider, InverseBarometer,
+    ParentTimeSeries, StillWater, characteristic_state,
+};
+pub use harmonic_tide::{HarmonicTide, tidal_ramp};
 pub use multi_bc_2d::MultiBoundaryCondition2D;
-pub use nesting_bc::NestingBC2D;
 #[cfg(feature = "netcdf")]
-pub use ocean_nesting::OceanNestingBC2D;
+pub use ocean_nesting::OceanModelState;
+pub use tidal_atlas::{AtlasConstituent, AtlasPoint, BoundaryTides, TidalAtlas, TidalAtlasError};
 pub use tidal_config::{SpongeConfig, TidalBCType, TidalSimulationBuilder};
-pub use tst_obc::{TSTConfig, TSTConstituent, TSTOBC2D};
 
 // Re-export validation types
 pub use bathymetry_validation::{

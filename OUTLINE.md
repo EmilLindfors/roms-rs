@@ -46,8 +46,10 @@ src/
 ├── source/           # SourceTerm1D/2D traits; Coriolis, friction, wind, tidal
 │                     # potential, viscosity, bathymetry, sponge; well-balanced
 │                     # hydrostatic reconstruction
-├── boundary/         # Chapman/Flather, TST-OBC, radiation, reflective, tidal
-│                     # forcing, multi-BC dispatch, NorKyst nesting
+├── boundary/         # CharacteristicOBC + external-state providers (still
+│                     # water, harmonic tide, tidal atlas, NorKyst parent,
+│                     # inverse barometer), reflective, clamped tidal,
+│                     # discharge, multi-BC dispatch
 │
 │  # ---- Solver ----
 ├── solver/
@@ -93,7 +95,7 @@ are the adapter edge; the DG core must stay free of I/O and feature flags
 | Time integration | Generic `SSPRK3` over `Integrable` is the real path; five legacy copies pending deletion |
 | Mode splitting | Prototype: Hann filter correct, but the FE subcycle runs inside every RK stage (first-order, damps M2 3–14 %/period), G double-counts advection, stresses never reach the depth mean. Needs a ROMS-style once-per-step forward-backward pass (REVIEW.md §2) |
 | 3D physics | Scaffolding: sigma grid, tridiagonal and implicit diffusion solid; tracers not constancy-preserving, vertical advection ×D (fix in review), non-balanced PGF, no GLS; essentially untested (REVIEW.md §3, §6.1) |
-| Boundaries/nesting | Tidal astronomy correct; Flather fixed (ghost = external state, reflection < 1e-5); spatially uniform tidal forcing, NorKyst nesting lacks CF time/rotation/transport conservation (REVIEW.md §4.2–§4.5) |
+| Boundaries/nesting | One characteristic OBC (flux F(q_b)·n, independent of the Riemann solver; reflection ~1e-6), NorKyst boundary tides from a harmonic atlas, `ModelClock`; NorKyst nesting still lacks rotation/transport conservation and a relaxation band (REVIEW.md §4.3–§4.5, TODO P1.5) |
 | Performance | SoA + rayon workspace pattern correct; ~47× ROMS core-hours as configured (model estimate): dt estimator, dense volume term, land elements, per-step allocations (REVIEW.md §5) |
 | GPU | Burn prototype physically wrong and slower-by-design; fix or replace with custom fused f64 kernels over CSR (REVIEW.md §5; TODO P0.11/P2.7) |
 
@@ -114,8 +116,8 @@ REVIEW.md §7 (2026-09-25):
    desingularization, point-implicit friction, HLL default, and the
    shoreline-balanced split form `SWEFormulation2D::WetDry`), η-limiting;
    isoparametric quads +
-   triangles; spatially varying
-   tides, model clock, proper NorKyst nesting.
+   triangles; proper NorKyst nesting. Done: one characteristic OBC,
+   spatially varying NorKyst boundary tides, model clock.
 3. **Cheap enough to matter** — per-element dt, sum factorisation, one Riemann
    solve per face, water-only meshes, then local time stepping or an implicit
    free surface.

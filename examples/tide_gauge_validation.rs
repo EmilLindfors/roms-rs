@@ -25,7 +25,7 @@ use dg_rs::analysis::{
     TideGaugeStation, TimeSeries,
 };
 use dg_rs::boundary::{
-    HarmonicTidal2D, MultiBoundaryCondition2D, Radiation2D, Reflective2D, TidalConstituent,
+    CharacteristicOBC, HarmonicTidal2D, MultiBoundaryCondition2D, Reflective2D, TidalConstituent,
 };
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
@@ -330,15 +330,15 @@ fn main() {
 
     // Setup boundary conditions
     //
-    // NOTE: Using HarmonicTidal2D (Dirichlet for elevation) instead of HarmonicFlather2D
-    // to avoid stability issues from velocity feedback in this closed-basin geometry.
-    // For open ocean boundaries, use HarmonicFlather2D for better wave absorption.
+    // NOTE: HarmonicTidal2D clamps the elevation (Dirichlet). For open
+    // boundaries that must let outgoing waves leave, use
+    // CharacteristicOBC::new(HarmonicTide::new(...)) instead.
     //
     // Alternatively, use TidalSimulationBuilder for recommended presets:
     //   let builder = TidalSimulationBuilder::closed_basin_stable(amp, h0, sponge_width);
     //   let bc = builder.build_bc();
     let wall_bc = Reflective2D::new();
-    let radiation_bc = Radiation2D::still_water();
+    let radiation_bc = CharacteristicOBC::still_water();
 
     let tidal_bc = HarmonicTidal2D::new(vec![
         TidalConstituent::m2(avg_m2_amp * amp_scale, avg_m2_phase.to_radians()),

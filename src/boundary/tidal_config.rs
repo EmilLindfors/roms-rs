@@ -18,7 +18,7 @@
 //! ```
 
 use crate::boundary::tidal::TidalConstituent;
-use crate::boundary::{HarmonicFlather2D, HarmonicTidal2D, SWEBoundaryCondition2D};
+use crate::boundary::{CharacteristicOBC, HarmonicTidal2D, HarmonicTide, SWEBoundaryCondition2D};
 use crate::mesh::Bathymetry2D;
 use crate::solver::SWEState2D;
 use crate::source::{SpongeLayer2D, SpongeProfile};
@@ -83,7 +83,7 @@ impl SpongeConfig {
 /// Type of boundary condition to use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TidalBCType {
-    /// Flather BC with velocity feedback (good wave absorption, can resonate).
+    /// Characteristic (Flather) OBC: outgoing waves leave, the tide comes in.
     Flather,
     /// Dirichlet BC for elevation (stable, doesn't absorb outgoing waves).
     Dirichlet,
@@ -253,23 +253,22 @@ impl TidalSimulationBuilder {
         self
     }
 
+    /// The configured tide.
+    fn tide(&self) -> HarmonicTide {
+        let tide =
+            HarmonicTide::new(self.constituents.clone()).with_mean_elevation(self.mean_elevation);
+        match self.ramp_duration {
+            Some(duration) => tide.with_ramp_up(duration),
+            None => tide,
+        }
+    }
+
     /// Build the boundary condition.
     pub fn build_bc(&self) -> Box<dyn SWEBoundaryCondition2D> {
         match self.bc_type {
-            TidalBCType::Flather => {
-                let mut bc = HarmonicFlather2D::new(self.constituents.clone(), self.h_ref)
-                    .with_mean_elevation(self.mean_elevation);
-                if let Some(duration) = self.ramp_duration {
-                    bc = bc.with_ramp_up(duration);
-                }
-                Box::new(bc)
-            }
+            TidalBCType::Flather => Box::new(CharacteristicOBC::new(self.tide())),
             TidalBCType::Dirichlet => {
-                let mut bc = HarmonicTidal2D::new(self.constituents.clone()).with_h_min(self.h_min);
-                if let Some(duration) = self.ramp_duration {
-                    bc = bc.with_ramp_up(duration);
-                }
-                Box::new(bc)
+                Box::new(HarmonicTidal2D::from_tide(self.tide()).with_h_min(self.h_min))
             }
         }
     }
@@ -389,7 +388,7 @@ mod tests {
     fn test_build_bc_flather() {
         let builder = TidalSimulationBuilder::m2(0.5, 0.0, 50.0);
         let bc = builder.build_bc();
-        assert_eq!(bc.name(), "harmonic_flather_2d");
+        assert_eq!(bc.name(), "characteristic_obc");
     }
 
     #[test]

@@ -11,6 +11,7 @@
 //!
 //! The [`Integrable`] trait marks solution types that can be time-stepped.
 
+mod clock;
 mod coupled_swe_tracer;
 pub mod integrator;
 pub mod mode_split;
@@ -22,6 +23,7 @@ mod ssp_rk3_swe_2d;
 #[cfg(feature = "burn")]
 mod burn_ssp_rk3;
 
+pub use clock::ModelClock;
 pub use coupled_swe_tracer::{
     CoupledRhs2D, CoupledState2D, CoupledTimeConfig, TracerLimiterType, compute_coupled_rhs,
     compute_coupled_rhs_baroclinic, compute_dt_coupled, run_coupled_simulation,

@@ -24,11 +24,11 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `REVIEW.md`
 
 ## ▶ Next session — start here
 
-Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the deferred P0.11 GPU), P1.1 for the `Simulation` path, and the P1.2 core (split form; `WetDry` with second-order shoreline subcells as the wet/dry default). Frøya now runs on `Simulation` + `WetDry` on a water-only mesh, with correctly georeferenced bathymetry: the GeoTIFF reader had ignored its georeferencing. Lake at rest over the real bathymetry holds to 1.5e-10 m/s for 1 h. A full M2 cycle at 9,653 P2 elements is stable, with 0 clips, in 11.4 min. Pick up in this order:
+Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the deferred P0.11 GPU), P1.1 for the `Simulation` path, and the P1.2 core (split form; `WetDry` with second-order shoreline subcells as the wet/dry default). Frøya now runs on `Simulation` + `WetDry` on a water-only mesh, with correctly georeferenced bathymetry: the GeoTIFF reader had ignored its georeferencing. Lake at rest over the real bathymetry holds to 1.5e-10 m/s for 1 h. P1.4 is done: one characteristic OBC (`CharacteristicOBC` + external-state providers), NorKyst-800 boundary tides from a harmonic atlas, and a `ModelClock`. A full M2 cycle with NorKyst boundary tides at 9,653 P2 elements is stable, with 0 clips, in 6 min. Pick up in this order:
 
-1. **P1.4 tidal forcing.** One characteristic OBC, boundary tides from NorKyst harmonics, and a `ModelClock`. The Frøya M2 run shows what the uniform-phase Flather forcing does (details under P1.4).
-2. **P3.1 validation.** A multi-day Frøya run with harmonic analysis at gauges against NorKyst and Kartverket. Re-run the Bergen NorKyst fit too: it used the truncated periods fixed in P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)).
-3. **Let the error budget choose next:** geometry (P1.3) if the coastline dominates the error, cost (P2, profile first) if run time does.
+1. **P3.1 validation.** The Frøya boundary forcing is now real (`data/froya_boundary_tides.txt`; regenerate with `examples/norkyst_boundary_tides.rs`, ~10 min over OPeNDAP). Run several days (`ramp_hours=3`) and fit `analysis::fit_reference_constants` at gauges (Heimsjø, Kristiansund) against NorKyst and Kartverket. Re-run the Bergen NorKyst fit too: it used the truncated periods fixed in P0.15 ([PR #2](https://github.com/EmilLindfors/roms-rs/pull/2)).
+2. **Shoreline cliffs (P1.6).** Lone wet nodes next to land nodes at `LAND_ELEVATION` = +5 m carry η jumps of ~1 m and 1–2.8 m/s through the tide (details under P1.4). They dominate the Frøya extremes; a foreshore DEM, or a gentler land elevation, is the likely fix.
+3. **Then let the error budget choose:** geometry (P1.3) if the coastline dominates the error, cost (P2, profile first) if run time does.
 4. **η-based limiting is on hold.** The subcells limit the partially dry elements, and tides are smooth. Revisit only if a real run shows oscillations.
 
 Build note: default features need the `roms-rs` conda env (`conda activate roms-rs`) for HDF5/netCDF. Otherwise use `cargo test --no-default-features --features parallel,simd`.
@@ -164,25 +164,19 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Gmsh: real MSH 4.1 parsing, sparse node tags, no `.unwrap()` on input, error (not drop) on unsupported element types.
 - [ ] CSR connectivity. Make `MeshGPUData` the single representation.
 
-### P1.4 Open boundaries and tidal forcing
-- **Evidence from Frøya** (`examples/froya_real_data.rs`, 120 × 90 grid, P2, one M2 cycle; M2 of 0.8 m in one phase on all four open sides, 1 h ramp):
-  - a 2.5 m/s jet in 40 m of water at the southern open boundary (the Frøya–Hitra channel) on the flood;
-  - η up to +1.36 m at t = 1 h against 0.7 m of forcing;
-  - basins that stay at ≈ +1.04 m through low tide, apparently water trapped behind sills that dry out at this resolution;
-  - 2.8 m/s over 1 m-deep draining flats.
-
-  Only walls on the south and east sides were worse (3.4 m/s at the wall). Recheck these with NorKyst boundary harmonics before tuning anything else.
-- [ ] Spatially varying tidal forcing: a TPXO/FES reader, or boundary harmonics from NorKyst. Uniform-phase forcing is wrong by ~30° of M2 phase along 200 km.
-- [ ] A `ModelClock { epoch_unix }` threaded through BCs (`OceanNestingBC2D::with_epoch` is the first per-BC epoch; fold it in), forcing, NetCDF output (writer time units, `netcdf_io.rs:241` vs `:397`) and validation (`tide_gauge.rs:234-239` compares by length only).
-- [ ] Nodal f/u at the run or record midpoint, not frozen at the epoch; guard against double application.
-- [ ] **One characteristic OBC.** Flather, Chapman, radiation, TST and nesting differ only in the external data that sets the incoming invariant `w− = u_n − 2√(gh)`; the outgoing `w+` always comes from the interior. Replace the per-type ghost logic with:
-  - a single `CharacteristicOBC` that builds the boundary state from the invariants (`u_b = ½(w+_int + w−_ext)`, `√(g h_b) = ¼(w+_int − w−_ext)`, u_t from the upwind side) and evaluates the flux as `F(q_b)·n`, so the result does not depend on the Riemann solver (ghost = external state is exact only for Roe; Lax–Friedrichs matches only at u = 0). The 1D `RadiationBC` (`radiation.rs`) already builds this state;
-  - external-state providers (constant/still water, harmonic tide, time series, nesting interpolation) in place of the BC zoo. Drop the finite-difference remnants: Chapman's elevation blend (a reflecting clamp in DG), TST's extra "subtidal" velocity, `NestingBC2D::flather_weight`, and `SWE2DRhsConfig::with_dt` (no callers);
-  - nesting relaxation in a sponge/FRS band (`source/`), not in the ghost; 1D characteristic OBCs reflect oblique incidence (~17 % at 45°);
-  - elevation-only forcing: take transports from NorKyst/TPXO, or assume an incoming progressive wave (`u_n,ext = −√(g/h) η_ext`); `u_ext = 0` delivers a progressive tide at half amplitude.
-  - Gate: extend `tests/open_boundary_flather_test.rs` to all three fluxes, oblique incidence and elevation-only forcing.
-  - Done: `Radiation2D` is now η-referenced still water (ghost = external state) instead of zero-gradient extrapolation.
-- [ ] Inverse-barometer consistency at open boundaries; cap Large–Pond Cd.
+### P1.4 Open boundaries and tidal forcing — DONE (except the relaxation band, moved to P1.5)
+- [x] **One characteristic OBC.** `CharacteristicOBC` builds the boundary state from the invariants (`u_b = ½(w+_int + w−_ext)`, `√(g h_b) = ¼(w+_int − w−_ext)`, u_t from the upwind side; supercritical sides whole; sonic Riemann states against a dry side) and the kernels take its physical flux `F(q_b)·n` (`BoundaryState::Exact`), independent of the Riemann solver.
+  - External data from providers: `StillWater`, `HarmonicTide`, `ParentTimeSeries`, `OceanModelState`, `BoundaryTides`, `InverseBarometer`, closures. Removed `Flather2D`, `HarmonicFlather2D`, `Radiation2D`, `Chapman2D`, `ChapmanFlather2D`, `TSTOBC2D`, `NestingBC2D`, `OceanNestingBC2D`, `SWE2DRhsConfig::with_dt`.
+  - Elevation-only forcing: `ElevationOnly::IncomingWave` (simple wave from still water) or `AtRest` (half amplitude for a progressive wave, as before).
+  - Gate (`tests/open_boundary_flather_test.rs`, Roe/HLL/Rusanov/EntropyStable/WetDry): reflection ~1e-6; delivered amplitude 0.997–1.001; 45° reflection 0.180 vs theory 0.172 (1D characteristic OBCs reflect oblique waves; see the module docs); flux identical across Riemann solvers; lake at rest 4e-14.
+- [x] Spatially varying tidal forcing from NorKyst harmonics: `TidalAtlas` (text format) → `BoundaryTides` (complex IDW onto boundary nodes, coverage check, velocity rotated to mesh axes); `examples/norkyst_boundary_tides.rs` fits reference constants of η, ū, v̄ from 30 days of NorKyst-800 over OPeNDAP (`analysis::fit_reference_constants`, P1 and K2 inferred). Frøya: 187 points, η R² 0.985–0.991, M2 0.70–0.81 m, G 297.6–303.8°.
+- [x] `ModelClock` (`time::ModelClock`): BCs (`HarmonicTide`, `BoundaryTides`, `OceanModelState`, which replaces the per-BC epoch), NetCDF output units (the writer claimed `since 1970-01-01` for simulation seconds), validation (`StationValidationResult::compute` now pairs by time).
+- [x] Nodal f/u at the run or record midpoint, V₀ at the epoch; corrections stored apart from the constants, so they cannot be applied twice.
+- [x] Inverse-barometer level at open boundaries (`InverseBarometer`); Large–Pond Cd held at its 25 m/s value.
+- **Frøya result** (`examples/froya_real_data.rs`, 9,653 P2 elements, NorKyst boundary tides, 2025-06-15): stable, 0 clips, 6 min per M2 cycle. The 1 h ramp overshoots (η 1.6 m, a 2.9 m/s jet at the southern boundary at t = 1 h) because it squeezes a spring-tide rise into an hour; `ramp_hours=3` removes it (0.48 m at 1 h, then the tide, η −1.14…+1.06 m). The "basins at +1.04 m through low tide" and the 2.8 m/s "draining flats" of the old evidence are **lone wet nodes in shoreline elements next to land nodes at `LAND_ELEVATION` = +5 m**: η jumps by 0.8–1.0 m between elements at the same vertex, with 1–2.8 m/s. A shoreline-geometry artifact (P1.6 foreshore DEM, P1.3), not the forcing.
+- [ ] Nesting relaxation in a sponge/FRS band (`source/`), not in the ghost: moved to P1.5 (same item there).
+- [ ] Transport consistency at the boundary: the atlas velocity is NorKyst's depth mean over NorKyst's depth; scale by `h_parent/h_child` (depth is in the atlas) where the beds differ (P1.5).
+- [ ] Velocity from z-levels stops at 300 m (NorKyst has no `ubar`/`vbar` on THREDDS); deeper columns extend the 300 m value.
 
 ### P1.5 Nesting done properly (NorKyst/ROMS parent)
 - [ ] Conserve parent transport: ubar_child = ubar_parent·h_parent/h_child. Read parent `h`, and blend child bathymetry to the parent's in the relaxation band (`ocean_nesting.rs:141-145`).
@@ -198,6 +192,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Land/nodata must not become B = 0 in `Bathymetry2D::from_geotiff` (`bathymetry_2d.rs:133`). Frøya now builds its bed itself, meshes water only and gives land nodes a positive elevation. Move that into the library (bed from GeoTIFF + coastline) and drop `from_geotiff`'s `unwrap_or(0.0)`.
 - [ ] `LandMask2D::from_coastline_and_bathymetry` counts water shallower than `min_depth` as land (the old Frøya run used 5 m, dropping every tidal flat) and uses nearest sampling. It is unused now; fix or delete it.
 - [ ] The Frøya GeoTIFF stores land as 0 and has no land elevations, so there are no intertidal flats: land is a wall at mean sea level (given `LAND_ELEVATION` = 5 m in the example). Real wetting/drying needs a merged DEM (e.g. Kartverket's) for the foreshore.
+  - Measured cost (P1.4 Frøya run): a wet node whose element neighbours are land at +5 m (a 5–10 m step within one P2 element) carries an η discontinuity of 0.8–1.0 m against the adjacent element at the same vertex, and 1–2.8 m/s, through the whole tide. These nodes set the run's η maximum and fastest current. Until a DEM exists, try a land elevation just above the highest tide (≈ +1.5 m) or a bed smoothed across the coastline.
 - [ ] GSHHS inner rings (holes) and a spatial index for point-in-polygon (`coastline.rs:81-95`).
 - [ ] f(latitude) and β helpers. Fix `norwegian_coast_beta()` (β = 1.6e-11 is the 45°N value; 60°N ≈ 1.14e-11). UTM33 / Lambert for coast-scale domains.
 - [ ] Atmospheric forcing reader for MET Nordic / MEPS / AROME-Arctic (Lambert grid, 2D lat/lon, grid-relative winds, CF time), wired to `WindStress2D`/`AtmosphericPressure2D`.
@@ -211,7 +206,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - Shorelines: `WetDry`, `test_wet_dry_lake_at_rest_with_shorelines` (RHS) and `tests/wet_dry_2d_test.rs::lake_at_rest_with_shoreline_is_exact` (100 s runs). `Standard` is bounded by `…_stays_near_rest`.
 - [x] Mass conservation with discontinuous B and slope-correlated flow: split forms `test_mass_conservation`, `WetDry` with dry regions `test_wet_dry_mass_conservation_with_dry_regions`; `Standard` covered by the P0.13 tests.
 - [x] Thacker parabolic bowl (dynamic wet/dry), planar SWASHES case: `thacker_planar_oscillation_converges_{standard,wet_dry}`. Both converge at ≈ 2nd order. Also the Ritter dry dam break, for both formulations.
-- [ ] Outgoing-pulse reflection < 1 %; delivered tidal amplitude.
+- [x] Outgoing-pulse reflection < 1 %; delivered tidal amplitude: `tests/open_boundary_flather_test.rs` for all three fluxes and both split forms, plus oblique incidence and elevation-only forcing (P1.4).
 - [ ] Nonlinear SWE convergence with bathymetry on curved meshes. Assert N+1: current thresholds 1.5/2.5 are below it (`tests/convergence_test.rs`).
 - [ ] Fix vacuous tests:
   - `test_geostrophic_balance` passes with Coriolis removed (tolerance 0.49 vs ~1e-3 signal).
@@ -278,7 +273,7 @@ The tidal-comparison code path is complete: fit with `HarmonicAnalysis` → `Har
 - [ ] Run the model against NorKyst-800 barotropic tides for a test period. This needs P0.12, P0.20, P1.3–P1.5.
 - [ ] Compare with ADCP currents (`analysis/adcp.rs`). Add a tidal-ellipse fit and a complex-difference skill metric.
 - [ ] Document skill scores (RMSE, bias, correlation) per station.
-- [ ] Harmonic analysis: a record-length/Rayleigh guard in `fit()`; P1-from-K1 inference for short records; an `AnalysisError` type instead of asserts.
+- [ ] Harmonic analysis: `fit_reference_constants` now has a Rayleigh check, P1/K2 inference and error returns (P1.4); `HarmonicAnalysis::fit` still has none of them. Port its callers or give it the same guard; an `AnalysisError` type instead of asserts and `String` errors.
 
 ### P3.2 Cost-vs-accuracy benchmark against ROMS
 - [ ] Pareto benchmark on the same hardware: M2/S2/K1/O1 error at tide gauges vs core-hours, ROMS 2D at 800/400/200 m vs DG P1–P4. This is what settles "faster than ROMS" (`REVIEW.md` §5.5).

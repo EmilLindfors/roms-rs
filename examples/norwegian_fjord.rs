@@ -16,7 +16,7 @@ use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 
-use dg_rs::boundary::{HarmonicFlather2D, MultiBoundaryCondition2D, Reflective2D};
+use dg_rs::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D};
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::io::write_vtk_coupled;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
@@ -216,7 +216,7 @@ fn main() {
     println!("Setting up boundary conditions...");
 
     // SWE: Tidal forcing at y=L_Y (open sea), walls elsewhere
-    let tidal_bc = HarmonicFlather2D::m2_only(M2_AMPLITUDE, 0.0, H_MEAN);
+    let tidal_bc = CharacteristicOBC::new(HarmonicTide::m2(M2_AMPLITUDE, 0.0));
     let wall_bc = Reflective2D::new();
 
     // Tracer: Atlantic water on inflow, extrapolation on outflow
