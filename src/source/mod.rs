@@ -27,7 +27,8 @@ pub mod wellbalanced;
 
 // Re-export traits
 pub use traits::{
-    CombinedSource, CombinedSource2D, SourceContext2D, SourceTerm, SourceTerm2D, SourceTerms2D,
+    CombinedSource, CombinedSource2D, ElementSources, SourceContext2D, SourceTerm, SourceTerm2D,
+    SourceTerms2D,
 };
 
 // Re-export 1D source terms

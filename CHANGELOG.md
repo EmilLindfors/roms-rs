@@ -160,6 +160,11 @@ All notable changes to this project should be documented in this file.
   - The RHS equals the old one to round-off (≤ 4e-19 on the snapshot cases).
   - Frøya, single thread, pinned, on mains power: RHS 5.3 → 4.85 ms. The face-aligned HLL core had already taken it from ≈ 5.9 ms. Neutral at 24 threads.
   - `SWEState2D` implements `Neg`.
+- **Source terms per element (TODO P2.2).**
+  - `SourceTerm2D::add_element(&ElementSources, h, hu, hv)` adds a source at every node of one element, and the 2D SWE RHS calls it once per element instead of evaluating per node.
+  - `ElementSources` gives lazy access to node states, positions and the full `SourceContext2D`. The default method builds that context per node, as the kernel did, so every existing source is unchanged.
+  - `SourceTerms2D` and `CombinedSource2D` forward to their parts. `CoriolisSource2D` overrides with a plain loop over the momentum, computing positions only on a β-plane; the result is bitwise that of `evaluate` (`add_element_matches_per_node_evaluate`).
+  - Frøya, single thread, pinned, on mains power: RHS 4.91 → 4.26–4.53 ms.
 - API (breaking, minor): `LimiterContext2D::h_min` and `LimiterContext2D::with_h_min` are removed.
 
 ### Fixed

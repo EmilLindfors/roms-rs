@@ -10,7 +10,10 @@
 
 use std::sync::Arc;
 
-use crate::solver::SWEState2D;
+use crate::mesh::{Bathymetry2D, Mesh2D};
+use crate::operators::DGOperators2D;
+use crate::solver::{SWESolution2D, SWEState2D};
+use crate::types::ElementIndex;
 
 /// Context for 2D source term evaluation.
 ///
@@ -70,6 +73,70 @@ impl SourceContext2D {
     }
 }
 
+/// One element's worth of source-term inputs, for
+/// [`SourceTerm2D::add_element`]: the RHS kernel calls each source once per
+/// element instead of once per node, and a source reads only what it needs
+/// (the node position costs a bilinear map, the per-node context a copy of
+/// every field).
+#[derive(Clone, Copy)]
+pub struct ElementSources<'a> {
+    /// The element
+    pub element: ElementIndex,
+    /// Current simulation time
+    pub time: f64,
+    /// The solution the RHS is evaluated at
+    pub solution: &'a SWESolution2D,
+    /// Mesh (for node positions)
+    pub mesh: &'a Mesh2D,
+    /// Reference-element operators (for node positions)
+    pub ops: &'a DGOperators2D,
+    /// Nodal bathymetry, if any
+    pub bathymetry: Option<&'a Bathymetry2D>,
+    /// Gravitational acceleration
+    pub g: f64,
+    /// Minimum depth threshold for wet/dry
+    pub h_min: f64,
+}
+
+impl ElementSources<'_> {
+    /// Number of nodes of the element.
+    #[inline]
+    pub fn n_nodes(&self) -> usize {
+        self.ops.n_nodes
+    }
+
+    /// State at node `i`.
+    #[inline]
+    pub fn state(&self, i: usize) -> SWEState2D {
+        self.solution.get_state(self.element, i)
+    }
+
+    /// Physical position of node `i`.
+    #[inline]
+    pub fn position(&self, i: usize) -> (f64, f64) {
+        let [x, y] =
+            self.mesh
+                .reference_to_physical(self.element, self.ops.nodes_r[i], self.ops.nodes_s[i]);
+        (x, y)
+    }
+
+    /// The full per-node context of [`SourceTerm2D::evaluate`] at node `i`.
+    pub fn context(&self, i: usize) -> SourceContext2D {
+        let (bathymetry, gradient) = self.bathymetry.map_or((0.0, (0.0, 0.0)), |b| {
+            (b.get(self.element, i), b.get_gradient(self.element, i))
+        });
+        SourceContext2D::new(
+            self.time,
+            self.position(i),
+            self.state(i),
+            bathymetry,
+            gradient,
+            self.g,
+            self.h_min,
+        )
+    }
+}
+
 /// Trait for 2D source terms in shallow water equations.
 ///
 /// Source terms modify the RHS of the equations:
@@ -85,6 +152,29 @@ pub trait SourceTerm2D: Send + Sync {
     /// # Returns
     /// Source contribution as SWEState2D (S_h, S_hu, S_hv)
     fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D;
+
+    /// Add this source at every node of one element to the element's RHS
+    /// (`h`, `hu`, `hv`, one value per node). This is what the 2D SWE RHS
+    /// calls.
+    ///
+    /// The default builds the full [`SourceContext2D`] per node and calls
+    /// [`Self::evaluate`]. Sources that need less (Coriolis on an f-plane
+    /// needs only the momentum) override it with a plain loop, which saves
+    /// the node position, the context and a virtual call per node.
+    fn add_element(
+        &self,
+        element: &ElementSources<'_>,
+        h: &mut [f64],
+        hu: &mut [f64],
+        hv: &mut [f64],
+    ) {
+        for i in 0..element.n_nodes() {
+            let s = self.evaluate(&element.context(i));
+            h[i] += s.h;
+            hu[i] += s.hu;
+            hv[i] += s.hv;
+        }
+    }
 
     /// Name of this source term for debugging and logging.
     fn name(&self) -> &'static str;
@@ -152,6 +242,18 @@ impl<'a> SourceTerm2D for CombinedSource2D<'a> {
         total
     }
 
+    fn add_element(
+        &self,
+        element: &ElementSources<'_>,
+        h: &mut [f64],
+        hu: &mut [f64],
+        hv: &mut [f64],
+    ) {
+        for source in &self.sources {
+            source.add_element(element, h, hu, hv);
+        }
+    }
+
     fn name(&self) -> &'static str {
         "combined_2d"
     }
@@ -200,6 +302,18 @@ impl SourceTerm2D for SourceTerms2D {
         self.sources
             .iter()
             .fold(SWEState2D::zero(), |total, s| total + s.evaluate(ctx))
+    }
+
+    fn add_element(
+        &self,
+        element: &ElementSources<'_>,
+        h: &mut [f64],
+        hu: &mut [f64],
+        hv: &mut [f64],
+    ) {
+        for source in &self.sources {
+            source.add_element(element, h, hu, hv);
+        }
     }
 
     fn name(&self) -> &'static str {
