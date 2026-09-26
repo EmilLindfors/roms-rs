@@ -4,13 +4,16 @@
 //! wet/dry defaults: the `WetDry` split form, HLL, positivity limiting, velocity
 //! desingularization, point-implicit Manning friction, and the positivity CFL.
 //!
-//! 1. **Domain.** Bathymetry from the GeoTIFF (EPSG:4326) and land from GSHHS:
-//!    a node is water where both say so. A rectangular grid covers the
-//!    domain, and only elements with a water node are kept
+//! 1. **Domain.** Bathymetry from the GeoTIFF (EPSG:4326) and land from GSHHS,
+//!    in one bed raster (`BedRaster`): the sea bed from the GeoTIFF (0 at its
+//!    dry pixels) and a land mask from GSHHS, four times finer, where the bed
+//!    is `land_elevation`. The raster is sampled at the nodes of a
+//!    rectangular grid (`bed=projected` L2-projects it instead,
+//!    `Bathymetry2D::project`), and only elements with a node below mean sea
+//!    level are kept
 //!    (`Mesh2D::retain_elements`); their faces to dropped elements are
-//!    coastline walls. Land nodes inside kept elements get the bed elevation
-//!    `land_elevation`, so `WetDry` treats them as dry shore. The sides of the
-//!    rectangle are open where they cross water.
+//!    coastline walls. Land nodes inside kept elements are dry shore for
+//!    `WetDry`. The sides of the rectangle are open where they cross water.
 //! 2. **Lake at rest.** Walls everywhere, no forcing: the largest spurious
 //!    current and surface error after `rest_hours` (exact balance keeps both
 //!    at round-off; the collocated scheme reached m/s on steep beds).
@@ -49,7 +52,7 @@
 //!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>] \
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
-//!     [output=output/froya]
+//!     [bed=point|projected] [output=output/froya]
 //! ```
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
@@ -81,8 +84,8 @@ use dg_rs::boundary::{
 };
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::io::{
-    CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry, LocalProjection,
-    TideGaugeFile, read_tide_gauge_file, write_tide_gauge_file, write_vtk_swe,
+    BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
+    LocalProjection, TideGaugeFile, read_tide_gauge_file, write_tide_gauge_file, write_vtk_swe,
 };
 #[cfg(feature = "netcdf")]
 use dg_rs::io::{NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig, OceanModelReader};
@@ -109,6 +112,9 @@ const MANNING_N: f64 = 0.025;
 /// Default bed elevation given to land nodes of shoreline elements (m above
 /// MSL; `land_elevation=`)
 const LAND_ELEVATION: f64 = 5.0;
+/// Land-mask cells per bathymetry pixel and direction: the coastline is
+/// rasterised at ≈ 25 × 58 m
+const LAND_MASK_REFINEMENT: usize = 4;
 
 /// M2 period (s) and a typical amplitude on this coast (m)
 const M2_PERIOD: f64 = 12.420_601 * 3600.0;
@@ -160,6 +166,12 @@ struct Options {
     spinup_hours: f64,
     gauge_ratios: Vec<&'static str>,
     land_elevation: f64,
+    /// Sample the bed at the nodes (`bed=point`, the default) or L2-project
+    /// it onto them (`bed=projected`). At 1 km both beat the old builder at
+    /// Mausund (centred RMSE 3.3 / 3.6 cm against 4.1 cm over hours 24–72),
+    /// but the station nodes differ, so the projection is not the default
+    /// until station interpolation (P3.1) separates the two.
+    project_bed: bool,
     profile: usize,
     output: Option<PathBuf>,
 }
@@ -187,6 +199,11 @@ impl Options {
             ramp_hours: get("ramp_hours", TIDAL_RAMP_HOURS)?,
             output_minutes: get("output_minutes", 60.0)?,
             land_elevation: get("land_elevation", LAND_ELEVATION)?,
+            project_bed: match args.get("bed").map_or("point", String::as_str) {
+                "projected" => true,
+                "point" => false,
+                other => return Err(format!("bad bed={other}: projected or point")),
+            },
             profile: get("profile", 0.0)? as usize,
             output: args.get("output").map(PathBuf::from),
             wind: args.contains_key("wind"),
@@ -264,44 +281,32 @@ struct Domain {
 }
 
 impl Domain {
-    /// Grid `nx` × `ny` over `[x0, x1] × [y0, y1]` with open sides; keep
-    /// elements with a water node, where `bed(x, y)` is `Some(B)`.
+    /// Grid `nx` × `ny` over `[x0, x1] × [y0, y1]` with open sides, bed
+    /// elevation `bed(x, y)` (positive on land) sampled at the nodes (or
+    /// projected onto them at `resolution` with `bed=projected`); keep the elements
+    /// with a node below mean sea level.
     fn build(
         name: &'static str,
         (x0, x1, y0, y1): (f64, f64, f64, f64),
         opts: &Options,
-        bed: impl Fn(f64, f64) -> Option<f64>,
+        bed: impl Fn(f64, f64) -> f64,
+        resolution: f64,
         projection: Option<LocalProjection>,
     ) -> Self {
         // The sides are open sea wherever they cross water (land is not meshed)
         let grid =
             Mesh2D::uniform_rectangle_with_bc(x0, x1, y0, y1, opts.nx, opts.ny, BoundaryTag::Open);
-
         let ops = DGOperators2D::new(opts.order);
-        let n = ops.n_nodes;
-        let beds: Vec<Option<f64>> = ElementIndex::iter(grid.n_elements)
-            .flat_map(|k| {
-                let grid = &grid;
-                let ops = &ops;
-                let bed = &bed;
-                (0..n).map(move |i| {
-                    let [x, y] = grid.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
-                    bed(x, y)
-                })
-            })
-            .collect();
-        let has_water = |k: ElementIndex| beds[k.as_usize() * n..][..n].iter().any(Option::is_some);
-        let (mesh, old) = grid.retain_elements(has_water, BoundaryTag::Wall);
-
+        let grid_geom = GeometricFactors2D::compute(&grid, &ops);
+        let grid_bed = if opts.project_bed {
+            Bathymetry2D::project(&grid, &ops, &grid_geom, bed, resolution)
+        } else {
+            Bathymetry2D::from_function(&grid, &ops, &grid_geom, bed)
+        };
+        let has_water = |k: ElementIndex| grid_bed.element(k).iter().any(|&b| b < 0.0);
+        let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
+        let bathymetry = grid_bed.select_elements(&kept);
         let geom = GeometricFactors2D::compute(&mesh, &ops);
-        let mut bathymetry = Bathymetry2D::flat(mesh.n_elements, n);
-        for (k, &o) in old.iter().enumerate() {
-            for i in 0..n {
-                let b = beds[o * n + i].unwrap_or(opts.land_elevation);
-                bathymetry.set(ElementIndex::new(k), i, b);
-            }
-        }
-        bathymetry.compute_gradients(&ops, &geom);
 
         Self {
             name,
@@ -330,22 +335,33 @@ impl Domain {
             "  Coastline: {} polygons",
             coastline.statistics().polygon_count
         );
+        let raster = BedRaster::from_geotiff(
+            &geotiff,
+            Some(&coastline),
+            opts.land_elevation,
+            &bbox,
+            LAND_MASK_REFINEMENT,
+        );
+        let (width, height) = raster.dimensions();
+        println!(
+            "  Bed raster: {width} × {height} pixels of {:.0} m (shorter side), {:.1} % water; {} onto the nodes",
+            raster.pixel_size(),
+            100.0 * raster.water_fraction(),
+            if opts.project_bed {
+                "projected"
+            } else {
+                "sampled"
+            }
+        );
 
         let (x0, y0) = projection.geo_to_xy(bbox.min_lat, bbox.min_lon);
         let (x1, y1) = projection.geo_to_xy(bbox.max_lat, bbox.max_lon);
-        let bed = |x: f64, y: f64| {
-            let (lat, lon) = projection.xy_to_geo(x, y);
-            coastline
-                .is_water(lat, lon)
-                .then(|| geotiff.get_depth_bilinear(lat, lon))
-                .flatten()
-                .filter(|&b| b < 0.0)
-        };
         Ok(Some(Self::build(
             "froya",
             (x0, x1, y0, y1),
             opts,
-            bed,
+            raster.sampler(&projection),
+            raster.pixel_size(),
             Some(projection),
         )))
     }
@@ -356,10 +372,13 @@ impl Domain {
         let (lx, ly) = (50_000.0, 40_000.0);
         let bed = |x: f64, y: f64| {
             let island = (x - 0.4 * lx).hypot(y - 0.5 * ly) < 4_000.0;
-            let b = -100.0 + 105.0 * (x / lx).powi(2);
-            (!island && b < 0.0).then_some(b)
+            if island {
+                opts.land_elevation
+            } else {
+                -100.0 + 105.0 * (x / lx).powi(2)
+            }
         };
-        Self::build("synthetic", (0.0, lx, 0.0, ly), opts, bed, None)
+        Self::build("synthetic", (0.0, lx, 0.0, ly), opts, bed, 100.0, None)
     }
 
     fn builder<BC: SWEBoundaryCondition2D>(&self, bc: BC) -> SWEPhysics2DBuilder<BC> {

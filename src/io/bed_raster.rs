@@ -1,0 +1,420 @@
+//! Bed elevation raster: bathymetry and land in one field defined everywhere.
+//!
+//! A mesh node needs a bed elevation B wherever it lies, on land as well as
+//! under water: `WetDry` treats nodes with B above the surface as dry shore.
+//! A [`BedRaster`] is one of two things:
+//!
+//! - **An elevation model** ([`BedRaster::new`]): B on a grid, land heights
+//!   included (a bathymetry merged with a foreshore DEM), sampled bilinearly
+//!   everywhere.
+//! - **A sea bed and a land mask** ([`BedRaster::from_geotiff`]): bathymetry
+//!   rasters have no land heights (the Frøya GeoTIFF stores land as 0), and
+//!   the land/water line is better known from a coastline than from the
+//!   raster's pixels. The sea bed is the bathymetry, with dry and no-data
+//!   pixels at 0 (the shore at mean sea level), sampled bilinearly; a land
+//!   mask on a grid `refinement` times finer, rasterised from the coastline,
+//!   puts B = `land_elevation` on land.
+//!
+//! The mask matters: baking `land_elevation` into the pixels instead ramps
+//! the bed up to it across a whole pixel at every coast, which closes narrow
+//! sounds at 1 km resolution (it cut M2 at Mausund to 0.6 of the gauge's).
+//!
+//! [`crate::mesh::Bathymetry2D::from_raster`] projects a raster onto the
+//! element nodes ([`crate::mesh::Bathymetry2D::project`]), which does not
+//! alias it where elements are coarser than the pixels.
+
+use super::coastline::CoastlineData;
+use super::geotiff::GeoTiffBathymetry;
+use super::projection::{CoordinateProjection, GeoBoundingBox, LocalProjection};
+
+/// Bed elevation (m above mean sea level, negative under water) on a
+/// north-up longitude/latitude grid, defined everywhere.
+///
+/// Pixel `(row, col)` covers `[min_lon + col·Δλ, min_lon + (col + 1)·Δλ] ×
+/// [max_lat − (row + 1)·Δφ, max_lat − row·Δφ]`, its value belongs to its
+/// centre, and row 0 is the northernmost. See the module docs for the two
+/// kinds of raster.
+#[derive(Debug, Clone)]
+pub struct BedRaster {
+    /// Elevations, row-major `[row × width + col]`
+    elevation: Vec<f64>,
+    width: usize,
+    height: usize,
+    bbox: GeoBoundingBox,
+    land: Option<LandMask>,
+}
+
+/// Land cells on a grid `refinement` times finer than the pixels, with the
+/// bed elevation given to them.
+#[derive(Debug, Clone)]
+struct LandMask {
+    cells: Vec<bool>,
+    refinement: usize,
+    elevation: f64,
+}
+
+impl BedRaster {
+    /// An elevation model: `width` × `height` elevations (row-major, row 0
+    /// north) covering `bbox`, land heights included.
+    ///
+    /// # Panics
+    /// If the sizes disagree, the raster is empty or a value is not finite.
+    pub fn new(bbox: GeoBoundingBox, width: usize, height: usize, elevation: Vec<f64>) -> Self {
+        assert!(width > 0 && height > 0, "empty bed raster");
+        assert_eq!(
+            elevation.len(),
+            width * height,
+            "bed raster has {} values for {width} × {height} pixels",
+            elevation.len()
+        );
+        assert!(
+            elevation.iter().all(|b| b.is_finite()),
+            "bed raster values must be finite"
+        );
+        assert!(
+            bbox.max_lon > bbox.min_lon && bbox.max_lat > bbox.min_lat,
+            "bed raster extent must be positive"
+        );
+        Self {
+            elevation,
+            width,
+            height,
+            bbox,
+            land: None,
+        }
+    }
+
+    /// A sea bed and a land mask over `window` (cropped to the whole pixels
+    /// of `bathymetry` that it touches).
+    ///
+    /// The sea bed is the bathymetry where it is below mean sea level, and 0
+    /// at dry and no-data pixels. The land mask has `refinement` ×
+    /// `refinement` cells per pixel. With a coastline, a cell is land where
+    /// its centre is inside a land polygon, or where the bilinear sea bed
+    /// there is not below mean sea level (the interior of the raster's land);
+    /// water pixels that the coastline puts on land, and dry pixels that it
+    /// leaves in the water, follow the coastline, which keeps narrow sounds
+    /// open that the pixels close. Without one, a cell is land where its pixel
+    /// is dry or no-data. Land cells get the bed elevation `land_elevation`.
+    ///
+    /// # Panics
+    /// If `land_elevation` is not positive, `refinement` is 0, or `window`
+    /// does not overlap the bathymetry.
+    pub fn from_geotiff(
+        bathymetry: &GeoTiffBathymetry,
+        coastline: Option<&CoastlineData>,
+        land_elevation: f64,
+        window: &GeoBoundingBox,
+        refinement: usize,
+    ) -> Self {
+        assert!(
+            land_elevation > 0.0,
+            "land must lie above mean sea level, got land_elevation = {land_elevation}"
+        );
+        assert!(refinement > 0, "land mask refinement must be positive");
+        let full = bathymetry.bbox();
+        let (full_width, full_height) = bathymetry.dimensions();
+        let dlon = (full.max_lon - full.min_lon) / full_width as f64;
+        let dlat = (full.max_lat - full.min_lat) / full_height as f64;
+        // Pixel ranges touched by the window
+        let col0 = ((window.min_lon - full.min_lon) / dlon).floor().max(0.0) as usize;
+        let col1 = (((window.max_lon - full.min_lon) / dlon).ceil() as usize).min(full_width);
+        let row0 = ((full.max_lat - window.max_lat) / dlat).floor().max(0.0) as usize;
+        let row1 = (((full.max_lat - window.min_lat) / dlat).ceil() as usize).min(full_height);
+        assert!(
+            col0 < col1 && row0 < row1,
+            "window {window:?} does not overlap the bathymetry ({full:?})"
+        );
+
+        let sea_bed: Vec<f64> = (row0..row1)
+            .flat_map(|row| {
+                (col0..col1).map(move |col| bathymetry.pixel(row, col).unwrap_or(0.0).min(0.0))
+            })
+            .collect();
+        let bbox = GeoBoundingBox::new(
+            full.min_lon + col0 as f64 * dlon,
+            full.max_lat - row1 as f64 * dlat,
+            full.min_lon + col1 as f64 * dlon,
+            full.max_lat - row0 as f64 * dlat,
+        );
+        let mut raster = Self::new(bbox, col1 - col0, row1 - row0, sea_bed);
+
+        let (mask_width, mask_height) = (raster.width * refinement, raster.height * refinement);
+        let cell_lon = (bbox.max_lon - bbox.min_lon) / mask_width as f64;
+        let cell_lat = (bbox.max_lat - bbox.min_lat) / mask_height as f64;
+        let cells = (0..mask_height)
+            .flat_map(|row| (0..mask_width).map(move |col| (row, col)))
+            .map(|(row, col)| {
+                let lat = bbox.max_lat - (row as f64 + 0.5) * cell_lat;
+                let lon = bbox.min_lon + (col as f64 + 0.5) * cell_lon;
+                match coastline {
+                    Some(c) => raster.bilinear(lat, lon) >= 0.0 || c.is_land(lat, lon),
+                    None => raster.pixel(row / refinement, col / refinement) >= 0.0,
+                }
+            })
+            .collect();
+        raster.land = Some(LandMask {
+            cells,
+            refinement,
+            elevation: land_elevation,
+        });
+        raster
+    }
+
+    /// Extent (outer pixel edges).
+    pub fn bbox(&self) -> &GeoBoundingBox {
+        &self.bbox
+    }
+
+    /// Size in pixels (width, height).
+    pub fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    /// Value of pixel `(row, col)`: the elevation, or the sea bed under a
+    /// land mask.
+    pub fn pixel(&self, row: usize, col: usize) -> f64 {
+        self.elevation[row * self.width + col]
+    }
+
+    /// Bed elevation at a longitude/latitude: the land elevation in a land
+    /// cell of the mask, else bilinear between pixel centres. Points in the
+    /// outer half pixel, or outside the raster, take the value at the
+    /// nearest point of the centres' hull (and of the mask).
+    pub fn elevation(&self, lat: f64, lon: f64) -> f64 {
+        match &self.land {
+            Some(mask) if self.is_land_cell(mask, lat, lon) => mask.elevation,
+            _ => self.bilinear(lat, lon),
+        }
+    }
+
+    /// Whether `(lat, lon)` is land: in a land cell of the mask, or, for an
+    /// elevation model, not below mean sea level.
+    pub fn is_land(&self, lat: f64, lon: f64) -> bool {
+        match &self.land {
+            Some(mask) => self.is_land_cell(mask, lat, lon),
+            None => self.bilinear(lat, lon) >= 0.0,
+        }
+    }
+
+    fn is_land_cell(&self, mask: &LandMask, lat: f64, lon: f64) -> bool {
+        let bbox = &self.bbox;
+        let (w, h) = (self.width * mask.refinement, self.height * mask.refinement);
+        let col = ((lon - bbox.min_lon) / (bbox.max_lon - bbox.min_lon) * w as f64)
+            .clamp(0.0, (w - 1) as f64) as usize;
+        let row = ((bbox.max_lat - lat) / (bbox.max_lat - bbox.min_lat) * h as f64)
+            .clamp(0.0, (h - 1) as f64) as usize;
+        mask.cells[row * w + col]
+    }
+
+    /// Bilinear interpolation of the pixel values between pixel centres.
+    fn bilinear(&self, lat: f64, lon: f64) -> f64 {
+        let bbox = &self.bbox;
+        let col = ((lon - bbox.min_lon) / (bbox.max_lon - bbox.min_lon) * self.width as f64 - 0.5)
+            .clamp(0.0, (self.width - 1) as f64);
+        let row = ((bbox.max_lat - lat) / (bbox.max_lat - bbox.min_lat) * self.height as f64 - 0.5)
+            .clamp(0.0, (self.height - 1) as f64);
+        let (c0, r0) = (col.floor() as usize, row.floor() as usize);
+        let (c1, r1) = ((c0 + 1).min(self.width - 1), (r0 + 1).min(self.height - 1));
+        let (s, t) = (col - c0 as f64, row - r0 as f64);
+        (1.0 - t) * ((1.0 - s) * self.pixel(r0, c0) + s * self.pixel(r0, c1))
+            + t * ((1.0 - s) * self.pixel(r1, c0) + s * self.pixel(r1, c1))
+    }
+
+    /// The bed elevation as a function of mesh coordinates (m) under
+    /// `projection`, for [`crate::mesh::Bathymetry2D::project`] or
+    /// [`crate::mesh::Bathymetry2D::from_function`].
+    pub fn sampler<'a, P: CoordinateProjection>(
+        &'a self,
+        projection: &'a P,
+    ) -> impl Fn(f64, f64) -> f64 + 'a {
+        move |x, y| {
+            let (lat, lon) = projection.xy_to_geo(x, y);
+            self.elevation(lat, lon)
+        }
+    }
+
+    /// The smaller side (m) of a pixel, or of a mask cell if finer, at the
+    /// raster's central latitude: the resolution to hand
+    /// [`crate::mesh::Bathymetry2D::project`].
+    pub fn pixel_size(&self) -> f64 {
+        let (lat, lon) = self.bbox.center();
+        let (m_per_deg_lat, m_per_deg_lon) = LocalProjection::new(lat, lon).scale_factors();
+        let refinement = self.land.as_ref().map_or(1, |mask| mask.refinement) as f64;
+        let dlon = (self.bbox.max_lon - self.bbox.min_lon) / (self.width as f64 * refinement);
+        let dlat = (self.bbox.max_lat - self.bbox.min_lat) / (self.height as f64 * refinement);
+        (dlon * m_per_deg_lon).min(dlat * m_per_deg_lat)
+    }
+
+    /// Fraction of the area that is water: mask cells, or pixels below mean
+    /// sea level for an elevation model.
+    pub fn water_fraction(&self) -> f64 {
+        match &self.land {
+            Some(mask) => {
+                mask.cells.iter().filter(|&&land| !land).count() as f64 / mask.cells.len() as f64
+            }
+            None => {
+                self.elevation.iter().filter(|&&b| b < 0.0).count() as f64
+                    / self.elevation.len() as f64
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 4 × 3 elevation model over [8, 8.4] × [63.7, 63.73]: 0.1° × 0.01°
+    /// pixels.
+    fn raster() -> BedRaster {
+        #[rustfmt::skip]
+        let elevation = vec![
+            -10.0, -20.0, -30.0, -40.0,
+            -12.0, -22.0, -32.0, -42.0,
+              2.0,   2.0, -34.0, -44.0,
+        ];
+        BedRaster::new(GeoBoundingBox::new(8.0, 63.7, 8.4, 63.73), 4, 3, elevation)
+    }
+
+    #[test]
+    fn pixel_centres_return_pixel_values() {
+        let r = raster();
+        for row in 0..3 {
+            for col in 0..4 {
+                let lat = 63.73 - (row as f64 + 0.5) * 0.01;
+                let lon = 8.0 + (col as f64 + 0.5) * 0.1;
+                assert!((r.elevation(lat, lon) - r.pixel(row, col)).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn bilinear_between_centres_and_clamped_outside() {
+        let r = raster();
+        // Midway between the centres of (0, 0) and (0, 1), and of (1, 0)
+        assert!((r.elevation(63.725, 8.1) - (-15.0)).abs() < 1e-9);
+        assert!((r.elevation(63.72, 8.05) - (-11.0)).abs() < 1e-9);
+        // Centre of the 2 × 2 block (0..2, 0..2): mean of −10, −20, −12, −22
+        assert!((r.elevation(63.72, 8.1) - (-16.0)).abs() < 1e-9);
+        // Outside: the nearest corner centre
+        assert!((r.elevation(64.0, 7.0) - (-10.0)).abs() < 1e-12);
+        assert!((r.elevation(63.0, 9.0) - (-44.0)).abs() < 1e-12);
+        // An elevation model has land where it is not below sea level
+        assert!(r.is_land(63.705, 8.05) && !r.is_land(63.705, 8.35));
+    }
+
+    #[test]
+    fn sampler_goes_through_the_projection() {
+        let r = raster();
+        let projection = LocalProjection::new(63.72, 8.1);
+        let bed = r.sampler(&projection);
+        assert!((bed(0.0, 0.0) - (-16.0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pixel_size_is_the_shorter_side_in_metres() {
+        // 0.01° of latitude ≈ 1.1 km, 0.1° of longitude at 63.7° ≈ 4.9 km
+        let size = raster().pixel_size();
+        assert!((size - 1113.0).abs() < 5.0, "{size}");
+    }
+
+    #[test]
+    fn water_fraction_counts_pixels_below_sea_level() {
+        assert!((raster().water_fraction() - 10.0 / 12.0).abs() < 1e-15);
+    }
+
+    /// 6 × 4 pixels of 0.1° × 0.05° over [8, 8.6] × [63.6, 63.8] with depths
+    /// −(10·row + col + 1), except a dry pixel (0) at (1, 1), a land height
+    /// (3) at (1, 2) and no-data at (2, 3); and a square island around the
+    /// centre of pixel (2, 4) (8.45° E, 63.675° N), 0.06° × 0.03°.
+    fn bathymetry_and_island() -> (GeoTiffBathymetry, CoastlineData) {
+        let mut values: Vec<f32> = (0..4)
+            .flat_map(|row| (0..6).map(move |col| -((10 * row + col + 1) as f32)))
+            .collect();
+        values[6 + 1] = 0.0;
+        values[6 + 2] = 3.0;
+        values[2 * 6 + 3] = -9999.0;
+        let bbox = GeoBoundingBox::new(8.0, 63.6, 8.6, 63.8);
+        let tiff = GeoTiffBathymetry::from_pixels(bbox, 6, 4, &values, -9999.0);
+        let island = vec![(8.42, 63.66), (8.48, 63.66), (8.48, 63.69), (8.42, 63.69)];
+        (tiff, CoastlineData::from_polygons(&[island], &bbox))
+    }
+
+    #[test]
+    fn from_geotiff_crops_to_the_window_and_keeps_the_sea_bed() {
+        let (tiff, coast) = bathymetry_and_island();
+        // A window inside pixels 1..5 × 1..4: cropped to those whole pixels
+        let window = GeoBoundingBox::new(8.12, 63.61, 8.47, 63.74);
+        let raster = BedRaster::from_geotiff(&tiff, Some(&coast), 5.0, &window, 4);
+        assert_eq!(raster.dimensions(), (4, 3));
+        let b = raster.bbox();
+        assert!((b.min_lon - 8.1).abs() < 1e-12 && (b.max_lon - 8.5).abs() < 1e-12);
+        assert!((b.min_lat - 63.6).abs() < 1e-12 && (b.max_lat - 63.75).abs() < 1e-12);
+        // Sea bed: dry, land and no-data pixels at 0; the island's pixel keeps
+        // its depth (the mask makes it land)
+        #[rustfmt::skip]
+        let expected = [
+            0.0, 0.0, -14.0, -15.0,
+            -22.0, -23.0, 0.0, -25.0,
+            -32.0, -33.0, -34.0, -35.0,
+        ];
+        for row in 0..3 {
+            for col in 0..4 {
+                assert_eq!(
+                    raster.pixel(row, col),
+                    expected[row * 4 + col],
+                    "({row}, {col})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn land_mask_follows_the_coastline_at_its_own_resolution() {
+        let (tiff, coast) = bathymetry_and_island();
+        let window = GeoBoundingBox::new(8.0, 63.6, 8.6, 63.8);
+        let raster = BedRaster::from_geotiff(&tiff, Some(&coast), 5.0, &window, 4);
+        // Inside the island, a quarter pixel from its edge, and just outside
+        assert_eq!(raster.elevation(63.675, 8.45), 5.0);
+        assert_eq!(raster.elevation(63.68, 8.47), 5.0);
+        assert!(!raster.is_land(63.675, 8.495));
+        let beside = raster.elevation(63.675, 8.495);
+        assert!(beside < -20.0, "{beside}");
+        // The coastline decides: the raster's dry pixels (1, 1) and (1, 2)
+        // are shallow water, the sea bed going to 0 at their centres, not a
+        // ramp up to the land elevation
+        assert!(!raster.is_land(63.725, 8.15));
+        assert!(raster.elevation(63.725, 8.15).abs() < 1e-9);
+        let shore = raster.elevation(63.725, 8.28);
+        assert!((-14.0..0.0).contains(&shore), "{shore}");
+        // Mask cells of 0.025° × 0.0125° (≈ 1.24 × 1.39 km): the resolution
+        assert!(
+            (raster.pixel_size() - 1236.0).abs() < 10.0,
+            "{}",
+            raster.pixel_size()
+        );
+        // 24 pixels × 16 cells: the island covers 4 to 9 cells
+        let water = raster.water_fraction();
+        assert!(
+            (1.0 - 9.0 / 384.0..=1.0 - 4.0 / 384.0).contains(&water),
+            "{water}"
+        );
+
+        // Without the coastline the island is water, and the dry, land and
+        // no-data pixels are land
+        let raster = BedRaster::from_geotiff(&tiff, None, 5.0, &window, 4);
+        assert!(!raster.is_land(63.675, 8.45));
+        assert!((raster.elevation(63.675, 8.45) - (-25.0)).abs() < 1e-9);
+        assert_eq!(raster.elevation(63.725, 8.15), 5.0);
+        assert_eq!(raster.elevation(63.725, 8.29), 5.0);
+        assert_eq!(raster.elevation(63.675, 8.35), 5.0);
+        assert!((raster.water_fraction() - 21.0 / 24.0).abs() < 1e-12);
+    }
+
+    #[test]
+    #[should_panic(expected = "12 values")]
+    fn wrong_size_panics() {
+        BedRaster::new(GeoBoundingBox::new(0.0, 0.0, 1.0, 1.0), 3, 3, vec![0.0; 12]);
+    }
+}

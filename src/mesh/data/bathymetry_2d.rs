@@ -4,10 +4,80 @@
 //! The water surface elevation is η = h + B, where h is the water depth.
 //!
 //! For well-balanced schemes, we need both B and its gradients ∂B/∂x and ∂B/∂y.
+//!
+//! Nodal values come from a function: sampled at the nodes
+//! ([`Bathymetry2D::from_function`]), or L2-projected onto each element's
+//! polynomial space and limited to the data range ([`Bathymetry2D::project`]),
+//! the right choice for raster data finer than the node spacing (e.g.
+//! [`crate::io::BedRaster`]).
+
+use faer::Mat;
+use faer::linalg::solvers::Solve;
 
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::polynomial::{gauss_legendre_nodes_weights, legendre, mode_degrees};
 use crate::types::ElementIndex;
+
+/// Physical position and Jacobian determinant of the bilinear map of an
+/// element with vertices `v` (counter-clockwise) at reference `(r, s)`.
+fn bilinear_map(v: &[[f64; 2]; 4], r: f64, s: f64) -> ([f64; 2], f64) {
+    let shape = [
+        (1.0 - r) * (1.0 - s),
+        (1.0 + r) * (1.0 - s),
+        (1.0 + r) * (1.0 + s),
+        (1.0 - r) * (1.0 + s),
+    ];
+    let d_r = [-(1.0 - s), 1.0 - s, 1.0 + s, -(1.0 + s)];
+    let d_s = [-(1.0 - r), -(1.0 + r), 1.0 + r, 1.0 - r];
+    let [mut x, mut y, mut x_r, mut y_r, mut x_s, mut y_s] = [0.0; 6];
+    for (c, &[vx, vy]) in v.iter().enumerate() {
+        x += shape[c] * vx;
+        y += shape[c] * vy;
+        x_r += d_r[c] * vx;
+        y_r += d_r[c] * vy;
+        x_s += d_s[c] * vx;
+        y_s += d_s[c] * vy;
+    }
+    ([0.25 * x, 0.25 * y], 0.0625 * (x_r * y_s - x_s * y_r))
+}
+
+/// A 1D quadrature rule on [−1, 1] with the orthonormal Legendre values of
+/// every degree ≤ N at its points (`legendre[point × (N + 1) + degree]`), for
+/// [`Bathymetry2D::project`].
+#[derive(Clone)]
+struct ProjectionRule {
+    points: Vec<f64>,
+    weights: Vec<f64>,
+    legendre: Vec<f64>,
+}
+
+impl ProjectionRule {
+    /// Call `visit(x, y, w·J, φ)` at every point of the tensor rule `self`
+    /// (in r) × `s_rule` (in s) on the element with vertices `verts`, where
+    /// `φ[m]` is the orthonormal mode m (numbered by [`mode_degrees`]) there.
+    fn for_each_point(
+        &self,
+        s_rule: &Self,
+        verts: &[[f64; 2]; 4],
+        phi: &mut [f64],
+        mut visit: impl FnMut(f64, f64, f64, &[f64]),
+    ) {
+        let n_1d = self.legendre.len() / self.points.len();
+        for (b, &s) in s_rule.points.iter().enumerate() {
+            let l_s = &s_rule.legendre[b * n_1d..][..n_1d];
+            for (a, &r) in self.points.iter().enumerate() {
+                let l_r = &self.legendre[a * n_1d..][..n_1d];
+                for (m, value) in phi.iter_mut().enumerate() {
+                    let (i, j) = mode_degrees(m, n_1d);
+                    *value = l_r[i] * l_s[j];
+                }
+                let ([x, y], jac) = bilinear_map(verts, r, s);
+                visit(x, y, self.weights[a] * s_rule.weights[b] * jac, phi);
+            }
+        }
+    }
+}
 
 /// Bathymetry data for 2D shallow water simulations.
 ///
@@ -82,64 +152,299 @@ impl Bathymetry2D {
         bathy
     }
 
-    /// Initialize bathymetry from a GeoTIFF file.
+    /// L2 projection of the bed elevation `f(x, y)` onto each element's
+    /// polynomial space, limited to the range of `f` over the element.
     ///
-    /// Reads depth data from a GeoTIFF file and interpolates to mesh nodes
-    /// using a coordinate projection to transform between mesh coordinates
-    /// (meters) and geographic coordinates (lat/lon).
+    /// Point sampling ([`Self::from_function`]) aliases data that varies on
+    /// scales below the node spacing, such as a bathymetry raster whose pixels
+    /// are finer than a coarse element. The projection instead finds, per
+    /// element k, the B ∈ Q_N minimising ∫_k (B − f)² dx:
     ///
-    /// # Arguments
-    /// * `mesh` - The 2D mesh
-    /// * `ops` - DG operators for node coordinates
-    /// * `geom` - Geometric factors for gradient computation
-    /// * `geotiff` - GeoTIFF bathymetry data
-    /// * `projection` - Coordinate projection for mesh to geographic transform
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use dg::io::{GeoTiffBathymetry, LocalProjection};
-    /// use dg::mesh::Bathymetry2D;
-    ///
-    /// let geotiff = GeoTiffBathymetry::load("data/bathymetry.tif")?;
-    /// let projection = LocalProjection::new(63.75, 8.75);
-    ///
-    /// let bathy = Bathymetry2D::from_geotiff(
-    ///     &mesh, &ops, &geom, &geotiff, &projection
-    /// );
+    /// ```text
+    /// Σ_n (∫_k φ_m φ_n J) c_n = ∫_k φ_m f J,   B = V c
     /// ```
-    pub fn from_geotiff<P: crate::io::CoordinateProjection>(
+    ///
+    /// with the orthonormal Legendre modes φ_m. The right side is integrated
+    /// by composite Gauss–Legendre quadrature on sub-cells no longer than
+    /// `resolution / 2` (N + 2 points per sub-cell and direction, at most
+    /// [`Self::MAX_PROJECTION_SUBCELLS`] sub-cells per direction), where
+    /// `resolution` is the length (m) on which `f` varies, the pixel size for
+    /// a raster.
+    ///
+    /// Properties:
+    /// - Exact for `f` in Q_N (e.g. linear fields on any quadrilateral).
+    /// - Volume-preserving: `Σ_i w_i J_i B_i = ∫_k f` to quadrature accuracy
+    ///   (for N ≥ 2, or on parallelograms), so the still-water volume is the
+    ///   data's.
+    /// - Bounded: an unresolved step (a coastline cliff) would overshoot like
+    ///   any L2 projection, so the nodal values are scaled towards the element
+    ///   mean until they lie within the minimum and maximum of `f` over the
+    ///   quadrature points and nodes (Zhang & Shu 2010). The scaling keeps the
+    ///   mean, and changes smooth data only at the level of the projection
+    ///   error, so the projection still converges at N + 1.
+    /// - Continuous: the element projections are independent, so a vertex on
+    ///   an unresolved coastline could get −18 m in the water element and
+    ///   +5 m in its land neighbours, leaving a lone deep node in a pocket
+    ///   (it jetted at 8 m/s in the Frøya run). Coincident nodes are
+    ///   therefore averaged ([`Self::make_continuous`]), which keeps the
+    ///   bounds, the total volume and the exactness for Q_N.
+    pub fn project<F>(
         mesh: &Mesh2D,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
-        geotiff: &crate::io::GeoTiffBathymetry,
-        projection: &P,
-    ) -> Self {
-        let n_elements = mesh.n_elements;
-        let n_nodes = ops.n_nodes;
-        let mut bathy = Self::flat(n_elements, n_nodes);
+        f: F,
+        resolution: f64,
+    ) -> Self
+    where
+        F: Fn(f64, f64) -> f64,
+    {
+        assert!(
+            resolution > 0.0 && resolution.is_finite(),
+            "projection resolution must be positive, got {resolution}"
+        );
+        let n_1d = ops.n_1d;
+        let n = ops.n_nodes;
+        let (gauss_x, gauss_w) = gauss_legendre_nodes_weights(ops.order + 2);
+        // Orthonormal Legendre values of every degree at `points`:
+        // `[point × degree]`
+        let legendre_table = |points: &[f64]| -> Vec<f64> {
+            points
+                .iter()
+                .flat_map(|&x| {
+                    (0..n_1d).map(move |i| ((2 * i + 1) as f64 / 2.0).sqrt() * legendre(i, x))
+                })
+                .collect()
+        };
+        // Composite rule on `m` equal sub-intervals of [−1, 1], with the
+        // Legendre table at its points
+        let composite = |m: usize| -> ProjectionRule {
+            let half = 1.0 / m as f64;
+            let (points, weights): (Vec<f64>, Vec<f64>) = (0..m)
+                .flat_map(|c| {
+                    let centre = -1.0 + (2 * c + 1) as f64 * half;
+                    gauss_x
+                        .iter()
+                        .zip(&gauss_w)
+                        .map(move |(&x, &w)| (centre + half * x, half * w))
+                })
+                .unzip();
+            let legendre = legendre_table(&points);
+            ProjectionRule {
+                points,
+                weights,
+                legendre,
+            }
+        };
+        // The mass matrix ∫ φ_m φ_n J: a polynomial of degree 2N + 1 per
+        // direction (J is bilinear), exact with the N + 2 point rule
+        let mass_rule = composite(1);
+        let mut rules: Vec<Option<ProjectionRule>> = vec![None; Self::MAX_PROJECTION_SUBCELLS + 1];
 
-        // Set bathymetry values at each node by interpolating from GeoTIFF
-        for k in ElementIndex::iter(n_elements) {
-            for i in 0..n_nodes {
-                let r = ops.nodes_r[i];
-                let s = ops.nodes_s[i];
-                let [x, y] = mesh.reference_to_physical(k, r, s);
+        let mut bathy = Self::flat(mesh.n_elements, n);
+        let mut mass = Mat::<f64>::zeros(n, n);
+        let mut rhs = Mat::<f64>::zeros(n, 1);
+        let mut phi = vec![0.0; n];
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let verts = mesh.element_vertices(k);
+            let dist = |a: usize, b: usize| {
+                let [xa, ya] = verts[a];
+                let [xb, yb] = verts[b];
+                ((xb - xa).powi(2) + (yb - ya).powi(2)).sqrt()
+            };
+            let subcells = |length: f64| {
+                ((2.0 * length / resolution).ceil() as usize)
+                    .clamp(1, Self::MAX_PROJECTION_SUBCELLS)
+            };
+            let m_r = subcells(dist(0, 1).max(dist(3, 2)));
+            let m_s = subcells(dist(0, 3).max(dist(1, 2)));
+            for m in [m_r, m_s] {
+                if rules[m].is_none() {
+                    rules[m] = Some(composite(m));
+                }
+            }
+            let (rule_r, rule_s) = (rules[m_r].as_ref().unwrap(), rules[m_s].as_ref().unwrap());
 
-                // Transform mesh coordinates to geographic
-                let (lat, lon) = projection.xy_to_geo(x, y);
+            mass.fill(0.0);
+            mass_rule.for_each_point(&mass_rule, &verts, &mut phi, |_, _, w, phi| {
+                for row in 0..n {
+                    for col in 0..n {
+                        mass[(row, col)] += w * phi[row] * phi[col];
+                    }
+                }
+            });
 
-                // Get depth from GeoTIFF with bilinear interpolation
-                let depth = geotiff.get_depth_bilinear(lat, lon).unwrap_or(0.0);
+            rhs.fill(0.0);
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            rule_r.for_each_point(rule_s, &verts, &mut phi, |x, y, w, phi| {
+                let value = f(x, y);
+                lo = lo.min(value);
+                hi = hi.max(value);
+                for row in 0..n {
+                    rhs[(row, 0)] += w * value * phi[row];
+                }
+            });
+            let modal = mass.full_piv_lu().solve(&rhs);
 
-                bathy.set(k, i, depth);
+            let ki = k.as_usize();
+            let nodal = &mut bathy.data[ki * n..][..n];
+            for (i, b) in nodal.iter_mut().enumerate() {
+                *b = (0..n)
+                    .map(|m| ops.vandermonde.v[(i, m)] * modal[(m, 0)])
+                    .sum();
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let value = f(x, y);
+                lo = lo.min(value);
+                hi = hi.max(value);
+            }
+
+            // Scale towards the mean into [lo, hi]
+            let mean = geom.element_mean(ki, nodal);
+            let (b_min, b_max) = nodal
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &v| {
+                    (a.min(v), b.max(v))
+                });
+            let mut theta: f64 = 1.0;
+            if b_max > hi {
+                theta = theta.min((hi - mean).max(0.0) / (b_max - mean));
+            }
+            if b_min < lo {
+                theta = theta.min((mean - lo).max(0.0) / (mean - b_min));
+            }
+            if theta < 1.0 {
+                for b in nodal.iter_mut() {
+                    *b = mean + theta * (*b - mean);
+                }
             }
         }
 
-        // Compute gradients
-        bathy.compute_gradients(ops, geom);
-
+        bathy.make_continuous(mesh, ops, geom);
         bathy
+    }
+
+    /// Make B continuous across elements: every set of coincident nodes
+    /// (on shared faces and vertices) gets the mean of its values weighted by
+    /// the nodes' mass w·J, as in the direct stiffness summation of spectral
+    /// elements; then recompute the gradients.
+    ///
+    /// The total `Σ w J B` is unchanged and every new value is a convex
+    /// combination of old ones, so bounds hold; a continuous B is unchanged.
+    /// Nodes are matched by the mesh connectivity (neighbours list their
+    /// shared face nodes in reverse order), not by position.
+    pub fn make_continuous(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+    ) {
+        let n = self.n_nodes;
+        let n_face = ops.n_face_nodes;
+        let mut parent: Vec<usize> = (0..self.data.len()).collect();
+        fn root(parent: &mut [usize], mut a: usize) -> usize {
+            while parent[a] != a {
+                parent[a] = parent[parent[a]];
+                a = parent[a];
+            }
+            a
+        }
+        let mut union = |a: usize, b: usize| {
+            let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+            if ra != rb {
+                parent[ra.max(rb)] = ra.min(rb);
+            }
+        };
+        for edge in &mesh.edges {
+            let Some(right) = edge.right else { continue };
+            let left = edge.left;
+            for fi in 0..n_face {
+                union(
+                    left.element * n + ops.face_nodes[left.face][fi],
+                    right.element * n + ops.face_nodes[right.face][n_face - 1 - fi],
+                );
+            }
+        }
+        // Elements that touch at a vertex only
+        let corner = |r: f64, s: f64| {
+            (0..n)
+                .find(|&i| ops.nodes_r[i] == r && ops.nodes_s[i] == s)
+                .expect("GLL nodes include the corners")
+        };
+        let corners = [
+            corner(-1.0, -1.0),
+            corner(1.0, -1.0),
+            corner(1.0, 1.0),
+            corner(-1.0, 1.0),
+        ];
+        let mut vertex_node = vec![None; mesh.n_vertices];
+        for (k, vertices) in mesh.elements.iter().enumerate() {
+            for (c, &v) in vertices.iter().enumerate() {
+                let node = k * n + corners[c];
+                match vertex_node[v] {
+                    Some(first) => union(first, node),
+                    None => vertex_node[v] = Some(node),
+                }
+            }
+        }
+
+        let mut mass = vec![0.0; self.data.len()];
+        let mut moment = vec![0.0; self.data.len()];
+        for node in 0..self.data.len() {
+            let r = root(&mut parent, node);
+            mass[r] += geom.mass[node];
+            moment[r] += geom.mass[node] * self.data[node];
+        }
+        for node in 0..self.data.len() {
+            let r = root(&mut parent, node);
+            self.data[node] = moment[r] / mass[r];
+        }
+        self.compute_gradients(ops, geom);
+    }
+
+    /// Bed from a merged elevation raster (bathymetry and land,
+    /// [`crate::io::BedRaster`]), projected onto the nodes
+    /// ([`Self::project`], at the raster's pixel size) through the map
+    /// `projection` from mesh coordinates to longitude/latitude.
+    ///
+    /// Nodes on land get the raster's land elevation, so `WetDry` treats them
+    /// as dry shore; nodes beyond the raster take its edge values.
+    pub fn from_raster<P: crate::io::CoordinateProjection>(
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        raster: &crate::io::BedRaster,
+        projection: &P,
+    ) -> Self {
+        Self::project(
+            mesh,
+            ops,
+            geom,
+            raster.sampler(projection),
+            raster.pixel_size(),
+        )
+    }
+
+    /// Largest number of projection sub-cells per element and direction
+    /// ([`Self::project`]).
+    pub const MAX_PROJECTION_SUBCELLS: usize = 64;
+
+    /// The bathymetry of the elements `kept` (old element indices, as
+    /// returned by [`Mesh2D::retain_elements`]), in that order.
+    ///
+    /// The elements keep their geometry, so the gradients are copied too.
+    pub fn select_elements(&self, kept: &[usize]) -> Self {
+        let n = self.n_nodes;
+        let pick = |field: &[f64]| -> Vec<f64> {
+            kept.iter()
+                .flat_map(|&k| field[k * n..][..n].iter().copied())
+                .collect()
+        };
+        Self {
+            data: pick(&self.data),
+            gradient_x: pick(&self.gradient_x),
+            gradient_y: pick(&self.gradient_y),
+            n_elements: kept.len(),
+            n_nodes: n,
+        }
     }
 
     /// Get bathymetry at node i in element k.
@@ -1140,5 +1445,200 @@ mod tests {
             bathy.data, original,
             "iterations=0 should not change anything"
         );
+    }
+
+    /// `n` × `n` mesh of [0, 1]² with interior vertices moved, so that
+    /// the elements are general (non-parallelogram) quadrilaterals.
+    fn distorted_mesh(n: usize) -> Mesh2D {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, n, n);
+        let tau = 2.0 * std::f64::consts::PI;
+        let a = 0.3 / n as f64;
+        for v in &mut mesh.vertices {
+            let [x, y] = *v;
+            let bump = (tau * x).sin() * (tau * y).sin();
+            *v = [x + a * bump, y - 0.7 * a * bump];
+        }
+        mesh
+    }
+
+    fn setup(mesh: Mesh2D, order: usize) -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
+        let ops = DGOperators2D::new(order);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        (mesh, ops, geom)
+    }
+
+    /// Largest |B − f| over the nodes.
+    fn nodal_error(
+        bathy: &Bathymetry2D,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        f: impl Fn(f64, f64) -> f64,
+    ) -> f64 {
+        let mut error: f64 = 0.0;
+        for e in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                error = error.max((bathy.get(e, i) - f(x, y)).abs());
+            }
+        }
+        error
+    }
+
+    #[test]
+    fn test_projection_is_exact_for_polynomials_of_the_element_degree() {
+        // x^a y^b with a + b ≤ N lies in Q_N of a bilinear element
+        for order in 1..=4 {
+            let (mesh, ops, geom) = setup(distorted_mesh(3), order);
+            let f = |x: f64, y: f64| {
+                -20.0 + 3.0 * x - 2.0 * y
+                    + (0..=order)
+                        .map(|a| x.powi(a as i32) * y.powi((order - a) as i32))
+                        .sum::<f64>()
+            };
+            let bathy = Bathymetry2D::project(&mesh, &ops, &geom, f, 0.2);
+            let error = nodal_error(&bathy, &mesh, &ops, f);
+            assert!(error < 1e-11, "N = {order}: {error:e}");
+        }
+    }
+
+    #[test]
+    fn test_projection_keeps_volume_and_bounds_at_a_cliff() {
+        // A coastline cliff from −30 m to +5 m at x = 0.5, inside the second
+        // column of 1/3-wide elements and on a sub-cell edge (1/60-wide
+        // sub-cells), so the quadrature of the step is exact
+        let (lo, hi, x_c) = (-30.0, 5.0, 0.5);
+        let f = |x: f64, _y: f64| if x < x_c { lo } else { hi };
+        for order in 1..=4 {
+            let (mesh, ops, geom) =
+                setup(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 3, 3), order);
+            let bathy = Bathymetry2D::project(&mesh, &ops, &geom, f, 0.034);
+            // The total volume is the data's (element volumes move between
+            // neighbours when coincident nodes are averaged)
+            let volume: f64 = ElementIndex::iter(mesh.n_elements)
+                .map(|e| geom.integrate_element(e.as_usize(), bathy.element(e)))
+                .sum();
+            let exact = lo * x_c + hi * (1.0 - x_c);
+            assert!(
+                (volume - exact).abs() < 1e-12,
+                "N = {order}: {volume} vs {exact}"
+            );
+            assert!(
+                bathy
+                    .data
+                    .iter()
+                    .all(|&b| (lo - 1e-9..=hi + 1e-9).contains(&b)),
+                "N = {order}: [{}, {}]",
+                bathy.min(),
+                bathy.max()
+            );
+            // The step elements keep a shoreline: dry and wet nodes
+            let step = ElementIndex::new(1);
+            let (b_min, b_max) = bathy
+                .element(step)
+                .iter()
+                .fold((hi, lo), |(a, b), &v| (a.min(v), b.max(v)));
+            assert!(
+                b_min < -10.0 && b_max > 0.0,
+                "N = {order}: [{b_min}, {b_max}]"
+            );
+            // Continuous across elements; away from the step column (off its
+            // faces, which are averaged with it) the data
+            assert_continuous(&bathy, &mesh, &ops, order);
+            for e in ElementIndex::iter(mesh.n_elements) {
+                for i in 0..ops.n_nodes {
+                    let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                    if !(1.0 / 3.0 - 1e-9..=2.0 / 3.0 + 1e-9).contains(&x) {
+                        let error = (bathy.get(e, i) - f(x, y)).abs();
+                        assert!(error < 1e-11, "N = {order}, ({x}, {y}): {error:e}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Coincident nodes (same position to 1e-9) carry the same B.
+    fn assert_continuous(bathy: &Bathymetry2D, mesh: &Mesh2D, ops: &DGOperators2D, order: usize) {
+        let mut seen: std::collections::HashMap<(i64, i64), f64> = Default::default();
+        for e in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                let key = ((x * 1e9).round() as i64, (y * 1e9).round() as i64);
+                let b = bathy.get(e, i);
+                let first = *seen.entry(key).or_insert(b);
+                assert!(
+                    (b - first).abs() < 1e-12,
+                    "N = {order}, ({x}, {y}): {b} vs {first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_projection_does_not_alias_unresolved_data() {
+        // Ripples of wavelength 0.13 on elements of 1/2 (P2 node spacing
+        // 1/4): point sampling returns their amplitude, the projection
+        // nearly their mean
+        let (mesh, ops, geom) = setup(distorted_mesh(2), 2);
+        let ripple = |x: f64, y: f64| {
+            let k = 2.0 * std::f64::consts::PI / 0.13;
+            -50.0 + 10.0 * (k * x + 0.3).sin() * (k * y + 0.7).sin()
+        };
+        let sampled = Bathymetry2D::from_function(&mesh, &ops, &geom, ripple);
+        let projected = Bathymetry2D::project(&mesh, &ops, &geom, ripple, 0.13 / 4.0);
+        let spread =
+            |b: &Bathymetry2D| b.data.iter().map(|&v| (v + 50.0).abs()).fold(0.0, f64::max);
+        assert!(spread(&sampled) > 5.0, "sampled: {}", spread(&sampled));
+        assert!(
+            spread(&projected) < 1.0,
+            "projected: {}",
+            spread(&projected)
+        );
+    }
+
+    #[test]
+    fn test_projection_converges_at_n_plus_one() {
+        let f = |x: f64, y: f64| -40.0 + 10.0 * (3.0 * x + 1.0).sin() * (2.0 * y - 0.5).cos();
+        for order in 2..=3 {
+            let errors: Vec<f64> = [4, 8, 16]
+                .iter()
+                .map(|&n| {
+                    let (mesh, ops, geom) = setup(distorted_mesh(n), order);
+                    let bathy = Bathymetry2D::project(&mesh, &ops, &geom, f, 0.25 / n as f64);
+                    nodal_error(&bathy, &mesh, &ops, f)
+                })
+                .collect();
+            for pair in errors.windows(2) {
+                let rate = (pair[0] / pair[1]).log2();
+                assert!(
+                    rate > order as f64 + 0.7,
+                    "N = {order}: rate {rate:.2} ({errors:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_select_elements_follows_retain_elements() {
+        let (mesh, ops, geom) = setup(distorted_mesh(3), 2);
+        let bed = |x: f64, y: f64| x - 0.5 + 0.1 * y;
+        let bathy = Bathymetry2D::project(&mesh, &ops, &geom, bed, 0.1);
+        let wet = |e: ElementIndex| bathy.element(e).iter().any(|&b| b < 0.0);
+        let (water, kept) = mesh.retain_elements(wet, crate::mesh::BoundaryTag::Wall);
+        let selected = bathy.select_elements(&kept);
+        assert!(water.n_elements < mesh.n_elements);
+        let water_geom = GeometricFactors2D::compute(&water, &ops);
+        let direct = Bathymetry2D::project(&water, &ops, &water_geom, bed, 0.1);
+        for (field, reference) in [
+            (&selected.data, &direct.data),
+            (&selected.gradient_x, &direct.gradient_x),
+            (&selected.gradient_y, &direct.gradient_y),
+        ] {
+            let diff = field
+                .iter()
+                .zip(reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(diff < 1e-12, "{diff:e}");
+        }
     }
 }
