@@ -72,6 +72,7 @@
 //! ```
 
 mod adcp_reader;
+mod bed_raster;
 mod coastline;
 mod constituent_reader;
 pub(crate) mod datetime;
@@ -90,6 +91,7 @@ mod vtk;
 mod z_levels;
 
 pub use adcp_reader::{ADCPFile, ADCPFileError, read_adcp_file, write_adcp_file};
+pub use bed_raster::BedRaster;
 pub use coastline::{CoastlineData, CoastlineError, CoastlineStatistics, FROYA_BBOX, NORWAY_BBOX};
 pub use constituent_reader::{
     ConstituentData, ConstituentEntry, ConstituentFileError, constituent_period,

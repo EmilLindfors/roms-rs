@@ -106,6 +106,39 @@ pub fn gauss_lobatto_weights(order: usize, nodes: &[f64]) -> Vec<f64> {
     weights
 }
 
+/// Gauss–Legendre nodes and weights with `n` points (n ≥ 1).
+///
+/// The nodes are the roots of P_n, found by Newton iteration from the
+/// Chebyshev guess; w_j = 2 / ((1 − x_j²) P_n'(x_j)²). The rule integrates
+/// polynomials of degree 2n − 1 exactly on [−1, 1].
+pub fn gauss_legendre_nodes_weights(n: usize) -> (Vec<f64>, Vec<f64>) {
+    assert!(n >= 1, "Gauss–Legendre needs at least one point");
+    let mut nodes = vec![0.0; n];
+    let mut weights = vec![0.0; n];
+    for j in 0..n.div_ceil(2) {
+        // Root j counted from x = +1
+        let mut x = (PI * (j as f64 + 0.75) / (n as f64 + 0.5)).cos();
+        for _ in 0..100 {
+            let (p, dp) = legendre_and_derivative(n, x);
+            let dx = p / dp;
+            x -= dx;
+            if dx.abs() < 1e-15 {
+                break;
+            }
+        }
+        let (_, dp) = legendre_and_derivative(n, x);
+        let w = 2.0 / ((1.0 - x * x) * dp * dp);
+        nodes[j] = -x;
+        nodes[n - 1 - j] = x;
+        weights[j] = w;
+        weights[n - 1 - j] = w;
+    }
+    if n % 2 == 1 {
+        nodes[n / 2] = 0.0;
+    }
+    (nodes, weights)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +273,35 @@ mod tests {
         assert!((weights[0] - 1.0 / 3.0).abs() < 1e-14);
         assert!((weights[1] - 4.0 / 3.0).abs() < 1e-14);
         assert!((weights[2] - 1.0 / 3.0).abs() < 1e-14);
+    }
+
+    #[test]
+    fn test_gauss_legendre_exactness() {
+        for n in 1..=12 {
+            let (nodes, weights) = gauss_legendre_nodes_weights(n);
+            assert_eq!(nodes.len(), n);
+            assert!(nodes.windows(2).all(|w| w[0] < w[1]), "n = {n}: sorted");
+            assert!(nodes.iter().all(|x| x.abs() < 1.0), "n = {n}: interior");
+            for k in 0..2 * n {
+                let exact = if k % 2 == 0 {
+                    2.0 / (k + 1) as f64
+                } else {
+                    0.0
+                };
+                let numerical: f64 = nodes
+                    .iter()
+                    .zip(&weights)
+                    .map(|(&x, &w)| w * x.powi(k as i32))
+                    .sum();
+                assert!(
+                    (numerical - exact).abs() < 1e-13,
+                    "n = {n}, degree {k}: {numerical} vs {exact}"
+                );
+            }
+        }
+        // Two points: ±1/√3, weights 1
+        let (nodes, weights) = gauss_legendre_nodes_weights(2);
+        assert!((nodes[1] - 1.0 / 3f64.sqrt()).abs() < 1e-15);
+        assert!((weights[0] - 1.0).abs() < 1e-15);
     }
 }

@@ -208,6 +208,7 @@ pub use analysis::{
 // I/O types
 pub use io::{
     BathymetryStatistics,
+    BedRaster,
     BoundaryTimeSeries,
     CoastlineData,
     CoastlineError,

@@ -17,4 +17,4 @@ pub use legendre_2d::{
     mode_degrees, mode_index, node_index_1d_to_2d, node_index_2d_to_1d, tensor_product_gll_nodes,
     tensor_product_gll_weights,
 };
-pub use nodes::{gauss_lobatto_nodes, gauss_lobatto_weights};
+pub use nodes::{gauss_legendre_nodes_weights, gauss_lobatto_nodes, gauss_lobatto_weights};

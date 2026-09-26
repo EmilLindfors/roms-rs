@@ -259,6 +259,38 @@ impl GeoTiffBathymetry {
         })
     }
 
+    /// Bathymetry from pixel values in memory: `width` × `height` values,
+    /// row-major with row 0 the northernmost, covering `bbox` (outer pixel
+    /// edges), with `nodata` marking missing pixels.
+    ///
+    /// # Panics
+    /// If the sizes disagree or the raster is empty.
+    pub fn from_pixels(
+        bbox: GeoBoundingBox,
+        width: usize,
+        height: usize,
+        values: &[f32],
+        nodata: f32,
+    ) -> Self {
+        assert!(width > 0 && height > 0, "empty raster");
+        assert_eq!(values.len(), width * height, "raster size mismatch");
+        Self {
+            depths: values.chunks_exact(width).map(<[f32]>::to_vec).collect(),
+            bbox,
+            width,
+            height,
+            nodata,
+        }
+    }
+
+    /// Value of pixel `(row, col)` (row 0 north), or `None` for no-data and
+    /// non-finite values. Unlike the depth accessors it does not treat
+    /// positive values (land heights) as missing.
+    pub fn pixel(&self, row: usize, col: usize) -> Option<f64> {
+        let value = self.depths[row][col];
+        (value.is_finite() && (value - self.nodata).abs() > 0.01).then_some(value as f64)
+    }
+
     /// Set the no-data value.
     pub fn set_nodata(&mut self, nodata: f32) {
         self.nodata = nodata;

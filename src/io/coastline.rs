@@ -112,6 +112,23 @@ impl CoastlineData {
         })
     }
 
+    /// Coastline from land polygons in memory, each an outer ring of
+    /// (longitude, latitude) vertices; points outside `bbox` count as water.
+    pub fn from_polygons(polygons: &[Vec<(f64, f64)>], bbox: &GeoBoundingBox) -> Self {
+        let land_polygons: Vec<Polygon<f64>> = polygons
+            .iter()
+            .map(|ring| {
+                let coords: Vec<Coord<f64>> = ring.iter().map(|&(x, y)| Coord { x, y }).collect();
+                Polygon::new(LineString::from(coords), vec![])
+            })
+            .collect();
+        Self {
+            polygon_count: land_polygons.len(),
+            land_polygons: MultiPolygon(land_polygons),
+            bbox: *bbox,
+        }
+    }
+
     /// Check if a point is in water (not inside any land polygon).
     ///
     /// Returns true if the point is outside all land polygons.
