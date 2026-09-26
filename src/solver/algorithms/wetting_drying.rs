@@ -155,7 +155,7 @@ impl WetDryConfig {
             *hu = h * u;
             *hv = h * v;
         }
-        let speed = hu.hypot(*hv) / h;
+        let speed = (*hu * *hu + *hv * *hv).sqrt() / h;
         if speed > self.max_velocity {
             let scale = self.max_velocity / speed;
             *hu *= scale;
@@ -288,7 +288,7 @@ impl ImplicitDamping2D<'_> {
                 Some(wd) => wd.desingularized_velocity(from.h, from.hu, from.hv),
                 None => from.velocity(self.h_min),
             };
-            let speed = u.hypot(v);
+            let speed = (u * u + v * v).sqrt();
             if speed > 0.0 {
                 rate += friction.damping_rate(h, speed);
             }

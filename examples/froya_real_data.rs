@@ -160,6 +160,7 @@ struct Options {
     spinup_hours: f64,
     gauge_ratios: Vec<&'static str>,
     land_elevation: f64,
+    profile: usize,
     output: Option<PathBuf>,
 }
 
@@ -186,6 +187,7 @@ impl Options {
             ramp_hours: get("ramp_hours", TIDAL_RAMP_HOURS)?,
             output_minutes: get("output_minutes", 60.0)?,
             land_elevation: get("land_elevation", LAND_ELEVATION)?,
+            profile: get("profile", 0.0)? as usize,
             output: args.get("output").map(PathBuf::from),
             wind: args.contains_key("wind"),
             start: args
@@ -584,6 +586,10 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
             .with_source(pressure());
     }
     let physics: SWEPhysics2D<_> = builder.build();
+    if opts.profile > 0 {
+        profile_phases(domain, &physics, opts.profile);
+        return Ok(());
+    }
 
     let output_dir = opts
         .output
@@ -719,6 +725,96 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
     }
     println!("Visualize with ParaView: {}/*.vtu", output_dir.display());
     Ok(())
+}
+
+/// Wall time of each phase of an SSP-RK3 step (`profile=N`): after 15 min of
+/// spin-up (so the flow and the wet/dry state are realistic), `n` calls of
+/// each. A step is 3 RHS, 3 post-processing and 3 implicit-damping calls and
+/// one dt.
+fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P, n: usize) {
+    let mut q = domain.at_rest();
+    let spin_up = 900.0;
+    let mut t = 0.0;
+    let mut stages = dg_rs::time::StageWorkspace::new();
+    while t < spin_up {
+        let dt = physics
+            .compute_dt(&q, physics.max_cfl().unwrap_or(1.0))
+            .min(spin_up - t);
+        dg_rs::time::TimeIntegrator::step_with_relaxation(
+            &SSPRK3,
+            &mut q,
+            dt,
+            t,
+            |s, time, out| physics.compute_rhs_into(s, time, out),
+            |stage, from, dt| physics.implicit_damping(stage, from, dt),
+            |s| physics.post_process(s),
+            &mut stages,
+        );
+        t += dt;
+    }
+    let dt = physics.compute_dt(&q, physics.max_cfl().unwrap_or(1.0));
+
+    // Median of `n` calls (after a warm-up): robust to the boost and thermal
+    // swings of a laptop
+    let time = |f: &mut dyn FnMut()| {
+        f();
+        let mut ms: Vec<f64> = (0..n)
+            .map(|_| {
+                let start = Instant::now();
+                f();
+                1e3 * start.elapsed().as_secs_f64()
+            })
+            .collect();
+        ms.sort_by(f64::total_cmp);
+        ms[n / 2]
+    };
+    let measure = |threads: usize| {
+        let mut out = q.clone();
+        let mut scratch = q.clone();
+        let rhs = time(&mut || physics.compute_rhs_into(&q, t, &mut out));
+        let copy = time(&mut || scratch.clone_from(&q));
+        let post = time(&mut || {
+            scratch.clone_from(&q);
+            physics.post_process(&mut scratch);
+        }) - copy;
+        let damping = time(&mut || {
+            scratch.clone_from(&q);
+            physics.implicit_damping(&mut scratch, &q, dt);
+        }) - copy;
+        let dt_ms = time(&mut || {
+            std::hint::black_box(physics.compute_dt(&q, 1.0));
+        });
+        let step = 3.0 * (rhs + post + damping) + dt_ms;
+        println!("\nPhases after {spin_up} s, {threads} threads: ms per call, share of a step");
+        for (name, ms, calls) in [
+            ("RHS", rhs, 3.0),
+            ("post_process (limiter, wet/dry)", post, 3.0),
+            ("implicit damping", damping, 3.0),
+            ("dt", dt_ms, 1.0),
+        ] {
+            println!(
+                "  {name:32} {ms:7.3} ms  {:5.1} %",
+                100.0 * calls * ms / step
+            );
+        }
+        println!("  step (sum, without RK combinations) {step:.2} ms");
+    };
+
+    // One thread, then all of them
+    let all = std::thread::available_parallelism().map_or(1, |n| n.get());
+    for threads in [1, all] {
+        #[cfg(feature = "parallel")]
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("thread pool")
+            .install(|| measure(threads));
+        #[cfg(not(feature = "parallel"))]
+        {
+            measure(1);
+            break;
+        }
+    }
 }
 
 /// Lower-case ASCII file-name form of a station name.

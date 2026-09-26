@@ -144,6 +144,18 @@ All notable changes to this project should be documented in this file.
 - Boundary conditions: because the Riemann solver now supplies the Flather relation, several knobs no longer affect the ghost state and are kept only for API compatibility (documented as unused): `NestingBC2D::{with_flather, without_flather, with_flather_weight, with_h_ref}`, `OceanNestingBC2D::{with_flather, with_flather_weight}` (Flather and Dirichlet modes now coincide), `ChapmanFlather2D::{dx, dt, h_ref}` / `with_dt` / `with_h_ref`, `TSTConfig::{dx, h_ref, subtidal_weight}`, and the 1D `FlatherBC::{bathymetry, g}`.
 - API (io, breaking): `NorKystTextData::sea_surface_height_series` and `surface_current_series` now return `Result` and fail with the new `NorKystTextError::MultipleLocations` when the records span several sites/coordinates; split with the new `NorKystTextData::for_site(id)`. `examples/norkyst_tidal_validation.rs` picks the site nearest the requested `(lon, lat)`. The shared time parser moved from `io/norkyst_time.rs` to `io/datetime.rs`.
 
+### Performance
+
+- **Cheaper wet/dry stage work on the Frøya case (TODO P2.2, P2.3).** Measured with the new `froya_real_data profile=N` phase timer, single thread; on battery power, so indicative only.
+  - Point-implicit Manning damping: 3.5 → 1.3 ms per call. `hypot` became `sqrt(x² + y²)` (MSVC's `hypot` is a C runtime call), and a Halley `cbrt` (≤ 2 ulp of `f64::cbrt`, 2× faster than the CRT's) replaced the CRT `cbrt`.
+  - Post-processing: 0.84 → 0.41 ms per call.
+    - The positivity limiter takes each element mean inside its element kernel, with no separate pass or allocation.
+    - `SWEPhysics2D::post_process` skips a `Positivity(h ≤ h_dry)` limiter when wet/dry is on: the wet/dry correction applies the same limiter to every element it would change, so the result is bitwise identical.
+    - `LimiterContext2D` no longer computes the unused `h_min`, a serial sqrt per edge every stage.
+  - The WetDry hydrostatic HLL passes the node velocities to a face-aligned HLL core (`hll_flux_face_aligned`) instead of rebuilding momenta and dividing them back out. `hll_flux_swe_2d` is bitwise unchanged.
+  - Profile findings (TODO P2): HLL is about a third of the single-thread time (every face is solved twice), and scaling stops at about 8 threads on the test laptop (4 Zen 5 + 8 Zen 5c cores).
+- API (breaking, minor): `LimiterContext2D::h_min` and `LimiterContext2D::with_h_min` are removed.
+
 ### Fixed
 
 - **`Simulation` callbacks drifted off their interval (simulation).** `with_callback_interval` fired at the first step past each interval, so callback (and output) times drifted by up to one dt per interval: hourly output at dt ≈ 0.7 s wandered off the hour. The step before each callback is now shortened to land on `t_start + k·interval` exactly. Test: `callbacks_land_on_the_interval`.

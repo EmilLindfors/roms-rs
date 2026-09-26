@@ -933,8 +933,8 @@ fn element_max_reference_rate(
     let ki = k.as_usize();
     let grad_r = (geom.rx[ki], geom.ry[ki]);
     let grad_s = (geom.sx[ki], geom.sy[ki]);
-    let norm_r = grad_r.0.hypot(grad_r.1);
-    let norm_s = grad_s.0.hypot(grad_s.1);
+    let norm_r = (grad_r.0 * grad_r.0 + grad_r.1 * grad_r.1).sqrt();
+    let norm_s = (grad_s.0 * grad_s.0 + grad_s.1 * grad_s.1).sqrt();
     let dir_r = (grad_r.0 / norm_r, grad_r.1 / norm_r);
     let dir_s = (grad_s.0 / norm_s, grad_s.1 / norm_s);
 

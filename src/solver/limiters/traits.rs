@@ -5,22 +5,20 @@ use crate::operators::DGOperators2D;
 
 use super::super::state::SWESolution2D;
 
-/// Context provided to limiter computations.
+/// Context provided to limiter computations: mesh and operators, so
+/// constructing one per RK stage costs nothing.
 #[derive(Clone, Copy)]
 pub struct LimiterContext2D<'a> {
     /// The mesh
     pub mesh: &'a Mesh2D,
     /// DG operators
     pub ops: &'a DGOperators2D,
-    /// Minimum element size
-    pub h_min: f64,
 }
 
 impl<'a> std::fmt::Debug for LimiterContext2D<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LimiterContext2D")
             .field("n_elements", &self.mesh.n_elements)
-            .field("h_min", &self.h_min)
             .finish()
     }
 }
@@ -28,16 +26,7 @@ impl<'a> std::fmt::Debug for LimiterContext2D<'a> {
 impl<'a> LimiterContext2D<'a> {
     /// Create a new limiter context.
     pub fn new(mesh: &'a Mesh2D, ops: &'a DGOperators2D) -> Self {
-        Self {
-            mesh,
-            ops,
-            h_min: mesh.h_min(),
-        }
-    }
-
-    /// Create a limiter context with a custom h_min.
-    pub fn with_h_min(mesh: &'a Mesh2D, ops: &'a DGOperators2D, h_min: f64) -> Self {
-        Self { mesh, ops, h_min }
+        Self { mesh, ops }
     }
 }
 

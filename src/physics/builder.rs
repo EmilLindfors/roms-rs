@@ -205,7 +205,18 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
     /// Limiter, then positivity and velocity desingularization (wet/dry).
     fn post_process(&self, state: &mut SWESolution2D) {
         let ctx = LimiterContext2D::new(&self.mesh, &self.ops);
-        let mut clips = self.limiter.apply_counting(state, &ctx);
+        // The wet/dry correction applies the same positivity limiter to every
+        // element with a node below h_dry, which includes every element a
+        // positivity limiter with a threshold ≤ h_dry changes: skip that pass
+        let redundant = matches!(
+            (&self.limiter, &self.wet_dry),
+            (StandardLimiter2D::Positivity(h), Some(config)) if *h <= config.h_dry.meters()
+        );
+        let mut clips = if redundant {
+            0
+        } else {
+            self.limiter.apply_counting(state, &ctx)
+        };
         if let Some(ref config) = self.wet_dry {
             clips += wet_dry_correction(state, &self.ops, config);
         }
@@ -481,6 +492,62 @@ mod tests {
         let ops = Arc::new(DGOperators2D::new(2));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh));
         (mesh, ops, geom)
+    }
+
+    /// A positivity limiter at or below h_dry is subsumed by the wet/dry
+    /// correction, which `post_process` then runs alone: the result, clip
+    /// count included, is bitwise that of running both.
+    #[test]
+    fn redundant_positivity_pass_is_skipped_exactly() {
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 6, 6));
+        let ops = Arc::new(DGOperators2D::new(3));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+        let config = WetDryConfig::default();
+        let h_dry = config.h_dry.meters();
+        let physics = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            ShallowWater2D::new(9.81),
+            Reflective2D::default(),
+        )
+        .with_limiter(StandardLimiter2D::Positivity(h_dry))
+        .with_wet_dry(config.clone())
+        .build();
+
+        // Wet, shoreline, film, negative-node and negative-mean elements
+        let mut state = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        let mut seed = 12345_u64;
+        let mut rand = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for e in 0..mesh.n_elements {
+            let scale = [1.0, 1e-2, 1e-3, 1e-4][e % 4];
+            let shift = [0.0, -0.3, 0.2, -0.9][e / 9 % 4];
+            for i in 0..ops.n_nodes {
+                let h = scale * (rand() + shift);
+                state.set_state(
+                    k(e),
+                    i,
+                    crate::solver::SWEState2D::new(h, rand() - 0.5, rand() - 0.5),
+                );
+            }
+        }
+
+        let mut expected = state.clone();
+        let ctx = LimiterContext2D::new(&mesh, &ops);
+        let clips = StandardLimiter2D::Positivity(h_dry).apply_counting(&mut expected, &ctx)
+            + wet_dry_correction(&mut expected, &ops, &config);
+        assert!(clips > 0, "the state should have negative-mean elements");
+
+        physics.post_process(&mut state);
+        assert_eq!(physics.negative_depth_clips(), clips);
+        for (a, b) in state.data.iter().zip(&expected.data) {
+            assert!(a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
+        }
     }
 
     #[test]

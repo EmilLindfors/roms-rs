@@ -163,7 +163,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [x] HLL is the default flux for wet/dry runs in `SWEPhysics2DBuilder`. `SWE2DRhsConfig::new` still defaults to Roe (low-level API).
 - [ ] Retire the cell-average/`linearize` workarounds: `WetDry` now covers wet/dry with nodal B.
 - [x] Move `examples/froya_real_data.rs` off the legacy `SWE2DTimeConfig` (`H_MIN` = 5 m, land as a 5 m film, cell-averaged B). It now uses `Simulation` + `WetDry` (nodal B) + `with_wet_dry` + `with_implicit_friction` on a water-only mesh, with all four sides open.
-- [ ] `SWEPhysics2D::post_process` builds a `LimiterContext2D` every stage, whose `new` computes `mesh.h_min()` (a sqrt per edge over all elements). No limiter reads `LimiterContext2D::h_min`: drop the field or cache it.
+- [x] `SWEPhysics2D::post_process` built a `LimiterContext2D` every stage, whose `new` computed `mesh.h_min()` serially (a sqrt per edge). No limiter read it: the field is gone (2026-09-26).
 
 ### P1.3 Geometry for real coastlines
 - [ ] Per-node isoparametric geometric factors (`[K]` → `[K × n_nodes]`). Remove the parallelogram-only panic (`geometric.rs:160-186`).
@@ -233,12 +233,16 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 ### P2.2 Kernels
 - [ ] Sum-factorised contravariant volume term. Currently 4 dense (p+1)⁴ mat-vecs per element (`swe_2d.rs:835-874`): 2.6× fewer flops at P2, 3.5× at P3.
 - [ ] Diagonal LIFT (GLL mass is diagonal; `kernels.rs:490-517` applies it densely).
-- [ ] One Riemann solve per interior face (each is currently solved twice).
-- [ ] SIMD Manning; drop per-node `reference_to_physical` and `dyn` dispatch in the RHS.
+- [ ] One Riemann solve per interior face (each is currently solved twice). HLL was 32 % of single-thread time on Frøya (2026-09-26 profile), so this is the largest single item. `hydrostatic_hll` already returns both sides' fluxes: precompute interior-face fluxes in a parallel face pass, then read them in the element loop. It also makes the exchange with neighbours bitwise conservative.
+- [ ] Drop per-node `reference_to_physical` and `dyn` dispatch in the RHS source loop: Coriolis alone was 5 % of single-thread time (2 FMAs per node behind a context build and two virtual calls).
+- [x] 2026-09-26: `hypot` → `sqrt(x² + y²)` in the hot paths (MSVC `hypot` is a C runtime call); a Halley `cbrt` for Manning (2× the CRT's, ≤ 2 ulp); the WetDry HLL takes the node velocities through a face-aligned core (`hll_flux_face_aligned`) instead of dividing momenta back out. Implicit damping 3.5 → 1.3 ms, post-processing 0.84 → 0.41 ms (single thread).
+- [ ] Whether the HLL core should be inlined into the face and subcell loops: the A/B was inconclusive on battery power. Redo it on mains power, pinned to a Zen 5 core (logical CPUs 0–7 on the HX 370; 8–23 are the slower Zen 5c).
+- [ ] Explicit SIMD (`pulp`, or fearless_simd) pays only once kernels vectorise across nodes or elements: the node passes (damping, positivity, wet/dry) first, then batched face fluxes. faer is not on the hot path (element-local 9-node operators).
 
 ### P2.3 Fused in-place stepper
 - [ ] Limiter, positivity and wet/dry in one parallel in-place pass. Today the "parallel" paths `to_vec` every field, allocate per element, and copy back serially (`limiters/swe_2d.rs:626-725`, `wetting_drying.rs:526-541`): 1.5–2.5× of wall time.
   - Limiters done (P0.19: in-place `par_chunks_exact_mut` over the SoA fields). The `wetting_drying.rs` parallel path is done too (P1.2: in place, plus a node-parallel implicit damping pass). Still open: the per-stage `Vec` of cell averages and vertex bounds (move to a workspace with P1.1). Then fuse the limiter, the wet/dry correction and the implicit damping into one pass.
+  - 2026-09-26: the positivity limiter computes each element mean in its element kernel (no separate pass or `Vec`), and `post_process` skips a `Positivity(h ≤ h_dry)` limiter when wet/dry is on, since the wet/dry correction applies the same limiter to every element it would change (bitwise identical; `redundant_positivity_pass_is_skipped_exactly`). The Kuzmin paths still allocate averages and vertex bounds per stage.
 
 ### P2.4 Water-only work
 - [x] Mesh water only: `Mesh2D::retain_elements` (faces towards dropped elements become coastline walls). Frøya keeps only elements with a water node.
@@ -248,7 +252,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] One 250 m element in 1300 m water forces ~22× more global steps. Multirate/LTS SSP-RK or semi-implicit free surface (SLIM/Thetis practice): 2–20×.
 
 ### P2.6 Benchmarks (was P1.6)
-- Measured 2026-09-26: Frøya, 9,653 P2 elements (87k nodes), dt ≈ 0.65 s: 8.2 ms/step on 24 threads, so a 30-day validation run takes ≈ 9 h.
+- Measured 2026-09-26: Frøya, 9,653 P2 elements (87k nodes), dt ≈ 0.65 s: 8.2 ms/step on 24 threads, so a 30-day validation run takes ≈ 9 h. Scaling stops at ≈ 8 threads (44.6 → 9 ms from 1 to 8–24 threads): the laptop's 4 Zen 5 + 8 Zen 5c cores and its power limit, not serial code. `froya_real_data profile=N` times each phase (RHS, post-processing, damping, dt) at 1 and all threads; single-thread RHS ≈ 85 % of the step.
 - [ ] Full-RHS and full-step throughput vs mesh size at realistic size (≥ 100k elements, bathymetry, limiter, open BCs), not cache-resident micro-cases.
 - [ ] DOFs/second; parallel scaling 1–16 cores; memory-bandwidth utilisation; allocation counting in CI.
 - [ ] Reconcile PERFORMANCE.md vs PROFILE.md: the same 65k run is recorded as 70.5 s and 217 s, and some cited RHS variants no longer exist.

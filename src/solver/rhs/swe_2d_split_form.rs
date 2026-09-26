@@ -81,8 +81,8 @@
 
 use crate::boundary::{BoundaryState, SWEBoundaryCondition2D};
 use crate::flux::{
-    SWENodeState2D, entropy_stable_dissipation_2d, hll_flux_swe_2d,
-    wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
+    HllSide, SWENodeState2D, entropy_stable_dissipation_2d, hll_flux_face_aligned,
+    rotate_from_normal, wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
 };
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
@@ -430,12 +430,29 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         g: f64,
     ) -> (SWEState2D, SWEState2D) {
         let h_min = self.reconstruction.h_min;
-        let a = SWEState2D::new(q_a.h, q_a.hu, q_a.hv);
-        let b = SWEState2D::new(q_b.h, q_b.hu, q_b.hv);
-        let (a_star, b_star) = self.reconstruction.reconstruct(&a, &b, q_a.b, q_b.b);
-        let norm = m.0.hypot(m.1);
-        let unit = (m.0 / norm, m.1 / norm);
-        let flux = norm * hll_flux_swe_2d(&a_star, &b_star, unit, g, h_min);
+        let norm = (m.0 * m.0 + m.1 * m.1).sqrt();
+        let (nx, ny) = (m.0 / norm, m.1 / norm);
+        // Audusse et al. (2004): h* = max(0, η − max(B_a, B_b)) with the
+        // velocity kept (zero on a side at or below h_min), so hu* = h* u.
+        // The node states carry u and v: HLL needs no division to recover them.
+        let b_face = q_a.b.max(q_b.b);
+        let side = |q: &SWENodeState2D| {
+            let h_star = (q.h + q.b - b_face).max(0.0);
+            let (u, v) = if q.h > h_min { (q.u, q.v) } else { (0.0, 0.0) };
+            let (un, ut) = (u * nx + v * ny, -u * ny + v * nx);
+            let (hun, hut) = (h_star * un, h_star * ut);
+            let (un, ut) = if h_star > h_min { (un, ut) } else { (0.0, 0.0) };
+            HllSide {
+                h: h_star,
+                hun,
+                hut,
+                un,
+                ut,
+            }
+        };
+        let (a_star, b_star) = (side(q_a), side(q_b));
+        let flux =
+            norm * rotate_from_normal(&hll_flux_face_aligned(a_star, b_star, g, h_min), nx, ny);
         // HLL returns zero, without the pressure ½g h*², when both sides are
         // below h_min (thin reconstructed subcell faces at a shoreline): the
         // correction then restores all of ½g h²
