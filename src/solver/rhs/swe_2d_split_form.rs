@@ -271,12 +271,94 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         self.config.bathymetry.map_or(0.0, |b| b.get(k, node))
     }
 
+    /// Length of the face buffer [`Self::edge_fluxes`] fills: both sides of
+    /// every edge.
+    pub(super) fn face_buffer_len(&self) -> usize {
+        2 * self.mesh.n_edges * self.ops.n_face_nodes
+    }
+
+    /// F* of both sides of interior edge `e`, into `out` (`2 · n_face_nodes`
+    /// values): first the left element's, then the right's, each in its own
+    /// face-node order and outward-normal direction. Boundary edges are left
+    /// untouched (their faces are evaluated per element).
+    ///
+    /// One surface-flux evaluation serves both sides, so the numerical flux
+    /// is computed once per face instead of once per element face, and the
+    /// two sides exchange exactly opposite interface fluxes.
+    pub(super) fn edge_fluxes(&self, e: usize, out: &mut [SWEState2D]) {
+        let edge = &self.mesh.edges[e];
+        let Some(right) = edge.right else {
+            return;
+        };
+        let n_face_nodes = self.ops.n_face_nodes;
+        let g = self.config.equation.g;
+        let h_min = self.config.equation.h_min.meters();
+        let (left_k, right_k) = (
+            ElementIndex::new(edge.left.element),
+            ElementIndex::new(right.element),
+        );
+        let normal = self.geom.normals[edge.left.element][edge.left.face];
+        let node = |k: ElementIndex, i: usize| {
+            SWENodeState2D::new(&self.q.get_state(k, i), self.bed(k, i), h_min)
+        };
+        let (left_out, right_out) = out.split_at_mut(n_face_nodes);
+        for (fi, &left_node) in self.ops.face_nodes[edge.left.face].iter().enumerate() {
+            let rfi = n_face_nodes - 1 - fi;
+            let right_node = self.ops.face_nodes[right.face][rfi];
+            let (f_left, f_right) = self.surface_flux(
+                &node(left_k, left_node),
+                &node(right_k, right_node),
+                normal,
+                g,
+            );
+            left_out[fi] = f_left;
+            right_out[rfi] = f_right;
+        }
+    }
+
+    /// Interface flux `F*` between `q_a` and `q_b` across a face with unit
+    /// normal `n` pointing from a to b: `F*·n` as seen from side a, and
+    /// `F*·(−n)` as seen from side b (its own outward normal).
+    ///
+    /// The two-point flux and the dissipation are antisymmetric under
+    /// swapping the sides and the normal, so they are evaluated once. Only
+    /// the bed term (and, for HLL, the hydrostatic correction) is per side.
+    #[inline]
+    fn surface_flux(
+        &self,
+        q_a: &SWENodeState2D,
+        q_b: &SWENodeState2D,
+        n: (f64, f64),
+        g: f64,
+    ) -> (SWEState2D, SWEState2D) {
+        match self.surface {
+            SurfaceFlux::HydrostaticHll => {
+                let (f_a, f_b) = self.hydrostatic_hll(q_a, q_b, n, g);
+                (f_a, -f_b)
+            }
+            surface => {
+                let mut shared = wintermeyer_flux_2d(q_a, q_b, n, g);
+                if surface == SurfaceFlux::EntropyStable {
+                    shared = shared + entropy_stable_dissipation_2d(q_a, q_b, n, g);
+                }
+                let minus_n = (-n.0, -n.1);
+                (
+                    shared + wintermeyer_bed_interface_term_2d(q_a.h, q_a.b, q_b.b, n, g),
+                    -shared + wintermeyer_bed_interface_term_2d(q_b.h, q_b.b, q_a.b, minus_n, g),
+                )
+            }
+        }
+    }
+
     /// Volume, bed-slope and surface terms of element `k`, written to `out`
-    /// (`[h, hu, hv]`, `n_nodes` values each). Source terms are not included.
+    /// (`[h, hu, hv]`, `n_nodes` values each), with interior-face fluxes from
+    /// `faces` (filled by [`Self::edge_fluxes`]). Source terms are not
+    /// included.
     pub(super) fn element_rhs(
         &self,
         k: ElementIndex,
         ws: &mut SplitFormWorkspace,
+        faces: &[SWEState2D],
         out: [&mut [f64]; 3],
     ) {
         let ops = self.ops;
@@ -318,52 +400,37 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         }
 
         // 2. Surface terms: J⁻¹ LIFT sJ (F(q⁻)·n − F*). For GLL collocation LIFT
-        //    only couples a face node to itself.
+        //    only couples a face node to itself. F* of interior faces comes
+        //    from the face pass (`edge_fluxes`), once per face for both sides.
         let j_inv = self.geom.det_j_inv[ki];
         for face in 0..4 {
             let normal = self.geom.normals[ki][face];
             let scale = j_inv * self.geom.surface_j[ki][face];
-            let neighbor = self.mesh.neighbor(k, face);
+            let edge_index = self.mesh.element_edges[ki][face];
+            let edge = &self.mesh.edges[edge_index];
+            // This side's slots in the face buffer, if the face is interior
+            let slots = edge.right.map(|_| {
+                let side = usize::from(edge.left.element != ki || edge.left.face != face);
+                &faces[(2 * edge_index + side) * n_face_nodes..][..n_face_nodes]
+            });
 
             for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
                 let q_int = ws.nodes[node];
-                let (q_ext, exact) = match neighbor {
-                    Some(nb) => {
-                        let nb_k = ElementIndex::new(nb.element);
-                        let nb_node = ops.face_nodes[nb.face][n_face_nodes - 1 - fi];
-                        let state = self.q.get_state(nb_k, nb_node);
-                        (
-                            SWENodeState2D::new(&state, self.bed(nb_k, nb_node), h_min),
-                            false,
-                        )
-                    }
-                    // Boundary state with mirrored bathymetry: no bed step at boundaries
-                    None => {
-                        let (state, exact) = match self.boundary_state(k, face, node, normal) {
-                            BoundaryState::Ghost(q) => (q, false),
-                            BoundaryState::Exact(q) => (q, true),
-                        };
-                        (SWENodeState2D::new(&state, q_int.b, h_min), exact)
-                    }
-                };
-
-                let f_star = match self.surface {
-                    // State on the boundary: its physical flux F(q_b)·n
-                    _ if exact => wintermeyer_flux_2d(&q_ext, &q_ext, normal, g),
-                    SurfaceFlux::HydrostaticHll => {
-                        self.hydrostatic_hll(&q_int, &q_ext, normal, g).0
-                    }
-                    surface => {
-                        let f = wintermeyer_flux_2d(&q_int, &q_ext, normal, g)
-                            + wintermeyer_bed_interface_term_2d(
-                                q_int.h, q_int.b, q_ext.b, normal, g,
-                            );
-                        if surface == SurfaceFlux::EntropyStable {
-                            f + entropy_stable_dissipation_2d(&q_int, &q_ext, normal, g)
-                        } else {
-                            f
+                let f_star = match slots {
+                    Some(slots) => slots[fi],
+                    // Boundary state with mirrored bathymetry: no bed step at
+                    // boundaries
+                    None => match self.boundary_state(k, face, node, normal) {
+                        // State on the boundary: its physical flux F(q_b)·n
+                        BoundaryState::Exact(q) => {
+                            let q_b = SWENodeState2D::new(&q, q_int.b, h_min);
+                            wintermeyer_flux_2d(&q_b, &q_b, normal, g)
                         }
-                    }
+                        BoundaryState::Ghost(q) => {
+                            let q_ext = SWENodeState2D::new(&q, q_int.b, h_min);
+                            self.surface_flux(&q_int, &q_ext, normal, g).0
+                        }
+                    },
                 };
                 let flux_diff = wintermeyer_flux_2d(&q_int, &q_int, normal, g) - f_star;
 
@@ -912,6 +979,46 @@ mod tests {
             }
         }
         q
+    }
+
+    /// The face pass evaluates each interior face once for both sides: the
+    /// mass fluxes the two neighbours see are exactly opposite, for
+    /// every split form, over shorelines and rough beds; momentum differs only
+    /// by each side's own bed/hydrostatic term.
+    #[test]
+    fn test_face_pass_exchanges_opposite_mass_fluxes() {
+        use super::SplitFormSWE2D;
+
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        for formulation in SPLIT_FORMS {
+            for (order, rough) in [(2, true), (3, false)] {
+                let (mesh, ops, geom, bathymetry) = shoreline_setup(order, true, rough);
+                let q = shoreline_state(&mesh, &ops, &bathymetry, 0.5);
+                let config = SWE2DRhsConfig::new(&equation, &bc)
+                    .with_formulation(formulation)
+                    .with_bathymetry(&bathymetry);
+                let split = SplitFormSWE2D::new(&q, &mesh, &ops, &geom, &config, 0.0).unwrap();
+                let nf = ops.n_face_nodes;
+                let mut slots = vec![SWEState2D::zero(); 2 * nf];
+                let mut nonzero = 0;
+                for e in 0..mesh.n_edges {
+                    split.edge_fluxes(e, &mut slots);
+                    for fi in 0..nf {
+                        let (left, right) = (slots[fi], slots[nf + nf - 1 - fi]);
+                        // Exact equality (== also equates the +0/−0 of dry faces)
+                        assert!(
+                            left.h == -right.h,
+                            "{formulation:?}: {} vs {}",
+                            left.h,
+                            right.h
+                        );
+                        nonzero += usize::from(left.h != 0.0);
+                    }
+                }
+                assert!(nonzero > 0, "{formulation:?}: no flow through faces");
+            }
+        }
     }
 
     #[test]

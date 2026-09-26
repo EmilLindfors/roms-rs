@@ -526,6 +526,55 @@ impl Drop for WorkspaceGuard {
     }
 }
 
+thread_local! {
+    /// Interior-face flux buffer of the split forms, cached on the thread
+    /// that drives the RHS (reused by every evaluation after the first).
+    static FACE_FLUXES: RefCell<Vec<SWEState2D>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The face-flux buffer, taken from this thread's cache for one RHS
+/// evaluation and returned on drop (a nested evaluation on the same thread
+/// gets a fresh one).
+struct FaceFluxGuard(Vec<SWEState2D>);
+
+impl FaceFluxGuard {
+    fn take() -> Self {
+        Self(
+            FACE_FLUXES
+                .with(|cell| cell.try_borrow_mut().map(|mut v| std::mem::take(&mut *v)))
+                .unwrap_or_default(),
+        )
+    }
+}
+
+impl std::ops::Deref for FaceFluxGuard {
+    type Target = Vec<SWEState2D>;
+    fn deref(&self) -> &Vec<SWEState2D> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FaceFluxGuard {
+    fn deref_mut(&mut self) -> &mut Vec<SWEState2D> {
+        &mut self.0
+    }
+}
+
+impl Drop for FaceFluxGuard {
+    fn drop(&mut self) {
+        let faces = std::mem::take(&mut self.0);
+        // Keep the larger buffer; `try_with`: the thread-local may be gone at
+        // thread exit
+        let _ = FACE_FLUXES.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut()
+                && slot.capacity() < faces.capacity()
+            {
+                *slot = faces;
+            }
+        });
+    }
+}
+
 /// One 2D SWE RHS evaluation. `element` is the only place the per-element
 /// terms are computed; the serial and parallel drivers just iterate over it.
 struct SWE2DRhsKernel<'a, 'c, BC: SWEBoundaryCondition2D> {
@@ -559,16 +608,53 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         }
     }
 
+    /// Interior-face fluxes of the split forms, once per face, into `faces`
+    /// (resized as needed; left empty for the collocated formulation).
+    fn face_fluxes(&self, faces: &mut Vec<SWEState2D>) {
+        let Some(split_form) = &self.split_form else {
+            faces.clear();
+            return;
+        };
+        faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
+        let per_edge = 2 * self.ops.n_face_nodes;
+        for (e, slots) in faces.chunks_exact_mut(per_edge).enumerate() {
+            split_form.edge_fluxes(e, slots);
+        }
+    }
+
+    /// [`Self::face_fluxes`] over the edges in parallel (identical result).
+    #[cfg(feature = "parallel")]
+    fn face_fluxes_parallel(&self, faces: &mut Vec<SWEState2D>) {
+        use rayon::prelude::*;
+
+        let Some(split_form) = &self.split_form else {
+            faces.clear();
+            return;
+        };
+        faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
+        let per_edge = 2 * self.ops.n_face_nodes;
+        faces
+            .par_chunks_exact_mut(per_edge)
+            .enumerate()
+            .for_each(|(e, slots)| split_form.edge_fluxes(e, slots));
+    }
+
     /// Volume, surface and source terms of element `k`, written (not added)
-    /// to `out = [h, hu, hv]`.
-    fn element(&self, k: usize, ws: &mut ElementWorkspace, out: [&mut [f64]; 3]) {
+    /// to `out = [h, hu, hv]`; `faces` from [`Self::face_fluxes`].
+    fn element(
+        &self,
+        k: usize,
+        ws: &mut ElementWorkspace,
+        faces: &[SWEState2D],
+        out: [&mut [f64]; 3],
+    ) {
         let k_idx = ElementIndex::new(k);
         let [out_h, out_hu, out_hv] = out;
 
         // 1–2. Volume and surface terms
         match &self.split_form {
             Some(split_form) => {
-                split_form.element_rhs(k_idx, &mut ws.split_form, [out_h, out_hu, out_hv])
+                split_form.element_rhs(k_idx, &mut ws.split_form, faces, [out_h, out_hu, out_hv])
             }
             None => self.collocated_terms(k_idx, ws, [out_h, out_hu, out_hv]),
         }
@@ -832,6 +918,8 @@ pub fn compute_rhs_swe_2d_into<BC: SWEBoundaryCondition2D>(
 ) {
     check_rhs_output(out, mesh, ops);
     let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
+    let mut faces = FaceFluxGuard::take();
+    kernel.face_fluxes(&mut faces);
     let n = ops.n_nodes;
     let [out_h, out_hu, out_hv] = &mut out.data;
     let mut ws = WorkspaceGuard::take(ops);
@@ -841,7 +929,7 @@ pub fn compute_rhs_swe_2d_into<BC: SWEBoundaryCondition2D>(
         .zip(out_hv.chunks_exact_mut(n))
         .enumerate()
     {
-        kernel.element(k, &mut ws, [h, hu, hv]);
+        kernel.element(k, &mut ws, &faces, [h, hu, hv]);
     }
     add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }
@@ -1011,6 +1099,9 @@ pub fn compute_rhs_swe_2d_parallel_into<BC: SWEBoundaryCondition2D + Sync>(
 
     check_rhs_output(out, mesh, ops);
     let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
+    let mut faces = FaceFluxGuard::take();
+    kernel.face_fluxes_parallel(&mut faces);
+    let faces: &[SWEState2D] = &faces;
     let n = ops.n_nodes;
     let [out_h, out_hu, out_hv] = &mut out.data;
     out_h
@@ -1020,7 +1111,7 @@ pub fn compute_rhs_swe_2d_parallel_into<BC: SWEBoundaryCondition2D + Sync>(
         .enumerate()
         .for_each_init(
             || WorkspaceGuard::take(ops),
-            |ws, (k, ((h, hu), hv))| kernel.element(k, ws, [h, hu, hv]),
+            |ws, (k, ((h, hu), hv))| kernel.element(k, ws, faces, [h, hu, hv]),
         );
     add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }

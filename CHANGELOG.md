@@ -154,6 +154,12 @@ All notable changes to this project should be documented in this file.
     - `LimiterContext2D` no longer computes the unused `h_min`, a serial sqrt per edge every stage.
   - The WetDry hydrostatic HLL passes the node velocities to a face-aligned HLL core (`hll_flux_face_aligned`) instead of rebuilding momenta and dividing them back out. `hll_flux_swe_2d` is bitwise unchanged.
   - Profile findings (TODO P2): HLL is about a third of the single-thread time (every face is solved twice), and scaling stops at about 8 threads on the test laptop (4 Zen 5 + 8 Zen 5c cores).
+- **One numerical flux per interior face for the split forms (TODO P2.2).**
+  - A face pass (`SplitFormSWE2D::edge_fluxes`, parallel over edges) evaluates F* once for both sides into a thread-cached buffer, and the element loop reads it.
+  - The two-point flux and the entropy dissipation are exactly antisymmetric, so only the bed and hydrostatic terms are evaluated per side. Neighbours now exchange exactly opposite mass fluxes (`test_face_pass_exchanges_opposite_mass_fluxes`).
+  - The RHS equals the old one to round-off (≤ 4e-19 on the snapshot cases).
+  - Frøya, single thread, pinned, on mains power: RHS 5.3 → 4.85 ms. The face-aligned HLL core had already taken it from ≈ 5.9 ms. Neutral at 24 threads.
+  - `SWEState2D` implements `Neg`.
 - API (breaking, minor): `LimiterContext2D::h_min` and `LimiterContext2D::with_h_min` are removed.
 
 ### Fixed
