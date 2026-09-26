@@ -71,7 +71,7 @@ Goal (added 2026-09-26): resolve currents at a farm site (cages ≈ 40–60 m ac
 This section only orders the existing items for that goal and adds the two farm-specific ones (F.1, F.2). Everything else lives in its own priority section.
 
 **Stage A: 2D farm-scale currents.** Depth-averaged, so it answers tidal exposure and the wake of the farm, not the surface layer.
-1. P1.3 geometry (blocker): coastline-fitted meshes with elements of tens of metres at the farm and kilometres offshore. General quadrilaterals are supported in 2D since 2026-09-26; the rest of P1.3 (robust Gmsh MSH 4.1 input, triangles or quad-dominant meshes, CSR) is still open.
+1. P1.3 geometry (blocker): coastline-fitted meshes with elements of tens of metres at the farm and kilometres offshore. General quadrilaterals are supported in 2D since 2026-09-26, and all-quad Gmsh meshes (MSH 4.1/2.2) load since 2026-09-26 (see `docs/gmsh-meshes.md`); the rest of P1.3 (triangles or quad-dominant meshes, CSR) is still open.
 2. P1.6 shoreline cliffs and bathymetry: the 1–2.8 m/s spurious currents at wet nodes next to land sit where farms are. Also L2 projection of the GeoTIFF onto nodes, a foreshore DEM, and the bed + coastline builder in the library.
 3. F.1 cage drag (2D form).
 4. P2.5 local time stepping or implicit free surface: a single 20 m element sets the global dt, so farm refinement makes this the dominant cost.
@@ -241,7 +241,11 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - [ ] Curved (high-order) faces: compute the same fields from the derivatives of an interpolated high-order map (Kopriva 2006: in 2D the metric identities hold for any map of degree ≤ N); fitted coastlines then need a boundary projection of the face nodes.
   - [ ] `Bathymetry2D::to_cell_average`/`linearize` use unweighted node means (as before); weight by the element mass.
 - [ ] Triangles (or quad-dominant meshes), and remove the hardcoded 4 faces (`swe_2d.rs:386,908`).
-- [ ] Gmsh: real MSH 4.1 parsing, sparse node tags, no `.unwrap()` on input, error (not drop) on unsupported element types.
+- [x] Gmsh: real MSH 4.1 parsing, sparse node tags, no `.unwrap()` on input, error (not drop) on unsupported element types (2026-09-26). `read_gmsh_mesh`/`parse_gmsh_mesh` read MSH 4.1 ASCII and binary (both byte orders, parametric nodes) and MSH 2.2 ASCII into one validating builder: unused nodes dropped, clockwise quads reordered, degenerate/non-convex quads, non-manifold edges, overlapping neighbours, lines off the mesh and conflicting tags are errors with the Gmsh tags in the message. Boundary tags from physical group names (`coast` → wall, `open`, `tidal`, `river`, else `Custom(n)`), unnamed groups by number. Edge numbering is deterministic (was `HashMap` order). Gates: `tests/gmsh_mesh_test.rs` on Gmsh 4.15 output (`scripts/gmsh_fixtures.py`, a bay with a coastline and an island): the three formats give the same mesh, tags on the right curves, lake at rest over rough and shoreline beds ≤ 1.3e-12 (P1–P3), mass to 1e-13 over a run, a raised sea fills the bay through the tagged open boundaries only.
+  - [ ] One `Mesh2D::from_quads(vertices, elements, boundary tags)` constructor: the edge building is written out again in `uniform_rectangle*`, `channel_periodic_x`, `uniform_periodic`, `retain_elements` and the Gmsh builder (`build_mesh` is the general one).
+  - [ ] `Mesh2D::edge_orientation` is never read: the kernels rely on neighbours listing their shared face nodes in reverse (consistent counter-clockwise order, now checked by the Gmsh builder). Drop it or use it in a `Mesh2D::validate`.
+  - [ ] Nodal fields from Gmsh (`$NodeData`, e.g. a bathymetry view interpolated by Gmsh) are skipped; read them if meshing workflows start carrying the bed in the mesh file.
+  - [ ] Periodic Gmsh meshes (`$Periodic`) are rejected: pair the faces if a periodic real-geometry case appears.
 - [ ] CSR connectivity. Make `MeshGPUData` the single representation.
 
 ### P1.4 Open boundaries and tidal forcing — DONE (except the relaxation band, moved to P1.5)
