@@ -17,7 +17,7 @@
 //! - β ≈ 1.6×10⁻¹¹ m⁻¹ s⁻¹
 
 use crate::solver::SWEState2D;
-use crate::source::{SourceContext2D, SourceTerm2D};
+use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
 
 /// Coriolis source term implementing SourceTerm2D trait.
 ///
@@ -122,6 +122,27 @@ impl SourceTerm2D for CoriolisSource2D {
             h: 0.0,
             hu: f * ctx.state.hv,
             hv: -f * ctx.state.hu,
+        }
+    }
+
+    /// Plain loop over the element's momentum; the node position (a bilinear
+    /// map) only on a β-plane. Same arithmetic as [`Self::evaluate`].
+    fn add_element(
+        &self,
+        element: &ElementSources<'_>,
+        _h: &mut [f64],
+        hu: &mut [f64],
+        hv: &mut [f64],
+    ) {
+        for i in 0..element.n_nodes() {
+            let f = if self.beta == 0.0 {
+                self.f0
+            } else {
+                self.f_at(element.position(i).1)
+            };
+            let state = element.state(i);
+            hu[i] += f * state.hv;
+            hv[i] += -f * state.hu;
         }
     }
 
@@ -243,5 +264,68 @@ mod tests {
             source.hu > 0.0,
             "Northward flow should gain eastward momentum"
         );
+    }
+
+    /// The per-element path gives exactly what per-node `evaluate` gives, on
+    /// an f-plane (no positions) and a β-plane, alone and inside a
+    /// `SourceTerms2D` next to a source on the default path.
+    #[test]
+    fn add_element_matches_per_node_evaluate() {
+        use std::sync::Arc;
+
+        use crate::mesh::{Bathymetry2D, Mesh2D};
+        use crate::operators::DGOperators2D;
+        use crate::solver::SWESolution2D;
+        use crate::source::{ManningFriction2D, SourceTerms2D};
+        use crate::types::ElementIndex;
+
+        let mesh = Mesh2D::uniform_rectangle(0.0, 2e4, -1e4, 1e4, 3, 2);
+        let ops = DGOperators2D::new(3);
+        let bathymetry = Bathymetry2D::flat(mesh.n_elements, ops.n_nodes);
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let x = (k.as_usize() * ops.n_nodes + i) as f64;
+                q.set_state(k, i, SWEState2D::new(10.0 + x.sin(), x.cos(), 0.3 * x));
+            }
+        }
+
+        let friction: Arc<dyn SourceTerm2D> = Arc::new(ManningFriction2D::new(9.81, 0.03));
+        for coriolis in [
+            CoriolisSource2D::f_plane(1.3e-4),
+            CoriolisSource2D::beta_plane(1.3e-4, 1.6e-11, 5e3),
+        ] {
+            let combined = SourceTerms2D::new(vec![Arc::new(coriolis), friction.clone()]);
+            let sources: [(&dyn SourceTerm2D, bool); 2] = [(&coriolis, true), (&combined, false)];
+            for (source, exact) in sources {
+                for k in ElementIndex::iter(mesh.n_elements) {
+                    let element = ElementSources {
+                        element: k,
+                        time: 0.0,
+                        solution: &q,
+                        mesh: &mesh,
+                        ops: &ops,
+                        bathymetry: Some(&bathymetry),
+                        g: 9.81,
+                        h_min: 1e-3,
+                    };
+                    let n = ops.n_nodes;
+                    let (mut h, mut hu, mut hv) = (vec![1.0; n], vec![2.0; n], vec![3.0; n]);
+                    source.add_element(&element, &mut h, &mut hu, &mut hv);
+                    for i in 0..n {
+                        let s = source.evaluate(&element.context(i));
+                        let expected = [1.0 + s.h, 2.0 + s.hu, 3.0 + s.hv];
+                        for (got, want) in [h[i], hu[i], hv[i]].into_iter().zip(expected) {
+                            if exact {
+                                assert_eq!(got, want);
+                            } else {
+                                // Summation order differs: sources are added one at a time
+                                assert!((got - want).abs() <= 4.0 * f64::EPSILON * want.abs());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

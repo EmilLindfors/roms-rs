@@ -8,4 +8,6 @@ mod source_1d;
 mod source_2d;
 
 pub use source_1d::{CombinedSource, SourceTerm};
-pub use source_2d::{CombinedSource2D, SourceContext2D, SourceTerm2D, SourceTerms2D};
+pub use source_2d::{
+    CombinedSource2D, ElementSources, SourceContext2D, SourceTerm2D, SourceTerms2D,
+};

@@ -20,7 +20,7 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::state::{SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{SWESolution2D, SWEState2D};
 use crate::source::swe_2d::viscosity::HorizontalViscosity2D;
-use crate::source::{HydrostaticReconstruction2D, SourceContext2D, SourceTerm2D};
+use crate::source::{ElementSources, HydrostaticReconstruction2D, SourceTerm2D};
 use crate::types::ElementIndex;
 
 use super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
@@ -853,27 +853,20 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
             }
         }
 
-        // 4. Trait-based source terms (preferred)
+        // 4. Trait-based source terms (preferred), one call per element: each
+        //    source reads only the node data it needs
         if let Some(sources) = config.source_terms {
-            for i in 0..n_nodes {
-                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
-                let (bathy_value, bathy_gradient) = config
-                    .bathymetry
-                    .map_or((0.0, (0.0, 0.0)), |b| (b.get(k, i), b.get_gradient(k, i)));
-                let ctx = SourceContext2D::new(
-                    self.time,
-                    (x, y),
-                    q.get_state(k, i),
-                    bathy_value,
-                    bathy_gradient,
-                    g,
-                    h_min,
-                );
-                let source = sources.evaluate(&ctx);
-                out_h[i] += source.h;
-                out_hu[i] += source.hu;
-                out_hv[i] += source.hv;
-            }
+            let element = ElementSources {
+                element: k,
+                time: self.time,
+                solution: q,
+                mesh,
+                ops,
+                bathymetry: config.bathymetry,
+                g,
+                h_min,
+            };
+            sources.add_element(&element, out_h, out_hu, out_hv);
         }
     }
 }
