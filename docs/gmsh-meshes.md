@@ -96,6 +96,21 @@ let sea = CharacteristicOBC::new(tides); // e.g. BoundaryTides from a TidalAtlas
 let bc = MultiBoundaryCondition2D::new(&wall).with_open(&sea);
 ```
 
+The cages themselves do not need to be meshed. A cage is usually smaller than
+an element, and `CageDrag2D` weights its drag onto the nodes it covers:
+
+```rust
+use dg_rs::source::{CageDrag2D, NetCage};
+
+// Two 50 m ring cages with 20 m nets, solidity 0.25 (clean netting)
+let cages = [
+    NetCage::circular([506000.0, 7053000.0], 25.0, 20.0, 0.25),
+    NetCage::circular([506070.0, 7053000.0], 25.0, 20.0, 0.25),
+];
+let drag = CageDrag2D::new(&mesh, &ops, &cages);
+let physics = builder.with_cage_drag(drag).build();
+```
+
 ## Test meshes
 
 `scripts/gmsh_fixtures.py` builds the meshes in `tests/data/gmsh/` with the Gmsh

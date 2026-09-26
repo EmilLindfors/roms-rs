@@ -73,7 +73,7 @@ This section only orders the existing items for that goal and adds the two farm-
 **Stage A: 2D farm-scale currents.** Depth-averaged, so it answers tidal exposure and the wake of the farm, not the surface layer.
 1. P1.3 geometry (blocker): coastline-fitted meshes with elements of tens of metres at the farm and kilometres offshore. General quadrilaterals are supported in 2D since 2026-09-26, and all-quad Gmsh meshes (MSH 4.1/2.2) load since 2026-09-26 (see `docs/gmsh-meshes.md`); the rest of P1.3 (triangles or quad-dominant meshes, CSR) is still open.
 2. P1.6 shoreline cliffs and bathymetry: the 1–2.8 m/s spurious currents at wet nodes next to land sit where farms are. Also L2 projection of the GeoTIFF onto nodes, a foreshore DEM, and the bed + coastline builder in the library.
-3. F.1 cage drag (2D form).
+3. ~~F.1 cage drag (2D form)~~ done 2026-09-26 (`CageDrag2D`, `with_cage_drag`).
 4. P2.5 local time stepping or implicit free surface: a single 20 m element sets the global dt, so farm refinement makes this the dominant cost.
 5. P1.5 nesting of NorKyst ū, v̄, η (residual and coastal-current transport, not only the tidal atlas) and the P1.6 atmospheric forcing reader (wind stress).
 6. P3.1 current validation: depth-averaged velocity in station series, sampling at the station position by interpolation inside the element (F.2 needs the same evaluation), ADCP comparison and tidal-ellipse fit. Farm-site current surveys, where available, are the natural data.
@@ -86,15 +86,20 @@ This section only orders the existing items for that goal and adds the two farm-
 Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
 
 ### F.1 Cage drag
-- [ ] Momentum sink from the net as a porous region: S = −½·C_d·a·|u|u per unit volume, with a (net area per volume) and C_d from the net solidity (Løland 1991; review in Klebert et al. 2013, Ocean Eng. 58). Fouling raises the solidity, so take it as a per-cage parameter.
-  - 2D: integrate over the net depth only, i.e. scale by min(d_net, h)/h, over the cage footprint.
-  - 3D: apply per level, only to levels above the net bottom.
-  - Cages are comparable to or smaller than an element: weight each node by the fraction of its quadrature area inside the footprint instead of switching nodes on/off.
-- [ ] Point-implicit like the bottom friction (`BottomFriction2D`, `step_with_relaxation`): the drag rate is large in shallow water and must not limit dt.
-- [ ] Gate tests:
-  - Flow through a porous patch in a channel: the integrated drag equals the momentum-flux and pressure loss across the patch.
-  - Mass conservation is unchanged (it is a momentum-only source); lake at rest with cages present is exact.
-  - Magnitude test (not only sign), as for P0.18.
+- [x] Momentum sink from the net as a porous region: S = −½·C_d·a·|u|u per unit volume, with a (net area per volume) and C_d from the net solidity (Løland 1991; review in Klebert et al. 2013, Ocean Eng. 58). Fouling raises the solidity, so it is a per-cage parameter (`NetCage`, `NetCage::circular` with Løland's C_d and a = 4/(πR)).
+  - [x] 2D (2026-09-26, `source/swe_2d/cage.rs`): integrated over the net depth only, Λ = ½C_d a |u| min(d_net, h)/h, over the cage footprint.
+  - [ ] 3D: apply per level, only to levels above the net bottom (Stage B).
+  - [x] Cages are comparable to or smaller than an element: each node is weighted by the area of its GLL subcell inside the footprint over w·J (adaptive bisection on the signed distance), so Σ wJφ is the footprint area on any quadrilateral.
+- [x] Point-implicit with the bottom friction (`ImplicitDamping2D::cages`, `SWEPhysics2DBuilder::with_cage_drag`).
+- [x] Gate tests (`tests/cage_drag_test.rs`):
+  - Porous band across a periodic channel driven by a body force: momentum-flux and pressure loss across the band = drag − forcing (1e-3); total drag = total forcing (1e-4).
+  - Mass conserved; lake at rest over a rough bed with cages exact (1e-10).
+  - Magnitude: domain-wide cage against a body force reaches the analytic u² = 2Gh/(C_d a min(d, h)) (1e-6); decay of uniform flow converges at first order.
+- [ ] Follow-ups:
+  - The rear net sees the cage-mean velocity; Løland's velocity reduction behind a panel (r = 1 − 0.46 C_d) is left to the resolved flow. Compare the wake with a farm survey or published flume data before trusting the default a = 4/(πR).
+  - Angle dependence (C_d(θ)) and the lift term: irrelevant for a circular cage averaged over its perimeter, not for square cages in oblique flow.
+  - Net deformation in strong currents (the net lifts and its projected depth shrinks, reducing d_net) is not modelled.
+  - A cage-layout reader (positions, radii, net depths per site), e.g. from the Fiskeridirektoratet site register, for real farms.
 
 ### F.2 Lagrangian particle tracking
 - [ ] Point location: find the element holding a point and its reference coordinates (Newton on the isoparametric map once P1.3 lands; a spatial index over elements).
