@@ -96,10 +96,8 @@ impl SWEDiagnostics2D {
         let mut max_froude = 0.0;
 
         for k in ElementIndex::iter(q.n_elements) {
-            // Jacobian is constant per element (affine quads)
-            let det_j = geom.det_j[k];
-
             for i in 0..n_nodes {
+                let det_j = geom.jacobian(k.as_usize(), i);
                 let state = q.get_state(k, i);
                 let h = state.h;
                 let hu = state.hu;
@@ -539,8 +537,8 @@ pub fn total_mass_2d(
     let mut mass = 0.0;
 
     for k in ElementIndex::iter(q.n_elements) {
-        let det_j = geom.det_j[k];
         for i in 0..n_nodes {
+            let det_j = geom.jacobian(k.as_usize(), i);
             let h = q.get_state(k, i).h;
             let w = compute_weight_2d(ops, i);
             mass += w * h * det_j;
@@ -563,8 +561,8 @@ pub fn total_momentum_2d(
     let mut mom_y = 0.0;
 
     for k in ElementIndex::iter(q.n_elements) {
-        let det_j = geom.det_j[k];
         for i in 0..n_nodes {
+            let det_j = geom.jacobian(k.as_usize(), i);
             let state = q.get_state(k, i);
             let w = compute_weight_2d(ops, i);
             mom_x += w * state.hu * det_j;
@@ -589,8 +587,8 @@ pub fn total_energy_2d(
     let mut energy = 0.0;
 
     for k in ElementIndex::iter(q.n_elements) {
-        let det_j = geom.det_j[k];
         for i in 0..n_nodes {
+            let det_j = geom.jacobian(k.as_usize(), i);
             let state = q.get_state(k, i);
             let h = state.h;
             let w = compute_weight_2d(ops, i);
@@ -668,7 +666,7 @@ mod tests {
     ) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let q = SystemSolution2D::new(mesh.n_elements, ops.n_nodes);
         (mesh, ops, geom, q)
     }

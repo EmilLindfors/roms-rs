@@ -145,7 +145,7 @@ fn main() {
 
     let ops = DGOperators2D::new(ORDER);
     let n_nodes = ops.n_nodes;
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     println!("  Elements: {}", n_elements);
     println!("  Nodes per element: {}", n_nodes);

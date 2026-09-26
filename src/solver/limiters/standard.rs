@@ -48,7 +48,7 @@ impl KuzminLimiter2D {
 
 impl Limiter2D for KuzminLimiter2D {
     fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
-        kuzmin(solution, ctx.mesh, ctx.ops, &self.param);
+        kuzmin(solution, ctx.mesh, ctx.ops, ctx.geom, &self.param);
     }
 
     fn name(&self) -> &'static str {
@@ -78,7 +78,7 @@ impl PositivityLimiter2D {
 
 impl Limiter2D for PositivityLimiter2D {
     fn apply(&self, solution: &mut SWESolution2D, ctx: &LimiterContext2D) {
-        positivity(solution, ctx.ops, self.h_min);
+        positivity(solution, ctx.geom, self.h_min);
     }
 
     fn name(&self) -> &'static str {
@@ -203,12 +203,12 @@ impl StandardLimiter2D {
         match self {
             StandardLimiter2D::None => 0,
             StandardLimiter2D::Kuzmin(param) => {
-                kuzmin(solution, ctx.mesh, ctx.ops, param);
+                kuzmin(solution, ctx.mesh, ctx.ops, ctx.geom, param);
                 0
             }
-            StandardLimiter2D::Positivity(h_dry) => positivity(solution, ctx.ops, *h_dry),
+            StandardLimiter2D::Positivity(h_dry) => positivity(solution, ctx.geom, *h_dry),
             StandardLimiter2D::KuzminWithPositivity { kuzmin, h_min } => {
-                kuzmin_with_positivity(solution, ctx.mesh, ctx.ops, kuzmin, *h_min)
+                kuzmin_with_positivity(solution, ctx.mesh, ctx.ops, ctx.geom, kuzmin, *h_min)
             }
         }
     }
@@ -254,7 +254,7 @@ pub fn create_limiter(limiter: StandardLimiter2D) -> BoxedLimiter2D {
 mod tests {
     use super::*;
     use crate::mesh::Mesh2D;
-    use crate::operators::DGOperators2D;
+    use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::solver::state::SWEState2D;
     use crate::types::ElementIndex;
 
@@ -262,8 +262,12 @@ mod tests {
         ElementIndex::new(idx)
     }
 
-    fn create_test_context<'a>(mesh: &'a Mesh2D, ops: &'a DGOperators2D) -> LimiterContext2D<'a> {
-        LimiterContext2D::new(mesh, ops)
+    fn create_test_context<'a>(
+        mesh: &'a Mesh2D,
+        ops: &'a DGOperators2D,
+        geom: &'a GeometricFactors2D,
+    ) -> LimiterContext2D<'a> {
+        LimiterContext2D::new(mesh, ops, geom)
     }
 
     #[test]
@@ -318,7 +322,8 @@ mod tests {
             }
         }
 
-        let ctx = create_test_context(&mesh, &ops);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let ctx = create_test_context(&mesh, &ops, &geom);
         let limiter = NoLimiter2D;
 
         // Apply no-op limiter

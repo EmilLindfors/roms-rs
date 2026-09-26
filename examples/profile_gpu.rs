@@ -67,7 +67,7 @@ fn main() {
         Mesh2D::uniform_rectangle_with_bc(0.0, 10000.0, 0.0, 5000.0, nx, ny, BoundaryTag::Wall);
 
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let n_elements = mesh.n_elements;
     let n_nodes = ops.n_nodes;
 

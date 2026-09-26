@@ -216,7 +216,7 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
 
     // Create operators
     let ops = DGOperators2D::new(order);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     let n_elements = mesh.n_elements;
     let total_dofs = n_elements * ops.n_nodes * 3; // h, hu, hv
@@ -292,7 +292,7 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
             }
         };
 
-        ssp_rk3_swe_2d_step_limited(&mut state, dt, t, &mesh, &ops, rhs_fn, &time_config);
+        ssp_rk3_swe_2d_step_limited(&mut state, dt, t, &mesh, &ops, &geom, rhs_fn, &time_config);
 
         t += dt;
         step += 1;

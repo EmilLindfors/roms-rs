@@ -293,7 +293,7 @@ impl Domain {
         let has_water = |k: ElementIndex| beds[k.as_usize() * n..][..n].iter().any(Option::is_some);
         let (mesh, old) = grid.retain_elements(has_water, BoundaryTag::Wall);
 
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let mut bathymetry = Bathymetry2D::flat(mesh.n_elements, n);
         for (k, &o) in old.iter().enumerate() {
             for i in 0..n {
@@ -462,9 +462,10 @@ impl Domain {
     fn volume(&self, q: &SWESolution2D) -> f64 {
         ElementIndex::iter(self.mesh.n_elements)
             .map(|k| {
-                let j = self.geom.det_j[k.as_usize()];
                 (0..self.ops.n_nodes)
-                    .map(|i| self.ops.weights[i] * j * q.get_state(k, i).h)
+                    .map(|i| {
+                        self.geom.mass[self.geom.node_index(k.as_usize(), i)] * q.get_state(k, i).h
+                    })
                     .sum::<f64>()
             })
             .sum()

@@ -116,10 +116,8 @@ pub fn apply_horizontal_advection_3d(
         let el_idx = ElementIndex::new(k);
 
         // Geometric factors
-        let rx = geom.rx[k];
-        let ry = geom.ry[k];
-        let sx = geom.sx[k];
-        let sy = geom.sy[k];
+        let metric = geom.affine_metric(k);
+        let (rx, ry, sx, sy) = (metric.rx, metric.ry, metric.sx, metric.sy);
 
         for l in 0..n_levels {
             // --- Gather level values ---
@@ -252,9 +250,8 @@ fn apply_horizontal_surface_terms(
 
     // For each face
     for face in 0..4 {
-        let normal = geom.normals[k][face];
-        let s_jac = geom.surface_j[k][face];
-        let j_inv = geom.det_j_inv[k];
+        let (normal, s_jac) = geom.affine_face(k, face);
+        let j_inv = geom.affine_metric(k).det_j_inv;
         let lift_scale = s_jac * j_inv;
 
         let face_nodes = &ops.face_nodes[face];
@@ -398,10 +395,8 @@ pub fn apply_tracer_advection_3d(
 
     for k in 0..mesh.n_elements {
         let el_idx = ElementIndex::new(k);
-        let rx = geom.rx[k];
-        let ry = geom.ry[k];
-        let sx = geom.sx[k];
-        let sy = geom.sy[k];
+        let metric = geom.affine_metric(k);
+        let (rx, ry, sx, sy) = (metric.rx, metric.ry, metric.sx, metric.sy);
 
         for l in 0..n_levels {
             // Gather level values
@@ -440,9 +435,8 @@ pub fn apply_tracer_advection_3d(
 
         // --- 2. Surface Terms ---
         for face in 0..4 {
-            let normal = geom.normals[k][face];
-            let s_jac = geom.surface_j[k][face];
-            let j_inv = geom.det_j_inv[k];
+            let (normal, s_jac) = geom.affine_face(k, face);
+            let j_inv = geom.affine_metric(k).det_j_inv;
             let lift_scale = s_jac * j_inv;
             let face_nodes = &ops.face_nodes[face];
 
@@ -832,7 +826,7 @@ mod tests {
                 for level in 0..sigma.n_levels() {
                     let idx = (k * ops.n_nodes + i) * sigma.n_levels() + level;
                     let hz = layer_thickness(state, bathymetry, el_idx, i, sigma.d_sigma()[level]);
-                    total += ops.weights[i] * geom.det_j[k] * hz * rhs[idx];
+                    total += ops.weights[i] * geom.affine_metric(k).det_j * hz * rhs[idx];
                 }
             }
         }
@@ -848,7 +842,7 @@ mod tests {
         // the inventory changed at O(1) of the advective scale.
         let mesh = Mesh2D::uniform_rectangle(0.0, 2000.0, 0.0, 1000.0, 4, 2);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let sigma = SigmaGrid::uniform(3);
         let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -20.0 - 0.01 * x);
 
@@ -866,7 +860,9 @@ mod tests {
                     state.salt[idx] = 30.0 + 1e-3 * x - 2e-3 * y + level as f64;
                     let hz =
                         layer_thickness(&state, &bathymetry, el_idx, i, sigma.d_sigma()[level]);
-                    scale += ops.weights[i] * geom.det_j[k] * hz * state.salt[idx] * 0.5 / 1000.0;
+                    scale +=
+                        ops.weights[i] * geom.affine_metric(k).det_j * hz * state.salt[idx] * 0.5
+                            / 1000.0;
                 }
             }
         }
@@ -902,7 +898,7 @@ mod tests {
     fn horizontal_tracer_advection_conserves_total_inventory_on_periodic_mesh() {
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 2, 1);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let sigma = SigmaGrid::uniform(2);
         let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -10.0);
         let bc = ExtrapolationTracerBC3D;

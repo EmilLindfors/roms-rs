@@ -677,8 +677,8 @@ pub fn total_mass(state: &CoupledState2D, ops: &DGOperators2D, geom: &GeometricF
     let mut mass = 0.0;
     for k in ElementIndex::iter(state.swe.n_elements) {
         let ki = k.as_usize();
-        let j = geom.det_j[ki];
         for (i, &w) in ops.weights.iter().enumerate() {
+            let j = geom.jacobian(ki, i);
             let h = state.swe.get_var(k, i, 0);
             mass += w * h * j;
         }
@@ -714,7 +714,7 @@ mod tests {
     fn create_test_setup() -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         (mesh, ops, geom)
     }
 
@@ -837,8 +837,8 @@ mod tests {
         let mut integral_h_s = 0.0;
         for elem in ElementIndex::iter(mesh.n_elements) {
             let ki = elem.as_usize();
-            let j = geom.det_j[ki];
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(ki, i);
                 let t = rhs.tracers.get_conservative(elem, i);
                 integral_h_t += w * t.h_t * j;
                 integral_h_s += w * t.h_s * j;

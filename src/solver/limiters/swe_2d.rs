@@ -25,7 +25,7 @@
 //! - Kuzmin (2010), "A vertex-based hierarchical slope limiter for p-adaptive DG methods"
 
 use crate::mesh::Mesh2D;
-use crate::operators::DGOperators2D;
+use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::state::SWESolution2D;
 use crate::types::ElementIndex;
 
@@ -34,32 +34,34 @@ pub use crate::solver::limiters::tracer_2d::KuzminParameter2D;
 
 /// Compute cell averages for SWE variables in 2D.
 ///
-/// Computes the mass-weighted average of h, hu, hv in each element:
-/// avg_h = (∫ h * w dA) / (∫ w dA)
-///
-/// # Affine element assumption
-///
-/// For affine elements (constant Jacobian per element), J cancels in the
-/// ratio ∫q dA / ∫dA, so this function uses quadrature weights directly
-/// without Jacobian weighting. This is exact for parallelogram meshes.
-/// For curved/non-affine elements, per-node Jacobian weighting would be
-/// required — see `GeometricFactors2D` for the affine assumption.
+/// Computes the element means of h, hu, hv with the element mass
+/// (GLL weight × J at every node): avg_h = Σ w_i J_i h_i / Σ w_i J_i, the
+/// quantity the DG scheme conserves. On parallelograms J is constant and
+/// cancels; on general quadrilaterals it does not.
 ///
 /// # Returns
 /// Vector of (avg_h, avg_hu, avg_hv) for each element.
-pub fn swe_cell_averages_2d(swe: &SWESolution2D, ops: &DGOperators2D) -> Vec<(f64, f64, f64)> {
-    let inv_total_weight: f64 = 1.0 / ops.weights.iter().sum::<f64>();
+pub fn swe_cell_averages_2d(
+    swe: &SWESolution2D,
+    geom: &GeometricFactors2D,
+) -> Vec<(f64, f64, f64)> {
     ElementIndex::iter(swe.n_elements)
         .map(|k| {
             element_mean(
                 swe.element_h(k),
                 swe.element_hu(k),
                 swe.element_hv(k),
-                &ops.weights,
-                inv_total_weight,
+                element_mass(geom, k.as_usize()),
+                1.0 / geom.area[k.as_usize()],
             )
         })
         .collect()
+}
+
+/// The element mass weights `w_i J_i` of element `k`.
+#[inline]
+pub(crate) fn element_mass(geom: &GeometricFactors2D, k: usize) -> &[f64] {
+    &geom.mass[geom.node_index(k, 0)..][..geom.n_nodes]
 }
 
 /// The Zhang-Shu theta parameter for depth positivity: the largest θ ∈ [0, 1]
@@ -91,8 +93,9 @@ fn scale_deviation(
     }
 }
 
-/// Mean of (h, hu, hv) over one element with GLL weights `weights` (affine
-/// elements, see [`swe_cell_averages_2d`]).
+/// Mean of (h, hu, hv) over one element with the element mass weights
+/// `weights` (`w_i J_i`, see [`element_mass`]) and `inv_total_weight` =
+/// 1 / Σ weights.
 #[inline]
 pub(crate) fn element_mean(
     h: &[f64],
@@ -217,7 +220,7 @@ fn for_each_element(
 ///
 /// # Arguments
 /// * `swe` - SWE solution to limit (modified in place)
-/// * `ops` - DG operators (for quadrature weights)
+/// * `geom` - Geometric factors (element mass weights)
 /// * `h_dry` - Dry threshold: elements with a smaller mean depth lose their momentum
 ///
 /// # Returns
@@ -225,13 +228,12 @@ fn for_each_element(
 /// (creating mass). Zero under the positivity CFL with HLL or Rusanov.
 pub fn swe_positivity_limiter_2d(
     swe: &mut SWESolution2D,
-    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     h_dry: f64,
 ) -> usize {
     // Each element needs only its own mean: no separate pass, no allocation
-    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
-    for_each_element(swe, |_, h, hu, hv| {
-        let avg = element_mean(h, hu, hv, &ops.weights, inv_total_weight);
+    for_each_element(swe, |k, h, hu, hv| {
+        let avg = element_mean(h, hu, hv, element_mass(geom, k), 1.0 / geom.area[k]);
         positivity_limit_element(h, hu, hv, avg, h_dry) as usize
     })
 }
@@ -337,14 +339,16 @@ fn all_vertex_bounds(
 /// * `swe` - SWE solution to limit (modified in place)
 /// * `mesh` - 2D mesh with vertex_to_elements connectivity
 /// * `ops` - DG operators
+/// * `geom` - Geometric factors (element means)
 /// * `kuzmin` - Kuzmin limiter parameters
 pub fn swe_kuzmin_limiter_2d(
     swe: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     kuzmin: &KuzminParameter2D,
 ) {
-    let averages = swe_cell_averages_2d(swe, ops);
+    let averages = swe_cell_averages_2d(swe, geom);
     let vertex_bounds = all_vertex_bounds(mesh, &averages, kuzmin.relaxation);
     for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
@@ -366,6 +370,7 @@ pub fn swe_kuzmin_limiter_2d(
 /// * `swe` - SWE solution to limit (modified in place)
 /// * `mesh` - 2D mesh
 /// * `ops` - DG operators
+/// * `geom` - Geometric factors (element means)
 /// * `kuzmin` - Kuzmin limiter parameter
 /// * `h_dry` - Dry threshold for the element mean depth
 ///
@@ -375,10 +380,11 @@ pub fn apply_swe_limiters_kuzmin_2d(
     swe: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     kuzmin: &KuzminParameter2D,
     h_dry: f64,
 ) -> usize {
-    let averages = swe_cell_averages_2d(swe, ops);
+    let averages = swe_cell_averages_2d(swe, geom);
     let vertex_bounds = all_vertex_bounds(mesh, &averages, kuzmin.relaxation);
     for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
@@ -393,21 +399,23 @@ pub fn apply_swe_limiters_kuzmin_2d(
 
 /// Parallel version of cell averages computation using Rayon.
 ///
-/// See [`swe_cell_averages_2d`] for the affine element assumption.
+/// See [`swe_cell_averages_2d`].
 #[cfg(feature = "parallel")]
 pub fn swe_cell_averages_2d_parallel(
     swe: &SWESolution2D,
-    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
 ) -> Vec<(f64, f64, f64)> {
     use rayon::prelude::*;
 
     let n = swe.n_nodes;
-    let inv_total_weight: f64 = 1.0 / ops.weights.iter().sum::<f64>();
     swe.h_data()
         .par_chunks_exact(n)
         .zip(swe.hu_data().par_chunks_exact(n))
         .zip(swe.hv_data().par_chunks_exact(n))
-        .map(|((h, hu), hv)| element_mean(h, hu, hv, &ops.weights, inv_total_weight))
+        .enumerate()
+        .map(|(k, ((h, hu), hv))| {
+            element_mean(h, hu, hv, element_mass(geom, k), 1.0 / geom.area[k])
+        })
         .collect()
 }
 
@@ -450,12 +458,11 @@ fn all_vertex_bounds_parallel(
 #[cfg(feature = "parallel")]
 pub fn swe_positivity_limiter_2d_parallel(
     swe: &mut SWESolution2D,
-    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     h_dry: f64,
 ) -> usize {
-    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
-    par_for_each_element(swe, |_, h, hu, hv| {
-        let avg = element_mean(h, hu, hv, &ops.weights, inv_total_weight);
+    par_for_each_element(swe, |k, h, hu, hv| {
+        let avg = element_mean(h, hu, hv, element_mass(geom, k), 1.0 / geom.area[k]);
         positivity_limit_element(h, hu, hv, avg, h_dry) as usize
     })
 }
@@ -468,9 +475,10 @@ pub fn swe_kuzmin_limiter_2d_parallel(
     swe: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     kuzmin: &KuzminParameter2D,
 ) {
-    let averages = swe_cell_averages_2d_parallel(swe, ops);
+    let averages = swe_cell_averages_2d_parallel(swe, geom);
     let vertex_bounds = all_vertex_bounds_parallel(mesh, &averages, kuzmin.relaxation);
     par_for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
@@ -488,10 +496,11 @@ pub fn apply_swe_limiters_kuzmin_2d_parallel(
     swe: &mut SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     kuzmin: &KuzminParameter2D,
     h_dry: f64,
 ) -> usize {
-    let averages = swe_cell_averages_2d_parallel(swe, ops);
+    let averages = swe_cell_averages_2d_parallel(swe, geom);
     let vertex_bounds = all_vertex_bounds_parallel(mesh, &averages, kuzmin.relaxation);
     par_for_each_element(swe, |k, h, hu, hv| {
         let vertices = mesh.element_vertex_indices(ElementIndex::new(k));
@@ -506,6 +515,11 @@ mod tests {
     use crate::solver::state::SWEState2D;
 
     const H_MIN: f64 = 0.01;
+
+    /// Geometry of one unit-square element.
+    fn unit_geometry(ops: &DGOperators2D) -> GeometricFactors2D {
+        GeometricFactors2D::compute(&Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1), ops)
+    }
 
     /// 4×4 P2 mesh with wet, oscillating elements and three problem elements:
     /// element 5 dry with momentum (mean 0.004 < H_MIN), element 6 with a
@@ -550,10 +564,12 @@ mod tests {
     #[test]
     fn test_fused_limiter_dry_elements() {
         let (mesh, ops, mut swe) = wet_dry_setup();
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let clipped = apply_swe_limiters_kuzmin_2d(
             &mut swe,
             &mesh,
             &ops,
+            &geom,
             &KuzminParameter2D::strict(),
             H_MIN,
         );
@@ -585,7 +601,10 @@ mod tests {
                 );
             }
             let before = swe.data.clone();
-            assert_eq!(swe_positivity_limiter_2d(&mut swe, &ops, h_dry), 0);
+            assert_eq!(
+                swe_positivity_limiter_2d(&mut swe, &unit_geometry(&ops), h_dry),
+                0
+            );
             assert_eq!(swe.data, before, "η = {eta}, h_dry = {h_dry}");
         }
     }
@@ -608,7 +627,10 @@ mod tests {
         };
         let before = mass(&swe);
 
-        assert_eq!(swe_positivity_limiter_2d(&mut swe, &ops, 1e-3), 0);
+        assert_eq!(
+            swe_positivity_limiter_2d(&mut swe, &unit_geometry(&ops), 1e-3),
+            0
+        );
         let h = swe.element_h(k);
         assert!(h.iter().all(|&h| h >= 0.0));
         // The limited minimum is zero, not a positive floor
@@ -623,10 +645,12 @@ mod tests {
         // dry-element branch. θ clamped to 0, so dry elements kept their mean
         // momentum and a negative mean depth survived.
         let (mesh, ops, mut swe) = wet_dry_setup();
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         apply_swe_limiters_kuzmin_2d_parallel(
             &mut swe,
             &mesh,
             &ops,
+            &geom,
             &KuzminParameter2D::strict(),
             H_MIN,
         );
@@ -637,21 +661,29 @@ mod tests {
     #[cfg(feature = "parallel")]
     fn test_parallel_limiters_match_serial() {
         let (mesh, ops, input) = wet_dry_setup();
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         for kuzmin in [KuzminParameter2D::strict(), KuzminParameter2D::relaxed(1.5)] {
             let (mut serial, mut parallel) = (input.clone(), input.clone());
-            apply_swe_limiters_kuzmin_2d(&mut serial, &mesh, &ops, &kuzmin, H_MIN);
-            apply_swe_limiters_kuzmin_2d_parallel(&mut parallel, &mesh, &ops, &kuzmin, H_MIN);
+            apply_swe_limiters_kuzmin_2d(&mut serial, &mesh, &ops, &geom, &kuzmin, H_MIN);
+            apply_swe_limiters_kuzmin_2d_parallel(
+                &mut parallel,
+                &mesh,
+                &ops,
+                &geom,
+                &kuzmin,
+                H_MIN,
+            );
             assert_eq!(serial.data, parallel.data, "fused Kuzmin + positivity");
 
             let (mut serial, mut parallel) = (input.clone(), input.clone());
-            swe_kuzmin_limiter_2d(&mut serial, &mesh, &ops, &kuzmin);
-            swe_kuzmin_limiter_2d_parallel(&mut parallel, &mesh, &ops, &kuzmin);
+            swe_kuzmin_limiter_2d(&mut serial, &mesh, &ops, &geom, &kuzmin);
+            swe_kuzmin_limiter_2d_parallel(&mut parallel, &mesh, &ops, &geom, &kuzmin);
             assert_eq!(serial.data, parallel.data, "Kuzmin");
         }
 
         let (mut serial, mut parallel) = (input.clone(), input.clone());
-        swe_positivity_limiter_2d(&mut serial, &ops, H_MIN);
-        swe_positivity_limiter_2d_parallel(&mut parallel, &ops, H_MIN);
+        swe_positivity_limiter_2d(&mut serial, &geom, H_MIN);
+        swe_positivity_limiter_2d_parallel(&mut parallel, &geom, H_MIN);
         assert_eq!(serial.data, parallel.data, "positivity");
     }
 
@@ -701,7 +733,7 @@ mod tests {
             swe.set_state(k, i, SWEState2D::new(0.005, 0.1, -0.1));
         }
 
-        swe_positivity_limiter_2d(&mut swe, &ops, 0.01);
+        swe_positivity_limiter_2d(&mut swe, &unit_geometry(&ops), 0.01);
 
         for i in 0..ops.n_nodes {
             let state = swe.get_state(k, i);

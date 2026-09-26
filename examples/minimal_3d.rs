@@ -23,7 +23,7 @@ fn main() -> Result<(), String> {
     // 1000m x 100m domain
     let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 100.0, 2, 1));
     let ops = Arc::new(DGOperators2D::new(1)); // Order 1 (bilinear)
-    let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+    let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
 
     println!(
         "Mesh: {} elements, {} nodes/element",

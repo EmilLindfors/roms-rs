@@ -86,10 +86,8 @@ pub fn compute_vertical_velocity(
             }
 
             // Compute volume divergence
-            let rx = geom.rx[e];
-            let ry = geom.ry[e];
-            let sx = geom.sx[e];
-            let sy = geom.sy[e];
+            let metric = geom.affine_metric(e);
+            let (rx, ry, sx, sy) = (metric.rx, metric.ry, metric.sx, metric.sy);
 
             compute_strong_divergence(
                 &flux_x,
@@ -110,9 +108,8 @@ pub fn compute_vertical_velocity(
 
         // 2. Add Surface Terms (Lift * Jump)
         for face in 0..4 {
-            let normal = geom.normals[e][face]; // (nx, ny)
-            let s_jac = geom.surface_j[e][face];
-            let j_inv = geom.det_j_inv[e]; // 2D Jacobian inverse
+            let (normal, s_jac) = geom.affine_face(e, face);
+            let j_inv = geom.affine_metric(e).det_j_inv; // 2D Jacobian inverse
             let lift_scale = s_jac * j_inv;
             let face_nodes = &ops.face_nodes[face];
             let n_face_nodes = face_nodes.len();
@@ -241,7 +238,7 @@ mod tests {
     fn omega_at_w_points_satisfies_layer_continuity() {
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 1);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let n_levels = 4;
         let sigma = SigmaGrid::uniform(n_levels);
         let n_nodes = ops.n_nodes;

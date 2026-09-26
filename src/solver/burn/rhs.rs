@@ -37,15 +37,23 @@ where
     B::FloatElem: From<f64>,
 {
     /// Upload CPU geometric factors to GPU.
+    ///
+    /// The Burn kernels use one metric per element, so the mesh must consist
+    /// of parallelograms.
     pub fn from_cpu(geom: &crate::operators::GeometricFactors2D, device: &B::Device) -> Self {
-        let n = geom.rx.len();
+        geom.assert_affine("the Burn GPU RHS");
+        let per_element = |f: fn(&crate::operators::AffineMetric) -> f64| -> Vec<f64> {
+            (0..geom.n_elements)
+                .map(|k| f(&geom.affine_metric(k)))
+                .collect()
+        };
 
         Self {
-            rx: Self::tensor_1d(&geom.rx, device),
-            sx: Self::tensor_1d(&geom.sx, device),
-            ry: Self::tensor_1d(&geom.ry, device),
-            sy: Self::tensor_1d(&geom.sy, device),
-            det_j: Self::tensor_1d(&geom.det_j, device),
+            rx: Self::tensor_1d(&per_element(|m| m.rx), device),
+            sx: Self::tensor_1d(&per_element(|m| m.sx), device),
+            ry: Self::tensor_1d(&per_element(|m| m.ry), device),
+            sy: Self::tensor_1d(&per_element(|m| m.sy), device),
+            det_j: Self::tensor_1d(&per_element(|m| m.det_j), device),
             device: device.clone(),
         }
     }
@@ -327,7 +335,7 @@ mod tests {
         let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let device = burn_ndarray::NdArrayDevice::Cpu;
 
         // Create GPU structures
@@ -372,7 +380,7 @@ mod tests {
         let mesh = Mesh2DBuilder::unit_square().with_resolution(2, 2).build();
 
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let device = burn_ndarray::NdArrayDevice::Cpu;
 
         let burn_geom = BurnGeometricFactors2D::<NdArray<f64>>::from_cpu(&geom, &device);

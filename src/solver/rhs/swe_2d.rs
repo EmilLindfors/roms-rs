@@ -26,11 +26,11 @@ use crate::types::ElementIndex;
 use super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
 use super::swe_2d_split_form::{SplitFormSWE2D, SplitFormWorkspace};
 #[cfg(feature = "simd")]
-use crate::solver::simd::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
+use crate::solver::simd::{apply_diff_matrix, apply_lift, coriolis_source};
 #[cfg(not(feature = "simd"))]
 use crate::solver::simd::{
     apply_diff_matrix_scalar as apply_diff_matrix, apply_lift_scalar as apply_lift,
-    combine_derivatives_scalar as combine_derivatives, coriolis_source_scalar as coriolis_source,
+    coriolis_source_scalar as coriolis_source,
 };
 use std::cell::RefCell;
 
@@ -313,9 +313,10 @@ fn boundary_velocity_component<BC: SWEBoundaryCondition2D>(
     visc_h_min: f64,
     k: ElementIndex,
     face: usize,
+    fi: usize,
     node: usize,
 ) -> f64 {
-    let normal = geom.normals[k.as_usize()][face];
+    let normal = geom.normal(k.as_usize(), face, fi);
     let ghost = boundary_state(q, mesh, ops, config, time, k, face, node, normal).state();
     if ghost.h <= visc_h_min {
         return 0.0;
@@ -359,14 +360,14 @@ fn add_br1_viscosity<BC: SWEBoundaryCondition2D>(
         }
     }
 
-    let boundary_u_for_gradient = |k, face, _fi, node, _interior| {
+    let boundary_u_for_gradient = |k, face, fi, node, _interior| {
         boundary_velocity_component(
-            0, q, mesh, ops, geom, config, time, visc.h_min, k, face, node,
+            0, q, mesh, ops, geom, config, time, visc.h_min, k, face, fi, node,
         )
     };
-    let boundary_v_for_gradient = |k, face, _fi, node, _interior| {
+    let boundary_v_for_gradient = |k, face, fi, node, _interior| {
         boundary_velocity_component(
-            1, q, mesh, ops, geom, config, time, visc.h_min, k, face, node,
+            1, q, mesh, ops, geom, config, time, visc.h_min, k, face, fi, node,
         )
     };
 
@@ -375,7 +376,8 @@ fn add_br1_viscosity<BC: SWEBoundaryCondition2D>(
 
     let mut coeff = vec![0.0; total_nodes];
     for k in ElementIndex::iter(mesh.n_elements) {
-        let delta = geom.det_j[k.as_usize()].sqrt();
+        // Filter width: half the element size (√J for affine elements)
+        let delta = 0.5 * geom.element_size(k.as_usize());
         for i in 0..n_nodes {
             let flat = k.as_usize() * n_nodes + i;
             let state = q.get_state(k, i);
@@ -409,12 +411,12 @@ fn add_br1_viscosity<BC: SWEBoundaryCondition2D>(
 struct ElementWorkspace {
     n_nodes: usize,
     n_face_nodes: usize,
-    flux_x: [Vec<f64>; 3],
-    flux_y: [Vec<f64>; 3],
-    dfx_dr: [Vec<f64>; 3],
-    dfx_ds: [Vec<f64>; 3],
-    dfy_dr: [Vec<f64>; 3],
-    dfy_ds: [Vec<f64>; 3],
+    /// Contravariant fluxes F·J∇r and F·J∇s
+    flux_r: [Vec<f64>; 3],
+    flux_s: [Vec<f64>; 3],
+    /// Dr·F̃r and Ds·F̃s
+    dfr_dr: [Vec<f64>; 3],
+    dfs_ds: [Vec<f64>; 3],
     /// hu, hv of the element (f-plane Coriolis kernel)
     momentum: [Vec<f64>; 2],
     /// F(q⁻)·n − F* at the face nodes
@@ -455,12 +457,10 @@ impl ElementWorkspace {
         Self {
             n_nodes,
             n_face_nodes,
-            flux_x: nodes(),
-            flux_y: nodes(),
-            dfx_dr: nodes(),
-            dfx_ds: nodes(),
-            dfy_dr: nodes(),
-            dfy_ds: nodes(),
+            flux_r: nodes(),
+            flux_s: nodes(),
+            dfr_dr: nodes(),
+            dfs_ds: nodes(),
             momentum: [padded(n_nodes), padded(n_nodes)],
             flux_diff: face(),
             ext: face(),
@@ -672,9 +672,13 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         self.source_terms(k_idx, ws, [out_h, out_hu, out_hv]);
     }
 
-    /// Collocated nodal DG volume and surface terms:
-    ///   −J⁻¹[Dr·Fr + Ds·Fs] + J⁻¹ Σ_f LIFT_f sJ_f (F(q⁻)·n − F*)
-    /// with Fr = F·∇r, Fs = F·∇s.
+    /// Collocated nodal DG volume and surface terms in conservative
+    /// (divergence) form, with the metric at every node (Kopriva 2009, ch. 6):
+    ///   −J⁻¹[Dr·F̃r + Ds·F̃s] + J⁻¹ Σ_f LIFT_f sJ_f (F(q⁻)·n − F*)
+    /// with the contravariant fluxes F̃r = F·J∇r, F̃s = F·J∇s. With the
+    /// discrete metric identities (`GeometricFactors2D`) it preserves a uniform
+    /// state on non-affine elements, and it conserves mass on any element
+    /// (the volume term telescopes to the faces, `D` being SBP).
     fn collocated_terms(
         &self,
         k: ElementIndex,
@@ -690,57 +694,41 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         let h_min = config.equation.h_min.meters();
         let [out_h, out_hu, out_hv] = out;
 
-        // 1. Volume term: −(∇·F), from the reference derivatives of the nodal flux
+        // 1. Volume term: −J⁻¹[Dr·F̃r + Ds·F̃s], from the contravariant fluxes
+        //    (into the workspace flux_r, flux_s)
         {
-            let [fx_h, fx_hu, fx_hv] = &mut ws.flux_x;
-            let [fy_h, fy_hu, fy_hv] = &mut ws.flux_y;
+            let [fr_h, fr_hu, fr_hv] = &mut ws.flux_r;
+            let [fs_h, fs_hu, fs_hv] = &mut ws.flux_s;
             for i in 0..n_nodes {
                 let state = q.get_state(k, i);
                 let fx = config.equation.flux_x(&state);
                 let fy = config.equation.flux_y(&state);
-                (fx_h[i], fx_hu[i], fx_hv[i]) = (fx.h, fx.hu, fx.hv);
-                (fy_h[i], fy_hu[i], fy_hv[i]) = (fy.h, fy.hu, fy.hv);
+                let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(ki, i);
+                let fr = ar_x * fx + ar_y * fy;
+                let fs = as_x * fx + as_y * fy;
+                (fr_h[i], fr_hu[i], fr_hv[i]) = (fr.h, fr.hu, fr.hv);
+                (fs_h[i], fs_hu[i], fs_hv[i]) = (fs.h, fs.hu, fs.hv);
             }
         }
         for (d, flux, out) in [
-            (&ops.dr_row_major, &ws.flux_x, &mut ws.dfx_dr),
-            (&ops.ds_row_major, &ws.flux_x, &mut ws.dfx_ds),
-            (&ops.dr_row_major, &ws.flux_y, &mut ws.dfy_dr),
-            (&ops.ds_row_major, &ws.flux_y, &mut ws.dfy_ds),
+            (&ops.dr_row_major, &ws.flux_r, &mut ws.dfr_dr),
+            (&ops.ds_row_major, &ws.flux_s, &mut ws.dfs_ds),
         ] {
             let [o_h, o_hu, o_hv] = out;
             apply_diff_matrix(d, &flux[0], &flux[1], &flux[2], o_h, o_hu, o_hv, n_nodes);
         }
-        combine_derivatives(
-            &ws.dfx_dr[0],
-            &ws.dfx_dr[1],
-            &ws.dfx_dr[2],
-            &ws.dfx_ds[0],
-            &ws.dfx_ds[1],
-            &ws.dfx_ds[2],
-            &ws.dfy_dr[0],
-            &ws.dfy_dr[1],
-            &ws.dfy_dr[2],
-            &ws.dfy_ds[0],
-            &ws.dfy_ds[1],
-            &ws.dfy_ds[2],
-            out_h,
-            out_hu,
-            out_hv,
-            geom.rx[ki],
-            geom.sx[ki],
-            geom.ry[ki],
-            geom.sy[ki],
-            n_nodes,
-        );
+        for i in 0..n_nodes {
+            let j_inv = geom.jacobian_inv(ki, i);
+            out_h[i] = -j_inv * (ws.dfr_dr[0][i] + ws.dfs_ds[0][i]);
+            out_hu[i] = -j_inv * (ws.dfr_dr[1][i] + ws.dfs_ds[1][i]);
+            out_hv[i] = -j_inv * (ws.dfr_dr[2][i] + ws.dfs_ds[2][i]);
+        }
 
         // 2. Surface terms
         let well_balanced = config.bathymetry.filter(|_| config.well_balanced);
         let hr = well_balanced.map(|_| HydrostaticReconstruction2D::new(g, h_min));
-        let j_inv = geom.det_j_inv[ki];
 
         for face in 0..4 {
-            let normal = geom.normals[ki][face];
             let face_nodes = &ops.face_nodes[face];
             let [ext_h, ext_hu, ext_hv] = &mut ws.ext;
 
@@ -767,6 +755,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                 }
             } else {
                 for (fi, &node) in face_nodes.iter().enumerate() {
+                    let normal = geom.normal(ki, face, fi);
                     let ghost = match boundary_state(
                         q, mesh, ops, config, self.time, k, face, node, normal,
                     ) {
@@ -785,6 +774,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
             // Numerical flux and flux difference at the face nodes
             let [diff_h, diff_hu, diff_hv] = &mut ws.flux_diff;
             for (fi, &node) in face_nodes.iter().enumerate() {
+                let normal = geom.normal(ki, face, fi);
+                // Per-node GLL lift scale sJ/J (LIFT couples a face node only
+                // to the volume node it coincides with)
+                let scale = geom.lift_scale(ki, face, fi, node);
                 let q_int = q.get_state(k, node);
                 let q_ext = SWEState2D::new(ext_h[fi], ext_hu[fi], ext_hv[fi]);
 
@@ -794,7 +787,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                     if let Some(face_mass) = face_mass.as_deref_mut() {
                         face_mass[face * n_face_nodes + fi] = f_b.h;
                     }
-                    let diff = config.equation.normal_flux(&q_int, normal) - f_b;
+                    let diff = scale * (config.equation.normal_flux(&q_int, normal) - f_b);
                     (diff_h[fi], diff_hu[fi], diff_hv[fi]) = (diff.h, diff.hu, diff.hv);
                     continue;
                 }
@@ -825,10 +818,11 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                 if let Some(r) = &hr {
                     diff = diff + r.pressure_correction(q_int.h, q_int_flux.h, normal);
                 }
+                let diff = scale * diff;
                 (diff_h[fi], diff_hu[fi], diff_hv[fi]) = (diff.h, diff.hu, diff.hv);
             }
 
-            // out += J⁻¹ sJ LIFT_f (F(q⁻)·n − F*)
+            // out += LIFT_f (sJ/J)(F(q⁻)·n − F*), the scale already applied
             apply_lift(
                 &ops.lift_row_major[face],
                 diff_h,
@@ -839,7 +833,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                 out_hv,
                 n_nodes,
                 n_face_nodes,
-                j_inv * geom.surface_j[ki][face],
+                1.0,
             );
         }
     }
@@ -1090,18 +1084,34 @@ fn element_max_reference_rate(
     k: ElementIndex,
 ) -> f64 {
     let ki = k.as_usize();
-    let grad_r = (geom.rx[ki], geom.ry[ki]);
-    let grad_s = (geom.sx[ki], geom.sy[ki]);
-    let norm_r = (grad_r.0 * grad_r.0 + grad_r.1 * grad_r.1).sqrt();
-    let norm_s = (grad_s.0 * grad_s.0 + grad_s.1 * grad_s.1).sqrt();
-    let dir_r = (grad_r.0 / norm_r, grad_r.1 / norm_r);
-    let dir_s = (grad_s.0 / norm_s, grad_s.1 / norm_s);
-
+    let h_min = equation.h_min.meters();
+    let norms = |(grad_r, grad_s): ((f64, f64), (f64, f64))| {
+        let norm_r = (grad_r.0 * grad_r.0 + grad_r.1 * grad_r.1).sqrt();
+        let norm_s = (grad_s.0 * grad_s.0 + grad_s.1 * grad_s.1).sqrt();
+        (grad_r, grad_s, norm_r, norm_s)
+    };
+    // A parallelogram has one metric: evaluate it once, from the dense
+    // per-element geometry
+    let element = geom.element_geometry(ki);
+    let affine = element.affine.then(|| {
+        norms((
+            (element.metric.rx, element.metric.ry),
+            (element.metric.sx, element.metric.sy),
+        ))
+    });
     (0..q.n_nodes)
         .map(|i| {
             let state = q.get_state(k, i);
-            let lambda_r = norm_r * equation.max_wave_speed_normal(&state, dir_r);
-            let lambda_s = norm_s * equation.max_wave_speed_normal(&state, dir_s);
+            if state.h <= h_min {
+                return 0.0;
+            }
+            // λ_r = |u·∇r| + c|∇r| (= |∇r| times the wave speed along ∇r)
+            let (grad_r, grad_s, norm_r, norm_s) =
+                affine.unwrap_or_else(|| norms((geom.grad_r(ki, i), geom.grad_s(ki, i))));
+            let (u, v) = equation.velocity_simple(&state);
+            let c = equation.celerity(state.h);
+            let lambda_r = (u * grad_r.0 + v * grad_r.1).abs() + c * norm_r;
+            let lambda_s = (u * grad_s.0 + v * grad_s.1).abs() + c * norm_s;
             0.25 * (lambda_r + lambda_s)
         })
         .fold(0.0_f64, f64::max)
@@ -1128,7 +1138,7 @@ fn dt_from_reference_rate(max_rate: f64, order: usize, cfl: f64) -> f64 {
 ///
 /// # Arguments
 /// * `nu_max` - Maximum viscosity coefficient [m²/s]
-/// * `min_h_elem` - Minimum element size (e.g. from `geom.det_j[k].sqrt() * 2.0`)
+/// * `min_h_elem` - Minimum element size (e.g. from `geom.element_size(k)`)
 /// * `order` - Polynomial order of the DG scheme
 /// * `cfl` - CFL number (typically 0.1–0.5 for diffusion)
 pub fn compute_dt_viscosity(nu_max: f64, min_h_elem: f64, order: usize, cfl: f64) -> f64 {
@@ -1322,16 +1332,15 @@ mod tests {
             let mut max_inflow: f64 = 0.0;
             for k in 0..mesh.n_elements {
                 let dh = &rhs.data[0][k * ops.n_nodes..(k + 1) * ops.n_nodes];
-                let volume: f64 =
-                    geom.det_j[k] * dh.iter().zip(&ops.weights).map(|(d, w)| d * w).sum::<f64>();
+                let volume = geom.integrate_element(k, dh);
                 let outflow: f64 = (0..4)
                     .map(|face| {
                         let f = &face_mass[(k * 4 + face) * n_face..][..n_face];
-                        geom.surface_j[k][face]
-                            * f.iter()
-                                .zip(&ops.weights_1d)
-                                .map(|(f, w)| f * w)
-                                .sum::<f64>()
+                        f.iter()
+                            .zip(&ops.weights_1d)
+                            .enumerate()
+                            .map(|(fi, (f, w))| geom.surface_jacobian(k, face, fi) * f * w)
+                            .sum::<f64>()
                     })
                     .sum();
                 max_inflow = max_inflow.max(outflow.abs());
@@ -1346,7 +1355,7 @@ mod tests {
     fn create_test_setup(order: usize) -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(order);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         (mesh, ops, geom)
     }
 
@@ -1398,7 +1407,7 @@ mod tests {
 
         // Use periodic mesh to avoid boundary effects
         let mesh_periodic = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
-        let geom_periodic = GeometricFactors2D::compute(&mesh_periodic);
+        let geom_periodic = GeometricFactors2D::compute(&mesh_periodic, &ops);
 
         let mut q = SWESolution2D::new(mesh_periodic.n_elements, ops.n_nodes);
         for k in ElementIndex::iter(mesh_periodic.n_elements) {
@@ -1432,7 +1441,7 @@ mod tests {
         // Test that total mass is conserved (RHS of h integrates to zero)
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
         let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -1457,9 +1466,8 @@ mod tests {
         let mut integral = 0.0;
         for k in ElementIndex::iter(mesh.n_elements) {
             let ki = k.as_usize();
-            let j = geom.det_j[ki];
             for (i, &w) in ops.weights.iter().enumerate() {
-                integral += w * rhs.get_var(k, i, 0) * j;
+                integral += w * rhs.get_var(k, i, 0) * geom.jacobian(ki, i);
             }
         }
 
@@ -1517,7 +1525,7 @@ mod tests {
         let order = 2;
         let (cfl, dx, depth) = (0.4, 250.0, 100.0);
         let mesh = Mesh2D::uniform_rectangle(0.0, 4.0 * dx, 0.0, 3.0 * dx, 4, 3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &DGOperators2D::new(order));
         let n_nodes = (order + 1) * (order + 1);
         let equation = ShallowWater2D::new(G);
         let c = (G * depth).sqrt();
@@ -1565,7 +1573,7 @@ mod tests {
         let order = 3;
         let cfl = 0.25;
         let mesh = graded_anisotropic_mesh();
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &DGOperators2D::new(order));
         let equation = ShallowWater2D::new(G);
         let n_nodes = (order + 1) * (order + 1);
         let depths = [5.0, 400.0];
@@ -1585,7 +1593,7 @@ mod tests {
             "dt = {dt}, expected {expected}"
         );
 
-        let old = cfl * (4.0 * geom.det_j[0]).sqrt() / (dg * (G * 400.0).sqrt());
+        let old = cfl * geom.element_size(0) / (dg * (G * 400.0).sqrt());
         assert!(
             dt > 3.0 * old,
             "dt = {dt} should exceed the old global pairing {old}"
@@ -1594,7 +1602,7 @@ mod tests {
         // The thin element alone: limited by its 50 m width, below the √detJ size.
         let q = element_wise_state(&mesh, n_nodes, |_| 5.0, 0.0);
         let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
-        let sqrt_det_j = cfl * (4.0 * geom.det_j[0]).sqrt() / (dg * (G * 5.0).sqrt());
+        let sqrt_det_j = cfl * geom.element_size(0) / (dg * (G * 5.0).sqrt());
         assert!(
             dt < 0.5 * sqrt_det_j,
             "dt = {dt} vs √detJ-based {sqrt_det_j}"
@@ -1606,7 +1614,7 @@ mod tests {
     fn test_dt_parallel_matches_serial() {
         let order = 2;
         let mesh = graded_anisotropic_mesh();
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &DGOperators2D::new(order));
         let equation = ShallowWater2D::new(G);
         let q = element_wise_state(&mesh, (order + 1) * (order + 1), |k| [3.0, 250.0][k], 1.5);
         let serial = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, 0.3);
@@ -1626,7 +1634,7 @@ mod tests {
     #[test]
     fn test_dt_dry_domain_is_unbounded() {
         let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &DGOperators2D::new(2));
         let equation = ShallowWater2D::new(G);
         let q = SWESolution2D::new(mesh.n_elements, 9);
         assert_eq!(
@@ -1696,7 +1704,7 @@ mod tests {
 
         // Use periodic mesh to eliminate surface terms
         let mesh_periodic = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
-        let geom_periodic = GeometricFactors2D::compute(&mesh_periodic);
+        let geom_periodic = GeometricFactors2D::compute(&mesh_periodic, &ops);
 
         let mut q = SWESolution2D::new(mesh_periodic.n_elements, ops.n_nodes);
         // h = 10, hu = 100 (so v-momentum source = f*hu = 1e-4 * 100 = 0.01)
@@ -1737,7 +1745,7 @@ mod tests {
         // Test that a single time step doesn't blow up
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
         let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -1779,7 +1787,7 @@ mod tests {
         // Test that different flux types work
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
 
@@ -1821,7 +1829,7 @@ mod tests {
 
         // Use periodic mesh to eliminate surface terms
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
 
         let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
         for k in ElementIndex::iter(mesh.n_elements) {
@@ -1885,7 +1893,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
 
@@ -1933,7 +1941,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 6, 6);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
 
@@ -1977,7 +1985,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
 
@@ -2028,7 +2036,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
 
@@ -2074,7 +2082,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
 
@@ -2121,7 +2129,7 @@ mod tests {
         const L: f64 = 20_000.0;
         let mesh = Mesh2D::uniform_periodic(0.0, L, 0.0, L, 12, 12);
         let ops = DGOperators2D::new(order);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let tau = 2.0 * std::f64::consts::PI / L;
         let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
             -200.0 + 150.0 * (tau * x).sin() * (tau * y).cos()
@@ -2166,9 +2174,8 @@ mod tests {
     ) -> f64 {
         let mut integral = 0.0;
         for k in ElementIndex::iter(mesh.n_elements) {
-            let j = geom.det_j[k.as_usize()];
-            for (i, &w) in ops.weights.iter().enumerate() {
-                integral += w * j * q.get_var(k, i, var);
+            for i in 0..ops.n_nodes {
+                integral += geom.mass[geom.node_index(k.as_usize(), i)] * q.get_var(k, i, var);
             }
         }
         integral
@@ -2304,7 +2311,7 @@ mod tests {
         // Case 1: flat bottom, non-uniform flow.
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
         for k in ElementIndex::iter(mesh.n_elements) {
             for i in 0..ops.n_nodes {
@@ -2343,7 +2350,7 @@ mod tests {
         // including Coriolis, both formulations.
         let mesh = Mesh2D::uniform_rectangle(0.0, 20_000.0, 0.0, 10_000.0, 6, 3);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
             -150.0 + 0.004 * x - 50.0 * (y / 10_000.0).powi(2)
         });
@@ -2388,7 +2395,7 @@ mod tests {
 
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(2);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let equation = ShallowWater2D::with_coriolis(G, 1.0e-4); // f-plane Coriolis
         let bc = Reflective2D::new();
         let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(true);

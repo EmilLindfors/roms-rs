@@ -43,9 +43,9 @@
 //! - Kurganov & Petrova (2007), Commun. Math. Sci. 5, desingularization
 //! - Medeiros & Hagen (2013), review of wetting and drying algorithms
 
-use crate::operators::DGOperators2D;
+use crate::operators::GeometricFactors2D;
 use crate::solver::SWESolution2D;
-use crate::solver::limiters::{element_mean, positivity_limit_element};
+use crate::solver::limiters::{element_mass, element_mean, positivity_limit_element};
 use crate::solver::state::SWEState2D;
 use crate::source::BottomFriction2D;
 use crate::types::Depth;
@@ -217,17 +217,18 @@ fn wet_dry_element(
 /// (creating mass); zero under the positivity CFL with HLL or Rusanov.
 pub fn apply_wet_dry_correction_all(
     solution: &mut SWESolution2D,
-    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     config: &WetDryConfig,
 ) -> usize {
     let n = solution.n_nodes;
-    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
     let [h, hu, hv] = &mut solution.data;
     h.chunks_exact_mut(n)
         .zip(hu.chunks_exact_mut(n))
         .zip(hv.chunks_exact_mut(n))
-        .map(|((h, hu), hv)| {
-            wet_dry_element(h, hu, hv, &ops.weights, inv_total_weight, config) as usize
+        .enumerate()
+        .map(|(k, ((h, hu), hv))| {
+            let (mass, inv_area) = (element_mass(geom, k), 1.0 / geom.area[k]);
+            wet_dry_element(h, hu, hv, mass, inv_area, config) as usize
         })
         .sum()
 }
@@ -237,19 +238,20 @@ pub fn apply_wet_dry_correction_all(
 #[cfg(feature = "parallel")]
 pub fn apply_wet_dry_correction_all_parallel(
     solution: &mut SWESolution2D,
-    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
     config: &WetDryConfig,
 ) -> usize {
     use rayon::prelude::*;
 
     let n = solution.n_nodes;
-    let inv_total_weight = 1.0 / ops.weights.iter().sum::<f64>();
     let [h, hu, hv] = &mut solution.data;
     h.par_chunks_exact_mut(n)
         .zip(hu.par_chunks_exact_mut(n))
         .zip(hv.par_chunks_exact_mut(n))
-        .map(|((h, hu), hv)| {
-            wet_dry_element(h, hu, hv, &ops.weights, inv_total_weight, config) as usize
+        .enumerate()
+        .map(|(k, ((h, hu), hv))| {
+            let (mass, inv_area) = (element_mass(geom, k), 1.0 / geom.area[k]);
+            wet_dry_element(h, hu, hv, mass, inv_area, config) as usize
         })
         .sum()
 }
@@ -373,8 +375,16 @@ fn damp_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::Mesh2D;
+    use crate::operators::DGOperators2D;
     use crate::source::ManningFriction2D;
     use crate::types::ElementIndex;
+
+    /// Geometry of `n` unit squares in a row.
+    fn unit_geometry(ops: &DGOperators2D, n: usize) -> GeometricFactors2D {
+        let mesh = Mesh2D::uniform_rectangle(0.0, n as f64, 0.0, 1.0, n, 1);
+        GeometricFactors2D::compute(&mesh, ops)
+    }
 
     fn weighted_mass(solution: &SWESolution2D, ops: &DGOperators2D) -> f64 {
         solution
@@ -466,7 +476,7 @@ mod tests {
 
         let initial_mass = weighted_mass(&solution, &ops).max(0.0);
         assert_eq!(
-            apply_wet_dry_correction_all(&mut solution, &ops, &config),
+            apply_wet_dry_correction_all(&mut solution, &unit_geometry(&ops, 1), &config),
             0
         );
         let final_mass = weighted_mass(&solution, &ops);
@@ -495,7 +505,7 @@ mod tests {
         }
         let before = solution.data.clone();
         assert_eq!(
-            apply_wet_dry_correction_all(&mut solution, &ops, &config),
+            apply_wet_dry_correction_all(&mut solution, &unit_geometry(&ops, 1), &config),
             0
         );
         assert_eq!(solution.data, before);
@@ -517,7 +527,7 @@ mod tests {
             );
         }
         let before = solution.data.clone();
-        apply_wet_dry_correction_all(&mut solution, &ops, &config);
+        apply_wet_dry_correction_all(&mut solution, &unit_geometry(&ops, 1), &config);
         assert_eq!(solution.data, before);
     }
 
@@ -536,8 +546,13 @@ mod tests {
             }
         }
         let (mut serial, mut parallel) = (input.clone(), input.clone());
-        let n_serial = apply_wet_dry_correction_all(&mut serial, &ops, &config);
-        let n_parallel = apply_wet_dry_correction_all_parallel(&mut parallel, &ops, &config);
+        let n_serial =
+            apply_wet_dry_correction_all(&mut serial, &unit_geometry(&ops, n_elements), &config);
+        let n_parallel = apply_wet_dry_correction_all_parallel(
+            &mut parallel,
+            &unit_geometry(&ops, n_elements),
+            &config,
+        );
         assert_eq!(serial.data, parallel.data);
         assert_eq!(n_serial, n_parallel);
         assert_eq!(n_serial, 1);

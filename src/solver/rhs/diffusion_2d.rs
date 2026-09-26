@@ -1,4 +1,9 @@
-//! Conservative DG diffusion helpers for 2D affine quadrilateral elements.
+//! Conservative DG diffusion helpers for 2D quadrilateral elements.
+//!
+//! The gradient is taken with the chain rule at every node; the divergence of
+//! the diffusive flux in conservative form, `J⁻¹[∂_r(J∇r·F) + ∂_s(J∇s·F)]`,
+//! so that the element-integrated diffusion telescopes to the face fluxes on
+//! any (also non-affine) element.
 
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
@@ -38,10 +43,6 @@ where
 
     for k in ElementIndex::iter(mesh.n_elements) {
         let k_usize = k.as_usize();
-        let rx = geom.rx[k_usize];
-        let ry = geom.ry[k_usize];
-        let sx = geom.sx[k_usize];
-        let sy = geom.sy[k_usize];
 
         for i in 0..n_nodes {
             let mut du_dr = 0.0;
@@ -54,17 +55,18 @@ where
             }
 
             let grad_idx = idx(k, i, n_nodes);
-            gradients[grad_idx].dx = du_dr * rx + du_ds * sx;
-            gradients[grad_idx].dy = du_dr * ry + du_ds * sy;
+            let (dx, dy) = geom.transform_derivatives(k_usize, i, du_dr, du_ds);
+            gradients[grad_idx].dx = dx;
+            gradients[grad_idx].dy = dy;
         }
 
         for face in 0..4 {
-            let normal = geom.normals[k_usize][face];
-            let scale = geom.det_j_inv[k_usize] * geom.surface_j[k_usize][face];
             let face_nodes = &ops.face_nodes[face];
 
             for fi in 0..n_face_nodes {
                 let node = face_nodes[fi];
+                let normal = geom.normal(k_usize, face, fi);
+                let scale = geom.lift_scale(k_usize, face, fi, node);
                 let value_int = values[idx(k, node, n_nodes)];
                 let value_ext = if let Some(neighbor) = mesh.neighbor(k, face) {
                     let neighbor_k = ElementIndex::new(neighbor.element);
@@ -110,46 +112,46 @@ pub(super) fn compute_br1_diffusion_rhs_2d(
 
     let mut flux_x = vec![0.0; values.len()];
     let mut flux_y = vec![0.0; values.len()];
-    for i in 0..values.len() {
-        let coeff = coefficients[i].max(0.0);
-        flux_x[i] = coeff * gradients[i].dx;
-        flux_y[i] = coeff * gradients[i].dy;
+    // Contravariant fluxes J∇r·F and J∇s·F
+    let mut flux_r = vec![0.0; values.len()];
+    let mut flux_s = vec![0.0; values.len()];
+    for k in 0..mesh.n_elements {
+        for i in 0..n_nodes {
+            let n = geom.node_index(k, i);
+            let coeff = coefficients[n].max(0.0);
+            flux_x[n] = coeff * gradients[n].dx;
+            flux_y[n] = coeff * gradients[n].dy;
+            let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, i);
+            flux_r[n] = ar_x * flux_x[n] + ar_y * flux_y[n];
+            flux_s[n] = as_x * flux_x[n] + as_y * flux_y[n];
+        }
     }
 
     let mut rhs = vec![0.0; values.len()];
 
     for k in ElementIndex::iter(mesh.n_elements) {
         let k_usize = k.as_usize();
-        let rx = geom.rx[k_usize];
-        let ry = geom.ry[k_usize];
-        let sx = geom.sx[k_usize];
-        let sy = geom.sy[k_usize];
 
         for i in 0..n_nodes {
-            let mut dfx_dr = 0.0;
-            let mut dfx_ds = 0.0;
-            let mut dfy_dr = 0.0;
-            let mut dfy_ds = 0.0;
+            let mut dfr_dr = 0.0;
+            let mut dfs_ds = 0.0;
 
             for j in 0..n_nodes {
                 let j_idx = idx(k, j, n_nodes);
-                dfx_dr += ops.dr[(i, j)] * flux_x[j_idx];
-                dfx_ds += ops.ds[(i, j)] * flux_x[j_idx];
-                dfy_dr += ops.dr[(i, j)] * flux_y[j_idx];
-                dfy_ds += ops.ds[(i, j)] * flux_y[j_idx];
+                dfr_dr += ops.dr[(i, j)] * flux_r[j_idx];
+                dfs_ds += ops.ds[(i, j)] * flux_s[j_idx];
             }
 
-            rhs[idx(k, i, n_nodes)] = (rx * dfx_dr + sx * dfx_ds) + (ry * dfy_dr + sy * dfy_ds);
+            rhs[idx(k, i, n_nodes)] = geom.jacobian_inv(k_usize, i) * (dfr_dr + dfs_ds);
         }
 
         for face in 0..4 {
-            let normal = geom.normals[k_usize][face];
-            let s_jac = geom.surface_j[k_usize][face];
-            let lift_scale = geom.det_j_inv[k_usize] * s_jac;
             let face_nodes = &ops.face_nodes[face];
 
             for fi in 0..n_face_nodes {
                 let node = face_nodes[fi];
+                let normal = geom.normal(k_usize, face, fi);
+                let lift_scale = geom.lift_scale(k_usize, face, fi, node);
                 let int_idx = idx(k, node, n_nodes);
                 let flux_int_n = flux_x[int_idx] * normal.0 + flux_y[int_idx] * normal.1;
 

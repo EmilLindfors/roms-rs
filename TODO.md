@@ -64,6 +64,51 @@ Build note: default features need the `roms-rs` conda env (`conda activate roms-
 
 ---
 
+## Application target: currents around a salmon farm
+
+Goal (added 2026-09-26): resolve currents at a farm site (cages ≈ 40–60 m across, nets 20–40 m deep) inside a NorKyst-driven coastal domain, and track sea-lice larvae, feed and faeces from the cages. A 3D visualisation (Bevy, separate crate) reads the model output; it is not part of `dg-rs`.
+
+This section only orders the existing items for that goal and adds the two farm-specific ones (F.1, F.2). Everything else lives in its own priority section.
+
+**Stage A: 2D farm-scale currents.** Depth-averaged, so it answers tidal exposure and the wake of the farm, not the surface layer.
+1. P1.3 geometry (blocker): coastline-fitted meshes with elements of tens of metres at the farm and kilometres offshore. General quadrilaterals are supported in 2D since 2026-09-26; the rest of P1.3 (robust Gmsh MSH 4.1 input, triangles or quad-dominant meshes, CSR) is still open.
+2. P1.6 shoreline cliffs and bathymetry: the 1–2.8 m/s spurious currents at wet nodes next to land sit where farms are. Also L2 projection of the GeoTIFF onto nodes, a foreshore DEM, and the bed + coastline builder in the library.
+3. F.1 cage drag (2D form).
+4. P2.5 local time stepping or implicit free surface: a single 20 m element sets the global dt, so farm refinement makes this the dominant cost.
+5. P1.5 nesting of NorKyst ū, v̄, η (residual and coastal-current transport, not only the tidal atlas) and the P1.6 atmospheric forcing reader (wind stress).
+6. P3.1 current validation: depth-averaged velocity in station series, sampling at the station position by interpolation inside the element (F.2 needs the same evaluation), ADCP comparison and tidal-ellipse fit. Farm-site current surveys, where available, are the natural data.
+7. Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7.
+
+**Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
+- P4.2 (tracer constancy, 3D open boundaries for T/S), P4.3 (balanced PGF, vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry, which gives NaN today; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
+- F.1 cage drag (3D form) and F.2 in 3D.
+
+Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
+
+### F.1 Cage drag
+- [ ] Momentum sink from the net as a porous region: S = −½·C_d·a·|u|u per unit volume, with a (net area per volume) and C_d from the net solidity (Løland 1991; review in Klebert et al. 2013, Ocean Eng. 58). Fouling raises the solidity, so take it as a per-cage parameter.
+  - 2D: integrate over the net depth only, i.e. scale by min(d_net, h)/h, over the cage footprint.
+  - 3D: apply per level, only to levels above the net bottom.
+  - Cages are comparable to or smaller than an element: weight each node by the fraction of its quadrature area inside the footprint instead of switching nodes on/off.
+- [ ] Point-implicit like the bottom friction (`BottomFriction2D`, `step_with_relaxation`): the drag rate is large in shallow water and must not limit dt.
+- [ ] Gate tests:
+  - Flow through a porous patch in a channel: the integrated drag equals the momentum-flux and pressure loss across the patch.
+  - Mass conservation is unchanged (it is a momentum-only source); lake at rest with cages present is exact.
+  - Magnitude test (not only sign), as for P0.18.
+
+### F.2 Lagrangian particle tracking
+- [ ] Point location: find the element holding a point and its reference coordinates (Newton on the isoparametric map once P1.3 lands; a spatial index over elements).
+- [ ] Velocity evaluation from the element polynomial (the same evaluation P3.1 station sampling needs), linear in time between output snapshots or online from the solver.
+- [ ] RK4 advection; horizontal random walk; vertical random walk with the ∂K/∂z drift correction (Visser 1997, MEPS 158) once 3D exists.
+- [ ] Coastline reflection, open-boundary exit, beaching of particles that reach a drying node.
+- [ ] Behaviour hooks: sinking speed (feed, faeces), lice larvae depth preference and salinity avoidance (as in the IMR salmon-lice model; Sandvik et al. 2020, Aquac. Environ. Interact. 12).
+- [ ] Gate tests:
+  - Solid-body rotation: trajectories exact to the time-stepping error when the velocity is in the polynomial space.
+  - No particle crosses a wall.
+  - The vertical random walk keeps an initially uniform distribution uniform under variable K (Visser's well-mixed condition).
+
+---
+
 ## Priority 0 (2026-09-25 review): Confirmed Correctness Bugs — OPEN
 
 All confirmed in code or by measurement (`REVIEW.md` "Top correctness bugs"). Each is small. Each needs a regression test that would have caught it.
@@ -188,7 +233,13 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [x] `SWEPhysics2D::post_process` built a `LimiterContext2D` every stage, whose `new` computed `mesh.h_min()` serially (a sqrt per edge). No limiter read it: the field is gone (2026-09-26).
 
 ### P1.3 Geometry for real coastlines
-- [ ] Per-node isoparametric geometric factors (`[K]` → `[K × n_nodes]`). Remove the parallelogram-only panic (`geometric.rs:160-186`).
+- [x] Per-node isoparametric geometric factors (`[K]` → `[K × n_nodes]`), parallelogram-only panic removed (2026-09-26). `GeometricFactors2D::compute(mesh, ops)` evaluates the bilinear map at every node: metric, J, mass weights w·J, and per face node the normal and sJ from the same contravariant vectors (`sJ n = ±J∇r, ±J∇s`), so the discrete metric identities hold to round-off.
+  - Kernels: the collocated SWE, tracer, advection and BR1 diffusion volume terms are in conservative form `J⁻¹[Dr(J∇r·F) + Ds(J∇s·F)]` with the per-node lift scale sJ/J; the split forms use the curvilinear Wintermeyer et al. (2017) form (`{{Ja}}` metric averages, bed term included); the `WetDry` subcells use the telescoping interface metrics (Fisher et al. 2013; Hennemann et al. 2021) plus a metric balance term in the bed source (zero on parallelograms and flat beds). Limiter, wet/dry and diagnostic means are mass-weighted (`LimiterContext2D` and the limiter / wet-dry functions take `&GeometricFactors2D`).
+  - Gates on distorted periodic meshes (`tests/curvilinear_2d_test.rs`): free stream, lake at rest over rough and shoreline beds, mass/momentum/tracer conservation, entropy; convergence N+1 for advection and the split forms, 2 for the subcells (`convergence_test.rs`, ACCURACY.md).
+  - Parallelograms take a fast path from a dense per-element copy of the node-0 geometry (`ElementGeometry`): the per-node fields are strided and cost ≈ 9 cache lines per element. Frøya (all parallelograms, `profile=80`, mains power, CPUs 0–7, five alternating runs, min/median): RHS 1 thread 4.44/4.51 ms against 4.36/4.38 on `main` (+2–3 %), 24 threads 1.22/1.26 against 1.17/1.20 (+4–5 %); `dt` 0.246/0.251 against 0.259/0.262 (−5 %); step at 24 threads +4–5 %. Before the fast paths the RHS was ≈ 10–20 % slower. [ ] Find the remaining few percent with a profiler (AMD uProf is installed).
+  - [ ] The 3D kernels (`advection_3d`, `vertical_velocity`, `baroclinic`, `limiters/tracer_3d`), `batched` SIMD and the Burn prototype still use one metric per element (`affine_metric`); `Hydrostatic3D::new`, `compute_volume_terms_batched` and `BurnGeometricFactors2D::from_cpu` assert parallelograms. Convert the 3D horizontal kernels with P4.2 (Hz-weighted conservative fluxes).
+  - [ ] Curved (high-order) faces: compute the same fields from the derivatives of an interpolated high-order map (Kopriva 2006: in 2D the metric identities hold for any map of degree ≤ N); fitted coastlines then need a boundary projection of the face nodes.
+  - [ ] `Bathymetry2D::to_cell_average`/`linearize` use unweighted node means (as before); weight by the element mass.
 - [ ] Triangles (or quad-dominant meshes), and remove the hardcoded 4 faces (`swe_2d.rs:386,908`).
 - [ ] Gmsh: real MSH 4.1 parsing, sparse node tags, no `.unwrap()` on input, error (not drop) on unsupported element types.
 - [ ] CSR connectivity. Make `MeshGPUData` the single representation.
@@ -486,7 +537,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] Two-way nesting (child feeds back to parent).
 - [ ] MPI for distributed memory (see P2.7).
 - [ ] Wave–current interaction.
-- [ ] Biological coupling (NPZD for salmon-lice dispersion).
+- [ ] Biological coupling (NPZD). Salmon-lice dispersion is particle tracking, now F.2 under "Application target".
 - [ ] Sediment transport.
 
 ---

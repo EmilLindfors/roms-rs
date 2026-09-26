@@ -329,11 +329,12 @@ fn boundary_tracer_concentration<BC: TracerBoundaryCondition2D>(
     time: f64,
     k: ElementIndex,
     face: usize,
+    fi: usize,
     node: usize,
 ) -> f64 {
     let tracer = tracers.get_conservative(k, node);
     let swe_state = swe.get_state(k, node);
-    let normal = geom.normals[k.as_usize()][face];
+    let normal = geom.normal(k.as_usize(), face, fi);
     let (r, s) = (ops.nodes_r[node], ops.nodes_s[node]);
     let [x, y] = mesh.reference_to_physical(k, r, s);
 
@@ -404,9 +405,9 @@ fn add_br1_tracer_diffusion<BC: TracerBoundaryCondition2D>(
     }
 
     if config.kappa_t > 0.0 {
-        let boundary_temperature_for_gradient = |k, face, _fi, node, _interior| {
+        let boundary_temperature_for_gradient = |k, face, fi, node, _interior| {
             boundary_tracer_concentration(
-                0, tracers, swe, mesh, ops, geom, config, time, k, face, node,
+                0, tracers, swe, mesh, ops, geom, config, time, k, face, fi, node,
             )
         };
         let grad_t = compute_br1_gradient_2d(
@@ -429,9 +430,9 @@ fn add_br1_tracer_diffusion<BC: TracerBoundaryCondition2D>(
     }
 
     if config.kappa_s > 0.0 {
-        let boundary_salinity_for_gradient = |k, face, _fi, node, _interior| {
+        let boundary_salinity_for_gradient = |k, face, fi, node, _interior| {
             boundary_tracer_concentration(
-                1, tracers, swe, mesh, ops, geom, config, time, k, face, node,
+                1, tracers, swe, mesh, ops, geom, config, time, k, face, fi, node,
             )
         };
         let grad_s =
@@ -479,58 +480,40 @@ pub fn compute_rhs_tracer_2d<BC: TracerBoundaryCondition2D>(
     let g = config.g;
 
     for k in ElementIndex::iter(mesh.n_elements) {
-        let j_inv = geom.det_j_inv[k.as_usize()];
-        let rx = geom.rx[k.as_usize()];
-        let ry = geom.ry[k.as_usize()];
-        let sx = geom.sx[k.as_usize()];
-        let sy = geom.sy[k.as_usize()];
+        let ki = k.as_usize();
 
-        // 1. Volume term: -∇·(hC **u**)
-        // Flux F = hC * u, G = hC * v
-        let mut flux_x = vec![ConservativeTracerState::zero(); n_nodes];
-        let mut flux_y = vec![ConservativeTracerState::zero(); n_nodes];
+        // 1. Volume term: -∇·(hC **u**) in conservative form,
+        //    −J⁻¹[Dr·(J∇r·F) + Ds·(J∇s·F)] with F = hC (u, v)
+        let mut flux_r = vec![ConservativeTracerState::zero(); n_nodes];
+        let mut flux_s = vec![ConservativeTracerState::zero(); n_nodes];
 
         for i in 0..n_nodes {
             let tracer = tracers.get_conservative(k, i);
             let swe_state = swe.get_state(k, i);
             let (u, v) = swe_state.velocity_simple(h_min);
+            let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(ki, i);
+            let (u_r, u_s) = (ar_x * u + ar_y * v, as_x * u + as_y * v);
 
-            flux_x[i] = ConservativeTracerState {
-                h_t: tracer.h_t * u,
-                h_s: tracer.h_s * u,
+            flux_r[i] = ConservativeTracerState {
+                h_t: tracer.h_t * u_r,
+                h_s: tracer.h_s * u_r,
             };
-            flux_y[i] = ConservativeTracerState {
-                h_t: tracer.h_t * v,
-                h_s: tracer.h_s * v,
+            flux_s[i] = ConservativeTracerState {
+                h_t: tracer.h_t * u_s,
+                h_s: tracer.h_s * u_s,
             };
         }
 
-        // Apply Dr and Ds to compute derivatives
         for i in 0..n_nodes {
-            let mut dfx_dr = ConservativeTracerState::zero();
-            let mut dfx_ds = ConservativeTracerState::zero();
-            let mut dfy_dr = ConservativeTracerState::zero();
-            let mut dfy_ds = ConservativeTracerState::zero();
-
+            let mut div_flux = ConservativeTracerState::zero();
             for j in 0..n_nodes {
-                let dr_ij = ops.dr[(i, j)];
-                let ds_ij = ops.ds[(i, j)];
-
-                dfx_dr = dfx_dr + dr_ij * flux_x[j];
-                dfx_ds = dfx_ds + ds_ij * flux_x[j];
-                dfy_dr = dfy_dr + dr_ij * flux_y[j];
-                dfy_ds = dfy_ds + ds_ij * flux_y[j];
+                div_flux = div_flux + ops.dr[(i, j)] * flux_r[j] + ops.ds[(i, j)] * flux_s[j];
             }
-
-            // Volume term: -(dF/dx + dG/dy)
-            let div_flux = dfx_dr * rx + dfx_ds * sx + dfy_dr * ry + dfy_ds * sy;
-            rhs.set_conservative(k, i, -1.0 * div_flux);
+            rhs.set_conservative(k, i, -geom.jacobian_inv(ki, i) * div_flux);
         }
 
-        // 2. Surface terms: LIFT_f * sJ_f * (F- - F*)
+        // 2. Surface terms: LIFT_f (sJ/J) (F- - F*) at every face node
         for face in 0..4 {
-            let normal = geom.normals[k.as_usize()][face];
-            let s_jac = geom.surface_j[k.as_usize()][face];
             let face_nodes = &ops.face_nodes[face];
 
             // Get exterior states
@@ -555,6 +538,7 @@ pub fn compute_rhs_tracer_2d<BC: TracerBoundaryCondition2D>(
                     (0..n_face_nodes)
                         .map(|i| {
                             let node_idx = face_nodes[i];
+                            let normal = geom.normal(ki, face, i);
                             let tracer = tracers.get_conservative(k, node_idx);
                             let swe_state = swe.get_state(k, node_idx);
                             let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
@@ -591,6 +575,7 @@ pub fn compute_rhs_tracer_2d<BC: TracerBoundaryCondition2D>(
 
             for i in 0..n_face_nodes {
                 let node_idx = face_nodes[i];
+                let normal = geom.normal(ki, face, i);
                 let tracer_int = tracers.get_conservative(k, node_idx);
                 let swe_int = swe.get_state(k, node_idx);
                 let (tracer_ext, swe_ext) = ext_states[i];
@@ -615,8 +600,8 @@ pub fn compute_rhs_tracer_2d<BC: TracerBoundaryCondition2D>(
                     h_s: tracer_int.h_s * un,
                 };
 
-                // Flux difference for surface term
-                flux_diff[i] = f_int - f_star;
+                // Flux difference for surface term, times sJ/J at the face node
+                flux_diff[i] = geom.lift_scale(ki, face, i, node_idx) * (f_int - f_star);
             }
 
             // Apply LIFT
@@ -624,11 +609,11 @@ pub fn compute_rhs_tracer_2d<BC: TracerBoundaryCondition2D>(
                 let mut lift_contrib = ConservativeTracerState::zero();
                 for fi in 0..n_face_nodes {
                     let lift_coeff = ops.lift[face][(i, fi)];
-                    lift_contrib = lift_contrib + lift_coeff * s_jac * flux_diff[fi];
+                    lift_contrib = lift_contrib + lift_coeff * flux_diff[fi];
                 }
 
                 let current = rhs.get_conservative(k, i);
-                rhs.set_conservative(k, i, current + j_inv * lift_contrib);
+                rhs.set_conservative(k, i, current + lift_contrib);
             }
         }
 
@@ -692,60 +677,42 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
         .enumerate()
         .for_each(|(k, rhs_chunk)| {
             let k_idx = ElementIndex::new(k);
-            let j_inv = geom.det_j_inv[k];
-            let rx = geom.rx[k];
-            let ry = geom.ry[k];
-            let sx = geom.sx[k];
-            let sy = geom.sy[k];
 
             // Element-local RHS storage
             let mut rhs_k = vec![ConservativeTracerState::zero(); n_nodes];
 
-            // 1. Volume term: -∇·(hC **u**)
-            let mut flux_x = vec![ConservativeTracerState::zero(); n_nodes];
-            let mut flux_y = vec![ConservativeTracerState::zero(); n_nodes];
+            // 1. Volume term: -∇·(hC **u**) in conservative form (see the
+            //    serial version)
+            let mut flux_r = vec![ConservativeTracerState::zero(); n_nodes];
+            let mut flux_s = vec![ConservativeTracerState::zero(); n_nodes];
 
             for i in 0..n_nodes {
                 let tracer = tracers.get_conservative(k_idx, i);
                 let swe_state = swe.get_state(k_idx, i);
                 let (u, v) = swe_state.velocity_simple(h_min);
+                let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, i);
+                let (u_r, u_s) = (ar_x * u + ar_y * v, as_x * u + as_y * v);
 
-                flux_x[i] = ConservativeTracerState {
-                    h_t: tracer.h_t * u,
-                    h_s: tracer.h_s * u,
+                flux_r[i] = ConservativeTracerState {
+                    h_t: tracer.h_t * u_r,
+                    h_s: tracer.h_s * u_r,
                 };
-                flux_y[i] = ConservativeTracerState {
-                    h_t: tracer.h_t * v,
-                    h_s: tracer.h_s * v,
+                flux_s[i] = ConservativeTracerState {
+                    h_t: tracer.h_t * u_s,
+                    h_s: tracer.h_s * u_s,
                 };
             }
 
-            // Apply Dr and Ds to compute derivatives
             for i in 0..n_nodes {
-                let mut dfx_dr = ConservativeTracerState::zero();
-                let mut dfx_ds = ConservativeTracerState::zero();
-                let mut dfy_dr = ConservativeTracerState::zero();
-                let mut dfy_ds = ConservativeTracerState::zero();
-
+                let mut div_flux = ConservativeTracerState::zero();
                 for j in 0..n_nodes {
-                    let dr_ij = ops.dr[(i, j)];
-                    let ds_ij = ops.ds[(i, j)];
-
-                    dfx_dr = dfx_dr + dr_ij * flux_x[j];
-                    dfx_ds = dfx_ds + ds_ij * flux_x[j];
-                    dfy_dr = dfy_dr + dr_ij * flux_y[j];
-                    dfy_ds = dfy_ds + ds_ij * flux_y[j];
+                    div_flux = div_flux + ops.dr[(i, j)] * flux_r[j] + ops.ds[(i, j)] * flux_s[j];
                 }
-
-                // Volume term: -(dF/dx + dG/dy)
-                let div_flux = dfx_dr * rx + dfx_ds * sx + dfy_dr * ry + dfy_ds * sy;
-                rhs_k[i] = -1.0 * div_flux;
+                rhs_k[i] = -geom.jacobian_inv(k, i) * div_flux;
             }
 
-            // 2. Surface terms: LIFT_f * sJ_f * (F- - F*)
+            // 2. Surface terms: LIFT_f (sJ/J) (F- - F*) at every face node
             for face in 0..4 {
-                let normal = geom.normals[k][face];
-                let s_jac = geom.surface_j[k][face];
                 let face_nodes = &ops.face_nodes[face];
 
                 // Get exterior states
@@ -767,6 +734,7 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
                     (0..n_face_nodes)
                         .map(|i| {
                             let node_idx = face_nodes[i];
+                            let normal = geom.normal(k, face, i);
                             let tracer = tracers.get_conservative(k_idx, node_idx);
                             let swe_state = swe.get_state(k_idx, node_idx);
                             let (r, s) = (ops.nodes_r[node_idx], ops.nodes_s[node_idx]);
@@ -802,6 +770,7 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
                 let mut flux_diff = vec![ConservativeTracerState::zero(); n_face_nodes];
                 for i in 0..n_face_nodes {
                     let node_idx = face_nodes[i];
+                    let normal = geom.normal(k, face, i);
                     let tracer_int = tracers.get_conservative(k_idx, node_idx);
                     let swe_int = swe.get_state(k_idx, node_idx);
                     let (tracer_ext, swe_ext) = ext_states[i];
@@ -826,7 +795,7 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
                         h_s: tracer_int.h_s * un,
                     };
 
-                    flux_diff[i] = f_int - f_star;
+                    flux_diff[i] = geom.lift_scale(k, face, i, node_idx) * (f_int - f_star);
                 }
 
                 // Apply LIFT
@@ -834,9 +803,9 @@ pub fn compute_rhs_tracer_2d_parallel<BC: TracerBoundaryCondition2D>(
                     let mut lift_contrib = ConservativeTracerState::zero();
                     for fi in 0..n_face_nodes {
                         let lift_coeff = ops.lift[face][(i, fi)];
-                        lift_contrib = lift_contrib + lift_coeff * s_jac * flux_diff[fi];
+                        lift_contrib = lift_contrib + lift_coeff * flux_diff[fi];
                     }
-                    rhs_k[i] = rhs_k[i] + j_inv * lift_contrib;
+                    rhs_k[i] = rhs_k[i] + lift_contrib;
                 }
             }
 
@@ -884,7 +853,7 @@ pub fn compute_dt_tracer_2d(
     let mut min_h_elem = f64::INFINITY;
 
     for k in ElementIndex::iter(mesh.n_elements) {
-        let h_elem = geom.det_j[k.as_usize()].sqrt() * 2.0;
+        let h_elem = geom.element_size(k.as_usize());
         min_h_elem = min_h_elem.min(h_elem);
 
         for i in 0..swe.n_nodes {
@@ -933,7 +902,7 @@ mod tests {
     fn create_test_setup(order: usize) -> (Mesh2D, DGOperators2D, GeometricFactors2D) {
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(order);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         (mesh, ops, geom)
     }
 
@@ -1057,8 +1026,8 @@ mod tests {
         let mut integral_h_t = 0.0;
         let mut integral_h_s = 0.0;
         for k in ElementIndex::iter(mesh.n_elements) {
-            let j = geom.det_j[k.as_usize()];
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(k.as_usize(), i);
                 let state = rhs.get_conservative(k, i);
                 integral_h_t += w * state.h_t * j;
                 integral_h_s += w * state.h_s * j;

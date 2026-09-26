@@ -420,8 +420,8 @@ impl TracerSolution2D {
     pub fn integrate_h_t(&self, ops: &DGOperators2D, geom: &GeometricFactors2D) -> f64 {
         let mut integral = 0.0;
         for k in ElementIndex::iter(self.n_elements) {
-            let j = geom.det_j[k];
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(k.as_usize(), i);
                 integral += w * self.get_h_t(k, i) * j;
             }
         }
@@ -432,8 +432,8 @@ impl TracerSolution2D {
     pub fn integrate_h_s(&self, ops: &DGOperators2D, geom: &GeometricFactors2D) -> f64 {
         let mut integral = 0.0;
         for k in ElementIndex::iter(self.n_elements) {
-            let j = geom.det_j[k];
             for (i, &w) in ops.weights.iter().enumerate() {
+                let j = geom.jacobian(k.as_usize(), i);
                 integral += w * self.get_h_s(k, i) * j;
             }
         }

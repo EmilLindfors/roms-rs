@@ -204,7 +204,7 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
 
     /// Limiter, then positivity and velocity desingularization (wet/dry).
     fn post_process(&self, state: &mut SWESolution2D) {
-        let ctx = LimiterContext2D::new(&self.mesh, &self.ops);
+        let ctx = LimiterContext2D::new(&self.mesh, &self.ops, &self.geom);
         // The wet/dry correction applies the same positivity limiter to every
         // element with a node below h_dry, which includes every element a
         // positivity limiter with a threshold ≤ h_dry changes: skip that pass
@@ -218,7 +218,7 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
             self.limiter.apply_counting(state, &ctx)
         };
         if let Some(ref config) = self.wet_dry {
-            clips += wet_dry_correction(state, &self.ops, config);
+            clips += wet_dry_correction(state, &self.geom, config);
         }
         if clips > 0 {
             self.negative_depth_clips
@@ -516,7 +516,7 @@ mod tests {
     fn create_test_components() -> (Arc<Mesh2D>, Arc<DGOperators2D>, Arc<GeometricFactors2D>) {
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2));
         let ops = Arc::new(DGOperators2D::new(2));
-        let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         (mesh, ops, geom)
     }
 
@@ -527,13 +527,13 @@ mod tests {
     fn redundant_positivity_pass_is_skipped_exactly() {
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 6, 6));
         let ops = Arc::new(DGOperators2D::new(3));
-        let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let config = WetDryConfig::default();
         let h_dry = config.h_dry.meters();
         let physics = PhysicsBuilder::swe_2d(
             mesh.clone(),
             ops.clone(),
-            geom,
+            geom.clone(),
             ShallowWater2D::new(9.81),
             Reflective2D::default(),
         )
@@ -564,9 +564,9 @@ mod tests {
         }
 
         let mut expected = state.clone();
-        let ctx = LimiterContext2D::new(&mesh, &ops);
+        let ctx = LimiterContext2D::new(&mesh, &ops, &geom);
         let clips = StandardLimiter2D::Positivity(h_dry).apply_counting(&mut expected, &ctx)
-            + wet_dry_correction(&mut expected, &ops, &config);
+            + wet_dry_correction(&mut expected, &geom, &config);
         assert!(clips > 0, "the state should have negative-mean elements");
 
         physics.post_process(&mut state);

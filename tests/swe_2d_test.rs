@@ -58,7 +58,7 @@ fn ssp_rk3_swe_step<BC: dg_rs::SWEBoundaryCondition2D>(
 fn test_lake_at_rest() {
     let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(3);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -90,7 +90,7 @@ fn test_lake_at_rest() {
 fn test_lake_at_rest_perturbation() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 8, 8);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -141,7 +141,7 @@ fn test_lake_at_rest_perturbation() {
 fn test_mass_conservation_smooth() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 8, 8);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -221,7 +221,7 @@ fn test_mass_conservation_smooth() {
 fn test_circular_dam_break() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 8, 8);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -286,7 +286,7 @@ fn test_coriolis_effect() {
     // Small domain for simplicity
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
 
     // Norwegian coast Coriolis
     let f = 1.2e-4;
@@ -350,7 +350,7 @@ fn test_coriolis_effect() {
 fn test_flux_type_comparison() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
 
@@ -431,7 +431,7 @@ fn test_flux_type_comparison() {
 fn test_reflective_boundary() {
     let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -492,7 +492,7 @@ fn test_reflective_boundary() {
 fn test_long_term_stability() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -572,7 +572,7 @@ fn test_long_term_stability() {
 fn test_multi_day_stability() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(1); // P1 for speed
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new(); // Never called on periodic mesh
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
@@ -677,7 +677,7 @@ fn test_long_time_conservation() {
 
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(1); // P1 for speed
-    let geom = GeometricFactors2D::compute(&mesh);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new(); // Never called on periodic mesh
     let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);

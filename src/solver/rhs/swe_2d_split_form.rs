@@ -6,21 +6,24 @@
 //!
 //! # Semi-discrete form
 //!
-//! On a tensor-product GLL element with constant (affine) metrics, node
-//! `i = (a, j)` lies on r-line `j` and s-line `a`. With `D` the 1D GLL
-//! differentiation matrix, the element update is
+//! On a tensor-product GLL element, node `i = (a, j)` lies on r-line `j` and
+//! s-line `a`. With `D` the 1D GLL differentiation matrix, the contravariant
+//! vectors `Ja¹ = J∇r`, `Ja² = J∇s` at the nodes (`GeometricFactors2D`) and
+//! `{{Ja}}_ic = ½(Ja_i + Ja_c)`, the element update is (Wintermeyer et al.
+//! 2017, curvilinear form)
 //!
 //! ```text
-//! dq_i/dt = − Σ_c 2 D_ac F#(q_i, q_(c,j))·(r_x, r_y)
-//!           − Σ_c 2 D_jc F#(q_i, q_(a,c))·(s_x, s_y)
-//!           − g h_i (0, ∂_x B, ∂_y B)_i
-//!           + J⁻¹ Σ_f LIFT_f sJ_f (F(q⁻)·n − F*)
+//! J_i dq_i/dt = − Σ_c 2 D_ac F#(q_i, q_(c,j))·{{Ja¹}}_(i,(c,j)) − g h_i Σ_c D_ac B_(c,j) (0, {{Ja¹}}_(i,(c,j)))
+//!               − Σ_c 2 D_jc F#(q_i, q_(a,c))·{{Ja²}}_(i,(a,c)) − g h_i Σ_c D_jc B_(a,c) (0, {{Ja²}}_(i,(a,c)))
+//!               + Σ_f LIFT_f sJ_f (F(q⁻)·n − F*)
 //!
 //! F* = F#(q⁻, q⁺)·n + ½g h⁻ (B⁺ − B⁻)(0, n)    [ − ½λ H̄[[w]]  for EntropyStable ]
 //! ```
 //!
-//! where `(∂_x B, ∂_y B)_i = (r_x, r_y) Σ_c D_ac B_(c,j) + (s_x, s_y) Σ_c D_jc B_(a,c)`
-//! is the collocated bed derivative taken with the same `D`, and `F(q⁻) = F#(q⁻, q⁻)`.
+//! with `F(q⁻) = F#(q⁻, q⁻)`. On affine elements `Ja` is constant and this is
+//! the Cartesian split form with `Ja/J = ∇r, ∇s` and the collocated bed slope
+//! `g h_i ∇B_i`. At the faces `sJ n = ±Ja` of the face node, so the volume and
+//! surface terms telescope as in the affine case.
 //!
 //! # Properties
 //!
@@ -176,8 +179,15 @@ enum SurfaceFlux {
 pub(super) struct SplitFormWorkspace {
     /// Node states (with bed and velocity) of the current element
     nodes: Vec<SWENodeState2D>,
-    /// RHS accumulator of the current element
+    /// RHS accumulator of the current element, times J (divided out at the end)
     rhs: Vec<SWEState2D>,
+    /// Contravariant vector of the current line's direction (J∇r on r-lines,
+    /// J∇s on s-lines) at each node of the line
+    metric: Vec<(f64, f64)>,
+    /// Subcell interface metrics of the current line (`n_1d + 1` values):
+    /// `interfaces[a]` is the direction between subcells `a − 1` and `a`, the
+    /// node metrics at the two line ends
+    interfaces: Vec<(f64, f64)>,
     /// Reconstructed (left, right) face states of the subcells of one line
     faces: Vec<(SWENodeState2D, SWENodeState2D)>,
     /// Per face node (`face · n_1d + fi`): the first interior node of the
@@ -200,6 +210,8 @@ impl SplitFormWorkspace {
         Self {
             nodes: padded(n_nodes, SWENodeState2D::default()),
             rhs: padded(n_nodes, SWEState2D::zero()),
+            metric: padded(n_1d, (0.0, 0.0)),
+            interfaces: padded(n_1d + 1, (0.0, 0.0)),
             faces: padded(n_1d, Default::default()),
             outer: padded(4 * n_1d, None),
         }
@@ -297,12 +309,19 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             ElementIndex::new(edge.left.element),
             ElementIndex::new(right.element),
         );
-        let normal = self.geom.normals[edge.left.element][edge.left.face];
         let node = |k: ElementIndex, i: usize| {
             SWENodeState2D::new(&self.q.get_state(k, i), self.bed(k, i), h_min)
         };
         let (left_out, right_out) = out.split_at_mut(n_face_nodes);
+        // A parallelogram's faces are straight with a constant normal
+        let left = self.geom.element_geometry(edge.left.element);
+        let affine_normal = left.faces[edge.left.face].0;
         for (fi, &left_node) in self.ops.face_nodes[edge.left.face].iter().enumerate() {
+            let normal = if left.affine {
+                affine_normal
+            } else {
+                self.geom.normal(edge.left.element, edge.left.face, fi)
+            };
             let rfi = n_face_nodes - 1 - fi;
             let right_node = self.ops.face_nodes[right.face][rfi];
             let (f_left, f_right) = self.surface_flux(
@@ -375,39 +394,67 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             ws.rhs[i] = SWEState2D::zero();
         }
 
-        // 1. Volume term, line by line (node ordering i = j·n1 + a, r fastest):
-        //    flux differencing with the collocated bed slope, or subcell finite
-        //    volumes in elements with dry nodes.
-        let dir_r = (self.geom.rx[ki], self.geom.ry[ki]);
-        let dir_s = (self.geom.sx[ki], self.geom.sy[ki]);
+        // 1. Volume term (times J), line by line (node ordering i = j·n1 + a,
+        //    r fastest): flux differencing with the collocated bed slope, or
+        //    subcell finite volumes in elements with dry nodes. Each line uses
+        //    the contravariant vector of its direction at its nodes.
         let subcells = self
             .h_dry
             .is_some_and(|h_dry| ws.nodes.iter().any(|n| n.h < h_dry));
         if subcells {
             self.outer_nodes(k, ws);
         }
+        // A parallelogram has a constant metric: take it from the dense
+        // per-element geometry and skip the pair averages (the Cartesian
+        // split form)
+        let element = self.geom.element_geometry(ki);
+        let affine = element.affine;
+        let (affine_r, affine_s) = element.metric.contravariant();
         for line in 0..n1 {
+            let r_line = |a: usize| line * n1 + a;
+            let s_line = |j: usize| j * n1 + line;
+            // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2
+            // and 3 list their nodes in reverse
+            let (rev, fwd) = (n1 - 1 - line, line);
+
+            for a in 0..n1 {
+                ws.metric[a] = if affine {
+                    affine_r
+                } else {
+                    self.geom.contravariant(ki, r_line(a)).0
+                };
+            }
             if subcells {
-                // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2
-                // and 3 list their nodes in reverse
-                let (rev, fwd) = (n1 - 1 - line, line);
                 let ends = [ws.outer[3 * n1 + rev], ws.outer[n1 + fwd]];
-                self.line_subcells(ws, |a| line * n1 + a, ends, dir_r, g);
-                let ends = [ws.outer[fwd], ws.outer[2 * n1 + rev]];
-                self.line_subcells(ws, |j| j * n1 + line, ends, dir_s, g);
+                self.line_subcells(ws, r_line, ends, affine, g);
+            } else if affine {
+                self.line_volume::<true>(ws, r_line, affine_r, g);
             } else {
-                self.line_volume(ws, |a| line * n1 + a, dir_r, g);
-                self.line_volume(ws, |j| j * n1 + line, dir_s, g);
+                self.line_volume::<false>(ws, r_line, affine_r, g);
+            }
+
+            for j in 0..n1 {
+                ws.metric[j] = if affine {
+                    affine_s
+                } else {
+                    self.geom.contravariant(ki, s_line(j)).1
+                };
+            }
+            if subcells {
+                let ends = [ws.outer[fwd], ws.outer[2 * n1 + rev]];
+                self.line_subcells(ws, s_line, ends, affine, g);
+            } else if affine {
+                self.line_volume::<true>(ws, s_line, affine_s, g);
+            } else {
+                self.line_volume::<false>(ws, s_line, affine_s, g);
             }
         }
 
-        // 2. Surface terms: J⁻¹ LIFT sJ (F(q⁻)·n − F*). For GLL collocation LIFT
-        //    only couples a face node to itself. F* of interior faces comes
-        //    from the face pass (`edge_fluxes`), once per face for both sides.
-        let j_inv = self.geom.det_j_inv[ki];
+        // 2. Surface terms (times J): LIFT sJ (F(q⁻)·n − F*). For GLL
+        //    collocation LIFT only couples a face node to itself. F* of
+        //    interior faces comes from the face pass (`edge_fluxes`), once per
+        //    face for both sides.
         for face in 0..4 {
-            let normal = self.geom.normals[ki][face];
-            let scale = j_inv * self.geom.surface_j[ki][face];
             let edge_index = self.mesh.element_edges[ki][face];
             let edge = &self.mesh.edges[edge_index];
             // This side's slots in the face buffer, if the face is interior
@@ -417,6 +464,14 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             });
 
             for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
+                let (normal, scale) = if affine {
+                    element.faces[face]
+                } else {
+                    (
+                        self.geom.normal(ki, face, fi),
+                        self.geom.surface_jacobian(ki, face, fi),
+                    )
+                };
                 let q_int = ws.nodes[node];
                 let f_star = match slots {
                     Some(slots) => slots[fi],
@@ -445,22 +500,43 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
 
         let [out_h, out_hu, out_hv] = out;
         for (i, r) in ws.rhs.iter().enumerate() {
-            out_h[i] = r.h;
-            out_hu[i] = r.hu;
-            out_hv[i] = r.hv;
+            let j_inv = if affine {
+                element.metric.det_j_inv
+            } else {
+                self.geom.jacobian_inv(ki, i)
+            };
+            out_h[i] = j_inv * r.h;
+            out_hu[i] = j_inv * r.hu;
+            out_hv[i] = j_inv * r.hv;
         }
     }
 
-    /// Accumulate `−Σ_c 2 D_ac F#(q_a, q_c)·dir − g h_a (Σ_c D_ac B_c) dir` along
-    /// one line of nodes `idx(0..n1)`.
+    /// Accumulate (times J) the flux-differencing volume term with the bed
+    /// slope along one line of nodes `idx(0..n1)`,
     ///
-    /// `F#` is symmetric, so each pair is evaluated once and applied to both ends.
+    /// ```text
+    /// −Σ_c 2 D_ac F#(q_a, q_c)·{{Ja}}_ac − g h_a Σ_c D_ac B_c {{Ja}}_ac (0, 1, 1)
+    /// ```
+    ///
+    /// with `Ja` the contravariant vector of the line direction
+    /// ([`SplitFormWorkspace::metric`]) and `{{Ja}}_ac = ½(Ja_a + Ja_c)`
+    /// (Wintermeyer et al. 2017, curvilinear form). At lake at rest the two
+    /// terms leave `½g h_a η₀ (D Ja)_a`, which cancels between the r- and
+    /// s-lines by the discrete metric identities; on affine elements `Ja` is
+    /// constant and this is the Cartesian split form.
+    ///
+    /// `F#` is symmetric in its states (and `{{Ja}}` in its nodes), so each
+    /// pair is evaluated once and applied to both ends.
+    ///
+    /// `AFFINE`: the metric is constant along the line (a parallelogram,
+    /// [`SplitFormWorkspace::metric`] filled with one value), so the averages
+    /// are skipped.
     #[inline]
-    fn line_volume(
+    fn line_volume<const AFFINE: bool>(
         &self,
         ws: &mut SplitFormWorkspace,
         idx: impl Fn(usize) -> usize,
-        dir: (f64, f64),
+        affine_metric: (f64, f64),
         g: f64,
     ) {
         let n1 = self.ops.n_1d;
@@ -468,20 +544,41 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         for a in 0..n1 {
             let ia = idx(a);
             let q_a = ws.nodes[ia];
+            let m_a = if AFFINE { affine_metric } else { ws.metric[a] };
 
             // Diagonal pair F#(q_a, q_a) = F(q_a); D_aa ≠ 0 only at line ends
-            let mut acc = (2.0 * d1[a * n1 + a]) * wintermeyer_flux_2d(&q_a, &q_a, dir, g);
+            let mut acc = (2.0 * d1[a * n1 + a]) * wintermeyer_flux_2d(&q_a, &q_a, m_a, g);
             for c in (a + 1)..n1 {
                 let ic = idx(c);
-                let f = wintermeyer_flux_2d(&q_a, &ws.nodes[ic], dir, g);
+                let m = if AFFINE {
+                    m_a
+                } else {
+                    let m_c = ws.metric[c];
+                    (0.5 * (m_a.0 + m_c.0), 0.5 * (m_a.1 + m_c.1))
+                };
+                let f = wintermeyer_flux_2d(&q_a, &ws.nodes[ic], m, g);
                 acc = acc + (2.0 * d1[a * n1 + c]) * f;
                 ws.rhs[ic] = ws.rhs[ic] - (2.0 * d1[c * n1 + a]) * f;
             }
 
             if self.config.bathymetry.is_some() {
-                let db: f64 = (0..n1).map(|c| d1[a * n1 + c] * ws.nodes[idx(c)].b).sum();
-                let force = g * q_a.h * db;
-                acc = acc + SWEState2D::new(0.0, force * dir.0, force * dir.1);
+                // g h_a Σ_c D_ac {{Ja}}_ac B_c = ½g h_a [Ja_a (D B)_a + (D (Ja B))_a]
+                let (mut db, mut db_x, mut db_y) = (0.0, 0.0, 0.0);
+                for c in 0..n1 {
+                    let d_b = d1[a * n1 + c] * ws.nodes[idx(c)].b;
+                    db += d_b;
+                    if !AFFINE {
+                        db_x += d_b * ws.metric[c].0;
+                        db_y += d_b * ws.metric[c].1;
+                    }
+                }
+                let (db_x, db_y) = if AFFINE {
+                    (db * m_a.0, db * m_a.1)
+                } else {
+                    (0.5 * (db * m_a.0 + db_x), 0.5 * (db * m_a.1 + db_y))
+                };
+                let force = g * q_a.h;
+                acc = acc + SWEState2D::new(0.0, force * db_x, force * db_y);
             }
 
             ws.rhs[ia] = ws.rhs[ia] - acc;
@@ -541,41 +638,82 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         )
     }
 
-    /// Accumulate the subcell finite-volume update along one line of nodes
-    /// `idx(0..n1)`:
+    /// Accumulate (times J) the subcell finite-volume update along one line of
+    /// nodes `idx(0..n1)`:
     ///
     /// ```text
-    /// dq_a/dt = −(F̂_{a,a+1} − F̂_{a−1,a} − S_a) / w_a
-    /// S_a     = −½g (h_a,L + h_a,R)(B_a,R − B_a,L) (0, dir)
+    /// J dq_a/dt = −(F̂_{a,a+1} − F̂_{a−1,a} − S_a) / w_a
+    /// S_a       = −½g (h_a,L + h_a,R)(B_a,R − B_a,L) (0, m̄_a)
+    ///             + ¼g [(h_a,R + h_a)(B_a − B_a,R) + (h_a,L + h_a)(B_a − B_a,L)]
+    ///               (0, m_{a,a+1} − m_{a−1,a})
     /// ```
     ///
     /// with the hydrostatic HLL flux on the reconstructed subcell face states
-    /// at the subcell interfaces, and the physical flux `F(q)·dir` at the two
+    /// at the subcell interfaces, and the physical flux `F(q)·Ja` at the two
     /// ends, which the surface term then replaces by `F*`. See
     /// [`reconstruct_subcell`] for the face states.
     ///
+    /// **Metrics.** Interface `(a, a+1)` has the direction
+    /// `m_{a,a+1} = Σ_{k≤a} Σ_{l>a} 2 Q_kl {{Ja}}_kl` (`Q = W D`), the metric
+    /// under which the flux-differencing volume term telescopes into subcell
+    /// fluxes (Fisher et al. 2013; Hennemann et al. 2021 on curvilinear
+    /// meshes); the line ends use `Ja` of the end nodes. Then
+    /// `m_{a,a+1} − m_{a−1,a} = w_a (D Ja)_a`, so a uniform state is preserved
+    /// by the discrete metric identities. On affine elements every `m` is `Ja`.
+    ///
+    /// **Bed term.** `m̄_a` is the mean of the subcell's two interface
+    /// metrics. The second term vanishes on affine elements and on a flat bed
+    /// (so momentum stays conserved there). At lake at rest it equals
+    /// `¼g(h_L² + h_R² − 2h_a²)(m_{a,a+1} − m_{a−1,a})` (wet: `h + B = η₀` at
+    /// the node and its faces; dry: all depths zero), which turns the metric
+    /// part of the pressure difference, `¼g(h_L² + h_R²)(m_{a,a+1} −
+    /// m_{a−1,a})`, into `½g h_a²(m_{a,a+1} − m_{a−1,a})`; that cancels between
+    /// the r- and s-lines of the node by the metric identities. For smooth flow
+    /// it is second-order small (a bed difference times a metric difference).
+    ///
     /// `ends` are the outer neighbours of the two end nodes (see
     /// [`SplitFormWorkspace::outer`]); an end subcell without one (physical
-    /// boundary) keeps its node state.
+    /// boundary) keeps its node state. `affine`: the metric is constant (every
+    /// interface metric is `Ja`).
     #[inline]
     fn line_subcells(
         &self,
         ws: &mut SplitFormWorkspace,
         idx: impl Fn(usize) -> usize,
         ends: [Option<(SWENodeState2D, f64)>; 2],
-        dir: (f64, f64),
+        affine: bool,
         g: f64,
     ) {
         let n1 = self.ops.n_1d;
         let w = &self.ops.weights_1d;
         let xi = &self.ops.nodes_1d;
+        let d1 = &self.ops.dr_1d_row_major;
+
+        // Interface metrics, m_{a,a+1} = m_{a−1,a} + Σ_{c≠a} 2 w_a D_ac {{Ja}}_ac
+        // from zero (the telescoping sum of the flux-differencing term)
+        if affine {
+            ws.interfaces[..=n1].fill(ws.metric[0]);
+        } else {
+            ws.interfaces[0] = ws.metric[0];
+            let mut m = (0.0, 0.0);
+            for a in 0..n1 - 1 {
+                for c in (0..n1).filter(|&c| c != a) {
+                    let q2 = 2.0 * w[a] * d1[a * n1 + c];
+                    m.0 += q2 * 0.5 * (ws.metric[a].0 + ws.metric[c].0);
+                    m.1 += q2 * 0.5 * (ws.metric[a].1 + ws.metric[c].1);
+                }
+                ws.interfaces[a + 1] = m;
+            }
+            ws.interfaces[n1] = ws.metric[n1 - 1];
+        }
 
         let (first, last) = (idx(0), idx(n1 - 1));
         let (q_first, q_last) = (ws.nodes[first], ws.nodes[last]);
+        let (m_first, m_last) = (ws.metric[0], ws.metric[n1 - 1]);
         ws.rhs[first] =
-            ws.rhs[first] + (1.0 / w[0]) * wintermeyer_flux_2d(&q_first, &q_first, dir, g);
+            ws.rhs[first] + (1.0 / w[0]) * wintermeyer_flux_2d(&q_first, &q_first, m_first, g);
         ws.rhs[last] =
-            ws.rhs[last] - (1.0 / w[n1 - 1]) * wintermeyer_flux_2d(&q_last, &q_last, dir, g);
+            ws.rhs[last] - (1.0 / w[n1 - 1]) * wintermeyer_flux_2d(&q_last, &q_last, m_last, g);
 
         // Face states. Subcell a spans [x_a, x_a + w_a] with x_0 = −1; the
         // end nodes sit on the element faces, where the face value is the node
@@ -605,16 +743,33 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
 
         for a in 0..n1 - 1 {
             let (ia, ib) = (idx(a), idx(a + 1));
-            let (f_a, f_b) = self.hydrostatic_hll(&ws.faces[a].1, &ws.faces[a + 1].0, dir, g);
+            let m = ws.interfaces[a + 1];
+            let (f_a, f_b) = self.hydrostatic_hll(&ws.faces[a].1, &ws.faces[a + 1].0, m, g);
             ws.rhs[ia] = ws.rhs[ia] - (1.0 / w[a]) * f_a;
             ws.rhs[ib] = ws.rhs[ib] + (1.0 / w[a + 1]) * f_b;
         }
 
-        // Bed-slope term, zero in subcells without a slope (B_L = B_R)
+        // Bed-slope term, zero in subcells without a slope (B_L = B_R), and
+        // the metric balance term, zero on affine elements
         for (a, ((left, right), w_a)) in ws.faces.iter().zip(w).enumerate() {
-            let force = -0.5 * g * (left.h + right.h) * (right.b - left.b) / w_a;
             let ia = idx(a);
-            ws.rhs[ia] = ws.rhs[ia] + SWEState2D::new(0.0, force * dir.0, force * dir.1);
+            let bed = -0.5 * g * (left.h + right.h) * (right.b - left.b) / w_a;
+            let (force_x, force_y) = if affine {
+                let m = ws.metric[0];
+                (bed * m.0, bed * m.1)
+            } else {
+                let (m_l, m_r) = (ws.interfaces[a], ws.interfaces[a + 1]);
+                let (h_a, b_a) = (ws.nodes[ia].h, ws.nodes[ia].b);
+                let metric = 0.25
+                    * g
+                    * ((right.h + h_a) * (b_a - right.b) + (left.h + h_a) * (b_a - left.b))
+                    / w_a;
+                (
+                    bed * 0.5 * (m_l.0 + m_r.0) + metric * (m_r.0 - m_l.0),
+                    bed * 0.5 * (m_l.1 + m_r.1) + metric * (m_r.1 - m_l.1),
+                )
+            };
+            ws.rhs[ia] = ws.rhs[ia] + SWEState2D::new(0.0, force_x, force_y);
         }
     }
 
@@ -623,8 +778,16 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let ops = self.ops;
         let n1 = ops.n_1d;
         let h_min = self.config.equation.h_min.meters();
-        // Element height normal to a face (affine), in physical units / 2
-        let height = |e: usize, f: usize| self.geom.det_j[e] / self.geom.surface_j[e][f];
+        // Element height normal to a face at a face node, in physical units / 2:
+        // J / sJ there (constant on a parallelogram)
+        let height = |e: usize, f: usize, fi: usize, node: usize| {
+            let element = self.geom.element_geometry(e);
+            if element.affine {
+                element.metric.det_j / element.faces[f].1
+            } else {
+                self.geom.jacobian(e, node) / self.geom.surface_jacobian(e, f, fi)
+            }
+        };
         for face in 0..4 {
             let neighbor = self.mesh.neighbor(k, face);
             for fi in 0..n1 {
@@ -638,9 +801,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
                         2 => nb_node - n1,
                         _ => nb_node + 1,
                     };
+                    let own_node = ops.face_nodes[face][fi];
                     let distance = (ops.nodes_1d[1] - ops.nodes_1d[0])
-                        * height(nb.element, nb.face)
-                        / height(k.as_usize(), face);
+                        * height(nb.element, nb.face, n1 - 1 - fi, nb_node)
+                        / height(k.as_usize(), face, fi, own_node);
                     let state = self.q.get_state(nb_k, inner);
                     (
                         SWENodeState2D::new(&state, self.bed(nb_k, inner), h_min),
@@ -720,7 +884,7 @@ mod tests {
             Mesh2D::uniform_rectangle(0.0, L, 0.0, 0.5 * L, 8, 5)
         };
         let ops = DGOperators2D::new(order);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, smooth_bed);
         match bed {
             Bed::Smooth => {}
@@ -761,7 +925,7 @@ mod tests {
         q
     }
 
-    /// Σ_k J_k Σ_i ω_i f(k, i)
+    /// Σ_k Σ_i ω_i J_ki f(k, i)
     fn integrate(
         mesh: &Mesh2D,
         ops: &DGOperators2D,
@@ -770,9 +934,8 @@ mod tests {
     ) -> f64 {
         let mut total = 0.0;
         for k in ElementIndex::iter(mesh.n_elements) {
-            let j = geom.det_j[k.as_usize()];
-            for (i, &w) in ops.weights.iter().enumerate() {
-                total += w * j * f(k, i);
+            for i in 0..ops.n_nodes {
+                total += geom.mass[geom.node_index(k.as_usize(), i)] * f(k, i);
             }
         }
         total
@@ -1134,7 +1297,7 @@ mod tests {
         let (mesh, _) = full.retain_elements(|k| !island(k), BoundaryTag::Wall);
         assert!(mesh.n_elements < full.n_elements);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, smooth_bed);
         let config = SWE2DRhsConfig::new(&equation, &bc)
             .with_coriolis(false)
@@ -1161,7 +1324,7 @@ mod tests {
         let bc = Reflective2D::new();
         let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 4);
         let ops = DGOperators2D::new(3);
-        let geom = GeometricFactors2D::compute(&mesh);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
         let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
         for k in ElementIndex::iter(mesh.n_elements) {
             for i in 0..ops.n_nodes {

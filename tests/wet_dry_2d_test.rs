@@ -43,7 +43,7 @@ struct Setup {
 impl Setup {
     fn new(mesh: Mesh2D, order: usize) -> Self {
         let ops = Arc::new(DGOperators2D::new(order));
-        let geom = Arc::new(GeometricFactors2D::compute(&mesh));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         Self {
             mesh: Arc::new(mesh),
             ops,
@@ -106,12 +106,14 @@ impl Setup {
         q
     }
 
-    /// ∫ f(q, x, y) dA with the GLL quadrature (affine elements)
+    /// ∫ f(q, x, y) dA with the GLL quadrature
     fn integrate(&self, q: &SWESolution2D, f: impl Fn(SWEState2D, f64, f64) -> f64) -> f64 {
         self.nodes()
             .map(|(k, i)| {
                 let (x, y) = self.node_xy(k, i);
-                self.ops.weights[i] * self.geom.det_j[k.as_usize()] * f(q.get_state(k, i), x, y)
+                self.ops.weights[i]
+                    * self.geom.jacobian(k.as_usize(), i)
+                    * f(q.get_state(k, i), x, y)
             })
             .sum()
     }
