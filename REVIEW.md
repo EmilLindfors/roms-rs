@@ -275,7 +275,7 @@ G = ⟨RHS₃D⟩ (`mode_split.rs:116-117`) includes horizontal advection and Co
 
 - **(a) Missing thickness-change term.** T and S are stepped as concentrations. The RHS divides an inventory tendency by Hz (`advection_3d.rs:428,530,688`) and never includes −C·∂ₜHz/Hz. With the corrected Ω, a constant field obeys ∂ₜC = C·(∂ₜHz)/Hz, i.e. C ∝ D(t).
   - Consequence [S]: a 1 m tide over 20 m of water pumps salinity by ±1.7 psu, corrupting stratification, fronts and the PGF.
-- **(b) Ω at the wrong points** [V]. Ω is stored at layer centres (`vertical_velocity.rs:222-227`) and re-averaged to faces in the advection kernels (`advection_3d.rs:633,676`). The effective divergence becomes a 1-2-1 smoothing of the one continuity used.
+- **(b) Ω at the wrong points** [V]. *Fixed in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2): Ω is stored at the w-points.* Ω is stored at layer centres (`vertical_velocity.rs:222-227`) and re-averaged to faces in the advection kernels (`advection_3d.rs:633,676`). The effective divergence becomes a 1-2-1 smoothing of the one continuity used.
 - **(c) 2D/3D flux mismatch is hidden.** The linear correction forcing Ω(0) = 0 (`vertical_velocity.rs:208-220`) masks it:
   - Ω's face flux is Rusanov with |u| + √(gD) dissipation (`:170`);
   - the tracer flux uses |u|;
@@ -289,6 +289,8 @@ G = ⟨RHS₃D⟩ (`mode_split.rs:116-117`) includes horizontal advection and Co
   - Ω(0) = 0 then holds exactly and should be *asserted*, not forced.
 
 ### 3.2 [BLOCKER] Vertical momentum advection too large by a factor of D [V]
+
+*Status: the vertical term is fixed in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2) (TODO P0.16). The horizontal Hz-weighting below is still open (TODO P4.2).*
 
 `apply_vertical_advection_field` computes `(flux[l+1] − flux[l]) / d_sigma[l]` with flux = Ω·u (`advection_3d.rs:641`). Ω is in m/s: it integrates div(D·u)·dσ (`vertical_velocity.rs:62-70,203-205`). The divisor must be Hz = D·Δσ, as the tracer version already does (`:688`). The term is 200× too large in 200 m of water.
 
@@ -316,6 +318,8 @@ Real estuarine forcing is about 5e-5. The rx1 at GLL spacing is 7.7–40, and th
 **Fix:** Shchepetkin & McWilliams (2003) density-Jacobian, or z-level interpolation (Stelling & van Kester 1994; Berntsen 2002). At minimum, subtract a horizontal-mean ρ̄(z), integrate trapezoidally, and use the BR1 lifted gradient. Gate with a linear-N² lake at rest (≤ 1e-12) and a seamount test (Beckmann & Haidvogel 1993).
 
 ### 3.4 [MAJOR] Tracer flux leaks through coastal walls [V]
+
+*Status: fixed in [PR #12](https://github.com/EmilLindfors/roms-rs/pull/12) (TODO P0.22).*
 
 P0.7 fixed Ω and momentum. The tracer kernel still sets `u_ext = u_int` at physical boundaries (`advection_3d.rs:489-491`), so heat and salt cross the coastline while the mass flux is zero. The P0.7 test covers only the `reflect_velocity` helper.
 

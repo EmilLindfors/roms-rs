@@ -1,5 +1,17 @@
 # 3D Implementation Roadmap
 
+> **Status (2026-09-26): background only; the checklists below are not maintained.**
+> This plan dates from 2026-02-11. It is superseded by `TODO.md` Priority 4 ("3D Rebuilt on the ROMS Recipe"), and the current assessment is in `REVIEW.md` §2–§3.
+> The boxes are left unchecked even though most of the Phase 1–4 scaffolding exists:
+> - `vertical/` (`SigmaGrid`, stretchings);
+> - `Solution3D` (`solver/state/state_3d.rs`);
+> - `ModeSplitIntegrator` (`time/mode_split.rs`) and `Simulation3D`;
+> - the Ω diagnostic, implicit vertical diffusion and Pacanowski–Philander mixing (`physics/`);
+> - the 3D RHS: advection, Coriolis and a standard-form baroclinic PGF (`solver/rhs/`);
+> - the UNESCO and linear EOS.
+>
+> Track 3D work in `TODO.md` P4.1–P4.6, not here.
+
 This document outlines the implementation plan for extending the DG solver to 3D for Norwegian coastal ocean modeling. The approach follows ROMS-style hybrid discretization: **DG horizontal + finite-difference vertical** with sigma (terrain-following) coordinates and mode-split time stepping.
 
 ## Architecture Decision
