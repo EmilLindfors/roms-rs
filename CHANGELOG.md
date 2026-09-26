@@ -89,6 +89,12 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **API (3D, breaking): one barotropic pass per baroclinic step (TODO P4.1, PR 1).**
+  - `ModeSplitIntegrator::new()` takes no arguments; `n_bt` follows from the 2D CFL every step (`with_barotropic_cfl`, default 0.5, capped by the 2D module's `max_cfl`; `with_min_substeps`, at least `MIN_BAROTROPIC_SUBSTEPS` = 4). `last_substeps()` reports the last step's `n_bt`.
+  - `ModeSplitIntegrator::step` takes the 2D module (`&impl PhysicsModule<SWESolution2D>`) instead of an (η, ū, v̄) RHS closure, and a 3D RHS that writes into a buffer. It replaces `step` + `step_with_stage_hook`; the stage hook is always passed.
+  - `Hydrostatic3D::compute_rhs_2d` is removed (its (η, ū) ↔ transport conversion divided by an unguarded depth). New: `Hydrostatic3D::compute_rhs_3d_into`, `Simulation3D::integrator`, `BarotropicFilter`.
+  - `Simulation3D` refreshes the density at every 3D RK stage, not once per step.
+  - `Integrable::copy_from` for `Solution3D` copies in place (the derived `Clone` reallocated every stage buffer).
 - **API (boundary, breaking): the open-boundary zoo is replaced by `CharacteristicOBC` + providers (TODO P1.4).** Removed: `Flather2D` → `CharacteristicOBC::new(closure)`; `HarmonicFlather2D` → `CharacteristicOBC::new(HarmonicTide)`; `Radiation2D` → `CharacteristicOBC::still_water()` / `StillWater::at(η)`; `NestingBC2D` → `CharacteristicOBC::new(ParentTimeSeries)`; `OceanNestingBC2D` → `CharacteristicOBC::new(OceanModelState)` (the epoch is now a `ModelClock`; `OceanModelState::first_snapshot` gives the old default); `Chapman2D`, `ChapmanFlather2D` and `TSTOBC2D` (finite-difference remnants: Chapman's elevation blend is a reflecting clamp in DG, TST's "subtidal" velocity has no frequency separation); `SWE2DRhsConfig::{dt, with_dt}` and `BCContext2D::dt` (no callers). `TidalSimulationBuilder`'s Flather type builds a `CharacteristicOBC`. `HarmonicTidal2D` now wraps a `HarmonicTide` (`.tide`), and its `with_nodal_corrections` takes a `ModelClock` and the run midpoint instead of a Julian date.
 - **Tide-gauge validation pairs model and observations by time (TODO P1.4).** `StationValidationResult::compute` interpolates the model to the observation times inside its span, instead of requiring equal lengths and pairing by index. Both series must share a time axis (`ModelClock::unix`).
 - **`DragCoefficient::LargePond` is held at its 25 m/s value above 25 m/s** (2.1e-3), the edge of the fitted range, instead of growing without bound (TODO P1.4; drag saturates in strong winds, Powell et al. 2003).
@@ -169,6 +175,13 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Mode splitting damped the barotropic mode (3D, TODO P4.1).**
+  - SSP-RK3 wrapped a Forward Euler barotropic subcycle that ran in every stage, and advanced η/ū through the RK combination of the filtered stage maps. That is first order, and a seiche lost about 23 % of its amplitude per period (M2 3–14 %, `REVIEW.md` §2.1). It cost 6·n_bt 2D RHS per step.
+  - Now one SSP-RK3 barotropic pass per step steps the transport (h, hu, hv) through `SWEPhysics2D`, with its limiter, wet/dry and implicit damping at every stage. The pass covers ≈ 1.3·dt and costs ≈ 3.9·n_bt RHS.
+  - The substep states are averaged with the Shchepetkin & McWilliams (2005) power-law weights (r = 0.284), centred on t + dt. Their second moment is almost zero, so resolved barotropic motion loses ≈ 0.02–0.1 % of its amplitude per period at 50 steps per period, against 5 % for the old Hann window.
+  - The 3D stages see the barotropic state interpolated linearly to their stage times (constant rates, which SSP-RK3 integrates exactly).
+  - Tests: `seiche_amplitude_is_kept_by_the_mode_split` (extra loss over the 2D model 0.035 % per period, volume to round-off), the filter moment, centring and no-amplification tests, and `seiche_period_matches_analytic` tightened from 15 % to 2 %.
+  - Found on the way: at T = S = 0 the default `LinearEOS` gives ρ = 0.975 ρ₀, so the old seiche test ran with 2.5 % of −g∇η leaking through the "baroclinic" PGF. And because tracers are not yet constancy-preserving (P4.2), T and S drift with η under the tide, which damped a seiche by a further 0.6 % per period through the density. The seiche tests now use a density independent of T and S.
 - **`Simulation` callbacks drifted off their interval (simulation).** `with_callback_interval` fired at the first step past each interval, so callback (and output) times drifted by up to one dt per interval: hourly output at dt ≈ 0.7 s wandered off the hour. The step before each callback is now shortened to land on `t_start + k·interval` exactly. Test: `callbacks_land_on_the_interval`.
 - **NetCDF output time units (io, TODO P1.4).** `NetCDFWriter` labelled its `time` variable `seconds since 1970-01-01` but wrote simulation seconds, so every output file claimed to be from January 1970. The units now name the `ModelClock` epoch (`NetCDFWriterConfig::with_clock`; the default clock keeps Unix time). Test: `writer_time_units_name_the_model_epoch`.
 - **GeoTIFF georeferencing was never read (io, TODO P1.6).**

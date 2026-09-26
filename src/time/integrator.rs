@@ -622,6 +622,28 @@ impl Integrable for Solution3D {
             *x += c * y;
         }
     }
+
+    /// In place (the derived `Clone` reallocates every field).
+    fn copy_from(&mut self, other: &Self) {
+        if (self.n_elements, self.n_nodes, self.n_levels)
+            != (other.n_elements, other.n_nodes, other.n_levels)
+        {
+            *self = other.clone();
+            return;
+        }
+        self.eta.copy_from(&other.eta);
+        self.ubar.copy_from(&other.ubar);
+        self.vbar.copy_from(&other.vbar);
+        self.u.copy_from_slice(&other.u);
+        self.v.copy_from_slice(&other.v);
+        self.w.copy_from_slice(&other.w);
+        self.temp.copy_from_slice(&other.temp);
+        self.salt.copy_from_slice(&other.salt);
+        self.rho.copy_from_slice(&other.rho);
+        self.eddy_viscosity.copy_from_slice(&other.eddy_viscosity);
+        self.eddy_diffusivity
+            .copy_from_slice(&other.eddy_diffusivity);
+    }
 }
 
 #[cfg(test)]

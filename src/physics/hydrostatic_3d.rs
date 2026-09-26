@@ -14,12 +14,10 @@ use crate::physics::eos::EquationOfState;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::physics::vertical_velocity::compute_vertical_velocity;
-use crate::solver::DGSolution2D;
 use crate::solver::rhs::{
     ExtrapolationTracerBC3D, Rhs3DConfig, TracerBoundaryCondition3D, compute_rhs_3d,
 };
 use crate::solver::state::Solution3D;
-use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
 use crate::source::CoriolisSource2D;
 use crate::vertical::SigmaGrid;
@@ -149,9 +147,22 @@ where
     }
 
     /// Compute the 3D Right-Hand Side.
-    pub fn compute_rhs_3d(&self, state: &Solution3D, _time: f64) -> Solution3D {
-        // Create accumulator initialized to zero
+    pub fn compute_rhs_3d(&self, state: &Solution3D, time: f64) -> Solution3D {
         let mut rhs = Solution3D::new(state.n_elements, state.n_nodes, state.n_levels);
+        self.compute_rhs_3d_into(state, time, &mut rhs);
+        rhs
+    }
+
+    /// [`Self::compute_rhs_3d`] into `rhs`, which is overwritten: tendencies of
+    /// `u, v, temp, salt`, and zero for the barotropic fields, `w` and `rho`
+    /// (the mode splitter supplies the barotropic rates; `w` and `rho` are
+    /// diagnostics).
+    pub fn compute_rhs_3d_into(&self, state: &Solution3D, _time: f64, rhs: &mut Solution3D) {
+        rhs.eta.fill(0.0);
+        rhs.ubar.fill(0.0);
+        rhs.vbar.fill(0.0);
+        rhs.w.fill(0.0);
+        rhs.rho.fill(0.0);
 
         let config = Rhs3DConfig {
             mesh: &self.mesh,
@@ -180,81 +191,12 @@ where
             self.g,
         );
 
-        compute_rhs_3d(&mut rhs, state, &*w_vel, &config);
-
-        rhs
+        compute_rhs_3d(rhs, state, &w_vel, &config);
     }
 
     /// Update density field based on current temperature and salinity.
     pub fn update_density(&self, state: &mut Solution3D) {
         self.eos.update_density(state);
-    }
-
-    /// Compute the 2D Right-Hand Side (via sub-model).
-    ///
-    /// Adapts the individual 2D components to the `SWESolution2D` expected by `SWEPhysics2D`.
-    pub fn compute_rhs_2d(
-        &self,
-        eta: &DGSolution2D,
-        ubar: &DGSolution2D,
-        vbar: &DGSolution2D,
-        time: f64,
-    ) -> (DGSolution2D, DGSolution2D, DGSolution2D) {
-        // Construct temporary SWESolution2D
-        let mut state_2d = crate::solver::SWESolution2D::new(eta.n_elements, eta.n_nodes);
-
-        // Conversion:
-        // H = eta - bathymetry, where bathymetry is bed elevation B.
-        // Hu = H * ubar
-        // Hv = H * vbar
-
-        // We need to apply this conversion.
-        for k in 0..eta.n_elements {
-            let bath = self.bathymetry.element(crate::types::ElementIndex::new(k));
-            for i in 0..eta.n_nodes {
-                let idx = k * eta.n_nodes + i;
-                let h_val = eta.data[idx] - bath[i];
-                state_2d.data[SWE_VAR_H][idx] = h_val;
-                state_2d.data[SWE_VAR_HU][idx] = h_val * ubar.data[idx];
-                state_2d.data[SWE_VAR_HV][idx] = h_val * vbar.data[idx];
-            }
-        }
-
-        let rhs_2d = self.swe_physics.compute_rhs(&state_2d, time);
-
-        // Convert back to (d_eta, d_ubar, d_vbar)
-        // d_eta = d_H
-        // d_ubar = d(Hu/H) = (d(Hu) - u * dH) / H
-        // d_vbar = d(Hv/H) = (d(Hv) - v * dH) / H
-
-        let mut d_eta = DGSolution2D::new(eta.n_elements, eta.n_nodes);
-        let mut d_ubar = DGSolution2D::new(eta.n_elements, eta.n_nodes);
-        let mut d_vbar = DGSolution2D::new(eta.n_elements, eta.n_nodes);
-
-        d_eta.data.copy_from_slice(&rhs_2d.data[SWE_VAR_H]);
-
-        // In-place transformation for momentum
-        for k in 0..eta.n_elements {
-            let bath = self.bathymetry.element(crate::types::ElementIndex::new(k));
-            for i in 0..eta.n_nodes {
-                let idx = k * eta.n_nodes + i;
-                let h_val = eta.data[idx] - bath[i];
-                let inv_h = 1.0 / h_val;
-
-                let u = ubar.data[idx];
-                let v = vbar.data[idx];
-
-                let d_h = rhs_2d.data[SWE_VAR_H][idx];
-                let d_hu = rhs_2d.data[SWE_VAR_HU][idx];
-                let d_hv = rhs_2d.data[SWE_VAR_HV][idx];
-
-                // Chain rule: d(u) = d(Hu / H) = (d(Hu) - u*dH) / H
-                d_ubar.data[idx] = (d_hu - u * d_h) * inv_h;
-                d_vbar.data[idx] = (d_hv - v * d_h) * inv_h;
-            }
-        }
-
-        (d_eta, d_ubar, d_vbar)
     }
 
     /// Compute permissible time step based on 3D CFL condition.

@@ -4,69 +4,248 @@
 //!
 //! # Method
 //!
-//! The mode splitting technique solves the 2D barotropic equations (free surface and depth-averaged velocity)
-//! with a small time step `dt_bt` and the 3D baroclinic equations with a larger time step `dt_bc`.
+//! One baroclinic step `tⁿ → tⁿ⁺¹ = tⁿ + Δt` (Shchepetkin & McWilliams 2005, with
+//! SSP-RK3 in place of their forward-backward barotropic stepping):
 //!
-//! The coupling involves:
-//! 1.  Forcing the 2D mode with "slow" terms from the 3D mode (advection, diffusion, baroclinic pressure gradient).
-//! 2.  Accumulating time-averaged 2D fields over the barotropic sub-steps.
-//! 3.  Replacing the depth-averaged part of the 3D velocity with the time-averaged 2D velocity (reconciliation).
+//! 1. **Slow forcing.** The 3D RHS `R₃D` at `tⁿ`; its depth integral
+//!    `G = Dⁿ·⟨R₃D,u⟩` is a transport tendency, frozen over the step.
+//! 2. **One barotropic pass.** The 2D shallow-water module steps the transport
+//!    `(h, hu, hv)` plus `G` with SSP-RK3 substeps of `Δt/n_bt` over
+//!    `[tⁿ, tⁿ + M*·Δt/n_bt]`, `M* ≈ 1.3·n_bt`. `n_bt` follows from the 2D CFL
+//!    every step. The substep states are averaged with the power-law weights of
+//!    [`BarotropicFilter`], centred on `tⁿ⁺¹`; the average `(η̄, D̄ū)` is the new
+//!    barotropic state, with `ū = D̄ū / D̄`.
+//! 3. **3D stages.** SSP-RK3 on the 3D fields. In every stage the depth mean of
+//!    the velocity tendency is replaced by the constant rate `(ūⁿ⁺¹ − ūⁿ)/Δt`,
+//!    and `η, ū, v̄` get the same constant rates. SSP-RK3 reproduces a
+//!    constant-rate solution exactly, so each stage sees the barotropic state
+//!    linearly interpolated to its stage time, and the depth mean of `u` stays
+//!    equal to `ū`. Stage 1 reuses the `R₃D` of step 1.
+//! 4. **Implicit vertical diffusion**, then the depth mean of `u` is reset to `ū`.
 //!
-//! The current G-term splitter uses Forward Euler for the barotropic substeps.
-//! The coupled scheme is therefore reported as first order even though the slow
-//! 3D tendency evaluations are staged with SSP-RK3.
+//! The 2D positivity limiter and wet/dry treatment run after every barotropic
+//! RK stage (and on the filtered state, since the filter has small negative
+//! weights), and stiff 2D damping (implicit friction) is applied per stage, as
+//! in [`crate::simulation::Simulation`].
 //!
-//! # Split Methods
+//! # Accuracy and known gaps (TODO P4.1)
 //!
-//! - **ROMS**: Predictor-corrector approach.
-//! - **Thetis**: G-term coupling (simpler implementation).
+//! - The filter adds almost no damping to resolved barotropic motion
+//!   (≈ 0.03 % amplitude per period at 50 baroclinic steps per period; see
+//!   [`BarotropicFilter`]).
+//! - `G` is frozen at `tⁿ`, so the slow coupling is first order in `Δt`.
+//!   AB3 extrapolation to `tⁿ⁺½` comes with the `rufrc` construction.
+//! - `G` still contains the 3D advection and Coriolis terms that the 2D module
+//!   computes too (double count), and no surface/bottom stress; both are fixed
+//!   by `G = ∫R₃D dz + (τ_s − τ_b)/ρ₀ − R₂D(q̄ⁿ)`.
+//! - `R₃D` is still evaluated into a freshly allocated state (TODO P4.5).
 
 use crate::mesh::data::Bathymetry2D;
+use crate::physics::PhysicsModule;
 use crate::physics::vertical_diffusion::apply_vertical_diffusion;
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
-use crate::solver::DGSolution2D;
 use crate::solver::state::Solution3D;
-use crate::time::{Integrable, IntegratorInfo, SSPRK3, TimeIntegrator};
+use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
+use crate::solver::{DGSolution2D, SWESolution2D};
+use crate::time::{Integrable, IntegratorInfo, SSPRK3, StageWorkspace, TimeIntegrator};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
+
+/// Fewest barotropic substeps per baroclinic step. Below four the filter
+/// weights cannot be centred on `tⁿ⁺¹`.
+pub const MIN_BAROTROPIC_SUBSTEPS: usize = 4;
 
 /// Method for coupling barotropic and baroclinic modes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SplitMethod {
-    /// Thetis-style G-term coupling.
-    ///
-    /// Computes slow terms once per 3D step and applies them as forcing to the 2D mode.
+    /// Depth-integrated 3D tendency as forcing of one filtered barotropic pass.
     GTerm,
 }
 
-/// Mode-split time integrator.
+/// Primary weights of the barotropic time filter.
+///
+/// The power-law shape of Shchepetkin & McWilliams (2005, §2.3; ROMS
+/// `set_weights.F`, `POWER_LAW`):
+///
+/// ```text
+///     A(τ) = τ^p (1 − τ^q) − r·τ,   p = 2, q = 4, r = 0.284,   τ = m·s
+/// ```
+///
+/// for substeps `m = 1 … M*`, where `M*` is the last positive weight. The weights
+/// are normalised to sum to one, and the scale `s` is iterated until their
+/// centroid is exactly `n_bt` (time `tⁿ⁺¹`). The window is `M* ≈ 1.3·n_bt`
+/// substeps long.
+///
+/// The `−r·τ` term makes the first few weights slightly negative and brings the
+/// second moment about `tⁿ⁺¹` close to zero. For a wave of frequency `ω` the
+/// filter's amplitude response is `|Σ w_m e^{iω(t_m − tⁿ⁺¹)}| ≈ 1 − ω²μ₂/2`, and
+/// the barotropic state is restarted from the filtered value every step, so
+/// `μ₂` sets the damping of resolved barotropic motion. At 50 baroclinic steps
+/// per period:
+///
+/// | Window | μ₂ / Δt² | amplitude lost per period |
+/// |---|---|---|
+/// | Hann over `2Δt` (the previous filter) | 0.131 | 5.0 % |
+/// | power law, `r = 0` | 0.084 | 3.2 % |
+/// | power law, `r = 0.284` | ≈ 0.001 | 0.03 % |
+///
+/// `μ₂` stays positive, so no frequency is amplified (`r = 0.3` would amplify).
+#[derive(Clone, Debug)]
+pub struct BarotropicFilter {
+    n_bt: usize,
+    weights: Vec<f64>,
+}
+
+impl BarotropicFilter {
+    const R: f64 = 0.284;
+
+    /// Weights for `n_bt` substeps per baroclinic step (`n_bt ≥ 4`).
+    pub fn new(n_bt: usize) -> Self {
+        assert!(
+            n_bt >= MIN_BAROTROPIC_SUBSTEPS,
+            "the barotropic filter needs at least {MIN_BAROTROPIC_SUBSTEPS} substeps per \
+             baroclinic step, got {n_bt}"
+        );
+        let n = n_bt as f64;
+        let shape = |x: f64| x * x * (1.0 - x.powi(4)) - Self::R * x;
+
+        let mut weights = Vec::with_capacity(2 * n_bt);
+        let mut scale = 0.6 / n;
+        for _ in 0..200 {
+            // A(x) < 0 for x ≥ 1, so the last positive weight has m·s < 1
+            let m_max = (1.0 / scale).floor() as usize;
+            weights.clear();
+            weights.extend((1..=m_max).map(|m| shape(m as f64 * scale)));
+            while weights.last().is_some_and(|&w| w <= 0.0) {
+                weights.pop();
+            }
+            let sum: f64 = weights.iter().sum();
+            weights.iter_mut().for_each(|w| *w /= sum);
+            let centroid = Self::centroid(&weights);
+            if (centroid - n).abs() <= 1e-13 * n {
+                break;
+            }
+            scale *= centroid / n;
+        }
+        Self { n_bt, weights }
+    }
+
+    /// Substeps per baroclinic step (`Δt/Δt_bt`).
+    pub fn n_bt(&self) -> usize {
+        self.n_bt
+    }
+
+    /// Weight of the state after substep `m`, stored at index `m − 1`. The
+    /// window length `M*` is `weights().len()`.
+    pub fn weights(&self) -> &[f64] {
+        &self.weights
+    }
+
+    fn centroid(weights: &[f64]) -> f64 {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| (i + 1) as f64 * w)
+            .sum()
+    }
+}
+
+/// Field buffers sized on the first step and reused afterwards.
+struct Buffers {
+    /// `R₃D` at `tⁿ`, reused as the first 3D stage.
+    rhs_n: Solution3D,
+    /// Barotropic transport during the pass.
+    q: SWESolution2D,
+    /// Filtered transport.
+    q_avg: SWESolution2D,
+    /// Slow forcing `G` of the transport (zero for `h`).
+    forcing: SWESolution2D,
+    /// Depth means of the u/v tendency (or of u/v after diffusion).
+    mean_u: DGSolution2D,
+    mean_v: DGSolution2D,
+    /// Constant barotropic rates over the step.
+    rate_eta: DGSolution2D,
+    rate_ubar: DGSolution2D,
+    rate_vbar: DGSolution2D,
+}
+
+impl Buffers {
+    fn new(state: &Solution3D) -> Self {
+        let (ne, nn) = (state.n_elements, state.n_nodes);
+        Self {
+            rhs_n: Solution3D::new(ne, nn, state.n_levels),
+            q: SWESolution2D::new(ne, nn),
+            q_avg: SWESolution2D::new(ne, nn),
+            forcing: SWESolution2D::new(ne, nn),
+            mean_u: DGSolution2D::new(ne, nn),
+            mean_v: DGSolution2D::new(ne, nn),
+            rate_eta: DGSolution2D::new(ne, nn),
+            rate_ubar: DGSolution2D::new(ne, nn),
+            rate_vbar: DGSolution2D::new(ne, nn),
+        }
+    }
+}
+
+/// Mode-split time integrator: one filtered barotropic pass per baroclinic
+/// SSP-RK3 step (see the module docs).
 pub struct ModeSplitIntegrator {
-    /// Number of barotropic steps per baroclinic step.
-    pub n_bt_steps: usize,
     /// Coupling method.
     pub split_method: SplitMethod,
-    /// Internal 3D integrator (usually SSP-RK3).
-    bc_integrator: SSPRK3,
-    /// Temporary storage for 2D RHS forcing (G-terms).
-    g_term_u: DGSolution2D,
-    g_term_v: DGSolution2D,
+    barotropic_cfl: f64,
+    min_substeps: usize,
+    filter: Option<BarotropicFilter>,
+    buffers: Option<Buffers>,
+    stages_3d: StageWorkspace<Solution3D>,
+    stages_2d: StageWorkspace<SWESolution2D>,
+}
+
+impl Default for ModeSplitIntegrator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ModeSplitIntegrator {
-    /// Create a new mode-split integrator.
-    pub fn new(n_bt_steps: usize, template_2d: &DGSolution2D) -> Self {
-        assert!(
-            n_bt_steps > 0,
-            "ModeSplitIntegrator requires at least one barotropic substep"
-        );
+    /// Barotropic CFL used unless set with [`Self::with_barotropic_cfl`].
+    pub const DEFAULT_BAROTROPIC_CFL: f64 = 0.5;
 
+    /// Integrator with the default barotropic CFL and at least
+    /// [`MIN_BAROTROPIC_SUBSTEPS`] substeps per step.
+    pub fn new() -> Self {
         Self {
-            n_bt_steps,
             split_method: SplitMethod::GTerm,
-            bc_integrator: SSPRK3,
-            g_term_u: template_2d.zeros_like(),
-            g_term_v: template_2d.zeros_like(),
+            barotropic_cfl: Self::DEFAULT_BAROTROPIC_CFL,
+            min_substeps: MIN_BAROTROPIC_SUBSTEPS,
+            filter: None,
+            buffers: None,
+            stages_3d: StageWorkspace::new(),
+            stages_2d: StageWorkspace::new(),
         }
+    }
+
+    /// CFL number of the barotropic substeps, capped by the 2D module's
+    /// [`PhysicsModule::max_cfl`] (e.g. its wet/dry positivity bound).
+    pub fn with_barotropic_cfl(mut self, cfl: f64) -> Self {
+        assert!(cfl > 0.0, "barotropic CFL must be positive, got {cfl}");
+        self.barotropic_cfl = cfl;
+        self
+    }
+
+    /// Use at least `n` barotropic substeps per baroclinic step, even when the
+    /// 2D CFL allows fewer (`n ≥ 4`).
+    pub fn with_min_substeps(mut self, n: usize) -> Self {
+        assert!(
+            n >= MIN_BAROTROPIC_SUBSTEPS,
+            "at least {MIN_BAROTROPIC_SUBSTEPS} barotropic substeps are needed, got {n}"
+        );
+        self.min_substeps = n;
+        self
+    }
+
+    /// Barotropic substeps per baroclinic step used by the last step (0 before
+    /// the first step).
+    pub fn last_substeps(&self) -> usize {
+        self.filter.as_ref().map_or(0, BarotropicFilter::n_bt)
     }
 
     /// Perform one baroclinic (3D) time step.
@@ -74,14 +253,19 @@ impl ModeSplitIntegrator {
     /// # Arguments
     /// * `state` - Full 3D solution (modified in place).
     /// * `sigma` - Vertical grid for depth averaging.
-    /// * `dt` - Baroclinic time step (large step).
+    /// * `bathymetry` - Bed elevation `B`; the depth is `η − B`.
+    /// * `dt` - Baroclinic time step.
     /// * `t` - Current time.
-    /// * `forcing` - Surface and bottom forcing.
+    /// * `forcing` - Surface and bottom forcing (vertical diffusion).
     /// * `mixing` - Vertical mixing closure.
-    /// * `rhs_2d` - Function computing 2D RHS: f(eta, ubar, vbar, t) -> (d_eta, d_ubar, d_vbar).
-    /// * `rhs_3d` - Function computing 3D RHS: f(state_3d, t) -> state_3d.
+    /// * `barotropic` - 2D shallow-water module for the fast mode, in transport
+    ///   form `(h, hu, hv)`.
+    /// * `rhs_3d` - `f(state, t, out)`: overwrites `out` with the 3D tendency.
+    ///   Only `u, v, temp, salt` are used; the barotropic entries are replaced.
+    /// * `stage_hook` - Runs on every 3D stage value, including the last:
+    ///   limiters and the density update.
     #[allow(clippy::too_many_arguments)]
-    pub fn step<F2, F3>(
+    pub fn step<P, F3, H>(
         &mut self,
         state: &mut Solution3D,
         sigma: &SigmaGrid,
@@ -90,366 +274,172 @@ impl ModeSplitIntegrator {
         t: f64,
         forcing: &Forcing,
         mixing: &dyn VerticalMixing,
-        mut rhs_2d: F2,
+        barotropic: &P,
         mut rhs_3d: F3,
+        stage_hook: H,
     ) where
-        F2: FnMut(
-            &DGSolution2D,
-            &DGSolution2D,
-            &DGSolution2D,
-            f64,
-        ) -> (DGSolution2D, DGSolution2D, DGSolution2D),
-        F3: FnMut(&Solution3D, f64) -> Solution3D,
-    {
-        // Extract fields to avoid capturing self
-        let bc_integrator = &self.bc_integrator;
-        let g_term_u = &mut self.g_term_u;
-        let g_term_v = &mut self.g_term_v;
-        let n_bt_steps = self.n_bt_steps;
-
-        // 1. Explicit 3D Step with Mode Splitting
-        bc_integrator.step(state, dt, t, |s, t_| {
-            // 1. Calculate 3D RHS (Slow terms)
-            let rhs_slow = rhs_3d(s, t_);
-
-            // 2. Calculate depth-averaged slow forcing (G-terms)
-            Self::compute_depth_average_field_static(sigma, &rhs_slow.u, g_term_u);
-            Self::compute_depth_average_field_static(sigma, &rhs_slow.v, g_term_v);
-
-            // 3. Sub-cycle 2D equations with forcing G, using a cosine time
-            // filter centred at t_+dt (see `subcycle_barotropic_filtered`).
-            let (eta_sum, ubar_sum, vbar_sum) = Self::subcycle_barotropic_filtered(
-                &s.eta,
-                &s.ubar,
-                &s.vbar,
-                g_term_u,
-                g_term_v,
-                dt,
-                t_,
-                n_bt_steps,
-                &mut rhs_2d,
-            );
-
-            // 4. Construct total RHS
-            let mut rhs_total = rhs_slow.clone();
-
-            // Calculate effective 2D rates: (endpoint_new - old) / dt
-            let mut d_ubar_eff = ubar_sum.clone();
-            d_ubar_eff.axpy(-1.0, &s.ubar);
-            d_ubar_eff.scale(1.0 / dt);
-
-            let mut d_vbar_eff = vbar_sum.clone();
-            d_vbar_eff.axpy(-1.0, &s.vbar);
-            d_vbar_eff.scale(1.0 / dt);
-
-            let mut d_eta_eff = eta_sum.clone();
-            d_eta_eff.axpy(-1.0, &s.eta);
-            d_eta_eff.scale(1.0 / dt);
-
-            // Apply correction to 3D fields:
-            // rhs_total = rhs_slow - G + d_bar_eff
-            Self::apply_barotropic_correction_static(
-                sigma,
-                &mut rhs_total.u,
-                g_term_u,
-                &d_ubar_eff,
-            );
-            Self::apply_barotropic_correction_static(
-                sigma,
-                &mut rhs_total.v,
-                g_term_v,
-                &d_vbar_eff,
-            );
-
-            // Update 2D fields in rhs_total
-            rhs_total.eta = d_eta_eff;
-            rhs_total.ubar = d_ubar_eff;
-            rhs_total.vbar = d_vbar_eff;
-
-            rhs_total
-        });
-
-        // 2. Implicit Vertical Diffusion
-        // This updates u, v, temp, salt in place
-        apply_vertical_diffusion(state, sigma, bathymetry, dt, mixing, forcing);
-
-        // 3. Reconcile 2D/3D momentum (again)
-        // Diffusion changes vertical profile and thus depth average (due to stress).
-        // We must ensure that depth average matches state.ubar (which came from 2D mode).
-        // 2D mode included stress.
-        // 3D diffusion included stress.
-        // Ideally they match. But due to numerics, they might drift.
-        // We enforce: u_final = u_diffused - ubar_diffused + ubar_state
-
-        // Compute ubar_diffused
-        Self::compute_depth_average_field_static(sigma, &state.u, g_term_u); // reuse buffer
-        Self::compute_depth_average_field_static(sigma, &state.v, g_term_v);
-
-        // Apply correction: u += (ubar_state - ubar_diffused)
-        // Correction term = ubar_state - ubar_diffused
-        // My function `apply_barotropic_correction_static` does: u += (d_eff - G)
-        // We want u += (ubar_state - ubar_diffused)
-        // So pass d_eff = ubar_state, G = ubar_diffused.
-
-        Self::apply_barotropic_correction_static(sigma, &mut state.u, g_term_u, &state.ubar);
-        Self::apply_barotropic_correction_static(sigma, &mut state.v, g_term_v, &state.vbar);
-    }
-
-    /// Perform one baroclinic time step and run a hook after each explicit
-    /// baroclinic RK stage.
-    ///
-    /// The hook is applied before the next 3D RHS evaluation, which is the
-    /// correct point for bounds or positivity projections. Implicit vertical
-    /// diffusion and barotropic reconciliation are still applied after the
-    /// explicit RK stages.
-    #[allow(clippy::too_many_arguments)]
-    pub fn step_with_stage_hook<F2, F3, H>(
-        &mut self,
-        state: &mut Solution3D,
-        sigma: &SigmaGrid,
-        bathymetry: &Bathymetry2D,
-        dt: f64,
-        t: f64,
-        forcing: &Forcing,
-        mixing: &dyn VerticalMixing,
-        mut rhs_2d: F2,
-        mut rhs_3d: F3,
-        mut stage_hook: H,
-    ) where
-        F2: FnMut(
-            &DGSolution2D,
-            &DGSolution2D,
-            &DGSolution2D,
-            f64,
-        ) -> (DGSolution2D, DGSolution2D, DGSolution2D),
-        F3: FnMut(&Solution3D, f64) -> Solution3D,
+        P: PhysicsModule<SWESolution2D>,
+        F3: FnMut(&Solution3D, f64, &mut Solution3D),
         H: FnMut(&mut Solution3D),
     {
-        // Extract fields to avoid capturing self
-        let bc_integrator = &self.bc_integrator;
-        let g_term_u = &mut self.g_term_u;
-        let g_term_v = &mut self.g_term_v;
-        let n_bt_steps = self.n_bt_steps;
+        let Buffers {
+            rhs_n,
+            q,
+            q_avg,
+            forcing: g_term,
+            mean_u,
+            mean_v,
+            rate_eta,
+            rate_ubar,
+            rate_vbar,
+        } = self.buffers.get_or_insert_with(|| Buffers::new(state));
 
-        // 1. Explicit 3D Step with Mode Splitting
-        bc_integrator.step_with_stage_hook(
+        // 1. Slow forcing: G = Dⁿ·⟨R₃D⟩ at tⁿ, a transport tendency
+        rhs_3d(state, t, rhs_n);
+        depth_average(sigma, &rhs_n.u, mean_u);
+        depth_average(sigma, &rhs_n.v, mean_v);
+        to_transport(state, bathymetry, q);
+        g_term.data[SWE_VAR_H].fill(0.0);
+        for (idx, &h) in q.data[SWE_VAR_H].iter().enumerate() {
+            g_term.data[SWE_VAR_HU][idx] = h * mean_u.data[idx];
+            g_term.data[SWE_VAR_HV][idx] = h * mean_v.data[idx];
+        }
+
+        // 2. One filtered barotropic pass
+        let cfl = barotropic
+            .max_cfl()
+            .map_or(self.barotropic_cfl, |max| self.barotropic_cfl.min(max));
+        let dt_bt_max = barotropic.compute_dt(q, cfl);
+        assert!(
+            dt_bt_max > 0.0,
+            "barotropic time step {dt_bt_max} is not positive"
+        );
+        let n_bt = ((dt / dt_bt_max).ceil() as usize).max(self.min_substeps);
+        if self.filter.as_ref().is_none_or(|f| f.n_bt() != n_bt) {
+            self.filter = Some(BarotropicFilter::new(n_bt));
+        }
+        let filter = self.filter.as_ref().expect("filter was just set");
+        let dt_bt = dt / n_bt as f64;
+
+        q_avg.fill(0.0);
+        for (m, &w) in filter.weights().iter().enumerate() {
+            SSPRK3.step_with_relaxation(
+                q,
+                dt_bt,
+                t + m as f64 * dt_bt,
+                |s, time, out| {
+                    barotropic.compute_rhs_into(s, time, out);
+                    out.axpy(1.0, g_term);
+                },
+                |stage, from, dt_stage| barotropic.implicit_damping(stage, from, dt_stage),
+                |s| barotropic.post_process(s),
+                &mut self.stages_2d,
+            );
+            q_avg.axpy(w, q);
+        }
+        // The early weights are negative: restore positivity of the average
+        barotropic.post_process(q_avg);
+
+        // Constant barotropic rates over the step
+        for k in 0..state.n_elements {
+            let bed = bathymetry.element(ElementIndex::new(k));
+            for (i, &b) in bed.iter().enumerate() {
+                let idx = k * state.n_nodes + i;
+                let h = q_avg.data[SWE_VAR_H][idx];
+                let (ubar, vbar) = if h > 0.0 {
+                    (
+                        q_avg.data[SWE_VAR_HU][idx] / h,
+                        q_avg.data[SWE_VAR_HV][idx] / h,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                rate_eta.data[idx] = (h + b - state.eta.data[idx]) / dt;
+                rate_ubar.data[idx] = (ubar - state.ubar.data[idx]) / dt;
+                rate_vbar.data[idx] = (vbar - state.vbar.data[idx]) / dt;
+            }
+        }
+
+        // 3. 3D stages with the barotropic state prescribed
+        let mut first_stage = true;
+        SSPRK3.step_with_workspace(
             state,
             dt,
             t,
-            |s, t_| {
-                // 1. Calculate 3D RHS (Slow terms)
-                let rhs_slow = rhs_3d(s, t_);
-
-                // 2. Calculate depth-averaged slow forcing (G-terms)
-                Self::compute_depth_average_field_static(sigma, &rhs_slow.u, g_term_u);
-                Self::compute_depth_average_field_static(sigma, &rhs_slow.v, g_term_v);
-
-                // 3. Sub-cycle 2D equations with forcing G, using a cosine time
-                // filter centred at t_+dt (see `subcycle_barotropic_filtered`).
-                let (eta_sum, ubar_sum, vbar_sum) = Self::subcycle_barotropic_filtered(
-                    &s.eta,
-                    &s.ubar,
-                    &s.vbar,
-                    g_term_u,
-                    g_term_v,
-                    dt,
-                    t_,
-                    n_bt_steps,
-                    &mut rhs_2d,
-                );
-
-                // 4. Construct total RHS
-                let mut rhs_total = rhs_slow.clone();
-
-                let mut d_ubar_eff = ubar_sum.clone();
-                d_ubar_eff.axpy(-1.0, &s.ubar);
-                d_ubar_eff.scale(1.0 / dt);
-
-                let mut d_vbar_eff = vbar_sum.clone();
-                d_vbar_eff.axpy(-1.0, &s.vbar);
-                d_vbar_eff.scale(1.0 / dt);
-
-                let mut d_eta_eff = eta_sum.clone();
-                d_eta_eff.axpy(-1.0, &s.eta);
-                d_eta_eff.scale(1.0 / dt);
-
-                Self::apply_barotropic_correction_static(
-                    sigma,
-                    &mut rhs_total.u,
-                    g_term_u,
-                    &d_ubar_eff,
-                );
-                Self::apply_barotropic_correction_static(
-                    sigma,
-                    &mut rhs_total.v,
-                    g_term_v,
-                    &d_vbar_eff,
-                );
-
-                rhs_total.eta = d_eta_eff;
-                rhs_total.ubar = d_ubar_eff;
-                rhs_total.vbar = d_vbar_eff;
-
-                rhs_total
+            |s, time, out| {
+                if first_stage {
+                    out.copy_from(rhs_n);
+                    first_stage = false;
+                } else {
+                    rhs_3d(s, time, out);
+                }
+                depth_average(sigma, &out.u, mean_u);
+                depth_average(sigma, &out.v, mean_v);
+                shift_columns(&mut out.u, out.n_levels, mean_u, rate_ubar);
+                shift_columns(&mut out.v, out.n_levels, mean_v, rate_vbar);
+                out.eta.copy_from(rate_eta);
+                out.ubar.copy_from(rate_ubar);
+                out.vbar.copy_from(rate_vbar);
             },
-            |stage_state| stage_hook(stage_state),
+            stage_hook,
+            &mut self.stages_3d,
         );
 
-        // 2. Implicit Vertical Diffusion
+        // 4. Implicit vertical diffusion changes the depth mean through the
+        // surface and bottom stresses; reset it to the barotropic ū.
         apply_vertical_diffusion(state, sigma, bathymetry, dt, mixing, forcing);
-
-        // 3. Reconcile 2D/3D momentum after diffusion.
-        Self::compute_depth_average_field_static(sigma, &state.u, g_term_u);
-        Self::compute_depth_average_field_static(sigma, &state.v, g_term_v);
-
-        Self::apply_barotropic_correction_static(sigma, &mut state.u, g_term_u, &state.ubar);
-        Self::apply_barotropic_correction_static(sigma, &mut state.v, g_term_v, &state.vbar);
+        depth_average(sigma, &state.u, mean_u);
+        depth_average(sigma, &state.v, mean_v);
+        shift_columns(&mut state.u, state.n_levels, mean_u, &state.ubar);
+        shift_columns(&mut state.v, state.n_levels, mean_v, &state.vbar);
     }
+}
 
-    /// Sub-cycle the barotropic (2D) mode over the baroclinic step `dt` and
-    /// return a **cosine-time-filtered** estimate of `(eta, ubar, vbar)` at
-    /// `t0 + dt`.
-    ///
-    /// # Why filter instead of taking the endpoint
-    ///
-    /// The barotropic mode is integrated with Forward Euler at the fast step
-    /// `dt_bt = dt / n_bt_steps`. Sampling the raw subcycle state at `t0 + dt`
-    /// is a correct *unbiased* estimate for the slow trend, but it aliases the
-    /// fast free-surface oscillations (which live near the barotropic step) into
-    /// the baroclinic update. ROMS suppresses this with a time filter
-    /// (Shchepetkin & McWilliams 2005, §2.3): the fast loop overshoots `t0 + dt`
-    /// and the fields fed back to the slow mode are a *centred weighted average*
-    /// rather than a point sample.
-    ///
-    /// Here the fast loop runs over the extended window `[t0, t0 + 2·dt]`
-    /// (`2·n_bt_steps` substeps, `dt_bt` unchanged so the barotropic CFL is
-    /// preserved) and each post-step state at time `m·dt_bt` is accumulated with
-    /// a raised-cosine (Hann) weight
-    ///
-    /// ```text
-    ///     w_m = 1 − cos(π · m / n_bt_steps),   m = 1 … 2·n_bt_steps
-    /// ```
-    ///
-    /// which is zero at both window edges (`m = 0`, `m = 2·n_bt_steps`) and peaks
-    /// at `m = n_bt_steps` (time `t0 + dt`). The window is symmetric about
-    /// `t0 + dt`, so its first moment is exactly `t0 + dt`: for a constant
-    /// tendency the filtered value equals the true value at `t0 + dt` (verified
-    /// by `cosine_filter_is_centred_at_baroclinic_endpoint`), keeping the G-term
-    /// coupling consistent while damping the aliased fast oscillations.
-    ///
-    /// A shorter asymmetric power-law window (ROMS' default) would halve the
-    /// extra barotropic work; the symmetric Hann window is chosen here for
-    /// simplicity and provable centring.
-    #[allow(clippy::too_many_arguments)]
-    fn subcycle_barotropic_filtered<F2>(
-        eta0: &DGSolution2D,
-        ubar0: &DGSolution2D,
-        vbar0: &DGSolution2D,
-        g_term_u: &DGSolution2D,
-        g_term_v: &DGSolution2D,
-        dt: f64,
-        t0: f64,
-        n_bt_steps: usize,
-        rhs_2d: &mut F2,
-    ) -> (DGSolution2D, DGSolution2D, DGSolution2D)
-    where
-        F2: FnMut(
-            &DGSolution2D,
-            &DGSolution2D,
-            &DGSolution2D,
-            f64,
-        ) -> (DGSolution2D, DGSolution2D, DGSolution2D),
+/// Barotropic transport `(h, hu, hv)` with `h = η − B`.
+fn to_transport(state: &Solution3D, bathymetry: &Bathymetry2D, q: &mut SWESolution2D) {
+    for k in 0..state.n_elements {
+        let bed = bathymetry.element(ElementIndex::new(k));
+        for (i, &b) in bed.iter().enumerate() {
+            let idx = k * state.n_nodes + i;
+            let h = state.eta.data[idx] - b;
+            q.data[SWE_VAR_H][idx] = h;
+            q.data[SWE_VAR_HU][idx] = h * state.ubar.data[idx];
+            q.data[SWE_VAR_HV][idx] = h * state.vbar.data[idx];
+        }
+    }
+}
+
+/// Depth average of every column of a 3D field.
+fn depth_average(sigma: &SigmaGrid, field: &[f64], out: &mut DGSolution2D) {
+    for (mean, column) in out
+        .data
+        .iter_mut()
+        .zip(field.chunks_exact(sigma.n_levels()))
     {
-        let mut eta_sub = eta0.clone();
-        let mut ubar_sub = ubar0.clone();
-        let mut vbar_sub = vbar0.clone();
-
-        let n = n_bt_steps as f64;
-        let m_total = 2 * n_bt_steps; // extend the fast loop to [t0, t0 + 2·dt]
-        let dt_bt = dt / n; // preserve the barotropic CFL
-
-        let mut eta_avg = eta0.zeros_like();
-        let mut ubar_avg = ubar0.zeros_like();
-        let mut vbar_avg = vbar0.zeros_like();
-        let mut w_sum = 0.0;
-
-        let mut t_bt = t0;
-        for m in 1..=m_total {
-            let (d_eta, d_ubar, d_vbar) = rhs_2d(&eta_sub, &ubar_sub, &vbar_sub, t_bt);
-
-            // Barotropic subcycling is Forward Euler in the current G-term splitter.
-            eta_sub.axpy(dt_bt, &d_eta);
-
-            ubar_sub.axpy(dt_bt, &d_ubar);
-            ubar_sub.axpy(dt_bt, g_term_u); // baroclinic forcing
-
-            vbar_sub.axpy(dt_bt, &d_vbar);
-            vbar_sub.axpy(dt_bt, g_term_v); // baroclinic forcing
-
-            t_bt += dt_bt;
-
-            // Accumulate the post-step state at time m·dt_bt with a Hann weight
-            // centred on t0 + dt (m = n_bt_steps).
-            let w = 1.0 - (std::f64::consts::PI * m as f64 / n).cos();
-            eta_avg.axpy(w, &eta_sub);
-            ubar_avg.axpy(w, &ubar_sub);
-            vbar_avg.axpy(w, &vbar_sub);
-            w_sum += w;
-        }
-
-        let inv = 1.0 / w_sum;
-        eta_avg.scale(inv);
-        ubar_avg.scale(inv);
-        vbar_avg.scale(inv);
-        (eta_avg, ubar_avg, vbar_avg)
+        *mean = sigma.depth_average(column);
     }
+}
 
-    fn compute_depth_average_field_static(
-        sigma: &SigmaGrid,
-        u_3d: &[f64],
-        u_2d: &mut DGSolution2D,
-    ) {
-        let n_levels = sigma.n_levels();
-        for k in 0..u_2d.n_elements {
-            for i in 0..u_2d.n_nodes {
-                let col =
-                    Solution3D::get_column(u_3d, u_2d.n_nodes, n_levels, ElementIndex::new(k), i);
-                u_2d.data[k * u_2d.n_nodes + i] = sigma.depth_average(col);
-            }
-        }
-    }
-
-    fn apply_barotropic_correction_static(
-        sigma: &SigmaGrid,
-        u_3d: &mut [f64],
-        g_term: &DGSolution2D,
-        d_bar_eff: &DGSolution2D,
-    ) {
-        let n_levels = sigma.n_levels();
-        for k in 0..g_term.n_elements {
-            for i in 0..g_term.n_nodes {
-                let correction =
-                    d_bar_eff.data[k * g_term.n_nodes + i] - g_term.data[k * g_term.n_nodes + i];
-                let col = Solution3D::get_column_mut(
-                    u_3d,
-                    g_term.n_nodes,
-                    n_levels,
-                    ElementIndex::new(k),
-                    i,
-                );
-                for l in 0..n_levels {
-                    col[l] += correction;
-                }
-            }
-        }
+/// Shift every column uniformly so its depth mean goes from `from` to `to`.
+/// The σ-layer fractions sum to one, so a uniform shift changes the depth mean
+/// by exactly the shift.
+fn shift_columns(field: &mut [f64], n_levels: usize, from: &DGSolution2D, to: &DGSolution2D) {
+    for ((column, &a), &b) in field
+        .chunks_exact_mut(n_levels)
+        .zip(&from.data)
+        .zip(&to.data)
+    {
+        let shift = b - a;
+        column.iter_mut().for_each(|x| *x += shift);
     }
 }
 
 impl IntegratorInfo for ModeSplitIntegrator {
     fn name(&self) -> &'static str {
-        "mode-split-gterm-fe-subcycled"
+        "mode-split-filtered-ssprk3"
     }
 
+    /// First order: the slow forcing is frozen at `tⁿ` over the step.
     fn order(&self) -> usize {
         1
     }
@@ -463,7 +453,7 @@ impl IntegratorInfo for ModeSplitIntegrator {
     }
 
     fn stage_times(&self, dt: f64) -> Vec<f64> {
-        self.bc_integrator.stage_times(dt)
+        SSPRK3.stage_times(dt)
     }
 }
 
@@ -471,89 +461,118 @@ impl IntegratorInfo for ModeSplitIntegrator {
 mod tests {
     use super::*;
 
+    /// Moments of the filter about `tⁿ⁺¹`, in units of the baroclinic step.
+    fn central_moment(filter: &BarotropicFilter, k: i32) -> f64 {
+        let n = filter.n_bt() as f64;
+        filter
+            .weights()
+            .iter()
+            .enumerate()
+            .map(|(i, w)| w * (((i + 1) as f64 - n) / n).powi(k))
+            .sum()
+    }
+
+    /// `|Σ w_m e^{iω(t_m − tⁿ⁺¹)}|` at `ω·Δt = omega_dt`.
+    fn response(filter: &BarotropicFilter, omega_dt: f64) -> f64 {
+        let n = filter.n_bt() as f64;
+        let (re, im) = filter
+            .weights()
+            .iter()
+            .enumerate()
+            .fold((0.0, 0.0), |(re, im), (i, w)| {
+                let phase = omega_dt * ((i + 1) as f64 - n) / n;
+                (re + w * phase.cos(), im + w * phase.sin())
+            });
+        (re * re + im * im).sqrt()
+    }
+
     #[test]
     fn reports_coupled_split_accuracy_not_slow_integrator_accuracy() {
-        let template = DGSolution2D::new(1, 1);
-        let integrator = ModeSplitIntegrator::new(4, &template);
+        let integrator = ModeSplitIntegrator::new();
 
-        assert_eq!(integrator.name(), "mode-split-gterm-fe-subcycled");
+        assert_eq!(integrator.name(), "mode-split-filtered-ssprk3");
         assert_eq!(integrator.order(), 1);
         assert_eq!(integrator.n_stages(), 3);
         assert!(!integrator.is_ssp());
+        assert_eq!(integrator.last_substeps(), 0);
     }
 
     #[test]
-    #[should_panic(expected = "at least one barotropic substep")]
-    fn rejects_zero_barotropic_substeps() {
-        let template = DGSolution2D::new(1, 1);
-        let _ = ModeSplitIntegrator::new(0, &template);
+    #[should_panic(expected = "at least 4 barotropic substeps")]
+    fn rejects_too_few_barotropic_substeps() {
+        let _ = ModeSplitIntegrator::new().with_min_substeps(3);
     }
 
-    /// The cosine (Hann) time filter must be *centred* at `t0 + dt`: for a
-    /// constant barotropic tendency `d` and constant G-forcing `g`, the filtered
-    /// value must equal the exact endpoint `state0 + dt·(d + g)` — the value at
-    /// `t0 + dt`, NOT the extended-window endpoint `state0 + 2·dt·(d + g)`.
-    ///
-    /// This guards P0.6: a naive extended-window endpoint would double the
-    /// evolution, an unnormalised accumulation would blow up, and an off-centre
-    /// window would bias the slow trend. Only a properly centred, normalised
-    /// filter reproduces the constant-rate value exactly.
+    /// The filter must be normalised and centred on `tⁿ⁺¹` (P0.6: a filter
+    /// that is off-centre biases the slow trend; an unnormalised one blows up),
+    /// and its window must end within `2Δt`.
     #[test]
-    fn cosine_filter_is_centred_at_baroclinic_endpoint() {
-        let n_bt = 10usize;
-        let dt = 2.0;
+    fn filter_is_normalised_and_centred_on_the_baroclinic_endpoint() {
+        for n_bt in MIN_BAROTROPIC_SUBSTEPS..=200 {
+            let filter = BarotropicFilter::new(n_bt);
+            let w = filter.weights();
+            let sum: f64 = w.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-13, "n_bt {n_bt}: Σw = {sum}");
+            let centred = central_moment(&filter, 1);
+            assert!(
+                centred.abs() < 1e-6,
+                "n_bt {n_bt}: centroid off tⁿ⁺¹ by {centred} Δt"
+            );
+            assert!(
+                w.len() > n_bt && w.len() <= 2 * n_bt,
+                "n_bt {n_bt}: window of {} substeps",
+                w.len()
+            );
+        }
+    }
 
-        // Constant tendencies. rhs_2d yields d_eta, d_ubar, d_vbar; G-forcing is
-        // added separately inside the subcycle.
-        let d_eta_rate = 1.5;
-        let d_ubar_rate = 5.0;
-        let d_vbar_rate = -3.0;
-        let g_u = 2.0;
-        let g_v = 0.5;
+    /// A constant-rate barotropic signal is reproduced exactly at `tⁿ⁺¹`: the
+    /// value at the centroid, not at the end of the window.
+    #[test]
+    fn filter_reproduces_a_linear_signal_at_the_endpoint() {
+        let n_bt = 12;
+        let filter = BarotropicFilter::new(n_bt);
+        let dt = 30.0;
+        let rate = 0.7;
+        let filtered: f64 = filter
+            .weights()
+            .iter()
+            .enumerate()
+            .map(|(i, w)| w * rate * (i + 1) as f64 * dt / n_bt as f64)
+            .sum();
+        assert!((filtered - rate * dt).abs() < 1e-9 * rate * dt);
+    }
 
-        let zero = DGSolution2D::new(1, 1);
-        let mut g_term_u = DGSolution2D::new(1, 1);
-        g_term_u.fill(g_u);
-        let mut g_term_v = DGSolution2D::new(1, 1);
-        g_term_v.fill(g_v);
+    /// Resolved barotropic motion is neither amplified nor noticeably damped,
+    /// and the filter still damps what the baroclinic step cannot resolve.
+    #[test]
+    fn filter_barely_damps_resolved_waves_and_never_amplifies() {
+        for n_bt in [4, 5, 6, 10, 20, 30, 60, 120] {
+            let filter = BarotropicFilter::new(n_bt);
+            // Second moment positive (no amplification) and small (little damping)
+            let mu2 = central_moment(&filter, 2);
+            assert!(mu2 > 0.0 && mu2 < 0.02, "n_bt {n_bt}: μ₂ = {mu2}");
 
-        let mut rhs = |_e: &DGSolution2D, _u: &DGSolution2D, _v: &DGSolution2D, _t: f64| {
-            let mut d_eta = DGSolution2D::new(1, 1);
-            d_eta.fill(d_eta_rate);
-            let mut d_ubar = DGSolution2D::new(1, 1);
-            d_ubar.fill(d_ubar_rate);
-            let mut d_vbar = DGSolution2D::new(1, 1);
-            d_vbar.fill(d_vbar_rate);
-            (d_eta, d_ubar, d_vbar)
-        };
+            for j in 0..=400 {
+                let omega_dt = std::f64::consts::PI * j as f64 / 400.0;
+                let r = response(&filter, omega_dt);
+                assert!(r <= 1.0 + 1e-12, "n_bt {n_bt}: |R({omega_dt})| = {r}");
+            }
 
-        let (eta, ubar, vbar) = ModeSplitIntegrator::subcycle_barotropic_filtered(
-            &zero, &zero, &zero, &g_term_u, &g_term_v, dt, 0.0, n_bt, &mut rhs,
+            // 50 baroclinic steps per period: < 0.7 % amplitude per period
+            let per_step = response(&filter, 2.0 * std::f64::consts::PI / 50.0);
+            let per_period = 1.0 - per_step.powi(50);
+            assert!(
+                per_period < 7e-3,
+                "n_bt {n_bt}: {:.3} % lost per period",
+                100.0 * per_period
+            );
+        }
+        // n_bt ≥ 10: < 0.1 % per period
+        let per_step = response(
+            &BarotropicFilter::new(30),
+            2.0 * std::f64::consts::PI / 50.0,
         );
-
-        // eta has no G-forcing; ubar/vbar do.
-        let expect_eta = dt * d_eta_rate;
-        let expect_ubar = dt * (d_ubar_rate + g_u);
-        let expect_vbar = dt * (d_vbar_rate + g_v);
-
-        assert!(
-            (eta.data[0] - expect_eta).abs() < 1e-12,
-            "filtered eta {} != centred value {expect_eta}",
-            eta.data[0]
-        );
-        assert!(
-            (ubar.data[0] - expect_ubar).abs() < 1e-12,
-            "filtered ubar {} != centred value {expect_ubar}",
-            ubar.data[0]
-        );
-        assert!(
-            (vbar.data[0] - expect_vbar).abs() < 1e-12,
-            "filtered vbar {} != centred value {expect_vbar}",
-            vbar.data[0]
-        );
-
-        // Sanity: the extended-window endpoint (2·dt) would be twice as large,
-        // so the centred filter is unmistakably not the raw overshoot endpoint.
-        assert!((ubar.data[0] - 2.0 * expect_ubar).abs() > 1.0);
+        assert!(1.0 - per_step.powi(50) < 1e-3);
     }
 }
