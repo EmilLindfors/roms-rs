@@ -10,7 +10,6 @@ use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
 use dg_rs::simulation::Simulation3D;
-use dg_rs::solver::DGSolution2D;
 use dg_rs::solver::state::Solution3D;
 use dg_rs::time::ModeSplitIntegrator;
 use dg_rs::types::ElementIndex;
@@ -109,9 +108,8 @@ fn main() -> Result<(), String> {
     physics.update_density(&mut state);
 
     // 6. Setup Integrator
-    let template_2d = DGSolution2D::new(mesh.n_elements, ops.n_nodes);
-    // 10 barotropic steps per baroclinic step
-    let integrator = ModeSplitIntegrator::new(10, &template_2d);
+    // Barotropic substeps per baroclinic step follow from the 2D CFL
+    let integrator = ModeSplitIntegrator::new();
 
     // 7. Run Simulation
     let mut sim = Simulation3D::new(physics, integrator)

@@ -332,7 +332,8 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 
 ### P4.1 Mode splitting
 
-**Today:** SSP-RK3 wraps a Forward Euler barotropic subcycle that runs in every stage (`mode_split.rs:111-134`). It is first-order, and M2 loses 3–14 % per period. It costs 6·n_bt 2D RHS per step (Shchepetkin & McWilliams 2005; `REVIEW.md` §2).
+**Before PR 1:** SSP-RK3 wrapped a Forward Euler barotropic subcycle that ran in every stage. It was first-order, M2 lost 3–14 % per period, and it cost 6·n_bt 2D RHS per step (Shchepetkin & McWilliams 2005; `REVIEW.md` §2).
+**After PR 1:** one filtered pass per step, 0.02–0.1 % barotropic amplitude loss per period, ≈ 3.9·n_bt 2D RHS per step. The slow coupling stays first order (G frozen at tⁿ), and G still double-counts advection/Coriolis, until PR 2.
 
 **Target step n → n+1 (plan of 2026-09-26):**
 1. One 3D RHS at tⁿ, after refreshing density. It is reused as the first 3D RK stage.
@@ -354,13 +355,18 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
   - Rule: every term the 2D module computes (friction, wind, Coriolis) must also appear in ∫R₃D + stresses, and vice versa.
   - Risk: the 3D surface gradient does not lift η/pressure jumps at element faces (P4.3), so ∫R₃D − R₂D(q̄) can carry a spurious slow forcing. Probe it on Frøya bathymetry, at rest and in a seiche, before relying on it.
 
-**PR 1: one barotropic pass**
-- [ ] Barotropic state as transport (h, hu, hv) in a `SWESolution2D`, not η/ū/v̄. This removes the unguarded 1/h at `hydrostatic_3d.rs:242` and gives the fast mode positivity, limiter and wet/dry.
-- [ ] One SSP-RK3 barotropic pass per baroclinic step. Take η/ū out of the 3D RK combination.
-- [ ] Shchepetkin & McWilliams (2005) power-law filter over ≈ 1.5·dt, replacing the Hann window over 2·dt. Moment test: Σw = 1, centred at t + dt.
-- [ ] Barotropic CFL control: n_bt = ⌈dt/dt_bt,max⌉ every step.
-- [ ] Recompute density at every RK stage (frozen today, `simulation_3d.rs:150`).
-- [ ] One `step` (remove the `step`/`step_with_stage_hook` duplication). Use a workspace, not ~64 N₃D-sized arrays allocated per step.
+**PR 1: one barotropic pass** — done on `feat/p4-1-barotropic-pass`
+- [x] The fast pass steps transport (h, hu, hv) in a `SWESolution2D` through `SWEPhysics2D`: positivity, limiter, wet/dry and implicit damping at every stage. The unguarded 1/h (`Hydrostatic3D::compute_rhs_2d`) is gone.
+  - `Solution3D` still stores η/ū/v̄ as the slow barotropic state, with ū = D̄ū/D̄ after the pass (guarded for h̄ ≤ 0). The 3D kernels read η; moving them to h is P4.2 work.
+- [x] One SSP-RK3 barotropic pass per baroclinic step. η/ū/v̄ leave the 3D RK combination: the 3D stages get constant rates, i.e. the barotropic state linearly interpolated to each stage time.
+- [x] Shchepetkin & McWilliams (2005) power-law filter (p = 2, q = 4, r = 0.284) over ≈ 1.3·dt, replacing the Hann window over 2·dt.
+  - The r term makes the second moment about t + dt almost zero. Measured per-period amplitude loss at 50 steps per period: Hann 5.0 %, power law with r = 0: 3.2 %, r = 0.284: 0.02–0.1 % (n_bt 40–7). r = 0.3 amplifies.
+  - The centring iteration needs n_bt ≥ 4 (`MIN_BAROTROPIC_SUBSTEPS`).
+- [x] Barotropic CFL control: n_bt = max(4, ⌈dt/dt_bt,max⌉) every step, at `min(barotropic_cfl, max_cfl)`.
+- [x] Density refreshed at every 3D RK stage (`Simulation3D` stage hook).
+- [x] One `step`. The 3D and 2D stage buffers and the field buffers are reused across steps, and `Solution3D::copy_from` copies in place. Still allocating: `compute_rhs_3d` internals (P4.5).
+- [x] Gate: `seiche_amplitude_is_kept_by_the_mode_split`. It loses 0.035 % per period more than the 2D model at n_bt = 23 (was ≈ 23 % per period), and conserves volume to round-off.
+  - The 100-period form was cut to 10 periods: the loss per period is constant, and the test must stay cheap in debug CI (16 s).
 
 **PR 2: consistent slow forcing**
 - [ ] G-term = ∫R₃D dz − R₂D(q̄ⁿ) (`rufrc`) with AB3 extrapolation. Today it double-counts advection and Coriolis.
@@ -383,6 +389,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] Assert Ω(0) = 0 instead of forcing it with the linear correction.
 - [ ] One 3D face-state helper for physical boundaries shared by the Ω, momentum and tracer kernels (today each has its own copy of the wall logic; P0.7/P0.22 were the same bug found twice). It should take the boundary tag, so 3D open boundaries (volume flux from the 2D OBC / nesting, tracer from `TracerBoundaryCondition3D` on inflow) are added in one place for all three.
 - [ ] Step Hz·C and Hz·u (inventory form), then divide by the new Hz. Today a 1 m tide over 20 m of water pumps salinity by about ±1.7 psu.
+  - Measured side effect (2026-09-26): with a T/S-dependent EOS, the drift of T and S with η feeds a spurious baroclinic PGF into the mode-split G. It damps a barotropic seiche by 0.6 % per period (P1), or amplifies it by 0.4 % per period (P2), independent of amplitude and dt. The seiche tests use a density independent of T and S until this is fixed.
 
 ### P4.3 Pressure gradient and vertical grid
 - [ ] Balanced PGF: Shchepetkin & McWilliams (2003) density-Jacobian, or z-level interpolation. Lift pressure/η jumps at element faces.
@@ -527,7 +534,7 @@ Details are in `CHANGELOG.md` and git history. Caveats found on 2026-09-25 are n
 | 2D tidal cost vs ROMS (model estimate) | ~47× core-hours | ≤ 1× per unit accuracy (P3.2) |
 | Validated against observations | Mausund (Kartverket MSU), 15 days at 1 km: M2 1.03×, +5.4° (≈ +2.3° at 500 m); tidal-prediction RMSE 9.8 cm | 5+ tide gauges, ADCP |
 | Multi-day stability | One M2 cycle on Frøya (9,653 P2 elements, 11.4 min wall, 0 clips) | 30+ days, real domain |
-| 3D | Scaffolding; 2 blockers (tracer constancy P4.2, σ PGF P4.3); vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting first-order (P4.1) | stratified lake-at-rest, constancy, lock exchange |
+| 3D | Scaffolding; 2 blockers (tracer constancy P4.2, σ PGF P4.3); vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting: one filtered barotropic pass, 0.035 % seiche damping per period (P4.1 PR 1); slow coupling first-order until PR 2 | stratified lake-at-rest, constancy, lock exchange |
 | GPU | Non-functional (P0.11) | fixed or replaced (P2.7) |
 
 ---
