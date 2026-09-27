@@ -4,7 +4,10 @@
 //! - **Tidal constituents**: Harmonic data (amplitude, phase) for open boundary forcing
 //! - **Boundary time series**: Time-varying state data for nesting from parent models
 //! - **VTK output**: Solution visualization in ParaView (VTU format)
-//! - **NetCDF I/O**: CF-conventions output and forcing data input (requires `netcdf` feature)
+//! - **NetCDF I/O**: CF-conventions output (requires `netcdf` feature)
+//! - **Gridded external models**: parent ocean models (`OceanModelReader`) and
+//!   weather models (`AtmosphereReader`) on structured lon/lat grids
+//!   (`GeoGrid`, `FieldSeries`); NetCDF reading requires `netcdf`
 //! - **GeoTIFF bathymetry**: Load depth data from GeoTIFF raster files
 //! - **Coastline data**: Load coastline polygons from GSHHS shapefiles
 //! - **Coordinate projections**: Transform between geographic and Cartesian coordinates
@@ -72,18 +75,22 @@
 //! ```
 
 mod adcp_reader;
+mod atmosphere;
 mod bed_raster;
 mod coastline;
 mod constituent_reader;
 pub(crate) mod datetime;
+mod field_series;
+mod geo_grid;
 mod geotiff;
 #[cfg(feature = "netcdf")]
 mod netcdf_io;
-#[cfg(all(test, feature = "netcdf"))]
-pub(crate) use netcdf_io::test_files;
+#[cfg(feature = "netcdf")]
+mod netcdf_read;
 #[cfg(feature = "parquet")]
 mod norkyst_parquet;
 mod norkyst_reader;
+mod ocean_model;
 mod projection;
 mod tide_gauge_reader;
 mod timeseries_reader;
@@ -91,18 +98,23 @@ mod vtk;
 mod z_levels;
 
 pub use adcp_reader::{ADCPFile, ADCPFileError, read_adcp_file, write_adcp_file};
+pub use atmosphere::{AtmosphereReader, AtmosphereState, P_REFERENCE, wind_from_direction};
 pub use bed_raster::BedRaster;
 pub use coastline::{CoastlineData, CoastlineError, CoastlineStatistics, FROYA_BBOX, NORWAY_BBOX};
 pub use constituent_reader::{
     ConstituentData, ConstituentEntry, ConstituentFileError, constituent_period,
     parse_constituents, read_constituent_file,
 };
+pub use field_series::{FieldSeries, TimeInterpolation, TimeStencil};
+pub use geo_grid::{
+    GeoGrid, GeoGridError, GridPoint, PlaneFrame, Stencil, bilinear_weights, east_axis,
+    geodesic_distance,
+};
 pub use geotiff::{BathymetryStatistics, GeoTiffBathymetry, GeoTiffError};
 #[cfg(feature = "netcdf")]
 pub use netcdf_io::{
-    FILL_VALUE_F32, FILL_VALUE_F64, ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo,
-    NetCDFWriter, NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState, is_valid_f32,
-    is_valid_f64,
+    FILL_VALUE_F32, FILL_VALUE_F64, NetCDFError, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig,
+    is_valid_f32, is_valid_f64,
 };
 #[cfg(feature = "parquet")]
 pub use norkyst_parquet::{
@@ -113,6 +125,7 @@ pub use norkyst_reader::{
     NorKystLevel, NorKystRecord, NorKystTextData, NorKystTextError, parse_norkyst_text_str,
     read_norkyst_text_file,
 };
+pub use ocean_model::{OceanModelReader, OceanState};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,
@@ -123,4 +136,4 @@ pub use timeseries_reader::{
     read_timeseries_file,
 };
 pub use vtk::{VtkError, write_vtk_coupled, write_vtk_series, write_vtk_swe};
-pub use z_levels::depth_average_z;
+pub use z_levels::{depth_average_z, s_level_weights, weighted_mean};

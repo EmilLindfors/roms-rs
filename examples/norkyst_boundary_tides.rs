@@ -36,6 +36,10 @@
 //! Requires the `netcdf` feature (default) with a DAP-enabled netCDF-C.
 
 #[cfg(feature = "netcdf")]
+#[path = "common/dap.rs"]
+mod dap;
+
+#[cfg(feature = "netcdf")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     app::run()
 }
@@ -50,13 +54,15 @@ mod app {
     use std::collections::HashMap;
     use std::error::Error;
     use std::path::PathBuf;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     use dg_rs::analysis::{Inference, ReferenceFit, fit_reference_constants};
     use dg_rs::boundary::{AtlasConstituent, AtlasPoint, TidalAtlas};
     use dg_rs::io::depth_average_z;
     use dg_rs::time::ModelClock;
-    use netcdf::{AttributeValue, Extent, Variable};
+    use netcdf::Variable;
+
+    use super::dap::{attribute_f64, locate_window, retry, slice};
 
     const URL: &str = "https://thredds.met.no/thredds/dodsC/fou-hi/norkystv3_800m_m00_be";
     /// Constituents resolvable from a month of hourly data
@@ -134,49 +140,6 @@ mod app {
         r * x.hypot(y)
     }
 
-    fn slice(start: usize, count: usize) -> Extent {
-        Extent::SliceCount {
-            start,
-            count,
-            stride: 1,
-        }
-    }
-
-    fn attribute_f64(var: &Variable, name: &str) -> Option<f64> {
-        match var.attribute_value(name)?.ok()? {
-            AttributeValue::Float(v) => Some(v as f64),
-            AttributeValue::Double(v) => Some(v),
-            AttributeValue::Short(v) => Some(v as f64),
-            _ => None,
-        }
-    }
-
-    /// Retry a DAP request: THREDDS answers 503 under load.
-    fn retry<T>(
-        what: &str,
-        mut f: impl FnMut() -> Result<T, netcdf::Error>,
-    ) -> Result<T, Box<dyn Error>> {
-        for attempt in 1..=5 {
-            match f() {
-                Ok(v) => return Ok(v),
-                Err(e) if attempt < 5 => {
-                    eprintln!("  {what}: {e}; retrying in {} s", 10 * attempt);
-                    std::thread::sleep(Duration::from_secs(10 * attempt));
-                }
-                Err(e) => return Err(format!("{what}: {e}").into()),
-            }
-        }
-        unreachable!()
-    }
-
-    /// A rectangular window of the NorKyst grid.
-    struct Window {
-        y0: usize,
-        x0: usize,
-        ny: usize,
-        nx: usize,
-    }
-
     /// A wet cell on the perimeter and its accumulated series.
     struct Cell {
         j: usize,
@@ -217,53 +180,14 @@ mod app {
         }
 
         // Locate the box on a coarse copy of the grid, then read it in full
-        let (ny_all, nx_all) = {
-            let lon = var("lon")?;
-            let dims = lon.dimensions();
-            (dims[0].len(), dims[1].len())
-        };
-        let coarse = |name: &str| -> Result<Vec<f64>, Box<dyn Error>> {
-            retry(name, || {
-                var(name).unwrap().get_values([
-                    Extent::SliceCount {
-                        start: 0,
-                        count: ny_all.div_ceil(STRIDE),
-                        stride: STRIDE as isize,
-                    },
-                    Extent::SliceCount {
-                        start: 0,
-                        count: nx_all.div_ceil(STRIDE),
-                        stride: STRIDE as isize,
-                    },
-                ])
-            })
-        };
-        let (clon, clat) = (coarse("lon")?, coarse("lat")?);
-        let cnx = nx_all.div_ceil(STRIDE);
-        let margin = 0.05;
-        let (mut y_range, mut x_range) = ((usize::MAX, 0), (usize::MAX, 0));
-        for (k, (&lo, &la)) in clon.iter().zip(&clat).enumerate() {
-            if (min_lon - margin..=max_lon + margin).contains(&lo)
-                && (min_lat - margin..=max_lat + margin).contains(&la)
-            {
-                let (y, x) = ((k / cnx) * STRIDE, (k % cnx) * STRIDE);
-                y_range = (y_range.0.min(y), y_range.1.max(y));
-                x_range = (x_range.0.min(x), x_range.1.max(x));
-            }
-        }
-        if y_range.0 == usize::MAX {
-            return Err("the box is outside the NorKyst grid".into());
-        }
-        let win = {
-            let y0 = y_range.0.saturating_sub(STRIDE);
-            let x0 = x_range.0.saturating_sub(STRIDE);
-            Window {
-                y0,
-                x0,
-                ny: (y_range.1 + STRIDE + 1).min(ny_all) - y0,
-                nx: (x_range.1 + STRIDE + 1).min(nx_all) - x0,
-            }
-        };
+        let win = locate_window(
+            &file,
+            "lon",
+            "lat",
+            [min_lon, min_lat, max_lon, max_lat],
+            0.05,
+            STRIDE,
+        )?;
         println!(
             "  grid window: Y {}+{}, X {}+{}",
             win.y0, win.ny, win.x0, win.nx
@@ -390,7 +314,7 @@ mod app {
                         (0..nz)
                             .map(|l| {
                                 let raw = data[(hour * nz + l) * plane + at];
-                                (raw != FILL).then(|| o + s * raw as f64)
+                                (raw != FILL).then_some(o + s * raw as f64)
                             })
                             .collect()
                     };

@@ -6,6 +6,7 @@
 //! - Drag of fish-farm net cages
 //! - Wind stress at the surface
 //! - Atmospheric pressure gradients
+//! - Wind and pressure from a weather model's grid
 //! - Tidal potential forcing
 //! - Bathymetry gradients
 
@@ -14,6 +15,7 @@ mod bathymetry;
 mod cage;
 mod coriolis;
 mod friction;
+mod gridded_atmosphere;
 mod tidal;
 pub mod viscosity;
 mod wind;
@@ -25,6 +27,7 @@ pub use coriolis::CoriolisSource2D;
 pub use friction::{
     BottomFriction2D, ChezyFriction2D, ManningFriction2D, SpatiallyVaryingManning2D,
 };
+pub use gridded_atmosphere::GriddedAtmosphere2D;
 pub use tidal::{TidalPotential, TidalPotentialConstituent};
 pub use viscosity::{HorizontalViscosity2D, ViscosityModel};
 pub use wind::{DragCoefficient, RHO_AIR, RHO_WATER, WindStress2D};
