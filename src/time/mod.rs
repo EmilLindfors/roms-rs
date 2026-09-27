@@ -8,6 +8,8 @@
 //! - [`SSPRK3`]: Strong Stability Preserving RK3 (optimal for hyperbolic systems)
 //! - [`ForwardEuler`]: Simple 1st order (for testing)
 //! - [`StandardIntegrator`]: Enum for zero-cost dispatch
+//! - [`MultirateSSPRK3`]: local time stepping, every element at its own
+//!   power-of-two fraction of the time step (conservative, SSP)
 //!
 //! The [`Integrable`] trait marks solution types that can be time-stepped.
 
@@ -15,6 +17,7 @@ mod clock;
 mod coupled_swe_tracer;
 pub mod integrator;
 pub mod mode_split;
+pub mod multirate;
 mod ssp_rk3;
 mod ssp_rk3_2d;
 mod ssp_rk3_swe;
@@ -33,6 +36,9 @@ pub use coupled_swe_tracer::{
 pub use mode_split::{
     BarotropicFilter, BarotropicPhysics, BarotropicTransport, MIN_BAROTROPIC_SUBSTEPS,
     ModeSplitIntegrator, ModeSplitPhysics, SplitMethod, step_average_weights,
+};
+pub use multirate::{
+    LocalTimeStepping, MultirateSSPRK3, MultirateStats, MultirateStepper, assign_levels,
 };
 pub use ssp_rk3::{compute_dt, ssp_rk3_step, ssp_rk3_step_timed};
 pub use ssp_rk3_2d::{run_advection_2d, ssp_rk3_step_2d, ssp_rk3_step_2d_timed};

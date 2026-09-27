@@ -24,7 +24,12 @@ use crate::solver::{
     apply_implicit_damping_2d_parallel as implicit_damping,
     apply_wet_dry_correction_all_parallel as wet_dry_correction,
 };
+use crate::solver::{
+    apply_wet_dry_correction_element, compute_rhs_swe_2d_where_then, element_dt_swe_2d,
+};
 use crate::source::{BottomFriction2D, CageDrag2D, SourceTerm2D, SourceTerms2D};
+use crate::time::LocalTimeStepping;
+use crate::time::multirate::{ElementMask, ElementStage};
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -136,6 +141,40 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
         self.negative_depth_clips.load(Ordering::Relaxed)
     }
 
+    /// The wet/dry correction applies the same positivity limiter to every
+    /// element with a node below h_dry, which includes every element a
+    /// positivity limiter with a threshold ≤ h_dry changes: that pass can be
+    /// skipped.
+    fn positivity_pass_is_redundant(&self) -> bool {
+        matches!(
+            (&self.limiter, &self.wet_dry),
+            (StandardLimiter2D::Positivity(h), Some(config)) if *h <= config.h_dry.meters()
+        )
+    }
+
+    /// [`PhysicsModule::post_process`] of element `k` alone (local time
+    /// stepping): the same element kernels. Returns the clips.
+    fn post_process_element(&self, k: usize, [h, hu, hv]: [&mut [f64]; 3]) -> usize {
+        let mut clips = 0;
+        if !self.positivity_pass_is_redundant() {
+            clips += self
+                .limiter
+                .apply_element(k, [&mut *h, &mut *hu, &mut *hv], &self.geom)
+                as usize;
+        }
+        if let Some(ref config) = self.wet_dry {
+            clips += apply_wet_dry_correction_element(k, [h, hu, hv], &self.geom, config) as usize;
+        }
+        clips
+    }
+
+    fn count_clips(&self, clips: usize) {
+        if clips > 0 {
+            self.negative_depth_clips
+                .fetch_add(clips, Ordering::Relaxed);
+        }
+    }
+
     fn damping(&self) -> ImplicitDamping2D<'_> {
         ImplicitDamping2D {
             friction: self.friction.as_deref(),
@@ -209,14 +248,7 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
     /// Limiter, then positivity and velocity desingularization (wet/dry).
     fn post_process(&self, state: &mut SWESolution2D) {
         let ctx = LimiterContext2D::new(&self.mesh, &self.ops, &self.geom);
-        // The wet/dry correction applies the same positivity limiter to every
-        // element with a node below h_dry, which includes every element a
-        // positivity limiter with a threshold ≤ h_dry changes: skip that pass
-        let redundant = matches!(
-            (&self.limiter, &self.wet_dry),
-            (StandardLimiter2D::Positivity(h), Some(config)) if *h <= config.h_dry.meters()
-        );
-        let mut clips = if redundant {
+        let mut clips = if self.positivity_pass_is_redundant() {
             0
         } else {
             self.limiter.apply_counting(state, &ctx)
@@ -224,10 +256,7 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
         if let Some(ref config) = self.wet_dry {
             clips += wet_dry_correction(state, &self.geom, config);
         }
-        if clips > 0 {
-            self.negative_depth_clips
-                .fetch_add(clips, Ordering::Relaxed);
-        }
+        self.count_clips(clips);
     }
 
     /// Point-implicit bottom friction, cage drag and thin-layer relaxation.
@@ -255,6 +284,137 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
 
     fn order(&self) -> usize {
         self.order
+    }
+
+    fn local_time_stepping(&self) -> Option<&dyn LocalTimeStepping<SWESolution2D>> {
+        Some(self)
+    }
+}
+
+/// Local time stepping ([`crate::time::MultirateSSPRK3`]). Supports every
+/// formulation, source term, boundary condition, wetting/drying and the
+/// point-implicit damping; not horizontal viscosity or the Kuzmin limiters
+/// (not element-local; they panic).
+impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics2D<BC> {
+    fn element_dt(&self, state: &SWESolution2D, cfl: f64, out: &mut [f64]) {
+        element_dt_swe_2d(
+            state,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &self.equation,
+            self.order,
+            cfl,
+            out,
+        );
+    }
+
+    /// The RHS, then per element and in the same pass: the stage
+    /// combination, the implicit damping, and either the sum into `acc` or
+    /// the limiter and wet/dry correction.
+    fn stage_where(
+        &self,
+        base: &SWESolution2D,
+        input: &SWESolution2D,
+        plan: &(dyn Fn(usize) -> Option<ElementStage> + Sync),
+        out: &mut SWESolution2D,
+        acc: Option<&mut SWESolution2D>,
+    ) {
+        let config = self.rhs_config();
+        let damping = self.damping();
+        let n = self.ops.n_nodes;
+        let clips = AtomicUsize::new(0);
+        let then = |k: usize, [h, hu, hv]: [&mut [f64]; 3], sum: Option<[&mut [f64]; 3]>| {
+            let Some(stage) = plan(k) else {
+                return;
+            };
+            let nodes = k * n..(k + 1) * n;
+            // out = a·base + b·input + c·F, F in the rows (as scale + axpy
+            // round it)
+            for (var, row) in [&mut *h, &mut *hu, &mut *hv].into_iter().enumerate() {
+                let (base, input) = (
+                    &base.data[var][nodes.clone()],
+                    &input.data[var][nodes.clone()],
+                );
+                for ((f, &s), &x) in row.iter_mut().zip(base).zip(input) {
+                    let mut v = if stage.a != 0.0 { stage.a * s } else { 0.0 };
+                    if stage.b != 0.0 {
+                        v += stage.b * x;
+                    }
+                    if stage.c != 0.0 {
+                        v += stage.c * *f;
+                    }
+                    *f = v;
+                }
+            }
+            let from = [0, 1, 2].map(|var| &input.data[var][nodes.clone()]);
+            damping.damp_element(k, [&mut *h, &mut *hu, &mut *hv], from, stage.c);
+            match (stage.accumulate, sum) {
+                (Some((w, keep)), Some(sum)) => {
+                    for (row, sum) in [&*h, &*hu, &*hv].into_iter().zip(sum) {
+                        for (s, &v) in sum.iter_mut().zip(row.iter()) {
+                            *s = if keep != 0.0 {
+                                w * v + keep * *s
+                            } else {
+                                w * v
+                            };
+                        }
+                    }
+                }
+                (Some(_), None) => panic!("an accumulating stage needs the sum buffer"),
+                (None, _) => {
+                    let clipped = self.post_process_element(k, [h, hu, hv]);
+                    if clipped > 0 {
+                        clips.fetch_add(clipped, Ordering::Relaxed);
+                    }
+                }
+            }
+        };
+        compute_rhs_swe_2d_where_then(
+            input,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &config,
+            &|k| plan(k).map(|stage| stage.time),
+            out,
+            acc,
+            &then,
+        );
+        self.count_clips(clips.into_inner());
+    }
+
+    fn finish_where(&self, state: &mut SWESolution2D, acc: &SWESolution2D, active: ElementMask) {
+        let n = self.ops.n_nodes;
+        let element = |k: usize, mut rows: [&mut [f64]; 3]| {
+            if !active(k) {
+                return 0;
+            }
+            for (var, row) in rows.iter_mut().enumerate() {
+                row.copy_from_slice(&acc.data[var][k * n..(k + 1) * n]);
+            }
+            self.post_process_element(k, rows)
+        };
+        let [h, hu, hv] = &mut state.data;
+        #[cfg(feature = "parallel")]
+        let clips = {
+            use rayon::prelude::*;
+            h.par_chunks_exact_mut(n)
+                .zip(hu.par_chunks_exact_mut(n))
+                .zip(hv.par_chunks_exact_mut(n))
+                .enumerate()
+                .map(|(k, ((h, hu), hv))| element(k, [h, hu, hv]))
+                .sum()
+        };
+        #[cfg(not(feature = "parallel"))]
+        let clips = h
+            .chunks_exact_mut(n)
+            .zip(hu.chunks_exact_mut(n))
+            .zip(hv.chunks_exact_mut(n))
+            .enumerate()
+            .map(|(k, ((h, hu), hv))| element(k, [h, hu, hv]))
+            .sum();
+        self.count_clips(clips);
     }
 }
 

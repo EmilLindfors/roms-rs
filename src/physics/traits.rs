@@ -4,7 +4,7 @@
 
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::time::Integrable;
+use crate::time::{Integrable, LocalTimeStepping};
 
 // =============================================================================
 // PhysicsModuleInfo Trait (non-generic, dyn-compatible)
@@ -119,6 +119,14 @@ pub trait PhysicsModule<S: Integrable>: PhysicsModuleInfo {
     /// guarantees hold (e.g. the positivity bound of a wet/dry scheme), if any.
     /// `Simulation` uses `min(cfl, max_cfl)`.
     fn max_cfl(&self) -> Option<f64> {
+        None
+    }
+
+    /// Element-subset operations for local time stepping
+    /// ([`MultirateSSPRK3`](crate::time::MultirateSSPRK3)), if this module
+    /// supports it. `Simulation` panics if a multirate integrator is paired
+    /// with a module that returns `None` (the default).
+    fn local_time_stepping(&self) -> Option<&dyn LocalTimeStepping<S>> {
         None
     }
 

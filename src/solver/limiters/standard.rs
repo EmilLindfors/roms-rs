@@ -13,8 +13,10 @@ use super::swe_2d::{
     apply_swe_limiters_kuzmin_2d_parallel as kuzmin_with_positivity,
     swe_kuzmin_limiter_2d_parallel as kuzmin, swe_positivity_limiter_2d_parallel as positivity,
 };
+use super::swe_2d::{element_mass, element_mean, positivity_limit_element};
 use super::tracer_2d::KuzminParameter2D;
 use super::traits::{BoxedLimiter2D, Limiter2D, LimiterContext2D};
+use crate::operators::GeometricFactors2D;
 
 /// Kuzmin vertex-based slope limiter.
 ///
@@ -209,6 +211,35 @@ impl StandardLimiter2D {
             StandardLimiter2D::Positivity(h_dry) => positivity(solution, ctx.geom, *h_dry),
             StandardLimiter2D::KuzminWithPositivity { kuzmin, h_min } => {
                 kuzmin_with_positivity(solution, ctx.mesh, ctx.ops, ctx.geom, kuzmin, *h_min)
+            }
+        }
+    }
+
+    /// [`Self::apply_counting`] on element `k` (its SoA rows) alone, for
+    /// local time stepping. Returns `true` if its negative mean depth had to
+    /// be emptied.
+    ///
+    /// # Panics
+    /// For the Kuzmin limiters: their vertex bounds come from the neighbours'
+    /// means, so they are not element-local.
+    pub fn apply_element(
+        &self,
+        k: usize,
+        [h, hu, hv]: [&mut [f64]; 3],
+        geom: &GeometricFactors2D,
+    ) -> bool {
+        match self {
+            StandardLimiter2D::None => false,
+            StandardLimiter2D::Positivity(h_dry) => {
+                let avg = element_mean(h, hu, hv, element_mass(geom, k), 1.0 / geom.area[k]);
+                positivity_limit_element(h, hu, hv, avg, *h_dry)
+            }
+            StandardLimiter2D::Kuzmin(_) | StandardLimiter2D::KuzminWithPositivity { .. } => {
+                panic!(
+                    "the {} limiter is not element-local; local time stepping supports 
+                     StandardLimiter2D::None and Positivity",
+                    self.name()
+                )
             }
         }
     }

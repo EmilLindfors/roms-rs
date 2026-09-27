@@ -52,8 +52,12 @@
 //!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>] \
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
-//!     [bed=point|projected] [dem=data/froya_topobathy.tif|none] [output=output/froya]
+//!     [bed=point|projected] [dem=data/froya_topobathy.tif|none] [lts=0] [output=output/froya]
 //! ```
+//!
+//! `lts=N` (N > 0) steps the tidal run with local time stepping
+//! (`MultirateSSPRK3`, up to N levels of halved time steps): every element at
+//! the largest power-of-two fraction of the step its own CFL allows.
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
 //! constituents: 15 days separate M2/S2 and K1/O1 (`hours=384` with the
@@ -100,7 +104,7 @@ use dg_rs::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, ManningFriction2D, WindStress2D,
 };
 use dg_rs::tides::canonical_name;
-use dg_rs::time::{ModelClock, SSPRK3};
+use dg_rs::time::{ModelClock, MultirateSSPRK3, SSPRK3};
 #[cfg(feature = "netcdf")]
 use dg_rs::types::Depth;
 use dg_rs::types::ElementIndex;
@@ -180,6 +184,9 @@ struct Options {
     /// but the station nodes differ, so the projection is not the default
     /// until station interpolation (P3.1) separates the two.
     project_bed: bool,
+    /// Local time stepping with up to this many levels (`lts=`; 0: global
+    /// SSP-RK3)
+    lts: usize,
     profile: usize,
     output: Option<PathBuf>,
 }
@@ -217,6 +224,7 @@ impl Options {
                 other => return Err(format!("bad bed={other}: projected or point")),
             },
             profile: get("profile", 0.0)? as usize,
+            lts: get("lts", 0.0)? as usize,
             output: args.get("output").map(PathBuf::from),
             wind: args.contains_key("wind"),
             start: args
@@ -749,15 +757,13 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
     let mut n_callbacks = 0;
     let mut frame = 0;
     let mut write_error = None;
-    let sim = Simulation::new(physics, SSPRK3)
-        .with_cfl(1.0)
-        .with_callback_interval(interval);
     let start = Instant::now();
-    let result = sim.run_with_callback(&mut q, 0.0, t_end, |q, t| {
+    let mut callback = |q: &SWESolution2D, t: f64| {
         for s in &mut stations {
             let state = q.get_state(s.element, s.node);
             s.times.push(clock.unix(t));
-            s.eta.push(state.h + domain.bathymetry.get(s.element, s.node));
+            s.eta
+                .push(state.h + domain.bathymetry.get(s.element, s.node));
         }
         n_callbacks += 1;
         if (n_callbacks - 1) % output_every != 0 {
@@ -800,7 +806,20 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
             }
         }
         frame += 1;
-    });
+    };
+    let (result, clips) = if opts.lts > 0 {
+        let sim = Simulation::new(physics, MultirateSSPRK3::new(opts.lts))
+            .with_cfl(1.0)
+            .with_callback_interval(interval);
+        let result = sim.run_with_callback(&mut q, 0.0, t_end, &mut callback);
+        (result, sim.physics().negative_depth_clips())
+    } else {
+        let sim = Simulation::new(physics, SSPRK3)
+            .with_cfl(1.0)
+            .with_callback_interval(interval);
+        let result = sim.run_with_callback(&mut q, 0.0, t_end, &mut callback);
+        (result, sim.physics().negative_depth_clips())
+    };
     if let Some(e) = write_error {
         return Err(e.into());
     }
@@ -814,8 +833,15 @@ fn tidal_run(domain: &Domain, opts: &Options) -> Result<(), Box<dyn std::error::
         result.final_time / steps as f64,
         start.elapsed().as_secs_f64(),
         1e3 * start.elapsed().as_secs_f64() / steps as f64,
-        sim.physics().negative_depth_clips()
+        clips
     );
+    if let Some(stats) = result.local_time_stepping {
+        println!(
+            "  Local time stepping: time-step ratio up to 2^{}, {:.2}x less RHS work than global steps at the finest step",
+            stats.finest_level,
+            stats.speedup()
+        );
+    }
     let station_atlas = Path::new(&opts.station_atlas);
     let station_atlas = station_atlas
         .exists()

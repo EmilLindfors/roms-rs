@@ -1246,6 +1246,239 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }
 
+/// Per-element continuation of [`compute_rhs_swe_2d_where_then`]: element
+/// k's rows of `out` (holding its RHS) and of the extra buffer, if any.
+pub type ElementRhsThen<'a> = &'a (dyn Fn(usize, [&mut [f64]; 3], Option<[&mut [f64]; 3]>) + Sync);
+
+/// [`compute_rhs_swe_2d_into`] for the elements with `time_of(k) = Some(t)`
+/// only, each at its own time `t`, for local time stepping; the other rows
+/// of `out` are left as they are.
+///
+/// A selected element gets bit for bit the RHS that the full evaluation at
+/// time `t` gives it: the split-form interior-face fluxes come from the same
+/// face pass, restricted to the faces of selected elements. Parallel with
+/// `parallel`; allocation-free after the first call on a thread.
+///
+/// # Panics
+/// With horizontal viscosity: BR1 couples elements two faces apart.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time_of: &(dyn Fn(usize) -> Option<f64> + Sync),
+    out: &mut SWESolution2D,
+) {
+    compute_rhs_swe_2d_where_then(
+        q,
+        mesh,
+        ops,
+        geom,
+        config,
+        time_of,
+        out,
+        None,
+        &|_, _, _| {},
+    );
+}
+
+/// [`compute_rhs_swe_2d_where_into`], then `then(k, out rows, extra rows)`
+/// for every selected element, in the same parallel pass while its rows are
+/// in cache: local time stepping turns the RHS into the next stage value
+/// there (combination, damping, limiting), one pass per stage.
+///
+/// # Panics
+/// With horizontal viscosity, or if `extra` has another shape than `out`.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_rhs_swe_2d_where_then<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time_of: &(dyn Fn(usize) -> Option<f64> + Sync),
+    out: &mut SWESolution2D,
+    extra: Option<&mut SWESolution2D>,
+    then: ElementRhsThen,
+) {
+    assert!(
+        config.viscosity.is_none(),
+        "local time stepping does not support horizontal viscosity (BR1 couples elements two faces apart)"
+    );
+    check_rhs_output(out, mesh, ops);
+    if let Some(extra) = &extra {
+        check_rhs_output(extra, mesh, ops);
+    }
+
+    // Interior-face fluxes of the faces of selected elements (they do not
+    // depend on time)
+    let faces_kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, 0.0);
+    let mut faces = FaceFluxGuard::take();
+    match &faces_kernel.split_form {
+        Some(split_form) => {
+            faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
+            let selected = |e: usize| {
+                let edge = &mesh.edges[e];
+                time_of(edge.left.element).is_some()
+                    || edge.right.is_some_and(|r| time_of(r.element).is_some())
+            };
+            let edge = |(e, slots): (usize, &mut [SWEState2D])| {
+                if selected(e) {
+                    split_form.edge_fluxes(e, slots);
+                }
+            };
+            let per_edge = 2 * ops.n_face_nodes;
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                faces
+                    .par_chunks_exact_mut(per_edge)
+                    .enumerate()
+                    .for_each(edge);
+            }
+            #[cfg(not(feature = "parallel"))]
+            faces.chunks_exact_mut(per_edge).enumerate().for_each(edge);
+        }
+        None => faces.clear(),
+    }
+    let faces: &[SWEState2D] = &faces;
+
+    let n = ops.n_nodes;
+    let element = |ws: &mut WorkspaceGuard,
+                   k: usize,
+                   [h, hu, hv]: [&mut [f64]; 3],
+                   extra: Option<[&mut [f64]; 3]>| {
+        if let Some(time) = time_of(k) {
+            SWE2DRhsKernel::new(q, mesh, ops, geom, config, time).element(
+                k,
+                ws,
+                faces,
+                [&mut *h, &mut *hu, &mut *hv],
+                None,
+            );
+            then(k, [h, hu, hv], extra);
+        }
+    };
+    let [out_h, out_hu, out_hv] = &mut out.data;
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        let out_rows = out_h
+            .par_chunks_exact_mut(n)
+            .zip(out_hu.par_chunks_exact_mut(n))
+            .zip(out_hv.par_chunks_exact_mut(n))
+            .map(|((h, hu), hv)| [h, hu, hv])
+            .enumerate();
+        match extra {
+            Some(extra) => {
+                let [h, hu, hv] = &mut extra.data;
+                let extra_rows = h
+                    .par_chunks_exact_mut(n)
+                    .zip(hu.par_chunks_exact_mut(n))
+                    .zip(hv.par_chunks_exact_mut(n))
+                    .map(|((h, hu), hv)| [h, hu, hv]);
+                out_rows.zip(extra_rows).for_each_init(
+                    || WorkspaceGuard::take(ops),
+                    |ws, ((k, rows), x)| element(ws, k, rows, Some(x)),
+                )
+            }
+            None => out_rows.for_each_init(
+                || WorkspaceGuard::take(ops),
+                |ws, (k, rows)| element(ws, k, rows, None),
+            ),
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut ws = WorkspaceGuard::take(ops);
+        let out_rows = out_h
+            .chunks_exact_mut(n)
+            .zip(out_hu.chunks_exact_mut(n))
+            .zip(out_hv.chunks_exact_mut(n))
+            .map(|((h, hu), hv)| [h, hu, hv])
+            .enumerate();
+        match extra {
+            Some(extra) => {
+                let [h, hu, hv] = &mut extra.data;
+                let extra_rows = h
+                    .chunks_exact_mut(n)
+                    .zip(hu.chunks_exact_mut(n))
+                    .zip(hv.chunks_exact_mut(n))
+                    .map(|((h, hu), hv)| [h, hu, hv]);
+                for ((k, rows), x) in out_rows.zip(extra_rows) {
+                    element(&mut ws, k, rows, Some(x));
+                }
+            }
+            None => {
+                for (k, rows) in out_rows {
+                    element(&mut ws, k, rows, None);
+                }
+            }
+        }
+    }
+}
+
+/// Largest stable time step of every element, into `out`
+/// (`mesh.n_elements` values), for local time stepping.
+///
+/// The bound of [`compute_dt_swe_2d`] with the element's own metric, over its
+/// own nodes and every node of its face neighbours. The interface flux sees
+/// the wave speeds of both sides, and water from a neighbour can reach the
+/// element within one of its substeps. A nearly dry element next to deep
+/// water, or a small element next to a fast one, must not step with its own
+/// speeds alone. So the minimum is at most [`compute_dt_swe_2d`].
+/// `f64::INFINITY` where everything the element sees is dry or at rest in
+/// zero depth. Parallel with `parallel`.
+#[allow(clippy::too_many_arguments)]
+pub fn element_dt_swe_2d(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    equation: &ShallowWater2D,
+    order: usize,
+    cfl: f64,
+    out: &mut [f64],
+) {
+    assert_eq!(out.len(), mesh.n_elements, "one time step per element");
+    let h_min = equation.h_min.meters();
+    let norm = |g: (f64, f64)| (g.0 * g.0 + g.1 * g.1).sqrt();
+    let element_dt = |(k, dt): (usize, &mut f64)| {
+        let k_idx = ElementIndex::new(k);
+        let mut rate = element_max_reference_rate(q, geom, equation, k_idx);
+        // Neighbour speeds |u| + c in this element's largest metric: an upper
+        // bound of λ_r + λ_s at any of its nodes
+        let metric = (0..ops.n_nodes)
+            .map(|i| norm(geom.grad_r(k, i)) + norm(geom.grad_s(k, i)))
+            .fold(0.0_f64, f64::max);
+        for face in 0..4 {
+            let Some(nb) = mesh.neighbor(k_idx, face) else {
+                continue;
+            };
+            let nb_k = ElementIndex::new(nb.element);
+            for i in 0..ops.n_nodes {
+                let state = q.get_state(nb_k, i);
+                if state.h <= h_min {
+                    continue;
+                }
+                let (u, v) = equation.velocity_simple(&state);
+                let speed = (u * u + v * v).sqrt() + equation.celerity(state.h);
+                rate = rate.max(0.25 * speed * metric);
+            }
+        }
+        *dt = dt_from_reference_rate(rate, order, cfl);
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.par_iter_mut().enumerate().for_each(element_dt);
+    }
+    #[cfg(not(feature = "parallel"))]
+    out.iter_mut().enumerate().for_each(element_dt);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
