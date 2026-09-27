@@ -50,6 +50,10 @@ pub enum GeoTiffError {
     /// is rotated
     #[error("Unsupported georeferencing: {0}")]
     UnsupportedGeoreferencing(String),
+
+    /// Pixels without data where a complete raster is required
+    #[error("Missing data: {0}")]
+    MissingData(String),
 }
 
 /// GeoTIFF tags (OGC GeoTIFF 1.1, 19-008r4) and GDAL's no-data tag.

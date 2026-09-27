@@ -24,7 +24,7 @@
 //! alias it where elements are coarser than the pixels.
 
 use super::coastline::CoastlineData;
-use super::geotiff::GeoTiffBathymetry;
+use super::geotiff::{GeoTiffBathymetry, GeoTiffError};
 use super::projection::{CoordinateProjection, GeoBoundingBox, LocalProjection};
 
 /// Bed elevation (m above mean sea level, negative under water) on a
@@ -42,6 +42,61 @@ pub struct BedRaster {
     height: usize,
     bbox: GeoBoundingBox,
     land: Option<LandMask>,
+}
+
+/// The whole pixels of a raster touched by a window.
+struct Crop {
+    rows: std::ops::Range<usize>,
+    cols: std::ops::Range<usize>,
+    bbox: GeoBoundingBox,
+}
+
+impl Crop {
+    /// # Panics
+    /// If `window` does not overlap the raster.
+    fn new(raster: &GeoTiffBathymetry, window: &GeoBoundingBox) -> Self {
+        let full = raster.bbox();
+        let (full_width, full_height) = raster.dimensions();
+        let dlon = (full.max_lon - full.min_lon) / full_width as f64;
+        let dlat = (full.max_lat - full.min_lat) / full_height as f64;
+        let col0 = ((window.min_lon - full.min_lon) / dlon).floor().max(0.0) as usize;
+        let col1 = (((window.max_lon - full.min_lon) / dlon).ceil() as usize).min(full_width);
+        let row0 = ((full.max_lat - window.max_lat) / dlat).floor().max(0.0) as usize;
+        let row1 = (((full.max_lat - window.min_lat) / dlat).ceil() as usize).min(full_height);
+        assert!(
+            col0 < col1 && row0 < row1,
+            "window {window:?} does not overlap the raster ({full:?})"
+        );
+        let bbox = GeoBoundingBox::new(
+            full.min_lon + col0 as f64 * dlon,
+            full.max_lat - row1 as f64 * dlat,
+            full.min_lon + col1 as f64 * dlon,
+            full.max_lat - row0 as f64 * dlat,
+        );
+        Self {
+            rows: row0..row1,
+            cols: col0..col1,
+            bbox,
+        }
+    }
+
+    fn width(&self) -> usize {
+        self.cols.len()
+    }
+
+    fn height(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// `value(row, col)` of every pixel in the crop, row-major (source
+    /// raster indices).
+    fn values(&self, value: impl Fn(usize, usize) -> f64) -> Vec<f64> {
+        self.rows
+            .clone()
+            .flat_map(|row| self.cols.clone().map(move |col| (row, col)))
+            .map(|(row, col)| value(row, col))
+            .collect()
+    }
 }
 
 /// Land cells on a grid `refinement` times finer than the pixels, with the
@@ -112,32 +167,10 @@ impl BedRaster {
             "land must lie above mean sea level, got land_elevation = {land_elevation}"
         );
         assert!(refinement > 0, "land mask refinement must be positive");
-        let full = bathymetry.bbox();
-        let (full_width, full_height) = bathymetry.dimensions();
-        let dlon = (full.max_lon - full.min_lon) / full_width as f64;
-        let dlat = (full.max_lat - full.min_lat) / full_height as f64;
-        // Pixel ranges touched by the window
-        let col0 = ((window.min_lon - full.min_lon) / dlon).floor().max(0.0) as usize;
-        let col1 = (((window.max_lon - full.min_lon) / dlon).ceil() as usize).min(full_width);
-        let row0 = ((full.max_lat - window.max_lat) / dlat).floor().max(0.0) as usize;
-        let row1 = (((full.max_lat - window.min_lat) / dlat).ceil() as usize).min(full_height);
-        assert!(
-            col0 < col1 && row0 < row1,
-            "window {window:?} does not overlap the bathymetry ({full:?})"
-        );
-
-        let sea_bed: Vec<f64> = (row0..row1)
-            .flat_map(|row| {
-                (col0..col1).map(move |col| bathymetry.pixel(row, col).unwrap_or(0.0).min(0.0))
-            })
-            .collect();
-        let bbox = GeoBoundingBox::new(
-            full.min_lon + col0 as f64 * dlon,
-            full.max_lat - row1 as f64 * dlat,
-            full.min_lon + col1 as f64 * dlon,
-            full.max_lat - row0 as f64 * dlat,
-        );
-        let mut raster = Self::new(bbox, col1 - col0, row1 - row0, sea_bed);
+        let crop = Crop::new(bathymetry, window);
+        let sea_bed = crop.values(|row, col| bathymetry.pixel(row, col).unwrap_or(0.0).min(0.0));
+        let mut raster = Self::new(crop.bbox, crop.width(), crop.height(), sea_bed);
+        let bbox = crop.bbox;
 
         let (mask_width, mask_height) = (raster.width * refinement, raster.height * refinement);
         let cell_lon = (bbox.max_lon - bbox.min_lon) / mask_width as f64;
@@ -159,6 +192,119 @@ impl BedRaster {
             elevation: land_elevation,
         });
         raster
+    }
+
+    /// An elevation model read from a GeoTIFF of bed elevations with land
+    /// heights (e.g. Kartverket's topobathy model,
+    /// `scripts/kartverket_topobathy.sh`), over `window` (cropped to the
+    /// whole pixels that it touches).
+    ///
+    /// # Errors
+    /// [`GeoTiffError::MissingData`] if a pixel in the window has no data:
+    /// an elevation model must be complete.
+    ///
+    /// # Panics
+    /// If `window` does not overlap the raster.
+    pub fn elevation_model(
+        elevation: &GeoTiffBathymetry,
+        window: &GeoBoundingBox,
+    ) -> Result<Self, GeoTiffError> {
+        let crop = Crop::new(elevation, window);
+        let values = crop.values(|row, col| elevation.pixel(row, col).unwrap_or(f64::NAN));
+        let missing = values.iter().filter(|v| v.is_nan()).count();
+        if missing > 0 {
+            return Err(GeoTiffError::MissingData(format!(
+                "{missing} of {} pixels in {window:?} have no data",
+                values.len()
+            )));
+        }
+        Ok(Self::new(crop.bbox, crop.width(), crop.height(), values))
+    }
+
+    /// Replace the pixels where `is_hole(value)` by the harmonic
+    /// interpolation of the others (Laplace's equation with the surrounding
+    /// pixels as boundary values, Gauss–Seidel to 1 mm), and return how many
+    /// were filled. Holes at the raster edge take no boundary value there; a
+    /// hole with no data around it at all keeps its values.
+    ///
+    /// Kartverket's topobathy model marks missing depths with an exact 0,
+    /// the water surface (a 30 × 30 pixel patch in 320 m of water off Frøya,
+    /// where the flat 0 piled water up to +1.2 m). Harmonic filling
+    /// reproduces linear beds exactly and leaves a 0 among near-zero shore
+    /// pixels near 0.
+    pub fn fill_holes(&mut self, is_hole: impl Fn(f64) -> bool) -> usize {
+        let (w, h) = (self.width, self.height);
+        let holes: Vec<usize> = (0..w * h).filter(|&i| is_hole(self.elevation[i])).collect();
+        let mut hole = vec![false; w * h];
+        for &i in &holes {
+            hole[i] = true;
+        }
+        let neighbours = |i: usize| {
+            let (row, col) = (i / w, i % w);
+            [
+                (row > 0).then(|| i - w),
+                (row + 1 < h).then(|| i + w),
+                (col > 0).then(|| i - 1),
+                (col + 1 < w).then(|| i + 1),
+            ]
+            .into_iter()
+            .flatten()
+        };
+        // Start from the mean of the known neighbours, spreading inwards
+        let mut known: Vec<bool> = hole.iter().map(|&h| !h).collect();
+        let mut pending = holes.clone();
+        while !pending.is_empty() {
+            let mut next = Vec::new();
+            let mut updates = Vec::new();
+            for &i in &pending {
+                let (sum, n) = neighbours(i)
+                    .filter(|&j| known[j])
+                    .fold((0.0, 0), |(s, n), j| (s + self.elevation[j], n + 1));
+                if n > 0 {
+                    updates.push((i, sum / n as f64));
+                } else {
+                    next.push(i);
+                }
+            }
+            if updates.is_empty() {
+                break; // no data around these at all
+            }
+            for (i, value) in updates {
+                self.elevation[i] = value;
+                known[i] = true;
+            }
+            pending = next;
+        }
+        let fillable: Vec<usize> = holes.iter().copied().filter(|&i| known[i]).collect();
+        for _ in 0..100_000 {
+            let mut change: f64 = 0.0;
+            for &i in &fillable {
+                let (sum, n) =
+                    neighbours(i).fold((0.0, 0), |(s, n), j| (s + self.elevation[j], n + 1));
+                let value = sum / n as f64;
+                change = change.max((value - self.elevation[i]).abs());
+                self.elevation[i] = value;
+            }
+            if change < 1e-3 {
+                break;
+            }
+        }
+        fillable.len()
+    }
+
+    /// Cap the bed at `max_elevation`: land that no water level reaches
+    /// only makes cliffs in shoreline elements (a wet corner at −7 m beside
+    /// +30 m land drew a creeping film in `WetDry` subcells), so keep the
+    /// foreshore and flatten the rest. The land elevation of a mask is capped
+    /// too.
+    pub fn clamp_land(mut self, max_elevation: f64) -> Self {
+        for b in &mut self.elevation {
+            *b = b.min(max_elevation);
+        }
+        if let Some(mask) = &mut self.land {
+            mask.elevation = mask.elevation.min(max_elevation);
+        }
+        self
     }
 
     /// Extent (outer pixel edges).
@@ -410,6 +556,71 @@ mod tests {
         assert_eq!(raster.elevation(63.725, 8.29), 5.0);
         assert_eq!(raster.elevation(63.675, 8.35), 5.0);
         assert!((raster.water_fraction() - 21.0 / 24.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn elevation_model_keeps_land_heights_and_rejects_gaps() {
+        let (tiff, _) = bathymetry_and_island();
+        // Pixels 3..6 × 0..2 have data (depths), pixel (1, 2) a land height
+        let window = GeoBoundingBox::new(8.21, 63.71, 8.59, 63.79);
+        let dem = BedRaster::elevation_model(&tiff, &window).unwrap();
+        assert_eq!(dem.dimensions(), (4, 2));
+        assert_eq!(dem.pixel(1, 0), 3.0);
+        assert_eq!(dem.pixel(0, 3), -6.0);
+        assert!(dem.is_land(63.725, 8.25));
+        // Real heights, not a land elevation: bilinear through the land pixel
+        let mid = dem.elevation(63.725, 8.3);
+        assert!((mid - 0.5 * (3.0 - 14.0)).abs() < 1e-9, "{mid}");
+        // Capped land keeps the foreshore below the cap
+        let capped = dem.clone().clamp_land(1.0);
+        assert_eq!(capped.pixel(1, 0), 1.0);
+        assert_eq!(capped.pixel(0, 3), -6.0);
+        // The no-data pixel (2, 3) makes a larger window fail
+        let window = GeoBoundingBox::new(8.0, 63.6, 8.6, 63.8);
+        assert!(matches!(
+            BedRaster::elevation_model(&tiff, &window),
+            Err(GeoTiffError::MissingData(_))
+        ));
+    }
+
+    #[test]
+    fn fill_holes_interpolates_harmonically() {
+        // A linear bed with a 3 × 3 hole of zeros inside and one at the edge
+        let (w, h) = (9, 7);
+        let bed = |row: usize, col: usize| -50.0 + 2.0 * col as f64 - 3.0 * row as f64;
+        let mut values: Vec<f64> = (0..h)
+            .flat_map(|r| (0..w).map(move |c| bed(r, c)))
+            .collect();
+        for r in 2..5 {
+            for c in 3..6 {
+                values[r * w + c] = 0.0;
+            }
+        }
+        values[w - 1] = 0.0;
+        let mut raster = BedRaster::new(GeoBoundingBox::new(8.0, 63.0, 8.9, 63.7), w, h, values);
+        assert_eq!(raster.fill_holes(|b| b == 0.0), 10);
+        // Linear inside; the corner hole, with no boundary value beyond the
+        // raster, takes the mean of its two neighbours
+        assert!((raster.pixel(0, w - 1) - 0.5 * (bed(0, w - 2) + bed(1, w - 1))).abs() < 0.01);
+        for r in 0..h {
+            for c in (0..w).filter(|&c| (r, c) != (0, w - 1)) {
+                let error = (raster.pixel(r, c) - bed(r, c)).abs();
+                assert!(
+                    error < 0.01,
+                    "({r}, {c}): {} vs {}",
+                    raster.pixel(r, c),
+                    bed(r, c)
+                );
+            }
+        }
+        // A raster of holes only is left alone
+        let mut empty = BedRaster::new(
+            GeoBoundingBox::new(8.0, 63.0, 8.2, 63.2),
+            2,
+            2,
+            vec![0.0; 4],
+        );
+        assert_eq!(empty.fill_holes(|b| b == 0.0), 0);
     }
 
     #[test]

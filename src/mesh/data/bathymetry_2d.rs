@@ -42,6 +42,62 @@ fn bilinear_map(v: &[[f64; 2]; 4], r: f64, s: f64) -> ([f64; 2], f64) {
     ([0.25 * x, 0.25 * y], 0.0625 * (x_r * y_s - x_s * y_r))
 }
 
+/// The representative of every node's set of coincident nodes (on shared
+/// faces and vertices), `[k·n_nodes + i]`, from the mesh connectivity:
+/// neighbours list their shared face nodes in reverse order, and corner
+/// nodes of elements that touch at a vertex only are matched through the
+/// vertex.
+fn coincident_nodes(mesh: &Mesh2D, ops: &DGOperators2D) -> Vec<usize> {
+    let n = ops.n_nodes;
+    let n_face = ops.n_face_nodes;
+    let mut parent: Vec<usize> = (0..mesh.n_elements * n).collect();
+    fn root(parent: &mut [usize], mut a: usize) -> usize {
+        while parent[a] != a {
+            parent[a] = parent[parent[a]];
+            a = parent[a];
+        }
+        a
+    }
+    let mut union = |a: usize, b: usize| {
+        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+        if ra != rb {
+            parent[ra.max(rb)] = ra.min(rb);
+        }
+    };
+    for edge in &mesh.edges {
+        let Some(right) = edge.right else { continue };
+        let left = edge.left;
+        for fi in 0..n_face {
+            union(
+                left.element * n + ops.face_nodes[left.face][fi],
+                right.element * n + ops.face_nodes[right.face][n_face - 1 - fi],
+            );
+        }
+    }
+    let corner = |r: f64, s: f64| {
+        (0..n)
+            .find(|&i| ops.nodes_r[i] == r && ops.nodes_s[i] == s)
+            .expect("GLL nodes include the corners")
+    };
+    let corners = [
+        corner(-1.0, -1.0),
+        corner(1.0, -1.0),
+        corner(1.0, 1.0),
+        corner(-1.0, 1.0),
+    ];
+    let mut vertex_node = vec![None; mesh.n_vertices];
+    for (k, vertices) in mesh.elements.iter().enumerate() {
+        for (c, &v) in vertices.iter().enumerate() {
+            let node = k * n + corners[c];
+            match vertex_node[v] {
+                Some(first) => union(first, node),
+                None => vertex_node[v] = Some(node),
+            }
+        }
+    }
+    (0..parent.len()).map(|a| root(&mut parent, a)).collect()
+}
+
 /// A 1D quadrature rule on [−1, 1] with the orthonormal Legendre values of
 /// every degree ≤ N at its points (`legendre[point × (N + 1) + degree]`), for
 /// [`Bathymetry2D::project`].
@@ -337,67 +393,86 @@ impl Bathymetry2D {
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
     ) {
-        let n = self.n_nodes;
-        let n_face = ops.n_face_nodes;
-        let mut parent: Vec<usize> = (0..self.data.len()).collect();
-        fn root(parent: &mut [usize], mut a: usize) -> usize {
-            while parent[a] != a {
-                parent[a] = parent[parent[a]];
-                a = parent[a];
-            }
-            a
-        }
-        let mut union = |a: usize, b: usize| {
-            let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
-            if ra != rb {
-                parent[ra.max(rb)] = ra.min(rb);
-            }
-        };
-        for edge in &mesh.edges {
-            let Some(right) = edge.right else { continue };
-            let left = edge.left;
-            for fi in 0..n_face {
-                union(
-                    left.element * n + ops.face_nodes[left.face][fi],
-                    right.element * n + ops.face_nodes[right.face][n_face - 1 - fi],
-                );
-            }
-        }
-        // Elements that touch at a vertex only
-        let corner = |r: f64, s: f64| {
-            (0..n)
-                .find(|&i| ops.nodes_r[i] == r && ops.nodes_s[i] == s)
-                .expect("GLL nodes include the corners")
-        };
-        let corners = [
-            corner(-1.0, -1.0),
-            corner(1.0, -1.0),
-            corner(1.0, 1.0),
-            corner(-1.0, 1.0),
-        ];
-        let mut vertex_node = vec![None; mesh.n_vertices];
-        for (k, vertices) in mesh.elements.iter().enumerate() {
-            for (c, &v) in vertices.iter().enumerate() {
-                let node = k * n + corners[c];
-                match vertex_node[v] {
-                    Some(first) => union(first, node),
-                    None => vertex_node[v] = Some(node),
-                }
-            }
-        }
-
+        let group = coincident_nodes(mesh, ops);
         let mut mass = vec![0.0; self.data.len()];
         let mut moment = vec![0.0; self.data.len()];
         for node in 0..self.data.len() {
-            let r = root(&mut parent, node);
-            mass[r] += geom.mass[node];
-            moment[r] += geom.mass[node] * self.data[node];
+            mass[group[node]] += geom.mass[node];
+            moment[group[node]] += geom.mass[node] * self.data[node];
         }
         for node in 0..self.data.len() {
-            let r = root(&mut parent, node);
-            self.data[node] = moment[r] / mass[r];
+            self.data[node] = moment[group[node]] / mass[group[node]];
         }
         self.compute_gradients(ops, geom);
+    }
+
+    /// Raise isolated wet nodes to dry shore, and return how many (sets of
+    /// coincident nodes) were raised.
+    ///
+    /// A node below `level` whose neighbours along the element's grid lines,
+    /// in every element that shares it, are all at or above `level` is water
+    /// the mesh cannot resolve: a narrow sound or a lake one node wide. In
+    /// `WetDry` such a lone wet node against dry nodes carries η jumps of up
+    /// to 1 m between the elements that share it and spurious currents of
+    /// 1–3 m/s through the tide (Frøya at 1 km). It is raised to the lowest
+    /// of its neighbours, repeatedly until none is left, and the gradients
+    /// are recomputed.
+    pub fn raise_isolated_wet_nodes(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        level: f64,
+    ) -> usize {
+        let n = self.n_nodes;
+        let n_1d = ops.n_1d;
+        let group = coincident_nodes(mesh, ops);
+        let mut members: Vec<Vec<usize>> = vec![Vec::new(); self.data.len()];
+        for (node, &g) in group.iter().enumerate() {
+            members[g].push(node);
+        }
+        // Neighbours along the grid lines of a node within its element
+        let grid_neighbours = |node: usize| {
+            let (k, i) = (node / n, node % n);
+            let (a, b) = (i % n_1d, i / n_1d);
+            [
+                (a > 0).then(|| i - 1),
+                (a + 1 < n_1d).then(|| i + 1),
+                (b > 0).then(|| i - n_1d),
+                (b + 1 < n_1d).then(|| i + n_1d),
+            ]
+            .into_iter()
+            .flatten()
+            .map(move |j| k * n + j)
+        };
+        let mut raised = 0;
+        loop {
+            let mut changed = false;
+            for nodes in &members {
+                if nodes.is_empty() || nodes.iter().all(|&m| self.data[m] >= level) {
+                    continue;
+                }
+                let lowest = nodes
+                    .iter()
+                    .flat_map(|&m| grid_neighbours(m))
+                    .map(|j| self.data[j])
+                    .fold(f64::INFINITY, f64::min);
+                if lowest >= level && lowest.is_finite() {
+                    for &m in nodes {
+                        self.data[m] = lowest;
+                    }
+                    raised += 1;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        if raised > 0 {
+            self.compute_gradients(ops, geom);
+        }
+        raised
     }
 
     /// Bed from a merged elevation raster (bathymetry and land,
@@ -1615,6 +1690,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_raise_isolated_wet_nodes() {
+        // Dry land at +2 m with a lone −10 m node at an interior vertex, a
+        // wet pair along a grid line, and open water along the west column
+        let (mesh, ops, geom) = setup(Mesh2D::uniform_rectangle(0.0, 4.0, 0.0, 4.0, 4, 4), 2);
+        let lone = [2.0, 2.0];
+        let pair = [[3.0, 1.0], [3.0, 1.5]];
+        let bed = |x: f64, y: f64| {
+            let at = |p: [f64; 2]| (x - p[0]).abs() < 1e-9 && (y - p[1]).abs() < 1e-9;
+            if at(lone) {
+                -10.0
+            } else if pair.iter().any(|&p| at(p)) {
+                -5.0
+            } else if x < 1.0 {
+                -20.0
+            } else {
+                2.0
+            }
+        };
+        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        assert_eq!(bathy.raise_isolated_wet_nodes(&mesh, &ops, &geom, 0.0), 1);
+        for e in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                let is_lone = (x - lone[0]).abs() < 1e-9 && (y - lone[1]).abs() < 1e-9;
+                // The lone node is raised to its lowest neighbour
+                let expected = if is_lone { 2.0 } else { bed(x, y) };
+                assert_eq!(bathy.get(e, i), expected, "({x}, {y})");
+            }
+        }
+        // Nothing left to raise
+        assert_eq!(bathy.raise_isolated_wet_nodes(&mesh, &ops, &geom, 0.0), 0);
     }
 
     #[test]
