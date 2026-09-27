@@ -6,6 +6,13 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Coastline-fitted meshes from an elevation model (TODO P1.3).** `scripts/gmsh_coastline_mesh.py` meshes the water of a lon/lat box from Kartverket's topobathy model.
+  - Geometry: the 0 m contour; land and water narrower than twice the coastal size are removed, so no sound is closed by the land filter and no feature forces elements smaller than itself.
+  - Meshing: the coastline is resampled at the element size, meshed by Gmsh recombination and subdivision with sizes growing from the coast (and an optional farm), and tagged `open` on the box and `coast` elsewhere. Every quad is checked to be convex and consistently oriented.
+  - `froya_real_data mesh=<file>` runs on it with the bed L2-projected (see `docs/gmsh-meshes.md`).
+  - Frøya at a 200 m coast: 12,206 quads; the lake at rest holds to 1.9e-12 m/s, and the tide runs without clips. The small quads subdivision leaves at the coast set a 0.009 s global step, so it runs with local time stepping (≈ 4 min per simulated hour at 24 threads). Sizing by depth is the next step (TODO P1.3).
+
+
 - **Map-wide tidal-current comparison with NorKyst-800** (`scripts/norkyst_current_comparison.py`). It fits the M2 ellipses of a `froya_real_data` run (hourly VTU) and of NorKyst's hourly ū, v̄ identically, and compares them at every NorKyst point in the domain, binned by depth.
   - It explains the weak currents at Mausund (TODO P3.1). NorKyst's peak speeds include its non-tidal flow. Tide against tide, the model has 0.89 of NorKyst's M2 current in deep water where the beds agree, but only 0.41 near Mausund: point samples of the 50 m DEM land on skerries and close the sounds.
   - `froya_real_data` now L2-projects the bed by default (`bed=point` for the old behaviour). At 1 km the ratio near Mausund becomes 0.63 (0.88 domain-wide), the M2 ellipse next to NorKyst's point matches its direction and phase (157° against 149°, lag 65° against 62°), and the gauge's centred RMSE drops from 4.4 to 4.0 cm. At 500 m the M2 current is 0.86 of NorKyst's domain-wide, 0.88 in deep water and 0.68 near Mausund. Next to NorKyst's point it sits in the lee of islands that NorKyst's 800 m grid does not have (0.010 m/s, in NorKyst's direction).
@@ -193,6 +200,10 @@ All notable changes to this project should be documented in this file.
 - Added `tides` module (`src/tides/`): a from-scratch Doodson/Schureman tidal astronomy layer supplying equilibrium arguments `V₀` and 18.61-year nodal corrections (`f`, `u`) for the standard constituents (M2, S2, N2, K2, K1, O1, P1, Q1, M4, MS4, MN4, M6, Mf, Mm, Ssa). Includes `AstronomicalArguments` (Meeus J2000 mean longitudes s/h/p/N/p₁ and mean lunar time τ), a Gregorian→Julian-Date converter, and `nodal_correction(name, &astro)`. Wired into tidal prediction via `TSTConfig::from_constituent_data_at_epoch`, epoch-aware builders `HarmonicFlather2D::with_nodal_corrections(epoch_jd)` / `HarmonicTidal2D::with_nodal_corrections(epoch_jd)`, the `TidalConstituent::with_nodal_correction` primitive, and the `correct_amplitude_phase` helper. Validated by reference-value tests (mean longitudes at J2000, Meeus Julian-date examples), an internal-consistency test that recovers each constituent's tabulated period from the analytic dV₀/dt, and nodal-factor range checks (M2 0.963–1.038; K1/O1 the 11–19% diurnal modulation).
 
 ### Changed
+
+- **Local time stepping runs over element lists (TODO P2.5).** Every pass of `MultirateSSPRK3` used to sweep all elements (and all faces) and skip the inactive ones, which dominated with many levels. The stepper now orders the elements by rate once per coarse step, so each active set is a prefix. `LocalTimeStepping::stage_where`/`finish_where` take element lists, and `compute_rhs_swe_2d_subset_then` (was `…_where_then`) computes only the faces of the listed elements, serially for small subsets. Bit for bit as before (the LTS gates).
+  - Frøya coastline mesh (2^8 levels): 254 → 162–177 ms per coarse step.
+  - Farm mesh (2^6 levels): unchanged.
 
 - **API (nesting and I/O, breaking; TODO P1.5).**
   - `OceanModelState` is built on a mesh (`OceanModelState::new(reader, &mesh, &ops, &projection, tag, clock, &options)`, no projection type parameter) instead of querying the parent by position at every boundary node and stage.

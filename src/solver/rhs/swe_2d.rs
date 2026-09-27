@@ -17,6 +17,7 @@ use crate::equations::ShallowWater2D;
 use crate::flux::{SWEFluxType2D, compute_flux_swe_2d};
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::core::disjoint::{DisjointChunks, all_distinct};
 use crate::solver::state::{SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{SWESolution2D, SWEState2D};
 use crate::source::swe_2d::viscosity::HorizontalViscosity2D;
@@ -1246,18 +1247,53 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }
 
-/// Per-element continuation of [`compute_rhs_swe_2d_where_then`]: element
+/// Per-element continuation of [`compute_rhs_swe_2d_subset_then`]: element
 /// k's rows of `out` (holding its RHS) and of the extra buffer, if any.
 pub type ElementRhsThen<'a> = &'a (dyn Fn(usize, [&mut [f64]; 3], Option<[&mut [f64]; 3]>) + Sync);
 
+/// Subsets smaller than this run serially: a parallel dispatch costs more
+/// than their work (local time stepping has many tiny subsets).
+const SUBSET_PARALLEL_MIN: usize = 64;
+
+/// The distinct edges of a list of elements, in order of first appearance,
+/// without sorting: an edge is taken when its stamp is not the current pass.
+#[derive(Default)]
+struct SubsetEdges {
+    list: Vec<u32>,
+    stamp: Vec<u32>,
+    pass: u32,
+}
+
+impl SubsetEdges {
+    fn collect(&mut self, mesh: &Mesh2D, elements: &[u32]) {
+        if self.stamp.len() != mesh.n_edges || self.pass == u32::MAX {
+            self.stamp.clear();
+            self.stamp.resize(mesh.n_edges, 0);
+            self.pass = 0;
+        }
+        self.pass += 1;
+        self.list.clear();
+        for &k in elements {
+            for e in mesh.element_edges[k as usize] {
+                if self.stamp[e] != self.pass {
+                    self.stamp[e] = self.pass;
+                    self.list.push(e as u32);
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// Edge scratch of the subset RHS on this thread (reused, not reallocated)
+    static SUBSET_EDGES: RefCell<SubsetEdges> = RefCell::new(SubsetEdges::default());
+}
+
 /// [`compute_rhs_swe_2d_into`] for the elements with `time_of(k) = Some(t)`
 /// only, each at its own time `t`, for local time stepping; the other rows
-/// of `out` are left as they are.
-///
-/// A selected element gets bit for bit the RHS that the full evaluation at
-/// time `t` gives it: the split-form interior-face fluxes come from the same
-/// face pass, restricted to the faces of selected elements. Parallel with
-/// `parallel`; allocation-free after the first call on a thread.
+/// of `out` are left as they are. A wrapper of
+/// [`compute_rhs_swe_2d_subset_then`] (it collects the element list, a pass
+/// over all elements).
 ///
 /// # Panics
 /// With horizontal viscosity: BR1 couples elements two faces apart.
@@ -1271,34 +1307,49 @@ pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
     time_of: &(dyn Fn(usize) -> Option<f64> + Sync),
     out: &mut SWESolution2D,
 ) {
-    compute_rhs_swe_2d_where_then(
+    let elements: Vec<u32> = (0..mesh.n_elements)
+        .filter(|&k| time_of(k).is_some())
+        .map(|k| k as u32)
+        .collect();
+    compute_rhs_swe_2d_subset_then(
         q,
         mesh,
         ops,
         geom,
         config,
-        time_of,
+        &elements,
+        &|k| time_of(k).expect("selected"),
         out,
         None,
         &|_, _, _| {},
     );
 }
 
-/// [`compute_rhs_swe_2d_where_into`], then `then(k, out rows, extra rows)`
-/// for every selected element, in the same parallel pass while its rows are
-/// in cache: local time stepping turns the RHS into the next stage value
-/// there (combination, damping, limiting), one pass per stage.
+/// [`compute_rhs_swe_2d_into`] for the listed `elements` only (distinct),
+/// element k at time `time_of(k)`, then `then(k, out rows, extra rows)` for
+/// each of them in the same pass, while its rows are in cache: local time
+/// stepping turns the RHS into the next stage value there (combination,
+/// damping, limiting). The other rows are left as they are.
+///
+/// A listed element gets bit for bit the RHS that the full evaluation at its
+/// time gives it: the split-form interior-face fluxes come from the same
+/// face kernel, run on the faces of the listed elements only. The work is
+/// proportional to the list, not to the mesh, so the many small subsets of
+/// a multirate step cost only their elements. Parallel with `parallel` from
+/// [`SUBSET_PARALLEL_MIN`] elements; allocation-free after the first calls
+/// on a thread.
 ///
 /// # Panics
 /// With horizontal viscosity, or if `extra` has another shape than `out`.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_rhs_swe_2d_where_then<BC: SWEBoundaryCondition2D>(
+pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     config: &SWE2DRhsConfig<BC>,
-    time_of: &(dyn Fn(usize) -> Option<f64> + Sync),
+    elements: &[u32],
+    time_of: &(dyn Fn(usize) -> f64 + Sync),
     out: &mut SWESolution2D,
     extra: Option<&mut SWESolution2D>,
     then: ElementRhsThen,
@@ -1311,112 +1362,82 @@ pub fn compute_rhs_swe_2d_where_then<BC: SWEBoundaryCondition2D>(
     if let Some(extra) = &extra {
         check_rhs_output(extra, mesh, ops);
     }
+    debug_assert!(all_distinct(elements, mesh.n_elements), "repeated elements");
+    #[cfg(feature = "parallel")]
+    use rayon::prelude::*;
+    #[cfg(feature = "parallel")]
+    let parallel = elements.len() >= SUBSET_PARALLEL_MIN;
 
-    // Interior-face fluxes of the faces of selected elements (they do not
+    // Interior-face fluxes of the faces of the listed elements (they do not
     // depend on time)
     let faces_kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, 0.0);
     let mut faces = FaceFluxGuard::take();
     match &faces_kernel.split_form {
         Some(split_form) => {
             faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
-            let selected = |e: usize| {
-                let edge = &mesh.edges[e];
-                time_of(edge.left.element).is_some()
-                    || edge.right.is_some_and(|r| time_of(r.element).is_some())
-            };
-            let edge = |(e, slots): (usize, &mut [SWEState2D])| {
-                if selected(e) {
-                    split_form.edge_fluxes(e, slots);
-                }
-            };
+            let mut scratch = SUBSET_EDGES.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+            scratch.collect(mesh, elements);
+            let edges = &scratch.list;
             let per_edge = 2 * ops.n_face_nodes;
+            let slots = DisjointChunks::new(&mut faces[..], per_edge);
+            // SAFETY: `edges` is distinct, so each edge's slots once
+            let edge =
+                |&e: &u32| split_form.edge_fluxes(e as usize, unsafe { slots.chunk(e as usize) });
             #[cfg(feature = "parallel")]
-            {
-                use rayon::prelude::*;
-                faces
-                    .par_chunks_exact_mut(per_edge)
-                    .enumerate()
-                    .for_each(edge);
+            if parallel {
+                edges.par_iter().for_each(edge);
+            } else {
+                edges.iter().for_each(edge);
             }
             #[cfg(not(feature = "parallel"))]
-            faces.chunks_exact_mut(per_edge).enumerate().for_each(edge);
+            edges.iter().for_each(edge);
+            SUBSET_EDGES.with(|cell| *cell.borrow_mut() = scratch);
         }
         None => faces.clear(),
     }
     let faces: &[SWEState2D] = &faces;
 
     let n = ops.n_nodes;
-    let element = |ws: &mut WorkspaceGuard,
-                   k: usize,
-                   [h, hu, hv]: [&mut [f64]; 3],
-                   extra: Option<[&mut [f64]; 3]>| {
-        if let Some(time) = time_of(k) {
-            SWE2DRhsKernel::new(q, mesh, ops, geom, config, time).element(
-                k,
-                ws,
-                faces,
-                [&mut *h, &mut *hu, &mut *hv],
-                None,
-            );
-            then(k, [h, hu, hv], extra);
-        }
-    };
     let [out_h, out_hu, out_hv] = &mut out.data;
+    let out_rows = [
+        DisjointChunks::new(out_h, n),
+        DisjointChunks::new(out_hu, n),
+        DisjointChunks::new(out_hv, n),
+    ];
+    let extra_rows = extra.map(|extra| {
+        let [h, hu, hv] = &mut extra.data;
+        [
+            DisjointChunks::new(h, n),
+            DisjointChunks::new(hu, n),
+            DisjointChunks::new(hv, n),
+        ]
+    });
+    let element = |ws: &mut WorkspaceGuard, &k: &u32| {
+        let k = k as usize;
+        // SAFETY: the elements are distinct, so each element's rows once
+        let [h, hu, hv] = out_rows.each_ref().map(|rows| unsafe { rows.chunk(k) });
+        let extra = extra_rows
+            .as_ref()
+            .map(|x| x.each_ref().map(|rows| unsafe { rows.chunk(k) }));
+        SWE2DRhsKernel::new(q, mesh, ops, geom, config, time_of(k)).element(
+            k,
+            ws,
+            faces,
+            [&mut *h, &mut *hu, &mut *hv],
+            None,
+        );
+        then(k, [h, hu, hv], extra);
+    };
     #[cfg(feature = "parallel")]
-    {
-        use rayon::prelude::*;
-        let out_rows = out_h
-            .par_chunks_exact_mut(n)
-            .zip(out_hu.par_chunks_exact_mut(n))
-            .zip(out_hv.par_chunks_exact_mut(n))
-            .map(|((h, hu), hv)| [h, hu, hv])
-            .enumerate();
-        match extra {
-            Some(extra) => {
-                let [h, hu, hv] = &mut extra.data;
-                let extra_rows = h
-                    .par_chunks_exact_mut(n)
-                    .zip(hu.par_chunks_exact_mut(n))
-                    .zip(hv.par_chunks_exact_mut(n))
-                    .map(|((h, hu), hv)| [h, hu, hv]);
-                out_rows.zip(extra_rows).for_each_init(
-                    || WorkspaceGuard::take(ops),
-                    |ws, ((k, rows), x)| element(ws, k, rows, Some(x)),
-                )
-            }
-            None => out_rows.for_each_init(
-                || WorkspaceGuard::take(ops),
-                |ws, (k, rows)| element(ws, k, rows, None),
-            ),
-        }
+    if parallel {
+        elements
+            .par_iter()
+            .for_each_init(|| WorkspaceGuard::take(ops), element);
+        return;
     }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let mut ws = WorkspaceGuard::take(ops);
-        let out_rows = out_h
-            .chunks_exact_mut(n)
-            .zip(out_hu.chunks_exact_mut(n))
-            .zip(out_hv.chunks_exact_mut(n))
-            .map(|((h, hu), hv)| [h, hu, hv])
-            .enumerate();
-        match extra {
-            Some(extra) => {
-                let [h, hu, hv] = &mut extra.data;
-                let extra_rows = h
-                    .chunks_exact_mut(n)
-                    .zip(hu.chunks_exact_mut(n))
-                    .zip(hv.chunks_exact_mut(n))
-                    .map(|((h, hu), hv)| [h, hu, hv]);
-                for ((k, rows), x) in out_rows.zip(extra_rows) {
-                    element(&mut ws, k, rows, Some(x));
-                }
-            }
-            None => {
-                for (k, rows) in out_rows {
-                    element(&mut ws, k, rows, None);
-                }
-            }
-        }
+    let mut ws = WorkspaceGuard::take(ops);
+    for k in elements {
+        element(&mut ws, k);
     }
 }
 

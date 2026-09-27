@@ -111,6 +111,48 @@ let drag = CageDrag2D::new(&mesh, &ops, &cages);
 let physics = builder.with_cage_drag(drag).build();
 ```
 
+## Coastline-fitted meshes from an elevation model
+
+`scripts/gmsh_coastline_mesh.py` meshes the water of a lon/lat box from an
+elevation model with land heights and depths (Kartverket's topobathy model,
+`scripts/kartverket_topobathy.sh`). `froya_real_data mesh=<file>` runs on the
+result, with the bed L2-projected from the same model:
+
+```bash
+uv run scripts/gmsh_coastline_mesh.py [coast=200] [far=1500] [dist=6000] \
+    [min_land=2·coast] [min_water=2·coast] [min_island=40000] [farm=lon,lat] \
+    [farm_size=50] [farm_radius=1000] [out=data/froya_coast.msh]
+cargo run --release --example froya_real_data -- mesh=data/froya_coast.msh lts=8
+```
+
+- **Coastline.** The 0 m contour of the model. Water not connected to the
+  edge of the box becomes land.
+- **Unresolvable features.** Land narrower than `min_land` is removed (an
+  opening of the land); skerries and thin points stay in the bed as shoals,
+  which the wet/dry scheme dries. Water narrower than `min_water` is filled
+  (an opening of the water), which also joins islands that nearly touch.
+  Both default to twice the coastal size. Coastline segments are that long
+  before subdivision, and a narrower feature would be cut by them, or would
+  force elements as small as itself.
+- **Coastline segments.** They are resampled at the element size before
+  subdivision. Sides on the box are one straight line each, tagged `open`,
+  and the coastline is `coast`.
+- **Mesher.** The default is recombination and subdivision, with sizes from
+  `coast` at the shore to `far` beyond `dist`, optionally `farm_size` near
+  `farm`. Gmsh's full-quad recombination halves every curve the same way.
+  Its quasi-structured quads (`mesher=qs`) took over 20 minutes on the Frøya
+  coastline.
+- **Check.** Every quad must be convex and oriented like the rest (Laplace
+  smoothing, `smooth=N`, can fold elements).
+
+**Frøya** (8.0–9.2°E, 63.6–64.0°N, the defaults): 12,206 quads, 33 islands,
+479 km of coastline, coastlines at least 278 m apart. The lake at rest holds
+to 1.9e-12 m/s. The quads of subdivided triangles are smaller than the rest:
+1 % under 38 m and the smallest 16 m across, at a 200 m coast. In 30–90 m of
+water they set a global time step of 0.009 s. With local time stepping
+(`lts=8`) a coarse step of 2.3 s costs ≈ 160 ms at 24 threads, ≈ 4 min per
+simulated hour.
+
 ## Test meshes
 
 `scripts/gmsh_fixtures.py` builds the meshes in `tests/data/gmsh/` with the Gmsh
