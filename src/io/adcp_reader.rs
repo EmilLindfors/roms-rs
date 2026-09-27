@@ -29,6 +29,11 @@
 //! 3600.0,0.22,0.12
 //! 7200.0,0.18,0.05
 //! ```
+//!
+//! Times are seconds or ISO 8601 / RFC3339 datetimes
+//! (`2025-06-01T00:10:00Z`), which become Unix seconds: the axis of
+//! [`ModelClock::unix`](crate::time::ModelClock::unix), so records and model
+//! series pair by time. `u` is eastward and `v` northward.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -38,6 +43,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::analysis::{ADCPStation, CurrentTimeSeries};
+use crate::io::datetime::parse_datetime_seconds;
 
 /// Error type for ADCP file operations.
 #[derive(Debug, Error)]
@@ -150,12 +156,8 @@ pub fn read_adcp_file(path: &Path) -> Result<ADCPFile, ADCPFileError> {
             )));
         }
 
-        let time: f64 = parts[0].parse().map_err(|_| {
-            ADCPFileError::ParseError(format!(
-                "Invalid time at line {}: {}",
-                line_num + 1,
-                parts[0]
-            ))
+        let time = parse_datetime_seconds(parts[0]).map_err(|e| {
+            ADCPFileError::ParseError(format!("Invalid time at line {}: {e}", line_num + 1))
         })?;
 
         let u: f64 = parts[1].parse().map_err(|_| {
@@ -269,6 +271,24 @@ mod tests {
     use super::*;
     use std::io::Write as IoWrite;
     use tempfile::NamedTempFile;
+
+    /// RFC3339 times become Unix seconds.
+    #[test]
+    fn reads_datetime_times() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "# station: Farm\n# longitude: 8.6\n# latitude: 63.8\n\
+             2025-06-01T00:00:00Z 0.1 0.05\n2025-06-01T00:10:00Z 0.2 -0.05"
+        )
+        .unwrap();
+        let adcp = read_adcp_file(file.path()).unwrap();
+        assert_eq!(
+            adcp.time_series.times(),
+            vec![1_748_736_000.0, 1_748_736_600.0]
+        );
+        assert_eq!(adcp.time_series.v_values(), vec![0.05, -0.05]);
+    }
 
     #[test]
     fn test_read_simple_format() {

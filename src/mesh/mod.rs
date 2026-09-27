@@ -26,7 +26,10 @@ pub mod io;
 pub mod traits;
 
 // Re-export core mesh types
-pub use core::{BoundaryConfig, BoundaryFace, Edge, ElementFace, Mesh1D, Mesh2D, Mesh2DBuilder};
+pub use core::{
+    BoundaryConfig, BoundaryFace, Edge, ElementFace, Mesh1D, Mesh2D, Mesh2DBuilder, MeshPoint,
+    PointLocator2D, inverse_bilinear,
+};
 
 // Re-export data types
 pub use data::{

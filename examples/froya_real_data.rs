@@ -8,8 +8,8 @@
 //!    (`dem=`, land heights and depths in one 50 m grid) when present; else
 //!    the GeoTIFF bathymetry (0 at its dry pixels) with a land mask from
 //!    GSHHS, four times finer, where the bed is `land_elevation`. The raster
-//!    is sampled at the nodes of a rectangular grid (`bed=projected`
-//!    L2-projects it instead, `Bathymetry2D::project`), and only elements
+//!    is L2-projected onto the nodes of a rectangular grid
+//!    (`Bathymetry2D::project`; `bed=point` samples it at the nodes), and only elements
 //!    with a node below mean sea level are kept (`Mesh2D::retain_elements`);
 //!    their faces to dropped elements are coastline walls. Land nodes inside
 //!    kept elements are dry shore for `WetDry`. The sides of the rectangle
@@ -35,7 +35,12 @@
 //!    the band (`blend=0` to keep it), ramped up from rest over `ramp_hours`.
 //!    Open faces NorKyst does not cover become walls. NorKyst's ζ is shifted
 //!    by minus the mean level `Z0` of the boundary atlas (its datum sits
-//!    0.28 m below mean sea level here), or by `nest_level=`. The parent ζ is taken as is; `ib=1` adds the
+//!    0.28 m below mean sea level here), or by `nest_level=`. NorKyst's
+//!    `gauge_ratios` constituents are replaced by the gauge-inferred ones
+//!    (below) by adding the difference between the corrected and the raw
+//!    atlas, which is NorKyst's own harmonic fit, so the residual flow is
+//!    kept (`OceanModelState::with_tidal_correction`; `nest_tides=raw` to
+//!    keep NorKyst's tides). The parent ζ is taken as is; `ib=1` adds the
 //!    inverse-barometer level of `met=` to it (for a parent run without
 //!    pressure forcing).
 //!    Without an atlas: M2 of `M2_AMPLITUDE` in one phase along the boundary.
@@ -43,10 +48,22 @@
 //!    observed) and about twice the Q1, so `gauge_ratios=N2,Q1` (the
 //!    default) re-infers them in the atlas from M2 and O1 with the ratios of
 //!    the first gauge's whole-record fit (`TidalAtlas::infer`).
-//! 5. **Validation.** Every `station_minutes` the surface is sampled at the
-//!    tide gauges `gauges=` (files as written by `scripts/kartverket_gauge.sh`;
-//!    the nearest node at least `STATION_MIN_DEPTH` deep). After the run each
-//!    station series is written to the output directory, and the part after
+//! 5. **Validation.** Every `station_minutes` the surface and the
+//!    depth-averaged current (east/north) are sampled at the tide gauges
+//!    `gauges=` (files as written by `scripts/kartverket_gauge.sh`) and at
+//!    the current records `currents=` (ADCP file format, depth-averaged). The
+//!    DG polynomial is evaluated at the station itself (`PointLocator2D`,
+//!    `Probe2D`) if its element is submerged (every node at least
+//!    `STATION_MIN_DEPTH` deep), else at the nearest point of a submerged
+//!    element: a coarse mesh leaves perched pockets in shoreline elements
+//!    that hold water above the tide. After the run
+//!    each station's series are written to the output directory
+//!    (`station_*.txt`, `currents_*.txt`). Currents are fitted for tidal
+//!    ellipses and compared with NorKyst-800's (from the velocity constants
+//!    of `station_atlas=`; each gauge gets a second station at its nearest
+//!    atlas point, where NorKyst's currents apply) and with the record's, by
+//!    constituent and by the complex difference |ΔW|, plus time-series
+//!    skill against the record. For the surface, the part after
 //!    `spinup_hours` is fitted for reference constants and compared with the
 //!    gauge (its whole record fitted, which also supplies the ratios of the
 //!    constituents the run is too short to resolve) and with NorKyst-800 at
@@ -64,10 +81,12 @@
 //! cargo run --release --example froya_real_data -- [nx=120] [ny=90] [order=2] \
 //!     [hours=12.42] [rest_hours=1] [ramp_hours=1] [output_minutes=60] [wind] \
 //!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>] \
-//!     [gauges=data/tide_gauges/mausund_obs.txt] [station_atlas=data/froya_station_tides.txt] \
+//!     [gauges=data/tide_gauges/mausund_obs.txt] [currents=<file,…>] \
+//!     [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
-//!     [bed=point|projected] [dem=data/froya_topobathy.tif|none] [lts=0] [output=output/froya] \
-//!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=]
+//!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [lts=0] [output=output/froya] \
+//!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
+//!     [nest_tides=corrected|raw]
 //! ```
 //!
 //! `lts=N` (N > 0) steps the tidal run with local time stepping
@@ -94,15 +113,17 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dg_rs::analysis::{
-    ConstituentComparison, Inference, ReferenceConstant, ReferenceFit, StationValidationResult,
-    TideGaugeStation, TimeSeries, fit_reference_constants, resolvable_constituents,
+    ADCPStation, ADCPValidationResult, ConstituentComparison, CurrentTimeSeries, EllipseFit,
+    Inference, ReferenceConstant, ReferenceFit, StationValidationResult, TidalEllipse,
+    TideGaugeStation, TimeSeries, fit_reference_constants, fit_tidal_ellipses,
+    resolvable_constituents,
 };
 #[cfg(feature = "netcdf")]
 use dg_rs::boundary::NestingOptions;
 use dg_rs::boundary::{
-    BCContext2D, BoundaryLevel, BoundaryTides, CharacteristicOBC, ExternalStateProvider,
-    HarmonicTide, InverseBarometer, MultiBoundaryCondition2D, OceanModelState, Reflective2D,
-    SWEBoundaryCondition2D, TidalAtlas,
+    AtlasPoint, BCContext2D, BoundaryLevel, BoundaryTides, CharacteristicOBC,
+    ExternalStateProvider, HarmonicTide, InverseBarometer, MultiBoundaryCondition2D,
+    OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
 };
 use dg_rs::equations::ShallowWater2D;
 #[cfg(feature = "netcdf")]
@@ -111,13 +132,14 @@ use dg_rs::io::{
 };
 use dg_rs::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection, TideGaugeFile, read_tide_gauge_file, write_tide_gauge_file, write_vtk_swe,
+    LocalProjection, TideGaugeFile, east_axis, read_adcp_file, read_tide_gauge_file,
+    write_adcp_file, write_tide_gauge_file, write_vtk_swe,
 };
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
+use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, MeshPoint, PointLocator2D, inverse_bilinear};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
 use dg_rs::simulation::Simulation;
-use dg_rs::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
+use dg_rs::solver::{Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
 use dg_rs::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
     ManningFriction2D, WindStress2D,
@@ -158,10 +180,11 @@ const WIND_DIRECTION: f64 = 225.0;
 const PRESSURE_GRADIENT: f64 = 1.5e-3;
 const PRESSURE_DIRECTION: f64 = 225.0;
 
-/// A station samples the nearest node at least this deep (m below MSL), so
-/// it stays wet through the tide
+/// A station samples the model at its position if every node of its element
+/// is at least this deep (m below MSL), so that it is in open water that
+/// stays wet through the tide; else at the nearest point of such an element
 const STATION_MIN_DEPTH: f64 = 3.0;
-/// ... and no farther than this from the gauge (m)
+/// ... no farther than this from the station (m)
 const STATION_MAX_OFFSET: f64 = 3000.0;
 /// Constituents fitted at the stations, in priority order (a short record
 /// keeps the first ones): the forcing's, without the long-period ones
@@ -201,11 +224,18 @@ struct Options {
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     blend_bed: bool,
     nesting_ib: bool,
+    /// Nesting: replace NorKyst's `gauge_ratios` constituents by the
+    /// gauge-inferred ones (`nest_tides=corrected`, the default) or keep its
+    /// tides (`nest_tides=raw`)
+    correct_nested_tides: bool,
     /// Added to NorKyst's ζ (m); default: minus the mean level `Z0` of the
     /// boundary atlas
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     nesting_level: Option<f64>,
     gauges: Vec<String>,
+    /// Current records (`currents=a.txt,b.txt`, ADCP file format:
+    /// depth-averaged east/north velocity)
+    currents: Vec<String>,
     station_atlas: String,
     station_minutes: f64,
     spinup_hours: f64,
@@ -214,11 +244,11 @@ struct Options {
     /// Elevation model with land heights (`dem=`, used if the file exists;
     /// `dem=none` for the GeoTIFF bathymetry and GSHHS coastline)
     dem: Option<String>,
-    /// Sample the bed at the nodes (`bed=point`, the default) or L2-project
-    /// it onto them (`bed=projected`). At 1 km both beat the old builder at
-    /// Mausund (centred RMSE 3.3 / 3.6 cm against 4.1 cm over hours 24–72),
-    /// but the station nodes differ, so the projection is not the default
-    /// until station interpolation (P3.1) separates the two.
+    /// L2-project the bed onto the nodes (`bed=projected`, the default) or
+    /// sample it there (`bed=point`). Point samples of the 50 m raster at
+    /// nodes 500 m apart land on skerries at random and close sounds: at
+    /// 1 km the M2 current near Mausund was 0.41 of NorKyst's with point
+    /// samples and 0.63 projected, the gauge's centred RMSE 4.4 and 4.0 cm
     project_bed: bool,
     /// Local time stepping with up to this many levels (`lts=`; 0: global
     /// SSP-RK3)
@@ -254,7 +284,7 @@ impl Options {
                 "none" => None,
                 path => Some(path.to_string()),
             },
-            project_bed: match args.get("bed").map_or("point", String::as_str) {
+            project_bed: match args.get("bed").map_or("projected", String::as_str) {
                 "projected" => true,
                 "point" => false,
                 other => return Err(format!("bad bed={other}: projected or point")),
@@ -283,6 +313,11 @@ impl Options {
             band_minutes: get("band_minutes", 30.0)?,
             blend_bed: get("blend", 1.0)? != 0.0,
             nesting_ib: get("ib", 0.0)? != 0.0,
+            correct_nested_tides: match args.get("nest_tides").map_or("corrected", String::as_str) {
+                "corrected" => true,
+                "raw" => false,
+                other => return Err(format!("bad nest_tides={other}: corrected or raw")),
+            },
             nesting_level: args
                 .get("nest_level")
                 .map(|v| v.parse().map_err(|_| format!("bad nest_level={v}")))
@@ -292,6 +327,13 @@ impl Options {
                 .map_or("data/tide_gauges/mausund_obs.txt", String::as_str)
                 .split(',')
                 .filter(|g| !g.is_empty())
+                .map(String::from)
+                .collect(),
+            currents: args
+                .get("currents")
+                .map_or("", String::as_str)
+                .split(',')
+                .filter(|c| !c.is_empty())
                 .map(String::from)
                 .collect(),
             station_atlas: args
@@ -322,22 +364,57 @@ struct Stats {
     wet: usize,
 }
 
-/// A tide gauge, the node that samples it, and the sampled series.
-struct Station {
+/// A tide gauge's record (finite samples, Unix times) and its reference
+/// constants.
+struct Gauge {
     station: TideGaugeStation,
-    /// Observed record (finite samples, Unix times) and its reference
-    /// constants
     observed: TimeSeries,
     observed_fit: Result<ReferenceFit, String>,
-    element: ElementIndex,
-    node: usize,
-    /// Distance from the gauge to the node (m)
+}
+
+/// A current record (Unix times, east/north) and its tidal ellipses.
+struct CurrentRecord {
+    station: ADCPStation,
+    observed: CurrentTimeSeries,
+    observed_fit: Result<EllipseFit, String>,
+}
+
+/// A station, the point that samples the model there, what it is compared
+/// with, and the sampled series.
+struct Station {
+    name: String,
+    longitude: f64,
+    latitude: f64,
+    /// Tide gauge record (η) and current record, if any
+    gauge: Option<Gauge>,
+    current: Option<CurrentRecord>,
+    /// The DG solution evaluated at the sampling point
+    probe: Probe2D,
+    /// Distance from the station to the sampling point (m; 0 at the station)
     offset: f64,
-    /// Still-water depth at the node (m)
+    /// Still-water depth at the sampling point (m)
     depth: f64,
-    /// Unix times and surface elevation
+    /// Local east in the mesh axes, `(cos θ, sin θ)`
+    east: (f64, f64),
+    /// Unix times, surface elevation, depth-averaged east and north velocity
     times: Vec<f64>,
     eta: Vec<f64>,
+    u_east: Vec<f64>,
+    v_north: Vec<f64>,
+}
+
+impl Station {
+    /// Record the state of `q` at Unix time `t`.
+    fn sample(&mut self, q: &SWESolution2D, bathymetry: &Bathymetry2D, t: f64) {
+        let p = self
+            .probe
+            .sample_swe(q, Some(bathymetry), WetDryConfig::DEFAULT_H_DRY);
+        let (c, s) = self.east;
+        self.times.push(t);
+        self.eta.push(p.eta);
+        self.u_east.push(p.u * c + p.v * s);
+        self.v_north.push(-p.u * s + p.v * c);
+    }
 }
 
 /// Water-only mesh with nodal bathymetry.
@@ -662,14 +739,63 @@ impl Domain {
         q
     }
 
-    /// Stations for the gauge files that lie in the domain: each samples the
-    /// nearest node at least `STATION_MIN_DEPTH` deep.
-    fn stations(&self, paths: &[String]) -> Vec<Station> {
+    /// Stations for the tide-gauge files `gauges` and the current records
+    /// `currents` that lie in the domain (see [`Domain::probe`]), and one at
+    /// each gauge's nearest point of the station atlas `atlas`: NorKyst's
+    /// currents are compared there, at NorKyst's own position, since they
+    /// vary over a few hundred metres among islands.
+    fn stations(
+        &self,
+        gauges: &[String],
+        currents: &[String],
+        atlas: Option<&TidalAtlas>,
+    ) -> Vec<Station> {
         let Some(projection) = &self.projection else {
             return Vec::new();
         };
+        let locator = PointLocator2D::new(&self.mesh);
+        let days = |t: &[f64]| {
+            t.last()
+                .zip(t.first())
+                .map_or(0.0, |(b, a)| (b - a) / 86_400.0)
+        };
         let mut stations = Vec::new();
-        for path in paths {
+        let mut add = |name: String,
+                       longitude: f64,
+                       latitude: f64,
+                       gauge: Option<Gauge>,
+                       current: Option<CurrentRecord>,
+                       record_days: f64| {
+            let (x, y) = projection.geo_to_xy(latitude, longitude);
+            let Some((probe, offset, depth)) = self.probe(&locator, [x, y]) else {
+                println!("  Station {name}: outside the domain (skipped)");
+                return;
+            };
+            println!(
+                "  Station {name}: sampled {}, {depth:.1} m deep; record {record_days:.0} days",
+                if offset > 0.0 {
+                    format!("{offset:.0} m from the station (its element is not submerged)")
+                } else {
+                    "at the station".to_string()
+                }
+            );
+            stations.push(Station {
+                name,
+                longitude,
+                latitude,
+                gauge,
+                current,
+                probe,
+                offset,
+                depth,
+                east: east_axis(projection, latitude, longitude),
+                times: Vec::new(),
+                eta: Vec::new(),
+                u_east: Vec::new(),
+                v_north: Vec::new(),
+            });
+        };
+        for path in gauges {
             let gauge = match read_tide_gauge_file(Path::new(path)) {
                 Ok(gauge) => gauge,
                 Err(e) => {
@@ -681,55 +807,111 @@ impl Domain {
                 println!("  Gauge {path}: no station position (skipped)");
                 continue;
             };
-            let (gx, gy) = projection.geo_to_xy(station.latitude, station.longitude);
-            let nearest = ElementIndex::iter(self.mesh.n_elements)
-                .flat_map(|k| (0..self.ops.n_nodes).map(move |i| (k, i)))
-                .filter(|&(k, i)| self.bathymetry.get(k, i) <= -STATION_MIN_DEPTH)
-                .map(|(k, i)| {
-                    let [x, y] = self.mesh.reference_to_physical(
-                        k,
-                        self.ops.nodes_r[i],
-                        self.ops.nodes_s[i],
-                    );
-                    ((x - gx).hypot(y - gy), k, i)
-                })
-                .min_by(|a, b| a.0.total_cmp(&b.0));
-            match nearest {
-                Some((offset, element, node)) if offset <= STATION_MAX_OFFSET => {
-                    let depth = -self.bathymetry.get(element, node);
-                    let (times, values): (Vec<f64>, Vec<f64>) = gauge
-                        .time_series
-                        .times()
-                        .into_iter()
-                        .zip(gauge.time_series.values())
-                        .filter(|(_, v)| v.is_finite())
-                        .unzip();
-                    let observed_fit = fit_record(&times, &values, &GAUGE_CONSTITUENTS, None);
-                    println!(
-                        "  Station {}: node {offset:.0} m from the gauge, {depth:.1} m deep; \
-                         gauge record {:.0} days",
-                        station.name,
-                        times
-                            .last()
-                            .zip(times.first())
-                            .map_or(0.0, |(b, a)| (b - a) / 86_400.0)
-                    );
-                    stations.push(Station {
-                        station,
-                        observed: TimeSeries::new(&times, &values),
-                        observed_fit,
-                        element,
-                        node,
-                        offset,
-                        depth,
-                        times: Vec::new(),
-                        eta: Vec::new(),
-                    });
-                }
-                _ => println!("  Gauge {}: outside the domain (skipped)", station.name),
+            let (times, values): (Vec<f64>, Vec<f64>) = gauge
+                .time_series
+                .times()
+                .into_iter()
+                .zip(gauge.time_series.values())
+                .filter(|(_, v)| v.is_finite())
+                .unzip();
+            let observed_fit = fit_record(&times, &values, &GAUGE_CONSTITUENTS, None);
+            let norkyst = atlas
+                .and_then(|a| a.nearest(station.longitude, station.latitude))
+                .filter(|&(p, d)| {
+                    d <= STATION_MAX_OFFSET
+                        && d > 0.0
+                        && p.constituents.iter().all(|c| c.velocity.is_some())
+                });
+            let name = station.name.clone();
+            add(
+                name.clone(),
+                station.longitude,
+                station.latitude,
+                Some(Gauge {
+                    station,
+                    observed: TimeSeries::new(&times, &values),
+                    observed_fit,
+                }),
+                None,
+                days(&times),
+            );
+            if let Some((p, _)) = norkyst {
+                add(
+                    format!("{name} NorKyst point"),
+                    p.lon,
+                    p.lat,
+                    None,
+                    None,
+                    0.0,
+                );
             }
         }
+        for path in currents {
+            let record = match read_adcp_file(Path::new(path)) {
+                Ok(record) => record,
+                Err(e) => {
+                    println!("  Current record {path}: {e} (skipped)");
+                    continue;
+                }
+            };
+            let observed = record.time_series;
+            let (times, u, v) = (observed.times(), observed.u_values(), observed.v_values());
+            let observed_fit = fit_current_record(&times, &u, &v, &GAUGE_CONSTITUENTS, None);
+            let station = record.station;
+            add(
+                station.name.clone(),
+                station.longitude,
+                station.latitude,
+                None,
+                Some(CurrentRecord {
+                    station,
+                    observed,
+                    observed_fit,
+                }),
+                days(&times),
+            );
+        }
         stations
+    }
+
+    /// Where a station at `p` samples the model: at `p` if its element is
+    /// submerged (every node at least `STATION_MIN_DEPTH` below mean sea
+    /// level), else at the nearest point of a submerged element within
+    /// `STATION_MAX_OFFSET`. Shoreline elements are avoided because
+    /// a coarse mesh leaves pockets there that hold water above the tide.
+    /// The probe, its distance from `p` and its still-water depth.
+    fn probe(&self, locator: &PointLocator2D, p: [f64; 2]) -> Option<(Probe2D, f64, f64)> {
+        let submerged = |k: ElementIndex| {
+            self.bathymetry
+                .element(k)
+                .iter()
+                .all(|&b| b <= -STATION_MIN_DEPTH)
+        };
+        let depth = |probe: &Probe2D| -probe.evaluate(self.bathymetry.element(probe.element()));
+        if let Some(probe) = Probe2D::at(locator, &self.ops, p)
+            && submerged(probe.element())
+        {
+            let d = depth(&probe);
+            return Some((probe, 0.0, d));
+        }
+        // The station's reference coordinates clamped to the element: its
+        // nearest point on a rectangle (the Frøya grid), close to it on any
+        // convex quadrilateral
+        let (distance, point) = ElementIndex::iter(self.mesh.n_elements)
+            .filter(|&k| submerged(k))
+            .filter_map(|k| {
+                let [r, s] = inverse_bilinear(&self.mesh.element_vertices(k), p)
+                    .unwrap_or([0.0, 0.0])
+                    .map(|c| c.clamp(-1.0, 1.0));
+                let [x, y] = self.mesh.reference_to_physical(k, r, s);
+                let distance = (x - p[0]).hypot(y - p[1]);
+                (distance <= STATION_MAX_OFFSET)
+                    .then_some((distance, MeshPoint { element: k, r, s }))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0))?;
+        let probe = Probe2D::new(&self.mesh, &self.ops, point);
+        let d = depth(&probe);
+        Some((probe, distance, d))
     }
 
     fn volume(&self, q: &SWESolution2D) -> f64 {
@@ -851,13 +1033,24 @@ fn tidal_run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t_end = opts.hours * 3600.0;
     let wall = Reflective2D::new();
-    let mut stations = domain.stations(&opts.gauges);
+    let station_atlas = Path::new(&opts.station_atlas);
+    let station_atlas = station_atlas
+        .exists()
+        .then(|| TidalAtlas::read(station_atlas))
+        .transpose()?;
+    let mut stations = domain.stations(&opts.gauges, &opts.currents, station_atlas.as_ref());
     let clock = ModelClock::parse(&opts.start)?;
     println!("  Clock: t = 0 at {} UTC", clock.format(0.0));
     let weather = weather(domain, opts, &clock, t_end)?;
     let level = match &weather {
         Some(gridded) => Some(Level::Gridded(gridded.clone())),
         None => opts.wind.then(|| Level::Uniform(pressure())),
+    };
+    let parent = match parent {
+        Some(parent) if opts.correct_nested_tides => Some(correct_parent_tides(
+            domain, opts, &stations, parent, t_end,
+        )?),
+        other => other,
     };
     let band = parent
         .as_ref()
@@ -936,10 +1129,7 @@ fn tidal_run(
     let start = Instant::now();
     let mut callback = |q: &SWESolution2D, t: f64| {
         for s in &mut stations {
-            let state = q.get_state(s.element, s.node);
-            s.times.push(clock.unix(t));
-            s.eta
-                .push(state.h + domain.bathymetry.get(s.element, s.node));
+            s.sample(q, &domain.bathymetry, clock.unix(t));
         }
         n_callbacks += 1;
         if (n_callbacks - 1) % output_every != 0 {
@@ -1018,25 +1208,53 @@ fn tidal_run(
             stats.speedup()
         );
     }
-    let station_atlas = Path::new(&opts.station_atlas);
-    let station_atlas = station_atlas
-        .exists()
-        .then(|| TidalAtlas::read(station_atlas))
-        .transpose()?;
+    let analysis_start = clock.unix(opts.spinup_hours * 3600.0);
     for s in &stations {
-        let path = output_dir.join(format!("station_{}.txt", slug(&s.station.name)));
-        let series = TimeSeries::new(&s.times, &s.eta).with_name(s.station.name.clone());
-        let mut file = TideGaugeFile::from_time_series(series).with_station(s.station.clone());
+        let slug = slug(&s.name);
+        let path = output_dir.join(format!("station_{slug}.txt"));
+        let series = TimeSeries::new(&s.times, &s.eta).with_name(s.name.clone());
+        let mut file =
+            TideGaugeFile::from_time_series(series).with_station(s.gauge.as_ref().map_or_else(
+                || TideGaugeStation::new(s.name.clone(), s.longitude, s.latitude),
+                |g| g.station.clone(),
+            ));
         file.datum = Some("MSL".into());
         file.units = Some("m".into());
         write_tide_gauge_file(&path, &file)?;
-        println!("\nStation {} → {}", s.station.name, path.display());
-        if let Err(e) = report_station(
-            s,
-            clock.unix(opts.spinup_hours * 3600.0),
-            station_atlas.as_ref(),
-        ) {
+        let current_path = output_dir.join(format!("currents_{slug}.txt"));
+        let currents = CurrentTimeSeries::new(&s.times, &s.u_east, &s.v_north);
+        let station =
+            ADCPStation::new(s.name.clone(), s.longitude, s.latitude).with_water_depth(s.depth);
+        write_adcp_file(&current_path, &station, &currents)?;
+        println!(
+            "\nStation {} → {}, {}",
+            s.name,
+            path.display(),
+            current_path.display()
+        );
+        let sampled = if s.offset > 0.0 {
+            format!("{:.0} m from the station", s.offset)
+        } else {
+            "at the station".into()
+        };
+        println!("  sampled {sampled}, {:.1} m deep", s.depth);
+        let atlas_point = station_atlas
+            .as_ref()
+            .and_then(|a| a.nearest(s.longitude, s.latitude))
+            .filter(|&(_, d)| d <= STATION_MAX_OFFSET);
+        if let Some((p, d)) = atlas_point {
+            println!(
+                "  NorKyst: atlas point {d:.0} m from the station, {:.0} m deep",
+                p.depth
+            );
+        }
+        if let Some(gauge) = &s.gauge
+            && let Err(e) = report_station(s, gauge, analysis_start, atlas_point.map(|(p, _)| p))
+        {
             println!("  no harmonic comparison: {e}");
+        }
+        if let Err(e) = report_currents(s, analysis_start, atlas_point.map(|(p, _)| p)) {
+            println!("  no current comparison: {e}");
         }
     }
     if let Some(e) = result.error {
@@ -1169,44 +1387,66 @@ fn fit_record(
     fit_reference_constants(times, values, &names, &inferred)
 }
 
+/// Tidal ellipses of the constituents a current record resolves; the others
+/// of P1, K2, N2 and Q1 are inferred with the major-axis ratio and lag
+/// difference of `reference` (a longer record at the same place) where it
+/// has them, else at equilibrium, for both components alike.
+fn fit_current_record(
+    times: &[f64],
+    u: &[f64],
+    v: &[f64],
+    candidates: &[&'static str],
+    reference: Option<&EllipseFit>,
+) -> Result<EllipseFit, String> {
+    let (Some(&t0), Some(&t1)) = (times.first(), times.last()) else {
+        return Err("empty record".into());
+    };
+    let names = resolvable_constituents(candidates, t1 - t0, 1.0);
+    let inferred: Vec<Inference> = Inference::EQUILIBRIUM
+        .into_iter()
+        .filter(|i| !names.contains(&i.name) && names.contains(&i.from))
+        .map(|i| {
+            let from_reference = reference.and_then(|r| {
+                let (a, b) = (r.get(i.name)?, r.get(i.from)?);
+                (b.major > 0.0).then(|| Inference {
+                    amplitude_ratio: a.major / b.major,
+                    lag_offset_deg: a.lag_deg - b.lag_deg,
+                    ..i
+                })
+            });
+            from_reference.unwrap_or(i)
+        })
+        .collect();
+    fit_tidal_ellipses(times, u, v, &names, &inferred)
+}
+
 /// The model's reference constants at a station after spin-up (from
-/// `analysis_start`, Unix s) against the gauge's (whole record) and the
-/// station atlas's; RMSE against the observations and the gauge's tidal
-/// prediction.
+/// `analysis_start`, Unix s) against the gauge's (whole record) and
+/// NorKyst's (`norkyst`, the station atlas); RMSE against the observations
+/// and the gauge's tidal prediction.
 fn report_station(
     s: &Station,
+    gauge_record: &Gauge,
     analysis_start: f64,
-    atlas: Option<&TidalAtlas>,
+    norkyst: Option<&AtlasPoint>,
 ) -> Result<(), String> {
     let first = s.times.partition_point(|&t| t < analysis_start);
     let (times, eta) = (&s.times[first..], &s.eta[first..]);
-    let gauge_times = s.observed.times();
-    let gauge = s
+    let gauge_times = gauge_record.observed.times();
+    let gauge = gauge_record
         .observed_fit
         .as_ref()
         .map_err(|e| format!("gauge fit: {e}"))?;
     let model = fit_record(times, eta, &STATION_CONSTITUENTS, Some(gauge))?;
-    let norkyst = atlas
-        .and_then(|a| a.nearest(s.station.longitude, s.station.latitude))
-        .filter(|&(_, d)| d <= STATION_MAX_OFFSET);
 
     let days = |t: &[f64]| (t[t.len() - 1] - t[0]) / 86_400.0;
     println!(
-        "  node {:.0} m from the gauge, {:.1} m deep; model {:.1} days after spin-up (R² {:.4}), \
-         gauge {:.1} days (R² {:.4})",
-        s.offset,
-        s.depth,
+        "  Surface: model {:.1} days after spin-up (R² {:.4}), gauge {:.1} days (R² {:.4})",
         days(times),
         model.r_squared,
         days(&gauge_times),
         gauge.r_squared
     );
-    if let Some((p, d)) = norkyst {
-        println!(
-            "  NorKyst: atlas point {d:.0} m from the gauge, {:.0} m deep",
-            p.depth
-        );
-    }
     println!(
         "  name |  model H   G    |  gauge H   G    | ratio   ΔG (°)  |ΔZ| (m) | NorKyst H   G    |ΔZ| (m)"
     );
@@ -1236,8 +1476,7 @@ fn report_station(
             vs_gauge.phase_error_degrees(),
             vs_gauge.complex_difference()
         );
-        if let Some(n) = norkyst.and_then(|(p, _)| p.constituents.iter().find(|n| n.name == c.name))
-        {
+        if let Some(n) = norkyst.and_then(|p| p.constituents.iter().find(|n| n.name == c.name)) {
             let vs_norkyst = cmp(c, n.eta.0, n.eta.1);
             rss_norkyst += vs_norkyst.complex_difference().powi(2);
             line += &format!(
@@ -1264,10 +1503,10 @@ fn report_station(
     let model_series = TimeSeries::new(times, eta);
     let prediction = TimeSeries::new(times, &gauge.predict(times));
     for (what, reference) in [
-        ("observations", &s.observed),
+        ("observations", &gauge_record.observed),
         ("gauge tidal prediction", &prediction),
     ] {
-        let v = StationValidationResult::compute(&s.station, &model_series, reference);
+        let v = StationValidationResult::compute(&gauge_record.station, &model_series, reference);
         let centred = (v.metrics.rmse.powi(2) - v.metrics.bias.powi(2))
             .max(0.0)
             .sqrt();
@@ -1280,6 +1519,124 @@ fn report_station(
             v.model_std,
             v.obs_std,
             v.metrics.n_points
+        );
+    }
+    Ok(())
+}
+
+/// The model's tidal ellipses of the depth-averaged current at a station
+/// after spin-up (from `analysis_start`, Unix s) against NorKyst's (the
+/// station atlas, if it has currents) and a current record's (its whole
+/// record fitted); time-series skill against the record.
+fn report_currents(
+    s: &Station,
+    analysis_start: f64,
+    norkyst: Option<&AtlasPoint>,
+) -> Result<(), String> {
+    let first = s.times.partition_point(|&t| t < analysis_start);
+    let (times, u, v) = (&s.times[first..], &s.u_east[first..], &s.v_north[first..]);
+    let observed = s
+        .current
+        .as_ref()
+        .map(|c| {
+            c.observed_fit
+                .as_ref()
+                .map_err(|e| format!("current record fit: {e}"))
+        })
+        .transpose()?;
+    let model = fit_current_record(times, u, v, &STATION_CONSTITUENTS, observed)?;
+    let norkyst: Vec<TidalEllipse> = norkyst
+        .map(|p| {
+            p.constituents
+                .iter()
+                .filter_map(|c| {
+                    Some(TidalEllipse::from_components(
+                        c.name,
+                        c.velocity?.0,
+                        c.velocity?.1,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    println!(
+        "  Depth-averaged current: model {:.1} days after spin-up (R² {:.4}), mean {:+.3} m/s east, \
+         {:+.3} m/s north",
+        (times[times.len() - 1] - times[0]) / 86_400.0,
+        model.r_squared(u, v),
+        model.mean.0,
+        model.mean.1
+    );
+    let references: Vec<(&str, &[TidalEllipse])> = [
+        (!norkyst.is_empty()).then_some(("NorKyst", norkyst.as_slice())),
+        observed.map(|o| ("record", o.ellipses.as_slice())),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let mut header = "  name | model major  minor   inc     G   ".to_string();
+    for (name, _) in &references {
+        header += &format!("| {name:>7} major  minor   inc     G    |ΔW| ");
+    }
+    println!("{header}  (m/s, degrees: inclination from east, Greenwich lag)");
+    let mut rss = vec![0.0; references.len()];
+    for e in &model.ellipses {
+        let mut line = format!(
+            "  {:4} | {:11.4} {:+7.4} {:5.1} {:6.1}{} ",
+            e.name,
+            e.major,
+            e.minor,
+            e.inclination_deg,
+            e.lag_deg,
+            if e.inferred { "*" } else { " " }
+        );
+        for ((_, reference), rss) in references.iter().zip(&mut rss) {
+            match reference.iter().find(|r| r.name == e.name) {
+                Some(r) => {
+                    let d = e.complex_difference(r);
+                    *rss += d * d;
+                    line += &format!(
+                        "| {:13.4} {:+7.4} {:5.1} {:6.1}  {d:.4} ",
+                        r.major, r.minor, r.inclination_deg, r.lag_deg
+                    );
+                }
+                None => line += &format!("| {:>46} ", "-"),
+            }
+        }
+        println!("{line}");
+    }
+    if !references.is_empty() {
+        let summary: Vec<String> = references
+            .iter()
+            .zip(&rss)
+            .map(|((name, _), rss)| format!("{:.4} m/s vs {name}", rss.sqrt()))
+            .collect();
+        println!(
+            "  (* inferred) root sum of squares of |ΔW|: {}",
+            summary.join(", ")
+        );
+    }
+
+    // Time series against the record, paired by time
+    if let Some(record) = &s.current {
+        let model_series = CurrentTimeSeries::new(times, u, v);
+        let (paired, _) = CurrentTimeSeries::paired_by_time(&model_series, &record.observed);
+        if paired.len() < 2 {
+            return Err("the current record does not overlap the run after spin-up".into());
+        }
+        let r = ADCPValidationResult::compute(&record.station, &model_series, &record.observed);
+        let m = &r.metrics;
+        println!(
+            "  vs current record ({} samples): RMSE u {:.3}, v {:.3}, speed {:.3} m/s; \
+             bias u {:+.3}, v {:+.3} m/s; vector correlation {:.3}; direction RMSE {:.1}°",
+            m.u_metrics.n_points,
+            m.u_metrics.rmse,
+            m.v_metrics.rmse,
+            m.speed_metrics.rmse,
+            m.u_metrics.bias,
+            m.v_metrics.bias,
+            m.vector_correlation,
+            m.direction_rmse
         );
     }
     Ok(())
@@ -1354,6 +1711,87 @@ fn weather(
 
 type OpenBoundary = (Box<dyn SWEBoundaryCondition2D>, String);
 
+/// `atlas` with the constituents `gauge_ratios` re-inferred from their
+/// neighbours with the ratios of the first gauge's whole-record fit
+/// (`TidalAtlas::infer`); unchanged without a gauge fit.
+fn corrected_atlas(
+    atlas: &TidalAtlas,
+    opts: &Options,
+    stations: &[Station],
+) -> Result<TidalAtlas, Box<dyn std::error::Error>> {
+    let mut atlas = atlas.clone();
+    let reference = stations.iter().find_map(|s| {
+        let gauge = s.gauge.as_ref()?;
+        Some((&s.name, gauge.observed_fit.as_ref().ok()?))
+    });
+    if reference.is_none() && !opts.gauge_ratios.is_empty() {
+        println!(
+            "  No gauge fit: the atlas keeps its own {:?}",
+            opts.gauge_ratios
+        );
+    }
+    for &name in opts.gauge_ratios.iter().filter(|_| reference.is_some()) {
+        let (Some(inference), Some((station, fit))) = (
+            Inference::EQUILIBRIUM.iter().find(|i| i.name == name),
+            reference,
+        ) else {
+            return Err(format!("gauge_ratios: {name} is not P1, K2, N2 or Q1").into());
+        };
+        let from = inference.from;
+        let i = Inference::from_reference(name, from, fit)
+            .ok_or(format!("gauge_ratios: {station} lacks {name} or {from}"))?;
+        atlas.infer(name, from, i.amplitude_ratio, i.lag_offset_deg)?;
+        println!(
+            "  Atlas {name} = {:.3} × {from}, lag {:+.1}° (ratio at {station})",
+            i.amplitude_ratio,
+            (i.lag_offset_deg + 180.0).rem_euclid(360.0) - 180.0
+        );
+    }
+    Ok(atlas)
+}
+
+/// NorKyst with its tides corrected (`nest_tides=corrected`): the boundary
+/// atlas is NorKyst's own harmonic fit, so adding (corrected atlas − atlas)
+/// keeps NorKyst's residual (coastal current, surge) and replaces its
+/// `gauge_ratios` constituents by the gauge-inferred ones, at the boundary
+/// and across the relaxation band.
+fn correct_parent_tides(
+    domain: &Domain,
+    opts: &Options,
+    stations: &[Station],
+    parent: OceanModelState,
+    t_end: f64,
+) -> Result<OceanModelState, Box<dyn std::error::Error>> {
+    let atlas_path = Path::new(&opts.tides);
+    let (Some(projection), true) = (&domain.projection, atlas_path.exists()) else {
+        println!(
+            "  No tidal atlas at {}: NorKyst's tides as they are",
+            opts.tides
+        );
+        return Ok(parent);
+    };
+    let raw = TidalAtlas::read(atlas_path)?;
+    let correction = corrected_atlas(&raw, opts, stations)?.difference(&raw)?;
+    let largest = correction
+        .points
+        .iter()
+        .flat_map(|p| p.constituents.iter().map(|c| (c.eta.0, c.name)))
+        .fold((0.0, ""), |a, b| if b.0 > a.0 { b } else { a });
+    if largest.0 == 0.0 {
+        return Ok(parent);
+    }
+    println!(
+        "  NorKyst tides corrected by (corrected − raw) atlas, largest {:.3} m ({})",
+        largest.0, largest.1
+    );
+    Ok(parent.with_tidal_correction(
+        &correction,
+        projection,
+        t_end,
+        ATLAS_COVERAGE + 1000.0 * opts.band_km,
+    )?)
+}
+
 /// Open-boundary condition and a description of the forcing: NorKyst
 /// nesting (`norkyst=`), else atlas tides (`tides=`), else uniform M2; raised
 /// by the inverse-barometer `level` of the pressure forcing (for nesting only
@@ -1384,33 +1822,7 @@ fn open_boundary(
     let clock = *clock;
     let atlas_path = Path::new(&opts.tides);
     if let (Some(projection), true) = (&domain.projection, atlas_path.exists()) {
-        let mut atlas = TidalAtlas::read(atlas_path)?;
-        let reference = stations
-            .iter()
-            .find_map(|s| Some((&s.station.name, s.observed_fit.as_ref().ok()?)));
-        if reference.is_none() && !opts.gauge_ratios.is_empty() {
-            println!(
-                "  No gauge fit: the atlas keeps its own {:?}",
-                opts.gauge_ratios
-            );
-        }
-        for &name in opts.gauge_ratios.iter().filter(|_| reference.is_some()) {
-            let (Some(inference), Some((station, fit))) = (
-                Inference::EQUILIBRIUM.iter().find(|i| i.name == name),
-                reference,
-            ) else {
-                return Err(format!("gauge_ratios: {name} is not P1, K2, N2 or Q1").into());
-            };
-            let from = inference.from;
-            let i = Inference::from_reference(name, from, fit)
-                .ok_or(format!("gauge_ratios: {station} lacks {name} or {from}"))?;
-            atlas.infer(name, from, i.amplitude_ratio, i.lag_offset_deg)?;
-            println!(
-                "  Atlas {name} = {:.3} × {from}, lag {:+.1}° (ratio at {station})",
-                i.amplitude_ratio,
-                (i.lag_offset_deg + 180.0).rem_euclid(360.0) - 180.0
-            );
-        }
+        let atlas = corrected_atlas(&TidalAtlas::read(atlas_path)?, opts, stations)?;
         let tides = atlas
             .boundary_tides(
                 &domain.mesh,

@@ -8,6 +8,7 @@
 //! - [`limiters`]: Slope limiters for oscillation control
 //! - [`algorithms`]: Specialized algorithms (wetting/drying)
 //! - [`diagnostics`]: Runtime diagnostics and progress tracking
+//! - [`probe`]: Sampling the solution at arbitrary points (stations)
 //! - [`simd`]: SIMD-optimized data structures and kernels
 //!
 //! # Limiter Traits
@@ -27,12 +28,15 @@ pub mod burn;
 pub mod core;
 pub mod diagnostics;
 pub mod limiters;
+pub mod probe;
 pub mod rhs;
 pub mod simd;
 pub mod state;
 
 // Re-export core solution types
 pub use core::{DGSolution1D, DGSolution2D, SystemSolution, SystemSolution2D};
+
+pub use probe::{Probe2D, SWEPointSample};
 
 // Re-export state types
 pub use state::{

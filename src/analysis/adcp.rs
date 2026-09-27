@@ -318,6 +318,38 @@ impl CurrentTimeSeries {
         }
         self.data.iter().map(|p| p.speed()).sum::<f64>() / self.data.len() as f64
     }
+
+    /// The observations `obs` that lie inside the time span of `model`
+    /// (sorted times), and the model linearly interpolated to their times:
+    /// two series on one time axis, for [`CurrentValidationMetrics`].
+    pub fn paired_by_time(model: &Self, obs: &Self) -> (Self, Self) {
+        let (Some(first), Some(last)) = (model.data.first(), model.data.last()) else {
+            return (Self::new(&[], &[], &[]), Self::new(&[], &[], &[]));
+        };
+        let (first, last) = (first.time, last.time);
+        let (paired_model, paired_obs): (Vec<CurrentPoint>, Vec<CurrentPoint>) = obs
+            .data
+            .iter()
+            .filter(|o| (first..=last).contains(&o.time))
+            .map(|o| {
+                let i = model.data.partition_point(|m| m.time < o.time);
+                let at = if model.data[i].time == o.time || i == 0 {
+                    model.data[i]
+                } else {
+                    let (a, b) = (model.data[i - 1], model.data[i]);
+                    let w = (o.time - a.time) / (b.time - a.time);
+                    CurrentPoint::new(o.time, a.u + w * (b.u - a.u), a.v + w * (b.v - a.v))
+                };
+                (CurrentPoint { time: o.time, ..at }, *o)
+            })
+            .unzip();
+        let with = |data, source: &Self| Self {
+            data,
+            location: source.location,
+            name: source.name.clone(),
+        };
+        (with(paired_model, model), with(paired_obs, obs))
+    }
 }
 
 /// Validation metrics for current velocity comparison.
@@ -487,6 +519,12 @@ impl ADCPValidationResult {
         model: &CurrentTimeSeries,
         obs: &CurrentTimeSeries,
     ) -> Self {
+        let (model, obs) = &CurrentTimeSeries::paired_by_time(model, obs);
+        assert!(
+            model.len() >= 2,
+            "{}: fewer than two observations inside the model's time span",
+            station.name
+        );
         let metrics = CurrentValidationMetrics::compute(model, obs);
 
         Self {
@@ -784,6 +822,26 @@ mod tests {
         let summary = result.summary();
         assert!(summary.contains("Test"));
         assert!(summary.contains("U RMSE"));
+    }
+
+    /// Observations between and outside the model's samples: the model is
+    /// interpolated to the observation times inside its span, the rest are
+    /// dropped.
+    #[test]
+    fn validation_pairs_by_time() {
+        let model = CurrentTimeSeries::new(&[0.0, 10.0, 20.0], &[0.0, 1.0, 3.0], &[1.0, 1.0, -1.0]);
+        let obs = CurrentTimeSeries::new(
+            &[-5.0, 0.0, 5.0, 15.0, 20.0, 25.0],
+            &[9.0, 0.0, 0.5, 2.0, 3.0, 9.0],
+            &[9.0, 1.0, 1.0, 0.0, -1.0, 9.0],
+        );
+        let (m, o) = CurrentTimeSeries::paired_by_time(&model, &obs);
+        assert_eq!(m.times(), vec![0.0, 5.0, 15.0, 20.0]);
+        assert_eq!(o.times(), m.times());
+        assert_eq!(m.u_values(), vec![0.0, 0.5, 2.0, 3.0]);
+        assert_eq!(m.v_values(), vec![1.0, 1.0, 0.0, -1.0]);
+        let result = ADCPValidationResult::compute(&ADCPStation::new("T", 0.0, 0.0), &model, &obs);
+        assert!(result.metrics.u_metrics.rmse < 1e-15 && result.metrics.v_metrics.rmse < 1e-15);
     }
 
     #[test]

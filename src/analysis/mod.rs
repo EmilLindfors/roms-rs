@@ -52,6 +52,7 @@
 //! ```
 
 mod adcp;
+mod ellipse;
 mod harmonic;
 mod metrics;
 mod reference_fit;
@@ -62,6 +63,7 @@ pub use adcp::{
     ADCPStation, ADCPValidationResult, ADCPValidationSummary, CurrentPoint, CurrentTimeSeries,
     CurrentValidationMetrics, norwegian_stations as adcp_norwegian_stations,
 };
+pub use ellipse::{EllipseFit, TidalEllipse, fit_tidal_ellipses};
 pub use harmonic::{ConstituentResult, HarmonicAnalysis, HarmonicResult};
 pub use metrics::{
     ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary, compare_harmonics,

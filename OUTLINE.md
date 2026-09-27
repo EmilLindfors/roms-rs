@@ -34,7 +34,7 @@ src/
 ├── basis/            # Vandermonde matrices, nodal<->modal (1D + 2D)
 ├── operators/        # Dr/Ds, mass, LIFT, GeometricFactors2D (affine-only — REVIEW.md §4.1)
 ├── mesh/
-│   ├── core/         # Mesh1D, Mesh2D (quads), Mesh2DBuilder
+│   ├── core/         # Mesh1D, Mesh2D (quads), Mesh2DBuilder, PointLocator2D
 │   ├── data/         # Bathymetry, land mask, boundary tags
 │   ├── io/           # Gmsh MSH 4.1 (ASCII/binary) + 2.2 reader, 2.2 writer
 │   └── traits/       # Mesh traits, Point; MeshGPUData (unimplemented)
@@ -62,6 +62,7 @@ src/
 │   ├── algorithms/   # Wetting/drying, tridiagonal (Thomas) solve
 │   ├── simd/         # pulp kernels + batched faer paths (parallel feature)
 │   ├── diagnostics/  # Runtime diagnostics
+│   ├── probe.rs      # Probe2D: the DG solution at a point (stations)
 │   └── burn/         # Burn GPU prototype — incomplete, deletion recommended
 │                     # (REVIEW.md §5; TODO P0.11/P2.7)
 ├── time/             # Integrable + TimeIntegrator traits, generic SSPRK3,
@@ -79,8 +80,8 @@ src/
 ├── io/               # NetCDF output; parent-ocean and weather-model readers
 │                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
 │                     # bathymetry, GSHHS coastline, projections, observations
-└── analysis/         # Harmonic (tidal) analysis, skill metrics, tide gauge,
-                      # ADCP, stability monitoring
+└── analysis/         # Harmonic (tidal) analysis, tidal current ellipses,
+                      # skill metrics, tide gauge, ADCP, stability monitoring
 ```
 
 Layering intent (dependencies point up this list): `types` → DG core →
