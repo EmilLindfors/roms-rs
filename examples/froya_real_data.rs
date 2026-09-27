@@ -8,8 +8,8 @@
 //!    (`dem=`, land heights and depths in one 50 m grid) when present; else
 //!    the GeoTIFF bathymetry (0 at its dry pixels) with a land mask from
 //!    GSHHS, four times finer, where the bed is `land_elevation`. The raster
-//!    is sampled at the nodes of a rectangular grid (`bed=projected`
-//!    L2-projects it instead, `Bathymetry2D::project`), and only elements
+//!    is L2-projected onto the nodes of a rectangular grid
+//!    (`Bathymetry2D::project`; `bed=point` samples it at the nodes), and only elements
 //!    with a node below mean sea level are kept (`Mesh2D::retain_elements`);
 //!    their faces to dropped elements are coastline walls. Land nodes inside
 //!    kept elements are dry shore for `WetDry`. The sides of the rectangle
@@ -84,7 +84,7 @@
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [currents=<file,…>] \
 //!     [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
-//!     [bed=point|projected] [dem=data/froya_topobathy.tif|none] [lts=0] [output=output/froya] \
+//!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [lts=0] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw]
 //! ```
@@ -244,8 +244,11 @@ struct Options {
     /// Elevation model with land heights (`dem=`, used if the file exists;
     /// `dem=none` for the GeoTIFF bathymetry and GSHHS coastline)
     dem: Option<String>,
-    /// Sample the bed at the nodes (`bed=point`, the default) or L2-project
-    /// it onto them (`bed=projected`)
+    /// L2-project the bed onto the nodes (`bed=projected`, the default) or
+    /// sample it there (`bed=point`). Point samples of the 50 m raster at
+    /// nodes 500 m apart land on skerries at random and close sounds: at
+    /// 1 km the M2 current near Mausund was 0.41 of NorKyst's with point
+    /// samples and 0.63 projected, the gauge's centred RMSE 4.4 and 4.0 cm
     project_bed: bool,
     /// Local time stepping with up to this many levels (`lts=`; 0: global
     /// SSP-RK3)
@@ -281,7 +284,7 @@ impl Options {
                 "none" => None,
                 path => Some(path.to_string()),
             },
-            project_bed: match args.get("bed").map_or("point", String::as_str) {
+            project_bed: match args.get("bed").map_or("projected", String::as_str) {
                 "projected" => true,
                 "point" => false,
                 other => return Err(format!("bad bed={other}: projected or point")),
