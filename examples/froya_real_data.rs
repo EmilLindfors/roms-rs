@@ -59,8 +59,9 @@
 //!    that hold water above the tide. After the run
 //!    each station's series are written to the output directory
 //!    (`station_*.txt`, `currents_*.txt`). Currents are fitted for tidal
-//!    ellipses and compared with NorKyst-800's at the station (from the
-//!    velocity constants of `station_atlas=`) and with the record's, by
+//!    ellipses and compared with NorKyst-800's (from the velocity constants
+//!    of `station_atlas=`; each gauge gets a second station at its nearest
+//!    atlas point, where NorKyst's currents apply) and with the record's, by
 //!    constituent and by the complex difference |ΔW|, plus time-series
 //!    skill against the record. For the surface, the part after
 //!    `spinup_hours` is fitted for reference constants and compared with the
@@ -736,8 +737,16 @@ impl Domain {
     }
 
     /// Stations for the tide-gauge files `gauges` and the current records
-    /// `currents` that lie in the domain (see [`Domain::probe`]).
-    fn stations(&self, gauges: &[String], currents: &[String]) -> Vec<Station> {
+    /// `currents` that lie in the domain (see [`Domain::probe`]), and one at
+    /// each gauge's nearest point of the station atlas `atlas`: NorKyst's
+    /// currents are compared there, at NorKyst's own position, since they
+    /// vary over a few hundred metres among islands.
+    fn stations(
+        &self,
+        gauges: &[String],
+        currents: &[String],
+        atlas: Option<&TidalAtlas>,
+    ) -> Vec<Station> {
         let Some(projection) = &self.projection else {
             return Vec::new();
         };
@@ -803,8 +812,16 @@ impl Domain {
                 .filter(|(_, v)| v.is_finite())
                 .unzip();
             let observed_fit = fit_record(&times, &values, &GAUGE_CONSTITUENTS, None);
+            let norkyst = atlas
+                .and_then(|a| a.nearest(station.longitude, station.latitude))
+                .filter(|&(p, d)| {
+                    d <= STATION_MAX_OFFSET
+                        && d > 0.0
+                        && p.constituents.iter().all(|c| c.velocity.is_some())
+                });
+            let name = station.name.clone();
             add(
-                station.name.clone(),
+                name.clone(),
                 station.longitude,
                 station.latitude,
                 Some(Gauge {
@@ -815,6 +832,16 @@ impl Domain {
                 None,
                 days(&times),
             );
+            if let Some((p, _)) = norkyst {
+                add(
+                    format!("{name} NorKyst point"),
+                    p.lon,
+                    p.lat,
+                    None,
+                    None,
+                    0.0,
+                );
+            }
         }
         for path in currents {
             let record = match read_adcp_file(Path::new(path)) {
@@ -1003,7 +1030,12 @@ fn tidal_run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let t_end = opts.hours * 3600.0;
     let wall = Reflective2D::new();
-    let mut stations = domain.stations(&opts.gauges, &opts.currents);
+    let station_atlas = Path::new(&opts.station_atlas);
+    let station_atlas = station_atlas
+        .exists()
+        .then(|| TidalAtlas::read(station_atlas))
+        .transpose()?;
+    let mut stations = domain.stations(&opts.gauges, &opts.currents, station_atlas.as_ref());
     let clock = ModelClock::parse(&opts.start)?;
     println!("  Clock: t = 0 at {} UTC", clock.format(0.0));
     let weather = weather(domain, opts, &clock, t_end)?;
@@ -1173,11 +1205,6 @@ fn tidal_run(
             stats.speedup()
         );
     }
-    let station_atlas = Path::new(&opts.station_atlas);
-    let station_atlas = station_atlas
-        .exists()
-        .then(|| TidalAtlas::read(station_atlas))
-        .transpose()?;
     let analysis_start = clock.unix(opts.spinup_hours * 3600.0);
     for s in &stations {
         let slug = slug(&s.name);
