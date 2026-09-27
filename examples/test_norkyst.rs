@@ -1,132 +1,111 @@
-//! Test loading NorKyst v3 data and using it for boundary conditions.
+//! Inspect a NorKyst/ROMS file as nesting data.
 //!
-//! Run with: cargo run --example test_norkyst --features netcdf
+//! Reads a parent-model file (`OceanModelReader::from_file`: local NetCDF or
+//! an OPeNDAP URL, e.g. one written by `norkyst_nesting_subset`), prints what
+//! it found, the state at a point, and the open-boundary state of a 10 km
+//! square nested around that point (`OceanModelState`).
+//!
+//! ```bash
+//! cargo run --release --example test_norkyst -- data/froya_norkyst.nc [lon=8.5] [lat=63.75]
+//! ```
 
 #[cfg(feature = "netcdf")]
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use dg_rs::boundary::{
-        BCContext2D, CharacteristicOBC, ExternalStateProvider, OceanModelState,
+        BCContext2D, CharacteristicOBC, ExternalStateProvider, NestingOptions, OceanModelState,
         SWEBoundaryCondition2D,
     };
     use dg_rs::io::{LocalProjection, OceanModelReader};
+    use dg_rs::mesh::{BoundaryTag, Mesh2D};
+    use dg_rs::operators::DGOperators2D;
     use dg_rs::solver::SWEState2D;
-    use std::sync::Arc;
 
-    // Try stuv file (salinity, temperature, u, v) with larger bbox
-    let path = "/home/emil/aqc/aqc-h3o/data/norkyst_v3/norkyst_v3_norkystv3_800m_m00_be_20240130_0600_stuv_bbox_7p8_62p8_8p9_64p1.nc";
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let path = args
+        .iter()
+        .find(|a| !a.contains('='))
+        .ok_or("usage: test_norkyst <file or URL> [lon=…] [lat=…]")?;
+    let options: HashMap<&str, f64> = args
+        .iter()
+        .filter_map(|a| a.split_once('='))
+        .filter_map(|(k, v)| Some((k, v.parse().ok()?)))
+        .collect();
+    let lon = options.get("lon").copied().unwrap_or(8.5);
+    let lat = options.get("lat").copied().unwrap_or(63.75);
 
-    println!("Loading NorKyst v3 file: {}", path);
+    println!("Loading {path}");
+    let reader = Arc::new(OceanModelReader::from_file(path)?);
+    println!("{}", reader.summary());
 
-    match OceanModelReader::from_file(path) {
-        Ok(reader) => {
-            println!("{}", reader.summary());
-
-            // Try to get a state at Frøya coordinates
-            let lat = 63.75;
-            let lon = 8.5;
-
-            if let Some(state) = reader.get_state(lon, lat, 0) {
-                println!("\nState at ({}, {}):", lat, lon);
-                println!("  SSH: {:.3} m", state.ssh);
-                println!("  u: {:.3} m/s", state.u);
-                println!("  v: {:.3} m/s", state.v);
-                if let Some(t) = state.temperature {
-                    println!("  T: {:.2} °C", t);
-                }
-                if let Some(s) = state.salinity {
-                    println!("  S: {:.2} PSU", s);
-                }
-            } else {
-                println!("No data at ({}, {})", lat, lon);
-            }
-
-            // Test time interpolation if there are multiple time steps
-            if reader.time.len() > 1 {
-                let t_mid = (reader.time[0] + reader.time[1]) / 2.0;
-                println!("\nTime interpolation test at t={:.1} s:", t_mid);
-                if let Some(state) = reader.get_state_interpolated(lon, lat, t_mid) {
-                    println!("  SSH: {:.3} m", state.ssh);
-                    println!("  u: {:.3} m/s", state.u);
-                    println!("  v: {:.3} m/s", state.v);
-                }
-            }
-
-            // =====================================================
-            // Demonstrate NorKyst as open-boundary data
-            // =====================================================
-            println!("\n{}", "=".repeat(60));
-            println!("OceanModelState + CharacteristicOBC demo");
-            println!("{}", "=".repeat(60));
-
-            // Create projection centered on Frøya
-            let projection = LocalProjection::new(lat, lon);
-
-            // Wrap reader in Arc for sharing
-            let reader = Arc::new(reader);
-
-            // Parent state on a clock starting at the first snapshot
-            let clock = OceanModelState::<LocalProjection>::first_snapshot(&reader);
-            let parent = OceanModelState::new(Arc::clone(&reader), projection, clock);
-            if let (Some((t0, t1)), Some((s0, s1))) =
-                (parent.time_range(), parent.simulation_time_range())
-            {
-                println!("Time range: {t0:.0} - {t1:.0} Unix s (simulation {s0:.0} - {s1:.0} s)");
-            }
-            println!("Spatial bounds: {:?}", parent.spatial_bounds());
-            let bc = CharacteristicOBC::new(parent.clone());
-            println!("BC name: {}", bc.name());
-
-            // Simulate a boundary node query
-            // At origin (0, 0) in local coords = center lat/lon
-            let bathymetry = -50.0; // bed 50 m below MSL
-            let interior_state = SWEState2D::from_primitives(50.0, 0.0, 0.0); // Still water
-            let time = 0.0; // Simulation time; t = 0 is the first snapshot by default
-
-            let ctx = BCContext2D::new(
-                time,
-                (0.0, 0.0), // Position at origin (= lat, lon center)
-                interior_state,
-                bathymetry,
-                (1.0, 0.0), // Outward normal in +x direction
-                9.81,       // g
-                1e-6,       // h_min
-            );
-
-            println!(
-                "\nParent state at origin: {:?}",
-                parent.external_state(&ctx)
-            );
-            let ghost = bc.ghost_state(&ctx);
-            println!("Boundary state at origin:");
-            println!("  h: {:.3} m", ghost.h);
-            println!("  u: {:.4} m/s", ghost.hu / ghost.h.max(1e-6));
-            println!("  v: {:.4} m/s", ghost.hv / ghost.h.max(1e-6));
-
-            // Test at a point 5km to the east
-            let ctx_east = BCContext2D::new(
-                time,
-                (5000.0, 0.0), // 5km east of center
-                interior_state,
-                bathymetry,
-                (1.0, 0.0),
-                9.81,
-                1e-6,
-            );
-
-            let ghost_east = bc.ghost_state(&ctx_east);
-            println!("\nBoundary state 5 km east:");
-            println!("  h: {:.3} m", ghost_east.h);
-            println!("  u: {:.4} m/s", ghost_east.hu / ghost_east.h.max(1e-6));
-            println!("  v: {:.4} m/s", ghost_east.hv / ghost_east.h.max(1e-6));
+    match reader.get_state(lon, lat, 0) {
+        Some(state) => {
+            println!("\nFirst snapshot at ({lon}, {lat}):");
+            println!("  SSH:      {:?} m", state.ssh);
+            println!("  velocity: {:?} m/s (east, north)", state.velocity);
+            println!("  depth:    {:?} m", state.depth);
+            println!("  T, S:     {:?}, {:?}", state.temperature, state.salinity);
         }
-        Err(e) => {
-            eprintln!("Failed to load: {}", e);
-        }
+        None => println!("\nNo parent data at ({lon}, {lat})"),
     }
+
+    // A 10 km square around the point, open on every side
+    let projection = LocalProjection::new(lat, lon);
+    let mesh = Mesh2D::uniform_rectangle_with_bc(
+        -5000.0,
+        5000.0,
+        -5000.0,
+        5000.0,
+        10,
+        10,
+        BoundaryTag::Open,
+    );
+    let ops = DGOperators2D::new(2);
+    let clock = OceanModelState::first_snapshot(&reader);
+    let parent = OceanModelState::new(
+        Arc::clone(&reader),
+        &mesh,
+        &ops,
+        &projection,
+        BoundaryTag::Open,
+        clock,
+        &NestingOptions::default().with_band(2000.0),
+    )?;
+    let (s0, s1) = parent.simulation_time_range();
+    println!(
+        "\nNested 10 km square: {} boundary nodes ({} snapped to wet parent points), {} band nodes; \
+         simulation times {s0:.0}–{s1:.0} s from {}",
+        parent.n_boundary_nodes(),
+        parent.n_snapped(),
+        parent.n_band_nodes(),
+        clock.format(0.0)
+    );
+
+    let bc = CharacteristicOBC::new(parent.clone());
+    for (name, position, normal) in [
+        ("east", (5000.0, 0.0), (1.0, 0.0)),
+        ("north", (0.0, 5000.0), (0.0, 1.0)),
+    ] {
+        let bed = -50.0;
+        let ctx = BCContext2D::new(
+            0.0,
+            position,
+            SWEState2D::new(-bed, 0.0, 0.0),
+            bed,
+            normal,
+            9.81,
+            1e-6,
+        );
+        let external = parent.external_state(&ctx);
+        let q = bc.boundary_state(&ctx);
+        println!("  {name} side, 50 m bed: parent {external:?} → boundary state {q:?}");
+    }
+    Ok(())
 }
 
 #[cfg(not(feature = "netcdf"))]
 fn main() {
-    eprintln!("This example requires the 'netcdf' feature.");
-    eprintln!("Run with: cargo run --example test_norkyst --features netcdf");
+    eprintln!("This example requires the `netcdf` feature.");
 }

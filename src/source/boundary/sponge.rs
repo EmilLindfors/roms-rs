@@ -44,7 +44,7 @@ use crate::source::{SourceContext2D, SourceTerm2D};
 use std::f64::consts::PI;
 
 /// Shape function for sponge layer damping profile.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum SpongeProfile {
     /// Linear ramp: γ(ξ) = γ_max · ξ
     Linear,

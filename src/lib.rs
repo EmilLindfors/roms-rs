@@ -71,8 +71,6 @@ pub use time::{
 
 // 2D types
 pub use basis::Vandermonde2D;
-#[cfg(feature = "netcdf")]
-pub use boundary::OceanModelState;
 pub use boundary::{
     BCContext2D, BathymetryValidationConfig, BathymetryValidationResult, BoundaryState,
     BoundaryTides, CharacteristicOBC, ConstantDischarge2D, Discharge2D, ElevationOnly,
@@ -81,6 +79,7 @@ pub use boundary::{
     Tidal2D, TidalAtlas, TidalBCType, TidalConstituent, TidalSimulationBuilder,
     format_bathymetry_warning, validate_bathymetry_convention,
 };
+pub use boundary::{NestingOptions, NestingRelaxation2D, OceanModelState};
 pub use equations::Advection2D;
 pub use mesh::{BoundaryConfig, BoundaryTag, Mesh2D, Mesh2DBuilder};
 pub use operators::{DGOperators2D, GeometricFactors2D};
@@ -158,9 +157,9 @@ pub use solver::burn::{
 };
 pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
-    HorizontalViscosity2D, HydrostaticReconstruction2D, P_STANDARD, RectangularBoundary,
-    SourceContext2D, SourceTerm2D, SpongeLayer2D, SpongeProfile, TidalPotential,
-    TidalPotentialConstituent, ViscosityModel, WindStress2D,
+    GriddedAtmosphere2D, HorizontalViscosity2D, HydrostaticReconstruction2D, P_STANDARD,
+    RectangularBoundary, SourceContext2D, SourceTerm2D, SpongeLayer2D, SpongeProfile,
+    TidalPotential, TidalPotentialConstituent, ViscosityModel, WindStress2D,
 };
 #[cfg(feature = "burn")]
 pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};
@@ -206,6 +205,7 @@ pub use analysis::{
 };
 
 // I/O types
+pub use io::{AtmosphereReader, AtmosphereState, OceanModelReader, OceanState};
 pub use io::{
     BathymetryStatistics,
     BedRaster,
@@ -252,9 +252,8 @@ pub use io::{
 };
 #[cfg(feature = "netcdf")]
 pub use io::{
-    FILL_VALUE_F32, FILL_VALUE_F64, ForcingDataPoint, ForcingReader, NetCDFError, NetCDFMeshInfo,
-    NetCDFWriter, NetCDFWriterConfig, OceanGridType, OceanModelReader, OceanState, is_valid_f32,
-    is_valid_f64,
+    FILL_VALUE_F32, FILL_VALUE_F64, NetCDFError, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig,
+    is_valid_f32, is_valid_f64,
 };
 #[cfg(feature = "parquet")]
 pub use io::{

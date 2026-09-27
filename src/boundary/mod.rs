@@ -60,7 +60,6 @@ mod boundary_2d;
 mod characteristic;
 mod harmonic_tide;
 mod multi_bc_2d;
-#[cfg(feature = "netcdf")]
 mod ocean_nesting;
 mod radiation;
 mod reflective;
@@ -79,13 +78,12 @@ pub use boundary_2d::{
     HarmonicTidal2D, Reflective2D, SWEBoundaryCondition2D, Tidal2D,
 };
 pub use characteristic::{
-    CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider, InverseBarometer,
-    ParentTimeSeries, StillWater, characteristic_state,
+    BoundaryLevel, CharacteristicOBC, ElevationOnly, ExternalState, ExternalStateProvider,
+    InverseBarometer, ParentTimeSeries, StillWater, characteristic_state,
 };
 pub use harmonic_tide::{HarmonicTide, tidal_ramp};
 pub use multi_bc_2d::MultiBoundaryCondition2D;
-#[cfg(feature = "netcdf")]
-pub use ocean_nesting::OceanModelState;
+pub use ocean_nesting::{NestingError, NestingOptions, NestingRelaxation2D, OceanModelState};
 pub use tidal_atlas::{AtlasConstituent, AtlasPoint, BoundaryTides, TidalAtlas, TidalAtlasError};
 pub use tidal_config::{SpongeConfig, TidalBCType, TidalSimulationBuilder};
 

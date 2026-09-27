@@ -164,15 +164,36 @@ impl ExternalStateProvider for ParentTimeSeries {
     }
 }
 
+/// A surface level (m) at boundary points, e.g. the inverse-barometer
+/// level of an atmospheric pressure field.
+pub trait BoundaryLevel: Send + Sync {
+    /// Level at the boundary point and time of `ctx`.
+    fn level(&self, ctx: &BCContext2D) -> f64;
+}
+
+/// Any closure `(x, y, t) → level`.
+impl<F> BoundaryLevel for F
+where
+    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
+{
+    fn level(&self, ctx: &BCContext2D) -> f64 {
+        let (x, y) = ctx.position;
+        self(x, y, ctx.time)
+    }
+}
+
 /// Adds the inverse-barometer response of the sea to another provider's
 /// elevation.
 ///
-/// With atmospheric pressure forcing (`AtmosphericPressure2D`) the interior
-/// sea level settles at `η_IB = −(p − p₀)/(ρ g)` (≈ −1 cm/hPa), which the
-/// pressure-gradient force balances exactly. External data without that
-/// response (tides, still water) pins the boundary to the wrong level and
-/// drives a spurious current through it. `level(x, y, t)` is the inverse
-/// barometer elevation, e.g. `|x, y, t| pressure.inverse_barometer(x, y, t)`.
+/// With atmospheric pressure forcing (`AtmosphericPressure2D`,
+/// `GriddedAtmosphere2D`) the interior sea level settles at
+/// `η_IB = −(p − p₀)/(ρ g)` (≈ −1 cm/hPa), which the pressure-gradient force
+/// balances exactly. External data without that response (tides, still
+/// water, a parent model forced without pressure) pins the boundary to the
+/// wrong level and drives a spurious current through it. `level` is the
+/// inverse-barometer elevation: a [`BoundaryLevel`] such as
+/// `GriddedAtmosphere2D`, or a closure like
+/// `|x, y, t| pressure.inverse_barometer(x, y, t)`.
 #[derive(Clone, Debug)]
 pub struct InverseBarometer<P, F> {
     provider: P,
@@ -182,9 +203,9 @@ pub struct InverseBarometer<P, F> {
 impl<P, F> InverseBarometer<P, F>
 where
     P: ExternalStateProvider,
-    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
+    F: BoundaryLevel,
 {
-    /// `provider`'s external state, raised by `level(x, y, t)`.
+    /// `provider`'s external state, raised by `level`.
     pub fn new(provider: P, level: F) -> Self {
         Self { provider, level }
     }
@@ -193,12 +214,11 @@ where
 impl<P, F> ExternalStateProvider for InverseBarometer<P, F>
 where
     P: ExternalStateProvider,
-    F: Fn(f64, f64, f64) -> f64 + Send + Sync,
+    F: BoundaryLevel,
 {
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
         let mut state = self.provider.external_state(ctx);
-        let (x, y) = ctx.position;
-        state.eta += (self.level)(x, y, ctx.time);
+        state.eta += self.level.level(ctx);
         state
     }
 }

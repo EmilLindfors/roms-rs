@@ -45,11 +45,12 @@ src/
 ├── equations/        # ConservationLaw trait; advection 1D/2D, SWE 1D/2D, UNESCO EOS
 ├── source/           # SourceTerm1D/2D traits; Coriolis, friction, wind, tidal
 │                     # potential, viscosity, bathymetry, sponge; net-cage drag
-│                     # (point-implicit); well-balanced hydrostatic reconstruction
+│                     # (point-implicit); gridded weather-model wind + pressure;
+│                     # well-balanced hydrostatic reconstruction
 ├── boundary/         # CharacteristicOBC + external-state providers (still
-│                     # water, harmonic tide, tidal atlas, NorKyst parent,
-│                     # inverse barometer), reflective, clamped tidal,
-│                     # discharge, multi-BC dispatch
+│                     # water, harmonic tide, tidal atlas, NorKyst nesting with
+│                     # relaxation band, inverse barometer), reflective,
+│                     # clamped tidal, discharge, multi-BC dispatch
 │
 │  # ---- Solver ----
 ├── solver/
@@ -75,8 +76,9 @@ src/
 │
 │  # ---- Application layer ----
 ├── simulation/       # Simulation runner (2D), Simulation3D
-├── io/               # NetCDF (nesting/output), VTK, GeoTIFF bathymetry,
-│                     # GSHHS coastline, projections, observation readers
+├── io/               # NetCDF output; parent-ocean and weather-model readers
+│                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
+│                     # bathymetry, GSHHS coastline, projections, observations
 └── analysis/         # Harmonic (tidal) analysis, skill metrics, tide gauge,
                       # ADCP, stability monitoring
 ```
@@ -96,7 +98,7 @@ are the adapter edge; the DG core must stay free of I/O and feature flags
 | Time integration | Generic `SSPRK3` over `Integrable` is the real path; five legacy copies pending deletion |
 | Mode splitting | Prototype: Hann filter correct, but the FE subcycle runs inside every RK stage (first-order, damps M2 3–14 %/period), G double-counts advection, stresses never reach the depth mean. Needs a ROMS-style once-per-step forward-backward pass (REVIEW.md §2) |
 | 3D physics | Scaffolding: sigma grid, tridiagonal and implicit diffusion solid; tracers not constancy-preserving, vertical advection ×D (fix in review), non-balanced PGF, no GLS; essentially untested (REVIEW.md §3, §6.1) |
-| Boundaries/nesting | One characteristic OBC (flux F(q_b)·n, independent of the Riemann solver; reflection ~1e-6), NorKyst boundary tides from a harmonic atlas, `ModelClock`; NorKyst nesting still lacks rotation/transport conservation and a relaxation band (REVIEW.md §4.3–§4.5, TODO P1.5) |
+| Boundaries/nesting | One characteristic OBC (flux F(q_b)·n, independent of the Riemann solver; reflection ~1e-6), NorKyst boundary tides from a harmonic atlas, `ModelClock`; 2D NorKyst nesting (`OceanModelState`: precomputed stencils, rotation into mesh axes, transport scaling, relaxation band, bed blending, cubic time interpolation); gridded MET Nordic/MEPS wind and pressure (`GriddedAtmosphere2D`). Open: atlas tides + NorKyst residual, 3D nesting (TODO P1.5) |
 | Performance | SoA + rayon workspace pattern correct; ~47× ROMS core-hours as configured (model estimate): dt estimator, dense volume term, land elements, per-step allocations (REVIEW.md §5) |
 | GPU | Burn prototype physically wrong and slower-by-design; fix or replace with custom fused f64 kernels over CSR (REVIEW.md §5; TODO P0.11/P2.7) |
 
