@@ -76,7 +76,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::boundary::{BCContext2D, ExternalState, ExternalStateProvider, tidal_ramp};
+use crate::boundary::{
+    BCContext2D, ExternalState, ExternalStateProvider, TidalAtlas, TidalAtlasError, tidal_ramp,
+};
 use crate::io::{
     CoordinateProjection, OceanModelReader, Stencil, TimeInterpolation, TimeStencil, east_axis,
 };
@@ -201,7 +203,7 @@ struct NestedNode {
     on_boundary: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Inner {
     reader: Arc<OceanModelReader>,
     clock: ModelClock,
@@ -564,6 +566,54 @@ impl OceanModelState {
         }
     }
 
+    /// Add the tide of `correction` to the parent at every forced and band
+    /// node and snapshot: ζ, ū and v̄ of the parent become parent +
+    /// correction. With `correction = corrected.difference(&raw)`, where
+    /// `raw` is a harmonic atlas of the parent itself and `corrected` the
+    /// same atlas with some constituents fixed (e.g. N2 re-inferred from a
+    /// gauge, [`TidalAtlas::infer`]), the parent keeps its residual (coastal
+    /// current, surge) and gets the corrected tides. Band nodes are
+    /// corrected too, so the relaxation does not pull the tide back.
+    ///
+    /// The correction is interpolated like boundary tides
+    /// ([`TidalAtlas::tides_at`]), with the nodal `f`, `u` at the middle of
+    /// a run of `duration` on this state's clock; every node must lie within
+    /// `coverage_radius` (m) of a point of `correction`.
+    pub fn with_tidal_correction<P: CoordinateProjection>(
+        self,
+        correction: &TidalAtlas,
+        projection: &P,
+        duration: f64,
+        coverage_radius: f64,
+    ) -> Result<Self, TidalAtlasError> {
+        let inner = &self.inner;
+        let positions: Vec<(f64, f64)> = inner.nodes.iter().map(|n| n.position).collect();
+        let tides = correction.tides_at(
+            &positions,
+            projection,
+            &inner.clock,
+            duration,
+            coverage_radius,
+        )?;
+        let n_times = inner.reader.n_times();
+        let mut series = inner.series.clone();
+        for (slot, node_series) in series.chunks_exact_mut(3 * n_times).enumerate() {
+            for (snapshot, q) in node_series.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+                let t = inner.clock.model_time(inner.reader.time[snapshot]);
+                let (eta, u, v) = tides.evaluate(slot, t);
+                for (value, delta) in q.iter_mut().zip([eta, u, v]) {
+                    *value = (*value as f64 + delta) as f32;
+                }
+            }
+        }
+        Ok(Self {
+            inner: Arc::new(Inner {
+                series,
+                ..(**inner).clone()
+            }),
+        })
+    }
+
     /// Blend the child bed towards the parent's across the relaxation band:
     /// `B ← (1 − w) B + w (−h_parent)` with the band weight `w` (1 on the
     /// boundary), at wet child nodes where the parent depth is known; then
@@ -895,6 +945,67 @@ mod tests {
         let (_, _, plain) = setup(&NestingOptions::default().with_transport_scaling(false));
         let (u_plain, _) = plain.external_state(&ctx(0.0, -2.0)).velocity.unwrap();
         assert!((u_plain - u).abs() < 1e-12);
+    }
+
+    /// A tidal correction adds its tide (with the clock's astronomy) to the
+    /// parent's ζ, ū and v̄ at every snapshot, band nodes included.
+    #[test]
+    fn tidal_correction_is_added_to_the_parent() {
+        use std::f64::consts::PI;
+        let options = NestingOptions::default().with_band(2000.0);
+        let (_, _, parent) = setup(&options);
+        let projection = LocalProjection::new(63.5, 8.5);
+        let (lat, lon) = projection.xy_to_geo(0.0, 0.0);
+        let correction = TidalAtlas::parse(&format!(
+            "{lon} {lat} 50.0 M2 0.25 40.0 0.05 130.0 0.02 300.0\n"
+        ))
+        .unwrap();
+        let duration = 7200.0;
+        let corrected = parent
+            .clone()
+            .with_tidal_correction(&correction, &projection, duration, 1e5)
+            .unwrap();
+        let clock = ModelClock::new(T0);
+        let n = clock.nodal_correction("M2", 0.5 * duration).unwrap();
+        let omega = 2.0 * PI / crate::tides::constituent_period("M2").unwrap();
+        let tide = |amp: f64, lag: f64, t: f64| {
+            n.f * amp * (omega * t + n.phase_offset_rad() - lag.to_radians()).cos()
+        };
+        // The mesh is centred on the projection origin: east is x there
+        for t in [0.0, 3600.0, 7200.0] {
+            let (a, b) = (
+                parent.external_state(&ctx(t, -DEPTH)),
+                corrected.external_state(&ctx(t, -DEPTH)),
+            );
+            assert!(
+                (b.eta - a.eta - tide(0.25, 40.0, t)).abs() < 1e-6,
+                "t = {t}"
+            );
+            let ((ua, va), (ub, vb)) = (a.velocity.unwrap(), b.velocity.unwrap());
+            assert!((ub - ua - tide(0.05, 130.0, t)).abs() < 1e-4, "t = {t}");
+            assert!((vb - va - tide(0.02, 300.0, t)).abs() < 1e-4, "t = {t}");
+        }
+        // Band nodes carry the correction too (their slots follow the
+        // boundary ones)
+        let n_slots = parent.n_boundary_nodes() + parent.n_band_nodes();
+        assert!(n_slots > parent.n_boundary_nodes());
+        let n_times = 3;
+        let changed = (0..n_slots)
+            .filter(|&slot| {
+                let (a, b) = (
+                    &parent.inner.series[slot * n_times * 3..][..3],
+                    &corrected.inner.series[slot * n_times * 3..][..3],
+                );
+                (b[0] - a[0] - tide(0.25, 40.0, 0.0) as f32).abs() < 1e-5
+            })
+            .count();
+        assert_eq!(changed, n_slots);
+        // Not covered: an error, not a silent zero
+        assert!(
+            parent
+                .with_tidal_correction(&correction, &projection, duration, 10.0)
+                .is_err()
+        );
     }
 
     /// The ramp starts the parent state from rest.

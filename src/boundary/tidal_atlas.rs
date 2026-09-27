@@ -366,6 +366,44 @@ impl TidalAtlas {
         duration: f64,
         coverage_radius: f64,
     ) -> Result<BoundaryTides, TidalAtlasError> {
+        let n_nodes = ops.n_nodes;
+        let mut slot_of_node = vec![u32::MAX; mesh.n_elements * n_nodes];
+        let mut positions = Vec::new();
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for face in 0..4 {
+                if mesh.neighbor(k, face).is_some() || mesh.boundary_tag(k, face) != Some(tag) {
+                    continue;
+                }
+                for &node in &ops.face_nodes[face] {
+                    let flat = k.as_usize() * n_nodes + node;
+                    if slot_of_node[flat] != u32::MAX {
+                        continue;
+                    }
+                    let [x, y] =
+                        mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
+                    slot_of_node[flat] = positions.len() as u32;
+                    positions.push((x, y));
+                }
+            }
+        }
+        let mut tides = self.tides_at(&positions, projection, clock, duration, coverage_radius)?;
+        tides.slot_of_node = slot_of_node;
+        Ok(tides)
+    }
+
+    /// The atlas at the points `positions` (mesh coordinates), in that order
+    /// of slots, for a run on `clock` of length `duration`: as
+    /// [`boundary_tides`](Self::boundary_tides), but anywhere (e.g. the
+    /// nodes of a nesting band, [`OceanModelState::with_tidal_correction`](crate::boundary::OceanModelState::with_tidal_correction)).
+    /// A [`BoundaryTides`] built here finds its slot by position only.
+    pub fn tides_at<P: CoordinateProjection>(
+        &self,
+        positions: &[(f64, f64)],
+        projection: &P,
+        clock: &ModelClock,
+        duration: f64,
+        coverage_radius: f64,
+    ) -> Result<BoundaryTides, TidalAtlasError> {
         self.validate()?;
         let names = self.names();
         let velocity = self.has_velocity();
@@ -387,115 +425,95 @@ impl TidalAtlas {
             .map(|p| projection.geo_to_xy(p.lat, p.lon))
             .collect();
 
-        let n_nodes = ops.n_nodes;
-        let mut slot_of_node = vec![u32::MAX; mesh.n_elements * n_nodes];
-        let mut positions = Vec::new();
-        let mut coefficients = Vec::new();
-        let mut mean = Vec::new();
-        let mut source_depth = Vec::new();
+        let mut coefficients = Vec::with_capacity(positions.len() * names.len() * 6);
+        let mut mean = Vec::with_capacity(positions.len());
+        let mut source_depth = Vec::with_capacity(positions.len());
         let mut nearest: Vec<(f64, usize)> = Vec::with_capacity(self.points.len());
 
-        for k in ElementIndex::iter(mesh.n_elements) {
-            for face in 0..4 {
-                if mesh.neighbor(k, face).is_some() || mesh.boundary_tag(k, face) != Some(tag) {
-                    continue;
-                }
-                for &node in &ops.face_nodes[face] {
-                    let flat = k.as_usize() * n_nodes + node;
-                    if slot_of_node[flat] != u32::MAX {
-                        continue;
-                    }
-                    let [x, y] =
-                        mesh.reference_to_physical(k, ops.nodes_r[node], ops.nodes_s[node]);
+        for &(x, y) in positions {
+            // Inverse-distance weights of the nearest atlas points
+            nearest.clear();
+            nearest.extend(
+                xy.iter()
+                    .enumerate()
+                    .map(|(i, &(px, py))| ((px - x).hypot(py - y), i)),
+            );
+            nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
+            nearest.truncate(NEIGHBOURS);
+            let d_min = nearest[0].0;
+            if d_min > coverage_radius {
+                let (lat, lon) = projection.xy_to_geo(x, y);
+                return Err(TidalAtlasError::NotCovered {
+                    x,
+                    y,
+                    lat,
+                    lon,
+                    distance: d_min,
+                    radius: coverage_radius,
+                });
+            }
+            let weights: Vec<(f64, usize)> = if d_min < 1.0 {
+                vec![(1.0, nearest[0].1)]
+            } else {
+                let w: Vec<(f64, usize)> =
+                    nearest.iter().map(|&(d, i)| (1.0 / (d * d), i)).collect();
+                let total: f64 = w.iter().map(|p| p.0).sum();
+                w.into_iter().map(|(wi, i)| (wi / total, i)).collect()
+            };
 
-                    // Inverse-distance weights of the nearest atlas points
-                    nearest.clear();
-                    nearest.extend(
-                        xy.iter()
-                            .enumerate()
-                            .map(|(i, &(px, py))| ((px - x).hypot(py - y), i)),
-                    );
-                    nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    nearest.truncate(NEIGHBOURS);
-                    let d_min = nearest[0].0;
-                    if d_min > coverage_radius {
-                        let (lat, lon) = projection.xy_to_geo(x, y);
-                        return Err(TidalAtlasError::NotCovered {
-                            x,
-                            y,
-                            lat,
-                            lon,
-                            distance: d_min,
-                            radius: coverage_radius,
-                        });
-                    }
-                    let weights: Vec<(f64, usize)> = if d_min < 1.0 {
-                        vec![(1.0, nearest[0].1)]
-                    } else {
-                        let w: Vec<(f64, usize)> =
-                            nearest.iter().map(|&(d, i)| (1.0 / (d * d), i)).collect();
-                        let total: f64 = w.iter().map(|p| p.0).sum();
-                        w.into_iter().map(|(wi, i)| (wi / total, i)).collect()
-                    };
+            // Rotation from east/north to the mesh axes: the direction of
+            // local north in the projected plane
+            let (lat, lon) = projection.xy_to_geo(x, y);
+            let (nx, ny) = projection.geo_to_xy(lat + 1e-4, lon);
+            let theta = (nx - x).atan2(ny - y); // angle of north from +y
+            let (sin_t, cos_t) = theta.sin_cos();
 
-                    // Rotation from east/north to the mesh axes: the direction
-                    // of local north in the projected plane
-                    let (lat, lon) = projection.xy_to_geo(x, y);
-                    let (nx, ny) = projection.geo_to_xy(lat + 1e-4, lon);
-                    let theta = (nx - x).atan2(ny - y); // angle of north from +y
-                    let (sin_t, cos_t) = theta.sin_cos();
+            mean.push(
+                weights
+                    .iter()
+                    .map(|&(w, i)| w * self.points[i].mean.unwrap_or(0.0))
+                    .sum::<f64>(),
+            );
+            source_depth.push(
+                weights
+                    .iter()
+                    .map(|&(w, i)| w * self.points[i].depth)
+                    .sum::<f64>(),
+            );
 
-                    let slot = positions.len();
-                    slot_of_node[flat] = slot as u32;
-                    positions.push((x, y));
-                    mean.push(
-                        weights
-                            .iter()
-                            .map(|&(w, i)| w * self.points[i].mean.unwrap_or(0.0))
-                            .sum::<f64>(),
-                    );
-                    source_depth.push(
-                        weights
-                            .iter()
-                            .map(|&(w, i)| w * self.points[i].depth)
-                            .sum::<f64>(),
-                    );
-
-                    for (j, n) in corrections.iter().enumerate() {
-                        // Complex amplitude H e^{−iG}, interpolated
-                        let interp = |get: &dyn Fn(&AtlasConstituent) -> Harmonic| {
-                            weights.iter().fold((0.0, 0.0), |(re, im), &(w, i)| {
-                                let (amp, lag) = get(&self.points[i].constituents[j]);
-                                let g = lag.to_radians();
-                                (re + w * amp * g.cos(), im - w * amp * g.sin())
-                            })
-                        };
-                        let eta = interp(&|c| c.eta);
-                        let (u, v) = if velocity {
-                            let east = interp(&|c| c.velocity.expect("validated").0);
-                            let north = interp(&|c| c.velocity.expect("validated").1);
-                            // Mesh components: u = E cos θ + N sin θ, v = −E sin θ + N cos θ
-                            (
-                                (
-                                    east.0 * cos_t + north.0 * sin_t,
-                                    east.1 * cos_t + north.1 * sin_t,
-                                ),
-                                (
-                                    -east.0 * sin_t + north.0 * cos_t,
-                                    -east.1 * sin_t + north.1 * cos_t,
-                                ),
-                            )
-                        } else {
-                            ((0.0, 0.0), (0.0, 0.0))
-                        };
-                        // f Re[A e^{i(ωt + V₀ + u)}] = C cos ωt + S sin ωt
-                        let (sin_p, cos_p) = n.phase_offset_rad().sin_cos();
-                        for (re, im) in [eta, u, v] {
-                            let (re, im) = (re * cos_p - im * sin_p, re * sin_p + im * cos_p);
-                            coefficients.push(n.f * re);
-                            coefficients.push(-n.f * im);
-                        }
-                    }
+            for (j, n) in corrections.iter().enumerate() {
+                // Complex amplitude H e^{−iG}, interpolated
+                let interp = |get: &dyn Fn(&AtlasConstituent) -> Harmonic| {
+                    weights.iter().fold((0.0, 0.0), |(re, im), &(w, i)| {
+                        let (amp, lag) = get(&self.points[i].constituents[j]);
+                        let g = lag.to_radians();
+                        (re + w * amp * g.cos(), im - w * amp * g.sin())
+                    })
+                };
+                let eta = interp(&|c| c.eta);
+                let (u, v) = if velocity {
+                    let east = interp(&|c| c.velocity.expect("validated").0);
+                    let north = interp(&|c| c.velocity.expect("validated").1);
+                    // Mesh components: u = E cos θ + N sin θ, v = −E sin θ + N cos θ
+                    (
+                        (
+                            east.0 * cos_t + north.0 * sin_t,
+                            east.1 * cos_t + north.1 * sin_t,
+                        ),
+                        (
+                            -east.0 * sin_t + north.0 * cos_t,
+                            -east.1 * sin_t + north.1 * cos_t,
+                        ),
+                    )
+                } else {
+                    ((0.0, 0.0), (0.0, 0.0))
+                };
+                // f Re[A e^{i(ωt + V₀ + u)}] = C cos ωt + S sin ωt
+                let (sin_p, cos_p) = n.phase_offset_rad().sin_cos();
+                for (re, im) in [eta, u, v] {
+                    let (re, im) = (re * cos_p - im * sin_p, re * sin_p + im * cos_p);
+                    coefficients.push(n.f * re);
+                    coefficients.push(-n.f * im);
                 }
             }
         }
@@ -504,13 +522,91 @@ impl TidalAtlas {
             names,
             omega,
             velocity,
-            slot_of_node,
-            positions,
+            slot_of_node: Vec::new(),
+            positions: positions.to_vec(),
             coefficients,
             mean,
             source_depth,
             use_mean: false,
             ramp_duration: None,
+        })
+    }
+
+    /// `self − other`, constituent by constituent (complex amplitudes
+    /// `H e^{−iG}` of η and velocity) at every point: the tide that turns
+    /// `other` into `self`, e.g. an atlas corrected with [`infer`](Self::infer)
+    /// minus the raw one. The points must be the same; a constituent missing
+    /// from one side counts as zero there. The mean level is the difference
+    /// of the means where both have one.
+    pub fn difference(&self, other: &Self) -> Result<Self, TidalAtlasError> {
+        self.validate()?;
+        other.validate()?;
+        if self.points.len() != other.points.len() || self.has_velocity() != other.has_velocity() {
+            return Err(TidalAtlasError::Inconsistent(
+                "difference of atlases with different points or velocity".into(),
+            ));
+        }
+        let complex = |(amp, lag): Harmonic| {
+            let g = lag.to_radians();
+            (amp * g.cos(), -amp * g.sin())
+        };
+        let harmonic =
+            |(re, im): (f64, f64)| (re.hypot(im), (-im).atan2(re).to_degrees().rem_euclid(360.0));
+        let minus = |a: Option<Harmonic>, b: Option<Harmonic>| {
+            let (a, b) = (a.map_or((0.0, 0.0), complex), b.map_or((0.0, 0.0), complex));
+            harmonic((a.0 - b.0, a.1 - b.1))
+        };
+        let mut names = self.names();
+        for name in other.names() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        let points = self
+            .points
+            .iter()
+            .zip(&other.points)
+            .map(|(p, q)| {
+                if (p.lon - q.lon).abs() > 1e-9 || (p.lat - q.lat).abs() > 1e-9 {
+                    return Err(TidalAtlasError::Inconsistent(format!(
+                        "difference of atlases with different points: ({}, {}) and ({}, {})",
+                        p.lon, p.lat, q.lon, q.lat
+                    )));
+                }
+                let find = |point: &AtlasPoint, name| {
+                    point.constituents.iter().find(|c| c.name == name).copied()
+                };
+                let constituents = names
+                    .iter()
+                    .map(|&name| {
+                        let (a, b) = (find(p, name), find(q, name));
+                        AtlasConstituent {
+                            name,
+                            eta: minus(a.map(|c| c.eta), b.map(|c| c.eta)),
+                            velocity: self.has_velocity().then(|| {
+                                let (ua, va) = (
+                                    a.and_then(|c| c.velocity).map(|v| v.0),
+                                    a.and_then(|c| c.velocity).map(|v| v.1),
+                                );
+                                let (ub, vb) = (
+                                    b.and_then(|c| c.velocity).map(|v| v.0),
+                                    b.and_then(|c| c.velocity).map(|v| v.1),
+                                );
+                                (minus(ua, ub), minus(va, vb))
+                            }),
+                        }
+                    })
+                    .collect();
+                Ok(AtlasPoint {
+                    constituents,
+                    mean: p.mean.zip(q.mean).map(|(a, b)| a - b),
+                    ..p.clone()
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            points,
+            header: vec!["difference of two atlases".into()],
         })
     }
 }
@@ -679,6 +775,48 @@ mod tests {
         assert_eq!(atlas.names(), vec!["M2", "S2", "N2"]);
         atlas.validate().unwrap();
         assert!(atlas.infer("Q1", "O1", 0.19, 0.0).is_err());
+    }
+
+    /// Corrected minus raw is the correction alone: zero where nothing
+    /// changed, the replaced constituent's complex difference where it did,
+    /// and a constituent only one side has, whole (negated for the other).
+    #[test]
+    fn difference_of_corrected_and_raw_atlas() {
+        let raw = TidalAtlas::parse(ATLAS).unwrap();
+        let mut corrected = raw.clone();
+        corrected.infer("S2", "M2", 0.3, 20.0).unwrap(); // S2: 0.3 at 10°/30°
+        corrected.infer("N2", "M2", 0.2, 0.0).unwrap(); // new
+        let d = corrected.difference(&raw).unwrap();
+        assert_eq!(d.names(), vec!["M2", "S2", "N2"]);
+        for (p, (c, r)) in d
+            .points
+            .iter()
+            .zip(corrected.points.iter().zip(&raw.points))
+        {
+            assert_eq!(p.constituents[0].eta.0, 0.0);
+            assert_eq!(p.mean, Some(0.0));
+            // S2: 0.3 e^{−i(G+20)} − 0.3 e^{−iG'} with the raw S2 lag G'
+            let complex = |(a, g): Harmonic| (a * g.to_radians().cos(), -a * g.to_radians().sin());
+            let (a, b) = (
+                complex(c.constituents[1].eta),
+                complex(r.constituents[1].eta),
+            );
+            let s2 = complex(p.constituents[1].eta);
+            assert!((s2.0 - (a.0 - b.0)).abs() < 1e-12 && (s2.1 - (a.1 - b.1)).abs() < 1e-12);
+            let (n2, cn2) = (p.constituents[2], c.constituents[2]);
+            assert!((n2.eta.0 - cn2.eta.0).abs() < 1e-12 && (n2.eta.1 - cn2.eta.1).abs() < 1e-9);
+        }
+        let back = raw.difference(&corrected).unwrap();
+        let n2 = back.points[0].constituents[2];
+        assert!((n2.eta.0 - 0.2).abs() < 1e-12);
+        assert!(
+            (n2.eta.1 - (corrected.points[0].constituents[2].eta.1 + 180.0).rem_euclid(360.0))
+                .abs()
+                < 1e-9
+        );
+        let mut moved = raw.clone();
+        moved.points[1].lon += 0.01;
+        assert!(corrected.difference(&moved).is_err());
     }
 
     /// 0.1° of longitude at 63° N is ≈ 5.05 km.

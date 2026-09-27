@@ -35,7 +35,12 @@
 //!    the band (`blend=0` to keep it), ramped up from rest over `ramp_hours`.
 //!    Open faces NorKyst does not cover become walls. NorKyst's ζ is shifted
 //!    by minus the mean level `Z0` of the boundary atlas (its datum sits
-//!    0.28 m below mean sea level here), or by `nest_level=`. The parent ζ is taken as is; `ib=1` adds the
+//!    0.28 m below mean sea level here), or by `nest_level=`. NorKyst's
+//!    `gauge_ratios` constituents are replaced by the gauge-inferred ones
+//!    (below) by adding the difference between the corrected and the raw
+//!    atlas, which is NorKyst's own harmonic fit, so the residual flow is
+//!    kept (`OceanModelState::with_tidal_correction`; `nest_tides=raw` to
+//!    keep NorKyst's tides). The parent ζ is taken as is; `ib=1` adds the
 //!    inverse-barometer level of `met=` to it (for a parent run without
 //!    pressure forcing).
 //!    Without an atlas: M2 of `M2_AMPLITUDE` in one phase along the boundary.
@@ -79,7 +84,8 @@
 //!     [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
 //!     [bed=point|projected] [dem=data/froya_topobathy.tif|none] [lts=0] [output=output/froya] \
-//!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=]
+//!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
+//!     [nest_tides=corrected|raw]
 //! ```
 //!
 //! `lts=N` (N > 0) steps the tidal run with local time stepping
@@ -217,6 +223,10 @@ struct Options {
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     blend_bed: bool,
     nesting_ib: bool,
+    /// Nesting: replace NorKyst's `gauge_ratios` constituents by the
+    /// gauge-inferred ones (`nest_tides=corrected`, the default) or keep its
+    /// tides (`nest_tides=raw`)
+    correct_nested_tides: bool,
     /// Added to NorKyst's ζ (m); default: minus the mean level `Z0` of the
     /// boundary atlas
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
@@ -299,6 +309,11 @@ impl Options {
             band_minutes: get("band_minutes", 30.0)?,
             blend_bed: get("blend", 1.0)? != 0.0,
             nesting_ib: get("ib", 0.0)? != 0.0,
+            correct_nested_tides: match args.get("nest_tides").map_or("corrected", String::as_str) {
+                "corrected" => true,
+                "raw" => false,
+                other => return Err(format!("bad nest_tides={other}: corrected or raw")),
+            },
             nesting_level: args
                 .get("nest_level")
                 .map(|v| v.parse().map_err(|_| format!("bad nest_level={v}")))
@@ -996,6 +1011,12 @@ fn tidal_run(
         Some(gridded) => Some(Level::Gridded(gridded.clone())),
         None => opts.wind.then(|| Level::Uniform(pressure())),
     };
+    let parent = match parent {
+        Some(parent) if opts.correct_nested_tides => Some(correct_parent_tides(
+            domain, opts, &stations, parent, t_end,
+        )?),
+        other => other,
+    };
     let band = parent
         .as_ref()
         .filter(|_| opts.band_km > 0.0)
@@ -1660,6 +1681,87 @@ fn weather(
 
 type OpenBoundary = (Box<dyn SWEBoundaryCondition2D>, String);
 
+/// `atlas` with the constituents `gauge_ratios` re-inferred from their
+/// neighbours with the ratios of the first gauge's whole-record fit
+/// (`TidalAtlas::infer`); unchanged without a gauge fit.
+fn corrected_atlas(
+    atlas: &TidalAtlas,
+    opts: &Options,
+    stations: &[Station],
+) -> Result<TidalAtlas, Box<dyn std::error::Error>> {
+    let mut atlas = atlas.clone();
+    let reference = stations.iter().find_map(|s| {
+        let gauge = s.gauge.as_ref()?;
+        Some((&s.name, gauge.observed_fit.as_ref().ok()?))
+    });
+    if reference.is_none() && !opts.gauge_ratios.is_empty() {
+        println!(
+            "  No gauge fit: the atlas keeps its own {:?}",
+            opts.gauge_ratios
+        );
+    }
+    for &name in opts.gauge_ratios.iter().filter(|_| reference.is_some()) {
+        let (Some(inference), Some((station, fit))) = (
+            Inference::EQUILIBRIUM.iter().find(|i| i.name == name),
+            reference,
+        ) else {
+            return Err(format!("gauge_ratios: {name} is not P1, K2, N2 or Q1").into());
+        };
+        let from = inference.from;
+        let i = Inference::from_reference(name, from, fit)
+            .ok_or(format!("gauge_ratios: {station} lacks {name} or {from}"))?;
+        atlas.infer(name, from, i.amplitude_ratio, i.lag_offset_deg)?;
+        println!(
+            "  Atlas {name} = {:.3} × {from}, lag {:+.1}° (ratio at {station})",
+            i.amplitude_ratio,
+            (i.lag_offset_deg + 180.0).rem_euclid(360.0) - 180.0
+        );
+    }
+    Ok(atlas)
+}
+
+/// NorKyst with its tides corrected (`nest_tides=corrected`): the boundary
+/// atlas is NorKyst's own harmonic fit, so adding (corrected atlas − atlas)
+/// keeps NorKyst's residual (coastal current, surge) and replaces its
+/// `gauge_ratios` constituents by the gauge-inferred ones, at the boundary
+/// and across the relaxation band.
+fn correct_parent_tides(
+    domain: &Domain,
+    opts: &Options,
+    stations: &[Station],
+    parent: OceanModelState,
+    t_end: f64,
+) -> Result<OceanModelState, Box<dyn std::error::Error>> {
+    let atlas_path = Path::new(&opts.tides);
+    let (Some(projection), true) = (&domain.projection, atlas_path.exists()) else {
+        println!(
+            "  No tidal atlas at {}: NorKyst's tides as they are",
+            opts.tides
+        );
+        return Ok(parent);
+    };
+    let raw = TidalAtlas::read(atlas_path)?;
+    let correction = corrected_atlas(&raw, opts, stations)?.difference(&raw)?;
+    let largest = correction
+        .points
+        .iter()
+        .flat_map(|p| p.constituents.iter().map(|c| (c.eta.0, c.name)))
+        .fold((0.0, ""), |a, b| if b.0 > a.0 { b } else { a });
+    if largest.0 == 0.0 {
+        return Ok(parent);
+    }
+    println!(
+        "  NorKyst tides corrected by (corrected − raw) atlas, largest {:.3} m ({})",
+        largest.0, largest.1
+    );
+    Ok(parent.with_tidal_correction(
+        &correction,
+        projection,
+        t_end,
+        ATLAS_COVERAGE + 1000.0 * opts.band_km,
+    )?)
+}
+
 /// Open-boundary condition and a description of the forcing: NorKyst
 /// nesting (`norkyst=`), else atlas tides (`tides=`), else uniform M2; raised
 /// by the inverse-barometer `level` of the pressure forcing (for nesting only
@@ -1690,34 +1792,7 @@ fn open_boundary(
     let clock = *clock;
     let atlas_path = Path::new(&opts.tides);
     if let (Some(projection), true) = (&domain.projection, atlas_path.exists()) {
-        let mut atlas = TidalAtlas::read(atlas_path)?;
-        let reference = stations.iter().find_map(|s| {
-            let gauge = s.gauge.as_ref()?;
-            Some((&s.name, gauge.observed_fit.as_ref().ok()?))
-        });
-        if reference.is_none() && !opts.gauge_ratios.is_empty() {
-            println!(
-                "  No gauge fit: the atlas keeps its own {:?}",
-                opts.gauge_ratios
-            );
-        }
-        for &name in opts.gauge_ratios.iter().filter(|_| reference.is_some()) {
-            let (Some(inference), Some((station, fit))) = (
-                Inference::EQUILIBRIUM.iter().find(|i| i.name == name),
-                reference,
-            ) else {
-                return Err(format!("gauge_ratios: {name} is not P1, K2, N2 or Q1").into());
-            };
-            let from = inference.from;
-            let i = Inference::from_reference(name, from, fit)
-                .ok_or(format!("gauge_ratios: {station} lacks {name} or {from}"))?;
-            atlas.infer(name, from, i.amplitude_ratio, i.lag_offset_deg)?;
-            println!(
-                "  Atlas {name} = {:.3} × {from}, lag {:+.1}° (ratio at {station})",
-                i.amplitude_ratio,
-                (i.lag_offset_deg + 180.0).rem_euclid(360.0) - 180.0
-            );
-        }
+        let atlas = corrected_atlas(&TidalAtlas::read(atlas_path)?, opts, stations)?;
         let tides = atlas
             .boundary_tides(
                 &domain.mesh,
