@@ -76,7 +76,7 @@ This section only orders the existing items for that goal and adds the two farm-
 3. ~~F.1 cage drag (2D form)~~ done 2026-09-26 (`CageDrag2D`, `with_cage_drag`).
 4. ~~P2.5 local time stepping~~ done 2026-09-27 (`MultirateSSPRK3`: 2.4–2.8× on a 20 m farm mesh, see P2.5 for the follow-ups).
 5. ~~P1.5 nesting of NorKyst ū, v̄, η and the P1.6 atmospheric forcing reader~~ done 2026-09-27 (`OceanModelState` with transport scaling, relaxation band and bed blending; `AtmosphereReader` + `GriddedAtmosphere2D`; see P1.5 for the follow-ups).
-6. P3.1 current validation: depth-averaged velocity in station series, sampling at the station position by interpolation inside the element (F.2 needs the same evaluation), ADCP comparison and tidal-ellipse fit. Farm-site current surveys, where available, are the natural data.
+6. ~~P3.1 current validation~~ tooling done 2026-09-27: station series of η, ū, v̄ sampled at the station by evaluating the DG polynomial there (`PointLocator2D`, `Probe2D`; F.2 reuses them), tidal-ellipse fit and complex difference (`fit_tidal_ellipses`), ADCP comparison paired by time. Still to do: real current data (farm-site surveys, see P3.1).
 7. Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7.
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
@@ -102,8 +102,8 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
   - A cage-layout reader (positions, radii, net depths per site), e.g. from the Fiskeridirektoratet site register, for real farms.
 
 ### F.2 Lagrangian particle tracking
-- [ ] Point location: find the element holding a point and its reference coordinates (Newton on the isoparametric map once P1.3 lands; a spatial index over elements).
-- [ ] Velocity evaluation from the element polynomial (the same evaluation P3.1 station sampling needs), linear in time between output snapshots or online from the solver.
+- [x] Point location: find the element holding a point and its reference coordinates (2026-09-27, P3.1: `mesh::PointLocator2D`, a bucket grid over element bounding boxes and Newton on the bilinear map). Curved (isoparametric) elements, once P1.3 has them, need the same Newton on the higher-order map.
+- [ ] Velocity evaluation from the element polynomial: the evaluation at a point is done (`solver::Probe2D`, P3.1); still to do: linear in time between output snapshots or online from the solver. A particle moves every step, so it needs `interpolation_weights_into` and `PointLocator2D::in_element` on the last element and its neighbours before a full `locate`.
 - [ ] RK4 advection; horizontal random walk; vertical random walk with the ∂K/∂z drift correction (Visser 1997, MEPS 158) once 3D exists.
 - [ ] Coastline reflection, open-boundary exit, beaching of particles that reach a drying node.
 - [ ] Behaviour hooks: sinking speed (feed, faeces), lice larvae depth preference and salinity avoidance (as in the IMR salmon-lice model; Sandvik et al. 2020, Aquac. Environ. Interact. 12).
@@ -409,10 +409,11 @@ The tidal-comparison code path is complete: fit with `HarmonicAnalysis` → `Har
   - `norkyst_boundary_tides points=` fits NorKyst at the gauges.
 - [ ] Real Kartverket (H, G) for Bergen, Stavanger, Trondheim, Kristiansund: `./scripts/kartverket_gauge.sh <name> <lat> <lon> 2024-07-01 2025-07-01` (codes and positions from `tide_request=stationlist`). Only Mausund and a synthetic `heimsjo.txt` ship. `norwegian_stations` positions are approximate (Heimsjø is at 63.425, 9.102).
 - [ ] Run the model against NorKyst-800 barotropic tides for a test period. This needs P0.12, P0.20, P1.3–P1.5.
-- [ ] Compare with ADCP currents (`analysis/adcp.rs`). Add a tidal-ellipse fit and a complex-difference skill metric.
+- [x] Compare with ADCP currents (`analysis/adcp.rs`). Add a tidal-ellipse fit and a complex-difference skill metric. Done 2026-09-27: `analysis::fit_tidal_ellipses` / `TidalEllipse` (complex difference √(|ΔŨ|² + |ΔṼ|²)); `ADCPValidationResult::compute` pairs by time; `froya_real_data currents=<ADCP files>` compares ellipses and time series, and compares the model's ellipses with NorKyst's at every station.
+  - [ ] Real current data: farm-site current surveys (the site reports to Fiskeridirektoratet carry 1-month current measurements, usually at 5 m, 15 m and the net bottom, not depth means), and any IMR/NIVA moorings near Frøya. Depth-averaged comparisons need the depth mean of a profile; single-depth records wait for Stage B.
 - [ ] Document skill scores (RMSE, bias, correlation) per station.
 - [ ] Harmonic analysis: `fit_reference_constants` now has a Rayleigh check, inference (equilibrium or from a reference fit), `resolvable_constituents` and `predict`; `HarmonicAnalysis::fit` still has none of them. Port its callers (`StationValidationResult::compute_with_harmonics`, `validate_stations`) or give it the same guard; an `AnalysisError` type instead of asserts and `String` errors.
-- [ ] Station series are η only. Add depth-averaged velocity, which the ADCP comparison and the tidal-ellipse fit need. Sample at the gauge position by interpolating in the element, not at the nearest node ≥ 3 m deep (Mausund's node is 199 m away, and 7.6 m deep).
+- [x] Station series are η only. Add depth-averaged velocity, which the ADCP comparison and the tidal-ellipse fit need. Sample at the gauge position by interpolating in the element, not at the nearest node ≥ 3 m deep (Mausund's node is 199 m away, and 7.6 m deep). Done 2026-09-27 (`Probe2D`): η, ū, v̄ at the station itself, or at the nearest point ≥ 3 m deep where the model is too shallow or dry there; velocities rotated to east/north.
 
 ### P3.2 Cost-vs-accuracy benchmark against ROMS
 - [ ] Pareto benchmark on the same hardware: M2/S2/K1/O1 error at tide gauges vs core-hours, ROMS 2D at 800/400/200 m vs DG P1–P4. This is what settles "faster than ROMS" (`REVIEW.md` §5.5).

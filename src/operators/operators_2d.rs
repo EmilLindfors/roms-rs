@@ -14,8 +14,8 @@
 
 use crate::basis::{Vandermonde, Vandermonde2D};
 use crate::polynomial::{
-    gauss_lobatto_nodes, gauss_lobatto_weights, node_index_1d_to_2d, tensor_product_gll_nodes,
-    tensor_product_gll_weights,
+    gauss_lobatto_nodes, gauss_lobatto_weights, lagrange_basis, node_index_1d_to_2d,
+    tensor_product_gll_nodes, tensor_product_gll_weights,
 };
 use faer::Mat;
 
@@ -245,6 +245,33 @@ impl DGOperators2D {
     pub fn face_weight(&self, face_node: usize) -> f64 {
         self.weights_1d[face_node]
     }
+
+    /// Values of the nodal basis `ℓᵢ(r) ℓⱼ(s)` at the reference point
+    /// `(r, s)`, in node order (`k = j·n_1d + i`), into `out`: a nodal field
+    /// `u` of the element is `Σₖ out[k] u[k]` there. Exact for every
+    /// polynomial of degree ≤ N in each of r and s.
+    pub fn interpolation_weights_into(&self, r: f64, s: f64, out: &mut [f64]) {
+        const MAX_1D: usize = 16;
+        assert!(self.n_1d <= MAX_1D, "order {} above 15", self.order);
+        assert_eq!(out.len(), self.n_nodes);
+        let (mut lr, mut ls) = ([0.0; MAX_1D], [0.0; MAX_1D]);
+        let n = self.n_1d;
+        lagrange_basis(&self.nodes_1d, r, &mut lr[..n]);
+        lagrange_basis(&self.nodes_1d, s, &mut ls[..n]);
+        for (row, &l_s) in out.chunks_exact_mut(n).zip(&ls[..n]) {
+            for (w, &l_r) in row.iter_mut().zip(&lr[..n]) {
+                *w = l_r * l_s;
+            }
+        }
+    }
+
+    /// [`interpolation_weights_into`](Self::interpolation_weights_into) into a
+    /// new vector.
+    pub fn interpolation_weights(&self, r: f64, s: f64) -> Vec<f64> {
+        let mut out = vec![0.0; self.n_nodes];
+        self.interpolation_weights_into(r, s, &mut out);
+        out
+    }
 }
 
 /// Compute 1D differentiation matrix Dr = Vr * V^{-1}.
@@ -427,6 +454,47 @@ fn compute_lift_matrices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The point weights reproduce every polynomial of degree ≤ N in r and in
+    /// s (Q_N) at arbitrary points, and are the identity at the nodes.
+    #[test]
+    fn interpolation_weights_are_exact_on_q_n() {
+        for order in 1..=5 {
+            let ops = DGOperators2D::new(order);
+            let p = |r: f64, s: f64| {
+                (0..=order)
+                    .flat_map(|a| (0..=order).map(move |b| (a, b)))
+                    .map(|(a, b)| {
+                        (1.0 + a as f64 - 0.3 * b as f64) * r.powi(a as i32) * s.powi(b as i32)
+                    })
+                    .sum::<f64>()
+            };
+            let values: Vec<f64> = (0..ops.n_nodes)
+                .map(|k| p(ops.nodes_r[k], ops.nodes_s[k]))
+                .collect();
+            for k in 0..ops.n_nodes {
+                let w = ops.interpolation_weights(ops.nodes_r[k], ops.nodes_s[k]);
+                for (j, &wj) in w.iter().enumerate() {
+                    assert_eq!(wj, if j == k { 1.0 } else { 0.0 });
+                }
+            }
+            for (r, s) in [
+                (-1.0, 0.3),
+                (0.17, -0.81),
+                (0.5, 0.5),
+                (0.99, 1.0),
+                (-0.4, -1.0),
+            ] {
+                let w = ops.interpolation_weights(r, s);
+                let u: f64 = w.iter().zip(&values).map(|(a, b)| a * b).sum();
+                assert!(
+                    (u - p(r, s)).abs() < 1e-11,
+                    "order {order} at ({r}, {s}): {u} vs {}",
+                    p(r, s)
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_operators_2d_dimensions() {

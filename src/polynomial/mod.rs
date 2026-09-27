@@ -6,10 +6,12 @@
 //! - 2D tensor-product Legendre polynomials for quadrilateral elements
 //! - 2D tensor-product GLL nodes and weights
 
+mod lagrange;
 mod legendre;
 mod legendre_2d;
 mod nodes;
 
+pub use lagrange::lagrange_basis;
 pub use legendre::{legendre, legendre_and_derivative, legendre_derivative};
 pub use legendre_2d::{
     legendre_2d, legendre_2d_gradient, legendre_2d_gradient_normalized, legendre_2d_norm,
