@@ -32,8 +32,8 @@ pub use advection_2d::{
 pub use swe_2d::{
     ElementRhsThen, SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d, compute_dt_viscosity,
     compute_rhs_swe_2d, compute_rhs_swe_2d_face_mass_into, compute_rhs_swe_2d_into,
-    compute_rhs_swe_2d_where_into, compute_rhs_swe_2d_where_then, element_dt_swe_2d, face_mass_len,
-    positivity_cfl_swe_2d,
+    compute_rhs_swe_2d_subset_then, compute_rhs_swe_2d_where_into, element_dt_swe_2d,
+    face_mass_len, positivity_cfl_swe_2d,
 };
 #[cfg(feature = "parallel")]
 pub use swe_2d::{

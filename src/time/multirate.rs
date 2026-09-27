@@ -72,9 +72,6 @@ use crate::types::ElementIndex;
 
 use super::integrator::{Integrable, IntegratorInfo, SSPRK3, StageWorkspace, TimeIntegrator};
 
-/// The selected elements.
-pub type ElementMask<'a> = &'a (dyn Fn(usize) -> bool + Sync);
-
 /// What one element does in one stage of [`LocalTimeStepping::stage_where`].
 ///
 /// With `F = L(input)` the element's RHS at `time`, the new stage value is
@@ -102,15 +99,16 @@ pub struct ElementStage {
 /// physics module (see
 /// [`PhysicsModule::local_time_stepping`](crate::physics::PhysicsModule::local_time_stepping)).
 ///
-/// Each works on the selected elements in one pass, gives them bit for bit
-/// what the whole-state operations give them, and leaves the other elements
-/// untouched.
+/// Each works on a list of distinct elements in one pass, with work
+/// proportional to the list (a multirate step makes many passes over small
+/// subsets), gives them bit for bit what the whole-state operations give
+/// them, and leaves the other elements untouched.
 pub trait LocalTimeStepping<S>: Sync {
     /// Largest stable time step of every element for `cfl`, into `out` (one
     /// value per mesh element; `f64::INFINITY` where nothing limits it).
     fn element_dt(&self, state: &S, cfl: f64, out: &mut [f64]);
 
-    /// One stage for every element k with `plan(k) = Some(stage)` (see
+    /// One stage for every listed element k, with stage `plan(k)` (see
     /// [`ElementStage`]): its RHS from `input`, which may read the element's
     /// own and its face neighbours' values, nothing further away; the new
     /// stage value into its rows of `out`, and its sum into `acc` when the
@@ -119,15 +117,16 @@ pub trait LocalTimeStepping<S>: Sync {
         &self,
         base: &S,
         input: &S,
-        plan: &(dyn Fn(usize) -> Option<ElementStage> + Sync),
+        elements: &[u32],
+        plan: &(dyn Fn(usize) -> ElementStage + Sync),
         out: &mut S,
         acc: Option<&mut S>,
     );
 
     /// `state ← acc` and
     /// [`PhysicsModule::post_process`](crate::physics::PhysicsModule::post_process)
-    /// on the elements with `active(k)`: the end of their substep.
-    fn finish_where(&self, state: &mut S, acc: &S, active: ElementMask);
+    /// on the listed elements: the end of their substep.
+    fn finish_where(&self, state: &mut S, acc: &S, elements: &[u32]);
 }
 
 // =============================================================================
@@ -301,6 +300,28 @@ fn limit_level_jumps(mesh: &Mesh2D, level: &mut Vec<u8>, scratch: &mut Vec<u8>) 
     }
 }
 
+/// Elements in decreasing order of `key` (increasing index within a key)
+/// into `order`, and `count[d]` = the number with `key ≥ d` for `d` in
+/// `0..=max_key + 1`: the elements with `key ≥ d` are `order[..count[d]]`.
+fn sort_descending(key: &[u8], max_key: usize, order: &mut Vec<u32>, count: &mut Vec<usize>) {
+    count.clear();
+    count.resize(max_key + 2, 0);
+    for &k in key {
+        count[k as usize] += 1;
+    }
+    // count[d] ← Σ_{r ≥ d} hist[r]; the elements of key r start at count[r + 1]
+    for d in (0..=max_key).rev() {
+        count[d] += count[d + 1];
+    }
+    let mut next: Vec<usize> = (0..=max_key).map(|r| count[r + 1]).collect();
+    order.clear();
+    order.resize(key.len(), 0);
+    for (k, &r) in key.iter().enumerate() {
+        order[next[r as usize]] = k as u32;
+        next[r as usize] += 1;
+    }
+}
+
 /// Level of finest substep p's alignment: the coarsest level whose substeps
 /// start at p (0 at the start and end of the coarse step).
 #[inline]
@@ -348,6 +369,13 @@ pub struct MultirateStepper<S> {
     /// `rate[s][k]`: the level whose substeps element k's stage-(s + 1) RHS
     /// follows, the finest level within s + 1 face hops
     rate: [Vec<u8>; 3],
+    /// Elements by decreasing `rate[s]` and by decreasing level, with the
+    /// counts at or above each depth (see [`sort_descending`]): the active
+    /// elements of a pass are a prefix
+    rate_order: [Vec<u32>; 3],
+    rate_count: [Vec<usize>; 3],
+    level_order: Vec<u32>,
+    level_count: Vec<usize>,
     /// Element RHS evaluations of one coarse step with the current levels
     evaluations_per_step: u64,
     y2: Option<S>,
@@ -367,6 +395,10 @@ impl<S: Integrable> MultirateStepper<S> {
             element_dt: Vec::new(),
             level: Vec::new(),
             rate: Default::default(),
+            rate_order: Default::default(),
+            rate_count: Default::default(),
+            level_order: Vec::new(),
+            level_count: Vec::new(),
             evaluations_per_step: 0,
             y2: None,
             y3: None,
@@ -403,6 +435,20 @@ impl<S: Integrable> MultirateStepper<S> {
         spread_to_neighbours(mesh, r1, r2, 0);
         spread_to_neighbours(mesh, r2, r3, 0);
         self.evaluations_per_step = self.rate.iter().flatten().map(|&r| 1u64 << r).sum();
+        for s in 0..3 {
+            sort_descending(
+                &self.rate[s],
+                finest,
+                &mut self.rate_order[s],
+                &mut self.rate_count[s],
+            );
+        }
+        sort_descending(
+            &self.level,
+            finest,
+            &mut self.level_order,
+            &mut self.level_count,
+        );
         dt
     }
 
@@ -427,6 +473,8 @@ impl<S: Integrable> MultirateStepper<S> {
     pub fn step(&mut self, local: &dyn LocalTimeStepping<S>, state: &mut S, t: f64, dt: f64) {
         let finest = self.finest;
         let (level, rate) = (&self.level, &self.rate);
+        let (rate_order, rate_count) = (&self.rate_order, &self.rate_count);
+        let (level_order, level_count) = (&self.level_order, &self.level_count);
         let y2 = self.y2.get_or_insert_with(|| state.clone());
         let y3 = self.y3.get_or_insert_with(|| state.clone());
         let f = self.rhs.get_or_insert_with(|| state.clone());
@@ -442,45 +490,42 @@ impl<S: Integrable> MultirateStepper<S> {
                 let q = p >> (finest - l as usize);
                 (t + q as f64 * dt_l, dt_l)
             };
-            let active = |s: usize| move |k: usize| rate[s][k] as usize >= d;
+            // The elements whose stage-(s + 1) RHS follows a level ≥ d
+            let active = |s: usize| &rate_order[s][..rate_count[s][d]];
 
             // Stage 1: Y₂ = S + Δt_ℓ F(S)
-            let on = active(0);
             local.stage_where(
                 state,
                 state,
+                active(0),
                 &|k| {
-                    on(k).then(|| {
-                        let (t_k, dt_l) = substep(k);
-                        ElementStage {
-                            time: t_k,
-                            a: 1.0,
-                            b: 0.0,
-                            c: dt_l,
-                            accumulate: None,
-                        }
-                    })
+                    let (t_k, dt_l) = substep(k);
+                    ElementStage {
+                        time: t_k,
+                        a: 1.0,
+                        b: 0.0,
+                        c: dt_l,
+                        accumulate: None,
+                    }
                 },
                 y2,
                 None,
             );
 
             // Stage 2: Y₃ = ¾S + ¼Y₂ + ¼Δt_ℓ F(Y₂)
-            let on = active(1);
             local.stage_where(
                 state,
                 y2,
+                active(1),
                 &|k| {
-                    on(k).then(|| {
-                        let (t_k, dt_l) = substep(k);
-                        ElementStage {
-                            time: t_k + dt_l,
-                            a: 0.75,
-                            b: 0.25,
-                            c: 0.25 * dt_l,
-                            accumulate: None,
-                        }
-                    })
+                    let (t_k, dt_l) = substep(k);
+                    ElementStage {
+                        time: t_k + dt_l,
+                        a: 0.75,
+                        b: 0.25,
+                        c: 0.25 * dt_l,
+                        accumulate: None,
+                    }
                 },
                 y3,
                 None,
@@ -489,23 +534,21 @@ impl<S: Integrable> MultirateStepper<S> {
             // Stage 3: H = ⅓S + ⅔Y₃ + ⅔Δt_ℓ F(Y₃). The substep result is the
             // mean of H over its 2^(r₃ − ℓ) blocks; a block starting with the
             // substep restarts the sum
-            let on = active(2);
             local.stage_where(
                 state,
                 y3,
+                active(2),
                 &|k| {
-                    on(k).then(|| {
-                        let (t_k, dt_l) = substep(k);
-                        let blocks = 1u64 << (rate[2][k] - level[k]);
-                        let first = level[k] as usize >= d;
-                        ElementStage {
-                            time: t_k + 0.5 * dt_l,
-                            a: 1.0 / 3.0,
-                            b: 2.0 / 3.0,
-                            c: 2.0 / 3.0 * dt_l,
-                            accumulate: Some((1.0 / blocks as f64, if first { 0.0 } else { 1.0 })),
-                        }
-                    })
+                    let (t_k, dt_l) = substep(k);
+                    let blocks = 1u64 << (rate[2][k] - level[k]);
+                    let first = level[k] as usize >= d;
+                    ElementStage {
+                        time: t_k + 0.5 * dt_l,
+                        a: 1.0 / 3.0,
+                        b: 2.0 / 3.0,
+                        c: 2.0 / 3.0 * dt_l,
+                        accumulate: Some((1.0 / blocks as f64, if first { 0.0 } else { 1.0 })),
+                    }
                 },
                 f,
                 Some(&mut *acc),
@@ -513,7 +556,7 @@ impl<S: Integrable> MultirateStepper<S> {
 
             // Substeps ending here
             let next = depth(p + 1, finest);
-            local.finish_where(state, acc, &|k| level[k] as usize >= next);
+            local.finish_where(state, acc, &level_order[..level_count[next]]);
         }
 
         self.stats.steps += 1;
@@ -563,6 +606,24 @@ mod tests {
             (f64::INFINITY, 0)
         );
         assert_eq!(levels, [0, 0, 0]);
+    }
+
+    #[test]
+    fn descending_sort_gives_prefixes_by_key() {
+        let key = [0u8, 2, 1, 2, 0, 3];
+        let (mut order, mut count) = (Vec::new(), Vec::new());
+        sort_descending(&key, 3, &mut order, &mut count);
+        assert_eq!(order, [5, 1, 3, 2, 0, 4]);
+        assert_eq!(count, [6, 4, 3, 1, 0]);
+        for d in 0..=4 {
+            let mut prefix: Vec<u32> = order[..count[d]].to_vec();
+            prefix.sort();
+            let expected: Vec<u32> = (0..6)
+                .filter(|&k| key[k] as usize >= d)
+                .map(|k| k as u32)
+                .collect();
+            assert_eq!(prefix, expected, "d = {d}");
+        }
     }
 
     #[test]

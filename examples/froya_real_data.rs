@@ -135,7 +135,9 @@ use dg_rs::io::{
     LocalProjection, TideGaugeFile, east_axis, read_adcp_file, read_tide_gauge_file,
     write_adcp_file, write_tide_gauge_file, write_vtk_swe,
 };
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, MeshPoint, PointLocator2D, inverse_bilinear};
+use dg_rs::mesh::{
+    Bathymetry2D, BoundaryTag, Mesh2D, MeshPoint, PointLocator2D, inverse_bilinear, read_gmsh_mesh,
+};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
 use dg_rs::simulation::Simulation;
@@ -250,6 +252,9 @@ struct Options {
     /// 1 km the M2 current near Mausund was 0.41 of NorKyst's with point
     /// samples and 0.63 projected, the gauge's centred RMSE 4.4 and 4.0 cm
     project_bed: bool,
+    /// Coastline-fitted Gmsh mesh (`mesh=`, from
+    /// `scripts/gmsh_coastline_mesh.py`) instead of the `nx` × `ny` grid
+    mesh: Option<String>,
     /// Local time stepping with up to this many levels (`lts=`; 0: global
     /// SSP-RK3)
     lts: usize,
@@ -291,6 +296,7 @@ impl Options {
             },
             profile: get("profile", 0.0)? as usize,
             lts: get("lts", 0.0)? as usize,
+            mesh: args.get("mesh").cloned(),
             output: args.get("output").map(PathBuf::from),
             wind: args.contains_key("wind"),
             start: args
@@ -435,15 +441,12 @@ impl Domain {
     /// with a node below mean sea level.
     fn build(
         name: &'static str,
-        (x0, x1, y0, y1): (f64, f64, f64, f64),
+        grid: Mesh2D,
         opts: &Options,
         bed: impl Fn(f64, f64) -> f64,
         resolution: f64,
         projection: Option<LocalProjection>,
     ) -> Self {
-        // The sides are open sea wherever they cross water (land is not meshed)
-        let grid =
-            Mesh2D::uniform_rectangle_with_bc(x0, x1, y0, y1, opts.nx, opts.ny, BoundaryTag::Open);
         let ops = DGOperators2D::new(opts.order);
         let grid_geom = GeometricFactors2D::compute(&grid, &ops);
         let mut grid_bed = if opts.project_bed {
@@ -538,11 +541,36 @@ impl Domain {
             }
         );
 
-        let (x0, y0) = projection.geo_to_xy(bbox.min_lat, bbox.min_lon);
-        let (x1, y1) = projection.geo_to_xy(bbox.max_lat, bbox.max_lon);
+        let grid = match &opts.mesh {
+            Some(path) => {
+                let mesh = read_gmsh_mesh(Path::new(path))?;
+                println!(
+                    "  Mesh: {path}, {} quadrilaterals, sizes {:.0}–{:.0} m",
+                    mesh.n_elements,
+                    mesh.h_min(),
+                    mesh.h_max()
+                );
+                mesh
+            }
+            None => {
+                // The sides are open sea wherever they cross water (land is
+                // not meshed)
+                let (x0, y0) = projection.geo_to_xy(bbox.min_lat, bbox.min_lon);
+                let (x1, y1) = projection.geo_to_xy(bbox.max_lat, bbox.max_lon);
+                Mesh2D::uniform_rectangle_with_bc(
+                    x0,
+                    x1,
+                    y0,
+                    y1,
+                    opts.nx,
+                    opts.ny,
+                    BoundaryTag::Open,
+                )
+            }
+        };
         Ok(Some(Self::build(
             "froya",
-            (x0, x1, y0, y1),
+            grid,
             opts,
             raster.sampler(&projection),
             raster.pixel_size(),
@@ -562,7 +590,16 @@ impl Domain {
                 -100.0 + 105.0 * (x / lx).powi(2)
             }
         };
-        Self::build("synthetic", (0.0, lx, 0.0, ly), opts, bed, 100.0, None)
+        let grid = Mesh2D::uniform_rectangle_with_bc(
+            0.0,
+            lx,
+            0.0,
+            ly,
+            opts.nx,
+            opts.ny,
+            BoundaryTag::Open,
+        );
+        Self::build("synthetic", grid, opts, bed, 100.0, None)
     }
 
     /// Make walls of the open-boundary faces with a node farther than

@@ -10,6 +10,7 @@ use crate::equations::ShallowWater2D;
 use crate::flux::StandardFlux2D;
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::core::disjoint::DisjointChunks;
 use crate::solver::{
     ImplicitDamping2D, Limiter2D, LimiterContext2D, SWEFormulation2D, SWESolution2D,
     StandardLimiter2D, WetDryConfig, positivity_cfl_swe_2d,
@@ -25,11 +26,11 @@ use crate::solver::{
     apply_wet_dry_correction_all_parallel as wet_dry_correction,
 };
 use crate::solver::{
-    apply_wet_dry_correction_element, compute_rhs_swe_2d_where_then, element_dt_swe_2d,
+    apply_wet_dry_correction_element, compute_rhs_swe_2d_subset_then, element_dt_swe_2d,
 };
 use crate::source::{BottomFriction2D, CageDrag2D, SourceTerm2D, SourceTerms2D};
 use crate::time::LocalTimeStepping;
-use crate::time::multirate::{ElementMask, ElementStage};
+use crate::time::multirate::ElementStage;
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -316,7 +317,8 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         &self,
         base: &SWESolution2D,
         input: &SWESolution2D,
-        plan: &(dyn Fn(usize) -> Option<ElementStage> + Sync),
+        elements: &[u32],
+        plan: &(dyn Fn(usize) -> ElementStage + Sync),
         out: &mut SWESolution2D,
         acc: Option<&mut SWESolution2D>,
     ) {
@@ -325,9 +327,7 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         let n = self.ops.n_nodes;
         let clips = AtomicUsize::new(0);
         let then = |k: usize, [h, hu, hv]: [&mut [f64]; 3], sum: Option<[&mut [f64]; 3]>| {
-            let Some(stage) = plan(k) else {
-                return;
-            };
+            let stage = plan(k);
             let nodes = k * n..(k + 1) * n;
             // out = a·base + b·input + c·F, F in the rows (as scale + axpy
             // round it)
@@ -370,13 +370,14 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
                 }
             }
         };
-        compute_rhs_swe_2d_where_then(
+        compute_rhs_swe_2d_subset_then(
             input,
             &self.mesh,
             &self.ops,
             &self.geom,
             &config,
-            &|k| plan(k).map(|stage| stage.time),
+            elements,
+            &|k| plan(k).time,
             out,
             acc,
             &then,
@@ -384,36 +385,32 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         self.count_clips(clips.into_inner());
     }
 
-    fn finish_where(&self, state: &mut SWESolution2D, acc: &SWESolution2D, active: ElementMask) {
+    fn finish_where(&self, state: &mut SWESolution2D, acc: &SWESolution2D, elements: &[u32]) {
         let n = self.ops.n_nodes;
-        let element = |k: usize, mut rows: [&mut [f64]; 3]| {
-            if !active(k) {
-                return 0;
-            }
+        let [h, hu, hv] = &mut state.data;
+        let rows = [
+            DisjointChunks::new(h, n),
+            DisjointChunks::new(hu, n),
+            DisjointChunks::new(hv, n),
+        ];
+        let element = |&k: &u32| {
+            let k = k as usize;
+            // SAFETY: the listed elements are distinct
+            let mut rows = rows.each_ref().map(|r| unsafe { r.chunk(k) });
             for (var, row) in rows.iter_mut().enumerate() {
                 row.copy_from_slice(&acc.data[var][k * n..(k + 1) * n]);
             }
             self.post_process_element(k, rows)
         };
-        let [h, hu, hv] = &mut state.data;
         #[cfg(feature = "parallel")]
-        let clips = {
+        let clips = if elements.len() >= 64 {
             use rayon::prelude::*;
-            h.par_chunks_exact_mut(n)
-                .zip(hu.par_chunks_exact_mut(n))
-                .zip(hv.par_chunks_exact_mut(n))
-                .enumerate()
-                .map(|(k, ((h, hu), hv))| element(k, [h, hu, hv]))
-                .sum()
+            elements.par_iter().map(element).sum()
+        } else {
+            elements.iter().map(element).sum()
         };
         #[cfg(not(feature = "parallel"))]
-        let clips = h
-            .chunks_exact_mut(n)
-            .zip(hu.chunks_exact_mut(n))
-            .zip(hv.chunks_exact_mut(n))
-            .enumerate()
-            .map(|(k, ((h, hu), hv))| element(k, [h, hu, hv]))
-            .sum();
+        let clips = elements.iter().map(element).sum();
         self.count_clips(clips);
     }
 }
