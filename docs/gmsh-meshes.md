@@ -117,3 +117,8 @@ let physics = builder.with_cage_drag(drag).build();
 Python API (`uv run scripts/gmsh_fixtures.py`). It meshes a bay with a curved
 coastline and an island and saves the result in the three supported formats,
 plus a quad-dominant version that the reader must reject.
+
+`scripts/gmsh_farm_mesh.py` builds `tests/data/gmsh/fjord_farm.msh`: the fjord
+arm above, in local metres, with ≈ 20 m quads at the farm growing to ≈ 450 m
+(`uv run scripts/gmsh_farm_mesh.py`). It is the benchmark for local time
+stepping (`MultirateSSPRK3`, `examples/local_time_stepping_farm.rs`).

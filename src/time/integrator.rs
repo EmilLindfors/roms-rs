@@ -140,6 +140,13 @@ pub trait IntegratorInfo: Send + Sync {
     ///
     /// For SSP-RK3: [0, dt, dt/2] (stages evaluate at t, t+dt, t+dt/2)
     fn stage_times(&self, dt: f64) -> Vec<f64>;
+
+    /// Largest number of levels below the coarsest if this integrator steps
+    /// elements with their own time steps (local time stepping, see
+    /// [`crate::time::MultirateSSPRK3`]); `None` for global time steps.
+    fn max_local_levels(&self) -> Option<usize> {
+        None
+    }
 }
 
 // =============================================================================

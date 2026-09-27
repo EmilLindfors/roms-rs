@@ -74,7 +74,7 @@ This section only orders the existing items for that goal and adds the two farm-
 1. P1.3 geometry (blocker): coastline-fitted meshes with elements of tens of metres at the farm and kilometres offshore. General quadrilaterals are supported in 2D since 2026-09-26, and all-quad Gmsh meshes (MSH 4.1/2.2) load since 2026-09-26 (see `docs/gmsh-meshes.md`); the rest of P1.3 (triangles or quad-dominant meshes, CSR) is still open.
 2. P1.6 shoreline cliffs and bathymetry: done at 50 m (2026-09-26: `BedRaster`, `Bathymetry2D::project`, Kartverket's topobathy model, `raise_isolated_wet_nodes`). Farm-scale meshes (tens of metres) need the service's 1 m level, which has depths only inside surveyed projects: merge it over the 50 m model where it has data (see P1.6).
 3. ~~F.1 cage drag (2D form)~~ done 2026-09-26 (`CageDrag2D`, `with_cage_drag`).
-4. P2.5 local time stepping or implicit free surface: a single 20 m element sets the global dt, so farm refinement makes this the dominant cost.
+4. ~~P2.5 local time stepping~~ done 2026-09-27 (`MultirateSSPRK3`: 2.4–2.8× on a 20 m farm mesh, see P2.5 for the follow-ups).
 5. P1.5 nesting of NorKyst ū, v̄, η (residual and coastal-current transport, not only the tidal atlas) and the P1.6 atmospheric forcing reader (wind stress).
 6. P3.1 current validation: depth-averaged velocity in station series, sampling at the station position by interpolation inside the element (F.2 needs the same evaluation), ADCP comparison and tidal-ellipse fit. Farm-site current surveys, where available, are the natural data.
 7. Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7.
@@ -349,7 +349,18 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [ ] Limit only troubled cells.
 
 ### P2.5 Local time stepping or implicit free surface
-- [ ] One 250 m element in 1300 m water forces ~22× more global steps. Multirate/LTS SSP-RK or semi-implicit free surface (SLIM/Thetis practice): 2–20×.
+- [x] One 250 m element in 1300 m water forces ~22× more global steps. Multirate/LTS SSP-RK or semi-implicit free surface (SLIM/Thetis practice): 2–20×.
+  - Done 2026-09-27: local time stepping, `MultirateSSPRK3` (see CHANGELOG). A conservative, SSP multirate SSP-RK3 in Constantinescu & Sandu's construction: power-of-two levels, reassigned every coarse step. One level is SSP-RK3 bit for bit. Gates in `tests/local_time_stepping_test.rs`.
+  - Farm mesh (`examples/local_time_stepping_farm.rs`, 12–455 m quads, P2): levels 0–6, 2.6× less RHS work (4.6× ideal), 2.4–2.8× less wall time.
+  - Frøya at 1 km: little to gain, 1.53× at best from depth. Fine and coarse elements interleave, so ≈ 1.05× less RHS work and 1.1–1.3× less wall time.
+- [ ] Follow-ups:
+  - Choose the coarse step to minimise work. It is anchored at 2^L·Δt_min, so an element with Δt_k just under 2·Δt_min runs at Δt_min, wasting up to 2× (≈ 1.4× on average) on the bulk. A histogram of log₂(Δt_k/Δt_min) gives the cost of each anchor in O(bins).
+  - The three-hop dependency (stage s reads neighbours' stage values s hops out) leaves 2.6× of the ideal 4.6× on the farm mesh, and almost nothing where levels interleave (Frøya). Levels could be made coherent (raise an element to the finest level around it when that costs less than its buffers); a mesh grading ≤ 1.2 per element also helps.
+  - Pass overhead: every stage is still one face pass and one element pass over *all* elements (7 parallel dispatches per finest substep), so with many levels on a large mesh the scans and fork/joins of the fine levels cost more than their work. Keep per-level element lists sorted by rate, so an active set is a prefix, and run small sets serially.
+  - Element-local limiting only: the Kuzmin limiters (vertex bounds from neighbour means) and BR1 horizontal viscosity (two-face coupling) panic under LTS.
+  - The interface coupling error is ≈ 50× SSP-RK3's time error at the same CFL for a gravity wave crossing four levels (1.5e-3 relative at CFL 0.8). It scales as (λΔt)², so tides are unaffected, but check eddies shed by cages as they leave the farm level.
+  - Validate on Frøya: `froya_real_data lts=6` reproduces the global run at Mausund (M2 to 1e-4) over 6 h; repeat over the 15-day harmonic run.
+- [ ] Semi-implicit free surface: still the alternative for 3D mode splitting (P4), where the barotropic step is the stiff part. Not needed for Stage A.
 
 ### P2.6 Benchmarks (was P1.6)
 - Measured 2026-09-26: Frøya, 9,653 P2 elements (87k nodes), dt ≈ 0.65 s: 8.2 ms/step on 24 threads, so a 30-day validation run takes ≈ 9 h. Scaling stops at ≈ 8 threads (44.6 → 9 ms from 1 to 8–24 threads): the laptop's 4 Zen 5 + 8 Zen 5c cores and its power limit, not serial code. `froya_real_data profile=N` times each phase (RHS, post-processing, damping, dt) at 1 and all threads; single-thread RHS ≈ 85 % of the step.

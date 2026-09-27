@@ -64,6 +64,7 @@ src/
 │   └── burn/         # Burn GPU prototype — incomplete, deletion recommended
 │                     # (REVIEW.md §5; TODO P0.11/P2.7)
 ├── time/             # Integrable + TimeIntegrator traits, generic SSPRK3,
+│                     # multirate (local time stepping, MultirateSSPRK3),
 │                     # mode_split (barotropic subcycling); legacy per-type
 │                     # ssp_rk3_* variants slated for deletion (REVIEW.md §6.2)
 │
@@ -119,8 +120,8 @@ REVIEW.md §7 (2026-09-25):
    triangles; proper NorKyst nesting. Done: one characteristic OBC,
    spatially varying NorKyst boundary tides, model clock.
 3. **Cheap enough to matter** — per-element dt, sum factorisation, one Riemann
-   solve per face, water-only meshes, then local time stepping or an implicit
-   free surface.
+   solve per face, water-only meshes, local time stepping (done:
+   `MultirateSSPRK3`), or an implicit free surface.
 4. **Validation and the speed claim** — tide gauges/NorKyst skill, and a
    cost-vs-error benchmark against ROMS 2D on the same hardware.
 5. **3D rebuilt on the ROMS recipe** — once-per-step forward-backward

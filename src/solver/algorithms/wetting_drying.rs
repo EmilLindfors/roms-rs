@@ -416,6 +416,33 @@ fn damp_nodes(
     }
 }
 
+/// The wet/dry correction of element `k` (its SoA rows), the element kernel
+/// of [`apply_wet_dry_correction_all`], for local time stepping. Returns
+/// `true` if its mean depth was negative and it was emptied.
+pub fn apply_wet_dry_correction_element(
+    k: usize,
+    [h, hu, hv]: [&mut [f64]; 3],
+    geom: &GeometricFactors2D,
+    config: &WetDryConfig,
+) -> bool {
+    let (mass, inv_area) = (element_mass(geom, k), 1.0 / geom.area[k]);
+    wet_dry_element(h, hu, hv, mass, inv_area, config)
+}
+
+impl ImplicitDamping2D<'_> {
+    /// [`apply_implicit_damping_2d`] of element `k` (its SoA rows `stage`,
+    /// with rates frozen at its rows `from`) over `dt`, for local time
+    /// stepping. Same per-node arithmetic, so the same result.
+    pub fn damp_element(&self, k: usize, stage: [&mut [f64]; 3], from: [&[f64]; 3], dt: f64) {
+        if !self.is_active() {
+            return;
+        }
+        let [h, hu, hv] = stage;
+        let [fh, fhu, fhv] = from;
+        damp_nodes(h, hu, hv, (fh, fhu, fhv), k * h.len(), dt, self);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

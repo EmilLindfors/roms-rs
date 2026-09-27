@@ -82,7 +82,10 @@ pub use rhs::{
     compute_rhs_swe_2d,
     compute_rhs_swe_2d_face_mass_into,
     compute_rhs_swe_2d_into,
+    compute_rhs_swe_2d_where_into,
+    compute_rhs_swe_2d_where_then,
     compute_rhs_tracer_2d,
+    element_dt_swe_2d,
     face_mass_len,
     positivity_cfl_swe_2d,
 };
@@ -129,7 +132,7 @@ pub use limiters::{
 // Re-export algorithms
 pub use algorithms::{
     ImplicitDamping2D, WetDryConfig, apply_implicit_damping_2d, apply_wet_dry_correction,
-    apply_wet_dry_correction_all,
+    apply_wet_dry_correction_all, apply_wet_dry_correction_element,
 };
 
 #[cfg(feature = "parallel")]

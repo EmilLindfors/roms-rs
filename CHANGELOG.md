@@ -6,6 +6,32 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Local time stepping: multirate SSP-RK3 (TODO P2.5).** On a farm-refined mesh the few smallest elements set the global time step. Now every element steps at the largest power-of-two fraction of the step that its own CFL allows.
+  - `time::MultirateSSPRK3::new(max_levels)` as the `Simulation` integrator: `Simulation::new(physics, MultirateSSPRK3::new(8))`. The scheme is a multirate partitioned RK in the construction of Constantinescu & Sandu (2007), which SLIM uses (Seny et al. 2013, 2014), with SSP-RK3 as the base method. In every finest substep each element takes one SSP-RK3 step of its own over its level's Δt, with its neighbours at their stage values. The substep result is the mean over the finest substeps it spans.
+    - Mass is conserved to rounding: every face flux gets the same weight on both sides.
+    - SSP: the Zhang–Shu positivity bound holds per element at its own Δt, since limiters and wet/dry run on every stage value.
+    - Order: SSP-RK3 within a level, second order across level interfaces. One level is SSP-RK3 bit for bit.
+    - An element's stage-s RHS is evaluated only at the finest rate within s face hops, and reused in between.
+  - Levels are reassigned every coarse step. An element's time step uses its own and its face neighbours' wave speeds (`solver::element_dt_swe_2d`), and neighbouring levels differ by at most one. Without these, nearly dry elements got enormous steps and water arriving from a finer neighbour made negative means (70 clips in the runup gate).
+  - `SimulationResult::local_time_stepping`: `MultirateStats` (coarse steps, element RHS evaluations against global steps at the finest Δt, finest level).
+  - Physics modules opt in with `PhysicsModule::local_time_stepping() -> Option<&dyn LocalTimeStepping<S>>`, and `IntegratorInfo::max_local_levels` marks the integrator. `LocalTimeStepping` has `element_dt`, a fused `stage_where` (RHS, stage combination, implicit damping, then limiting or the substep sum, all in one pass per stage) and `finish_where`. `SWEPhysics2D` implements it for every formulation, source term, boundary condition, wetting/drying, friction and cage drag. It does not support horizontal viscosity or the Kuzmin limiters, which are not element-local and panic.
+  - Solver pieces: `compute_rhs_swe_2d_where_into` / `_where_then` (the RHS of a subset of elements, each at its own time, bit for bit the full RHS on them), `ImplicitDamping2D::damp_element`, `apply_wet_dry_correction_element`, `StandardLimiter2D::apply_element`.
+  - Gates (`tests/local_time_stepping_test.rs`):
+    - One level is SSP-RK3 bit for bit, with WetDry, positivity, wet/dry, implicit friction and a time-dependent source.
+    - The subset RHS is bit for bit the full one.
+    - Mass is conserved across four levels (1.7e-14 relative drift, against 4.6e-14 for global SSP-RK3).
+    - A lake at rest over a rough bed with a dry island holds to 1e-10.
+    - A uniform y-force on an x-graded mesh is integrated to 1e-6: stage times per element are right.
+    - Temporal convergence to the global solution at orders 2.6–2.8.
+    - A runup across levels has no clip and h ≥ 0.
+    - The farm mesh saves 2.6× of the RHS work.
+  - **Accuracy cost:** the interface coupling dominates the time error, ≈ 50× that of global SSP-RK3 at the same CFL for a gravity wave crossing four levels (1.5e-3 relative at CFL 0.8). It scales as (λΔt)², so it is negligible for tides.
+  - **Farm benchmark** (`examples/local_time_stepping_farm.rs`, P2, 0.5 h of M2 from rest with cages, friction and Coriolis): 3,584 quads from 12 to 455 m (`tests/data/gmsh/fjord_farm.msh`, from `scripts/gmsh_farm_mesh.py`).
+    - Levels 0–6 and 2.6× less RHS work (4.6× would be the ideal per-element time step).
+    - Wall time 165–189 s global against 68 s local, 2.4–2.8× faster (24 threads, a noisy laptop).
+    - Largest difference from the global solution: 1.5e-4 m in η and 7e-5 m/s in speed.
+  - **Frøya** (`froya_real_data lts=6`, uniform 1 km mesh): at most 1.53× from depth variation alone. Fine and coarse levels interleave, so the three-hop dependency leaves 1.05× less RHS work and ≈ 1.1–1.3× less wall time. Mausund's M2 agrees with the global run to 1e-4, with 0 clips.
+
 - **Kartverket's topobathy model as the bed: land heights and depths in one grid (TODO P1.6).** The Frøya GeoTIFF has no land heights, so every land node got a constant 5 m and shoreline elements carried 10–15 m cliffs.
   - `Bathymetry2D::raise_isolated_wet_nodes(mesh, ops, geom, level)`: a node below `level` whose grid-line neighbours are all dry, in every element that shares it, is water the mesh cannot resolve (a sound or lake one node wide). In `WetDry` it carried η jumps up to 1 m between elements and 1–3 m/s. It is raised to the lowest of its neighbours; the Frøya example raises 14–21 at 1 km before cutting the water-only mesh. Node matching is shared with `make_continuous`.
   - `scripts/kartverket_topobathy.sh <box> [cell_m=50] [out]` fetches the national topobathy terrain model (free WCS, hoydedata.no) as a GeoTIFF in EPSG:4326. The service has two levels. Cells coarser than ≈ 42 m get the 50 m model, land and sea interpolated together. Finer cells get the 1 m level, where unsurveyed sea is a flat 0, so the script refuses cells under 50 m. One request covers up to 3840 × 2160 pixels (the Frøya domain at 50 m is 1180 × 891).

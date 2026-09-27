@@ -3,7 +3,7 @@
 //! Provides a high-level interface for running time-dependent simulations.
 
 use crate::physics::PhysicsModule;
-use crate::time::{Integrable, StageWorkspace, TimeIntegrator};
+use crate::time::{Integrable, MultirateStats, MultirateStepper, StageWorkspace, TimeIntegrator};
 
 // =============================================================================
 // Simulation Configuration
@@ -60,6 +60,8 @@ pub struct SimulationResult {
     pub success: bool,
     /// Error message if simulation failed.
     pub error: Option<String>,
+    /// Work counts of local time stepping (a multirate integrator), if used.
+    pub local_time_stepping: Option<MultirateStats>,
 }
 
 impl SimulationResult {
@@ -79,6 +81,7 @@ impl SimulationResult {
             wall_time,
             success: true,
             error: None,
+            local_time_stepping: None,
         }
     }
 
@@ -92,6 +95,7 @@ impl SimulationResult {
             wall_time: 0.0,
             success: false,
             error: Some(error),
+            local_time_stepping: None,
         }
     }
 }
@@ -240,6 +244,18 @@ where
             .physics
             .max_cfl()
             .map_or(self.config.cfl, |max| self.config.cfl.min(max));
+        // Local time stepping: every element at its own power-of-two
+        // fraction of the (coarse) step
+        let mut multirate = self.integrator.max_local_levels().map(|max_levels| {
+            let local = self.physics.local_time_stepping().unwrap_or_else(|| {
+                panic!(
+                    "the {} integrator needs a physics module with local time stepping; {} has none",
+                    self.integrator.name(),
+                    self.physics.name()
+                )
+            });
+            (local, MultirateStepper::new(max_levels))
+        });
 
         // Call initial callback
         callback(state, t);
@@ -272,8 +288,18 @@ where
                 );
             }
 
-            // Compute time step
-            let mut dt = self.physics.compute_dt(state, cfl);
+            // Compute time step (with local time stepping, assign the levels
+            // and take the coarse step, which respects dt_max)
+            let mut dt = match multirate.as_mut() {
+                Some((local, stepper)) => stepper.assign_levels(
+                    *local,
+                    self.physics.mesh(),
+                    state,
+                    cfl,
+                    self.config.dt_max,
+                ),
+                None => self.physics.compute_dt(state, cfl),
+            };
 
             // Apply dt limits
             if let Some(dt_max) = self.config.dt_max {
@@ -306,15 +332,18 @@ where
             // relaxation) is implicit in every RK stage; limiters
             // and wet/dry treatment run after every RK stage, so no RHS
             // evaluation sees an unlimited state.
-            self.integrator.step_with_relaxation(
-                state,
-                dt,
-                t,
-                |s, time, out| self.physics.compute_rhs_into(s, time, out),
-                |stage, from, dt| self.physics.implicit_damping(stage, from, dt),
-                |s| self.physics.post_process(s),
-                &mut stages,
-            );
+            match multirate.as_mut() {
+                Some((local, stepper)) => stepper.step(*local, state, t, dt),
+                None => self.integrator.step_with_relaxation(
+                    state,
+                    dt,
+                    t,
+                    |s, time, out| self.physics.compute_rhs_into(s, time, out),
+                    |stage, from, dt| self.physics.implicit_damping(stage, from, dt),
+                    |s| self.physics.post_process(s),
+                    &mut stages,
+                ),
+            }
 
             // Exact landing: no round-off drift from t + (target − t)
             t = if landed { target } else { t + dt };
@@ -343,9 +372,19 @@ where
             println!("  Steps: {}", n_steps);
             println!("  Wall time: {:.2}s", wall_time);
             println!("  dt range: [{:.2e}, {:.2e}]", dt_min_used, dt_max_used);
+            if let Some((_, stepper)) = &multirate {
+                let stats = stepper.stats();
+                println!(
+                    "  Local time stepping: time-step ratio up to 2^{}, {:.2}x less RHS work than global steps",
+                    stats.finest_level,
+                    stats.speedup()
+                );
+            }
         }
 
-        SimulationResult::success(t, n_steps, dt_min_used, dt_max_used, wall_time)
+        let mut result = SimulationResult::success(t, n_steps, dt_min_used, dt_max_used, wall_time);
+        result.local_time_stepping = multirate.map(|(_, stepper)| stepper.stats());
+        result
     }
 }
 
