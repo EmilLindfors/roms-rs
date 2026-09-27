@@ -4,16 +4,16 @@
 //! wet/dry defaults: the `WetDry` split form, HLL, positivity limiting, velocity
 //! desingularization, point-implicit Manning friction, and the positivity CFL.
 //!
-//! 1. **Domain.** Bathymetry from the GeoTIFF (EPSG:4326) and land from GSHHS,
-//!    in one bed raster (`BedRaster`): the sea bed from the GeoTIFF (0 at its
-//!    dry pixels) and a land mask from GSHHS, four times finer, where the bed
-//!    is `land_elevation`. The raster is sampled at the nodes of a
-//!    rectangular grid (`bed=projected` L2-projects it instead,
-//!    `Bathymetry2D::project`), and only elements with a node below mean sea
-//!    level are kept
-//!    (`Mesh2D::retain_elements`); their faces to dropped elements are
-//!    coastline walls. Land nodes inside kept elements are dry shore for
-//!    `WetDry`. The sides of the rectangle are open where they cross water.
+//! 1. **Domain.** A bed raster (`BedRaster`): Kartverket's topobathy model
+//!    (`dem=`, land heights and depths in one 50 m grid) when present; else
+//!    the GeoTIFF bathymetry (0 at its dry pixels) with a land mask from
+//!    GSHHS, four times finer, where the bed is `land_elevation`. The raster
+//!    is sampled at the nodes of a rectangular grid (`bed=projected`
+//!    L2-projects it instead, `Bathymetry2D::project`), and only elements
+//!    with a node below mean sea level are kept (`Mesh2D::retain_elements`);
+//!    their faces to dropped elements are coastline walls. Land nodes inside
+//!    kept elements are dry shore for `WetDry`. The sides of the rectangle
+//!    are open where they cross water.
 //! 2. **Lake at rest.** Walls everywhere, no forcing: the largest spurious
 //!    current and surface error after `rest_hours` (exact balance keeps both
 //!    at round-off; the collocated scheme reached m/s on steep beds).
@@ -52,7 +52,7 @@
 //!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>] \
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
-//!     [bed=point|projected] [output=output/froya]
+//!     [bed=point|projected] [dem=data/froya_topobathy.tif|none] [output=output/froya]
 //! ```
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
@@ -61,8 +61,10 @@
 //!
 //! ## Data files in ./data/
 //!
-//! - froya_smola_hitra.tif (bathymetry)
-//! - GSHHS_f_L1.shp (coastline)
+//! - froya_topobathy.tif (Kartverket's topobathy model: land heights and
+//!   depths at 50 m, from `scripts/kartverket_topobathy.sh`; used when present)
+//! - froya_smola_hitra.tif (bathymetry) and GSHHS_f_L1.shp (coastline):
+//!   without the topobathy model, or with `dem=none`
 //! - froya_boundary_tides.txt (tidal atlas, optional)
 //! - tide_gauges/mausund_obs.txt, froya_station_tides.txt (validation, optional)
 
@@ -112,6 +114,9 @@ const MANNING_N: f64 = 0.025;
 /// Default bed elevation given to land nodes of shoreline elements (m above
 /// MSL; `land_elevation=`)
 const LAND_ELEVATION: f64 = 5.0;
+/// Default elevation model: Kartverket's topobathy model at 50 m
+/// (`scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif`)
+const DEM: &str = "data/froya_topobathy.tif";
 /// Land-mask cells per bathymetry pixel and direction: the coastline is
 /// rasterised at ≈ 25 × 58 m
 const LAND_MASK_REFINEMENT: usize = 4;
@@ -166,6 +171,9 @@ struct Options {
     spinup_hours: f64,
     gauge_ratios: Vec<&'static str>,
     land_elevation: f64,
+    /// Elevation model with land heights (`dem=`, used if the file exists;
+    /// `dem=none` for the GeoTIFF bathymetry and GSHHS coastline)
+    dem: Option<String>,
     /// Sample the bed at the nodes (`bed=point`, the default) or L2-project
     /// it onto them (`bed=projected`). At 1 km both beat the old builder at
     /// Mausund (centred RMSE 3.3 / 3.6 cm against 4.1 cm over hours 24–72),
@@ -199,6 +207,10 @@ impl Options {
             ramp_hours: get("ramp_hours", TIDAL_RAMP_HOURS)?,
             output_minutes: get("output_minutes", 60.0)?,
             land_elevation: get("land_elevation", LAND_ELEVATION)?,
+            dem: match args.get("dem").map_or(DEM, String::as_str) {
+                "none" => None,
+                path => Some(path.to_string()),
+            },
             project_bed: match args.get("bed").map_or("point", String::as_str) {
                 "projected" => true,
                 "point" => false,
@@ -298,11 +310,14 @@ impl Domain {
             Mesh2D::uniform_rectangle_with_bc(x0, x1, y0, y1, opts.nx, opts.ny, BoundaryTag::Open);
         let ops = DGOperators2D::new(opts.order);
         let grid_geom = GeometricFactors2D::compute(&grid, &ops);
-        let grid_bed = if opts.project_bed {
+        let mut grid_bed = if opts.project_bed {
             Bathymetry2D::project(&grid, &ops, &grid_geom, bed, resolution)
         } else {
             Bathymetry2D::from_function(&grid, &ops, &grid_geom, bed)
         };
+        // Water one node wide is unresolved: make it shore
+        let raised = grid_bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
+        println!("  {raised} isolated wet nodes raised to the lowest of their neighbours");
         let has_water = |k: ElementIndex| grid_bed.element(k).iter().any(|&b| b < 0.0);
         let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
         let bathymetry = grid_bed.select_elements(&kept);
@@ -320,31 +335,64 @@ impl Domain {
 
     /// Frøya–Smøla–Hitra from the data files, or `None` if they are missing.
     fn froya(opts: &Options) -> Result<Option<Self>, Box<dyn std::error::Error>> {
-        let bathy_path = Path::new("data/froya_smola_hitra.tif");
-        let coast_path = Path::new("data/GSHHS_f_L1.shp");
-        if !bathy_path.exists() || !coast_path.exists() {
-            return Ok(None);
-        }
         let bbox = GeoBoundingBox::new(8.0, 63.6, 9.2, 64.0);
         let (lat0, lon0) = bbox.center();
         let projection = LocalProjection::new(lat0, lon0);
-        let geotiff = GeoTiffBathymetry::load(bathy_path)?;
-        let coastline = CoastlineData::load(coast_path, &bbox)?;
-        println!("  Bathymetry: {}", geotiff.statistics());
-        println!(
-            "  Coastline: {} polygons",
-            coastline.statistics().polygon_count
-        );
-        let raster = BedRaster::from_geotiff(
-            &geotiff,
-            Some(&coastline),
-            opts.land_elevation,
-            &bbox,
-            LAND_MASK_REFINEMENT,
-        );
+        let dem_path = opts.dem.as_deref().map(Path::new).filter(|p| p.exists());
+        let raster = if let Some(dem_path) = dem_path {
+            // Kartverket's topobathy model: land heights and depths in one grid
+            let dem = GeoTiffBathymetry::load(dem_path)?;
+            let mut raster = BedRaster::elevation_model(&dem, &bbox)?;
+            let (width, height) = raster.dimensions();
+            // The 1 m level of the service fills unsurveyed sea with a flat 0
+            // (`scripts/kartverket_topobathy.sh` refuses the cells that get it)
+            let flat = (0..height)
+                .flat_map(|row| (0..width).map(move |col| (row, col)))
+                .filter(|&(row, col)| raster.pixel(row, col) == 0.0)
+                .count();
+            if flat * 20 > width * height {
+                return Err(format!(
+                    "{}: {:.0} % of the pixels are exactly 0, the flat sea of the 1 m level; \
+                     fetch it at 50 m cells",
+                    dem_path.display(),
+                    100.0 * flat as f64 / (width * height) as f64
+                )
+                .into());
+            }
+            // Missing depths are an exact 0 too (the water surface): fill them
+            // from their surroundings. Land above `land_elevation` is never
+            // wet: cap it
+            let filled = raster.fill_holes(|b| b == 0.0);
+            println!(
+                "  Elevation model: {} ({filled} zero pixels filled, land capped at {} m)",
+                dem_path.display(),
+                opts.land_elevation
+            );
+            raster.clamp_land(opts.land_elevation)
+        } else {
+            let bathy_path = Path::new("data/froya_smola_hitra.tif");
+            let coast_path = Path::new("data/GSHHS_f_L1.shp");
+            if !bathy_path.exists() || !coast_path.exists() {
+                return Ok(None);
+            }
+            let geotiff = GeoTiffBathymetry::load(bathy_path)?;
+            let coastline = CoastlineData::load(coast_path, &bbox)?;
+            println!("  Bathymetry: {}", geotiff.statistics());
+            println!(
+                "  Coastline: {} polygons",
+                coastline.statistics().polygon_count
+            );
+            BedRaster::from_geotiff(
+                &geotiff,
+                Some(&coastline),
+                opts.land_elevation,
+                &bbox,
+                LAND_MASK_REFINEMENT,
+            )
+        };
         let (width, height) = raster.dimensions();
         println!(
-            "  Bed raster: {width} × {height} pixels of {:.0} m (shorter side), {:.1} % water; {} onto the nodes",
+            "  Bed raster: {width} × {height} pixels, {:.0} m resolution, {:.1} % water; {} onto the nodes",
             raster.pixel_size(),
             100.0 * raster.water_fraction(),
             if opts.project_bed {
@@ -379,6 +427,54 @@ impl Domain {
             }
         };
         Self::build("synthetic", (0.0, lx, 0.0, ly), opts, bed, 100.0, None)
+    }
+
+    /// Make walls of the open-boundary faces with a node farther than
+    /// `ATLAS_COVERAGE` from the tidal atlas: water the atlas's parent model
+    /// does not resolve (a narrow fjord arm crossing the domain edge) has no
+    /// tide to force.
+    fn close_uncovered_open_faces(
+        &mut self,
+        opts: &Options,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let atlas_path = Path::new(&opts.tides);
+        let Some(projection) = self.projection else {
+            return Ok(());
+        };
+        if !atlas_path.exists() || opts.norkyst.is_some() {
+            return Ok(());
+        }
+        let atlas = TidalAtlas::read(atlas_path)?;
+        let (mesh, ops) = (
+            Arc::get_mut(&mut self.mesh).expect("mesh not shared yet"),
+            &self.ops,
+        );
+        let mut closed = 0;
+        for e in 0..mesh.edges.len() {
+            let edge = &mesh.edges[e];
+            if edge.right.is_some() || edge.boundary_tag != Some(BoundaryTag::Open) {
+                continue;
+            }
+            let (k, face) = (ElementIndex::new(edge.left.element), edge.left.face);
+            let uncovered = ops.face_nodes[face].iter().any(|&i| {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let (lat, lon) = projection.xy_to_geo(x, y);
+                atlas
+                    .nearest(lon, lat)
+                    .is_none_or(|(_, d)| d > ATLAS_COVERAGE)
+            });
+            if uncovered {
+                mesh.edges[e].boundary_tag = Some(BoundaryTag::Wall);
+                closed += 1;
+            }
+        }
+        if closed > 0 {
+            println!(
+                "  {closed} open-boundary faces lie farther than {:.0} km from the tidal atlas: walls",
+                ATLAS_COVERAGE / 1000.0
+            );
+        }
+        Ok(())
     }
 
     fn builder<BC: SWEBoundaryCondition2D>(&self, bc: BC) -> SWEPhysics2DBuilder<BC> {
@@ -552,7 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = Options::parse()?;
     println!("Frøya–Smøla–Hitra tidal run (WetDry split form, Simulation)\n");
     println!("Setting up the domain...");
-    let domain = match Domain::froya(&opts)? {
+    let mut domain = match Domain::froya(&opts)? {
         Some(domain) => domain,
         None => {
             println!("  Data files not found in ./data/: synthetic basin instead");
@@ -560,6 +656,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     domain.print_summary();
+    domain.close_uncovered_open_faces(&opts)?;
 
     lake_at_rest(&domain, opts.rest_hours);
     tidal_run(&domain, &opts)
