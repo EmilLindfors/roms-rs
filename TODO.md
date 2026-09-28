@@ -87,7 +87,8 @@ This section only orders the existing items for that goal and adds the two farm-
 4. ~~P2.5 local time stepping~~ done 2026-09-27 (`MultirateSSPRK3`: 2.4–2.8× on a 20 m farm mesh; with horizontal viscosity since 2026-09-28; see P2.5 for the follow-ups).
 5. ~~P1.5 nesting of NorKyst ū, v̄, η and the P1.6 atmospheric forcing reader~~ done 2026-09-27 (`OceanModelState` with transport scaling, relaxation band and bed blending; `AtmosphereReader` + `GriddedAtmosphere2D`; gauge-corrected tides with NorKyst's residual, `with_tidal_correction`; see P1.5 for the follow-ups).
 6. ~~P3.1 current validation~~ tooling done 2026-09-27: station series of η, ū, v̄ sampled at the station by evaluating the DG polynomial there (`PointLocator2D`, `Probe2D`; F.2 reuses them), tidal-ellipse fit and complex difference (`fit_tidal_ellipses`), ADCP comparison paired by time. Still to do: real current data (farm-site surveys, see P3.1).
-7. Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7.
+7. ~~F.2 particle tracking in 2D~~ done 2026-09-28 (`particles::ParticleTracker2D`: RK4 on the DG velocity, random walk, walls, open exits, stranding; online or between snapshots; see F.2 for the follow-ups).
+8. Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7.
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
 - P4.2 (tracer constancy, 3D open boundaries for T/S), P4.3 (balanced PGF, vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry, which gives NaN today; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
@@ -119,19 +120,30 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
 
 ### F.2 Lagrangian particle tracking
 - [x] Point location: find the element holding a point and its reference coordinates (2026-09-27, P3.1: `mesh::PointLocator2D`, a bucket grid over element bounding boxes and Newton on the bilinear map). Curved (isoparametric) elements, once P1.3 has them, need the same Newton on the higher-order map.
-- [ ] Velocity evaluation from the element polynomial: the evaluation at a point is done (`solver::Probe2D`, P3.1); still to do: linear in time between output snapshots or online from the solver. A particle moves every step, so it needs `interpolation_weights_into` and `PointLocator2D::in_element` on the last element and its neighbours before a full `locate`.
-- [ ] RK4 advection; horizontal random walk; vertical random walk with the ∂K/∂z drift correction (Visser 1997, MEPS 158) once 3D exists.
-- [ ] Coastline reflection, open-boundary exit, beaching of particles that reach a drying node.
-- [ ] Behaviour hooks: sinking speed (feed, faeces), lice larvae depth preference and salinity avoidance (as in the IMR salmon-lice model; Sandvik et al. 2020, Aquac. Environ. Interact. 12).
-- [ ] Gate tests:
-  - Solid-body rotation: trajectories exact to the time-stepping error when the velocity is in the polynomial space.
-  - No particle crosses a wall.
-  - The vertical random walk keeps an initially uniform distribution uniform under variable K (Visser's well-mixed condition).
+- [x] 2D tracking (2026-09-28, `src/particles/`): `ParticleTracker2D` moves `Particle2D`s through a `ParticleVelocity2D`, sampled as the element polynomial at the particle (`interpolation_weights_into` on the stack, no allocation).
+  - [x] Velocity: `SWEVelocity2D` is (hu, hv)/h of a solution, steady or linear in time between two snapshots (output files, or online: the previous and current state a `Simulation` callback hands over); `NodalVelocity2D` is any nodal field.
+  - [x] Locating: every move walks the straight segment face by face from the particle's element (`particles::walk`), O(faces crossed), no bucket search after release.
+  - [x] RK4 advection; horizontal random walk √(2KΔt)ξ with constant K. Each particle has its own SplitMix64 stream (tracker seed, particle id), so a run does not depend on thread count or particle order. Particles are stepped in parallel with `parallel`.
+  - [x] Boundaries: walls reflect specularly (`with_reflecting` picks the tags; untagged faces reflect), other faces let the particle out at the crossing (`ParticleStatus::Exited(tag)`), periodic faces carry it across. Particles in water shallower than `with_stranding_depth` strand and float again when it deepens.
+  - [x] Gates (`tests/particle_tracking_test.rs`):
+    - Solid-body rotation on distorted quads (exact in Q1): one revolution returns to 7e-7 at 100 steps, rate 4.00.
+    - A walk of 0.45 per step (several elements) with a flow into a corner never leaves the basin.
+    - Well-mixed: a uniform distribution stays uniform in a closed basin (χ² over 64 bins 72 and 57 for steps below and above the element size); in open water the variance is 2Kt to 5 %.
+    - Open exit at the crossing point, periodic wrap, stranding and refloating, reproducibility per particle.
+    - Online in a running `Simulation` (uniform oscillating flow): second order in the snapshot interval (rate 2.00).
+  - [x] `local_time_stepping_farm particles=N [particle_seconds=60] [kh=0.1]` releases N particles in each cage and tracks them online. 1 h from rest with 500 per cage (4 threads): the tracking costs 0.08 s against 198 s for the solver. The clouds drift 42 m with the flood and spread 38 m RMS, which is the random walk's √(4Kt) (the tidal current at the farm is mm/s, so the site says little about advection; a farm-wake study needs a site with real currents, see F.1).
+- [ ] Follow-ups:
+  - Variable K (drift ∇K) and, for a depth-integrated tracer (∂(hc)/∂t = ∇·(hK∇c)), the drift K∇h/h (Dimou & Adams 1993). The constant-K walk is right for a surface or depth-uniform concentration only.
+  - Curved (isoparametric) elements, once P1.3 has them: the walk assumes straight faces, and `inverse_bilinear` the bilinear map.
+  - Particle output (positions per snapshot) for the viewer (F.3) and for connectivity statistics between farms.
+  - A higher-order time interpolation between snapshots (cubic, as for the nesting fields in P1.5) when the output interval is long against the tidal period.
+- [ ] Vertical random walk with the ∂K/∂z drift correction (Visser 1997, MEPS 158) once 3D exists, gated by Visser's well-mixed test under variable K.
+- [ ] Behaviour hooks: sinking speed (feed, faeces), lice larvae depth preference and salinity avoidance (as in the IMR salmon-lice model; Sandvik et al. 2020, Aquac. Environ. Interact. 12). They need a vertical position, so they come with Stage B.
 
 ### F.3 3D visualisation (`viz/`, Bevy 0.20)
 - [x] Crate `dg-viz` in `viz/` (its own workspace, so dg-rs builds and tests never compile Bevy; dg-rs without NetCDF, so no native HDF5). Runs the fjord-farm scenario of `examples/local_time_stepping_farm.rs` on a solver thread (`run_with_callback`), plays the snapshots back (rate, pause, seek; oldest dropped beyond a memory budget) as the water surface over the bed, each element as p² quads of its own nodes with the polynomial's exact normals, coloured by speed or η; walls along the mesh boundary; current arrows sampled by the element polynomial (`Probe2D` weights) on a domain grid and a fine farm grid; net cages (collar, textured net) riding η; orbit camera; `--screenshot` for headless checks (2026-09-27).
 - [ ] Salmon in the cages (pfish-bevy in `../blender-procedural-fish-addon/rust`, once the add-on has a salmon).
-- [ ] Particles (lice larvae, feed, faeces) once F.2 exists; until then they can be developed against NorKyst-800 fields.
+- [ ] Particles (lice larvae, feed, faeces): the 2D tracker exists (F.2, 2026-09-28); draw `Particle2D` positions riding η, tracked on the solver thread from the callback snapshots as `local_time_stepping_farm particles=` does.
 - [ ] A snapshot file (element-major f32 η, u, v plus the mesh and bed) so runs can be replayed without re-running, and other scenarios (Frøya coastline mesh, nested runs) selectable from the command line.
 - [ ] 3D fields (Stage B): vertical sections and a surface layer from `Solution3D`.
 
@@ -396,6 +408,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - Choose the coarse step to minimise work. It is anchored at 2^L·Δt_min, so an element with Δt_k just under 2·Δt_min runs at Δt_min, wasting up to 2× (≈ 1.4× on average) on the bulk. A histogram of log₂(Δt_k/Δt_min) gives the cost of each anchor in O(bins).
   - The three-hop dependency (stage s reads neighbours' stage values s hops out) leaves 2.6× of the ideal 4.6× on the farm mesh, and almost nothing where levels interleave (Frøya). Levels could be made coherent (raise an element to the finest level around it when that costs less than its buffers); a mesh grading ≤ 1.2 per element also helps.
   - [x] Pass overhead (2026-09-27): the passes now run over element lists, with work proportional to the list. Elements are ordered by rate once per coarse step, so each active set is a prefix. The subset RHS runs only the faces of its elements (distinct edges by a per-edge stamp, not a sort), serially below 64 elements. `LocalTimeStepping::stage_where`/`finish_where` take the lists. Frøya coastline mesh (12k quads, 2^8 levels): 254 → 162–177 ms per coarse step; farm mesh unchanged (26.7 against 26.9–28.2 s for 15 min). What is left is the RHS work itself (≈ 0.4 µs per element evaluation with post-processing).
+  - [ ] Oversubscription (measured 2026-09-28): with other processes taking ≈ 40 % of the CPU, 72 model seconds of the farm under LTS took 358 s at the default 24 threads against 3.9 s at `RAYON_NUM_THREADS=4` (90×). LTS runs many small fork/joins per coarse step, and a preempted worker stalls each one. Raise the serial cut-off of the subset passes (64 elements) by work rather than count, cap the pool for small meshes, or document running with a thread count below the free cores.
   - Element-local limiting only: the Kuzmin limiters (vertex bounds from neighbour means) panic under LTS. (BR1 horizontal viscosity runs under LTS since 2026-09-28, with a wider stencil.)
   - The interface coupling error is ≈ 50× SSP-RK3's time error at the same CFL for a gravity wave crossing four levels (1.5e-3 relative at CFL 0.8). It scales as (λΔt)², so tides are unaffected, but check eddies shed by cages as they leave the farm level.
   - Validate on Frøya: `froya_real_data lts=6` reproduces the global run at Mausund (M2 to 1e-4) over 6 h; repeat over the 15-day harmonic run.

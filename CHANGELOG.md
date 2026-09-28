@@ -6,6 +6,19 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Lagrangian particle tracking in 2D (`dg_rs::particles`, TODO F.2).** `ParticleTracker2D` moves particles (lice larvae, feed, drifters) with the depth-averaged flow.
+  - The velocity is the DG polynomial at the particle, not the nearest node (`ParticleVelocity2D`). `SWEVelocity2D` gives (hu, hv)/h of one solution, or linear in time between two snapshots: output files, or online, the previous and current state a `Simulation` callback hands over. `NodalVelocity2D` takes any nodal field.
+  - Each step is classical RK4, plus a random walk √(2KΔt)ξ with constant horizontal diffusivity K (`with_diffusivity`). Each particle draws from its own SplitMix64 stream (tracker seed, particle id), so runs are reproducible whatever the thread count or particle order. Particles are stepped in parallel with `parallel`.
+  - Every move walks the straight segment face by face from the particle's element (`particles::walk`), so tracking costs O(faces crossed) and never searches the whole mesh after release.
+  - Walls reflect specularly (`with_reflecting` picks the tags). Other boundary faces let the particle out at the crossing (`ParticleStatus::Exited`), and periodic faces carry it across. With `with_stranding_depth`, particles in shallower water strand and float again when it deepens.
+  - `local_time_stepping_farm particles=N` releases N particles in each cage and tracks them online (`particle_seconds`, `kh`). Over 1 h with 1000 particles, tracking takes 0.08 s against 198 s for the solver.
+  - Gates (`tests/particle_tracking_test.rs`):
+    - Solid-body rotation on distorted quads returns after one revolution to 7e-7 (rate 4.00).
+    - Particles never cross a wall, even with a random walk of several elements per step.
+    - A uniform distribution stays uniform in a closed basin (Visser's well-mixed condition), and the spread in open water is 2Kt to 5 %.
+    - Particles leave open boundaries at the crossing point, wrap across periodic faces, and strand and refloat.
+    - Tracking online in a running `Simulation` converges at second order in the snapshot interval.
+
 - **3D viewer `viz/` (dg-viz, Bevy 0.20; TODO F.3).** A separate crate with its own workspace, so dg-rs builds and tests do not compile Bevy. It depends on dg-rs without NetCDF, so no native HDF5 is needed.
   - It runs the fjord farm of `examples/local_time_stepping_farm.rs` (with the tide ramped up over an hour by default, `--ramp`: switched on at once, the start-up surge leaves a drag wake that outlasts the tidal current at the farm, TODO F.1) on a solver thread and plays the snapshots back while the run goes on: the water surface over the bed, coloured by current speed or η, current arrows, and the net cages riding the surface.
   - Each element is drawn as p² quads of its own GLL nodes, lit by the polynomial's exact gradient. Arrows are sampled with `Probe2D`'s weights.

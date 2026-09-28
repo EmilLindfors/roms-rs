@@ -19,10 +19,16 @@
 //! reports the wall time, the RHS work and the difference between the two
 //! solutions: η and speed at the farm and over the domain.
 //!
+//! With `particles=N`, each run also releases N particles in each cage at
+//! t = 0 and tracks them online (TODO F.2): between the solver's snapshots
+//! every `particle_seconds` (default 60), linear in time, with a horizontal
+//! random walk of diffusivity `kh` (m²/s, default 0.1). It reports where the
+//! clouds went, how far they spread, and what the tracking cost.
+//!
 //! ```bash
 //! cargo run --release --no-default-features --features parallel,simd \
 //!     --example local_time_stepping_farm -- [hours=1] [order=2] [levels=8] [ramp=3600] \
-//!     [nu=0] [run=both]
+//!     [nu=0] [run=both] [particles=0] [particle_seconds=60] [kh=0.1]
 //! ```
 
 use std::collections::HashMap;
@@ -35,11 +41,12 @@ use dg_rs::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D,
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::{Bathymetry2D, read_gmsh_mesh};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
+use dg_rs::particles::{Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocity2D};
 use dg_rs::physics::PhysicsBuilder;
 use dg_rs::simulation::{Simulation, SimulationResult};
 use dg_rs::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
 use dg_rs::source::{
-    CageDrag2D, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, NetCage,
+    CageDrag2D, CageFootprint, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, NetCage,
 };
 use dg_rs::time::{MultirateSSPRK3, SSPRK3};
 use dg_rs::types::ElementIndex;
@@ -64,6 +71,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ramp: f64 = get("ramp", 3600.0)?;
     let nu: f64 = get("nu", 0.0)?;
     let run_which = args.get("run").map_or("both", String::as_str);
+    let particles_per_cage = get("particles", 0.0)? as usize;
+    let particle_seconds: f64 = get("particle_seconds", 60.0)?;
+    let kh: f64 = get("kh", 0.1)?;
 
     let mesh = Arc::new(read_gmsh_mesh(Path::new("tests/data/gmsh/fjord_farm.msh"))?);
     let ops = Arc::new(DGOperators2D::new(order));
@@ -124,17 +134,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t_end = hours * 3600.0;
 
     let run = |label: &str, q: &mut SWESolution2D, local: bool| -> SimulationResult {
+        let mut tracking = (particles_per_cage > 0)
+            .then(|| FarmParticles::release(&mesh, &ops, &cages, particles_per_cage, kh));
+        let mut callback = |q: &SWESolution2D, t: f64| {
+            if let Some(tracking) = tracking.as_mut() {
+                tracking.advance(q, t);
+            }
+        };
+        let interval = (particles_per_cage > 0).then_some(particle_seconds);
         let start = Instant::now();
         let result = if local {
-            Simulation::new(physics(), MultirateSSPRK3::new(levels))
-                .with_cfl(1.0)
-                .run(q, 0.0, t_end)
+            let sim = Simulation::new(physics(), MultirateSSPRK3::new(levels)).with_cfl(1.0);
+            match interval {
+                Some(i) => sim.with_callback_interval(i),
+                None => sim,
+            }
+            .run_with_callback(q, 0.0, t_end, &mut callback)
         } else {
-            Simulation::new(physics(), SSPRK3)
-                .with_cfl(1.0)
-                .run(q, 0.0, t_end)
+            let sim = Simulation::new(physics(), SSPRK3).with_cfl(1.0);
+            match interval {
+                Some(i) => sim.with_callback_interval(i),
+                None => sim,
+            }
+            .run_with_callback(q, 0.0, t_end, &mut callback)
         };
         let wall = start.elapsed().as_secs_f64();
+        if let Some(tracking) = &tracking {
+            tracking.report(label, &cages);
+        }
         println!(
             "{label:>9}: {:6} steps, dt {:.3}–{:.3} s, {wall:6.1} s wall{}",
             result.n_steps,
@@ -201,4 +228,125 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         all.0, all.1, all.2
     );
     Ok(())
+}
+
+/// Particles released in the cages and tracked online (TODO F.2).
+struct FarmParticles<'a> {
+    tracker: ParticleTracker2D<'a>,
+    particles: Vec<Particle2D>,
+    /// Release point of each particle and the cage it came from
+    origins: Vec<([f64; 2], usize)>,
+    /// The solver's previous snapshot
+    previous: Option<(f64, SWESolution2D)>,
+    seconds: f64,
+    steps: usize,
+}
+
+impl<'a> FarmParticles<'a> {
+    /// `n` particles in each cage footprint (a sunflower pattern), with a
+    /// random walk of diffusivity `kh`; they strand in water under 5 cm.
+    fn release(
+        mesh: &'a dg_rs::mesh::Mesh2D,
+        ops: &'a DGOperators2D,
+        cages: &[NetCage],
+        n: usize,
+        kh: f64,
+    ) -> Self {
+        let tracker = ParticleTracker2D::new(mesh, ops)
+            .with_diffusivity(kh)
+            .with_stranding_depth(0.05);
+        let golden_angle = PI * (3.0 - 5.0_f64.sqrt());
+        let mut particles = Vec::new();
+        let mut origins = Vec::new();
+        for (c, cage) in cages.iter().enumerate() {
+            let CageFootprint::Circle { center, radius } = cage.footprint else {
+                panic!("the farm's cages are circles");
+            };
+            for i in 0..n {
+                let r = radius * ((i as f64 + 0.5) / n as f64).sqrt();
+                let angle = i as f64 * golden_angle;
+                let p = [center[0] + r * angle.cos(), center[1] + r * angle.sin()];
+                let particle = tracker
+                    .release(particles.len() as u64, p)
+                    .expect("cages are in the water");
+                particles.push(particle);
+                origins.push((p, c));
+            }
+        }
+        Self {
+            tracker,
+            particles,
+            origins,
+            previous: None,
+            seconds: 0.0,
+            steps: 0,
+        }
+    }
+
+    /// Move the particles from the previous snapshot to `q` at `t`, in
+    /// steps of at most 10 s.
+    fn advance(&mut self, q: &SWESolution2D, t: f64) {
+        let start = Instant::now();
+        if let Some((t0, q0)) = &self.previous {
+            let field = SWEVelocity2D::between(*t0, q0, t, q, WetDryConfig::DEFAULT_H_DRY);
+            let n = ((t - t0) / 10.0).ceil().max(1.0) as usize;
+            let dt = (t - t0) / n as f64;
+            for s in 0..n {
+                self.tracker
+                    .step(&mut self.particles, &field, t0 + s as f64 * dt, dt);
+            }
+            self.steps += n;
+        }
+        match &mut self.previous {
+            Some((tp, qp)) => {
+                *tp = t;
+                qp.clone_from(q);
+            }
+            None => self.previous = Some((t, q.clone())),
+        }
+        self.seconds += start.elapsed().as_secs_f64();
+    }
+
+    /// Per cage: particles still in the domain, stranded and out through
+    /// the open boundary; mean drift and RMS spread about the mean.
+    fn report(&self, label: &str, cages: &[NetCage]) {
+        println!(
+            "{label:>9}: {} particles, {} tracking steps, {:.2} s tracking",
+            self.particles.len(),
+            self.steps,
+            self.seconds
+        );
+        for c in 0..cages.len() {
+            let cloud: Vec<(&Particle2D, [f64; 2])> = self
+                .particles
+                .iter()
+                .zip(&self.origins)
+                .filter(|(_, (_, cage))| *cage == c)
+                .map(|(p, (origin, _))| (p, *origin))
+                .collect();
+            let count =
+                |status: ParticleStatus| cloud.iter().filter(|(p, _)| p.status() == status).count();
+            let exited = cloud.iter().filter(|(p, _)| !p.in_domain()).count();
+            let inside: Vec<[f64; 2]> = cloud
+                .iter()
+                .filter(|(p, _)| p.in_domain())
+                .map(|(p, o)| [p.position()[0] - o[0], p.position()[1] - o[1]])
+                .collect();
+            let n = inside.len().max(1) as f64;
+            let mean = [0, 1].map(|d| inside.iter().map(|x| x[d]).sum::<f64>() / n);
+            let spread = (inside
+                .iter()
+                .map(|x| (x[0] - mean[0]).powi(2) + (x[1] - mean[1]).powi(2))
+                .sum::<f64>()
+                / n)
+                .sqrt();
+            println!(
+                "           cage {c}: {} active, {} stranded, {exited} out; drift ({:+.0}, {:+.0}) m, spread {spread:.0} m",
+                count(ParticleStatus::Active),
+                count(ParticleStatus::Stranded),
+                mean[0],
+                mean[1]
+            );
+        }
+    }
 }
