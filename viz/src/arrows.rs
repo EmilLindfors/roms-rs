@@ -31,13 +31,27 @@ struct Grid {
 
 impl Grid {
     /// Arrows every `spacing` metres over [lo, hi], where the mesh is.
-    fn new(locator: &PointLocator2D, scenario: &Scenario, lo: [f64; 2], hi: [f64; 2], spacing: f64) -> Self {
-        let (nx, ny) = (((hi[0] - lo[0]) / spacing) as usize, ((hi[1] - lo[1]) / spacing) as usize);
+    fn new(
+        locator: &PointLocator2D,
+        scenario: &Scenario,
+        lo: [f64; 2],
+        hi: [f64; 2],
+        spacing: f64,
+    ) -> Self {
+        let (nx, ny) = (
+            ((hi[0] - lo[0]) / spacing) as usize,
+            ((hi[1] - lo[1]) / spacing) as usize,
+        );
         let arrows = (0..=ny)
-            .flat_map(|j| (0..=nx).map(move |i| [lo[0] + i as f64 * spacing, lo[1] + j as f64 * spacing]))
+            .flat_map(|j| {
+                (0..=nx).map(move |i| [lo[0] + i as f64 * spacing, lo[1] + j as f64 * spacing])
+            })
             .filter_map(|at| Probe::at(locator, scenario, at).map(|probe| Arrow { at, probe }))
             .collect();
-        Self { spacing: spacing as f32, arrows }
+        Self {
+            spacing: spacing as f32,
+            arrows,
+        }
     }
 }
 
@@ -54,13 +68,31 @@ pub struct Arrows {
 impl Arrows {
     /// A coarse grid of about `across` arrows over the mesh's longer side, and a fine
     /// one every `fine_spacing` metres within `fine_radius` of the farm.
-    pub fn new(locator: &PointLocator2D, scenario: &Scenario, across: usize, fine_spacing: f64, fine_radius: f64) -> Self {
-        let (lo, hi) = scenario.mesh.vertices.iter().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(lo, hi), v| {
-            ([lo[0].min(v[0]), lo[1].min(v[1])], [hi[0].max(v[0]), hi[1].max(v[1])])
-        });
+    pub fn new(
+        locator: &PointLocator2D,
+        scenario: &Scenario,
+        across: usize,
+        fine_spacing: f64,
+        fine_radius: f64,
+    ) -> Self {
+        let (lo, hi) = scenario.mesh.vertices.iter().fold(
+            ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+            |(lo, hi), v| {
+                (
+                    [lo[0].min(v[0]), lo[1].min(v[1])],
+                    [hi[0].max(v[0]), hi[1].max(v[1])],
+                )
+            },
+        );
         let coarse_spacing = (hi[0] - lo[0]).max(hi[1] - lo[1]) / across as f64;
         let half = coarse_spacing / 2.0;
-        let coarse = Grid::new(locator, scenario, [lo[0] + half, lo[1] + half], hi, coarse_spacing);
+        let coarse = Grid::new(
+            locator,
+            scenario,
+            [lo[0] + half, lo[1] + half],
+            hi,
+            coarse_spacing,
+        );
         let [fx, fy] = scenario.farm;
         let fine = Grid::new(
             locator,
@@ -69,7 +101,13 @@ impl Arrows {
             [fx + fine_radius, fy + fine_radius],
             fine_spacing,
         );
-        Self { coarse, fine, near: (4.0 * fine_radius) as f32, on: true, lut: Lut::new(VIRIDIS) }
+        Self {
+            coarse,
+            fine,
+            near: (4.0 * fine_radius) as f32,
+            on: true,
+            lut: Lut::new(VIRIDIS),
+        }
     }
 
     pub fn count(&self) -> (usize, usize) {

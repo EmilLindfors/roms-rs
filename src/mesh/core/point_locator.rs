@@ -81,7 +81,8 @@ pub fn inverse_bilinear(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> Option<[f64; 2
         let ds = (-yr * fx + xr * fy) / det;
         r -= dr;
         s -= ds;
-        if dr.abs().max(ds.abs()) < 1e-14 * (1.0 + r.abs().max(s.abs())) + noise / det.abs().sqrt() {
+        if dr.abs().max(ds.abs()) < 1e-14 * (1.0 + r.abs().max(s.abs())) + noise / det.abs().sqrt()
+        {
             return Some([r, s]);
         }
         if r.abs().max(s.abs()) > 1e6 {
@@ -366,11 +367,15 @@ mod tests {
             [5960.487946721068, 2992.0441019699315],
         ];
         let [r, s] = inverse_bilinear(&farm, [5960.0, 3000.0]).expect("converges");
-        assert!((r + 0.2024).abs() < 1e-3 && (s - 0.7417).abs() < 1e-3, "{r} {s}");
+        assert!(
+            (r + 0.2024).abs() < 1e-3 && (s - 0.7417).abs() < 1e-3,
+            "{r} {s}"
+        );
 
         // A skewed 20 m quad at UTM northings: every point of a grid over it.
         let (x0, y0) = (512_345.678, 7_045_678.901);
-        let utm = [[0.0, 0.0], [21.0, 1.5], [19.5, 18.0], [-1.0, 20.5]].map(|[x, y]| [x0 + x, y0 + y]);
+        let utm =
+            [[0.0, 0.0], [21.0, 1.5], [19.5, 18.0], [-1.0, 20.5]].map(|[x, y]| [x0 + x, y0 + y]);
         for i in 0..=20 {
             for j in 0..=20 {
                 let (r, s) = (-1.0 + 0.1 * i as f64, -1.0 + 0.1 * j as f64);
@@ -382,7 +387,10 @@ mod tests {
                 ];
                 let p = [0, 1].map(|d| (0..4).map(|v| n[v] * utm[v][d]).sum::<f64>());
                 let [rr, ss] = inverse_bilinear(&utm, p).expect("converges");
-                assert!((rr - r).abs() < 1e-8 && (ss - s).abs() < 1e-8, "({r}, {s}) → ({rr}, {ss})");
+                assert!(
+                    (rr - r).abs() < 1e-8 && (ss - s).abs() < 1e-8,
+                    "({r}, {s}) → ({rr}, {ss})"
+                );
             }
         }
     }

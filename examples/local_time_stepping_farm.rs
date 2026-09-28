@@ -75,7 +75,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let wall = Reflective2D::new();
     let tide = HarmonicTide::m2(0.8, 0.0);
-    let sea = CharacteristicOBC::new(if ramp > 0.0 { tide.with_ramp_up(ramp) } else { tide });
+    let sea = CharacteristicOBC::new(if ramp > 0.0 {
+        tide.with_ramp_up(ramp)
+    } else {
+        tide
+    });
     let cages = [
         NetCage::circular([FARM[0] - 40.0, FARM[1]], 25.0, 20.0, 0.25),
         NetCage::circular([FARM[0] + 40.0, FARM[1]], 25.0, 20.0, 0.25),

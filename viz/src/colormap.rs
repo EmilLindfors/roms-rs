@@ -64,7 +64,8 @@ pub fn srgb_at(stops: &[[u8; 3]], x: f32) -> Srgba {
     let f = x.clamp(0.0, 1.0) * (stops.len() - 1) as f32;
     let i = (f as usize).min(stops.len() - 2);
     let w = f - i as f32;
-    let [a, b] = [stops[i], stops[i + 1]].map(|c| Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32) / 255.0);
+    let [a, b] =
+        [stops[i], stops[i + 1]].map(|c| Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32) / 255.0);
     let c = a.lerp(b, w);
     Srgba::new(c.x, c.y, c.z, 1.0)
 }

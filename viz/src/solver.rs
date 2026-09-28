@@ -40,7 +40,13 @@ impl Snapshot {
         let velocity = |m: &[f64]| {
             h.iter()
                 .zip(m)
-                .map(|(&h, &m)| if h > H_DRY as f64 { (m / h) as f32 } else { 0.0 })
+                .map(|(&h, &m)| {
+                    if h > H_DRY as f64 {
+                        (m / h) as f32
+                    } else {
+                        0.0
+                    }
+                })
                 .collect()
         };
         Self {
@@ -100,7 +106,11 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
             pool.install(|| {
                 let wall = Reflective2D::new();
                 let tide = HarmonicTide::m2(forcing.m2_amplitude, 0.0);
-                let tide = if forcing.ramp > 0.0 { tide.with_ramp_up(forcing.ramp) } else { tide };
+                let tide = if forcing.ramp > 0.0 {
+                    tide.with_ramp_up(forcing.ramp)
+                } else {
+                    tide
+                };
                 let sea = CharacteristicOBC::new(tide);
                 let physics = PhysicsBuilder::swe_2d(
                     mesh.clone(),
@@ -113,14 +123,22 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
                 .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
                 .with_wet_dry(WetDryConfig::default())
                 .with_implicit_friction(ManningFriction2D::new(G, forcing.manning))
-                .with_cage_drag(CageDrag2D::new(&mesh, &ops, if config.drag { &cages } else { &[] }))
+                .with_cage_drag(CageDrag2D::new(
+                    &mesh,
+                    &ops,
+                    if config.drag { &cages } else { &[] },
+                ))
                 .with_source(CoriolisSource2D::f_plane(forcing.coriolis))
                 .build();
 
                 let started = Instant::now();
                 // A send fails only once the viewer has closed; the run then ends with the process.
                 let mut send = |q: &SWESolution2D, t: f64| {
-                    let _ = tx.send(SolverMessage::Snapshot(Snapshot::of(q, &bathymetry.data, t)));
+                    let _ = tx.send(SolverMessage::Snapshot(Snapshot::of(
+                        q,
+                        &bathymetry.data,
+                        t,
+                    )));
                 };
                 send(&q, 0.0);
                 let result = if config.levels > 0 {

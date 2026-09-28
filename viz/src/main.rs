@@ -82,12 +82,16 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut args = Self {
-            mesh: PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/data/gmsh/fjord_farm.msh")),
+            mesh: PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../tests/data/gmsh/fjord_farm.msh"
+            )),
             order: 2,
             levels: 8,
             hours: 25.0,
             interval: 60.0,
-            threads: std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1)),
+            threads: std::thread::available_parallelism()
+                .map_or(1, |n| n.get().saturating_sub(2).max(1)),
             memory_mb: 2048,
             rate: 60.0,
             vz: 3.0,
@@ -113,15 +117,21 @@ impl Args {
                 "--vz" => args.vz = num(&flag, &value)?,
                 "--speed-max" => args.speed_max = Some(num(&flag, &value)?),
                 "--ramp" => args.ramp = Some(num(&flag, &value)?),
-                "--drag" => args.drag = match value.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    _ => return Err(format!("--drag takes on or off, not {value}")),
-                },
+                "--drag" => {
+                    args.drag = match value.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("--drag takes on or off, not {value}")),
+                    }
+                }
                 "--view" => args.view = value,
                 "--screenshot" => args.screenshot = Some(value),
                 "--at" => args.at = Some(num(&flag, &value)?),
-                _ => return Err(format!("unknown option {flag} (see the docs at the top of viz/src/main.rs)")),
+                _ => {
+                    return Err(format!(
+                        "unknown option {flag} (see the docs at the top of viz/src/main.rs)"
+                    ));
+                }
             }
         }
         Ok(args)
@@ -129,7 +139,9 @@ impl Args {
 }
 
 fn num<T: std::str::FromStr>(flag: &str, value: &str) -> Result<T, String> {
-    value.parse().map_err(|_| format!("bad value for {flag}: {value}"))
+    value
+        .parse()
+        .map_err(|_| format!("bad value for {flag}: {value}"))
 }
 
 /// `--screenshot`: the frame to save, and how many frames since the shown time reached it.
@@ -151,7 +163,10 @@ fn main() -> AppExit {
     let mut scenario = match Scenario::fjord_farm(&args.mesh, args.order) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("cannot build the scenario from {}: {e}", args.mesh.display());
+            eprintln!(
+                "cannot build the scenario from {}: {e}",
+                args.mesh.display()
+            );
             return AppExit::from_code(1);
         }
     };
@@ -159,10 +174,19 @@ fn main() -> AppExit {
         scenario.forcing.ramp = ramp;
     }
 
-    let (lo, hi) = scenario.mesh.vertices.iter().fold(([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]), |(lo, hi), v| {
-        ([lo[0].min(v[0]), lo[1].min(v[1])], [hi[0].max(v[0]), hi[1].max(v[1])])
-    });
-    let frame = Frame { origin: [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])], vz: args.vz };
+    let (lo, hi) = scenario.mesh.vertices.iter().fold(
+        ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+        |(lo, hi), v| {
+            (
+                [lo[0].min(v[0]), lo[1].min(v[1])],
+                [hi[0].max(v[0]), hi[1].max(v[1])],
+            )
+        },
+    );
+    let frame = Frame {
+        origin: [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])],
+        vz: args.vz,
+    };
     let nodes = Nodes::new(&scenario, &frame);
     let locator = PointLocator2D::new(&scenario.mesh);
     let cages = CageLayout(
@@ -189,15 +213,35 @@ fn main() -> AppExit {
 
     let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]) as f32;
     let views = Views {
-        farm: OrbitCamera { focus: frame.world(scenario.farm, 0.0), yaw: 0.7, pitch: 0.5, distance: 420.0 },
-        domain: OrbitCamera { focus: Vec3::ZERO, yaw: 0.35, pitch: 0.7, distance: 0.85 * extent },
+        farm: OrbitCamera {
+            focus: frame.world(scenario.farm, 0.0),
+            yaw: 0.7,
+            pitch: 0.5,
+            distance: 420.0,
+        },
+        domain: OrbitCamera {
+            focus: Vec3::ZERO,
+            yaw: 0.35,
+            pitch: 0.7,
+            distance: 0.85 * extent,
+        },
     };
-    let start = if args.view == "domain" { views.domain } else { views.farm };
+    let start = if args.view == "domain" {
+        views.domain
+    } else {
+        views.farm
+    };
 
     let t_end = args.hours * 3600.0;
     let channel = solver::spawn(
         &scenario,
-        SolverConfig { t_end, interval: args.interval, levels: args.levels, threads: args.threads, drag: args.drag },
+        SolverConfig {
+            t_end,
+            interval: args.interval,
+            levels: args.levels,
+            threads: args.threads,
+            drag: args.drag,
+        },
     );
 
     App::new()
@@ -210,7 +254,11 @@ fn main() -> AppExit {
             ..default()
         }))
         .insert_resource(ClearColor(Color::srgb(0.05, 0.065, 0.08)))
-        .insert_resource(GlobalAmbientLight { color: Color::srgb(0.75, 0.85, 1.0), brightness: 350.0, ..default() })
+        .insert_resource(GlobalAmbientLight {
+            color: Color::srgb(0.75, 0.85, 1.0),
+            brightness: 350.0,
+            ..default()
+        })
         .insert_resource(frame)
         .insert_resource(nodes)
         .insert_resource(cages)
@@ -219,20 +267,43 @@ fn main() -> AppExit {
         .insert_resource(Field::default())
         .insert_resource(Colouring::new(args.speed_max))
         .insert_resource(Title(scenario.name.clone()))
-        .insert_resource(Playback::new(args.rate, args.interval, args.memory_mb << 20))
+        .insert_resource(Playback::new(
+            args.rate,
+            args.interval,
+            args.memory_mb << 20,
+        ))
         .insert_resource(SolverChannel(Mutex::new(channel)))
-        .insert_resource(Capture { path: args.screenshot, at: args.at.unwrap_or(t_end), frames: None })
-        .add_plugins((PlaybackPlugin, SurfacePlugin, CagesPlugin, ArrowsPlugin, CameraPlugin, HudPlugin))
+        .insert_resource(Capture {
+            path: args.screenshot,
+            at: args.at.unwrap_or(t_end),
+            frames: None,
+        })
+        .add_plugins((
+            PlaybackPlugin,
+            SurfacePlugin,
+            CagesPlugin,
+            ArrowsPlugin,
+            CameraPlugin,
+            HudPlugin,
+        ))
         .add_systems(Startup, move |mut commands: Commands| {
             commands.spawn((
                 Camera3d::default(),
-                Projection::Perspective(PerspectiveProjection { near: 1.0, far: 400_000.0, ..default() }),
+                Projection::Perspective(PerspectiveProjection {
+                    near: 1.0,
+                    far: 400_000.0,
+                    ..default()
+                }),
                 start.transform(),
                 start,
             ));
             // Sun from the south-west, 35° up.
             commands.spawn((
-                DirectionalLight { illuminance: 9_000.0, shadow_maps_enabled: false, ..default() },
+                DirectionalLight {
+                    illuminance: 9_000.0,
+                    shadow_maps_enabled: false,
+                    ..default()
+                },
                 Transform::from_xyz(-1.0, 1.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
             ));
         })
@@ -249,10 +320,13 @@ fn capture(
     field: Res<Field>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let Some(path) = capture.path.clone() else { return };
+    let Some(path) = capture.path.clone() else {
+        return;
+    };
     match capture.frames.as_mut() {
         None => {
-            let ended = !matches!(playback.solver, SolverState::Running) && playback.newest().is_some_and(|t| playback.t >= t);
+            let ended = !matches!(playback.solver, SolverState::Running)
+                && playback.newest().is_some_and(|t| playback.t >= t);
             if field.t.is_some_and(|t| t >= capture.at) || (field.t.is_some() && ended) {
                 playback.paused = true;
                 capture.frames = Some(0);
@@ -262,7 +336,9 @@ fn capture(
             *n += 1;
             // A few frames for the meshes to reach the GPU, then some for the file to be written.
             if *n == 10 {
-                commands.spawn(Screenshot::primary_window()).observe(save_to_disk(path));
+                commands
+                    .spawn(Screenshot::primary_window())
+                    .observe(save_to_disk(path));
             } else if *n == 40 {
                 exit.write(AppExit::Success);
             }

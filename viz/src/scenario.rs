@@ -50,7 +50,8 @@ impl Scenario {
     pub fn fjord_farm(mesh_path: &Path, order: usize) -> Result<Self, Box<dyn Error>> {
         const LX: f64 = 12_000.0;
         const FARM: [f64; 2] = [6_000.0, 3_000.0];
-        let bed = |x: f64, y: f64| -(30.0 + 120.0 * (1.0 - x / LX)) - 10.0 * (PI * y / 6_000.0).sin();
+        let bed =
+            |x: f64, y: f64| -(30.0 + 120.0 * (1.0 - x / LX)) - 10.0 * (PI * y / 6_000.0).sin();
 
         let mesh = Arc::new(read_gmsh_mesh(mesh_path)?);
         let ops = Arc::new(DGOperators2D::new(order));

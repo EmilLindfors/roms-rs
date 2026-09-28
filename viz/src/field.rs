@@ -30,7 +30,11 @@ pub struct Frame {
 impl Frame {
     /// World position of the mesh point (x, y) at height z (m).
     pub fn world(&self, [x, y]: [f64; 2], z: f32) -> Vec3 {
-        Vec3::new((x - self.origin[0]) as f32, z * self.vz, -(y - self.origin[1]) as f32)
+        Vec3::new(
+            (x - self.origin[0]) as f32,
+            z * self.vz,
+            -(y - self.origin[1]) as f32,
+        )
     }
 }
 
@@ -73,7 +77,11 @@ impl Nodes {
         }
         let f32s = |v: &[f64]| v.iter().map(|&x| x as f32).collect::<Vec<f32>>();
         let boundary = ElementIndex::iter(mesh.n_elements)
-            .flat_map(|k| (0..4).filter(move |&f| mesh.is_boundary_face(k, f)).map(move |f| (k.as_usize(), f)))
+            .flat_map(|k| {
+                (0..4)
+                    .filter(move |&f| mesh.is_boundary_face(k, f))
+                    .map(move |f| (k.as_usize(), f))
+            })
             .collect();
         Self {
             n_elements: mesh.n_elements,
@@ -134,7 +142,9 @@ pub fn interpolate(playback: Res<Playback>, mut field: ResMut<Field>) {
     if !playback.changed {
         return;
     }
-    let Some((a, b, w)) = playback.bracket() else { return };
+    let Some((a, b, w)) = playback.bracket() else {
+        return;
+    };
     let lerp = |out: &mut Vec<f32>, x: &[f32], y: &[f32]| {
         out.clear();
         out.extend(x.iter().zip(y).map(|(x, y)| x + w * (y - x)));

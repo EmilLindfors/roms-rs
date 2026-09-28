@@ -17,8 +17,13 @@ pub struct OrbitCamera {
 
 impl OrbitCamera {
     pub fn transform(&self) -> Transform {
-        let dir = Vec3::new(self.pitch.cos() * self.yaw.sin(), self.pitch.sin(), self.pitch.cos() * self.yaw.cos());
-        Transform::from_translation(self.focus + self.distance * dir).looking_at(self.focus, Vec3::Y)
+        let dir = Vec3::new(
+            self.pitch.cos() * self.yaw.sin(),
+            self.pitch.sin(),
+            self.pitch.cos() * self.yaw.cos(),
+        );
+        Transform::from_translation(self.focus + self.distance * dir)
+            .looking_at(self.focus, Vec3::Y)
     }
 }
 
@@ -45,7 +50,9 @@ fn input(
     views: Res<Views>,
     mut cameras: Query<&mut OrbitCamera>,
 ) {
-    let Ok(mut orbit) = cameras.single_mut() else { return };
+    let Ok(mut orbit) = cameras.single_mut() else {
+        return;
+    };
     if keys.just_pressed(KeyCode::KeyF) {
         *orbit = views.farm;
     }
@@ -53,7 +60,9 @@ fn input(
         *orbit = views.domain;
     }
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
-    let pan = mouse.pressed(MouseButton::Right) || mouse.pressed(MouseButton::Middle) || (shift && mouse.pressed(MouseButton::Left));
+    let pan = mouse.pressed(MouseButton::Right)
+        || mouse.pressed(MouseButton::Middle)
+        || (shift && mouse.pressed(MouseButton::Left));
     let d = motion.delta;
     if pan && d != Vec2::ZERO {
         // Along the ground: the view's right and its forward flattened.

@@ -39,7 +39,8 @@ pub struct CagesPlugin;
 
 impl Plugin for CagesPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn).add_systems(Update, ride.after(crate::field::interpolate));
+        app.add_systems(Startup, spawn)
+            .add_systems(Update, ride.after(crate::field::interpolate));
     }
 }
 
@@ -70,13 +71,20 @@ fn spawn(
         let (centre, outline) = match &cage.footprint {
             CageFootprint::Circle { center, radius } => {
                 let r = *radius as f32;
-                let outline = (0..=64).map(|i| Vec2::from_angle(TAU * i as f32 / 64.0) * r).collect::<Vec<_>>();
+                let outline = (0..=64)
+                    .map(|i| Vec2::from_angle(TAU * i as f32 / 64.0) * r)
+                    .collect::<Vec<_>>();
                 (*center, outline)
             }
             CageFootprint::Polygon(vertices) => {
                 let n = vertices.len() as f64;
-                let c = vertices.iter().fold([0.0; 2], |a, v| [a[0] + v[0] / n, a[1] + v[1] / n]);
-                let mut outline: Vec<Vec2> = vertices.iter().map(|v| Vec2::new((v[0] - c[0]) as f32, -(v[1] - c[1]) as f32)).collect();
+                let c = vertices
+                    .iter()
+                    .fold([0.0; 2], |a, v| [a[0] + v[0] / n, a[1] + v[1] / n]);
+                let mut outline: Vec<Vec2> = vertices
+                    .iter()
+                    .map(|v| Vec2::new((v[0] - c[0]) as f32, -(v[1] - c[1]) as f32))
+                    .collect();
                 outline.push(outline[0]);
                 (c, outline)
             }
@@ -87,11 +95,18 @@ fn spawn(
             Transform::from_translation(frame.world(centre, 0.0)),
             Visibility::default(),
         ));
-        entity.with_child((Mesh3d(meshes.add(net_mesh(&outline, depth))), MeshMaterial3d(net.clone())));
+        entity.with_child((
+            Mesh3d(meshes.add(net_mesh(&outline, depth))),
+            MeshMaterial3d(net.clone()),
+        ));
         if let CageFootprint::Circle { radius, .. } = cage.footprint {
             for r in [radius as f32, radius as f32 + PIPE_SPACING] {
                 let pipe = Torus::new(r - PIPE_RADIUS, r + PIPE_RADIUS);
-                entity.with_child((Mesh3d(meshes.add(pipe)), MeshMaterial3d(collar.clone()), Transform::from_xyz(0.0, 0.1, 0.0)));
+                entity.with_child((
+                    Mesh3d(meshes.add(pipe)),
+                    MeshMaterial3d(collar.clone()),
+                    Transform::from_xyz(0.0, 0.1, 0.0),
+                ));
             }
         }
     }
@@ -139,11 +154,14 @@ fn net_mesh(outline: &[Vec2], depth: f32) -> Mesh {
             indices.extend([centre, v - 1, v]);
         }
     }
-    Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
-        .with_inserted_indices(Indices::U32(indices))
-        .with_computed_normals()
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
+    .with_computed_normals()
 }
 
 /// One cell of netting: opaque twine along two edges over a faint veil, white (the
@@ -161,7 +179,11 @@ fn net_texture() -> Image {
     let mut size = SIZE;
     let mut levels = 0;
     loop {
-        data.extend(level.iter().flat_map(|&a| [255, 255, 255, (a * 255.0).round() as u8]));
+        data.extend(
+            level
+                .iter()
+                .flat_map(|&a| [255, 255, 255, (a * 255.0).round() as u8]),
+        );
         levels += 1;
         if size == 1 {
             break;
@@ -170,13 +192,20 @@ fn net_texture() -> Image {
         level = (0..half * half)
             .map(|p| {
                 let (x, y) = (2 * (p % half), 2 * (p / half));
-                0.25 * (level[y * size + x] + level[y * size + x + 1] + level[(y + 1) * size + x] + level[(y + 1) * size + x + 1])
+                0.25 * (level[y * size + x]
+                    + level[y * size + x + 1]
+                    + level[(y + 1) * size + x]
+                    + level[(y + 1) * size + x + 1])
             })
             .collect();
         size = half;
     }
     let mut image = Image::new_fill(
-        Extent3d { width: SIZE as u32, height: SIZE as u32, depth_or_array_layers: 1 },
+        Extent3d {
+            width: SIZE as u32,
+            height: SIZE as u32,
+            depth_or_array_layers: 1,
+        },
         TextureDimension::D2,
         &[255; 4],
         TextureFormat::Rgba8Unorm,

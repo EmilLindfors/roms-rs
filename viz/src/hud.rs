@@ -38,16 +38,23 @@ pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, spawn).add_systems(Update, (status, scale, help));
+        app.add_systems(Startup, spawn)
+            .add_systems(Update, (status, scale, help));
     }
 }
 
 fn shadow() -> TextShadow {
-    TextShadow { offset: Vec2::splat(1.5), color: Color::srgba(0.0, 0.0, 0.0, 0.85) }
+    TextShadow {
+        offset: Vec2::splat(1.5),
+        color: Color::srgba(0.0, 0.0, 0.0, 0.85),
+    }
 }
 
 fn font(size: f32) -> TextFont {
-    TextFont { font_size: FontSize::Px(size), ..default() }
+    TextFont {
+        font_size: FontSize::Px(size),
+        ..default()
+    }
 }
 
 fn spawn(mut commands: Commands) {
@@ -56,7 +63,12 @@ fn spawn(mut commands: Commands) {
         Text::new(""),
         font(15.0),
         shadow(),
-        Node { position_type: PositionType::Absolute, left: Val::Px(14.0), top: Val::Px(12.0), ..default() },
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(14.0),
+            top: Val::Px(12.0),
+            ..default()
+        },
     ));
     commands.spawn((
         Help,
@@ -64,8 +76,16 @@ fn spawn(mut commands: Commands) {
         font(13.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
         shadow(),
-        TextLayout { justify: Justify::Right, ..default() },
-        Node { position_type: PositionType::Absolute, right: Val::Px(14.0), bottom: Val::Px(12.0), ..default() },
+        TextLayout {
+            justify: Justify::Right,
+            ..default()
+        },
+        Node {
+            position_type: PositionType::Absolute,
+            right: Val::Px(14.0),
+            bottom: Val::Px(12.0),
+            ..default()
+        },
     ));
     commands
         .spawn(Node {
@@ -79,9 +99,20 @@ fn spawn(mut commands: Commands) {
         })
         .with_children(|scale| {
             scale.spawn((ScaleTitle, Text::new(""), font(13.0), shadow()));
-            scale.spawn((Bar, Node { width: Val::Percent(100.0), height: Val::Px(12.0), ..default() }, BackgroundGradient::default()));
+            scale.spawn((
+                Bar,
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(12.0),
+                    ..default()
+                },
+                BackgroundGradient::default(),
+            ));
             scale
-                .spawn(Node { justify_content: JustifyContent::SpaceBetween, ..default() })
+                .spawn(Node {
+                    justify_content: JustifyContent::SpaceBetween,
+                    ..default()
+                })
                 .with_children(|ticks| {
                     for i in 0..3 {
                         ticks.spawn((Tick(i), Text::new(""), font(12.0), shadow()));
@@ -96,8 +127,15 @@ fn clock(t: f64) -> String {
     format!("{} h {:02} min", minutes / 60, minutes % 60)
 }
 
-fn status(playback: Res<Playback>, title: Res<Title>, style: Res<SurfaceStyle>, mut text: Query<&mut Text, With<Status>>) {
-    let Ok(mut text) = text.single_mut() else { return };
+fn status(
+    playback: Res<Playback>,
+    title: Res<Title>,
+    style: Res<SurfaceStyle>,
+    mut text: Query<&mut Text, With<Status>>,
+) {
+    let Ok(mut text) = text.single_mut() else {
+        return;
+    };
     let mut s = format!("{}\n", title.0);
     match playback.newest() {
         None => s += "starting the solver...\n",
@@ -114,8 +152,15 @@ fn status(playback: Res<Playback>, title: Res<Title>, style: Res<SurfaceStyle>, 
     }
     let newest = playback.newest().unwrap_or(0.0);
     s += &match &playback.solver {
-        SolverState::Running => format!("solver at {}, {:.0}x real time\n", clock(newest), playback.solver_speed()),
-        SolverState::Finished { steps, wall } => format!("solver done: {} in {steps} steps, {wall:.0} s\n", clock(newest)),
+        SolverState::Running => format!(
+            "solver at {}, {:.0}x real time\n",
+            clock(newest),
+            playback.solver_speed()
+        ),
+        SolverState::Finished { steps, wall } => format!(
+            "solver done: {} in {steps} steps, {wall:.0} s\n",
+            clock(newest)
+        ),
         SolverState::Failed(e) => format!("solver failed: {e}\n"),
     };
     if let (Some(lo), Some(hi)) = (playback.oldest(), playback.newest()) {
@@ -149,12 +194,18 @@ fn scale(
     *shown = Some(key);
     let stops = colouring.stops();
     if let Ok(mut bar) = bar.single_mut() {
-        let colours = (0..=16).map(|i| ColorStop::from(Color::from(srgb_at(stops, i as f32 / 16.0)))).collect();
+        let colours = (0..=16)
+            .map(|i| ColorStop::from(Color::from(srgb_at(stops, i as f32 / 16.0))))
+            .collect();
         *bar = LinearGradient::to_right(colours).into();
     }
     let (heading, lo, hi) = match colouring.by {
         ColourBy::Speed => ("current speed (m/s)", 0.0, colouring.speed_max),
-        ColourBy::Elevation => ("surface elevation η (m)", -colouring.eta_max, colouring.eta_max),
+        ColourBy::Elevation => (
+            "surface elevation η (m)",
+            -colouring.eta_max,
+            colouring.eta_max,
+        ),
     };
     if let Ok(mut title) = title.single_mut() {
         title.0 = heading.into();
@@ -168,7 +219,11 @@ fn scale(
 fn help(keys: Res<ButtonInput<KeyCode>>, mut help: Query<&mut Visibility, With<Help>>) {
     if keys.just_pressed(KeyCode::KeyH) {
         for mut visibility in &mut help {
-            *visibility = if *visibility == Visibility::Hidden { Visibility::Inherited } else { Visibility::Hidden };
+            *visibility = if *visibility == Visibility::Hidden {
+                Visibility::Inherited
+            } else {
+                Visibility::Hidden
+            };
         }
     }
 }

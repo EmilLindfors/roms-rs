@@ -28,7 +28,10 @@ impl Plugin for SurfacePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(SurfaceStyle::Translucent)
             .add_systems(Startup, spawn)
-            .add_systems(Update, (keys, style, update_water.after(crate::field::interpolate)));
+            .add_systems(
+                Update,
+                (keys, style, update_water.after(crate::field::interpolate)),
+            );
     }
 }
 
@@ -91,7 +94,10 @@ impl Colouring {
                 follow(&mut self.speed_max, *p98, 1e-3);
             }
         }
-        let eta_abs = eta.iter().step_by(stride).fold(0.0_f32, |m, e| m.max(e.abs()));
+        let eta_abs = eta
+            .iter()
+            .step_by(stride)
+            .fold(0.0_f32, |m, e| m.max(e.abs()));
         follow(&mut self.eta_max, eta_abs, 1e-2);
     }
 
@@ -109,7 +115,11 @@ fn nice_ceil(x: f32) -> f32 {
         return 0.0;
     }
     let decade = 10f32.powf(x.log10().floor());
-    [1.0, 2.0, 2.5, 5.0, 10.0].iter().map(|m| m * decade).find(|&v| v >= x * (1.0 - 1e-6)).unwrap_or(10.0 * decade)
+    [1.0, 2.0, 2.5, 5.0, 10.0]
+        .iter()
+        .map(|m| m * decade)
+        .find(|&v| v >= x * (1.0 - 1e-6))
+        .unwrap_or(10.0 * decade)
 }
 
 #[derive(Resource, Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +167,9 @@ impl Sheet {
             }
         }
         Self {
-            positions: (0..nodes.len()).map(|g| [nodes.xz[g].x, z[g] * vz, nodes.xz[g].y]).collect(),
+            positions: (0..nodes.len())
+                .map(|g| [nodes.xz[g].x, z[g] * vz, nodes.xz[g].y])
+                .collect(),
             normals,
             colours: (0..nodes.len()).map(colour).collect(),
             indices,
@@ -166,14 +178,24 @@ impl Sheet {
 
     /// Walls down from each boundary node's vertex to height `bottom(node)` (m), two
     /// vertices per column (top, bottom); returns the node of every column.
-    fn walls(&mut self, nodes: &Nodes, vz: f32, bottom: impl Fn(usize) -> f32, bottom_colour: impl Fn(usize) -> [f32; 4]) -> Vec<usize> {
+    fn walls(
+        &mut self,
+        nodes: &Nodes,
+        vz: f32,
+        bottom: impl Fn(usize) -> f32,
+        bottom_colour: impl Fn(usize) -> [f32; 4],
+    ) -> Vec<usize> {
         let n = nodes.n_nodes;
         let mut columns = Vec::new();
         for &(k, face) in &nodes.boundary {
-            let column_nodes: Vec<usize> = nodes.face_nodes[face].iter().map(|&i| k * n + i).collect();
+            let column_nodes: Vec<usize> =
+                nodes.face_nodes[face].iter().map(|&i| k * n + i).collect();
             // Outward: along the face turned away from the element's centre.
             let centre = (0..n).map(|i| nodes.xz[k * n + i]).sum::<Vec2>() / n as f32;
-            let (first, last) = (nodes.xz[column_nodes[0]], nodes.xz[*column_nodes.last().unwrap()]);
+            let (first, last) = (
+                nodes.xz[column_nodes[0]],
+                nodes.xz[*column_nodes.last().unwrap()],
+            );
             let mut out = (last - first).perp().normalize_or_zero();
             if out.dot(first - centre) < 0.0 {
                 out = -out;
@@ -182,7 +204,8 @@ impl Sheet {
             for (c, &g) in column_nodes.iter().enumerate() {
                 let top = self.positions.len() as u32;
                 self.positions.push(self.positions[g]);
-                self.positions.push([nodes.xz[g].x, bottom(g) * vz, nodes.xz[g].y]);
+                self.positions
+                    .push([nodes.xz[g].x, bottom(g) * vz, nodes.xz[g].y]);
                 self.normals.extend([normal, normal]);
                 self.colours.extend([self.colours[g], bottom_colour(g)]);
                 if c > 0 {
@@ -196,11 +219,14 @@ impl Sheet {
     }
 
     fn mesh(self) -> Mesh {
-        Mesh::new(PrimitiveTopology::TriangleList, RenderAssetUsages::default())
-            .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
-            .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colours)
-            .with_inserted_indices(Indices::U32(self.indices))
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colours)
+        .with_inserted_indices(Indices::U32(self.indices))
     }
 }
 
@@ -216,14 +242,25 @@ fn spawn(
 ) {
     let vz = frame.vz;
     let deepest = nodes.bed.iter().copied().fold(0.0_f32, f32::min);
-    let shallowest = nodes.bed.iter().copied().fold(f32::NEG_INFINITY, f32::max).min(0.0);
+    let shallowest = nodes
+        .bed
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max)
+        .min(0.0);
     let base = 1.1 * deepest;
 
     let seabed = Lut::new(SEABED);
-    let bed_colour = |g: usize| seabed.at((shallowest - nodes.bed[g]) / (shallowest - deepest).max(1e-6));
+    let bed_colour =
+        |g: usize| seabed.at((shallowest - nodes.bed[g]) / (shallowest - deepest).max(1e-6));
     let mut bed = Sheet::surface(&nodes, &nodes.bed, vz, bed_colour);
     let earth = Color::srgb(0.16, 0.14, 0.12).to_linear();
-    bed.walls(&nodes, vz, |_| base, |_| [earth.red, earth.green, earth.blue, 1.0]);
+    bed.walls(
+        &nodes,
+        vz,
+        |_| base,
+        |_| [earth.red, earth.green, earth.blue, 1.0],
+    );
     commands.spawn((
         Name::new("Bed"),
         Mesh3d(meshes.add(bed.mesh())),
@@ -258,10 +295,18 @@ fn spawn(
         // The surface moves: its bounding box from rest would cull it wrongly.
         NoFrustumCulling,
     ));
-    commands.insert_resource(Water { mesh, material, wall_nodes });
+    commands.insert_resource(Water {
+        mesh,
+        material,
+        wall_nodes,
+    });
 }
 
-fn keys(keys: Res<ButtonInput<KeyCode>>, mut colouring: ResMut<Colouring>, mut style: ResMut<SurfaceStyle>) {
+fn keys(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut colouring: ResMut<Colouring>,
+    mut style: ResMut<SurfaceStyle>,
+) {
     if keys.just_pressed(KeyCode::KeyC) {
         colouring.by = match colouring.by {
             ColourBy::Speed => ColourBy::Elevation,
@@ -288,7 +333,11 @@ fn style(
         return;
     }
     for mut visibility in &mut surface {
-        *visibility = if *style == SurfaceStyle::Hidden { Visibility::Hidden } else { Visibility::Inherited };
+        *visibility = if *style == SurfaceStyle::Hidden {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
     }
     if let Some(mut material) = materials.get_mut(&water.material) {
         let (alpha, mode) = match *style {
@@ -323,10 +372,20 @@ fn update_water(
     if field.t.is_none() || !(playback.changed || colouring.is_changed()) {
         return;
     }
-    let WaterScratch { heights, speed, normals } = &mut *scratch;
+    let WaterScratch {
+        heights,
+        speed,
+        normals,
+    } = &mut *scratch;
     // Dry nodes sink just under the bed, out of sight.
     heights.clear();
-    heights.extend(field.eta.iter().zip(&nodes.bed).map(|(&eta, &b)| if eta - b > H_DRY { eta } else { b - 0.5 }));
+    heights.extend(
+        field
+            .eta
+            .iter()
+            .zip(&nodes.bed)
+            .map(|(&eta, &b)| if eta - b > H_DRY { eta } else { b - 0.5 }),
+    );
     speed.clear();
     speed.extend(field.u.iter().zip(&field.v).map(|(u, v)| u.hypot(*v)));
     normals.resize(nodes.len(), [0.0; 3]);
@@ -335,9 +394,13 @@ fn update_water(
     // water would be rewritten every frame.
     colouring.bypass_change_detection().fit(speed, &field.eta);
 
-    let Some(mut mesh) = meshes.get_mut(&water.mesh) else { return };
+    let Some(mut mesh) = meshes.get_mut(&water.mesh) else {
+        return;
+    };
     let n = nodes.len();
-    if let Some(VertexAttributeValues::Float32x3(positions)) = mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION) {
+    if let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+    {
         for g in 0..n {
             positions[g][1] = heights[g] * frame.vz;
         }
@@ -345,10 +408,13 @@ fn update_water(
             positions[n + 2 * c][1] = heights[g] * frame.vz;
         }
     }
-    if let Some(VertexAttributeValues::Float32x3(out)) = mesh.attribute_mut(Mesh::ATTRIBUTE_NORMAL) {
+    if let Some(VertexAttributeValues::Float32x3(out)) = mesh.attribute_mut(Mesh::ATTRIBUTE_NORMAL)
+    {
         out[..n].copy_from_slice(normals);
     }
-    if let Some(VertexAttributeValues::Float32x4(colours)) = mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR) {
+    if let Some(VertexAttributeValues::Float32x4(colours)) =
+        mesh.attribute_mut(Mesh::ATTRIBUTE_COLOR)
+    {
         for g in 0..n {
             colours[g] = colouring.at(speed[g], field.eta[g]);
         }

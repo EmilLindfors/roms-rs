@@ -361,7 +361,10 @@ fn test_physics_builder_viscosity_decays_shear_flow() {
         "decay {viscous:.6} against exp(-νt) = {expected:.6}"
     );
     let inviscid = amplitude(false);
-    assert!((inviscid - 1.0).abs() < 1e-6, "inviscid amplitude {inviscid:.8}");
+    assert!(
+        (inviscid - 1.0).abs() < 1e-6,
+        "inviscid amplitude {inviscid:.8}"
+    );
 }
 
 /// Local time stepping cannot run BR1 viscosity (it couples elements two faces

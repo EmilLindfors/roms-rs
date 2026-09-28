@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use bevy::prelude::*;
 
-use crate::solver::{SolverMessage, Snapshot};
+use crate::solver::{Snapshot, SolverMessage};
 
 /// How the run on the solver thread ended.
 pub enum SolverState {
@@ -81,7 +81,9 @@ impl Playback {
 
     /// Whether the clock is held at the newest snapshot waiting for the solver.
     pub fn waiting(&self) -> bool {
-        !self.paused && matches!(self.solver, SolverState::Running) && self.newest().is_none_or(|t| self.t >= t)
+        !self.paused
+            && matches!(self.solver, SolverState::Running)
+            && self.newest().is_none_or(|t| self.t >= t)
     }
 
     /// The snapshots around `self.t` and the weight of the later one.
@@ -90,7 +92,11 @@ impl Playback {
         let later = later.min(self.frames.len().checked_sub(1)?);
         let earlier = later.saturating_sub(1);
         let (a, b) = (&self.frames[earlier], &self.frames[later]);
-        let w = if b.t > a.t { ((self.t - a.t) / (b.t - a.t)).clamp(0.0, 1.0) } else { 1.0 };
+        let w = if b.t > a.t {
+            ((self.t - a.t) / (b.t - a.t)).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         Some((a, b, w as f32))
     }
 
