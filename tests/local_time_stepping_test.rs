@@ -11,6 +11,9 @@
 //!   second order.
 //! - A wave running up a beach across several levels keeps h ≥ 0 without a
 //!   single negative-mean clip, and conserves mass.
+//! - With horizontal viscosity (a two-hop stencil): one level is still
+//!   SSP-RK3 bit for bit; several levels conserve mass and momentum to
+//!   rounding and converge to the global solution.
 //!
 //! All runs use the production path: `Simulation` + `SWEPhysics2D`.
 
@@ -25,7 +28,7 @@ use dg_rs::simulation::Simulation;
 use dg_rs::solver::{
     KuzminParameter2D, SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
 };
-use dg_rs::source::{ManningFriction2D, SourceContext2D, SourceTerm2D};
+use dg_rs::source::{HorizontalViscosity2D, ManningFriction2D, SourceContext2D, SourceTerm2D};
 use dg_rs::time::{MultirateSSPRK3, SSPRK3};
 use dg_rs::types::{Depth, ElementIndex};
 
@@ -172,6 +175,10 @@ fn max_speed(q: &SWESolution2D) -> f64 {
 /// positivity limiter and wet/dry correction, implicit Manning friction and a
 /// time-dependent source.
 fn shoreline_physics(setup: &Setup) -> SWEPhysics2D<Reflective2D> {
+    shoreline_builder(setup).build()
+}
+
+fn shoreline_builder(setup: &Setup) -> SWEPhysics2DBuilder<Reflective2D> {
     let bed = |x: f64, y: f64| -2.0 + 3.0 * x / 1000.0 + 0.3 * (y / 150.0).sin();
     setup
         .builder()
@@ -183,7 +190,6 @@ fn shoreline_physics(setup: &Setup) -> SWEPhysics2D<Reflective2D> {
             amplitude: 1e-3,
             omega: 2.0 * std::f64::consts::PI / 600.0,
         })
-        .build()
 }
 
 fn shoreline_state(setup: &Setup) -> SWESolution2D {
@@ -195,11 +201,28 @@ fn shoreline_state(setup: &Setup) -> SWESolution2D {
 
 #[test]
 fn one_level_is_ssp_rk3_bit_for_bit() {
+    one_level_matches_ssp_rk3(None);
+}
+
+#[test]
+fn one_level_with_viscosity_is_ssp_rk3_bit_for_bit() {
+    one_level_matches_ssp_rk3(Some(HorizontalViscosity2D::constant(5.0)));
+}
+
+fn one_level_matches_ssp_rk3(viscosity: Option<HorizontalViscosity2D>) {
     let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 500.0, 8, 4), 2);
     let q0 = shoreline_state(&setup);
-    let dt = 0.2 * shoreline_physics(&setup).compute_dt(&q0, 1.0);
+    let physics = || {
+        let builder = shoreline_builder(&setup);
+        match &viscosity {
+            Some(v) => builder.with_viscosity(v.clone()),
+            None => builder,
+        }
+        .build()
+    };
+    let dt = 0.2 * physics().compute_dt(&q0, 1.0);
     let run = |sim_q: &mut SWESolution2D, levels: Option<usize>| {
-        let physics = shoreline_physics(&setup);
+        let physics = physics();
         let result = match levels {
             None => {
                 Simulation::new(physics, SSPRK3)
@@ -567,4 +590,156 @@ fn farm_refinement_saves_rhs_work() {
     assert!(stats.speedup() > 2.0, "{stats:?}");
     let drift = (setup.mass(&q) - mass0).abs() / mass0;
     assert!(drift < 1e-13, "relative mass drift {drift:e}");
+}
+
+// =============================================================================
+// Horizontal viscosity
+// =============================================================================
+
+/// ∫hu and ∫hv
+fn momentum(setup: &Setup, q: &SWESolution2D) -> [f64; 2] {
+    [setup.integral(q.hu_data()), setup.integral(q.hv_data())]
+}
+
+/// A periodic 10 × 2 km mesh, 20 × 8 elements with the interior vertices
+/// moved pseudo-randomly by up to 0.4 of the spacing, over a flat bed 40 m
+/// deep, with a surface bump and a sheared current: irregular levels.
+///
+/// Irregular on purpose: a neighbour's gradient at the shared face reads
+/// beyond that neighbour only at the face's corner nodes (the GLL lift of a
+/// face touches only its own nodes), i.e. from the elements diagonal to the
+/// evaluating one. On a graded tensor-product mesh the diagonal element
+/// always shares a level with one of the common face neighbours, so an RHS
+/// reused with a one-hop stencil is never stale there.
+fn periodic_viscous_setup() -> (Setup, SWESolution2D) {
+    let (lx, ly, nx, ny) = (10_000.0, 2_000.0, 20, 8);
+    let mut mesh = Mesh2D::uniform_periodic(0.0, lx, 0.0, ly, nx, ny);
+    let (dx, dy) = (lx / nx as f64, ly / ny as f64);
+    let noise = |i: f64| ((i * 12.9898).sin() * 43_758.545_3).fract();
+    for (i, v) in mesh.vertices.iter_mut().enumerate() {
+        let interior = v[0] > 1.0 && v[0] < lx - 1.0 && v[1] > 1.0 && v[1] < ly - 1.0;
+        if interior {
+            v[0] += 0.4 * dx * noise(i as f64);
+            v[1] += 0.4 * dy * noise(i as f64 + 0.5);
+        }
+    }
+    let setup = Setup::new(mesh, 2);
+    let q = setup.fill(|x, y| {
+        let h = 40.0 + 0.3 * gaussian(x, y, (1_500.0, 1_000.0), 400.0);
+        // Sheared across the level interfaces (along x) and along them
+        let (kx, ky) = (
+            2.0 * std::f64::consts::PI / 2_500.0,
+            2.0 * std::f64::consts::PI / 2_000.0,
+        );
+        let u = 0.1 + 0.2 * (ky * y).sin() + 0.1 * (kx * x).cos();
+        let v = 0.2 * (kx * x).sin();
+        SWEState2D::new(h, h * u, h * v)
+    });
+    (setup, q)
+}
+
+/// Across levels with BR1 viscosity, every face flux (the viscous one reads
+/// the neighbours' gradients, two face hops of the state) is the same from
+/// both sides at every stage: mass and momentum are conserved to rounding.
+/// An RHS reused past a change two hops away (the stepper following a
+/// one-hop stencil) breaks it at the level interfaces.
+#[test]
+fn viscosity_across_levels_conserves_mass_and_momentum() {
+    let (setup, mut q) = periodic_viscous_setup();
+    let physics = setup
+        .builder()
+        .with_viscosity(HorizontalViscosity2D::constant(50.0))
+        .build();
+    let (mass0, momentum0) = (setup.mass(&q), momentum(&setup, &q));
+    let q0 = q.clone();
+
+    let sim = Simulation::new(physics, MultirateSSPRK3::new(8)).with_cfl(0.8);
+    let result = sim.run(&mut q, 0.0, 300.0);
+    assert!(result.success);
+    let stats = result.local_time_stepping.unwrap();
+    println!("viscous: {stats:?}, {:.2}x", stats.speedup());
+    assert!(stats.finest_level >= 3, "{stats:?}");
+
+    let drift = (setup.mass(&q) - mass0).abs() / mass0;
+    println!("mass drift {drift:e}");
+    assert!(drift < 1e-13, "relative mass drift {drift:e}");
+    // Scale: ∫h|u|, as ∫hv starts near zero
+    let speeds: Vec<f64> = q0
+        .hu_data()
+        .iter()
+        .zip(q0.hv_data())
+        .map(|(hu, hv)| hu.hypot(*hv))
+        .collect();
+    let scale = setup.integral(&speeds);
+    for (component, (m1, m0)) in momentum(&setup, &q).iter().zip(momentum0).enumerate() {
+        let drift = (m1 - m0).abs() / scale;
+        println!("momentum {component} drift {drift:e}");
+        assert!(
+            drift < 1e-13,
+            "momentum {component}: relative drift {drift:e}"
+        );
+    }
+    assert!(max_speed(&q) > 0.1, "the current must survive");
+}
+
+/// With viscosity the multirate solution converges to the global SSP-RK3
+/// one at second order in the time step at least (as without).
+#[test]
+fn viscous_run_converges_to_the_global_solution() {
+    let setup = graded_setup();
+    let physics = |nu: f64| {
+        let builder = setup
+            .builder()
+            .with_bathymetry(setup.bathymetry(graded_bed));
+        if nu > 0.0 {
+            builder.with_viscosity(HorizontalViscosity2D::constant(nu))
+        } else {
+            builder
+        }
+        .build()
+    };
+    let nu = 200.0;
+    let q0 = setup.fill(|x, y| {
+        let mut state = at_rest(graded_bed, |x, y| {
+            0.2 * gaussian(x, y, (3_000.0, 1_000.0), 1_500.0)
+        })(x, y);
+        // A sheared current for the viscosity to act on
+        let u = 0.3 * (2.0 * std::f64::consts::PI * y / 2_000.0).sin() * (x / 10_000.0);
+        state.hu = state.h * u;
+        state
+    });
+    let t_end = 200.0;
+
+    let mut reference = q0.clone();
+    let result =
+        Simulation::new(physics(nu), SSPRK3)
+            .with_cfl(0.02)
+            .run(&mut reference, 0.0, t_end);
+    assert!(result.success);
+    let mut inviscid = q0.clone();
+    Simulation::new(physics(0.0), SSPRK3)
+        .with_cfl(0.1)
+        .run(&mut inviscid, 0.0, t_end);
+    let viscous_effect = setup.l2_difference(&reference, &inviscid);
+
+    let errors: Vec<f64> = [0.8, 0.4, 0.2]
+        .iter()
+        .map(|&cfl| {
+            let mut q = q0.clone();
+            let result = Simulation::new(physics(nu), MultirateSSPRK3::new(8))
+                .with_cfl(cfl)
+                .run(&mut q, 0.0, t_end);
+            assert!(result.local_time_stepping.unwrap().finest_level >= 2);
+            setup.l2_difference(&q, &reference)
+        })
+        .collect();
+    let orders: Vec<f64> = errors.windows(2).map(|e| (e[0] / e[1]).log2()).collect();
+    println!("viscous effect {viscous_effect:e}, errors {errors:?}, orders {orders:?}");
+    assert!(
+        errors[0] < 0.1 * viscous_effect,
+        "the viscous term must matter more than the time error"
+    );
+    for order in orders {
+        assert!(order > 1.8, "temporal order {order:.2} (errors {errors:?})");
+    }
 }

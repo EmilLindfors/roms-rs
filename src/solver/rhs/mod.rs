@@ -12,6 +12,7 @@ mod scalar_1d;
 mod swe_1d;
 mod swe_2d;
 mod swe_2d_split_form;
+mod swe_2d_viscosity;
 mod tracer_2d;
 
 // 1D scalar
@@ -33,7 +34,7 @@ pub use swe_2d::{
     ElementRhsThen, SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d, compute_dt_viscosity,
     compute_rhs_swe_2d, compute_rhs_swe_2d_face_mass_into, compute_rhs_swe_2d_into,
     compute_rhs_swe_2d_subset_then, compute_rhs_swe_2d_where_into, element_dt_swe_2d,
-    face_mass_len, positivity_cfl_swe_2d,
+    element_dt_viscous_swe_2d, face_mass_len, positivity_cfl_swe_2d,
 };
 #[cfg(feature = "parallel")]
 pub use swe_2d::{

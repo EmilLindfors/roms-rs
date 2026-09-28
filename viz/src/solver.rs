@@ -3,7 +3,9 @@
 //! [`spawn`] builds the scenario's physics and runs `Simulation::run_with_callback`
 //! with a callback every `interval` seconds of model time. Each callback reduces the
 //! state to what the viewer draws, a [`Snapshot`] of the surface η and the
-//! depth-averaged velocity (u, v) at every node, and sends it down a channel. The
+//! depth-averaged velocity (u, v) at every node, plus the particles released from the
+//! cages ([`crate::particles::Cloud`], tracked here between snapshots), and sends it
+//! down a channel. The
 //! solver's own rayon pool leaves a couple of cores to Bevy.
 
 use std::sync::mpsc::{Receiver, channel};
@@ -17,6 +19,7 @@ use dg_rs::solver::{SWESolution2D, StandardLimiter2D, WetDryConfig};
 use dg_rs::source::{CageDrag2D, CoriolisSource2D, ManningFriction2D};
 use dg_rs::time::{MultirateSSPRK3, SSPRK3};
 
+use crate::particles::{Cloud, ParticleConfig, ParticleSnapshot};
 use crate::scenario::{G, Scenario};
 
 /// Below this depth a node is dry: no velocity, and the viewer hides its surface.
@@ -32,10 +35,12 @@ pub struct Snapshot {
     pub u: Vec<f32>,
     /// Depth-averaged velocity, mesh y (m/s)
     pub v: Vec<f32>,
+    /// The particles released so far
+    pub particles: ParticleSnapshot,
 }
 
 impl Snapshot {
-    fn of(q: &SWESolution2D, bed: &[f64], t: f64) -> Self {
+    fn of(q: &SWESolution2D, bed: &[f64], t: f64, particles: ParticleSnapshot) -> Self {
         let [h, hu, hv] = &q.data;
         let velocity = |m: &[f64]| {
             h.iter()
@@ -54,11 +59,12 @@ impl Snapshot {
             eta: h.iter().zip(bed).map(|(h, b)| (h + b) as f32).collect(),
             u: velocity(hu),
             v: velocity(hv),
+            particles,
         }
     }
 
     pub fn bytes(&self) -> usize {
-        4 * (self.eta.len() + self.u.len() + self.v.len())
+        4 * (self.eta.len() + self.u.len() + self.v.len()) + self.particles.bytes()
     }
 }
 
@@ -83,6 +89,8 @@ pub struct SolverConfig {
     pub threads: usize,
     /// Whether the cages' nets drag on the flow (they are drawn either way)
     pub drag: bool,
+    /// Particles released from the cages
+    pub particles: ParticleConfig,
 }
 
 /// Start the run; snapshots arrive on the returned channel, the first at t = 0.
@@ -132,12 +140,22 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
                 .build();
 
                 let started = Instant::now();
+                let mut cloud = (config.particles.per_release > 0)
+                    .then(|| Cloud::new(&mesh, &ops, &cages, config.particles));
                 // A send fails only once the viewer has closed; the run then ends with the process.
                 let mut send = |q: &SWESolution2D, t: f64| {
+                    let particles = match cloud.as_mut() {
+                        Some(cloud) => {
+                            cloud.advance(q, t);
+                            cloud.snapshot(q, &bathymetry.data)
+                        }
+                        None => ParticleSnapshot::default(),
+                    };
                     let _ = tx.send(SolverMessage::Snapshot(Snapshot::of(
                         q,
                         &bathymetry.data,
                         t,
+                        particles,
                     )));
                 };
                 send(&q, 0.0);

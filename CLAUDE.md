@@ -59,6 +59,7 @@ src/
 ├── physics/        # PhysicsModule trait, SWEPhysics2D, Hydrostatic3D,
 │                   # vertical mixing/diffusion/velocity
 ├── simulation/     # Simulation / Simulation3D runners
+├── particles/      # Lagrangian particle tracking (RK4, random walk, walls)
 ├── io/             # NetCDF, VTK, GeoTIFF, coastline, projections, obs readers
 └── analysis/       # Harmonic analysis, skill metrics, tide gauge, ADCP
 ```

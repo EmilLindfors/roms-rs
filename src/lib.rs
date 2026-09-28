@@ -36,6 +36,7 @@ pub mod flux;
 pub mod io;
 pub mod mesh;
 pub mod operators;
+pub mod particles;
 pub mod physics;
 pub mod polynomial;
 pub mod simulation;

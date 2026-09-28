@@ -90,6 +90,7 @@ pub use rhs::{
     compute_rhs_swe_2d_where_into,
     compute_rhs_tracer_2d,
     element_dt_swe_2d,
+    element_dt_viscous_swe_2d,
     face_mass_len,
     positivity_cfl_swe_2d,
 };

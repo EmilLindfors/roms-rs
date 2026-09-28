@@ -1,0 +1,373 @@
+//! Particles released from the cages (sea-lice larvae, feed, faeces): tracked on the
+//! solver thread, drawn riding the water surface.
+//!
+//! [`Cloud`] lives on the solver thread. At every snapshot it moves its particles from
+//! the previous snapshot to this one with `dg_rs::particles::ParticleTracker2D` (RK4
+//! on the depth-averaged current, linear in time between the two states, plus a
+//! horizontal random walk), then releases a new batch spread over each cage's
+//! footprint, and reports every particle's position, the surface η there, its state
+//! and its release time ([`ParticleSnapshot`]). Particles are only ever appended, so
+//! particle `i` is the same in every snapshot that has it.
+//!
+//! The viewer interpolates the positions linearly between the snapshots around the
+//! shown time and draws each particle as a small octahedron just above the surface,
+//! coloured by age (young bright, old dark; stranded grey). Particles that left
+//! through the open boundary are not drawn. Their size follows the camera's distance,
+//! so the cloud stays visible from the farm to the whole fjord. P toggles them.
+
+use bevy::asset::RenderAssetUsages;
+use bevy::camera::visibility::NoFrustumCulling;
+use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::prelude::*;
+use dg_rs::mesh::Mesh2D;
+use dg_rs::operators::DGOperators2D;
+use dg_rs::particles::{Particle2D, ParticleStatus, ParticleTracker2D, SWEVelocity2D};
+use dg_rs::solver::{SWESolution2D, WetDryConfig};
+use dg_rs::source::NetCage;
+
+use crate::camera::OrbitCamera;
+use crate::colormap::{Lut, PLASMA};
+use crate::field::Frame;
+use crate::playback::Playback;
+
+/// Longest tracking step (s); a snapshot interval is split into steps no longer.
+const MAX_STEP: f64 = 10.0;
+/// Particles in water shallower than this (m) strand.
+const STRANDING_DEPTH: f64 = 0.05;
+
+/// Particle states as sent to the viewer.
+pub const ACTIVE: u8 = 0;
+pub const STRANDED: u8 = 1;
+pub const EXITED: u8 = 2;
+
+/// What is released and how it disperses.
+#[derive(Clone, Copy, Debug)]
+pub struct ParticleConfig {
+    /// Particles released in each cage per release; 0 for none
+    pub per_release: usize,
+    /// Model time between releases (s)
+    pub release_every: f64,
+    /// Horizontal diffusivity of the random walk (m²/s)
+    pub kh: f64,
+}
+
+/// Every particle at one snapshot, in release order.
+#[derive(Default)]
+pub struct ParticleSnapshot {
+    /// Position, mesh coordinates (m)
+    pub xy: Vec<[f32; 2]>,
+    /// Surface elevation at the particle (m)
+    pub eta: Vec<f32>,
+    /// [`ACTIVE`], [`STRANDED`] or [`EXITED`]
+    pub state: Vec<u8>,
+    /// Model time of release (s)
+    pub born: Vec<f32>,
+}
+
+impl ParticleSnapshot {
+    pub fn len(&self) -> usize {
+        self.xy.len()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.len() * (8 + 4 + 1 + 4)
+    }
+
+    /// Particles active, stranded and out of the domain.
+    pub fn counts(&self) -> [usize; 3] {
+        let mut counts = [0; 3];
+        for &s in &self.state {
+            counts[s as usize] += 1;
+        }
+        counts
+    }
+}
+
+/// The particles, on the solver thread (see the module docs).
+pub struct Cloud<'a> {
+    tracker: ParticleTracker2D<'a>,
+    ops: &'a DGOperators2D,
+    particles: Vec<Particle2D>,
+    born: Vec<f32>,
+    /// Centre and radius of each cage's release disc
+    sources: Vec<([f64; 2], f64)>,
+    config: ParticleConfig,
+    next_release: f64,
+    /// The previous snapshot's state
+    previous: Option<(f64, SWESolution2D)>,
+    weights: Vec<f64>,
+}
+
+impl<'a> Cloud<'a> {
+    pub fn new(
+        mesh: &'a Mesh2D,
+        ops: &'a DGOperators2D,
+        cages: &[NetCage],
+        config: ParticleConfig,
+    ) -> Self {
+        let sources = cages
+            .iter()
+            .map(|cage| {
+                let (lo, hi) = cage.footprint.bounding_box();
+                let centre = [0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])];
+                (centre, 0.5 * (hi[0] - lo[0]).min(hi[1] - lo[1]))
+            })
+            .collect();
+        Self {
+            tracker: ParticleTracker2D::new(mesh, ops)
+                .with_diffusivity(config.kh)
+                .with_stranding_depth(STRANDING_DEPTH),
+            ops,
+            particles: Vec::new(),
+            born: Vec::new(),
+            sources,
+            config,
+            next_release: 0.0,
+            previous: None,
+            weights: vec![0.0; ops.n_nodes],
+        }
+    }
+
+    /// Move the particles to the state `q` at `t`, then release the batches due.
+    pub fn advance(&mut self, q: &SWESolution2D, t: f64) {
+        if let Some((t0, q0)) = &self.previous
+            && t > *t0
+        {
+            let field = SWEVelocity2D::between(*t0, q0, t, q, WetDryConfig::DEFAULT_H_DRY);
+            let steps = ((t - t0) / MAX_STEP).ceil().max(1.0) as usize;
+            let dt = (t - t0) / steps as f64;
+            for s in 0..steps {
+                self.tracker
+                    .step(&mut self.particles, &field, t0 + s as f64 * dt, dt);
+            }
+        }
+        match &mut self.previous {
+            Some((tp, qp)) => {
+                *tp = t;
+                qp.clone_from(q);
+            }
+            None => self.previous = Some((t, q.clone())),
+        }
+        while self.next_release <= t + 1e-9 {
+            self.release(t);
+            self.next_release += self.config.release_every;
+        }
+    }
+
+    /// One batch in each cage, spread over its disc (a sunflower pattern that turns
+    /// from batch to batch).
+    fn release(&mut self, t: f64) {
+        const GOLDEN_ANGLE: f64 = 2.399_963_229_728_653;
+        const PHI: f64 = 0.618_033_988_749_895;
+        let n = self.config.per_release;
+        for &(centre, radius) in &self.sources {
+            let first = self.particles.len();
+            for j in first..first + n {
+                let r = radius * ((j as f64 + 0.5) * PHI).fract().sqrt();
+                let angle = j as f64 * GOLDEN_ANGLE;
+                let p = [centre[0] + r * angle.cos(), centre[1] + r * angle.sin()];
+                if let Some(particle) = self.tracker.release(self.particles.len() as u64, p) {
+                    self.particles.push(particle);
+                    self.born.push(t as f32);
+                }
+            }
+        }
+    }
+
+    /// Where every particle is, and the surface there.
+    pub fn snapshot(&mut self, q: &SWESolution2D, bed: &[f64]) -> ParticleSnapshot {
+        let n = self.ops.n_nodes;
+        let mut out = ParticleSnapshot {
+            xy: Vec::with_capacity(self.particles.len()),
+            eta: Vec::with_capacity(self.particles.len()),
+            state: Vec::with_capacity(self.particles.len()),
+            born: self.born.clone(),
+        };
+        for p in &self.particles {
+            let [x, y] = p.position();
+            out.xy.push([x as f32, y as f32]);
+            let point = p.point();
+            self.ops
+                .interpolation_weights_into(point.r, point.s, &mut self.weights);
+            let k = point.element.as_usize();
+            let (h, b) = (q.element_h(point.element), &bed[k * n..(k + 1) * n]);
+            let eta: f64 = self
+                .weights
+                .iter()
+                .zip(h.iter().zip(b))
+                .map(|(w, (h, b))| w * (h + b))
+                .sum();
+            out.eta.push(eta as f32);
+            out.state.push(match p.status() {
+                ParticleStatus::Active => ACTIVE,
+                ParticleStatus::Stranded => STRANDED,
+                ParticleStatus::Exited(_) => EXITED,
+            });
+        }
+        out
+    }
+}
+
+/// The drawn cloud.
+#[derive(Resource)]
+pub struct Particles {
+    pub on: bool,
+    /// Active, stranded and out, at the shown time
+    pub counts: [usize; 3],
+    /// Age (s) at the dark end of the colour map
+    pub age_scale: f32,
+    lut: Lut,
+    mesh: Handle<Mesh>,
+}
+
+#[derive(Component)]
+struct Cloudlet;
+
+pub struct ParticlesPlugin;
+
+impl Plugin for ParticlesPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_systems(Startup, spawn)
+            .add_systems(Update, (toggle, draw.after(crate::field::interpolate)));
+    }
+}
+
+fn spawn(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+) {
+    let mesh = meshes.add(
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, Vec::<[f32; 3]>::new())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, Vec::<[f32; 3]>::new())
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, Vec::<[f32; 4]>::new())
+        .with_inserted_indices(Indices::U32(Vec::new())),
+    );
+    commands.spawn((
+        Name::new("Particles"),
+        Cloudlet,
+        Mesh3d(mesh.clone()),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            unlit: true,
+            ..default()
+        })),
+        // The cloud moves: a bounding box from its first frame would cull it wrongly.
+        NoFrustumCulling,
+        Visibility::Hidden,
+    ));
+    commands.insert_resource(Particles {
+        on: true,
+        counts: [0; 3],
+        age_scale: 600.0,
+        lut: Lut::new(PLASMA),
+        mesh,
+    });
+}
+
+fn toggle(keys: Res<ButtonInput<KeyCode>>, mut particles: ResMut<Particles>) {
+    if keys.just_pressed(KeyCode::KeyP) {
+        particles.on = !particles.on;
+    }
+}
+
+/// The six corners of an octahedron and its eight faces.
+const CORNERS: [Vec3; 6] = [
+    Vec3::X,
+    Vec3::NEG_X,
+    Vec3::Y,
+    Vec3::NEG_Y,
+    Vec3::Z,
+    Vec3::NEG_Z,
+];
+const FACES: [[u32; 3]; 8] = [
+    [0, 2, 4],
+    [4, 2, 1],
+    [1, 2, 5],
+    [5, 2, 0],
+    [4, 3, 0],
+    [1, 3, 4],
+    [5, 3, 1],
+    [0, 3, 5],
+];
+
+fn draw(
+    mut particles: ResMut<Particles>,
+    playback: Res<Playback>,
+    frame: Res<Frame>,
+    camera: Query<&OrbitCamera>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut visibility: Query<&mut Visibility, With<Cloudlet>>,
+) {
+    let Ok(mut visible) = visibility.single_mut() else {
+        return;
+    };
+    let Some((a, b, w)) = playback.bracket() else {
+        return;
+    };
+    let (a, b) = (&a.particles, &b.particles);
+    let t = playback.t as f32;
+    let oldest = b.born.first().copied().unwrap_or(0.0);
+    let age_scale = (t - oldest).max(600.0);
+    let counts = b.counts();
+    if particles.counts != counts || particles.age_scale != age_scale {
+        particles.counts = counts;
+        particles.age_scale = age_scale;
+    }
+    if !particles.on || b.len() == 0 {
+        visible.set_if_neq(Visibility::Hidden);
+        return;
+    }
+    visible.set_if_neq(Visibility::Inherited);
+
+    // A few pixels across at any distance: about 1.3 m at the farm view, 30 m over
+    // the whole fjord.
+    let size = camera
+        .single()
+        .map_or(1.5, |c| (0.003 * c.distance).clamp(0.4, 60.0));
+    let grey = [0.55, 0.55, 0.55, 1.0];
+
+    let n = b.len();
+    let mut positions = Vec::with_capacity(6 * n);
+    let mut normals = Vec::with_capacity(6 * n);
+    let mut colours = Vec::with_capacity(6 * n);
+    let mut indices = Vec::with_capacity(24 * n);
+    for i in 0..n {
+        if b.state[i] == EXITED || b.born[i] > t + 1e-3 {
+            continue;
+        }
+        // Released since the earlier snapshot: at its first position.
+        let (xy, eta) = if i < a.len() && a.state[i] != EXITED {
+            let lerp = |x: f32, y: f32| x + w * (y - x);
+            (
+                [lerp(a.xy[i][0], b.xy[i][0]), lerp(a.xy[i][1], b.xy[i][1])],
+                lerp(a.eta[i], b.eta[i]),
+            )
+        } else {
+            (b.xy[i], b.eta[i])
+        };
+        let centre = frame.world([xy[0] as f64, xy[1] as f64], eta) + Vec3::Y * 0.6 * size;
+        let colour = if b.state[i] == STRANDED {
+            grey
+        } else {
+            particles.lut.at(1.0 - (t - b.born[i]) / age_scale)
+        };
+        let base = positions.len() as u32;
+        for corner in CORNERS {
+            positions.push((centre + corner * size).to_array());
+            normals.push(corner.to_array());
+            colours.push(colour);
+        }
+        indices.extend(FACES.iter().flatten().map(|&v| base + v));
+    }
+    let Some(mut mesh) = meshes.get_mut(&particles.mesh) else {
+        return;
+    };
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colours);
+    mesh.insert_indices(Indices::U32(indices));
+}
