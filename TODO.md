@@ -110,6 +110,12 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
   - Angle dependence (C_d(θ)) and the lift term: irrelevant for a circular cage averaged over its perimeter, not for square cages in oblique flow.
   - Net deformation in strong currents (the net lifts and its projected depth shrinks, reducing d_net) is not modelled.
   - A cage-layout reader (positions, radii, net depths per site), e.g. from the Fiskeridirektoratet site register, for real farms.
+  - [ ] Farm runs need a spun-up tide and horizontal viscosity (found with `viz/`, 2026-09-27/28). In the fjord-farm scenario the fastest water was a jet through the cages. Drag minus no-drag at the west cage centre, 50 model minutes, P2, `examples/local_time_stepping_farm.rs` setup:
+    - Abrupt start, inviscid (the example as it is): the tide switched on at full amplitude from rest sends a ≈ 110–130 mm/s surge past the farm at t ≈ 5–10 min. The drag opposes it (−5.5 mm/s at 10 min), and the deficit then *stays*: −6.9 mm/s at 50 min and −6.7 at 2 h, while the tidal current there is 2–5 mm/s (the fjord is short and closed, so the tide is nearly standing). Local and global stepping agree to 0.01 mm/s, so the scheme is not at fault.
+    - The persistence comes from the model, not the ocean: without horizontal viscosity nothing removes a 50–100 m eddy but bottom friction (≈ 1e-7 /s at 90 m) and weak upwind dissipation (the largest anomaly within 300 m: 9.0 → 7.3 mm/s over 2 h). With ν = 1 m²/s (`with_viscosity`, global stepping) it decays with e-folding ≈ 1000 s ≈ L²/ν: −3.5 → −1.5 → −1.1 mm/s at 10/20/30 min (largest 4.5 → 1.9 → 1.3), and the background flow is unchanged (no-drag velocities equal to 0.01 mm/s).
+    - With a 1 h ramp (`HarmonicTide::with_ramp_up`) there is no surge: flood peaks at 19 mm/s at the farm and the drag takes 0.35–0.65 mm/s (3–4 %) off it. Still inviscid, that deficit then does not decay after the flow reverses (−0.67 mm/s at 2 h).
+    - Done 2026-09-28: the tide ramps up over 1 h in `examples/local_time_stepping_farm.rs` (`ramp=`) and in the viewer (`--ramp`). At 15 min, local stepping still does 2.60× less RHS work, and local and global agree to 1.6e-6 m/s.
+    - To do: run farm cases with viscosity (P2.5: needs LTS support to be affordable), and choose ν (constant 1–10 m²/s or Smagorinsky with a background: at these shears Smagorinsky alone gives ν ≈ (0.1·20 m)²·|S| ≈ 5e-4 m²/s, i.e. nothing). A farm-wake study also wants a site with real tidal currents.
 
 ### F.2 Lagrangian particle tracking
 - [x] Point location: find the element holding a point and its reference coordinates (2026-09-27, P3.1: `mesh::PointLocator2D`, a bucket grid over element bounding boxes and Newton on the bilinear map). Curved (isoparametric) elements, once P1.3 has them, need the same Newton on the higher-order map.
@@ -121,6 +127,13 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
   - Solid-body rotation: trajectories exact to the time-stepping error when the velocity is in the polynomial space.
   - No particle crosses a wall.
   - The vertical random walk keeps an initially uniform distribution uniform under variable K (Visser's well-mixed condition).
+
+### F.3 3D visualisation (`viz/`, Bevy 0.20)
+- [x] Crate `dg-viz` in `viz/` (its own workspace, so dg-rs builds and tests never compile Bevy; dg-rs without NetCDF, so no native HDF5). Runs the fjord-farm scenario of `examples/local_time_stepping_farm.rs` on a solver thread (`run_with_callback`), plays the snapshots back (rate, pause, seek; oldest dropped beyond a memory budget) as the water surface over the bed, each element as p² quads of its own nodes with the polynomial's exact normals, coloured by speed or η; walls along the mesh boundary; current arrows sampled by the element polynomial (`Probe2D` weights) on a domain grid and a fine farm grid; net cages (collar, textured net) riding η; orbit camera; `--screenshot` for headless checks (2026-09-27).
+- [ ] Salmon in the cages (pfish-bevy in `../blender-procedural-fish-addon/rust`, once the add-on has a salmon).
+- [ ] Particles (lice larvae, feed, faeces) once F.2 exists; until then they can be developed against NorKyst-800 fields.
+- [ ] A snapshot file (element-major f32 η, u, v plus the mesh and bed) so runs can be replayed without re-running, and other scenarios (Frøya coastline mesh, nested runs) selectable from the command line.
+- [ ] 3D fields (Stage B): vertical sections and a surface layer from `Solution3D`.
 
 ---
 
@@ -363,6 +376,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 - [x] 2026-09-26: `hypot` → `sqrt(x² + y²)` in the hot paths (MSVC `hypot` is a C runtime call); a Halley `cbrt` for Manning (2× the CRT's, ≤ 2 ulp); the WetDry HLL takes the node velocities through a face-aligned core (`hll_flux_face_aligned`) instead of dividing momenta back out. Implicit damping 3.5 → 1.3 ms, post-processing 0.84 → 0.41 ms (single thread).
 - [x] The face-aligned HLL core, measured on mains power pinned to a Zen 5 core: RHS 5.8–6.7 → 5.4–5.7 ms (≈ 7 %). Benchmark this laptop only on mains power, pinned (logical CPUs 0–7 are Zen 5, 8–23 the slower Zen 5c); on battery everything runs ≈ 2× slower and noisier.
 - [ ] Explicit SIMD (`pulp`, or fearless_simd) pays only once kernels vectorise across nodes or elements: the node passes (damping, positivity, wet/dry) first, then batched face fluxes. faer is not on the hot path (element-local 9-node operators).
+- [ ] Build flags (2026-09-28, expected 10–20 %, unmeasured): `-C target-cpu=native` for the SIMD paths, and `mimalloc` where the allocating paths still run (the viscous RHS, the Kuzmin limiters). `viz/` builds dg-rs without it. Note for any crate that drives the solver: `Simulation<P, I>` and the physics builder are generic, so the hot loops are compiled in the *calling* crate at its opt-level. A `[profile.dev.package."*"] opt-level = 3` override does not reach them (a scratch driver at opt-level 0 ran several times slower).
 
 ### P2.3 Fused in-place stepper
 - [ ] Limiter, positivity and wet/dry in one parallel in-place pass. Today the "parallel" paths `to_vec` every field, allocate per element, and copy back serially (`limiters/swe_2d.rs:626-725`, `wetting_drying.rs:526-541`): 1.5–2.5× of wall time.
@@ -385,7 +399,8 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
   - Element-local limiting only: the Kuzmin limiters (vertex bounds from neighbour means) and BR1 horizontal viscosity (two-face coupling) panic under LTS.
   - The interface coupling error is ≈ 50× SSP-RK3's time error at the same CFL for a gravity wave crossing four levels (1.5e-3 relative at CFL 0.8). It scales as (λΔt)², so tides are unaffected, but check eddies shed by cages as they leave the farm level.
   - Validate on Frøya: `froya_real_data lts=6` reproduces the global run at Mausund (M2 to 1e-4) over 6 h; repeat over the 15-day harmonic run.
-- [ ] Semi-implicit free surface: still the alternative for 3D mode splitting (P4), where the barotropic step is the stiff part. Not needed for Stage A.
+  - [ ] Horizontal viscosity under LTS (measured 2026-09-28). Farm runs need it (the drag wake otherwise never decays, see F.1), but BR1 couples each element to its neighbours' gradients, so `with_viscosity` is global-stepping only. On the farm mesh that costs twice: global stepping (≈ 2.5× the LTS work) and 4.5× per step for the viscous RHS itself (43 against 9.5 s per 30 model s on 4 threads: the gradient pass and the ≈ 10 arrays it allocates per RHS, P1.1). Together ≈ 10× on viscous farm runs. Make the viscous term's allocations workspace-backed first, then give LTS the extra hop BR1 needs (neighbour gradients at the stage's time level).
+- [ ] Semi-implicit free surface: the alternative for 3D mode splitting (P4), where the barotropic step is the stiff part, and (2026-09-28) the main cost lever for farm-scale Stage A too. On the farm mesh the global step is ≈ 0.024 s (124k steps per 50 model minutes), set by the gravity wave (√(gh) ≈ 30 m/s at 90 m) on the 20 m farm elements, while the currents there are mm/s–cm/s. A free surface implicit in the gravity-wave terms (θ-method as in Casulli's TRIM/UnTRIM; SLIM and Thetis for DG) steps at the advective CFL, up to 10–100× fewer steps where the flow is slow; LTS gets 2.4–2.8× on the same mesh. Cost: a global linear solve per step (SPD for the θ-scheme) and care with wetting/drying.
 
 ### P2.6 Benchmarks (was P1.6)
 - Measured 2026-09-26: Frøya, 9,653 P2 elements (87k nodes), dt ≈ 0.65 s: 8.2 ms/step on 24 threads, so a 30-day validation run takes ≈ 9 h. Scaling stops at ≈ 8 threads (44.6 → 9 ms from 1 to 8–24 threads): the laptop's 4 Zen 5 + 8 Zen 5c cores and its power limit, not serial code. `froya_real_data profile=N` times each phase (RHS, post-processing, damping, dt) at 1 and all threads; single-thread RHS ≈ 85 % of the step.
@@ -397,6 +412,7 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
 ### P2.7 GPU and distributed memory (decision)
 - [ ] Either fix Burn (P0.11) or replace it with custom fused f64 kernels (CubeCL/cudarc) over CSR faces. Burn with fusion disabled (`Cargo.toml:38`) moves ~13× more bytes per node-stage than fused kernels.
 - [ ] MPI/domain decomposition plan (METIS partitioning, halo exchange of face traces).
+- Sizing (2026-09-28): neither more cores nor a GPU helps the current farm mesh (3,584 P2 elements, 32k nodes). LTS went from ≈ 10× real time on 4 threads to ≈ 17× on 10 (1.6× for 2.5× the threads): the per-step work is too small to spread. On a GPU, 124k steps × 3 stages × several kernels per 50 model minutes would be dominated by launch overhead. Consumer GPUs also run f64 at about 1/64 of f32 (e.g. the RTX 4060 Laptop here), and f32 is ruled out. GPU and many-core pay off from ≈ 10⁵ elements (real farm-scale coastal meshes), on data-centre GPUs with full-rate FP64 (A100/H100 class). Fewer steps (semi-implicit free surface, P2.5) and cheaper viscosity come first.
 
 ---
 

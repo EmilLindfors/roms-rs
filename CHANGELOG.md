@@ -6,6 +6,13 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **3D viewer `viz/` (dg-viz, Bevy 0.20; TODO F.3).** A separate crate with its own workspace, so dg-rs builds and tests do not compile Bevy. It depends on dg-rs without NetCDF, so no native HDF5 is needed.
+  - It runs the fjord farm of `examples/local_time_stepping_farm.rs` (with the tide ramped up over an hour by default, `--ramp`: switched on at once, the start-up surge leaves a drag wake that outlasts the tidal current at the farm, TODO F.1) on a solver thread and plays the snapshots back while the run goes on: the water surface over the bed, coloured by current speed or η, current arrows, and the net cages riding the surface.
+  - Each element is drawn as p² quads of its own GLL nodes, lit by the polynomial's exact gradient. Arrows are sampled with `Probe2D`'s weights.
+  - Run with `cd viz && cargo run --release`; the options and keys are documented at the top of `viz/src/main.rs`. `--screenshot PATH --at S` saves a frame and quits.
+
+- **Horizontal viscosity on the `Simulation` path.** `SWEPhysics2DBuilder::with_viscosity(HorizontalViscosity2D)` (constant or Smagorinsky, BR1). Until now viscosity was reachable only through the legacy `ssp_rk3_swe_2d` stepper, so every `Simulation` run, the farm scenario included, was inviscid. Global time stepping only: it is not element-local, so `MultirateSSPRK3` cannot use it yet (TODO P2.5). Tests: `test_physics_builder_viscosity_decays_shear_flow` (a periodic shear flow decays as exp(−νt) to 1e-3; without viscosity it holds to 1e-6) and `test_local_time_stepping_refuses_viscosity` (it panics rather than running inviscid).
+
 - **Coastline-fitted meshes from an elevation model (TODO P1.3).** `scripts/gmsh_coastline_mesh.py` meshes the water of a lon/lat box from Kartverket's topobathy model.
   - Geometry: the 0 m contour; land and water narrower than twice the coastal size are removed, so no sound is closed by the land filter and no feature forces elements smaller than itself.
   - Meshing: the coastline is resampled at the element size, meshed by Gmsh recombination and subdivision with sizes growing from the coast (and an optional farm), and tagged `open` on the box and `coast` elsewhere. Every quad is checked to be convex and consistently oriented.
@@ -201,6 +208,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **The farm example ramps its tide up (TODO F.1).** `examples/local_time_stepping_farm.rs` now ramps the M2 tide up over an hour (`ramp=`, `ramp=0` for the old abrupt start). Switched on at full amplitude, the tide sent a ≈ 0.13 m/s surge past the farm, and without horizontal viscosity its drag wake (≈ 7 mm/s through the cages) outlasted the tidal current there (2–5 mm/s). The step is set by the gravity wave, so the cost is unchanged: at 15 min local stepping does 2.60× less RHS work, and local and global agree to 1.6e-6 m/s.
+
 - **Local time stepping runs over element lists (TODO P2.5).** Every pass of `MultirateSSPRK3` used to sweep all elements (and all faces) and skip the inactive ones, which dominated with many levels. The stepper now orders the elements by rate once per coarse step, so each active set is a prefix. `LocalTimeStepping::stage_where`/`finish_where` take element lists, and `compute_rhs_swe_2d_subset_then` (was `…_where_then`) computes only the faces of the listed elements, serially for small subsets. Bit for bit as before (the LTS gates).
   - Frøya coastline mesh (2^8 levels): 254 → 162–177 ms per coarse step.
   - Farm mesh (2^6 levels): unchanged.
@@ -308,6 +317,7 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Point location failed on small elements far from the origin (TODO P3.1, F.2).** `inverse_bilinear` stopped Newton at a fixed step of 1e-14 in (r, s). That is below the round-off of x(r, s) − p, ≈ ε·|p|/√J, so for unlucky points the step bounced at round-off until the iterations ran out and the point was reported outside the mesh. On the 20 m quads of the fjord-farm mesh (x ≈ 6 km) both cage centres failed; on UTM-scale coordinates most points would. The tolerance now includes that round-off. Test: `inverse_bilinear_converges_at_round_off_far_from_the_origin` (the farm quad, and a grid of points on a skewed 20 m quad at UTM northings).
 - **Mode splitting emptied dry elements at round-off (3D, TODO P4.1, PR 3).** η at the end of a step came from the RK combination of constant barotropic rates, which can leave a dry node a hair below its bed. The next barotropic pass then started from h ≈ −1e-16, and the positivity limiter emptied the element, counted as a negative-depth clip (15 clips in 10 steps on a beach). Now η = h̄ + B and ū = D̄ū/D̄ are taken exactly from the filtered state. Test: `barotropic_transport_balances_every_element_with_wetting_and_drying` (0 clips).
 - **Mode-split slow forcing (3D, TODO P4.1, PR 2).**
   - **Double counting.** `G` was the depth integral of the whole 3D momentum tendency, so the mean-flow advection and Coriolis the 2D module already computes were counted twice. A nonlinear unsheared seiche drifted from the pure 2D model by 0.14 of its amplitude in two periods.
