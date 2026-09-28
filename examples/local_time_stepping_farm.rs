@@ -7,6 +7,12 @@
 //! 0.8 m enters through a characteristic open boundary; Coriolis, Manning
 //! friction and two net cages act on the flow.
 //!
+//! The tide ramps up from rest over `ramp` seconds (default one hour). Switched
+//! on at full amplitude (`ramp=0`), it sends a ≈ 0.13 m/s surge past the farm,
+//! whose drag wake then outlasts the few mm/s of tidal current there: the model
+//! has no horizontal viscosity on this path (TODO F.1). The step is set by
+//! the gravity wave on the 20 m elements, so the ramp does not change the cost.
+//!
 //! The same run is taken twice from rest, with global SSP-RK3 and with
 //! `MultirateSSPRK3`. It reports the wall time, the RHS work and the
 //! difference between the two solutions: η and speed at the farm and over
@@ -14,7 +20,7 @@
 //!
 //! ```bash
 //! cargo run --release --no-default-features --features parallel,simd \
-//!     --example local_time_stepping_farm -- [hours=1] [order=2] [levels=8]
+//!     --example local_time_stepping_farm -- [hours=1] [order=2] [levels=8] [ramp=3600]
 //! ```
 
 use std::collections::HashMap;
@@ -51,6 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let hours: f64 = get("hours", 1.0)?;
     let order = get("order", 2.0)? as usize;
     let levels = get("levels", 8.0)? as usize;
+    let ramp: f64 = get("ramp", 3600.0)?;
 
     let mesh = Arc::new(read_gmsh_mesh(Path::new("tests/data/gmsh/fjord_farm.msh"))?);
     let ops = Arc::new(DGOperators2D::new(order));
@@ -67,7 +74,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let wall = Reflective2D::new();
-    let sea = CharacteristicOBC::new(HarmonicTide::m2(0.8, 0.0));
+    let tide = HarmonicTide::m2(0.8, 0.0);
+    let sea = CharacteristicOBC::new(if ramp > 0.0 { tide.with_ramp_up(ramp) } else { tide });
     let cages = [
         NetCage::circular([FARM[0] - 40.0, FARM[1]], 25.0, 20.0, 0.25),
         NetCage::circular([FARM[0] + 40.0, FARM[1]], 25.0, 20.0, 0.25),
