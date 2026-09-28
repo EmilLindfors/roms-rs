@@ -21,6 +21,10 @@ All notable changes to this project should be documented in this file.
 
 - **Particles in the viewer (`viz/`, TODO F.3).** Particles are released continuously from the cages (`--particles N` per cage every `--release S` model seconds, default 20 every 60 s; `--kh` for the random walk). They are tracked on the solver thread between the snapshots with `ParticleTracker2D` and drawn riding the water surface, coloured by age (stranded ones grey). P toggles them, and the HUD shows how many are in the water, stranded and out.
 
+- **Frøya in the viewer (`viz/`, TODO F.3).** `cargo run --release -- --scenario froya` runs Frøya–Smøla–Hitra on the coastline mesh with NorKyst-800 boundary tides, as `froya_real_data mesh=data/froya_coast.msh` does, from the example's data files in `data/`. F frames the Mausund tide gauge. It runs about 18× faster than real time at 10 solver threads.
+
+- **Bathymetry in the viewer (`viz/`, TODO F.3).** The translucent water is 40 % opaque by default instead of 82 %, so the bed reads through it; `--water-alpha` sets it and - / = step it. The HUD shows the bed's depth colour scale, and the bed carries depth contours (a round interval of about ten lines, every fifth bright) found by marching triangles over the bed's own triangles and drawn as ribbons a few pixels wide at any zoom. B toggles them.
+
 - **3D viewer `viz/` (dg-viz, Bevy 0.20; TODO F.3).** A separate crate with its own workspace, so dg-rs builds and tests do not compile Bevy. It depends on dg-rs without NetCDF, so no native HDF5 is needed.
   - It runs the fjord farm of `examples/local_time_stepping_farm.rs` (with the tide ramped up over an hour by default, `--ramp`: switched on at once, the start-up surge leaves a drag wake that outlasts the tidal current at the farm, TODO F.1) on a solver thread and plays the snapshots back while the run goes on: the water surface over the bed, coloured by current speed or η, current arrows, and the net cages riding the surface.
   - Each element is drawn as p² quads of its own GLL nodes, lit by the polynomial's exact gradient. Arrows are sampled with `Probe2D`'s weights.

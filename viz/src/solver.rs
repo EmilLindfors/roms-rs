@@ -11,7 +11,9 @@
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
-use dg_rs::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D};
+use dg_rs::boundary::{
+    CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D,
+};
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::physics::PhysicsBuilder;
 use dg_rs::simulation::Simulation;
@@ -20,7 +22,7 @@ use dg_rs::source::{CageDrag2D, CoriolisSource2D, ManningFriction2D};
 use dg_rs::time::{MultirateSSPRK3, SSPRK3};
 
 use crate::particles::{Cloud, ParticleConfig, ParticleSnapshot};
-use crate::scenario::{G, Scenario};
+use crate::scenario::{G, Scenario, Tide};
 
 /// Below this depth a node is dry: no velocity, and the viewer hides its surface.
 pub const H_DRY: f32 = 0.01;
@@ -101,7 +103,7 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
     let geom = scenario.geom.clone();
     let bathymetry = scenario.bathymetry.clone();
     let cages = scenario.cages.clone();
-    let forcing = scenario.forcing;
+    let forcing = scenario.forcing.clone();
     let mut q = scenario.at_rest();
     std::thread::Builder::new()
         .name("dg-rs solver".into())
@@ -113,19 +115,26 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
                 .expect("solver thread pool");
             pool.install(|| {
                 let wall = Reflective2D::new();
-                let tide = HarmonicTide::m2(forcing.m2_amplitude, 0.0);
-                let tide = if forcing.ramp > 0.0 {
-                    tide.with_ramp_up(forcing.ramp)
-                } else {
-                    tide
+                let ramp = (forcing.ramp > 0.0).then_some(forcing.ramp);
+                let sea: Box<dyn SWEBoundaryCondition2D + Send + Sync> = match forcing.tide {
+                    Tide::UniformM2(amplitude) => {
+                        let tide = HarmonicTide::m2(amplitude, 0.0);
+                        Box::new(CharacteristicOBC::new(match ramp {
+                            Some(r) => tide.with_ramp_up(r),
+                            None => tide,
+                        }))
+                    }
+                    Tide::Atlas(tides) => Box::new(CharacteristicOBC::new(match ramp {
+                        Some(r) => tides.with_ramp_up(r),
+                        None => tides,
+                    })),
                 };
-                let sea = CharacteristicOBC::new(tide);
                 let physics = PhysicsBuilder::swe_2d(
                     mesh.clone(),
                     ops.clone(),
                     geom.clone(),
                     ShallowWater2D::new(G),
-                    MultiBoundaryCondition2D::new(&wall).with_open(&sea),
+                    MultiBoundaryCondition2D::new(&wall).with_open(sea.as_ref()),
                 )
                 .with_bathymetry(bathymetry.clone())
                 .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
