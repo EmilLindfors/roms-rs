@@ -61,6 +61,11 @@ pub fn inverse_bilinear(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> Option<[f64; 2
     let (bx, by) = (0.25 * (-x0 + x1 + x2 - x3), 0.25 * (-y0 + y1 + y2 - y3));
     let (cx, cy) = (0.25 * (-x0 - x1 + x2 + x3), 0.25 * (-y0 - y1 + y2 + y3));
     let (dx, dy) = (0.25 * (x0 - x1 + x2 - x3), 0.25 * (y0 - y1 + y2 - y3));
+    // Newton converges down to the round-off of x(r, s) − p, ≈ ε·|p| in space
+    // and so ≈ ε·|p|/√J in (r, s): on small elements far from the origin
+    // (projected coordinates) that is above any fixed tolerance, and a step
+    // bouncing at round-off must count as converged.
+    let noise = 16.0 * f64::EPSILON * p[0].abs().max(p[1].abs()).max(ax.abs()).max(ay.abs());
     let (mut r, mut s) = (0.0, 0.0);
     for _ in 0..50 {
         let fx = ax + bx * r + cx * s + dx * r * s - p[0];
@@ -76,7 +81,8 @@ pub fn inverse_bilinear(vertices: &[[f64; 2]; 4], p: [f64; 2]) -> Option<[f64; 2
         let ds = (-yr * fx + xr * fy) / det;
         r -= dr;
         s -= ds;
-        if dr.abs().max(ds.abs()) < 1e-14 * (1.0 + r.abs().max(s.abs())) {
+        if dr.abs().max(ds.abs()) < 1e-14 * (1.0 + r.abs().max(s.abs())) + noise / det.abs().sqrt()
+        {
             return Some([r, s]);
         }
         if r.abs().max(s.abs()) > 1e6 {
@@ -342,6 +348,48 @@ mod tests {
                 assert!(
                     (rr - r).abs() < 1e-12 && (ss - s).abs() < 1e-12,
                     "{vertices:?}"
+                );
+            }
+        }
+    }
+
+    /// Regression: Newton's step settles at the round-off of x(r, s) − p,
+    /// which on a small element far from the origin is above 1e-14 in (r, s).
+    /// A fixed tolerance then ran out of iterations and reported points inside
+    /// as outside: the cage centres of the fjord-farm mesh (a 20 m quad at
+    /// x ≈ 6 km, found by dg-viz) and most points on UTM-scale meshes.
+    #[test]
+    fn inverse_bilinear_converges_at_round_off_far_from_the_origin() {
+        let farm = [
+            [5980.243973360533, 2996.022050984966],
+            [5973.01191486553, 3014.8088120528337],
+            [5952.808833700457, 3010.6876645752254],
+            [5960.487946721068, 2992.0441019699315],
+        ];
+        let [r, s] = inverse_bilinear(&farm, [5960.0, 3000.0]).expect("converges");
+        assert!(
+            (r + 0.2024).abs() < 1e-3 && (s - 0.7417).abs() < 1e-3,
+            "{r} {s}"
+        );
+
+        // A skewed 20 m quad at UTM northings: every point of a grid over it.
+        let (x0, y0) = (512_345.678, 7_045_678.901);
+        let utm =
+            [[0.0, 0.0], [21.0, 1.5], [19.5, 18.0], [-1.0, 20.5]].map(|[x, y]| [x0 + x, y0 + y]);
+        for i in 0..=20 {
+            for j in 0..=20 {
+                let (r, s) = (-1.0 + 0.1 * i as f64, -1.0 + 0.1 * j as f64);
+                let n = [
+                    0.25 * (1.0 - r) * (1.0 - s),
+                    0.25 * (1.0 + r) * (1.0 - s),
+                    0.25 * (1.0 + r) * (1.0 + s),
+                    0.25 * (1.0 - r) * (1.0 + s),
+                ];
+                let p = [0, 1].map(|d| (0..4).map(|v| n[v] * utm[v][d]).sum::<f64>());
+                let [rr, ss] = inverse_bilinear(&utm, p).expect("converges");
+                assert!(
+                    (rr - r).abs() < 1e-8 && (ss - s).abs() < 1e-8,
+                    "({r}, {s}) → ({rr}, {ss})"
                 );
             }
         }

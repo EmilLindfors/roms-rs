@@ -316,3 +316,80 @@ fn test_viscosity_parallel_consistency() {
         "Parallel RHS with viscosity should match serial: max diff = {max_diff:.2e}"
     );
 }
+
+/// `SWEPhysics2DBuilder::with_viscosity` reaches the `Simulation` path.
+///
+/// A shear flow u = ε·sin(y), v = 0 over a flat bed on a periodic domain is an
+/// exact solution with no pressure gradient and no advection (u·∇u = 0), so the
+/// viscous momentum equation reduces to ∂u/∂t = ν ∂²u/∂y²: hu decays as
+/// ε·sin(y)·exp(−νt). The same run without viscosity must not decay.
+#[test]
+fn test_physics_builder_viscosity_decays_shear_flow() {
+    use dg_rs::Simulation;
+    use dg_rs::physics::PhysicsBuilder;
+    use dg_rs::time::SSPRK3;
+    use std::sync::Arc;
+
+    let (nu, eps, t_end) = (0.1, 0.01, 1.0);
+    let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, 2.0 * PI, 0.0, 2.0 * PI, 8, 8));
+    let ops = Arc::new(DGOperators2D::new(3));
+    let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+    let amplitude = |viscous: bool| {
+        let mut builder = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(9.81),
+            Reflective2D::new(),
+        );
+        if viscous {
+            builder = builder.with_viscosity(HorizontalViscosity2D::constant(nu));
+        }
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        q.set_from_functions(&mesh, &ops, |_, _| 1.0, |_, y| eps * y.sin(), |_, _| 0.0);
+        let result = Simulation::new(builder.build(), SSPRK3)
+            .with_dt_max(0.005)
+            .run(&mut q, 0.0, t_end);
+        assert!(result.success, "{:?}", result.error);
+        q.data[1].iter().map(|v| v.abs()).fold(0.0_f64, f64::max) / eps
+    };
+
+    let viscous = amplitude(true);
+    let expected = (-nu * t_end).exp();
+    assert!(
+        (viscous - expected).abs() < 1e-3,
+        "decay {viscous:.6} against exp(-νt) = {expected:.6}"
+    );
+    let inviscid = amplitude(false);
+    assert!(
+        (inviscid - 1.0).abs() < 1e-6,
+        "inviscid amplitude {inviscid:.8}"
+    );
+}
+
+/// Local time stepping cannot run BR1 viscosity (it couples elements two faces
+/// apart): it must refuse loudly rather than silently run inviscid (TODO P2.5).
+#[test]
+#[should_panic(expected = "local time stepping does not support horizontal viscosity")]
+fn test_local_time_stepping_refuses_viscosity() {
+    use dg_rs::Simulation;
+    use dg_rs::physics::PhysicsBuilder;
+    use dg_rs::time::MultirateSSPRK3;
+    use std::sync::Arc;
+
+    let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, 2.0 * PI, 0.0, 2.0 * PI, 4, 4));
+    let ops = Arc::new(DGOperators2D::new(2));
+    let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+    let physics = PhysicsBuilder::swe_2d(
+        mesh.clone(),
+        ops.clone(),
+        geom,
+        ShallowWater2D::new(9.81),
+        Reflective2D::new(),
+    )
+    .with_viscosity(HorizontalViscosity2D::constant(0.1))
+    .build();
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    q.set_from_functions(&mesh, &ops, |_, _| 1.0, |_, y| 0.01 * y.sin(), |_, _| 0.0);
+    Simulation::new(physics, MultirateSSPRK3::new(2)).run(&mut q, 0.0, 0.1);
+}
