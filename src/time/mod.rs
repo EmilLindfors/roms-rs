@@ -38,7 +38,7 @@ pub use mode_split::{
     ModeSplitIntegrator, ModeSplitPhysics, SplitMethod, step_average_weights,
 };
 pub use multirate::{
-    LocalTimeStepping, MultirateSSPRK3, MultirateStats, MultirateStepper, assign_levels,
+    LocalTimeStepping, MultirateSSPRK3, MultirateStats, MultirateStepper, RhsStencil, assign_levels,
 };
 pub use ssp_rk3::{compute_dt, ssp_rk3_step, ssp_rk3_step_timed};
 pub use ssp_rk3_2d::{run_advection_2d, ssp_rk3_step_2d, ssp_rk3_step_2d_timed};

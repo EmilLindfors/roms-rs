@@ -2,8 +2,8 @@
 //!
 //! This module provides builder patterns for constructing physics modules.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::equations::ShallowWater2D;
@@ -27,12 +27,14 @@ use crate::solver::{
 };
 use crate::solver::{
     apply_wet_dry_correction_element, compute_rhs_swe_2d_subset_then, element_dt_swe_2d,
+    element_dt_viscous_swe_2d,
 };
 use crate::source::{
     BottomFriction2D, CageDrag2D, HorizontalViscosity2D, SourceTerm2D, SourceTerms2D,
+    ViscosityModel,
 };
 use crate::time::LocalTimeStepping;
-use crate::time::multirate::ElementStage;
+use crate::time::multirate::{ElementStage, RhsStencil};
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -104,12 +106,15 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     pub friction: Option<Arc<dyn BottomFriction2D>>,
     /// Net-cage drag applied point-implicitly, if any
     pub cages: Option<Arc<CageDrag2D>>,
-    /// Horizontal eddy viscosity (BR1), if any; global time stepping only
+    /// Horizontal eddy viscosity (BR1), if any
     pub viscosity: Option<Arc<HorizontalViscosity2D>>,
     /// Polynomial order
     pub order: usize,
     /// Elements emptied because their mean depth was negative
     negative_depth_clips: AtomicUsize,
+    /// Viscous time step of every element at CFL 1, for the constant
+    /// viscosity it was computed for (geometry only; computed at first use)
+    viscous_dt: OnceLock<(f64, Vec<f64>)>,
 }
 
 impl<BC: SWEBoundaryCondition2D> PhysicsModuleInfo for SWEPhysics2D<BC> {
@@ -189,6 +194,30 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
         }
     }
 
+    /// Stable time step of the viscous term alone on every element at CFL 1
+    /// ([`element_dt_viscous_swe_2d`]), for a constant viscosity.
+    /// Smagorinsky's ν follows the strain and is not bounded a priori.
+    fn viscous_dt(&self) -> Option<std::borrow::Cow<'_, [f64]>> {
+        let ViscosityModel::Constant(nu) = self.viscosity.as_deref()?.model else {
+            return None;
+        };
+        let compute = || -> Vec<f64> {
+            (0..self.mesh.n_elements)
+                .map(|k| {
+                    element_dt_viscous_swe_2d(
+                        &self.mesh, &self.ops, &self.geom, nu, self.order, 1.0, k,
+                    )
+                })
+                .collect()
+        };
+        let (cached_nu, cached) = self.viscous_dt.get_or_init(|| (nu, compute()));
+        Some(if *cached_nu == nu {
+            std::borrow::Cow::Borrowed(cached.as_slice())
+        } else {
+            std::borrow::Cow::Owned(compute())
+        })
+    }
+
     /// RHS configuration for this module's components.
     fn rhs_config(&self) -> crate::solver::SWE2DRhsConfig<'_, BC> {
         use crate::solver::SWE2DRhsConfig;
@@ -218,6 +247,18 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     }
 }
 
+/// Time step for two rates at once: `1/(1/a + 1/b)`, with `a` and `b` the
+/// steps each allows alone (advection and viscosity).
+fn combine_dt(a: f64, b: f64) -> f64 {
+    if a.is_infinite() {
+        b
+    } else if b.is_infinite() {
+        a
+    } else {
+        1.0 / (1.0 / a + 1.0 / b)
+    }
+}
+
 impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<BC> {
     fn compute_rhs(&self, state: &SWESolution2D, time: f64) -> SWESolution2D {
         let mut out = SWESolution2D::new(self.mesh.n_elements, self.ops.n_nodes);
@@ -243,14 +284,21 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
         #[cfg(feature = "parallel")]
         use crate::solver::compute_dt_swe_2d_parallel as dt;
 
-        dt(
+        let dt = dt(
             state,
             &self.mesh,
             &self.geom,
             &self.equation,
             self.order,
             cfl,
-        )
+        );
+        match self.viscous_dt() {
+            Some(viscous) => {
+                let dt_viscous = viscous.iter().copied().fold(f64::INFINITY, f64::min);
+                combine_dt(dt, cfl * dt_viscous)
+            }
+            None => dt,
+        }
     }
 
     /// Limiter, then positivity and velocity desingularization (wet/dry).
@@ -300,10 +348,19 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
 }
 
 /// Local time stepping ([`crate::time::MultirateSSPRK3`]). Supports every
-/// formulation, source term, boundary condition, wetting/drying and the
-/// point-implicit damping; not horizontal viscosity or the Kuzmin limiters
-/// (not element-local; they panic).
+/// formulation, source term, boundary condition, wetting/drying, the
+/// point-implicit damping and horizontal viscosity (a two-hop stencil); not
+/// the Kuzmin limiters (not element-local; they panic).
 impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics2D<BC> {
+    /// Wider with horizontal viscosity: BR1 reads the neighbours' gradients.
+    fn stencil(&self) -> RhsStencil {
+        if self.viscosity.is_some() {
+            RhsStencil::FacesAndCorners
+        } else {
+            RhsStencil::Faces
+        }
+    }
+
     fn element_dt(&self, state: &SWESolution2D, cfl: f64, out: &mut [f64]) {
         element_dt_swe_2d(
             state,
@@ -315,6 +372,11 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             cfl,
             out,
         );
+        if let Some(viscous) = self.viscous_dt() {
+            for (dt, &dt_viscous) in out.iter_mut().zip(viscous.iter()) {
+                *dt = combine_dt(*dt, cfl * dt_viscous);
+            }
+        }
     }
 
     /// The RHS, then per element and in the same pass: the stage
@@ -606,9 +668,9 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
     }
 
     /// Add horizontal eddy viscosity (constant or Smagorinsky, BR1 face
-    /// coupling). It couples each element to its neighbours' gradients, so it
-    /// is not element-local: global time stepping only (`SSPRK3`), and it
-    /// allocates per RHS evaluation (TODO P2.3).
+    /// coupling). It couples each element to its neighbours' gradients, so
+    /// the RHS of an element also reads the elements at its neighbours' far
+    /// corners; local time stepping follows that wider stencil.
     pub fn with_viscosity(mut self, viscosity: HorizontalViscosity2D) -> Self {
         self.viscosity = Some(Arc::new(viscosity));
         self
@@ -671,6 +733,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             viscosity: self.viscosity,
             order: self.order,
             negative_depth_clips: AtomicUsize::new(0),
+            viscous_dt: OnceLock::new(),
         }
     }
 }

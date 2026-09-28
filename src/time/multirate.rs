@@ -61,11 +61,21 @@
 //! outrunning an element's time step (a nearly dry element otherwise gets an
 //! enormous one). Levels are reassigned every coarse step.
 //!
-//! **Cost.** The stage-s values of an element change only when those within
-//! s face hops change. So an element's stage-s RHS is evaluated only at the
-//! rate rₛ(k), the finest level within s hops, and reused in between. Near a
-//! level interface the coarse side pays up to three element layers at the
-//! finer rate; elsewhere every element runs at its own level.
+//! **Cost.** An element's RHS reads the state of its stencil
+//! ([`LocalTimeStepping::stencil`]: its face neighbours for the fluxes, and
+//! with BR1 horizontal viscosity also the elements at their far corners), so
+//! its stage-s values change only when those within s stencil steps change.
+//! Its stage-s RHS is therefore evaluated only at the rate rₛ(k), the finest
+//! level within s stencil steps, and reused in between. Near a level
+//! interface the coarse side pays up to three stencil widths at the finer
+//! rate; elsewhere every element runs at its own level.
+//!
+//! A reused RHS is the one the element would compute again: its inputs,
+//! including its substep's stage time, are unchanged. So the flux through a
+//! face at (p, s) is the same seen from both sides, also for a viscous flux
+//! that reads the neighbours' gradients (each evaluated at its own
+//! element's stage time). A stencil that is too narrow breaks exactly this,
+//! and with it conservation (`tests/local_time_stepping_test.rs`).
 
 use crate::mesh::Mesh2D;
 use crate::types::ElementIndex;
@@ -95,6 +105,20 @@ pub struct ElementStage {
     pub accumulate: Option<(f64, f64)>,
 }
 
+/// The elements whose state the RHS of an element k reads
+/// ([`LocalTimeStepping::stencil`]), besides k itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RhsStencil {
+    /// Its face neighbours (numerical fluxes).
+    Faces,
+    /// Its face neighbours j and, for each, the elements across the two
+    /// faces of j that meet the shared face at its corners: BR1 viscosity,
+    /// whose face flux reads j's gradient at the shared face's nodes. With
+    /// the diagonal GLL LIFT, that gradient reads beyond j only at the corner
+    /// nodes. On a structured mesh: the 3 × 3 block around k.
+    FacesAndCorners,
+}
+
 /// The element-subset operations that local time stepping needs from a
 /// physics module (see
 /// [`PhysicsModule::local_time_stepping`](crate::physics::PhysicsModule::local_time_stepping)).
@@ -108,11 +132,18 @@ pub trait LocalTimeStepping<S>: Sync {
     /// value per mesh element; `f64::INFINITY` where nothing limits it).
     fn element_dt(&self, state: &S, cfl: f64, out: &mut [f64]);
 
+    /// The elements whose state an element's RHS reads.
+    fn stencil(&self) -> RhsStencil {
+        RhsStencil::Faces
+    }
+
     /// One stage for every listed element k, with stage `plan(k)` (see
-    /// [`ElementStage`]): its RHS from `input`, which may read the element's
-    /// own and its face neighbours' values, nothing further away; the new
-    /// stage value into its rows of `out`, and its sum into `acc` when the
-    /// stage accumulates (`acc` must then be given).
+    /// [`ElementStage`]): its RHS from `input`, which may read the values
+    /// of its [`Self::stencil`], nothing further away; the new stage value
+    /// into its rows of `out`, and its sum into `acc` when the stage
+    /// accumulates (`acc` must then be given). `plan` may also be called for
+    /// the face neighbours of the listed elements (their stage time, e.g. for
+    /// the boundary values of their gradients).
     fn stage_where(
         &self,
         base: &S,
@@ -289,6 +320,42 @@ fn spread_to_neighbours(mesh: &Mesh2D, from: &[u8], to: &mut [u8], drop: u8) -> 
         .fold(false, |a, b| a | b)
 }
 
+/// `to[k]` = the largest `from` over k and its `stencil`.
+fn spread_over_stencil(mesh: &Mesh2D, from: &[u8], to: &mut [u8], stencil: RhsStencil) {
+    match stencil {
+        RhsStencil::Faces => {
+            spread_to_neighbours(mesh, from, to, 0);
+        }
+        RhsStencil::FacesAndCorners => {
+            let element = |(k, out): (usize, &mut u8)| {
+                let mut max = from[k];
+                for face in 0..4 {
+                    let Some(nb) = mesh.neighbor(ElementIndex::new(k), face) else {
+                        continue;
+                    };
+                    max = max.max(from[nb.element]);
+                    // Across the faces of the neighbour adjacent to the
+                    // shared one (faces are numbered around the element)
+                    let nb_idx = ElementIndex::new(nb.element);
+                    for side in [1, 3] {
+                        if let Some(corner) = mesh.neighbor(nb_idx, (nb.face + side) % 4) {
+                            max = max.max(from[corner.element]);
+                        }
+                    }
+                }
+                *out = max;
+            };
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                to.par_iter_mut().enumerate().for_each(element);
+            }
+            #[cfg(not(feature = "parallel"))]
+            to.iter_mut().enumerate().for_each(element);
+        }
+    }
+}
+
 /// Raise levels until face neighbours differ by at most one (the coarser
 /// side is refined; smaller steps stay stable). An element then sees at most
 /// two neighbour substeps per substep of its own, so water from a neighbour
@@ -367,7 +434,7 @@ pub struct MultirateStepper<S> {
     element_dt: Vec<f64>,
     level: Vec<u8>,
     /// `rate[s][k]`: the level whose substeps element k's stage-(s + 1) RHS
-    /// follows, the finest level within s + 1 face hops
+    /// follows, the finest level within s + 1 steps of the RHS stencil
     rate: [Vec<u8>; 3],
     /// Elements by decreasing `rate[s]` and by decreasing level, with the
     /// counts at or above each depth (see [`sort_descending`]): the active
@@ -426,14 +493,15 @@ impl<S: Integrable> MultirateStepper<S> {
             assign_levels(&self.element_dt, self.max_levels, dt_cap, &mut self.level);
         self.finest = finest;
 
+        let stencil = local.stencil();
         let [r1, r2, r3] = &mut self.rate;
         for r in [&mut *r1, &mut *r2, &mut *r3] {
             r.resize(n, 0);
         }
         limit_level_jumps(mesh, &mut self.level, r1);
-        spread_to_neighbours(mesh, &self.level, r1, 0);
-        spread_to_neighbours(mesh, r1, r2, 0);
-        spread_to_neighbours(mesh, r2, r3, 0);
+        spread_over_stencil(mesh, &self.level, r1, stencil);
+        spread_over_stencil(mesh, r1, r2, stencil);
+        spread_over_stencil(mesh, r2, r3, stencil);
         self.evaluations_per_step = self.rate.iter().flatten().map(|&r| 1u64 << r).sum();
         for s in 0..3 {
             sort_descending(
@@ -648,6 +716,32 @@ mod tests {
         assert_eq!(r1, [0, 0, 0, 0, 2, 2]);
         assert_eq!(r2, [0, 0, 0, 2, 2, 2]);
         assert_eq!(r3, [0, 0, 2, 2, 2, 2]);
+    }
+
+    /// The viscous stencil of an element on a structured mesh is the 3 × 3
+    /// block around it: face neighbours and diagonals, not two faces away.
+    #[test]
+    fn corner_stencil_is_the_block_around_an_element() {
+        // 5 × 5 elements, row-major from the bottom left; the centre on level 1
+        let mesh = Mesh2D::uniform_rectangle(0.0, 5.0, 0.0, 5.0, 5, 5);
+        let at = |i: usize, j: usize| j * 5 + i;
+        let mut level = vec![0u8; 25];
+        level[at(2, 2)] = 1;
+        let mut rate = vec![0u8; 25];
+        spread_over_stencil(&mesh, &level, &mut rate, RhsStencil::FacesAndCorners);
+        for j in 0..5_usize {
+            for i in 0..5_usize {
+                let in_block = i.abs_diff(2) <= 1 && j.abs_diff(2) <= 1;
+                assert_eq!(rate[at(i, j)], in_block as u8, "element ({i}, {j})");
+            }
+        }
+        spread_over_stencil(&mesh, &level, &mut rate, RhsStencil::Faces);
+        for j in 0..5_usize {
+            for i in 0..5_usize {
+                let in_cross = i.abs_diff(2) + j.abs_diff(2) <= 1;
+                assert_eq!(rate[at(i, j)], in_cross as u8, "element ({i}, {j})");
+            }
+        }
     }
 
     #[test]

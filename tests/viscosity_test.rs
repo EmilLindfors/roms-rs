@@ -367,18 +367,29 @@ fn test_physics_builder_viscosity_decays_shear_flow() {
     );
 }
 
-/// Local time stepping cannot run BR1 viscosity (it couples elements two faces
-/// apart): it must refuse loudly rather than silently run inviscid (TODO P2.5).
-#[test]
-#[should_panic(expected = "local time stepping does not support horizontal viscosity")]
-fn test_local_time_stepping_refuses_viscosity() {
+/// Shear flow u = ε·sin(y) on a periodic 2π domain (the exact solution
+/// ε·sin(y)·exp(−νt) of `test_physics_builder_viscosity_decays_shear_flow`)
+/// run through `Simulation` at CFL 1 with the time step it chooses.
+fn simulated_shear_decay(nu: f64, t_end: f64, local: bool, grade: f64) -> f64 {
     use dg_rs::Simulation;
     use dg_rs::physics::PhysicsBuilder;
-    use dg_rs::time::MultirateSSPRK3;
+    use dg_rs::time::{MultirateSSPRK3, SSPRK3};
     use std::sync::Arc;
 
-    let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, 2.0 * PI, 0.0, 2.0 * PI, 4, 4));
-    let ops = Arc::new(DGOperators2D::new(2));
+    let eps = 0.01;
+    let mut mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 2.0 * PI, 12, 8);
+    // Columns growing geometrically along x (the flow does not vary along x)
+    for v in &mut mesh.vertices {
+        v[0] = 2.0
+            * PI
+            * if grade == 1.0 {
+                v[0]
+            } else {
+                (grade.powf(12.0 * v[0]) - 1.0) / (grade.powf(12.0) - 1.0)
+            };
+    }
+    let mesh = Arc::new(mesh);
+    let ops = Arc::new(DGOperators2D::new(3));
     let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
     let physics = PhysicsBuilder::swe_2d(
         mesh.clone(),
@@ -387,9 +398,112 @@ fn test_local_time_stepping_refuses_viscosity() {
         ShallowWater2D::new(9.81),
         Reflective2D::new(),
     )
-    .with_viscosity(HorizontalViscosity2D::constant(0.1))
+    .with_viscosity(HorizontalViscosity2D::constant(nu))
     .build();
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-    q.set_from_functions(&mesh, &ops, |_, _| 1.0, |_, y| 0.01 * y.sin(), |_, _| 0.0);
-    Simulation::new(physics, MultirateSSPRK3::new(2)).run(&mut q, 0.0, 0.1);
+    q.set_from_functions(&mesh, &ops, |_, _| 1.0, |_, y| eps * y.sin(), |_, _| 0.0);
+    let result = if local {
+        let result = Simulation::new(physics, MultirateSSPRK3::new(8))
+            .with_cfl(1.0)
+            .run(&mut q, 0.0, t_end);
+        let stats = result.local_time_stepping.expect("multirate stats");
+        assert!(stats.finest_level >= 2, "{stats:?}");
+        result
+    } else {
+        Simulation::new(physics, SSPRK3)
+            .with_cfl(1.0)
+            .run(&mut q, 0.0, t_end)
+    };
+    assert!(result.success, "{:?}", result.error);
+    q.data[1].iter().map(|v| v.abs()).fold(0.0_f64, f64::max) / eps
+}
+
+/// With a viscosity strong enough that the diffusive limit, not the gravity
+/// wave, sets the time step (ν = 5 m²/s on elements of 0.5 m at P3: ≈ 20×
+/// below the advective step), `Simulation` stays stable at CFL 1 and follows
+/// exp(−νt). Without the viscous bound in `compute_dt` it took the advective
+/// step and blew up.
+#[test]
+fn test_viscous_time_step_bound_keeps_simulation_stable() {
+    let (nu, t_end) = (5.0, 0.2);
+    let decay = simulated_shear_decay(nu, t_end, false, 1.0);
+    let expected = (-nu * t_end).exp();
+    assert!(
+        (decay - expected).abs() < 1e-3 * expected,
+        "decay {decay:.6} against exp(-νt) = {expected:.6}"
+    );
+}
+
+/// The same under local time stepping on columns graded by 1.2 (element
+/// widths 7× apart, levels set by the viscous limit ∝ width²): stable, and
+/// the decay is still exp(−νt).
+#[test]
+fn test_viscous_decay_under_local_time_stepping() {
+    let (nu, t_end) = (5.0, 0.2);
+    let decay = simulated_shear_decay(nu, t_end, true, 1.2);
+    let expected = (-nu * t_end).exp();
+    assert!(
+        (decay - expected).abs() < 1e-3 * expected,
+        "decay {decay:.6} against exp(-νt) = {expected:.6}"
+    );
+}
+
+/// `element_dt_viscous_swe_2d` bounds the spectral radius ρ of the BR1
+/// viscous operator (power iteration on periodic meshes of square and 4:1
+/// elements, P1–P4): ρ·Δt ≤ 2.5127 (SSP-RK3's real-axis limit) at CFL 1,
+/// and not far below it.
+#[test]
+fn test_viscous_dt_bounds_the_br1_spectral_radius() {
+    use dg_rs::solver::{SWEFormulation2D, element_dt_viscous_swe_2d};
+
+    let nu = 1.0;
+    let visc = HorizontalViscosity2D::constant(nu);
+    let equation = ShallowWater2D::new(9.81);
+    let bc = Reflective2D::new();
+    // Entropy-conservative fluxes: no interface dissipation, so at rest over
+    // a flat bed the momentum RHS of a tiny velocity is the viscous term
+    let config = SWE2DRhsConfig::new(&equation, &bc)
+        .with_coriolis(false)
+        .with_formulation(SWEFormulation2D::EntropyConservative)
+        .with_viscosity(&visc);
+    for (nx, ny) in [(4, 4), (8, 2)] {
+        let mesh = Mesh2D::uniform_periodic(0.0, 8.0, 0.0, 8.0, nx, ny);
+        for order in 1..=4 {
+            let ops = DGOperators2D::new(order);
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            let n = mesh.n_elements * ops.n_nodes;
+            let mut v: Vec<f64> = (0..2 * n)
+                .map(|i| ((i * 7919) % 101) as f64 - 50.0)
+                .collect();
+            let eps = 1e-7;
+            let mut rho = 0.0;
+            for _ in 0..200 {
+                let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+                v.iter_mut().for_each(|x| *x /= norm);
+                let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                q.data[0].fill(1.0);
+                for (var, part) in [1, 2].into_iter().zip(v.chunks_exact(n)) {
+                    for (x, &p) in q.data[var].iter_mut().zip(part) {
+                        *x = eps * p;
+                    }
+                }
+                let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+                let w: Vec<f64> = rhs.data[1]
+                    .iter()
+                    .chain(&rhs.data[2])
+                    .map(|x| x / eps)
+                    .collect();
+                rho = w.iter().zip(&v).map(|(a, b)| a * b).sum::<f64>().abs();
+                v = w;
+            }
+            let dt = element_dt_viscous_swe_2d(&mesh, &ops, &geom, nu, order, 1.0, 0);
+            let product = rho * dt;
+            println!("{nx}x{ny} P{order}: rho {rho:.3}, rho·dt {product:.3}");
+            assert!(product <= 2.5127, "{nx}x{ny} P{order}: ρ·Δt = {product:.4}");
+            assert!(
+                product > 0.7 * 2.5127,
+                "{nx}x{ny} P{order}: ρ·Δt = {product:.4}"
+            );
+        }
+    }
 }

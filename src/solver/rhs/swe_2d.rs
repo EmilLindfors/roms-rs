@@ -18,14 +18,14 @@ use crate::flux::{SWEFluxType2D, compute_flux_swe_2d};
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::disjoint::{DisjointChunks, all_distinct};
-use crate::solver::state::{SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{SWESolution2D, SWEState2D};
 use crate::source::swe_2d::viscosity::HorizontalViscosity2D;
 use crate::source::{ElementSources, HydrostaticReconstruction2D, SourceTerm2D};
 use crate::types::ElementIndex;
 
-use super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
+use super::diffusion_2d::ScalarGradient2D;
 use super::swe_2d_split_form::{SplitFormSWE2D, SplitFormWorkspace};
+use super::swe_2d_viscosity::{ViscousScratch, ViscousTerm, ViscousWorkspace};
 #[cfg(feature = "simd")]
 use crate::solver::simd::{apply_diff_matrix, apply_lift, coriolis_source};
 #[cfg(not(feature = "simd"))]
@@ -302,111 +302,6 @@ pub(super) fn boundary_state<BC: SWEBoundaryCondition2D>(
     config.bc.boundary_state(&ctx)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn boundary_velocity_component<BC: SWEBoundaryCondition2D>(
-    component: usize,
-    q: &SWESolution2D,
-    mesh: &Mesh2D,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-    config: &SWE2DRhsConfig<BC>,
-    time: f64,
-    visc_h_min: f64,
-    k: ElementIndex,
-    face: usize,
-    fi: usize,
-    node: usize,
-) -> f64 {
-    let normal = geom.normal(k.as_usize(), face, fi);
-    let ghost = boundary_state(q, mesh, ops, config, time, k, face, node, normal).state();
-    if ghost.h <= visc_h_min {
-        return 0.0;
-    }
-
-    let h_safe = ghost.h.max(visc_h_min);
-    match component {
-        0 => ghost.hu / h_safe,
-        1 => ghost.hv / h_safe,
-        _ => unreachable!("invalid velocity component"),
-    }
-}
-
-fn add_br1_viscosity<BC: SWEBoundaryCondition2D>(
-    rhs: &mut SWESolution2D,
-    q: &SWESolution2D,
-    mesh: &Mesh2D,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-    config: &SWE2DRhsConfig<BC>,
-    time: f64,
-) {
-    let Some(visc) = config.viscosity else {
-        return;
-    };
-
-    let n_nodes = ops.n_nodes;
-    let total_nodes = mesh.n_elements * n_nodes;
-    let mut u = vec![0.0; total_nodes];
-    let mut v = vec![0.0; total_nodes];
-
-    for k in ElementIndex::iter(mesh.n_elements) {
-        for i in 0..n_nodes {
-            let flat = k.as_usize() * n_nodes + i;
-            let state = q.get_state(k, i);
-            if state.h > visc.h_min {
-                let h_safe = state.h.max(visc.h_min);
-                u[flat] = state.hu / h_safe;
-                v[flat] = state.hv / h_safe;
-            }
-        }
-    }
-
-    let boundary_u_for_gradient = |k, face, fi, node, _interior| {
-        boundary_velocity_component(
-            0, q, mesh, ops, geom, config, time, visc.h_min, k, face, fi, node,
-        )
-    };
-    let boundary_v_for_gradient = |k, face, fi, node, _interior| {
-        boundary_velocity_component(
-            1, q, mesh, ops, geom, config, time, visc.h_min, k, face, fi, node,
-        )
-    };
-
-    let grad_u = compute_br1_gradient_2d(&u, mesh, ops, geom, boundary_u_for_gradient);
-    let grad_v = compute_br1_gradient_2d(&v, mesh, ops, geom, boundary_v_for_gradient);
-
-    let mut coeff = vec![0.0; total_nodes];
-    for k in ElementIndex::iter(mesh.n_elements) {
-        // Filter width: half the element size (√J for affine elements)
-        let delta = 0.5 * geom.element_size(k.as_usize());
-        for i in 0..n_nodes {
-            let flat = k.as_usize() * n_nodes + i;
-            let state = q.get_state(k, i);
-            if state.h > visc.h_min {
-                let nu = visc.compute_viscosity(
-                    grad_u[flat].dx,
-                    grad_u[flat].dy,
-                    grad_v[flat].dx,
-                    grad_v[flat].dy,
-                    delta,
-                );
-                coeff[flat] = nu * state.h;
-            }
-        }
-    }
-
-    let diff_u = compute_br1_diffusion_rhs_2d(&u, &coeff, &grad_u, mesh, ops, geom);
-    let diff_v = compute_br1_diffusion_rhs_2d(&v, &coeff, &grad_v, mesh, ops, geom);
-
-    for k in ElementIndex::iter(mesh.n_elements) {
-        for i in 0..n_nodes {
-            let flat = k.as_usize() * n_nodes + i;
-            rhs.data[SWE_VAR_HU][flat] += diff_u[flat];
-            rhs.data[SWE_VAR_HV][flat] += diff_v[flat];
-        }
-    }
-}
-
 /// Scratch space for one element of the RHS kernel (SoA, one `Vec` per
 /// variable).
 struct ElementWorkspace {
@@ -430,6 +325,7 @@ struct ElementWorkspace {
     int_bathy: Vec<f64>,
     ext_bathy: Vec<f64>,
     split_form: SplitFormWorkspace,
+    viscous: ViscousScratch,
 }
 
 /// `n` zeros with two cache lines of unused capacity after them.
@@ -469,6 +365,7 @@ impl ElementWorkspace {
             int_bathy: padded(n_face_nodes),
             ext_bathy: padded(n_face_nodes),
             split_form: SplitFormWorkspace::new(n_nodes),
+            viscous: ViscousScratch::new(n_nodes),
         }
     }
 }
@@ -573,6 +470,83 @@ impl Drop for FaceFluxGuard {
                 *slot = faces;
             }
         });
+    }
+}
+
+thread_local! {
+    /// Viscous-term workspace (velocity gradients of every node), cached on
+    /// the thread that drives the RHS.
+    static VISCOUS_WORKSPACE: RefCell<ViscousWorkspace> = RefCell::new(ViscousWorkspace::default());
+}
+
+/// The viscous workspace, taken from this thread's cache for one RHS
+/// evaluation and returned on drop (a nested evaluation on the same thread
+/// gets a fresh one).
+struct ViscousGuard(ViscousWorkspace);
+
+impl ViscousGuard {
+    /// The gradients of u and v (whole-mesh arrays).
+    fn gradients(&self) -> [&[ScalarGradient2D]; 2] {
+        [&self.0.grad_u, &self.0.grad_v]
+    }
+
+    /// With gradient storage for every node of `n_elements × n_nodes`.
+    fn take(n_total: usize) -> Self {
+        let mut ws = VISCOUS_WORKSPACE
+            .with(|cell| cell.try_borrow_mut().map(|mut ws| std::mem::take(&mut *ws)))
+            .unwrap_or_default();
+        ws.resize(n_total);
+        Self(ws)
+    }
+}
+
+impl Drop for ViscousGuard {
+    fn drop(&mut self) {
+        let ws = std::mem::take(&mut self.0);
+        // Keep the larger buffers; `try_with`: the thread-local may be gone
+        // at thread exit
+        let _ = VISCOUS_WORKSPACE.try_with(|cell| {
+            if let Ok(mut slot) = cell.try_borrow_mut()
+                && slot.grad_u.capacity() < ws.grad_u.capacity()
+            {
+                *slot = ws;
+            }
+        });
+    }
+}
+
+/// Pass 1 of the viscous term (its gradients) over every element at `time`,
+/// in parallel with `parallel`.
+fn viscous_gradients_all<BC: SWEBoundaryCondition2D>(
+    viscous: &ViscousTerm<BC>,
+    ops: &DGOperators2D,
+    time: f64,
+    ws: &mut ViscousWorkspace,
+    parallel: bool,
+) {
+    let n = ops.n_nodes;
+    let ViscousWorkspace { grad_u, grad_v, .. } = ws;
+    #[cfg(feature = "parallel")]
+    if parallel {
+        use rayon::prelude::*;
+        grad_u
+            .par_chunks_exact_mut(n)
+            .zip(grad_v.par_chunks_exact_mut(n))
+            .enumerate()
+            .for_each_init(
+                || WorkspaceGuard::take(ops),
+                |ws, (k, (gu, gv))| viscous.gradients(k, time, &mut ws.viscous, gu, gv),
+            );
+        return;
+    }
+    let _ = parallel;
+    let mut ws = WorkspaceGuard::take(ops);
+    for (k, (gu, gv)) in grad_u
+        .chunks_exact_mut(n)
+        .zip(grad_v.chunks_exact_mut(n))
+        .enumerate()
+    {
+        viscous.gradients(k, time, &mut ws.viscous, gu, gv);
     }
 }
 
@@ -986,6 +960,7 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
         );
         fm.chunks_exact_mut(per_element)
     });
+    let viscous = viscous_all(q, mesh, ops, geom, config, time, false);
     let [out_h, out_hu, out_hv] = &mut out.data;
     let mut ws = WorkspaceGuard::take(ops);
     for (k, ((h, hu), hv)) in out_h
@@ -995,9 +970,29 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
         .enumerate()
     {
         let fm = face_mass.as_mut().and_then(Iterator::next);
-        kernel.element(k, &mut ws, &faces, [h, hu, hv], fm);
+        kernel.element(k, &mut ws, &faces, [h, &mut *hu, &mut *hv], fm);
+        if let Some((term, grads)) = &viscous {
+            term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
+        }
     }
-    add_br1_viscosity(out, q, mesh, ops, geom, config, time);
+}
+
+/// The viscous term of one whole-mesh RHS evaluation with its gradients
+/// (pass 1) over every element at `time`, if `config` has viscosity.
+#[allow(clippy::too_many_arguments)]
+fn viscous_all<'a, 'c, BC: SWEBoundaryCondition2D>(
+    q: &'a SWESolution2D,
+    mesh: &'a Mesh2D,
+    ops: &'a DGOperators2D,
+    geom: &'a GeometricFactors2D,
+    config: &'a SWE2DRhsConfig<'c, BC>,
+    time: f64,
+    parallel: bool,
+) -> Option<(ViscousTerm<'a, 'c, BC>, ViscousGuard)> {
+    let term = ViscousTerm::new(q, mesh, ops, geom, config)?;
+    let mut guard = ViscousGuard::take(mesh.n_elements * ops.n_nodes);
+    viscous_gradients_all(&term, ops, time, &mut guard.0, parallel);
+    Some((term, guard))
 }
 
 fn check_rhs_output(out: &SWESolution2D, mesh: &Mesh2D, ops: &DGOperators2D) {
@@ -1126,7 +1121,54 @@ fn dt_from_reference_rate(max_rate: f64, order: usize, cfl: f64) -> f64 {
     cfl / ((2.0 * order as f64 + 1.0) * max_rate)
 }
 
+/// Largest stable SSP-RK3 step of the BR1 viscous term alone, `cfl` times
+/// the real-axis stability limit, for a constant viscosity `nu`, on element
+/// `k` (the largest metric over its own and its face neighbours' nodes: the
+/// neighbours' gradients enter its term).
+///
+/// The spectral radius of the BR1 operator (`solver/rhs/swe_2d_viscosity.rs`)
+/// is bounded by `0.0825 (N+1)⁴ ν (|∇r|² + |∇s|²)`, fitted to power
+/// iteration on periodic meshes of square and 4:1 elements (0.080, 0.080,
+/// 0.080, 0.081 for N = 1–4 on squares; the same on 4:1 elements), and
+/// SSP-RK3 is stable on the negative real axis up to `Δt·ρ = 2.5127`.
+/// `f64::INFINITY` for `nu = 0`.
+pub fn element_dt_viscous_swe_2d(
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    nu: f64,
+    order: usize,
+    cfl: f64,
+    k: usize,
+) -> f64 {
+    /// Real-axis stability limit of the three-stage, third-order RK methods
+    const SSP_RK3_REAL_AXIS: f64 = 2.5127;
+    if nu <= 0.0 {
+        return f64::INFINITY;
+    }
+    let metric = |j: usize| {
+        (0..ops.n_nodes)
+            .map(|i| {
+                let ((rx, ry), (sx, sy)) = (geom.grad_r(j, i), geom.grad_s(j, i));
+                rx * rx + ry * ry + sx * sx + sy * sy
+            })
+            .fold(0.0_f64, f64::max)
+    };
+    let k_idx = ElementIndex::new(k);
+    let largest = (0..4)
+        .filter_map(|face| mesh.neighbor(k_idx, face))
+        .map(|nb| metric(nb.element))
+        .fold(metric(k), f64::max);
+    let rate = 0.0825 * ((order + 1) as f64).powi(4) * nu * largest;
+    cfl * SSP_RK3_REAL_AXIS / rate
+}
+
 /// Compute the diffusive time step restriction for horizontal viscosity.
+///
+/// Its `(2N+1)²` underestimates the BR1 spectral radius at N ≥ 2 (by 2.0,
+/// 3.4, 5.0× at N = 2, 3, 4), so at `cfl = 1` the step exceeds SSP-RK3's
+/// stability limit from N = 3; `SWEPhysics2D` uses the measured bound of
+/// [`element_dt_viscous_swe_2d`].
 ///
 /// The diffusive CFL condition is:
 ///   Δt ≤ CFL × Δx² / (ν × (2N+1)²)
@@ -1217,6 +1259,16 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     kernel.face_fluxes_parallel(&mut faces);
     let faces: &[SWEState2D] = &faces;
     let n = ops.n_nodes;
+    let viscous = viscous_all(q, mesh, ops, geom, config, time, true);
+    let element = |ws: &mut WorkspaceGuard,
+                   k: usize,
+                   [h, hu, hv]: [&mut [f64]; 3],
+                   fm: Option<&mut [f64]>| {
+        kernel.element(k, ws, faces, [h, &mut *hu, &mut *hv], fm);
+        if let Some((term, grads)) = &viscous {
+            term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
+        }
+    };
     let [out_h, out_hu, out_hv] = &mut out.data;
     let elements = out_h
         .par_chunks_exact_mut(n)
@@ -1234,17 +1286,14 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
                 .zip(face_mass.par_chunks_exact_mut(4 * ops.n_face_nodes))
                 .for_each_init(
                     || WorkspaceGuard::take(ops),
-                    |ws, ((k, ((h, hu), hv)), fm)| {
-                        kernel.element(k, ws, faces, [h, hu, hv], Some(fm))
-                    },
+                    |ws, ((k, ((h, hu), hv)), fm)| element(ws, k, [h, hu, hv], Some(fm)),
                 );
         }
         None => elements.for_each_init(
             || WorkspaceGuard::take(ops),
-            |ws, (k, ((h, hu), hv))| kernel.element(k, ws, faces, [h, hu, hv], None),
+            |ws, (k, ((h, hu), hv))| element(ws, k, [h, hu, hv], None),
         ),
     }
-    add_br1_viscosity(out, q, mesh, ops, geom, config, time);
 }
 
 /// Per-element continuation of [`compute_rhs_swe_2d_subset_then`]: element
@@ -1293,10 +1342,8 @@ thread_local! {
 /// only, each at its own time `t`, for local time stepping; the other rows
 /// of `out` are left as they are. A wrapper of
 /// [`compute_rhs_swe_2d_subset_then`] (it collects the element list, a pass
-/// over all elements).
-///
-/// # Panics
-/// With horizontal viscosity: BR1 couples elements two faces apart.
+/// over all elements). With horizontal viscosity, unselected face
+/// neighbours take the time of the first selected element.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
@@ -1311,6 +1358,10 @@ pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
         .filter(|&k| time_of(k).is_some())
         .map(|k| k as u32)
         .collect();
+    let fallback = elements
+        .first()
+        .and_then(|&k| time_of(k as usize))
+        .unwrap_or(0.0);
     compute_rhs_swe_2d_subset_then(
         q,
         mesh,
@@ -1318,7 +1369,7 @@ pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
         geom,
         config,
         &elements,
-        &|k| time_of(k).expect("selected"),
+        &|k| time_of(k).unwrap_or(fallback),
         out,
         None,
         &|_, _, _| {},
@@ -1339,8 +1390,16 @@ pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
 /// [`SUBSET_PARALLEL_MIN`] elements; allocation-free after the first calls
 /// on a thread.
 ///
+/// With horizontal viscosity the RHS of an element also reads its face
+/// neighbours' velocity gradients (the state of the elements at their far
+/// corners too). They are
+/// computed here for the listed elements and their neighbours, with each
+/// neighbour's boundary values at `time_of(neighbour)`, so `time_of` must
+/// be defined for those too. The viscous flux through a face is then the
+/// same whichever side evaluates it.
+///
 /// # Panics
-/// With horizontal viscosity, or if `extra` has another shape than `out`.
+/// If `extra` has another shape than `out`.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
@@ -1354,10 +1413,6 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
     extra: Option<&mut SWESolution2D>,
     then: ElementRhsThen,
 ) {
-    assert!(
-        config.viscosity.is_none(),
-        "local time stepping does not support horizontal viscosity (BR1 couples elements two faces apart)"
-    );
     check_rhs_output(out, mesh, ops);
     if let Some(extra) = &extra {
         check_rhs_output(extra, mesh, ops);
@@ -1397,7 +1452,44 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
     }
     let faces: &[SWEState2D] = &faces;
 
+    // Viscous gradients of the listed elements and their face neighbours,
+    // each at its own time
     let n = ops.n_nodes;
+    let viscous = ViscousTerm::new(q, mesh, ops, geom, config).map(|term| {
+        let mut guard = ViscousGuard::take(mesh.n_elements * n);
+        let ViscousWorkspace {
+            grad_u,
+            grad_v,
+            neighbourhood,
+            ..
+        } = {
+            guard.0.collect_neighbourhood(mesh, elements);
+            &mut guard.0
+        };
+        let rows = [
+            DisjointChunks::new(grad_u, n),
+            DisjointChunks::new(grad_v, n),
+        ];
+        let gradients = |ws: &mut WorkspaceGuard, &k: &u32| {
+            let k = k as usize;
+            // SAFETY: the neighbourhood is distinct, so each element's rows once
+            let [gu, gv] = rows.each_ref().map(|rows| unsafe { rows.chunk(k) });
+            term.gradients(k, time_of(k), &mut ws.viscous, gu, gv);
+        };
+        #[cfg(feature = "parallel")]
+        if neighbourhood.len() >= SUBSET_PARALLEL_MIN {
+            neighbourhood
+                .par_iter()
+                .for_each_init(|| WorkspaceGuard::take(ops), gradients);
+            return (term, guard);
+        }
+        let mut ws = WorkspaceGuard::take(ops);
+        for k in neighbourhood.iter() {
+            gradients(&mut ws, k);
+        }
+        (term, guard)
+    });
+
     let [out_h, out_hu, out_hv] = &mut out.data;
     let out_rows = [
         DisjointChunks::new(out_h, n),
@@ -1426,6 +1518,9 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
             [&mut *h, &mut *hu, &mut *hv],
             None,
         );
+        if let Some((term, grads)) = &viscous {
+            term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
+        }
         then(k, [h, hu, hv], extra);
     };
     #[cfg(feature = "parallel")]
@@ -1602,6 +1697,166 @@ mod tests {
                     (volume + outflow).abs() < 1e-12 * max_inflow.max(1e-3),
                     "{formulation:?}, element {k}: ∫dh/dt = {volume:.3e}, ∮F* = {outflow:.3e}"
                 );
+            }
+        }
+    }
+
+    /// The whole-mesh BR1 viscosity that the per-element viscous term
+    /// replaced (whole-mesh velocity, gradient, coefficient and diffusion
+    /// arrays), added to `rhs`.
+    fn reference_viscosity<BC: SWEBoundaryCondition2D>(
+        rhs: &mut SWESolution2D,
+        q: &SWESolution2D,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        config: &SWE2DRhsConfig<BC>,
+        time: f64,
+    ) {
+        use super::super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
+
+        let visc = config.viscosity.expect("viscosity");
+        let n_nodes = ops.n_nodes;
+        let total_nodes = mesh.n_elements * n_nodes;
+        let mut u = vec![0.0; total_nodes];
+        let mut v = vec![0.0; total_nodes];
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..n_nodes {
+                let flat = k.as_usize() * n_nodes + i;
+                let state = q.get_state(k, i);
+                if state.h > visc.h_min {
+                    let h_safe = state.h.max(visc.h_min);
+                    u[flat] = state.hu / h_safe;
+                    v[flat] = state.hv / h_safe;
+                }
+            }
+        }
+        let boundary = |component: usize| {
+            move |k: ElementIndex, face: usize, fi: usize, node: usize, _interior: f64| {
+                let normal = geom.normal(k.as_usize(), face, fi);
+                let ghost =
+                    boundary_state(q, mesh, ops, config, time, k, face, node, normal).state();
+                if ghost.h <= visc.h_min {
+                    return 0.0;
+                }
+                let h_safe = ghost.h.max(visc.h_min);
+                if component == 0 {
+                    ghost.hu / h_safe
+                } else {
+                    ghost.hv / h_safe
+                }
+            }
+        };
+        let grad_u = compute_br1_gradient_2d(&u, mesh, ops, geom, boundary(0));
+        let grad_v = compute_br1_gradient_2d(&v, mesh, ops, geom, boundary(1));
+
+        let mut coeff = vec![0.0; total_nodes];
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let delta = 0.5 * geom.element_size(k.as_usize());
+            for i in 0..n_nodes {
+                let flat = k.as_usize() * n_nodes + i;
+                let state = q.get_state(k, i);
+                if state.h > visc.h_min {
+                    let nu = visc.compute_viscosity(
+                        grad_u[flat].dx,
+                        grad_u[flat].dy,
+                        grad_v[flat].dx,
+                        grad_v[flat].dy,
+                        delta,
+                    );
+                    coeff[flat] = nu * state.h;
+                }
+            }
+        }
+        let diff_u = compute_br1_diffusion_rhs_2d(&u, &coeff, &grad_u, mesh, ops, geom);
+        let diff_v = compute_br1_diffusion_rhs_2d(&v, &coeff, &grad_v, mesh, ops, geom);
+        for flat in 0..total_nodes {
+            rhs.data[1][flat] += diff_u[flat];
+            rhs.data[2][flat] += diff_v[flat];
+        }
+    }
+
+    /// The per-element viscous term (whole mesh serial and parallel, and the
+    /// element-subset RHS of local time stepping) gives bit for bit the
+    /// whole-mesh BR1 viscosity it replaced: on curved-sided quads, with
+    /// walls, a dry region, constant and Smagorinsky viscosity.
+    #[test]
+    fn viscous_term_matches_the_whole_mesh_reference() {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 5, 4);
+        for v in &mut mesh.vertices {
+            let [x, y] = *v;
+            let bump = x * (1.0 - x) * y * (1.0 - y);
+            *v = [
+                x + 0.4 * bump * (7.0 * y).sin(),
+                y + 0.5 * bump * (5.0 * x).cos(),
+            ];
+        }
+        let ops = DGOperators2D::new(3);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -0.3 + 0.6 * x + 0.1 * (3.0 * y).sin()
+        });
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let h = (0.02 * (4.0 * x).cos() - bathymetry.get(k, i)).max(0.0);
+                let (u, v) = (0.3 * (3.0 * y).sin() + 0.1 * x, 0.2 * (2.0 * x).cos() * y);
+                q.set_state(k, i, SWEState2D::new(h, h * u, h * v));
+            }
+        }
+        assert!(q.h_data().contains(&0.0), "part of the domain must be dry");
+        let t = 3.0;
+
+        for visc in [
+            HorizontalViscosity2D::constant(0.7),
+            HorizontalViscosity2D::smagorinsky(0.2),
+        ] {
+            let inviscid = || {
+                SWE2DRhsConfig::new(&equation, &bc)
+                    .with_coriolis(false)
+                    .with_formulation(SWEFormulation2D::WetDry)
+                    .with_bathymetry(&bathymetry)
+            };
+            let without = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &inviscid(), t);
+            let config = inviscid().with_viscosity(&visc);
+            let mut expected = without.clone();
+            reference_viscosity(&mut expected, &q, &mesh, &ops, &geom, &config, t);
+
+            let serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, t);
+            assert_eq!(serial.data, expected.data, "{:?}: serial", visc.model);
+            assert_ne!(
+                serial.data[1], without.data[1],
+                "the viscous term must do something"
+            );
+            #[cfg(feature = "parallel")]
+            {
+                let parallel = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, t);
+                assert_eq!(parallel.data, expected.data, "{:?}: parallel", visc.model);
+            }
+
+            let mut subset = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+            let selected = |k: usize| k % 3 != 1;
+            compute_rhs_swe_2d_where_into(
+                &q,
+                &mesh,
+                &ops,
+                &geom,
+                &config,
+                &|k| selected(k).then_some(t),
+                &mut subset,
+            );
+            for k in ElementIndex::iter(mesh.n_elements).filter(|k| selected(k.as_usize())) {
+                for var in 0..3 {
+                    assert_eq!(
+                        subset.element_var(k, var),
+                        expected.element_var(k, var),
+                        "{:?}: subset, element {k:?}, variable {var}",
+                        visc.model
+                    );
+                }
             }
         }
     }

@@ -9,18 +9,20 @@
 //!
 //! The tide ramps up from rest over `ramp` seconds (default one hour). Switched
 //! on at full amplitude (`ramp=0`), it sends a ≈ 0.13 m/s surge past the farm,
-//! whose drag wake then outlasts the few mm/s of tidal current there: the model
-//! has no horizontal viscosity on this path (TODO F.1). The step is set by
-//! the gravity wave on the 20 m elements, so the ramp does not change the cost.
+//! whose drag wake then outlasts the few mm/s of tidal current there unless
+//! horizontal viscosity (`nu`, a constant in m²/s; default none) removes it
+//! (TODO F.1). The step is set by the gravity wave on the 20 m elements, so
+//! neither the ramp nor a viscosity of a few m²/s changes it.
 //!
 //! The same run is taken twice from rest, with global SSP-RK3 and with
-//! `MultirateSSPRK3`. It reports the wall time, the RHS work and the
-//! difference between the two solutions: η and speed at the farm and over
-//! the domain.
+//! `MultirateSSPRK3` (`run=global` or `run=local` for one of them). It
+//! reports the wall time, the RHS work and the difference between the two
+//! solutions: η and speed at the farm and over the domain.
 //!
 //! ```bash
 //! cargo run --release --no-default-features --features parallel,simd \
-//!     --example local_time_stepping_farm -- [hours=1] [order=2] [levels=8] [ramp=3600]
+//!     --example local_time_stepping_farm -- [hours=1] [order=2] [levels=8] [ramp=3600] \
+//!     [nu=0] [run=both]
 //! ```
 
 use std::collections::HashMap;
@@ -36,7 +38,9 @@ use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::PhysicsBuilder;
 use dg_rs::simulation::{Simulation, SimulationResult};
 use dg_rs::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
-use dg_rs::source::{CageDrag2D, CoriolisSource2D, ManningFriction2D, NetCage};
+use dg_rs::source::{
+    CageDrag2D, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, NetCage,
+};
 use dg_rs::time::{MultirateSSPRK3, SSPRK3};
 use dg_rs::types::ElementIndex;
 
@@ -58,6 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let order = get("order", 2.0)? as usize;
     let levels = get("levels", 8.0)? as usize;
     let ramp: f64 = get("ramp", 3600.0)?;
+    let nu: f64 = get("nu", 0.0)?;
+    let run_which = args.get("run").map_or("both", String::as_str);
 
     let mesh = Arc::new(read_gmsh_mesh(Path::new("tests/data/gmsh/fjord_farm.msh"))?);
     let ops = Arc::new(DGOperators2D::new(order));
@@ -85,7 +91,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         NetCage::circular([FARM[0] + 40.0, FARM[1]], 25.0, 20.0, 0.25),
     ];
     let physics = || {
-        PhysicsBuilder::swe_2d(
+        let builder = PhysicsBuilder::swe_2d(
             mesh.clone(),
             ops.clone(),
             geom.clone(),
@@ -97,7 +103,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_wet_dry(WetDryConfig::default())
         .with_implicit_friction(ManningFriction2D::new(G, 0.025))
         .with_cage_drag(CageDrag2D::new(&mesh, &ops, &cages))
-        .with_source(CoriolisSource2D::f_plane(1.2e-4))
+        .with_source(CoriolisSource2D::f_plane(1.2e-4));
+        if nu > 0.0 {
+            builder.with_viscosity(HorizontalViscosity2D::constant(nu))
+        } else {
+            builder
+        }
         .build()
     };
     let at_rest = || {
@@ -141,11 +152,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         result
     };
 
-    println!("\nM2 from rest, {hours} h:");
+    let viscosity = if nu > 0.0 {
+        format!(", ν = {nu} m²/s")
+    } else {
+        String::new()
+    };
+    println!("\nM2 from rest, {hours} h{viscosity}:");
     let mut global = at_rest();
-    run("global", &mut global, false);
     let mut local = at_rest();
-    run("local", &mut local, true);
+    match run_which {
+        "global" => {
+            run("global", &mut global, false);
+            return Ok(());
+        }
+        "local" => {
+            run("local", &mut local, true);
+            return Ok(());
+        }
+        _ => {
+            run("global", &mut global, false);
+            run("local", &mut local, true);
+        }
+    }
 
     // Differences near the farm (within 500 m) and everywhere
     let mut near = (0.0_f64, 0.0_f64, 0.0_f64);
