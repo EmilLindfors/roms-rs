@@ -26,6 +26,21 @@ Mesh.ElementOrder = 1;
 Subdivision halves the element size, so set the size fields to twice the target
 size.
 
+Also set a minimum quality for recombination:
+
+```
+Mesh.RecombineMinimumQuality = 0.3;  // default 0.01
+```
+
+With the default, recombination accepts nearly degenerate quads, for example
+two triangles along a straight stretch of coastline. After subdivision these
+leave quads with a corner of up to 179°. There the bilinear map's Jacobian
+nearly vanishes, and the time step collapses with it, whatever the element's
+size. With 0.3, the poor pairs stay triangles and are subdivided into three
+good quads each. The time step follows `CFL/(2N+1)·4/(λ_r + λ_s)` with
+λ_r = c|∇r|, so check the largest corner angle of a new mesh as well as its
+shortest edge.
+
 The reader also rejects:
 - degenerate or non-convex quads (their bilinear map has J ≤ 0);
 - high-order elements;
@@ -80,6 +95,7 @@ Mesh.MeshSizeExtendFromBoundary = 0;
 Mesh.Algorithm = 8;
 Mesh.RecombinationAlgorithm = 3;
 Mesh.RecombineAll = 1;
+Mesh.RecombineMinimumQuality = 0.3;
 Mesh.SubdivisionAlgorithm = 1;
 ```
 
@@ -137,21 +153,30 @@ cargo run --release --example froya_real_data -- mesh=data/froya_coast.msh lts=8
 - **Coastline segments.** They are resampled at the element size before
   subdivision. Sides on the box are one straight line each, tagged `open`,
   and the coastline is `coast`.
-- **Mesher.** The default is recombination and subdivision, with sizes from
-  `coast` at the shore to `far` beyond `dist`, optionally `farm_size` near
-  `farm`. Gmsh's full-quad recombination halves every curve the same way.
-  Its quasi-structured quads (`mesher=qs`) took over 20 minutes on the Frøya
-  coastline.
+- **Mesher.** The default is recombination (minimum quality
+  `recombine_quality=0.3`) and subdivision, then `smooth=5` Laplace passes,
+  with sizes from `coast` at the shore to `far` beyond `dist`, optionally
+  `farm_size` near `farm`. Gmsh's full-quad recombination halves every curve
+  the same way. Its quasi-structured quads (`mesher=qs`) took over 20
+  minutes on the Frøya coastline.
 - **Check.** Every quad must be convex and oriented like the rest (Laplace
-  smoothing, `smooth=N`, can fold elements).
+  smoothing can fold elements). The script prints the shortest edges and
+  the largest corner angle.
 
-**Frøya** (8.0–9.2°E, 63.6–64.0°N, the defaults): 12,206 quads, 33 islands,
-479 km of coastline, coastlines at least 278 m apart. The lake at rest holds
-to 1.9e-12 m/s. The quads of subdivided triangles are smaller than the rest:
-1 % under 38 m and the smallest 16 m across, at a 200 m coast. In 30–90 m of
-water they set a global time step of 0.009 s. With local time stepping
-(`lts=8`) a coarse step of 2.3 s costs ≈ 160 ms at 24 threads, ≈ 4 min per
-simulated hour.
+**Frøya** (8.0–9.2°E, 63.6–64.0°N, the defaults): 12,490 quads, 33 islands,
+479 km of coastline, coastlines at least 278 m apart; the largest corner is
+153°. At rest, max |dq/dt| is 1e-11. The quads of subdivided triangles are
+smaller than the rest: 1 % under 51 m and the smallest 19 m across, at a
+200 m coast. The smallest time step is 0.11 s (P2). With local time
+stepping (`lts=8`, which uses 5 levels here), a coarse step of 3.5 s costs
+≈ 115 ms at 24 threads: 2 min per simulated hour, against 3.7 min with
+global steps.
+
+Before the minimum recombination quality (Gmsh's default 0.01, no
+smoothing), the mesh had 12,206 quads and 110 corners over 160°. The worst
+reached 178° in 50–110 m of water and set a time step of 0.0096 s. Local time
+stepping then needed 8 levels and a 2.3 s coarse step at ≈ 140 ms: 3.6 min
+per simulated hour, 1.84× the current mesh.
 
 ## Test meshes
 
