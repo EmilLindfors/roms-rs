@@ -28,7 +28,9 @@ use crate::solver::{
 use crate::solver::{
     apply_wet_dry_correction_element, compute_rhs_swe_2d_subset_then, element_dt_swe_2d,
 };
-use crate::source::{BottomFriction2D, CageDrag2D, SourceTerm2D, SourceTerms2D};
+use crate::source::{
+    BottomFriction2D, CageDrag2D, HorizontalViscosity2D, SourceTerm2D, SourceTerms2D,
+};
 use crate::time::LocalTimeStepping;
 use crate::time::multirate::ElementStage;
 
@@ -102,6 +104,8 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     pub friction: Option<Arc<dyn BottomFriction2D>>,
     /// Net-cage drag applied point-implicitly, if any
     pub cages: Option<Arc<CageDrag2D>>,
+    /// Horizontal eddy viscosity (BR1), if any; global time stepping only
+    pub viscosity: Option<Arc<HorizontalViscosity2D>>,
     /// Polynomial order
     pub order: usize,
     /// Elements emptied because their mean depth was negative
@@ -206,6 +210,9 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
         }
         if let Some(ref wet_dry) = self.wet_dry {
             config = config.with_dry_threshold(wet_dry.h_dry.meters());
+        }
+        if let Some(ref viscosity) = self.viscosity {
+            config = config.with_viscosity(viscosity.as_ref());
         }
         config
     }
@@ -475,6 +482,7 @@ pub struct SWEPhysics2DBuilder<BC: SWEBoundaryCondition2D> {
     wet_dry: Option<WetDryConfig>,
     friction: Option<Arc<dyn BottomFriction2D>>,
     cages: Option<Arc<CageDrag2D>>,
+    viscosity: Option<Arc<HorizontalViscosity2D>>,
     order: usize,
 }
 
@@ -503,6 +511,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             wet_dry: None,
             friction: None,
             cages: None,
+            viscosity: None,
             order,
         }
     }
@@ -596,6 +605,15 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
         self
     }
 
+    /// Add horizontal eddy viscosity (constant or Smagorinsky, BR1 face
+    /// coupling). It couples each element to its neighbours' gradients, so it
+    /// is not element-local: global time stepping only (`SSPRK3`), and it
+    /// allocates per RHS evaluation (TODO P2.3).
+    pub fn with_viscosity(mut self, viscosity: HorizontalViscosity2D) -> Self {
+        self.viscosity = Some(Arc::new(viscosity));
+        self
+    }
+
     /// Build the physics module.
     ///
     /// # Panics
@@ -650,6 +668,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             wet_dry: self.wet_dry,
             friction: self.friction,
             cages: self.cages,
+            viscosity: self.viscosity,
             order: self.order,
             negative_depth_clips: AtomicUsize::new(0),
         }
