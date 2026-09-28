@@ -10,7 +10,8 @@
 //!
 //! The water's heights, normals and colours are rewritten whenever the shown field
 //! changes. Keys: C colours the water by current speed or by surface elevation; T
-//! cycles the water through translucent, opaque and hidden.
+//! cycles the water through translucent, opaque and hidden; - and = make the
+//! translucent water clearer or denser, down to a tint over the bed.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -27,6 +28,7 @@ pub struct SurfacePlugin;
 impl Plugin for SurfacePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(SurfaceStyle::Translucent)
+            .init_resource::<WaterOpacity>()
             .add_systems(Startup, spawn)
             .add_systems(
                 Update,
@@ -110,7 +112,7 @@ impl Colouring {
 }
 
 /// The smallest of 1, 2, 2.5, 5 × 10ⁿ at or above `x`.
-fn nice_ceil(x: f32) -> f32 {
+pub(crate) fn nice_ceil(x: f32) -> f32 {
     if x <= 0.0 || !x.is_finite() {
         return 0.0;
     }
@@ -127,6 +129,37 @@ pub enum SurfaceStyle {
     Translucent,
     Opaque,
     Hidden,
+}
+
+/// Opacity of the translucent water (`--water-alpha`; - and = step it). Low enough by
+/// default that the bed reads through it, high enough that the colouring still does.
+#[derive(Resource, Clone, Copy, Debug, PartialEq)]
+pub struct WaterOpacity(pub f32);
+
+impl Default for WaterOpacity {
+    fn default() -> Self {
+        Self(0.4)
+    }
+}
+
+impl WaterOpacity {
+    /// Steps of the - and = keys, and the range they keep to.
+    const STEP: f32 = 0.1;
+    const MIN: f32 = 0.05;
+    const MAX: f32 = 0.95;
+
+    fn step(&mut self, up: bool) {
+        let next = self.0 + if up { Self::STEP } else { -Self::STEP };
+        // Round to the step so repeated presses land on 0.1, 0.2, ...
+        self.0 = ((next / Self::STEP).round() * Self::STEP).clamp(Self::MIN, Self::MAX);
+    }
+}
+
+/// Depths (m, positive down) at the two ends of the bed's colour map, for the legend.
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct BedScale {
+    pub shallow: f32,
+    pub deep: f32,
 }
 
 /// The water's mesh and material, and its walls: the node each wall column hangs from.
@@ -237,6 +270,7 @@ fn spawn(
     mut commands: Commands,
     nodes: Res<Nodes>,
     frame: Res<Frame>,
+    opacity: Res<WaterOpacity>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -250,6 +284,10 @@ fn spawn(
         .min(0.0);
     let base = 1.1 * deepest;
 
+    commands.insert_resource(BedScale {
+        shallow: -shallowest,
+        deep: -deepest,
+    });
     let seabed = Lut::new(SEABED);
     let bed_colour =
         |g: usize| seabed.at((shallowest - nodes.bed[g]) / (shallowest - deepest).max(1e-6));
@@ -278,7 +316,7 @@ fn spawn(
     let mut water = Sheet::surface(&nodes, &still, vz, |_| [0.1, 0.3, 0.45, 1.0]);
     let wall_nodes = water.walls(&nodes, vz, |g| nodes.bed[g], |_| WATER_DEEP);
     let material = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 1.0, 1.0, 0.82),
+        base_color: Color::srgba(1.0, 1.0, 1.0, opacity.0),
         alpha_mode: AlphaMode::Blend,
         perceptual_roughness: 0.3,
         reflectance: 0.35,
@@ -306,6 +344,7 @@ fn keys(
     keys: Res<ButtonInput<KeyCode>>,
     mut colouring: ResMut<Colouring>,
     mut style: ResMut<SurfaceStyle>,
+    mut opacity: ResMut<WaterOpacity>,
 ) {
     if keys.just_pressed(KeyCode::KeyC) {
         colouring.by = match colouring.by {
@@ -320,16 +359,26 @@ fn keys(
             SurfaceStyle::Hidden => SurfaceStyle::Translucent,
         };
     }
+    let clearer = keys.any_just_pressed([KeyCode::Minus, KeyCode::NumpadSubtract]);
+    let denser = keys.any_just_pressed([KeyCode::Equal, KeyCode::NumpadAdd]);
+    if clearer || denser {
+        opacity.step(denser);
+        // Stepping the opacity shows the translucent water
+        if *style != SurfaceStyle::Translucent {
+            *style = SurfaceStyle::Translucent;
+        }
+    }
 }
 
 fn style(
     style: Res<SurfaceStyle>,
+    opacity: Res<WaterOpacity>,
     water: Option<Res<Water>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut surface: Query<&mut Visibility, With<WaterSurface>>,
 ) {
     let Some(water) = water else { return };
-    if !style.is_changed() {
+    if !(style.is_changed() || opacity.is_changed()) {
         return;
     }
     for mut visibility in &mut surface {
@@ -342,7 +391,7 @@ fn style(
     if let Some(mut material) = materials.get_mut(&water.material) {
         let (alpha, mode) = match *style {
             SurfaceStyle::Opaque => (1.0, AlphaMode::Opaque),
-            _ => (0.82, AlphaMode::Blend),
+            _ => (opacity.0, AlphaMode::Blend),
         };
         material.base_color.set_alpha(alpha);
         material.alpha_mode = mode;

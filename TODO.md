@@ -146,7 +146,11 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
 - [ ] Salmon in the cages (pfish-bevy in `../blender-procedural-fish-addon/rust`, once the add-on has a salmon).
 - [x] Particles (2026-09-28, `viz/src/particles.rs`): released continuously from the cages (`--particles N` per cage every `--release S`, random walk `--kh`), tracked on the solver thread between the callback snapshots, drawn as small octahedra riding η, coloured by age (grey when stranded); P toggles them, the HUD counts them. At the fjord farm the cloud is mostly random walk (currents < 1 cm/s).
   - [ ] Particle types with their own behaviour (lice larvae, sinking feed and faeces) once F.2 has behaviour hooks; trails; a density field instead of points for 10⁵+ particles.
-- [ ] A snapshot file (element-major f32 η, u, v plus the mesh and bed) so runs can be replayed without re-running, and other scenarios (Frøya coastline mesh, nested runs) selectable from the command line.
+- [x] Bathymetry through the water (2026-09-28): the water is 40 % opaque by default (`--water-alpha`, - and = step it, T still cycles translucent/opaque/hidden), the HUD has a bed-depth colour scale, and the bed carries depth contours (`viz/src/contours.rs`: marching triangles over the bed's own triangles, a round interval of about ten lines, every fifth bright, drawn as ribbons a few pixels wide that follow the camera distance; B toggles them).
+- [x] Frøya in the viewer (2026-09-28): `--scenario froya` runs Frøya–Smøla–Hitra as `froya_real_data mesh=data/froya_coast.msh` does (the topobathy bed projected onto the coastline mesh, NorKyst-800 atlas tides from 2025-06-15, open faces beyond the atlas walled off, a 3 h ramp); F frames the Mausund gauge. ≈ 18× faster than real time at 10 solver threads, so play it back at `--rate 15`.
+  - [ ] Land: the islands are holes with walls down to the base. Draw the elevation model's land (a raster surface, or a coarse land mesh) around the water.
+  - [ ] Bevy's default font has no ø, æ, å: bundle a font for Norwegian names (the title is ASCII for now).
+- [ ] A snapshot file (element-major f32 η, u, v plus the mesh and bed) so runs can be replayed without re-running, and other scenarios (~~Frøya coastline mesh~~ done, nested runs) selectable from the command line.
 - [ ] 3D fields (Stage B): vertical sections and a surface layer from `Solution3D`.
 
 ---

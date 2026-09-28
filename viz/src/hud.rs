@@ -1,18 +1,21 @@
-//! What is shown and how far the solver has got (top left), the colour scale (bottom
-//! left) and the keys (bottom right; H hides them).
+//! What is shown and how far the solver has got (top left), the colour scales of the
+//! water and of the bed's depth (bottom left) and the keys (bottom right; H hides
+//! them).
 
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use bevy::ui::{BackgroundGradient, ColorStop, LinearGradient};
 
-use crate::colormap::srgb_at;
+use crate::colormap::{SEABED, srgb_at};
+use crate::contours::Contours;
 use crate::particles::Particles;
 use crate::playback::{Playback, SolverState};
-use crate::surface::{ColourBy, Colouring, SurfaceStyle};
+use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 
 // ASCII only: Bevy's default font has no arrows or middle dots.
 const KEYS: &str = "Space pause   [ ] rate   Left/Right seek   Home/End\n\
-C colour   T water   A arrows   P particles   F farm   O overview   H keys\n\
+C colour   T water   - = water opacity   B contours   A arrows\n\
+P particles   F close-up   O overview   H keys\n\
 drag orbit   right-drag pan   wheel zoom";
 
 /// The scenario's one-line description, heading the status.
@@ -35,12 +38,22 @@ struct Tick(usize);
 #[derive(Component)]
 struct ScaleTitle;
 
+/// The bed's depth scale: its title, its bar and its labels (shallow, middle, deep).
+#[derive(Component)]
+struct BedTitle;
+
+#[derive(Component)]
+struct BedBar;
+
+#[derive(Component)]
+struct BedTick(usize);
+
 pub struct HudPlugin;
 
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn)
-            .add_systems(Update, (status, scale, help));
+            .add_systems(Update, (status, scale, bed_scale, help));
     }
 }
 
@@ -99,6 +112,27 @@ fn spawn(mut commands: Commands) {
             ..default()
         })
         .with_children(|scale| {
+            scale.spawn((BedTitle, Text::new("bed depth (m)"), font(13.0), shadow()));
+            scale.spawn((
+                BedBar,
+                Node {
+                    width: Val::Percent(100.0),
+                    height: Val::Px(12.0),
+                    ..default()
+                },
+                BackgroundGradient::default(),
+            ));
+            scale
+                .spawn(Node {
+                    justify_content: JustifyContent::SpaceBetween,
+                    margin: UiRect::bottom(Val::Px(8.0)),
+                    ..default()
+                })
+                .with_children(|ticks| {
+                    for i in 0..3 {
+                        ticks.spawn((BedTick(i), Text::new(""), font(12.0), shadow()));
+                    }
+                });
             scale.spawn((ScaleTitle, Text::new(""), font(13.0), shadow()));
             scale.spawn((
                 Bar,
@@ -132,6 +166,7 @@ fn status(
     playback: Res<Playback>,
     title: Res<Title>,
     style: Res<SurfaceStyle>,
+    opacity: Res<WaterOpacity>,
     particles: Res<Particles>,
     mut text: Query<&mut Text, With<Status>>,
 ) {
@@ -185,9 +220,13 @@ fn status(
             s += " (hidden, P)";
         }
     }
-    if *style == SurfaceStyle::Hidden {
-        s += "\nwater hidden (T)";
-    }
+    s += &match *style {
+        SurfaceStyle::Translucent => {
+            format!("\nwater {:.0} % opaque (- =)", 100.0 * opacity.0)
+        }
+        SurfaceStyle::Opaque => "\nwater opaque (T)".into(),
+        SurfaceStyle::Hidden => "\nwater hidden (T)".into(),
+    };
     if text.0 != s {
         text.0 = s;
     }
@@ -226,6 +265,42 @@ fn scale(
     for (tick, mut text) in &mut ticks {
         let v = lo + (hi - lo) * tick.0 as f32 / 2.0;
         text.0 = format!("{}", (v * 1000.0).round() / 1000.0);
+    }
+}
+
+/// The bed's depth scale, once the bed exists (it is fixed), and its contour interval.
+fn bed_scale(
+    bed: Option<Res<BedScale>>,
+    contours: Option<Res<Contours>>,
+    mut bar: Query<&mut BackgroundGradient, With<BedBar>>,
+    mut ticks: Query<(&BedTick, &mut Text), Without<BedTitle>>,
+    mut title: Query<&mut Text, With<BedTitle>>,
+    mut done: Local<bool>,
+) {
+    if let (Some(contours), Ok(mut title)) = (contours, title.single_mut()) {
+        let heading = if contours.on {
+            format!("bed depth (m), contour {} m", contours.interval)
+        } else {
+            "bed depth (m)".to_string()
+        };
+        if title.0 != heading {
+            title.0 = heading;
+        }
+    }
+    let Some(bed) = bed else { return };
+    if *done {
+        return;
+    }
+    *done = true;
+    if let Ok(mut bar) = bar.single_mut() {
+        let colours = (0..=16)
+            .map(|i| ColorStop::from(Color::from(srgb_at(SEABED, i as f32 / 16.0))))
+            .collect();
+        *bar = LinearGradient::to_right(colours).into();
+    }
+    for (tick, mut text) in &mut ticks {
+        let depth = bed.shallow + (bed.deep - bed.shallow) * tick.0 as f32 / 2.0;
+        text.0 = format!("{depth:.0}");
     }
 }
 

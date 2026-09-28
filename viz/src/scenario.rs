@@ -1,29 +1,47 @@
 //! What is simulated: the mesh, the bed, the cages and the forcing.
 //!
-//! [`Scenario::fjord_farm`] is the fjord arm of `examples/local_time_stepping_farm.rs`
-//! (`docs/gmsh-meshes.md`): 12 × 6 km, open to the sea in the west, quads refined from
-//! ≈ 450 m to ≈ 20 m at a fish farm in the middle. The bed deepens from 30 m at the head
-//! to 150 m at the mouth; an M2 tide enters through a characteristic open boundary, and
-//! Coriolis, Manning friction and two net cages act on the flow.
+//! - [`Scenario::fjord_farm`] is the fjord arm of `examples/local_time_stepping_farm.rs`
+//!   (`docs/gmsh-meshes.md`): 12 × 6 km, open to the sea in the west, quads refined
+//!   from ≈ 450 m to ≈ 20 m at a fish farm in the middle. The bed deepens from 30 m at
+//!   the head to 150 m at the mouth; an M2 tide enters through a characteristic open
+//!   boundary, and Coriolis, Manning friction and two net cages act on the flow.
+//! - [`Scenario::froya`] is Frøya–Smøla–Hitra as `examples/froya_real_data.rs` runs it
+//!   on the coastline-fitted mesh (`mesh=`): the bed from Kartverket's topobathy model,
+//!   projected onto the nodes, and NorKyst-800 boundary tides from the tidal atlas
+//!   (`BoundaryTides`), on a clock starting 2025-06-15. The data files are those of the
+//!   example (untracked, in `data/`; see `TODO.md` P1.6 and P3.1 for how to fetch them).
 
 use std::error::Error;
 use std::f64::consts::PI;
 use std::path::Path;
 use std::sync::Arc;
 
-use dg_rs::mesh::{Bathymetry2D, Mesh2D, read_gmsh_mesh};
+use dg_rs::boundary::{BoundaryTides, TidalAtlas};
+use dg_rs::io::{
+    BedRaster, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry, LocalProjection,
+};
+use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::solver::{SWESolution2D, SWEState2D};
 use dg_rs::source::NetCage;
+use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
 
 pub const G: f64 = 9.81;
 
+/// The tide at the open boundary.
+#[derive(Clone, Debug)]
+pub enum Tide {
+    /// M2 of this amplitude (m), in one phase along the whole boundary
+    UniformM2(f64),
+    /// Tides of a boundary atlas, varying along the boundary
+    Atlas(BoundaryTides),
+}
+
 /// Tidal forcing and friction of a scenario.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Forcing {
-    /// M2 amplitude at the open boundary (m)
-    pub m2_amplitude: f64,
+    pub tide: Tide,
     /// Manning coefficient (s/m^(1/3))
     pub manning: f64,
     /// Coriolis parameter (1/s)
@@ -34,6 +52,18 @@ pub struct Forcing {
     pub ramp: f64,
 }
 
+/// The close-up view (F): its camera distance and the fine grid of current arrows
+/// around the point of interest.
+#[derive(Clone, Copy, Debug)]
+pub struct CloseUp {
+    /// Camera distance (world units)
+    pub distance: f32,
+    /// Spacing of the fine arrows (m)
+    pub arrow_spacing: f64,
+    /// Radius of the fine arrow grid (m)
+    pub arrow_radius: f64,
+}
+
 pub struct Scenario {
     pub name: String,
     pub mesh: Arc<Mesh2D>,
@@ -41,8 +71,10 @@ pub struct Scenario {
     pub geom: Arc<GeometricFactors2D>,
     pub bathymetry: Arc<Bathymetry2D>,
     pub cages: Vec<NetCage>,
-    /// Centre of the farm, where the camera starts (m, mesh coordinates)
+    /// Point of interest, where the close-up view looks: the farm, or a tide gauge
+    /// (m, mesh coordinates)
     pub farm: [f64; 2],
+    pub close_up: CloseUp,
     pub forcing: Forcing,
 }
 
@@ -64,8 +96,13 @@ impl Scenario {
                 NetCage::circular([FARM[0] + 40.0, FARM[1]], 25.0, 20.0, 0.25),
             ],
             farm: FARM,
+            close_up: CloseUp {
+                distance: 420.0,
+                arrow_spacing: 25.0,
+                arrow_radius: 500.0,
+            },
             forcing: Forcing {
-                m2_amplitude: 0.8,
+                tide: Tide::UniformM2(0.8),
                 manning: 0.025,
                 coriolis: 1.2e-4,
                 ramp: 3600.0,
@@ -74,6 +111,109 @@ impl Scenario {
             ops,
             geom,
             bathymetry,
+        })
+    }
+
+    /// Frøya–Smøla–Hitra on the coastline mesh `mesh_path`, with the elevation model
+    /// `dem_path` and the boundary tidal atlas `atlas_path` (see the module docs),
+    /// run for `duration` seconds (for the tides' nodal corrections).
+    pub fn froya(
+        mesh_path: &Path,
+        dem_path: &Path,
+        atlas_path: &Path,
+        order: usize,
+        duration: f64,
+    ) -> Result<Self, Box<dyn Error>> {
+        /// Land above this height (m) is never wet: capped, so that shoreline cliffs
+        /// do not drive films up the land
+        const LAND_ELEVATION: f64 = 5.0;
+        /// Open faces farther than this (m) from an atlas point become walls
+        const ATLAS_COVERAGE: f64 = 5000.0;
+        /// Mausund tide gauge (Kartverket MSU), the close-up view
+        const MAUSUND: (f64, f64) = (63.869331, 8.665231);
+
+        let bbox = GeoBoundingBox::new(8.0, 63.6, 9.2, 64.0);
+        let (lat0, lon0) = bbox.center();
+        let projection = LocalProjection::new(lat0, lon0);
+
+        // Kartverket's topobathy model: land heights and depths in one grid; its
+        // missing depths are an exact 0, filled from their surroundings
+        let dem = GeoTiffBathymetry::load(dem_path)?;
+        let mut raster = BedRaster::elevation_model(&dem, &bbox)?;
+        raster.fill_holes(|b| b == 0.0);
+        let raster = raster.clamp_land(LAND_ELEVATION);
+
+        // The bed L2-projected onto the nodes; water one node wide is unresolved
+        // and becomes shore; the elements without water are dropped
+        let grid = read_gmsh_mesh(mesh_path)?;
+        let ops = DGOperators2D::new(order);
+        let grid_geom = GeometricFactors2D::compute(&grid, &ops);
+        let mut grid_bed = Bathymetry2D::project(
+            &grid,
+            &ops,
+            &grid_geom,
+            raster.sampler(&projection),
+            raster.pixel_size(),
+        );
+        grid_bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
+        let has_water = |k: ElementIndex| grid_bed.element(k).iter().any(|&b| b < 0.0);
+        let (mut mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
+        let bathymetry = grid_bed.select_elements(&kept);
+
+        // Water the atlas's parent model does not resolve (a fjord arm crossing the
+        // domain edge far from any atlas point) has no tide to force: wall it off
+        let atlas = TidalAtlas::read(atlas_path)?;
+        for e in 0..mesh.edges.len() {
+            let edge = &mesh.edges[e];
+            if edge.right.is_some() || edge.boundary_tag != Some(BoundaryTag::Open) {
+                continue;
+            }
+            let (k, face) = (ElementIndex::new(edge.left.element), edge.left.face);
+            let uncovered = ops.face_nodes[face].iter().any(|&i| {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let (lat, lon) = projection.xy_to_geo(x, y);
+                atlas
+                    .nearest(lon, lat)
+                    .is_none_or(|(_, d)| d > ATLAS_COVERAGE)
+            });
+            if uncovered {
+                mesh.edges[e].boundary_tag = Some(BoundaryTag::Wall);
+            }
+        }
+
+        let clock = ModelClock::parse("2025-06-15T00:00:00Z")?;
+        let tides = atlas.boundary_tides(
+            &mesh,
+            &ops,
+            &projection,
+            BoundaryTag::Open,
+            &clock,
+            duration,
+            ATLAS_COVERAGE,
+        )?;
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let (x, y) = projection.geo_to_xy(MAUSUND.0, MAUSUND.1);
+        Ok(Self {
+            // ASCII: Bevy's default font has no ø
+            name: "Froya-Smola-Hitra: NorKyst-800 tides from 2025-06-15".into(),
+            cages: Vec::new(),
+            farm: [x, y],
+            close_up: CloseUp {
+                distance: 6_000.0,
+                arrow_spacing: 250.0,
+                arrow_radius: 5_000.0,
+            },
+            forcing: Forcing {
+                tide: Tide::Atlas(tides),
+                manning: 0.025,
+                coriolis: 1.31e-4,
+                // A spring tide squeezed into one hour overshoots (TODO P1.4)
+                ramp: 3.0 * 3600.0,
+            },
+            mesh: Arc::new(mesh),
+            ops: Arc::new(ops),
+            geom: Arc::new(geom),
+            bathymetry: Arc::new(bathymetry),
         })
     }
 
