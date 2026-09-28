@@ -3,8 +3,9 @@
 //! The solver runs on its own thread ([`solver`]) and sends a snapshot of η and the
 //! depth-averaged current every `--interval` seconds of model time; the viewer plays
 //! them back ([`playback`]) as the water surface over the bed ([`surface`]), coloured by
-//! current speed or elevation, with current arrows ([`arrows`]) and the farm's net cages
-//! riding the surface ([`cages`]).
+//! current speed or elevation, with current arrows ([`arrows`]), the farm's net cages
+//! riding the surface ([`cages`]) and particles released from the cages, tracked with
+//! the flow ([`particles`]).
 //!
 //! The scenario is the farm fjord of `examples/localtime_stepping_farm.rs`
 //! ([`scenario::Scenario::fjord_farm`]).
@@ -27,6 +28,9 @@
 //!   once, and the start-up surge then leaves a drag wake at the farm that outlasts
 //!   the tidal current there [3600]
 //! - `--drag on|off` whether the nets drag on the flow (drawn either way) [on]
+//! - `--particles N` particles released in each cage every `--release S` model seconds
+//!   [20, 60]; 0 for none. `--kh K` horizontal diffusivity of their random walk (m²/s)
+//!   [0.1]
 //! - `--view farm|domain` starting framing [farm]
 //! - `--screenshot PATH` save a frame once the shown time reaches `--at S` (model
 //!   seconds; default the end of the run) and quit: for checking a change headlessly.
@@ -39,6 +43,7 @@ mod camera;
 mod colormap;
 mod field;
 mod hud;
+mod particles;
 mod playback;
 mod scenario;
 mod solver;
@@ -56,6 +61,7 @@ use cages::{CageLayout, CagesPlugin};
 use camera::{CameraPlugin, OrbitCamera, Views};
 use field::{Field, Frame, Nodes, Probe};
 use hud::{HudPlugin, Title};
+use particles::{ParticleConfig, ParticlesPlugin};
 use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState};
 use scenario::Scenario;
 use solver::SolverConfig;
@@ -74,6 +80,7 @@ struct Args {
     speed_max: Option<f32>,
     drag: bool,
     ramp: Option<f64>,
+    particles: ParticleConfig,
     view: String,
     screenshot: Option<String>,
     at: Option<f64>,
@@ -98,6 +105,11 @@ impl Args {
             speed_max: None,
             drag: true,
             ramp: None,
+            particles: ParticleConfig {
+                per_release: 20,
+                release_every: 60.0,
+                kh: 0.1,
+            },
             view: "farm".into(),
             screenshot: None,
             at: None,
@@ -124,6 +136,9 @@ impl Args {
                         _ => return Err(format!("--drag takes on or off, not {value}")),
                     }
                 }
+                "--particles" => args.particles.per_release = num(&flag, &value)?,
+                "--release" => args.particles.release_every = num(&flag, &value)?,
+                "--kh" => args.particles.kh = num(&flag, &value)?,
                 "--view" => args.view = value,
                 "--screenshot" => args.screenshot = Some(value),
                 "--at" => args.at = Some(num(&flag, &value)?),
@@ -241,6 +256,7 @@ fn main() -> AppExit {
             levels: args.levels,
             threads: args.threads,
             drag: args.drag,
+            particles: args.particles,
         },
     );
 
@@ -283,6 +299,7 @@ fn main() -> AppExit {
             SurfacePlugin,
             CagesPlugin,
             ArrowsPlugin,
+            ParticlesPlugin,
             CameraPlugin,
             HudPlugin,
         ))

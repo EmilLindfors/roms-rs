@@ -6,12 +6,13 @@ use bevy::text::FontSize;
 use bevy::ui::{BackgroundGradient, ColorStop, LinearGradient};
 
 use crate::colormap::srgb_at;
+use crate::particles::Particles;
 use crate::playback::{Playback, SolverState};
 use crate::surface::{ColourBy, Colouring, SurfaceStyle};
 
 // ASCII only: Bevy's default font has no arrows or middle dots.
 const KEYS: &str = "Space pause   [ ] rate   Left/Right seek   Home/End\n\
-C colour   T water   A arrows   F farm   O overview   H keys\n\
+C colour   T water   A arrows   P particles   F farm   O overview   H keys\n\
 drag orbit   right-drag pan   wheel zoom";
 
 /// The scenario's one-line description, heading the status.
@@ -131,6 +132,7 @@ fn status(
     playback: Res<Playback>,
     title: Res<Title>,
     style: Res<SurfaceStyle>,
+    particles: Res<Particles>,
     mut text: Query<&mut Text, With<Status>>,
 ) {
     let Ok(mut text) = text.single_mut() else {
@@ -171,6 +173,17 @@ fn status(
             playback.frames.len(),
             playback.bytes() as f64 / 1e6
         );
+    }
+    let [active, stranded, out] = particles.counts;
+    if active + stranded + out > 0 {
+        s += &format!(
+            "\nparticles: {active} in the water, {stranded} stranded, {out} out\n\
+             colour: age, yellow new to dark blue {}; grey stranded",
+            clock(particles.age_scale as f64)
+        );
+        if !particles.on {
+            s += " (hidden, P)";
+        }
     }
     if *style == SurfaceStyle::Hidden {
         s += "\nwater hidden (T)";
