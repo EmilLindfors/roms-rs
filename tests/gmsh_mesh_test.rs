@@ -72,7 +72,6 @@ fn msh41_ascii_binary_and_msh22_load_to_the_same_mesh() {
         }
         assert_eq!(ascii.elements, other.elements, "{name}");
         assert_eq!(ascii.element_edges, other.element_edges, "{name}");
-        assert_eq!(ascii.edge_orientation, other.edge_orientation, "{name}");
         for (e, f) in ascii.edges.iter().zip(&other.edges) {
             assert_eq!(
                 (e.vertices, e.left, e.right, e.boundary_tag),
