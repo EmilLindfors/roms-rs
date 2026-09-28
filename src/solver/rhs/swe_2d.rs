@@ -2876,15 +2876,60 @@ mod tests {
             .with_bathymetry(&bathymetry)
             .with_source_terms(&coriolis);
         assert_parallel_matches_serial(&q, &mesh, &ops, &geom, &config, "walls, split form");
+
+        // Case 4: a tidal open boundary (characteristic OBC, exact boundary
+        // flux) on the west side, walls elsewhere, all three formulations
+        use crate::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D};
+        use crate::mesh::BoundaryTag;
+        let mesh = Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            20_000.0,
+            0.0,
+            10_000.0,
+            6,
+            3,
+            [
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Open,
+            ],
+        );
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -150.0 + 0.004 * x - 50.0 * (y / 10_000.0).powi(2)
+        });
+        let q = sloped_state(&mesh, &ops, &bathymetry, 0.8);
+        let sea = CharacteristicOBC::new(HarmonicTide::m2(0.5, 0.3));
+        let open = MultiBoundaryCondition2D::new(&bc).with_open(&sea);
+        for formulation in [
+            SWEFormulation2D::Standard,
+            SWEFormulation2D::EntropyStable,
+            SWEFormulation2D::WetDry,
+        ] {
+            let config = SWE2DRhsConfig::new(&equation, &open)
+                .with_formulation(formulation)
+                .with_bathymetry(&bathymetry);
+            // The split forms carry the bed slope in the operator
+            let config = if formulation == SWEFormulation2D::Standard {
+                config.with_source_terms(&sources).with_well_balanced(true)
+            } else {
+                config.with_source_terms(&coriolis)
+            };
+            let serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 1000.0);
+            let parallel = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, 1000.0);
+            assert!(serial.max_abs() > 0.0);
+            assert_eq!(serial.data, parallel.data, "open boundary, {formulation:?}");
+        }
     }
 
     #[cfg(feature = "parallel")]
-    fn assert_parallel_matches_serial(
+    fn assert_parallel_matches_serial<BC: SWEBoundaryCondition2D + Sync>(
         q: &SWESolution2D,
         mesh: &Mesh2D,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
-        config: &SWE2DRhsConfig<Reflective2D>,
+        config: &SWE2DRhsConfig<BC>,
         case: &str,
     ) {
         // P1.1: one element kernel for both drivers, so the results are identical.

@@ -58,6 +58,112 @@ impl Edge {
     }
 }
 
+/// Why [`Mesh2D::from_quads`] rejected a mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuadMeshError {
+    /// An element refers to a vertex that does not exist.
+    VertexOutOfRange {
+        /// The element
+        element: usize,
+        /// Its vertex index
+        vertex: usize,
+    },
+    /// More than two faces share the edge between these vertices.
+    NonManifoldEdge {
+        /// The edge's vertices
+        vertices: (usize, usize),
+        /// Three of the faces on it
+        faces: [ElementFace; 3],
+    },
+    /// Two faces traverse their shared edge in the same direction: the
+    /// elements overlap, or one of them is clockwise.
+    Overlap {
+        /// The edge's vertices
+        vertices: (usize, usize),
+        /// The two faces
+        faces: [ElementFace; 2],
+    },
+    /// A periodic face does not exist, is in two pairs, or shares its
+    /// vertices with another face.
+    Periodic {
+        /// The face
+        face: ElementFace,
+    },
+}
+
+impl std::fmt::Display for QuadMeshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::VertexOutOfRange { element, vertex } => {
+                write!(
+                    f,
+                    "element {element} uses vertex {vertex}, which does not exist"
+                )
+            }
+            Self::NonManifoldEdge { vertices, faces } => write!(
+                f,
+                "the edge between vertices {} and {} is shared by more than two elements \
+                 ({}, {} and {})",
+                vertices.0, vertices.1, faces[0].element, faces[1].element, faces[2].element
+            ),
+            Self::Overlap { vertices, faces } => write!(
+                f,
+                "elements {} and {} traverse their shared edge (vertices {} and {}) in the \
+                 same direction: they overlap, or one is clockwise",
+                faces[0].element, faces[1].element, vertices.0, vertices.1
+            ),
+            Self::Periodic { face } => write!(
+                f,
+                "periodic face {} of element {} does not exist, is paired twice, or is \
+                 shared with another element",
+                face.face, face.element
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QuadMeshError {}
+
+/// Vertices and counter-clockwise elements of an `nx` × `ny` grid of
+/// [x0, x1] × [y0, y1], row by row from the bottom left.
+fn structured_quads(
+    x0: f64,
+    x1: f64,
+    y0: f64,
+    y1: f64,
+    nx: usize,
+    ny: usize,
+) -> (Vec<[f64; 2]>, Vec<[usize; 4]>) {
+    assert!(
+        nx > 0 && ny > 0,
+        "Need at least one element in each direction"
+    );
+    assert!(x1 > x0 && y1 > y0, "Invalid domain bounds");
+    let dx = (x1 - x0) / nx as f64;
+    let dy = (y1 - y0) / ny as f64;
+    let vertices = (0..=ny)
+        .flat_map(|j| (0..=nx).map(move |i| [x0 + i as f64 * dx, y0 + j as f64 * dy]))
+        .collect();
+    let elements = (0..ny)
+        .flat_map(|j| {
+            (0..nx).map(move |i| {
+                let v0 = j * (nx + 1) + i; // bottom-left
+                [v0, v0 + 1, v0 + nx + 2, v0 + nx + 1]
+            })
+        })
+        .collect();
+    (vertices, elements)
+}
+
+/// The right face of the last element of row `j` of an `nx`-wide grid and
+/// the left face of its first element.
+fn periodic_x_pair(nx: usize, j: usize) -> (ElementFace, ElementFace) {
+    (
+        ElementFace::new(j * nx + nx - 1, 1),
+        ElementFace::new(j * nx, 3),
+    )
+}
+
 /// 2D mesh of quadrilateral elements.
 #[derive(Clone)]
 pub struct Mesh2D {
@@ -77,11 +183,6 @@ pub struct Mesh2D {
 
     /// Element-to-edge mapping: element_edges[k][f] = edge index for face f of element k
     pub element_edges: Vec<[usize; 4]>,
-
-    /// Edge orientation for each element face:
-    /// +1 if element's face direction matches edge direction
-    /// -1 if reversed
-    pub edge_orientation: Vec<[i8; 4]>,
 
     /// Number of elements
     pub n_elements: usize,
@@ -127,44 +228,7 @@ impl Mesh2D {
         ny: usize,
         bc_tag: BoundaryTag,
     ) -> Self {
-        assert!(
-            nx > 0 && ny > 0,
-            "Need at least one element in each direction"
-        );
-        assert!(x1 > x0 && y1 > y0, "Invalid domain bounds");
-
-        let dx = (x1 - x0) / nx as f64;
-        let dy = (y1 - y0) / ny as f64;
-
-        // Generate vertices: (nx+1) × (ny+1) grid
-        let n_vertices = (nx + 1) * (ny + 1);
-        let mut vertices = Vec::with_capacity(n_vertices);
-
-        for j in 0..=ny {
-            for i in 0..=nx {
-                let x = x0 + i as f64 * dx;
-                let y = y0 + j as f64 * dy;
-                vertices.push([x, y]);
-            }
-        }
-
-        // Generate elements: nx × ny quads
-        let n_elements = nx * ny;
-        let mut elements = Vec::with_capacity(n_elements);
-
-        for j in 0..ny {
-            for i in 0..nx {
-                // Vertex indices for this element (counter-clockwise)
-                let v0 = j * (nx + 1) + i; // bottom-left
-                let v1 = v0 + 1; // bottom-right
-                let v2 = v1 + (nx + 1); // top-right
-                let v3 = v0 + (nx + 1); // top-left
-                elements.push([v0, v1, v2, v3]);
-            }
-        }
-
-        // Build edge connectivity
-        Self::build_mesh_with_connectivity(vertices, elements, nx, ny, bc_tag)
+        Self::uniform_rectangle_with_sides(x0, x1, y0, y1, nx, ny, [bc_tag; 4])
     }
 
     /// Create a uniform rectangular mesh with different boundary tags on each side.
@@ -184,571 +248,172 @@ impl Mesh2D {
         ny: usize,
         bc_tags: [BoundaryTag; 4],
     ) -> Self {
-        assert!(
-            nx > 0 && ny > 0,
-            "Need at least one element in each direction"
-        );
-        assert!(x1 > x0 && y1 > y0, "Invalid domain bounds");
-
-        let dx = (x1 - x0) / nx as f64;
-        let dy = (y1 - y0) / ny as f64;
-
-        // Generate vertices
-        let n_vertices = (nx + 1) * (ny + 1);
-        let mut vertices = Vec::with_capacity(n_vertices);
-
-        for j in 0..=ny {
-            for i in 0..=nx {
-                let x = x0 + i as f64 * dx;
-                let y = y0 + j as f64 * dy;
-                vertices.push([x, y]);
-            }
-        }
-
-        // Generate elements
-        let n_elements = nx * ny;
-        let mut elements = Vec::with_capacity(n_elements);
-
-        for j in 0..ny {
-            for i in 0..nx {
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + 1;
-                let v2 = v1 + (nx + 1);
-                let v3 = v0 + (nx + 1);
-                elements.push([v0, v1, v2, v3]);
-            }
-        }
-
-        // Build connectivity with side-specific tags
-        Self::build_mesh_with_side_tags(vertices, elements, nx, ny, bc_tags)
+        let (vertices, elements) = structured_quads(x0, x1, y0, y1, nx, ny);
+        // A boundary face of the grid lies on the side of its face number
+        Self::from_quads(vertices, elements, &[], |face| bc_tags[face.face])
+            .expect("a structured grid is a valid quad mesh")
     }
 
-    /// Create a mesh that is periodic in the x-direction (channel flow).
+    /// Create a mesh that is periodic in the x-direction (channel flow), with
+    /// walls at y0 and y1.
     pub fn channel_periodic_x(x0: f64, x1: f64, y0: f64, y1: f64, nx: usize, ny: usize) -> Self {
-        assert!(
-            nx > 0 && ny > 0,
-            "Need at least one element in each direction"
-        );
-        assert!(x1 > x0 && y1 > y0, "Invalid domain bounds");
-
-        let dx = (x1 - x0) / nx as f64;
-        let dy = (y1 - y0) / ny as f64;
-
-        // Generate vertices
-        let n_vertices = (nx + 1) * (ny + 1);
-        let mut vertices = Vec::with_capacity(n_vertices);
-
-        for j in 0..=ny {
-            for i in 0..=nx {
-                let x = x0 + i as f64 * dx;
-                let y = y0 + j as f64 * dy;
-                vertices.push([x, y]);
-            }
-        }
-
-        // Generate elements
-        let n_elements = nx * ny;
-        let mut elements = Vec::with_capacity(n_elements);
-
-        for j in 0..ny {
-            for i in 0..nx {
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + 1;
-                let v2 = v1 + (nx + 1);
-                let v3 = v0 + (nx + 1);
-                elements.push([v0, v1, v2, v3]);
-            }
-        }
-
-        // Build connectivity with periodic x, wall y
-        Self::build_channel_mesh(vertices, elements, nx, ny)
+        let (vertices, elements) = structured_quads(x0, x1, y0, y1, nx, ny);
+        let periodic: Vec<_> = (0..ny).map(|j| periodic_x_pair(nx, j)).collect();
+        Self::from_quads(vertices, elements, &periodic, |_| BoundaryTag::Wall)
+            .expect("a structured grid is a valid quad mesh")
     }
 
     /// Create a fully periodic mesh (periodic in both x and y).
     pub fn uniform_periodic(x0: f64, x1: f64, y0: f64, y1: f64, nx: usize, ny: usize) -> Self {
-        assert!(
-            nx > 0 && ny > 0,
-            "Need at least one element in each direction"
-        );
-        assert!(x1 > x0 && y1 > y0, "Invalid domain bounds");
-
-        let dx = (x1 - x0) / nx as f64;
-        let dy = (y1 - y0) / ny as f64;
-
-        // Generate vertices
-        let n_vertices = (nx + 1) * (ny + 1);
-        let mut vertices = Vec::with_capacity(n_vertices);
-
-        for j in 0..=ny {
-            for i in 0..=nx {
-                let x = x0 + i as f64 * dx;
-                let y = y0 + j as f64 * dy;
-                vertices.push([x, y]);
-            }
-        }
-
-        // Generate elements
-        let n_elements = nx * ny;
-        let mut elements = Vec::with_capacity(n_elements);
-
-        for j in 0..ny {
-            for i in 0..nx {
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + 1;
-                let v2 = v1 + (nx + 1);
-                let v3 = v0 + (nx + 1);
-                elements.push([v0, v1, v2, v3]);
-            }
-        }
-
-        // Build connectivity with full periodicity
-        Self::build_periodic_mesh(vertices, elements, nx, ny)
+        let (vertices, elements) = structured_quads(x0, x1, y0, y1, nx, ny);
+        // The top face of the top row meets the bottom face of the bottom row
+        let periodic: Vec<_> = (0..ny)
+            .map(|j| periodic_x_pair(nx, j))
+            .chain((0..nx).map(|i| {
+                (
+                    ElementFace::new((ny - 1) * nx + i, 2),
+                    ElementFace::new(i, 0),
+                )
+            }))
+            .collect();
+        Self::from_quads(vertices, elements, &periodic, |_| BoundaryTag::Wall)
+            .expect("a structured grid is a valid quad mesh")
     }
 
-    /// Build mesh with edge connectivity for a structured grid.
-    fn build_mesh_with_connectivity(
+    /// Mesh of the quadrilaterals `elements` (vertex indices into
+    /// `vertices`, counter-clockwise: face f runs from vertex f to vertex
+    /// f + 1), with its edge connectivity.
+    ///
+    /// - Faces with the same two vertices are the two sides of one interior
+    ///   edge. They must traverse it in opposite directions, as they do when
+    ///   both elements are counter-clockwise: the kernels pair the face nodes
+    ///   of neighbours in reverse order.
+    /// - `periodic` pairs faces that are identified although their vertices
+    ///   differ; each pair is one interior edge. Neither face may share its
+    ///   vertices with another face, and their nodes must match in reverse
+    ///   order (e.g. the right face of the last element in a row and the left
+    ///   face of the first).
+    /// - Every other face is a boundary edge, tagged `boundary_tag(face)`.
+    ///
+    /// Edges are numbered in the order their first face appears (by element,
+    /// then face). The left side of an edge is its first face, or the first
+    /// face of its periodic pair, and the edge's vertices are those of its
+    /// left side.
+    pub fn from_quads(
         vertices: Vec<[f64; 2]>,
         elements: Vec<[usize; 4]>,
-        nx: usize,
-        ny: usize,
-        bc_tag: BoundaryTag,
-    ) -> Self {
+        periodic: &[(ElementFace, ElementFace)],
+        mut boundary_tag: impl FnMut(ElementFace) -> BoundaryTag,
+    ) -> Result<Self, QuadMeshError> {
+        use std::collections::HashMap;
+        use std::collections::hash_map::Entry;
+
         let n_elements = elements.len();
         let n_vertices = vertices.len();
+        for (k, quad) in elements.iter().enumerate() {
+            if let Some(&vertex) = quad.iter().find(|&&v| v >= n_vertices) {
+                return Err(QuadMeshError::VertexOutOfRange { element: k, vertex });
+            }
+        }
+        let face_vertices = |face: ElementFace| {
+            let quad = elements[face.element];
+            (quad[face.face], quad[(face.face + 1) % 4])
+        };
+        let key = |(a, b): (usize, usize)| (a.min(b), a.max(b));
 
-        // Count edges: horizontal + vertical
-        // Horizontal edges: (nx) × (ny+1)
-        // Vertical edges: (nx+1) × (ny)
-        let n_horiz = nx * (ny + 1);
-        let n_vert = (nx + 1) * ny;
-        let n_edges = n_horiz + n_vert;
-
-        let mut edges = Vec::with_capacity(n_edges);
-        let mut element_edges = vec![[0usize; 4]; n_elements];
-        let mut edge_orientation = vec![[1i8; 4]; n_elements];
-
-        // Helper to get element index from grid position
-        let elem_idx = |i: usize, j: usize| -> usize { j * nx + i };
-
-        // Create horizontal edges (bottom/top faces)
-        for j in 0..=ny {
-            for i in 0..nx {
-                let edge_idx = edges.len();
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + 1;
-
-                let left = if j > 0 {
-                    // This is the top face of element below
-                    let k = elem_idx(i, j - 1);
-                    element_edges[k][2] = edge_idx;
-                    edge_orientation[k][2] = -1; // top face goes right-to-left
-                    Some(ElementFace::new(k, 2))
-                } else {
-                    None
-                };
-
-                let right = if j < ny {
-                    // This is the bottom face of element above
-                    let k = elem_idx(i, j);
-                    element_edges[k][0] = edge_idx;
-                    edge_orientation[k][0] = 1; // bottom face goes left-to-right
-                    Some(ElementFace::new(k, 0))
-                } else {
-                    None
-                };
-
-                // Determine which is left/right based on which exists
-                let (left_ef, right_ef, boundary) = match (left, right) {
-                    (Some(l), Some(r)) => (l, Some(r), None),
-                    (Some(l), None) => (l, None, Some(bc_tag)), // top boundary
-                    (None, Some(r)) => (r, None, Some(bc_tag)), // bottom boundary
-                    (None, None) => unreachable!(),
-                };
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: left_ef,
-                    right: right_ef,
-                    boundary_tag: boundary,
-                });
+        // Periodic faces → their pair
+        let mut pair_of: HashMap<(usize, usize), usize> =
+            HashMap::with_capacity(2 * periodic.len());
+        for (p, &(a, b)) in periodic.iter().enumerate() {
+            for face in [a, b] {
+                if face.element >= n_elements
+                    || face.face >= 4
+                    || pair_of.insert((face.element, face.face), p).is_some()
+                {
+                    return Err(QuadMeshError::Periodic { face });
+                }
             }
         }
 
-        // Create vertical edges (left/right faces)
-        for j in 0..ny {
-            for i in 0..=nx {
-                let edge_idx = edges.len();
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + (nx + 1);
-
-                let left = if i > 0 {
-                    // This is the right face of element to the left
-                    let k = elem_idx(i - 1, j);
-                    element_edges[k][1] = edge_idx;
-                    edge_orientation[k][1] = 1; // right face goes bottom-to-top
-                    Some(ElementFace::new(k, 1))
-                } else {
-                    None
-                };
-
-                let right = if i < nx {
-                    // This is the left face of element to the right
-                    let k = elem_idx(i, j);
-                    element_edges[k][3] = edge_idx;
-                    edge_orientation[k][3] = -1; // left face goes top-to-bottom
-                    Some(ElementFace::new(k, 3))
-                } else {
-                    None
-                };
-
-                let (left_ef, right_ef, boundary) = match (left, right) {
-                    (Some(l), Some(r)) => (l, Some(r), None),
-                    (Some(l), None) => (l, None, Some(bc_tag)), // right boundary
-                    (None, Some(r)) => (r, None, Some(bc_tag)), // left boundary
-                    (None, None) => unreachable!(),
-                };
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: left_ef,
-                    right: right_ef,
-                    boundary_tag: boundary,
-                });
+        let mut edges: Vec<Edge> = Vec::with_capacity(2 * n_elements + 64);
+        let mut element_edges = vec![[usize::MAX; 4]; n_elements];
+        // Vertex pair → edge of ordinary faces; periodic pair → edge
+        let mut edge_of_key: HashMap<(usize, usize), usize> =
+            HashMap::with_capacity(2 * n_elements);
+        let mut edge_of_pair = vec![usize::MAX; periodic.len()];
+        for (k, faces) in element_edges.iter_mut().enumerate() {
+            for (f, slot) in faces.iter_mut().enumerate() {
+                let face = ElementFace::new(k, f);
+                if let Some(&p) = pair_of.get(&(k, f)) {
+                    if edge_of_pair[p] == usize::MAX {
+                        let (left, right) = periodic[p];
+                        edge_of_pair[p] = edges.len();
+                        edges.push(Edge {
+                            vertices: key(face_vertices(left)),
+                            left,
+                            right: Some(right),
+                            boundary_tag: None,
+                        });
+                    }
+                    *slot = edge_of_pair[p];
+                    continue;
+                }
+                let (a, b) = face_vertices(face);
+                match edge_of_key.entry(key((a, b))) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(edges.len());
+                        *slot = edges.len();
+                        edges.push(Edge {
+                            vertices: key((a, b)),
+                            left: face,
+                            right: None,
+                            boundary_tag: None,
+                        });
+                    }
+                    Entry::Occupied(entry) => {
+                        let e = *entry.get();
+                        let edge = &mut edges[e];
+                        if let Some(right) = edge.right {
+                            return Err(QuadMeshError::NonManifoldEdge {
+                                vertices: edge.vertices,
+                                faces: [edge.left, right, face],
+                            });
+                        }
+                        if face_vertices(edge.left) != (b, a) {
+                            return Err(QuadMeshError::Overlap {
+                                vertices: edge.vertices,
+                                faces: [edge.left, face],
+                            });
+                        }
+                        edge.right = Some(face);
+                        *slot = e;
+                    }
+                }
             }
         }
+        // A periodic face must not also be the side of an ordinary edge
+        for &(a, b) in periodic {
+            for face in [a, b] {
+                if edge_of_key.contains_key(&key(face_vertices(face))) {
+                    return Err(QuadMeshError::Periodic { face });
+                }
+            }
+        }
+        for edge in edges.iter_mut().filter(|e| e.right.is_none()) {
+            edge.boundary_tag = Some(boundary_tag(edge.left));
+        }
 
-        let n_boundary_edges = edges.iter().filter(|e| e.is_boundary()).count();
-        let vertex_to_elements = Self::build_vertex_to_elements(&elements, n_vertices);
-
-        Self {
+        Ok(Self {
+            vertex_to_elements: Self::build_vertex_to_elements(&elements, n_vertices),
             vertices,
             elements,
+            n_edges: edges.len(),
+            n_boundary_edges: edges.iter().filter(|e| e.is_boundary()).count(),
             edges,
             element_edges,
-            edge_orientation,
             n_elements,
-            n_edges,
-            n_boundary_edges,
             n_vertices,
-            vertex_to_elements,
-        }
-    }
-
-    /// Build mesh with different boundary tags on each side.
-    /// bc_tags: [south, east, north, west]
-    fn build_mesh_with_side_tags(
-        vertices: Vec<[f64; 2]>,
-        elements: Vec<[usize; 4]>,
-        nx: usize,
-        ny: usize,
-        bc_tags: [BoundaryTag; 4],
-    ) -> Self {
-        let n_elements = elements.len();
-        let n_vertices = vertices.len();
-
-        let n_horiz = nx * (ny + 1);
-        let n_vert = (nx + 1) * ny;
-        let n_edges = n_horiz + n_vert;
-
-        let mut edges = Vec::with_capacity(n_edges);
-        let mut element_edges = vec![[0usize; 4]; n_elements];
-        let mut edge_orientation = vec![[1i8; 4]; n_elements];
-
-        let elem_idx = |i: usize, j: usize| -> usize { j * nx + i };
-
-        // Create horizontal edges (bottom/top faces)
-        for j in 0..=ny {
-            for i in 0..nx {
-                let edge_idx = edges.len();
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + 1;
-
-                let left = if j > 0 {
-                    let k = elem_idx(i, j - 1);
-                    element_edges[k][2] = edge_idx;
-                    edge_orientation[k][2] = -1;
-                    Some(ElementFace::new(k, 2))
-                } else {
-                    None
-                };
-
-                let right = if j < ny {
-                    let k = elem_idx(i, j);
-                    element_edges[k][0] = edge_idx;
-                    edge_orientation[k][0] = 1;
-                    Some(ElementFace::new(k, 0))
-                } else {
-                    None
-                };
-
-                let (left_ef, right_ef, boundary) = match (left, right) {
-                    (Some(l), Some(r)) => (l, Some(r), None),
-                    (Some(l), None) => (l, None, Some(bc_tags[2])), // north boundary
-                    (None, Some(r)) => (r, None, Some(bc_tags[0])), // south boundary
-                    (None, None) => unreachable!(),
-                };
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: left_ef,
-                    right: right_ef,
-                    boundary_tag: boundary,
-                });
-            }
-        }
-
-        // Create vertical edges (left/right faces)
-        for j in 0..ny {
-            for i in 0..=nx {
-                let edge_idx = edges.len();
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + (nx + 1);
-
-                let left = if i > 0 {
-                    let k = elem_idx(i - 1, j);
-                    element_edges[k][1] = edge_idx;
-                    edge_orientation[k][1] = 1;
-                    Some(ElementFace::new(k, 1))
-                } else {
-                    None
-                };
-
-                let right = if i < nx {
-                    let k = elem_idx(i, j);
-                    element_edges[k][3] = edge_idx;
-                    edge_orientation[k][3] = -1;
-                    Some(ElementFace::new(k, 3))
-                } else {
-                    None
-                };
-
-                let (left_ef, right_ef, boundary) = match (left, right) {
-                    (Some(l), Some(r)) => (l, Some(r), None),
-                    (Some(l), None) => (l, None, Some(bc_tags[1])), // east boundary
-                    (None, Some(r)) => (r, None, Some(bc_tags[3])), // west boundary
-                    (None, None) => unreachable!(),
-                };
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: left_ef,
-                    right: right_ef,
-                    boundary_tag: boundary,
-                });
-            }
-        }
-
-        let n_boundary_edges = edges.iter().filter(|e| e.is_boundary()).count();
-        let vertex_to_elements = Self::build_vertex_to_elements(&elements, n_vertices);
-
-        Self {
-            vertices,
-            elements,
-            edges,
-            element_edges,
-            edge_orientation,
-            n_elements,
-            n_edges,
-            n_boundary_edges,
-            n_vertices,
-            vertex_to_elements,
-        }
-    }
-
-    /// Build channel mesh with periodic x-direction.
-    fn build_channel_mesh(
-        vertices: Vec<[f64; 2]>,
-        elements: Vec<[usize; 4]>,
-        nx: usize,
-        ny: usize,
-    ) -> Self {
-        let n_elements = elements.len();
-        let n_vertices = vertices.len();
-
-        let n_horiz = nx * (ny + 1);
-        let n_vert = nx * ny; // No boundary vertical edges due to periodicity
-        let n_edges = n_horiz + n_vert;
-
-        let mut edges = Vec::with_capacity(n_edges);
-        let mut element_edges = vec![[0usize; 4]; n_elements];
-        let mut edge_orientation = vec![[1i8; 4]; n_elements];
-
-        let elem_idx = |i: usize, j: usize| -> usize { j * nx + i };
-
-        // Horizontal edges (same as non-periodic)
-        for j in 0..=ny {
-            for i in 0..nx {
-                let edge_idx = edges.len();
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + 1;
-
-                let below = if j > 0 {
-                    let k = elem_idx(i, j - 1);
-                    element_edges[k][2] = edge_idx;
-                    edge_orientation[k][2] = -1;
-                    Some(ElementFace::new(k, 2))
-                } else {
-                    None
-                };
-
-                let above = if j < ny {
-                    let k = elem_idx(i, j);
-                    element_edges[k][0] = edge_idx;
-                    edge_orientation[k][0] = 1;
-                    Some(ElementFace::new(k, 0))
-                } else {
-                    None
-                };
-
-                let (left_ef, right_ef, boundary) = match (below, above) {
-                    (Some(l), Some(r)) => (l, Some(r), None),
-                    (Some(l), None) => (l, None, Some(BoundaryTag::Wall)),
-                    (None, Some(r)) => (r, None, Some(BoundaryTag::Wall)),
-                    (None, None) => unreachable!(),
-                };
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: left_ef,
-                    right: right_ef,
-                    boundary_tag: boundary,
-                });
-            }
-        }
-
-        // Vertical edges (interior only, with periodic wrapping)
-        for j in 0..ny {
-            for i in 0..nx {
-                let edge_idx = edges.len();
-
-                // Right face of element (i, j)
-                let k_left = elem_idx(i, j);
-                // Left face of element to the right (with periodic wrap)
-                let i_right = (i + 1) % nx;
-                let k_right = elem_idx(i_right, j);
-
-                element_edges[k_left][1] = edge_idx;
-                edge_orientation[k_left][1] = 1;
-                element_edges[k_right][3] = edge_idx;
-                edge_orientation[k_right][3] = -1;
-
-                // Use vertices from k_left's right edge
-                let v0 = j * (nx + 1) + i + 1;
-                let v1 = v0 + (nx + 1);
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: ElementFace::new(k_left, 1),
-                    right: Some(ElementFace::new(k_right, 3)),
-                    boundary_tag: None,
-                });
-            }
-        }
-
-        let n_boundary_edges = edges.iter().filter(|e| e.is_boundary()).count();
-        let n_edges_actual = edges.len();
-        let vertex_to_elements = Self::build_vertex_to_elements(&elements, n_vertices);
-
-        Self {
-            vertices,
-            elements,
-            edges,
-            element_edges,
-            edge_orientation,
-            n_elements,
-            n_edges: n_edges_actual,
-            n_boundary_edges,
-            n_vertices,
-            vertex_to_elements,
-        }
-    }
-
-    /// Build fully periodic mesh.
-    fn build_periodic_mesh(
-        vertices: Vec<[f64; 2]>,
-        elements: Vec<[usize; 4]>,
-        nx: usize,
-        ny: usize,
-    ) -> Self {
-        let n_elements = elements.len();
-        let n_vertices = vertices.len();
-
-        // All edges are interior
-        let n_edges = nx * ny * 2; // Each element contributes 2 unique edges
-
-        let mut edges = Vec::with_capacity(n_edges);
-        let mut element_edges = vec![[0usize; 4]; n_elements];
-        let mut edge_orientation = vec![[1i8; 4]; n_elements];
-
-        let elem_idx = |i: usize, j: usize| -> usize { j * nx + i };
-
-        // Horizontal edges (bottom of each element)
-        for j in 0..ny {
-            for i in 0..nx {
-                let edge_idx = edges.len();
-
-                let k_above = elem_idx(i, j);
-                let j_below = if j > 0 { j - 1 } else { ny - 1 };
-                let k_below = elem_idx(i, j_below);
-
-                element_edges[k_above][0] = edge_idx;
-                edge_orientation[k_above][0] = 1;
-                element_edges[k_below][2] = edge_idx;
-                edge_orientation[k_below][2] = -1;
-
-                let v0 = j * (nx + 1) + i;
-                let v1 = v0 + 1;
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: ElementFace::new(k_below, 2),
-                    right: Some(ElementFace::new(k_above, 0)),
-                    boundary_tag: None,
-                });
-            }
-        }
-
-        // Vertical edges (right of each element)
-        for j in 0..ny {
-            for i in 0..nx {
-                let edge_idx = edges.len();
-
-                let k_left = elem_idx(i, j);
-                let i_right = (i + 1) % nx;
-                let k_right = elem_idx(i_right, j);
-
-                element_edges[k_left][1] = edge_idx;
-                edge_orientation[k_left][1] = 1;
-                element_edges[k_right][3] = edge_idx;
-                edge_orientation[k_right][3] = -1;
-
-                let v0 = j * (nx + 1) + i + 1;
-                let v1 = v0 + (nx + 1);
-
-                edges.push(Edge {
-                    vertices: (v0.min(v1), v0.max(v1)),
-                    left: ElementFace::new(k_left, 1),
-                    right: Some(ElementFace::new(k_right, 3)),
-                    boundary_tag: None,
-                });
-            }
-        }
-
-        let n_edges_actual = edges.len();
-        let vertex_to_elements = Self::build_vertex_to_elements(&elements, n_vertices);
-
-        Self {
-            vertices,
-            elements,
-            edges,
-            element_edges,
-            edge_orientation,
-            n_elements,
-            n_edges: n_edges_actual,
-            n_boundary_edges: 0,
-            n_vertices,
-            vertex_to_elements,
-        }
+        })
     }
 
     /// Get the vertices of an element.
@@ -906,48 +571,32 @@ impl Mesh2D {
             })
             .collect();
 
-        let mut edges = Vec::new();
-        let mut element_edges = vec![[usize::MAX; 4]; kept.len()];
+        // Interior edges between kept elements whose faces do not share
+        // vertices (periodic ones) stay interior
         let map_face =
             |ef: ElementFace| new_element[ef.element].map(|k| ElementFace::new(k, ef.face));
-        for edge in &self.edges {
-            let left = map_face(edge.left);
-            let right = edge.right.and_then(map_face);
-            let (left, right, boundary_tag) = match (left, right) {
-                (Some(l), Some(r)) => (l, Some(r), None),
-                (Some(side), None) | (None, Some(side)) => {
-                    (side, None, Some(edge.boundary_tag.unwrap_or(new_boundary)))
-                }
-                (None, None) => continue,
-            };
-            for face in std::iter::once(left).chain(right) {
-                element_edges[face.element][face.face] = edges.len();
-            }
-            let (v0, v1) = (
-                new_vertex[edge.vertices.0].expect("vertex of a kept element"),
-                new_vertex[edge.vertices.1].expect("vertex of a kept element"),
-            );
-            edges.push(Edge {
-                vertices: (v0.min(v1), v0.max(v1)),
-                left,
-                right,
-                boundary_tag,
-            });
-        }
-
-        let n_vertices = vertices.len();
-        let mesh = Mesh2D {
-            vertex_to_elements: Self::build_vertex_to_elements(&elements, n_vertices),
-            vertices,
-            n_elements: elements.len(),
-            elements,
-            n_edges: edges.len(),
-            n_boundary_edges: edges.iter().filter(|e| e.is_boundary()).count(),
-            edges,
-            element_edges,
-            edge_orientation: kept.iter().map(|&old| self.edge_orientation[old]).collect(),
-            n_vertices,
+        let face_key = |ef: ElementFace| {
+            let quad = self.elements[ef.element];
+            let (a, b) = (quad[ef.face], quad[(ef.face + 1) % 4]);
+            (a.min(b), a.max(b))
         };
+        let periodic: Vec<_> = self
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let right = edge.right?;
+                let pair = (map_face(edge.left)?, map_face(right)?);
+                (face_key(edge.left) != face_key(right)).then_some(pair)
+            })
+            .collect();
+        let mesh = Mesh2D::from_quads(vertices, elements, &periodic, |face| {
+            // A boundary face of the submesh keeps its tag, or faced a
+            // dropped element
+            let old = ElementFace::new(kept[face.element], face.face);
+            let edge = &self.edges[self.element_edges[old.element][old.face]];
+            edge.boundary_tag.unwrap_or(new_boundary)
+        })
+        .expect("a submesh of a valid mesh is valid");
         (mesh, kept)
     }
 
@@ -1213,6 +862,143 @@ mod tests {
             mesh.n_boundary_edges,
             mesh.edges.iter().filter(|e| e.is_boundary()).count()
         );
+    }
+
+    /// Two unit squares side by side, counter-clockwise.
+    fn two_squares() -> (Vec<[f64; 2]>, Vec<[usize; 4]>) {
+        let vertices = vec![
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [2.0, 1.0],
+        ];
+        (vertices, vec![[0, 1, 4, 3], [1, 2, 5, 4]])
+    }
+
+    #[test]
+    fn test_from_quads_connects_and_tags() {
+        let (vertices, elements) = two_squares();
+        let mesh = Mesh2D::from_quads(vertices, elements, &[], |face| {
+            if face.element == 0 && face.face == 3 {
+                BoundaryTag::Open
+            } else {
+                BoundaryTag::Wall
+            }
+        })
+        .unwrap();
+        assert_eq!((mesh.n_edges, mesh.n_boundary_edges), (7, 6));
+        assert_consistent(&mesh);
+        // The shared edge: left is the first face to appear
+        assert_eq!(
+            mesh.neighbor(k(0), 1),
+            Some(ElementFace::new(1, 3)),
+            "right face of 0 meets the left face of 1"
+        );
+        let shared = &mesh.edges[mesh.edge_for_face(k(0), 1)];
+        assert_eq!(
+            (shared.left, shared.right),
+            (ElementFace::new(0, 1), Some(ElementFace::new(1, 3)))
+        );
+        assert_eq!(mesh.boundary_tag(k(0), 3), Some(BoundaryTag::Open));
+        assert_eq!(mesh.boundary_tag(k(1), 1), Some(BoundaryTag::Wall));
+    }
+
+    #[test]
+    fn test_from_quads_rejects_bad_topology() {
+        let wall = |_| BoundaryTag::Wall;
+        // Second element clockwise: both traverse the shared edge upwards
+        let (vertices, _) = two_squares();
+        let error = Mesh2D::from_quads(
+            vertices.clone(),
+            vec![[0, 1, 4, 3], [1, 4, 5, 2]],
+            &[],
+            wall,
+        );
+        assert!(
+            matches!(
+                error,
+                Err(QuadMeshError::Overlap {
+                    vertices: (1, 4),
+                    ..
+                })
+            ),
+            "{:?}",
+            error.as_ref().err()
+        );
+        // A third element on the edge 1–4
+        let mut more = vertices.clone();
+        more.extend([[1.5, 0.5], [1.5, 0.7]]);
+        let error = Mesh2D::from_quads(
+            more,
+            vec![[0, 1, 4, 3], [1, 2, 5, 4], [4, 1, 6, 7]],
+            &[],
+            wall,
+        );
+        assert!(
+            matches!(
+                error,
+                Err(QuadMeshError::NonManifoldEdge {
+                    vertices: (1, 4),
+                    ..
+                })
+            ),
+            "{:?}",
+            error.as_ref().err()
+        );
+        let error = Mesh2D::from_quads(vertices.clone(), vec![[0, 1, 4, 9]], &[], wall);
+        assert_eq!(
+            error.err(),
+            Some(QuadMeshError::VertexOutOfRange {
+                element: 0,
+                vertex: 9
+            })
+        );
+        // A periodic face that is an interior face, and one paired twice
+        let (a, b) = (ElementFace::new(0, 1), ElementFace::new(1, 1));
+        let error = Mesh2D::from_quads(vertices.clone(), two_squares().1, &[(a, b)], wall);
+        assert_eq!(error.err(), Some(QuadMeshError::Periodic { face: a }));
+        let (c, d) = (ElementFace::new(0, 3), ElementFace::new(1, 1));
+        let error = Mesh2D::from_quads(vertices, two_squares().1, &[(c, d), (d, c)], wall);
+        assert!(
+            matches!(error, Err(QuadMeshError::Periodic { .. })),
+            "{:?}",
+            error.as_ref().err()
+        );
+    }
+
+    /// A single element periodic in both directions is its own neighbour
+    /// across both pairs of faces.
+    #[test]
+    fn test_single_periodic_element() {
+        let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 1, 1);
+        assert_eq!((mesh.n_edges, mesh.n_boundary_edges), (2, 0));
+        assert_consistent(&mesh);
+        assert_eq!(mesh.neighbor(k(0), 1), Some(ElementFace::new(0, 3)));
+        assert_eq!(mesh.neighbor(k(0), 2), Some(ElementFace::new(0, 0)));
+    }
+
+    /// A submesh of a periodic mesh keeps the periodic edges between kept
+    /// elements, and a periodic face whose partner is dropped becomes a
+    /// boundary. (With the edge's vertices taken from the dropped side, this
+    /// used to panic.)
+    #[test]
+    fn test_retain_elements_of_a_periodic_mesh() {
+        let mesh = Mesh2D::uniform_periodic(0.0, 3.0, 0.0, 2.0, 3, 2);
+        // Drop the top row's last element (k = 5)
+        let (sub, old) = mesh.retain_elements(|k| k.as_usize() != 5, BoundaryTag::Open);
+        assert_eq!(old, [0, 1, 2, 3, 4]);
+        assert_consistent(&sub);
+        // Bottom row: still periodic in x
+        assert_eq!(sub.neighbor(k(2), 1), Some(ElementFace::new(0, 3)));
+        // Top row: element 3's left face faced the dropped element 5
+        assert_eq!(sub.neighbor(k(3), 3), None);
+        assert_eq!(sub.boundary_tag(k(3), 3), Some(BoundaryTag::Open));
+        // Periodic in y between kept elements: top of 3 meets bottom of 0
+        assert_eq!(sub.neighbor(k(3), 2), Some(ElementFace::new(0, 0)));
+        // ... and the bottom of 2 faced the dropped top-row element 5
+        assert_eq!(sub.boundary_tag(k(2), 0), Some(BoundaryTag::Open));
     }
 
     #[test]

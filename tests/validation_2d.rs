@@ -116,7 +116,11 @@ fn test_circular_dam_break_mass_conservation() {
 /// η(x, t) = A * cos(kx) * cos(ωt)
 /// where ω = sqrt(gH) * k
 ///
-/// This test verifies that the wave period matches the analytical prediction.
+/// The period is timed from the zero crossings of the mode amplitude
+/// a(t) = ∫ η cos(kx) dA (interpolated between steps). P2 with 20 elements
+/// per wavelength gets it to 3e-5. (The test used to time the peaks of η at
+/// one node, which was 0.9 % off, under a 5 % tolerance, and skipped the
+/// check when it found fewer than two peaks.)
 #[test]
 fn test_standing_wave_period() {
     let lx = 100.0;
@@ -149,136 +153,153 @@ fn test_standing_wave_period() {
         |_, _| 0.0,
     );
 
-    // Track elevation at center point over time
-    let mut max_eta_times: Vec<f64> = Vec::new();
-    let center_elem = mesh.n_elements / 2;
+    // Amplitude of the cos(kx) mode, ∫ (h − h0) cos(kx) dA by GLL quadrature
+    let mode = |q: &SWESolution2D| {
+        let mut a = 0.0;
+        for ki in 0..mesh.n_elements {
+            for i in 0..ops.n_nodes {
+                let [x, _] = mesh.reference_to_physical(k(ki), ops.nodes_r[i], ops.nodes_s[i]);
+                let weight = ops.weights[i] * geom.det_j[ki * ops.n_nodes + i];
+                a += weight * (q.get_state(k(ki), i).h - h0) * (wave_k * x).cos();
+            }
+        }
+        a
+    };
 
-    let cfl = 0.3;
-    let end_time = 2.0 * period;
+    // Zero crossings of a(t): at T/4, 3T/4, 5T/4
+    let cfl = 0.1;
     let mut time = 0.0;
-    let mut last_eta = f64::NEG_INFINITY;
-    let mut searching_peak = true;
-
-    while time < end_time {
+    let mut previous = mode(&q);
+    let mut crossings = Vec::new();
+    while crossings.len() < 3 {
+        assert!(time < 2.0 * period, "no oscillation by t = {time:.2} s");
         let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, ops.order, cfl);
-        let dt = dt.min(end_time - time);
         ssp_rk3_step_with_sources(&mut q, &mesh, &ops, &geom, &config, dt, time);
         time += dt;
-
-        // Sample elevation at center
-        let eta = q.get_state(k(center_elem), ops.n_nodes / 2).h - h0;
-
-        // Detect peaks (for period measurement)
-        if searching_peak && eta < last_eta && last_eta > 0.0 {
-            max_eta_times.push(time - dt);
-            searching_peak = false;
-        } else if eta > last_eta {
-            searching_peak = true;
+        let a = mode(&q);
+        if a.signum() != previous.signum() {
+            crossings.push(time - dt + dt * previous / (previous - a));
         }
-        last_eta = eta;
+        previous = a;
     }
 
-    // Measure period from peak-to-peak
-    if max_eta_times.len() >= 2 {
-        let measured_period = max_eta_times[1] - max_eta_times[0];
-        let period_error = ((measured_period - period) / period).abs();
-
-        assert!(
-            period_error < 0.05, // 5% tolerance
-            "Standing wave period error: {:.1}% (expected {:.3}s, got {:.3}s)",
-            period_error * 100.0,
-            period,
-            measured_period
-        );
-    }
+    let measured_period = crossings[2] - crossings[0];
+    let period_error = ((measured_period - period) / period).abs();
+    assert!(
+        period_error < 1e-4,
+        "Standing wave period error: {:.2e} (expected {:.5}s, got {:.5}s)",
+        period_error,
+        period,
+        measured_period
+    );
+    // First crossing at a quarter period
+    assert!(
+        (crossings[0] - 0.25 * period).abs() < 1e-3 * period,
+        "first zero crossing at {:.4} s, expected {:.4} s",
+        crossings[0],
+        0.25 * period
+    );
 }
 
-/// Test geostrophic balance.
+/// Geostrophic balance.
 ///
-/// In steady state, the pressure gradient should balance Coriolis:
-/// f * v = g * ∂η/∂x
-/// f * u = -g * ∂η/∂y
+/// On an f-plane, η = h₀ + A sin(kx) with u = 0 and v = (g/f) ∂η/∂x is an
+/// exact steady state of the nonlinear SWE over a flat bed: the pressure
+/// gradient g h ∂h/∂x balances f h v, the flow runs along the isolines, and
+/// nothing varies along y. The wave is periodic, so the periodic mesh sees
+/// no jump (the old test put a linear η on a periodic mesh: its 0.1 m seam
+/// swamped the 1e-3 Coriolis term, and it passed with Coriolis removed).
 ///
-/// Initialize with a linear SSH gradient and corresponding velocities.
-/// The solution should remain steady.
+/// Checks, each with a negative control without Coriolis:
+/// - the RHS is a small fraction of the Coriolis term f h v (P3: 3e-6
+///   against 6e-3 at 16 elements per wavelength), and converges at order
+///   ≈ N (2.9); without Coriolis it is the Coriolis term;
+/// - over 6 h (a third of an inertial period, seven gravity-wave crossings
+///   of the wavelength) the flow stays within 1.1e-4 of geostrophic;
+///   without Coriolis, gravity waves (u ≈ A·c/h₀, 5 % of v) move it 5e-2.
 #[test]
 fn test_geostrophic_balance() {
-    let lx = 100000.0; // 100 km
-    let ly = 100000.0;
+    let lx = 100_000.0; // one wavelength
+    let f = 1.0e-4;
+    let h0 = 100.0;
+    let amplitude = 0.1;
+    let wave_k = 2.0 * PI / lx;
+    let v_amp = G * amplitude * wave_k / f; // 0.62 m/s
+    let eta = move |x: f64| h0 + amplitude * (wave_k * x).sin();
+    let v_geo = move |x: f64| v_amp * (wave_k * x).cos();
 
-    let mesh = Mesh2D::uniform_periodic(0.0, lx, 0.0, ly, 10, 10);
-    let ops = DGOperators2D::new(2);
-    let geom = GeometricFactors2D::compute(&mesh, &ops);
-
-    let f = 1.0e-4; // Coriolis parameter
-    let h0 = 100.0; // Mean depth
-    let deta_dx = 1.0e-6; // SSH gradient (1 mm per km)
-
-    // Geostrophic velocity: f * v = g * deta/dx => v = g * deta_dx / f
-    let v_geo = G * deta_dx / f;
-
-    let equation = ShallowWater2D::with_coriolis(G, f);
+    let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
-
-    // Use trait-based Coriolis
     let coriolis = CoriolisSource2D::f_plane(f);
-    let config = SWE2DRhsConfig::new(&equation, &bc)
-        .with_coriolis(false)
-        .with_source_terms(&coriolis);
-
-    // Initialize in geostrophic balance
-    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-    q.set_from_functions(
-        &mesh,
-        &ops,
-        |x, _y| h0 + deta_dx * x, // η = η0 + dη/dx * x
-        |_, _| 0.0,               // u = 0
-        |_, _| v_geo,             // v = geostrophic
-    );
-
-    // Get initial RHS (should be near zero for balance)
-    let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
-    let max_rhs = rhs.max_abs();
-
-    // RHS should be small relative to the momentum scale: h * v_geo = 100 * 0.0981 ≈ 10
-    // On a coarse mesh, numerical discretization introduces some imbalance.
-    // A 5% error (0.5) is acceptable.
-    let momentum_scale = h0 * v_geo.abs();
-    assert!(
-        max_rhs < 0.05 * momentum_scale,
-        "Geostrophic balance RHS too large: {:.2e} (scale: {:.2e})",
-        max_rhs,
-        momentum_scale
-    );
-
-    // Run a few time steps and verify solution remains stable
-    let cfl = 0.3;
-    let mut time = 0.0;
-    let end_time = 1000.0; // 1000 seconds
-
-    while time < end_time {
-        let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, ops.order, cfl);
-        let dt = dt.min(end_time - time);
-        ssp_rk3_step_with_sources(&mut q, &mesh, &ops, &geom, &config, dt, time);
-        time += dt;
-    }
-
-    // Velocity should remain close to geostrophic
-    let mut max_v_deviation: f64 = 0.0;
-    for ki in 0..mesh.n_elements {
-        for i in 0..ops.n_nodes {
-            let state = q.get_state(k(ki), i);
-            let v = state.hv / state.h;
-            max_v_deviation = max_v_deviation.max((v - v_geo).abs());
+    let setup = |n: usize| {
+        let mesh = Mesh2D::uniform_periodic(0.0, lx, 0.0, lx, n, 2);
+        let ops = DGOperators2D::new(3);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        q.set_from_functions(&mesh, &ops, |x, _| eta(x), |_, _| 0.0, |x, _| v_geo(x));
+        (mesh, ops, geom, q)
+    };
+    let config = |with_coriolis: bool| {
+        let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
+        if with_coriolis {
+            config.with_source_terms(&coriolis)
+        } else {
+            config
         }
-    }
+    };
+    // The Coriolis term the balance rests on
+    let coriolis_scale = f * h0 * v_amp;
 
-    // Allow 5% drift over 1000s - acceptable for coarse mesh discretization
+    // Steady: the residual is truncation error, converging at order ≥ N
+    let residual = |n: usize, with_coriolis: bool| {
+        let (mesh, ops, geom, q) = setup(n);
+        compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config(with_coriolis), 0.0).max_abs()
+    };
+    let (coarse, fine) = (residual(8, true), residual(16, true));
+    let rate = (coarse / fine).log2();
     assert!(
-        max_v_deviation < 0.05 * v_geo.abs(),
-        "Geostrophic balance drift: max deviation = {:.2e}, expected < {:.2e} (5% of v_geo)",
-        max_v_deviation,
-        0.05 * v_geo.abs()
+        fine < 1e-3 * coriolis_scale && rate > 2.5,
+        "geostrophic residual {coarse:.2e} → {fine:.2e} (rate {rate:.2}), Coriolis term {coriolis_scale:.2e}"
+    );
+    let unbalanced = residual(8, false);
+    assert!(
+        unbalanced > 0.9 * coriolis_scale,
+        "without Coriolis the residual {unbalanced:.2e} should be the Coriolis term {coriolis_scale:.2e}"
+    );
+
+    // Over 6 h the flow stays geostrophic; without Coriolis the pressure
+    // gradient drives u and the state oscillates as standing gravity waves
+    let drift = |with_coriolis: bool| {
+        let (mesh, ops, geom, mut q) = setup(8);
+        let config = config(with_coriolis);
+        let (cfl, end_time) = (0.3, 6.0 * 3600.0);
+        let mut time = 0.0;
+        while time < end_time {
+            let dt = compute_dt_swe_2d(&q, &mesh, &geom, &equation, ops.order, cfl);
+            let dt = dt.min(end_time - time);
+            ssp_rk3_step_with_sources(&mut q, &mesh, &ops, &geom, &config, dt, time);
+            time += dt;
+        }
+        let mut deviation: f64 = 0.0;
+        for ki in 0..mesh.n_elements {
+            for i in 0..ops.n_nodes {
+                let [x, _] = mesh.reference_to_physical(k(ki), ops.nodes_r[i], ops.nodes_s[i]);
+                let state = q.get_state(k(ki), i);
+                let (u, v) = (state.hu / state.h, state.hv / state.h);
+                deviation = deviation.max(u.abs()).max((v - v_geo(x)).abs());
+            }
+        }
+        deviation / v_amp
+    };
+    let (balanced, adjusting) = (drift(true), drift(false));
+    assert!(
+        balanced < 1e-3,
+        "geostrophic flow drifted by {:.2e} of its speed in 6 h",
+        balanced
+    );
+    assert!(
+        adjusting > 0.02,
+        "without Coriolis the flow should leave the balance, drift {adjusting:.2e}"
     );
 }
 

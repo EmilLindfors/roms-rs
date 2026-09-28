@@ -29,6 +29,13 @@ examples/froya_real_data.rs (`mesh=`).
    coastline to `far` (m) `dist` metres offshore, optionally refined to
    `farm_size` within `farm_radius` of `farm=lon,lat`. Recombination and
    subdivision give an all-quad mesh (sizes here are after subdivision).
+   Recombination only pairs triangles into quads of quality at least
+   `recombine_quality` (0.3); the other triangles become three quads each on
+   subdivision. Gmsh's default (0.01) accepts nearly degenerate quads, and
+   the corners of up to 179° they leave after subdivision (mostly quads with
+   two coastline edges) collapse the bilinear Jacobian and set the time
+   step: 0.0096 s at Frøya, against 0.11 s with 0.3 and `smooth=5` Laplace
+   passes.
 5. Boundary curves on the box are the physical group "open", the rest
    "coast"; the water is "water".
 
@@ -39,7 +46,7 @@ Usage:
     uv run scripts/gmsh_coastline_mesh.py [dem=data/froya_topobathy.tif] \\
         [bbox=8.0,63.6,9.2,64.0] [coast=200] [far=1500] [dist=6000] \\
         [min_land=2·coast] [min_water=2·coast] [min_island=40000] [farm=lon,lat] [farm_size=50] \\
-        [farm_radius=1000] [out=data/froya_coast.msh]
+        [farm_radius=1000] [recombine_quality=0.3] [smooth=5] [out=data/froya_coast.msh]
 """
 
 import math
@@ -194,7 +201,7 @@ def main(opts):
     # Meshers:
     # - subdivide (default): recombination + subdivision at twice the size.
     #   The quads of subdivided triangles are smaller than the rest (1 %
-    #   under 38 m, the smallest 16 m across, at a 200 m coast); local time
+    #   under 38 m, the smallest 19 m across, at a 200 m coast); local time
     #   stepping keeps them from setting the cost (`lts=` in the example).
     #   Gmsh's full-quad recombination halves every curve the same way.
     # - qs: quasi-structured quads (Gmsh algorithm 11) at the final size;
@@ -242,13 +249,18 @@ def main(opts):
         # Blossom (1): subdivision turns any triangle left into quads
         gmsh.option.setNumber("Mesh.RecombinationAlgorithm", 1)
         gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)
+        # Pairs worse than this stay triangles (and become three good quads
+        # on subdivision); see the module docs
+        gmsh.option.setNumber(
+            "Mesh.RecombineMinimumQuality", float(opts.get("recombine_quality", 0.3))
+        )
     gmsh.option.setNumber("Mesh.ElementOrder", 1)
     gmsh.model.mesh.generate(2)
-    smoothing = int(opts.get("smooth", 0))
+    smoothing = int(opts.get("smooth", 5 if subdivide else 0))
     if smoothing:
         # Evens out the short edges subdivided triangles leave next to the
-        # coastline, a little (1st percentile 18 → 24 m at Frøya), but can
-        # fold elements: checked below
+        # coastline (1st percentile 38 → 51 m at Frøya, smallest time step
+        # 0.091 → 0.112 s), but can fold elements: checked below
         gmsh.model.mesh.optimize("Laplace2D", niter=smoothing)
 
     gmsh.option.setNumber("Mesh.MshFileVersion", 4.1)
@@ -269,9 +281,14 @@ def main(opts):
     if bad.any():
         centre = quads[np.argmax(bad)].mean(axis=0)
         sys.exit(f"{bad.sum()} non-convex quads, e.g. at ({centre[0]:.0f}, {centre[1]:.0f})")
+    # A corner near 180° collapses the bilinear map's Jacobian there and sets
+    # the time step, whatever the element's size
+    cos = (a * b).sum(-1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
+    angles = np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
     print(
         f"{out}: {sum(len(t) for t in tags)} surface elements (types {list(types)}); shortest edge "
-        f"min {edges.min():.0f} m, 1st percentile {np.percentile(edges, 1):.0f} m, median {np.median(edges):.0f} m"
+        f"min {edges.min():.0f} m, 1st percentile {np.percentile(edges, 1):.0f} m, median {np.median(edges):.0f} m; "
+        f"largest corner {angles.max():.0f}°, {(angles > 160).sum()} corners over 160°"
     )
     gmsh.finalize()
 

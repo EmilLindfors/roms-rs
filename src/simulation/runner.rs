@@ -104,6 +104,10 @@ impl SimulationResult {
 // Simulation Runner
 // =============================================================================
 
+/// Relative slack in landing on a target time: a step that ends within this
+/// fraction of itself before the target is stretched to land on it.
+pub(crate) const LANDING_SLACK: f64 = 1e-9;
+
 /// High-level simulation runner.
 ///
 /// Ties together physics modules and time integrators into a complete
@@ -317,9 +321,13 @@ where
                 );
             }
 
-            // Don't overshoot the end time or the next callback time
+            // Don't overshoot the end time or the next callback time, and
+            // don't leave a sliver of it: steps that should land exactly
+            // (ten steps of 0.1 to 1.0) accumulate round-off, and the sliver
+            // would cost a whole step. Landing stretches the step by at most
+            // LANDING_SLACK of itself.
             let target = next_callback(callbacks_done).map_or(t_end, |c| c.min(t_end));
-            let landed = t + dt >= target;
+            let landed = t + dt * (1.0 + LANDING_SLACK) >= target;
             if landed {
                 dt = target - t;
             }
@@ -453,6 +461,29 @@ mod tests {
 
         assert!(result.success);
         assert!(callback_count > 0);
+    }
+
+    /// Steps that should land on t_end exactly, up to round-off, take no
+    /// extra sliver step: ten steps of 0.005 add up to 0.049999999999999996,
+    /// and the run used to take an 11th step of 7e-18 s. (Sums of 3 and 100
+    /// steps round up instead, and always landed.)
+    #[test]
+    fn round_off_leaves_no_sliver_step() {
+        let (physics, mut state) = create_test_setup();
+        let dt = 0.005; // below the CFL step (0.016)
+        let sim = Simulation::new(physics, SSPRK3)
+            .with_cfl(0.5)
+            .with_dt_max(dt);
+        for n in [3, 10, 100, 1000] {
+            let result = sim.run(&mut state, 0.0, n as f64 * dt);
+            assert_eq!(result.n_steps, n, "{n} steps of {dt}");
+            assert_eq!(result.final_time, n as f64 * dt);
+            assert!(
+                result.dt_min > 0.999 * dt,
+                "{n} steps: dt_min {}",
+                result.dt_min
+            );
+        }
     }
 
     /// An interval that is not a multiple of dt: callbacks land exactly on

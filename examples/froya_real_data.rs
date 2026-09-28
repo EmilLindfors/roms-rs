@@ -21,7 +21,9 @@
 //!    by NorKyst-800 boundary tides (`BoundaryTides` from the tidal atlas
 //!    `tides=<file>`, made by `examples/norkyst_boundary_tides.rs`: η, ū, v̄ of
 //!    10 constituents plus P1 and K2, varying along the boundary), on a
-//!    `ModelClock` starting at `start`. Coriolis, Manning friction, optionally
+//!    `ModelClock` starting at `start`. `tide_transport=3` scales the atlas
+//!    velocity to carry NorKyst's transport over the child's bed, by up to a
+//!    factor 3 (`BoundaryTides::with_transport_scaling`; off by default). Coriolis, Manning friction, optionally
 //!    wind and an atmospheric pressure gradient (with the inverse-barometer
 //!    level at the open boundaries): uniform (`wind`) or from a weather model
 //!    (`met=<file,…>`: MET Nordic, MEPS, AROME-Arctic or ERA5 NetCDF, e.g.
@@ -258,6 +260,9 @@ struct Options {
     /// Local time stepping with up to this many levels (`lts=`; 0: global
     /// SSP-RK3)
     lts: usize,
+    /// Scale the atlas velocity by NorKyst's total depth over the child's,
+    /// by up to this factor (`tide_transport=`; 0: off)
+    tide_transport: f64,
     profile: usize,
     output: Option<PathBuf>,
 }
@@ -296,6 +301,7 @@ impl Options {
             },
             profile: get("profile", 0.0)? as usize,
             lts: get("lts", 0.0)? as usize,
+            tide_transport: get("tide_transport", 0.0)?,
             mesh: args.get("mesh").cloned(),
             output: args.get("output").map(PathBuf::from),
             wind: args.contains_key("wind"),
@@ -1871,7 +1877,18 @@ fn open_boundary(
                 ATLAS_COVERAGE,
             )?
             .with_ramp_up(3600.0 * opts.ramp_hours);
-        let description = describe(&tides, atlas_path);
+        let tides = if opts.tide_transport > 0.0 {
+            tides.with_transport_scaling(opts.tide_transport)
+        } else {
+            tides
+        };
+        let mut description = describe(&tides, atlas_path);
+        if opts.tide_transport > 0.0 {
+            description.push_str(&format!(
+                ", velocity transport-scaled (≤ {}×)",
+                opts.tide_transport
+            ));
+        }
         return Ok((characteristic(tides, level), description));
     }
 

@@ -65,7 +65,7 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
-use crate::mesh::core::{Edge, ElementFace, Mesh2D};
+use crate::mesh::core::{Mesh2D, QuadMeshError};
 use crate::mesh::data::BoundaryTag;
 
 /// Error type for Gmsh I/O operations.
@@ -845,58 +845,44 @@ fn build_mesh(raw: RawMesh) -> Result<Mesh2D> {
         }
         elements.push(quad);
     }
-    let n_elements = elements.len();
     let element_tag = |k: usize| raw.quads[k].0;
 
-    // Edges in order of first appearance; the second face must traverse the
-    // edge in the opposite direction
-    let mut edge_index: HashMap<(usize, usize), usize> = HashMap::with_capacity(2 * n_elements);
-    let mut edges: Vec<Edge> = Vec::with_capacity(2 * n_elements + 64);
-    let mut element_edges = vec![[0usize; 4]; n_elements];
-    let mut edge_orientation = vec![[1i8; 4]; n_elements];
-    for (k, quad) in elements.iter().enumerate() {
-        for face in 0..4 {
-            let (a, b) = (quad[face], quad[(face + 1) % 4]);
-            let key = (a.min(b), a.max(b));
-            edge_orientation[k][face] = if a < b { 1 } else { -1 };
-            let e = *edge_index.entry(key).or_insert_with(|| {
-                edges.push(Edge {
-                    vertices: key,
-                    left: ElementFace::new(k, face),
-                    right: None,
-                    boundary_tag: None,
-                });
-                edges.len() - 1
-            });
-            element_edges[k][face] = e;
-            let left = edges[e].left;
-            if left == ElementFace::new(k, face) {
-                continue;
-            }
-            let [x0, y0] = vertices[key.0];
-            let [x1, y1] = vertices[key.1];
-            if edges[e].right.is_some() {
-                return Err(GmshError::InvalidMesh(format!(
-                    "the edge ({x0}, {y0})–({x1}, {y1}) is shared by more than two \
-                     elements (elements {}, {} and {})",
-                    element_tag(left.element),
-                    element_tag(edges[e].right.map_or(0, |f| f.element)),
-                    element_tag(k)
-                )));
-            }
-            if edge_orientation[left.element][left.face] == edge_orientation[k][face] {
-                return Err(GmshError::InvalidMesh(format!(
-                    "elements {} and {} overlap: they traverse their shared edge \
-                     ({x0}, {y0})–({x1}, {y1}) in the same direction",
-                    element_tag(left.element),
-                    element_tag(k)
-                )));
-            }
-            edges[e].right = Some(ElementFace::new(k, face));
-        }
-    }
+    // Edges, checked: at most two faces per edge, traversed in opposite
+    // directions. Boundary edges are walls unless a line element tags them.
+    let coordinates = vertices.clone();
+    let segment = |(a, b): (usize, usize)| {
+        let ([x0, y0], [x1, y1]) = (coordinates[a], coordinates[b]);
+        format!("({x0}, {y0})–({x1}, {y1})")
+    };
+    let mut mesh = Mesh2D::from_quads(vertices, elements, &[], |_| BoundaryTag::Wall).map_err(
+        |error| {
+            GmshError::InvalidMesh(match error {
+                QuadMeshError::NonManifoldEdge { vertices, faces } => format!(
+                    "the edge {} is shared by more than two elements (elements {}, {} and {})",
+                    segment(vertices),
+                    element_tag(faces[0].element),
+                    element_tag(faces[1].element),
+                    element_tag(faces[2].element)
+                ),
+                QuadMeshError::Overlap { vertices, faces } => format!(
+                    "elements {} and {} overlap: they traverse their shared edge {} in the                      same direction",
+                    element_tag(faces[0].element),
+                    element_tag(faces[1].element),
+                    segment(vertices)
+                ),
+                other => other.to_string(),
+            })
+        },
+    )?;
 
     // Boundary tags from the line elements
+    let edge_index: HashMap<(usize, usize), usize> = mesh
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(e, edge)| (edge.vertices, e))
+        .collect();
+    let mut line_tags: Vec<Option<BoundaryTag>> = vec![None; mesh.n_edges];
     for &(element, tags, groups) in &raw.lines {
         let [a, b] = tags.map(|tag| {
             node_index
@@ -910,46 +896,32 @@ fn build_mesh(raw: RawMesh) -> Result<Mesh2D> {
         };
         let Some(e) = edge else {
             return Err(GmshError::InvalidMesh(format!(
-                "line element {element} (nodes {} and {}) is not an edge of the \
-                 quadrilateral mesh",
+                "line element {element} (nodes {} and {}) is not an edge of the                  quadrilateral mesh",
                 tags[0], tags[1]
             )));
         };
-        if edges[e].is_interior() {
+        if mesh.edges[e].is_interior() {
             continue;
         }
         let Some(tag) = line_boundary_tag(&raw, groups)? else {
             continue;
         };
-        match edges[e].boundary_tag {
+        match line_tags[e] {
             Some(existing) if existing != tag => {
-                let [x0, y0] = vertices[edges[e].vertices.0];
-                let [x1, y1] = vertices[edges[e].vertices.1];
                 return Err(GmshError::InvalidMesh(format!(
-                    "the boundary edge ({x0}, {y0})–({x1}, {y1}) has two boundary tags, \
-                     {existing:?} and {tag:?}"
+                    "the boundary edge {} has two boundary tags, {existing:?} and {tag:?}",
+                    segment(mesh.edges[e].vertices)
                 )));
             }
-            _ => edges[e].boundary_tag = Some(tag),
+            _ => line_tags[e] = Some(tag),
         }
     }
-    for edge in edges.iter_mut().filter(|e| e.is_boundary()) {
-        edge.boundary_tag.get_or_insert(BoundaryTag::Wall);
+    for (edge, tag) in mesh.edges.iter_mut().zip(line_tags) {
+        if tag.is_some() {
+            edge.boundary_tag = tag;
+        }
     }
-
-    let n_vertices = vertices.len();
-    Ok(Mesh2D {
-        vertex_to_elements: Mesh2D::build_vertex_to_elements(&elements, n_vertices),
-        vertices,
-        elements,
-        n_edges: edges.len(),
-        n_boundary_edges: edges.iter().filter(|e| e.is_boundary()).count(),
-        edges,
-        element_edges,
-        edge_orientation,
-        n_elements,
-        n_vertices,
-    })
+    Ok(mesh)
 }
 
 // =============================================================================
@@ -1034,6 +1006,7 @@ pub fn write_gmsh_mesh(mesh: &Mesh2D, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::core::ElementFace;
     use tempfile::NamedTempFile;
 
     fn parse(text: &str) -> Result<Mesh2D> {
@@ -1131,10 +1104,12 @@ $EndElements
         // Neighbours traverse the shared edge in opposite directions
         let interior = mesh.edges.iter().find(|e| e.is_interior()).unwrap();
         let (l, r) = (interior.left, interior.right.unwrap());
-        assert_eq!(
-            mesh.edge_orientation[l.element][l.face],
-            -mesh.edge_orientation[r.element][r.face]
-        );
+        let face = |f: ElementFace| {
+            let quad = mesh.elements[f.element];
+            (quad[f.face], quad[(f.face + 1) % 4])
+        };
+        let (a, b) = face(l);
+        assert_eq!(face(r), (b, a));
     }
 
     /// The same mesh as binary MSH 4.1.

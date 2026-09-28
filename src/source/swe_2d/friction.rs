@@ -17,8 +17,11 @@
 //! (`SWEPhysics2DBuilder::with_implicit_friction`, via
 //! `TimeIntegrator::step_with_relaxation`).
 
+use crate::mesh::Mesh2D;
+use crate::operators::DGOperators2D;
 use crate::solver::SWEState2D;
-use crate::source::{SourceContext2D, SourceTerm2D};
+use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
+use crate::types::ElementIndex;
 
 /// Cube root of `x`, within 2 ulp of `f64::cbrt`, about twice as fast as the
 /// MSVC C runtime's `cbrt`. Manning friction takes one per node and RK
@@ -58,8 +61,17 @@ pub(crate) fn cbrt(x: f64) -> f64 {
 /// (Λ ∝ |u|) with Λ taken at the start of the step, this is the exact
 /// solution of `d(hu)/dt = −Λ hu` over Δt at fixed depth.
 pub trait BottomFriction2D: Send + Sync {
-    /// Damping rate Λ ≥ 0 (1/s) at depth `h > 0` and speed `speed = |u|`.
-    fn damping_rate(&self, h: f64, speed: f64) -> f64;
+    /// Damping rate Λ ≥ 0 (1/s) at mesh node `node` (element-major,
+    /// `k·n_nodes + i`), depth `h > 0` and speed `speed = |u|`. Uniform laws
+    /// ignore `node`.
+    fn damping_rate(&self, node: usize, h: f64, speed: f64) -> f64;
+
+    /// Number of mesh nodes (`K·n_nodes`) a spatially varying law was built
+    /// for, so that the damping can check it against the solution; `None`
+    /// for laws that do not depend on the node.
+    fn n_total_nodes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Manning bottom friction source term for 2D shallow water equations.
@@ -155,7 +167,7 @@ impl ManningFriction2D {
         }
 
         // S = (0, -C_f |u| u, -C_f |u| v) = -Λ (0, hu, hv)
-        let rate = self.damping_rate(state.h, speed);
+        let rate = self.rate(state.h, speed);
         SWEState2D {
             h: 0.0,
             hu: -rate * state.hu,
@@ -191,7 +203,7 @@ impl ManningFriction2D {
             return *state;
         }
 
-        let factor = 1.0 / (1.0 + dt * self.damping_rate(state.h, speed));
+        let factor = 1.0 / (1.0 + dt * self.rate(state.h, speed));
         SWEState2D {
             h: state.h,
             hu: factor * state.hu,
@@ -208,16 +220,31 @@ impl ManningFriction2D {
         }
 
         let speed = (state.hu * state.hu + state.hv * state.hv).sqrt() / state.h;
-        dt * self.damping_rate(state.h, speed) > 1.0
+        dt * self.rate(state.h, speed) > 1.0
+    }
+
+    /// Λ = C_f |u| / h = g n² |u| / h^{4/3}.
+    #[inline]
+    fn rate(&self, h: f64, speed: f64) -> f64 {
+        manning_rate(
+            self.g * self.manning_n * self.manning_n,
+            h.max(self.h_min),
+            speed,
+        )
     }
 }
 
+/// Manning's damping rate Λ = g n² |u| / h^{4/3} from `g_n2` = g·n² at the
+/// (already floored) depth `h`.
+#[inline]
+fn manning_rate(g_n2: f64, h: f64, speed: f64) -> f64 {
+    g_n2 * speed / (cbrt(h) * h)
+}
+
 impl BottomFriction2D for ManningFriction2D {
-    /// Λ = C_f |u| / h = g n² |u| / h^{4/3}.
     #[inline]
-    fn damping_rate(&self, h: f64, speed: f64) -> f64 {
-        let h_eff = h.max(self.h_min);
-        self.g * self.manning_n * self.manning_n * speed / (cbrt(h_eff) * h_eff)
+    fn damping_rate(&self, _node: usize, h: f64, speed: f64) -> f64 {
+        self.rate(h, speed)
     }
 }
 
@@ -271,7 +298,7 @@ impl ChezyFriction2D {
         }
 
         // S = (0, -C_D |u| u, -C_D |u| v) = -Λ (0, hu, hv)
-        let rate = self.damping_rate(state.h, speed);
+        let rate = self.damping_rate(0, state.h, speed);
         SWEState2D {
             h: 0.0,
             hu: -rate * state.hu,
@@ -283,7 +310,7 @@ impl ChezyFriction2D {
 impl BottomFriction2D for ChezyFriction2D {
     /// Λ = C_D |u| / h.
     #[inline]
-    fn damping_rate(&self, h: f64, speed: f64) -> f64 {
+    fn damping_rate(&self, _node: usize, h: f64, speed: f64) -> f64 {
         self.c_d * speed / h.max(self.h_min)
     }
 }
@@ -302,82 +329,167 @@ impl SourceTerm2D for ChezyFriction2D {
     }
 }
 
-/// Spatially-varying Manning friction.
+/// Manning friction with a coefficient n(x, y) that varies in space (bed
+/// types, calibrated roughness maps), held as g·n² at every mesh node.
 ///
-/// Allows the Manning coefficient to vary with position,
-/// useful for domains with different bed types.
+/// The field is evaluated once at construction, so the law can be applied
+/// point-implicitly ([`BottomFriction2D`], through
+/// `SWEPhysics2DBuilder::with_implicit_friction`) and costs no closure call
+/// per node and stage. It belongs to the mesh and order it was built for.
 ///
 /// # Example
 ///
-/// ```ignore
-/// // Higher friction in shallow coastal areas
-/// let friction = SpatiallyVaryingManning2D::new(9.81, |x, y| {
-///     let depth_proxy = y;  // Assume depth increases with y
-///     if depth_proxy < 10.0 {
-///         0.05  // Higher friction in shallows
-///     } else {
-///         0.025  // Lower friction in deep water
-///     }
-/// });
 /// ```
-pub struct SpatiallyVaryingManning2D<F>
-where
-    F: Fn(f64, f64) -> f64 + Send + Sync,
-{
+/// use dg_rs::mesh::Mesh2D;
+/// use dg_rs::operators::DGOperators2D;
+/// use dg_rs::source::SpatiallyVaryingManning2D;
+///
+/// let mesh = Mesh2D::uniform_rectangle(0.0, 20.0, 0.0, 10.0, 4, 2);
+/// let ops = DGOperators2D::new(2);
+/// // Rougher bed in the shallows (x < 5 m)
+/// let friction = SpatiallyVaryingManning2D::new(9.81, &mesh, &ops, |x, _y| {
+///     if x < 5.0 { 0.05 } else { 0.025 }
+/// });
+/// assert_eq!(friction.n_total_nodes(), 8 * 9);
+/// ```
+#[derive(Clone, Debug)]
+pub struct SpatiallyVaryingManning2D {
     /// Gravitational acceleration (m/s²)
-    pub g: f64,
-    /// Function returning Manning coefficient n(x, y)
-    pub manning_fn: F,
+    g: f64,
+    /// g·n² per node, element-major (`k·n_nodes + i`)
+    g_n2: Vec<f64>,
+    /// Nodes per element
+    n_nodes: usize,
     /// Minimum depth (m)
     pub h_min: f64,
 }
 
-impl<F> SpatiallyVaryingManning2D<F>
-where
-    F: Fn(f64, f64) -> f64 + Send + Sync,
-{
-    /// Create a new spatially-varying Manning friction.
-    pub fn new(g: f64, manning_fn: F) -> Self {
+impl SpatiallyVaryingManning2D {
+    /// Evaluate `manning_fn(x, y)` (s/m^{1/3}) at the nodes of `mesh` at the
+    /// order of `ops`.
+    ///
+    /// # Panics
+    /// If `manning_fn` returns a negative or non-finite coefficient.
+    pub fn new(
+        g: f64,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        manning_fn: impl Fn(f64, f64) -> f64,
+    ) -> Self {
+        let n = ElementIndex::iter(mesh.n_elements)
+            .flat_map(|k| {
+                (0..ops.n_nodes)
+                    .map(move |i| mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]))
+            })
+            .map(|[x, y]| manning_fn(x, y))
+            .collect();
+        Self::from_nodal(g, ops.n_nodes, n)
+    }
+
+    /// Standard gravity (9.81 m/s²) with a coefficient `manning_fn(x, y)`.
+    pub fn standard(
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        manning_fn: impl Fn(f64, f64) -> f64,
+    ) -> Self {
+        Self::new(9.81, mesh, ops, manning_fn)
+    }
+
+    /// From Manning coefficients `n` (s/m^{1/3}) at every node, element-major
+    /// with `n_nodes` nodes per element (e.g. projected from a roughness map).
+    ///
+    /// # Panics
+    /// If `n.len()` is not a multiple of `n_nodes`, or a coefficient is
+    /// negative or not finite.
+    pub fn from_nodal(g: f64, n_nodes: usize, n: Vec<f64>) -> Self {
+        assert!(
+            n_nodes > 0 && n.len().is_multiple_of(n_nodes),
+            "{} Manning coefficients for {n_nodes} nodes per element",
+            n.len()
+        );
+        let g_n2 = n
+            .into_iter()
+            .map(|n| {
+                assert!(
+                    n.is_finite() && n >= 0.0,
+                    "Manning coefficient {n} is negative or not finite"
+                );
+                g * n * n
+            })
+            .collect();
         Self {
             g,
-            manning_fn,
+            g_n2,
+            n_nodes,
             h_min: 1e-6,
         }
     }
 
-    /// Standard gravity with spatially-varying coefficient.
-    pub fn standard(manning_fn: F) -> Self {
-        Self::new(9.81, manning_fn)
+    /// Manning coefficient n (s/m^{1/3}) at node `i` of element `k`.
+    pub fn manning_n(&self, k: ElementIndex, i: usize) -> f64 {
+        (self.g_n2[k.as_usize() * self.n_nodes + i] / self.g).sqrt()
+    }
+
+    /// Number of mesh nodes (`K·n_nodes`) this was built for.
+    pub fn n_total_nodes(&self) -> usize {
+        self.g_n2.len()
     }
 }
 
-impl<F> SourceTerm2D for SpatiallyVaryingManning2D<F>
-where
-    F: Fn(f64, f64) -> f64 + Send + Sync,
-{
-    fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
-        if ctx.state.h < self.h_min {
-            return SWEState2D::zero();
-        }
+impl BottomFriction2D for SpatiallyVaryingManning2D {
+    /// Λ = g n² |u| / h^{4/3} with the node's n.
+    #[inline]
+    fn damping_rate(&self, node: usize, h: f64, speed: f64) -> f64 {
+        manning_rate(self.g_n2[node], h.max(self.h_min), speed)
+    }
 
-        let (x, y) = ctx.position;
-        let n = (self.manning_fn)(x, y);
+    fn n_total_nodes(&self) -> Option<usize> {
+        Some(self.g_n2.len())
+    }
+}
 
-        let u = ctx.state.hu / ctx.state.h;
-        let v = ctx.state.hv / ctx.state.h;
-        let speed = (u * u + v * v).sqrt();
+impl SourceTerm2D for SpatiallyVaryingManning2D {
+    /// The per-node context carries no node index, so the coefficient cannot
+    /// be looked up here: the 2D SWE RHS goes through
+    /// [`SourceTerm2D::add_element`].
+    ///
+    /// # Panics
+    /// Always.
+    fn evaluate(&self, _ctx: &SourceContext2D) -> SWEState2D {
+        panic!(
+            "SpatiallyVaryingManning2D is a per-node field: evaluate it per element \
+             (SourceTerm2D::add_element) or apply it as implicit friction"
+        )
+    }
 
-        if speed < 1e-14 {
-            return SWEState2D::zero();
-        }
-
-        let h_eff = ctx.state.h.max(self.h_min);
-        let c_f = self.g * n * n / cbrt(h_eff);
-
-        SWEState2D {
-            h: 0.0,
-            hu: -c_f * speed * u,
-            hv: -c_f * speed * v,
+    fn add_element(
+        &self,
+        element: &ElementSources<'_>,
+        _h: &mut [f64],
+        hu: &mut [f64],
+        hv: &mut [f64],
+    ) {
+        let n = element.n_nodes();
+        assert_eq!(
+            self.n_nodes, n,
+            "SpatiallyVaryingManning2D was built for another order"
+        );
+        let base = element.element.as_usize() * n;
+        let [h_in, hu_in, hv_in] = &element.solution.data;
+        // Same arithmetic as `ManningFriction2D::explicit_source`
+        for i in 0..n {
+            let (h, qx, qy) = (h_in[base + i], hu_in[base + i], hv_in[base + i]);
+            if h < element.h_min {
+                continue;
+            }
+            let speed = (qx * qx + qy * qy).sqrt() * (1.0 / h);
+            if speed < 1e-14 {
+                continue;
+            }
+            // S = −Λ (0, hu, hv)
+            let rate = self.damping_rate(base + i, h, speed);
+            hu[i] -= rate * qx;
+            hv[i] -= rate * qy;
         }
     }
 
@@ -648,24 +760,100 @@ mod tests {
         assert!(s.hv.abs() < TOL);
     }
 
+    /// Manning coefficient varying inside and across elements: rough near
+    /// the left of the domain, smooth to the right.
+    fn roughness(x: f64, y: f64) -> f64 {
+        0.02 + 0.03 * (-x / 7.0).exp() + 0.002 * y
+    }
+
+    /// Mesh, operators and a flow with h, u, v varying from node to node.
+    fn varying_flow() -> (Mesh2D, DGOperators2D, crate::solver::SWESolution2D) {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 20.0, 0.0, 10.0, 4, 3);
+        let ops = DGOperators2D::new(3);
+        let mut q = crate::solver::SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let h = 0.5 + 0.1 * x + 0.05 * y;
+                let state = SWEState2D::from_primitives(h, (0.3 * y).sin(), 0.2 - 0.02 * x);
+                q.set_state(k, i, state);
+            }
+        }
+        (mesh, ops, q)
+    }
+
+    /// Each node carries its own coefficient: the point-implicit rate and the
+    /// explicit source equal those of a uniform Manning law with that node's
+    /// n, bit for bit.
     #[test]
-    fn test_spatially_varying_manning() {
-        // Higher friction for x < 5
-        let friction = SpatiallyVaryingManning2D::new(G, |x, _y| if x < 5.0 { 0.05 } else { 0.02 });
-
-        let state = SWEState2D::new(2.0, 4.0, 0.0);
-
-        let ctx_rough = SourceContext2D::new(0.0, (0.0, 0.0), state, 0.0, (0.0, 0.0), G, 1e-6);
-
-        let ctx_smooth = SourceContext2D::new(0.0, (10.0, 0.0), state, 0.0, (0.0, 0.0), G, 1e-6);
-
-        let s_rough = friction.evaluate(&ctx_rough);
-        let s_smooth = friction.evaluate(&ctx_smooth);
-
-        assert!(
-            s_rough.hu.abs() > s_smooth.hu.abs(),
-            "Should have more friction in rough region"
+    fn test_spatially_varying_manning_is_manning_per_node() {
+        let (mesh, ops, q) = varying_flow();
+        let friction = SpatiallyVaryingManning2D::new(G, &mesh, &ops, roughness);
+        assert_eq!(
+            BottomFriction2D::n_total_nodes(&friction),
+            Some(q.h_data().len())
         );
+
+        let mut out = [
+            vec![0.0; ops.n_nodes],
+            vec![0.0; ops.n_nodes],
+            vec![0.0; ops.n_nodes],
+        ];
+        let mut rough_vs_smooth = (0.0_f64, f64::INFINITY);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let element = ElementSources {
+                element: k,
+                time: 0.0,
+                solution: &q,
+                mesh: &mesh,
+                ops: &ops,
+                bathymetry: None,
+                g: G,
+                h_min: 1e-6,
+            };
+            for v in &mut out {
+                v.fill(0.0);
+            }
+            let [oh, ohu, ohv] = &mut out;
+            friction.add_element(&element, oh, ohu, ohv);
+            for i in 0..ops.n_nodes {
+                let (x, y) = element.position(i);
+                let uniform = ManningFriction2D::new(G, roughness(x, y));
+                let node = k.as_usize() * ops.n_nodes + i;
+                let state = q.get_state(k, i);
+                let speed = (state.hu * state.hu + state.hv * state.hv).sqrt() / state.h;
+                assert_eq!(
+                    friction.damping_rate(node, state.h, speed),
+                    uniform.damping_rate(node, state.h, speed)
+                );
+                let expected = uniform.evaluate(&element.context(i));
+                assert_eq!((oh[i], ohu[i], ohv[i]), (0.0, expected.hu, expected.hv));
+                assert!((friction.manning_n(k, i) - roughness(x, y)).abs() < 1e-15);
+                let n = friction.manning_n(k, i);
+                rough_vs_smooth = (rough_vs_smooth.0.max(n), rough_vs_smooth.1.min(n));
+            }
+        }
+        // The field does vary
+        assert!(rough_vs_smooth.0 > 2.0 * rough_vs_smooth.1);
+    }
+
+    #[test]
+    #[should_panic(expected = "per-node field")]
+    fn test_spatially_varying_manning_has_no_pointwise_evaluate() {
+        let friction = SpatiallyVaryingManning2D::from_nodal(G, 4, vec![0.03; 8]);
+        friction.evaluate(&make_context(2.0, 4.0, 0.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "nodes per element")]
+    fn test_spatially_varying_manning_rejects_partial_elements() {
+        SpatiallyVaryingManning2D::from_nodal(G, 4, vec![0.03; 6]);
+    }
+
+    #[test]
+    #[should_panic(expected = "negative or not finite")]
+    fn test_spatially_varying_manning_rejects_negative_n() {
+        SpatiallyVaryingManning2D::from_nodal(G, 2, vec![0.03, -0.01]);
     }
 
     #[test]

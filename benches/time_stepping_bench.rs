@@ -9,11 +9,15 @@ use dg_rs::boundary::Reflective2D;
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::Mesh2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
+use dg_rs::physics::{PhysicsBuilder, SWEPhysics2D};
+use dg_rs::simulation::Simulation;
 use dg_rs::solver::{
     DiagnosticsTracker, SWE2DRhsConfig, SWEDiagnostics2D, SWESolution2D, SWEState2D,
     compute_dt_swe_2d, compute_rhs_swe_2d,
 };
-use dg_rs::time::{SWE2DTimeConfig, ssp_rk3_swe_2d_step_limited};
+use dg_rs::time::SSPRK3;
+use dg_rs::types::ElementIndex;
+use std::sync::Arc;
 
 /// Setup a test problem.
 fn setup_problem(
@@ -36,7 +40,7 @@ fn setup_problem(
     let h0 = 10.0;
     let u0 = 0.5;
     let v0 = 0.3;
-    for k in 0..q.n_elements {
+    for k in ElementIndex::iter(q.n_elements) {
         for i in 0..ops.n_nodes {
             q.set_state(k, i, SWEState2D::new(h0, h0 * u0, h0 * v0));
         }
@@ -76,39 +80,42 @@ fn bench_compute_dt(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark single SSP-RK3 step with limiters.
+/// Production physics (`SWEPhysics2D`, walls, no limiter) for a problem.
+fn physics(
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+) -> SWEPhysics2D<Reflective2D> {
+    PhysicsBuilder::swe_2d(
+        Arc::new(mesh.clone()),
+        Arc::new(ops.clone()),
+        Arc::new(geom.clone()),
+        ShallowWater2D::new(9.81),
+        Reflective2D::new(),
+    )
+    .build()
+}
+
+/// Benchmark SSP-RK3 steps on the production path (`Simulation` with
+/// `SSPRK3` and `SWEPhysics2D`): one step, which includes allocating the
+/// stage workspace, and runs of 10–100 steps, which reuse it.
 fn bench_ssp_rk3_step(c: &mut Criterion) {
     let mut group = c.benchmark_group("ssp_rk3_step");
     group.sample_size(30);
 
     for (nx, ny) in [(8, 8), (16, 16)] {
         let n_elements = nx * ny;
-        let (mesh, ops, geom, q, equation) = setup_problem(nx, ny, 3);
-        let bc = Reflective2D::new();
-        let config = SWE2DRhsConfig::new(&equation, &bc);
-        let time_config = SWE2DTimeConfig::new(0.5, 9.81, 1e-6);
-        let dt = 0.1;
-        let q_backup = q.clone();
+        let (mesh, ops, geom, q, _) = setup_problem(nx, ny, 3);
+        let sim = Simulation::new(physics(&mesh, &ops, &geom), SSPRK3).with_dt_max(0.1);
+        let mut q_work = q.clone();
 
         group.bench_with_input(
             BenchmarkId::new("step", format!("{}_elements", n_elements)),
             &n_elements,
             |b, _| {
-                let mut q_work = q_backup.clone();
                 b.iter(|| {
-                    q_work = q_backup.clone();
-                    let rhs_fn = |s: &SWESolution2D, time: f64| {
-                        compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time)
-                    };
-                    ssp_rk3_swe_2d_step_limited(
-                        black_box(&mut q_work),
-                        black_box(dt),
-                        black_box(0.0),
-                        black_box(&mesh),
-                        black_box(&ops),
-                        rhs_fn,
-                        black_box(&time_config),
-                    )
+                    q_work.clone_from(&q);
+                    sim.run(black_box(&mut q_work), 0.0, 0.1)
                 });
             },
         );
@@ -123,37 +130,21 @@ fn bench_multiple_steps(c: &mut Criterion) {
     group.sample_size(20);
 
     let (nx, ny) = (10, 10);
-    let (mesh, ops, geom, q, equation) = setup_problem(nx, ny, 3);
-    let bc = Reflective2D::new();
-    let config = SWE2DRhsConfig::new(&equation, &bc);
-    let time_config = SWE2DTimeConfig::new(0.5, 9.81, 1e-6);
+    let (mesh, ops, geom, q, _) = setup_problem(nx, ny, 3);
     let dt = 0.1;
-    let q_backup = q.clone();
+    let sim = Simulation::new(physics(&mesh, &ops, &geom), SSPRK3).with_dt_max(dt);
+    let mut q_work = q.clone();
 
     for n_steps in [10, 50, 100] {
         group.bench_with_input(
             BenchmarkId::new("steps", n_steps.to_string()),
             &n_steps,
             |b, &n_steps| {
-                let mut q_work = q_backup.clone();
                 b.iter(|| {
-                    q_work = q_backup.clone();
-                    let mut t = 0.0;
-                    for _ in 0..n_steps {
-                        let rhs_fn = |s: &SWESolution2D, time: f64| {
-                            compute_rhs_swe_2d(s, &mesh, &ops, &geom, &config, time)
-                        };
-                        ssp_rk3_swe_2d_step_limited(
-                            black_box(&mut q_work),
-                            black_box(dt),
-                            black_box(t),
-                            black_box(&mesh),
-                            black_box(&ops),
-                            rhs_fn,
-                            black_box(&time_config),
-                        );
-                        t += dt;
-                    }
+                    q_work.clone_from(&q);
+                    let result = sim.run(black_box(&mut q_work), 0.0, n_steps as f64 * dt);
+                    assert_eq!(result.n_steps, n_steps);
+                    result
                 });
             },
         );

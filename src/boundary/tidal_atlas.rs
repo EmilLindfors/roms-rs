@@ -529,6 +529,7 @@ impl TidalAtlas {
             source_depth,
             use_mean: false,
             ramp_duration: None,
+            max_transport_ratio: None,
         })
     }
 
@@ -627,12 +628,30 @@ pub struct BoundaryTides {
     source_depth: Vec<f64>,
     use_mean: bool,
     ramp_duration: Option<f64>,
+    /// Largest transport-scaling factor, if the velocity is scaled
+    max_transport_ratio: Option<f64>,
 }
 
 impl BoundaryTides {
     /// Ramp the tide up over `duration` seconds.
     pub fn with_ramp_up(mut self, duration: f64) -> Self {
         self.ramp_duration = Some(duration);
+        self
+    }
+
+    /// Scale the velocity to carry the source model's transport over the
+    /// child's bed: `u · D_source/D_child` with total depths `D = h + η`
+    /// (the source's from the atlas depths, [`Self::source_depths`]),
+    /// limited to a factor `max_ratio` either way, as
+    /// [`OceanModelState`](super::OceanModelState) nesting does.
+    ///
+    /// The atlas velocity is the source model's depth mean over its own
+    /// depth. Where the child's bed differs (a coastline-fitted bed from a
+    /// 50 m elevation model against NorKyst's smoothed 800 m one), imposing
+    /// it unscaled imposes a different transport. Off by default.
+    pub fn with_transport_scaling(mut self, max_ratio: f64) -> Self {
+        assert!(max_ratio >= 1.0, "transport ratio limit below 1");
+        self.max_transport_ratio = Some(max_ratio);
         self
     }
 
@@ -720,12 +739,21 @@ impl BoundaryTides {
 
 impl ExternalStateProvider for BoundaryTides {
     fn external_state(&self, ctx: &BCContext2D) -> ExternalState {
-        let (eta, u, v) = self.evaluate(self.slot(ctx), ctx.time);
-        if self.velocity {
-            ExternalState::new(eta, u, v)
-        } else {
-            ExternalState::elevation(eta)
+        let slot = self.slot(ctx);
+        let (eta, mut u, mut v) = self.evaluate(slot, ctx.time);
+        if !self.velocity {
+            return ExternalState::elevation(eta);
         }
+        if let Some(max) = self.max_transport_ratio {
+            let h_source = self.source_depth[slot];
+            let (d_source, d_child) = (h_source + eta, eta - ctx.bathymetry);
+            if h_source > 0.0 && d_source > 0.0 && d_child > 0.0 {
+                let ratio = (d_source / d_child).clamp(1.0 / max, max);
+                u *= ratio;
+                v *= ratio;
+            }
+        }
+        ExternalState::new(eta, u, v)
     }
 }
 
@@ -733,6 +761,7 @@ impl ExternalStateProvider for BoundaryTides {
 mod tests {
     use super::*;
     use crate::io::LocalProjection;
+    use crate::solver::SWEState2D;
 
     const ATLAS: &str = "\
 # test atlas
@@ -916,6 +945,64 @@ mod tests {
         let tides = tides.with_mean_level(true).with_ramp_up(2.0 * t);
         let (eta_ramped, _, _) = tides.evaluate(mid, t);
         assert!((eta_ramped - (0.05 + 0.5 * eta)).abs() < 1e-12);
+    }
+
+    /// With transport scaling the velocity carries the source's transport
+    /// over the child's bed, limited by the ratio; without it, or without
+    /// source depth, it is the atlas velocity.
+    #[test]
+    fn transport_scaling_conserves_the_source_transport() {
+        let atlas = TidalAtlas::parse(ATLAS).unwrap();
+        let (mesh, ops, projection) = setup();
+        let clock = ModelClock::default();
+        let tides = atlas
+            .boundary_tides(
+                &mesh,
+                &ops,
+                &projection,
+                BoundaryTag::Open,
+                &clock,
+                0.0,
+                3000.0,
+            )
+            .unwrap();
+        let (x_west, _) = projection.geo_to_xy(63.0, 8.0);
+        let west = tides
+            .positions()
+            .iter()
+            .position(|p| (p.0 - x_west).abs() < 1e-6)
+            .unwrap();
+        assert_eq!(tides.source_depths()[west], 100.0);
+        let t = 5000.0;
+        let (eta, u, v) = tides.evaluate(west, t);
+        assert!(u.abs() > 1e-3 && v.abs() > 1e-3);
+        let velocity = |tides: &BoundaryTides, bed: f64| {
+            let ctx = BCContext2D::new(
+                t,
+                tides.positions()[west],
+                SWEState2D::new(eta - bed, 0.0, 0.0),
+                bed,
+                (-1.0, 0.0),
+                9.81,
+                1e-6,
+            );
+            let state = tides.external_state(&ctx);
+            assert_eq!(state.eta, eta);
+            state.velocity.unwrap()
+        };
+        // Unscaled: the atlas velocity whatever the bed
+        assert_eq!(velocity(&tides, -40.0), (u, v));
+        let scaled = tides.clone().with_transport_scaling(3.0);
+        // A child half as deep (in total depth) carries the source's
+        // transport at twice the speed
+        let d_source = 100.0 + eta;
+        let (us, vs) = velocity(&scaled, eta - 0.5 * d_source);
+        assert!((us - 2.0 * u).abs() < 1e-12 && (vs - 2.0 * v).abs() < 1e-12);
+        // Limited to the ratio: a 10 m child under a 100 m source
+        let (ul, vl) = velocity(&scaled, -10.0);
+        assert!((ul - 3.0 * u).abs() < 1e-12 && (vl - 3.0 * v).abs() < 1e-12);
+        // The same depth: unchanged
+        assert_eq!(velocity(&scaled, -100.0), (u, v));
     }
 
     #[test]

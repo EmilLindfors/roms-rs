@@ -59,13 +59,13 @@ fn bench_cell_averages(c: &mut Criterion) {
 
     for (nx, ny) in [(8, 8), (16, 16), (32, 32)] {
         let n_elements = nx * ny;
-        let (_, ops, _, q) = setup_problem(nx, ny, 3);
+        let (_, _, geom, q) = setup_problem(nx, ny, 3);
 
         group.bench_with_input(
             BenchmarkId::new("swe", format!("{}_elements", n_elements)),
             &n_elements,
             |b, _| {
-                b.iter(|| swe_cell_averages_2d(black_box(&q), black_box(&ops)));
+                b.iter(|| swe_cell_averages_2d(black_box(&q), black_box(&geom)));
             },
         );
     }
@@ -79,7 +79,7 @@ fn bench_kuzmin_limiter(c: &mut Criterion) {
 
     for (nx, ny) in [(8, 8), (16, 16), (32, 32)] {
         let n_elements = nx * ny;
-        let (mesh, ops, _, q) = setup_problem(nx, ny, 3);
+        let (mesh, ops, geom, q) = setup_problem(nx, ny, 3);
         let kuzmin = KuzminParameter2D::strict();
         let q_backup = q.clone();
 
@@ -89,11 +89,12 @@ fn bench_kuzmin_limiter(c: &mut Criterion) {
             |b, _| {
                 let mut q_work = q_backup.clone();
                 b.iter(|| {
-                    q_work = q_backup.clone();
+                    q_work.clone_from(&q_backup);
                     swe_kuzmin_limiter_2d(
                         black_box(&mut q_work),
                         black_box(&mesh),
                         black_box(&ops),
+                        black_box(&geom),
                         black_box(&kuzmin),
                     )
                 });
@@ -110,7 +111,7 @@ fn bench_positivity_limiter(c: &mut Criterion) {
 
     for (nx, ny) in [(8, 8), (16, 16), (32, 32)] {
         let n_elements = nx * ny;
-        let (_, ops, _, q) = setup_problem(nx, ny, 3);
+        let (_, _, geom, q) = setup_problem(nx, ny, 3);
         let h_min = 1e-6;
         let q_backup = q.clone();
 
@@ -120,10 +121,10 @@ fn bench_positivity_limiter(c: &mut Criterion) {
             |b, _| {
                 let mut q_work = q_backup.clone();
                 b.iter(|| {
-                    q_work = q_backup.clone();
+                    q_work.clone_from(&q_backup);
                     swe_positivity_limiter_2d(
                         black_box(&mut q_work),
-                        black_box(&ops),
+                        black_box(&geom),
                         black_box(h_min),
                     )
                 });
@@ -140,7 +141,7 @@ fn bench_combined_kuzmin_positivity(c: &mut Criterion) {
 
     for (nx, ny) in [(8, 8), (16, 16), (32, 32)] {
         let n_elements = nx * ny;
-        let (mesh, ops, _, q) = setup_problem(nx, ny, 3);
+        let (mesh, ops, geom, q) = setup_problem(nx, ny, 3);
         let kuzmin = KuzminParameter2D::strict();
         let h_min = 1e-6;
         let q_backup = q.clone();
@@ -151,11 +152,12 @@ fn bench_combined_kuzmin_positivity(c: &mut Criterion) {
             |b, _| {
                 let mut q_work = q_backup.clone();
                 b.iter(|| {
-                    q_work = q_backup.clone();
+                    q_work.clone_from(&q_backup);
                     apply_swe_limiters_kuzmin_2d(
                         black_box(&mut q_work),
                         black_box(&mesh),
                         black_box(&ops),
+                        black_box(&geom),
                         black_box(&kuzmin),
                         black_box(h_min),
                     )
@@ -172,7 +174,7 @@ fn bench_limiter_comparison(c: &mut Criterion) {
     let mut group = c.benchmark_group("limiter_comparison");
 
     let (nx, ny) = (16, 16);
-    let (mesh, ops, _, q) = setup_problem(nx, ny, 3);
+    let (mesh, ops, geom, q) = setup_problem(nx, ny, 3);
     let kuzmin = KuzminParameter2D::strict();
     let h_min = 1e-6;
 
@@ -182,11 +184,12 @@ fn bench_limiter_comparison(c: &mut Criterion) {
     group.bench_function("kuzmin_full", |b| {
         let mut q_work = q_backup.clone();
         b.iter(|| {
-            q_work = q_backup.clone();
+            q_work.clone_from(&q_backup);
             apply_swe_limiters_kuzmin_2d(
                 black_box(&mut q_work),
                 black_box(&mesh),
                 black_box(&ops),
+                black_box(&geom),
                 black_box(&kuzmin),
                 black_box(h_min),
             )
@@ -196,8 +199,8 @@ fn bench_limiter_comparison(c: &mut Criterion) {
     group.bench_function("positivity_only", |b| {
         let mut q_work = q_backup.clone();
         b.iter(|| {
-            q_work = q_backup.clone();
-            swe_positivity_limiter_2d(black_box(&mut q_work), black_box(&ops), black_box(h_min))
+            q_work.clone_from(&q_backup);
+            swe_positivity_limiter_2d(black_box(&mut q_work), black_box(&geom), black_box(h_min))
         });
     });
 
