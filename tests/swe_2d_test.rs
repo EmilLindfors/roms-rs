@@ -51,36 +51,84 @@ fn ssp_rk3_swe_step<BC: dg_rs::SWEBoundaryCondition2D>(
     q.axpy(2.0 / 3.0, &u2);
 }
 
-/// Test lake-at-rest: uniform depth, zero velocity.
-///
-/// For a well-balanced scheme, the RHS should be zero regardless of bathymetry.
+/// Lake at rest over a steep, nodal bed (TODO P1.7): a fjord sill and
+/// continental-slope profile from 30 m to 400 m over 10 km, plus bumps, so
+/// the bed is far from linear inside the elements. The split forms
+/// (`EntropyStable`, `WetDry`) must keep η = 0, u = 0 to round-off at P1–P4
+/// with walls, serial and parallel. The collocated `Standard` form with
+/// hydrostatic reconstruction is balanced only for beds of degree ≤ p/2 and
+/// serves as the negative control. (This test used a flat bottom.)
 #[test]
 fn test_lake_at_rest() {
-    let mesh = Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4);
-    let ops = DGOperators2D::new(3);
-    let geom = GeometricFactors2D::compute(&mesh, &ops);
+    use dg_rs::mesh::Bathymetry2D;
+    use dg_rs::solver::SWEFormulation2D;
+    use dg_rs::source::BathymetrySource2D;
+
+    let bed = |x: f64, y: f64| {
+        let slope = 0.5 * (1.0 + ((x - 5_000.0) / 1_200.0).tanh()); // 0 → 1 across the slope
+        -30.0 - 370.0 * slope + 20.0 * (x / 700.0).sin() * (y / 900.0).cos()
+    };
     let equation = ShallowWater2D::new(G);
     let bc = Reflective2D::new();
-    let config = SWE2DRhsConfig::new(&equation, &bc).with_coriolis(false);
+    let bathy_source = BathymetrySource2D::new(G);
 
-    // Initialize: h = 5.0, u = v = 0
-    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-    for ki in 0..mesh.n_elements {
-        for i in 0..ops.n_nodes {
-            q.set_state(k(ki), i, SWEState2D::new(5.0, 0.0, 0.0));
+    for order in 1..=4 {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 10_000.0, 0.0, 4_000.0, 10, 4);
+        let ops = DGOperators2D::new(order);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        let (depths, _) = bathymetry
+            .data
+            .iter()
+            .fold((f64::INFINITY, 0.0), |(lo, hi): (f64, f64), &b| {
+                (lo.min(-b), hi.max(-b))
+            });
+        assert!(depths < 40.0, "shallowest {depths}");
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for ki in 0..mesh.n_elements {
+            for i in 0..ops.n_nodes {
+                let h = -bathymetry.get(k(ki), i);
+                q.set_state(k(ki), i, SWEState2D::new(h, 0.0, 0.0));
+            }
         }
+        let rates = |config: &SWE2DRhsConfig<Reflective2D>| {
+            let serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, config, 0.0);
+            #[cfg(feature = "parallel")]
+            {
+                let parallel =
+                    dg_rs::compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, config, 0.0);
+                assert_eq!(serial.data, parallel.data, "p={order}: serial ≠ parallel");
+            }
+            let max = |v: &[f64]| v.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+            (
+                max(serial.h_data()),
+                max(serial.hu_data()).max(max(serial.hv_data())),
+            )
+        };
+
+        for formulation in [SWEFormulation2D::EntropyStable, SWEFormulation2D::WetDry] {
+            let config = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_formulation(formulation)
+                .with_bathymetry(&bathymetry);
+            let (dh, dm) = rates(&config);
+            // d(hu)/dt of 1e-10 m²/s² is 2.5e-13 m/s² of spurious
+            // acceleration in 400 m of water
+            assert!(
+                dh < 1e-12 && dm < 1e-10,
+                "p={order}, {formulation:?}: max |dh/dt| = {dh:.2e}, max |d(hu)/dt| = {dm:.2e}"
+            );
+        }
+
+        // Negative control: the collocated form is not balanced on this bed
+        let config = SWE2DRhsConfig::new(&equation, &bc)
+            .with_coriolis(false)
+            .with_bathymetry(&bathymetry)
+            .with_source_terms(&bathy_source)
+            .with_well_balanced(true);
+        let (_, dm) = rates(&config);
+        assert!(dm > 1e-4, "p={order}, Standard: max |d(hu)/dt| = {dm:.2e}");
     }
-
-    // Compute RHS
-    let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
-
-    // RHS should be zero (lake at rest)
-    let max_rhs = rhs.max_abs();
-    assert!(
-        max_rhs < 1e-10,
-        "Lake at rest should have zero RHS, got {}",
-        max_rhs
-    );
 }
 
 /// Test lake-at-rest with perturbation.
@@ -560,16 +608,158 @@ fn test_long_term_stability() {
     );
 }
 
-/// Multi-day stability test.
+/// Multi-day tidal run on the production path (TODO P1.7): three days of
+/// M2 through an open boundary into a 40 × 20 km basin that shoals from
+/// 200 m at the mouth to 20 m at the head, with Coriolis, point-implicit
+/// Manning friction and the split-form operator (`Simulation` + `SSPRK3` +
+/// `SWEPhysics2D`).
 ///
-/// Runs a 2D SWE simulation for 30+ simulated "days" (measured in wave-crossing
-/// times of the domain) to verify no drift, blow-up, or numerical instability.
-///
-/// Uses a periodic domain with smooth initial perturbation. The wave speed
-/// c = sqrt(g*h) ≈ 3.16 m/s with g=10, h=1, domain=10, so T_cross ≈ 3.16s.
-/// We run for 100 crossing times ≈ 316s (> 30 T_cross "days").
+/// After a 3 h ramp and a day of spin-up the response must be periodic:
+/// the basin volume and the surface at the head repeat from one tidal cycle
+/// to the next (no secular drift of mass, mean level or amplitude), and the
+/// head amplitude is the forcing's (the basin is 3 % of a tidal wavelength
+/// long, so the tide is nearly uniform across it). Measured: cycle to cycle
+/// the volume changes by 5e-7 m of basin-mean surface and the head surface
+/// by 1.4e-6 m; the head amplitude is 0.498 m for 0.5 m forced.
 #[test]
-fn test_multi_day_stability() {
+fn test_multi_day_tidal_run() {
+    use std::sync::Arc;
+
+    use dg_rs::boundary::{
+        CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, TidalConstituent,
+    };
+    use dg_rs::mesh::{Bathymetry2D, BoundaryTag};
+    use dg_rs::physics::PhysicsBuilder;
+    use dg_rs::simulation::Simulation;
+    use dg_rs::solver::SWEFormulation2D;
+    use dg_rs::source::{CoriolisSource2D, ManningFriction2D};
+    use dg_rs::time::SSPRK3;
+
+    let (lx, ly, amplitude) = (40_000.0, 20_000.0, 0.5);
+    let period = TidalConstituent::m2(amplitude, 0.0).period;
+    let bed = move |x: f64, y: f64| {
+        -(20.0 + 180.0 * (1.0 - x / lx)) - 10.0 * (std::f64::consts::PI * y / ly).sin()
+    };
+    let mesh = Arc::new(Mesh2D::uniform_rectangle_with_sides(
+        0.0,
+        lx,
+        0.0,
+        ly,
+        8,
+        4,
+        [
+            BoundaryTag::Wall,
+            BoundaryTag::Wall,
+            BoundaryTag::Wall,
+            BoundaryTag::Open,
+        ],
+    ));
+    let ops = Arc::new(DGOperators2D::new(2));
+    let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+    let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, bed));
+
+    let wall = Reflective2D::new();
+    let sea = CharacteristicOBC::new(HarmonicTide::m2(amplitude, 0.0).with_ramp_up(3.0 * 3600.0));
+    let physics = PhysicsBuilder::swe_2d(
+        mesh.clone(),
+        ops.clone(),
+        geom.clone(),
+        ShallowWater2D::new(G),
+        MultiBoundaryCondition2D::new(&wall).with_open(&sea),
+    )
+    .with_bathymetry(bathymetry.clone())
+    .with_formulation(SWEFormulation2D::EntropyStable)
+    .with_implicit_friction(ManningFriction2D::new(G, 0.025))
+    .with_source(CoriolisSource2D::f_plane(1.2e-4))
+    .build();
+
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    for ki in 0..mesh.n_elements {
+        for i in 0..ops.n_nodes {
+            q.set_state(
+                k(ki),
+                i,
+                SWEState2D::new(-bathymetry.get(k(ki), i), 0.0, 0.0),
+            );
+        }
+    }
+
+    // Every hour of the tidal cycle (24 samples per period): the basin's
+    // volume and the mean surface of the head column of elements
+    let samples_per_period = 24;
+    let head: Vec<usize> = (0..mesh.n_elements)
+        .filter(|&ki| {
+            mesh.element_vertices(k(ki))
+                .iter()
+                .all(|v| v[0] >= lx - 5_000.0 - 1e-6)
+        })
+        .collect();
+    let mut volume = Vec::new();
+    let mut head_eta = Vec::new();
+    let mut max_speed: f64 = 0.0;
+    let end = 3.0 * 86_400.0;
+    Simulation::new(physics, SSPRK3)
+        .with_callback_interval(period / samples_per_period as f64)
+        .run_with_callback(&mut q, 0.0, end, |q, _| {
+            let (mut v, mut eta, mut area) = (0.0, 0.0, 0.0);
+            for ki in 0..mesh.n_elements {
+                for i in 0..ops.n_nodes {
+                    let weight = ops.weights[i] * geom.det_j[ki * ops.n_nodes + i];
+                    let state = q.get_state(k(ki), i);
+                    v += weight * state.h;
+                    max_speed = max_speed.max(state.hu.hypot(state.hv) / state.h);
+                    if head.contains(&ki) {
+                        eta += weight * (state.h + bathymetry.get(k(ki), i));
+                        area += weight;
+                    }
+                }
+            }
+            volume.push(v);
+            head_eta.push(eta / area);
+        });
+    assert!(q.h_data().iter().all(|h| h.is_finite() && *h > 0.0));
+    assert!(max_speed < 0.5, "max speed {max_speed:.3} m/s");
+
+    // Compare the last full cycle with the one before (volume in metres of
+    // basin-mean surface)
+    let n = samples_per_period;
+    let last = volume.len() - n..volume.len();
+    let before = volume.len() - 2 * n..volume.len() - n;
+    let area = lx * ly;
+    let volume_change = last
+        .clone()
+        .zip(before.clone())
+        .map(|(a, b)| ((volume[a] - volume[b]) / area).abs())
+        .fold(0.0_f64, f64::max);
+    let head_change = last
+        .clone()
+        .zip(before)
+        .map(|(a, b)| (head_eta[a] - head_eta[b]).abs())
+        .fold(0.0_f64, f64::max);
+    let range = |r: std::ops::Range<usize>| {
+        let (lo, hi) = r.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), i| {
+            (lo.min(head_eta[i]), hi.max(head_eta[i]))
+        });
+        (0.5 * (hi - lo), 0.5 * (hi + lo))
+    };
+    let (head_amplitude, head_mean) = range(last);
+    assert!(
+        volume_change < 1e-5 && head_change < 2e-5,
+        "not periodic: volume changed by {volume_change:.2e} m, head η by {head_change:.2e} m"
+    );
+    assert!(
+        (0.98..1.02).contains(&(head_amplitude / amplitude)),
+        "head amplitude {head_amplitude:.4} m against {amplitude} m forced"
+    );
+    assert!(head_mean.abs() < 1e-3, "head mean level {head_mean:.3e} m");
+}
+
+/// Long-run mass conservation: 100 wave-crossing times of a periodic domain
+/// (316 s, > 1000 steps) with a smooth perturbation, checking mass, positivity
+/// and boundedness along the way. For a run over days of model time see
+/// `test_multi_day_tidal_run`.
+#[test]
+fn test_long_run_mass_conservation() {
     let mesh = Mesh2D::uniform_periodic(0.0, 10.0, 0.0, 10.0, 4, 4);
     let ops = DGOperators2D::new(1); // P1 for speed
     let geom = GeometricFactors2D::compute(&mesh, &ops);

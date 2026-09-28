@@ -28,7 +28,7 @@ use dg_rs::solver::{
     KuzminParameter2D, SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D,
     WetDryConfig, positivity_cfl_swe_2d,
 };
-use dg_rs::source::{BathymetrySource2D, ManningFriction2D};
+use dg_rs::source::{BathymetrySource2D, ManningFriction2D, SpatiallyVaryingManning2D};
 use dg_rs::time::SSPRK3;
 use dg_rs::types::{Depth, ElementIndex};
 
@@ -487,6 +487,78 @@ fn implicit_friction_converges_to_exact_decay() {
         fine < 2e-3 && rate > 0.9,
         "errors {coarse:.2e}, {fine:.2e}, rate {rate:.2}"
     );
+}
+
+/// A spatially varying Manning field that happens to be uniform runs bit for
+/// bit like `ManningFriction2D`, point-implicitly and as an explicit source,
+/// in a sheared flow over a bed (so fluxes, bed and friction all act).
+#[test]
+fn spatially_varying_manning_runs_like_uniform_manning() {
+    let manning_n = 0.03;
+    let setup = Setup::new(Mesh2D::uniform_periodic(0.0, 100.0, 0.0, 100.0, 4, 4), 2);
+    let w = 2.0 * PI / 100.0;
+    let bed = move |x: f64, y: f64| -2.0 + 0.3 * (w * x).sin() * (w * y).cos();
+    let initial =
+        setup.fill(|x, y| SWEState2D::from_primitives(2.0 - bed(x, y), 0.4 * (w * y).cos(), 0.1));
+    let field = || SpatiallyVaryingManning2D::new(G, &setup.mesh, &setup.ops, |_, _| manning_n);
+    let run = |physics| {
+        let mut q = initial.clone();
+        Simulation::new(physics, SSPRK3)
+            .with_dt_max(0.2)
+            .run(&mut q, 0.0, 20.0);
+        q
+    };
+    let over_bed = || {
+        setup
+            .builder()
+            .with_bathymetry(Arc::new(Bathymetry2D::from_function(
+                &setup.mesh,
+                &setup.ops,
+                &setup.geom,
+                bed,
+            )))
+            .with_formulation(SWEFormulation2D::EntropyStable)
+    };
+
+    let uniform = run(over_bed()
+        .with_implicit_friction(ManningFriction2D::new(G, manning_n))
+        .build());
+    let varying = run(over_bed().with_implicit_friction(field()).build());
+    assert_eq!(uniform.data, varying.data, "implicit");
+    // Friction did act: Λ ≈ 6e-4 /s over 20 s takes ≈ 1 % off the
+    // frictionless momentum. (Σ hu itself is ≈ 0 by symmetry, so compare
+    // magnitudes.)
+    let frictionless = run(over_bed().build());
+    let momentum = |q: &SWESolution2D| {
+        q.hu_data()
+            .iter()
+            .zip(q.hv_data())
+            .map(|(qx, qy)| (qx * qx + qy * qy).sqrt())
+            .sum::<f64>()
+    };
+    let ratio = momentum(&uniform) / momentum(&frictionless);
+    assert!((0.98..0.995).contains(&ratio), "momentum ratio {ratio}");
+
+    let uniform = run(over_bed()
+        .with_source(ManningFriction2D::new(G, manning_n))
+        .build());
+    let varying = run(over_bed().with_source(field()).build());
+    assert_eq!(uniform.data, varying.data, "explicit");
+}
+
+#[test]
+#[should_panic(expected = "different mesh or order")]
+fn spatially_varying_manning_from_another_mesh_is_rejected() {
+    let setup = Setup::new(Mesh2D::uniform_periodic(0.0, 100.0, 0.0, 100.0, 4, 4), 2);
+    let other = Mesh2D::uniform_periodic(0.0, 100.0, 0.0, 100.0, 2, 2);
+    let friction = SpatiallyVaryingManning2D::new(G, &other, &setup.ops, |_, _| 0.03);
+    let mut q = setup.fill(|_, _| SWEState2D::from_primitives(1.0, 0.1, 0.0));
+    Simulation::new(
+        setup.builder().with_implicit_friction(friction).build(),
+        SSPRK3,
+    )
+    .with_dt_max(0.1)
+    .run(&mut q, 0.0, 0.1);
 }
 
 // ---------------------------------------------------------------------------

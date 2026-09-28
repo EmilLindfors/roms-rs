@@ -276,11 +276,14 @@ impl ImplicitDamping2D<'_> {
         self.friction.is_some() || self.wet_dry.is_some() || self.cages.is_some()
     }
 
-    /// Damp the momentum of one node of a stage value with depth `h`, whose
-    /// RHS was evaluated at `from`; `cages` are the node's cage-drag entries.
+    /// Damp the momentum of mesh node `node` of a stage value with depth
+    /// `h`, whose RHS was evaluated at `from`; `cages` are the node's
+    /// cage-drag entries.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn damp_node(
         &self,
+        node: usize,
         h: f64,
         hu: &mut f64,
         hv: &mut f64,
@@ -303,7 +306,7 @@ impl ImplicitDamping2D<'_> {
             let speed = (u * u + v * v).sqrt();
             if speed > 0.0 {
                 if let Some(friction) = self.friction {
-                    rate += friction.damping_rate(h, speed);
+                    rate += friction.damping_rate(node, h, speed);
                 }
                 rate += CageDrag2D::damping_rate(cages, h, speed);
             }
@@ -338,20 +341,28 @@ pub fn apply_implicit_damping_2d(
     if !damping.is_active() {
         return;
     }
-    check_cage_mesh(stage, damping);
+    check_mesh(stage, damping);
     let [h, hu, hv] = &mut stage.data;
     let [fh, fhu, fhv] = &from.data;
     damp_nodes(h, hu, hv, (fh, fhu, fhv), 0, dt, damping);
 }
 
-/// The cage drag must come from the stage's mesh and order.
+/// The cage drag and a spatially varying friction must come from the
+/// stage's mesh and order.
 #[inline]
-fn check_cage_mesh(stage: &SWESolution2D, damping: &ImplicitDamping2D) {
+fn check_mesh(stage: &SWESolution2D, damping: &ImplicitDamping2D) {
+    let n_total = stage.h_data().len();
     if let Some(cages) = damping.cages {
         assert_eq!(
             cages.n_total_nodes(),
-            stage.h_data().len(),
+            n_total,
             "CageDrag2D was built for a different mesh or order"
+        );
+    }
+    if let Some(n) = damping.friction.and_then(|f| f.n_total_nodes()) {
+        assert_eq!(
+            n, n_total,
+            "the friction field was built for a different mesh or order"
         );
     }
 }
@@ -370,7 +381,7 @@ pub fn apply_implicit_damping_2d_parallel(
     if !damping.is_active() {
         return;
     }
-    check_cage_mesh(stage, damping);
+    check_mesh(stage, damping);
     let [h, hu, hv] = &mut stage.data;
     let [fh, fhu, fhv] = &from.data;
     h.par_chunks(CHUNK)
@@ -406,6 +417,7 @@ fn damp_nodes(
         }
         let from = SWEState2D::new(fh[i], fhu[i], fhv[i]);
         damping.damp_node(
+            offset + i,
             h[i],
             &mut hu[i],
             &mut hv[i],
