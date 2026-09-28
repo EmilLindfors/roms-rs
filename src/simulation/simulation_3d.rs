@@ -143,8 +143,10 @@ where
                 );
             }
 
-            // Don't overshoot end time
-            if t + dt > t_end {
+            // Don't overshoot the end time or leave a sliver of it (see
+            // `Simulation::run_with_callback`)
+            let landed = t + dt * (1.0 + super::runner::LANDING_SLACK) >= t_end;
+            if landed {
                 dt = t_end - t;
             }
 
@@ -158,7 +160,7 @@ where
             // One barotropic pass and one 3D SSP-RK3 step
             self.integrator.step(state, &self.physics, dt, t);
 
-            t += dt;
+            t = if landed { t_end } else { t + dt };
             n_steps += 1;
 
             // Post-process

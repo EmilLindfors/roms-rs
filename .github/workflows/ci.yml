@@ -84,11 +84,9 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # `--lib --tests` deliberately excludes `benches/`, which have drifted from
-      # the current API and do not build (tracked separately). Add `--benches`
-      # once they are repaired.
+      # `--benches` keeps the criterion benches building against the current API
       - name: cargo clippy
-        run: cargo clippy --no-default-features --features parallel,simd --lib --tests
+        run: cargo clippy --no-default-features --features parallel,simd --lib --tests --benches
 
   fmt:
     name: rustfmt

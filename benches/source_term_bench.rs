@@ -12,6 +12,7 @@ use dg_rs::source::{
     BathymetrySource2D, CombinedSource2D, CoriolisSource2D, ManningFriction2D, SourceContext2D,
     SourceTerm2D,
 };
+use dg_rs::types::ElementIndex;
 
 const G: f64 = 9.81;
 const H_MIN: f64 = 1e-6;
@@ -37,7 +38,7 @@ fn setup_problem(
     let h0 = 10.0;
     let u0 = 0.5;
     let v0 = 0.3;
-    for k in 0..q.n_elements {
+    for k in ElementIndex::iter(q.n_elements) {
         for i in 0..ops.n_nodes {
             q.set_state(k, i, SWEState2D::new(h0, h0 * u0, h0 * v0));
         }
@@ -46,11 +47,11 @@ fn setup_problem(
     // Create sloped bathymetry
     let mut bathy = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, 50.0);
     // Add slope in x-direction
-    for k in 0..mesh.n_elements {
+    for k in ElementIndex::iter(mesh.n_elements) {
         let verts = mesh.element_vertices(k);
-        let cx = (verts[0].0 + verts[2].0) / 2.0;
+        let cx = (verts[0][0] + verts[2][0]) / 2.0;
         for i in 0..ops.n_nodes {
-            let idx = k * ops.n_nodes + i;
+            let idx = k.as_usize() * ops.n_nodes + i;
             bathy.data[idx] = 50.0 - 0.01 * cx; // 1% slope
         }
     }
@@ -87,13 +88,13 @@ fn bench_coriolis(c: &mut Criterion) {
             &n_elements,
             |b, _| {
                 b.iter(|| {
-                    for k in 0..q.n_elements {
+                    for k in ElementIndex::iter(q.n_elements) {
                         let verts = mesh.element_vertices(k);
-                        let cx = (verts[0].0 + verts[2].0) / 2.0;
-                        let cy = (verts[0].1 + verts[2].1) / 2.0;
+                        let cx = (verts[0][0] + verts[2][0]) / 2.0;
+                        let cy = (verts[0][1] + verts[2][1]) / 2.0;
 
                         for i in 0..ops.n_nodes {
-                            let idx = k * ops.n_nodes + i;
+                            let idx = k.as_usize() * ops.n_nodes + i;
                             let state = q.get_state(k, i);
                             let ctx = make_context(&state, cx, cy, 0.0, (0.0, 0.0));
                             results[idx] = coriolis.evaluate(black_box(&ctx));
@@ -124,9 +125,9 @@ fn bench_manning_friction(c: &mut Criterion) {
             &n_elements,
             |b, _| {
                 b.iter(|| {
-                    for k in 0..q.n_elements {
+                    for k in ElementIndex::iter(q.n_elements) {
                         for i in 0..ops.n_nodes {
-                            let idx = k * ops.n_nodes + i;
+                            let idx = k.as_usize() * ops.n_nodes + i;
                             let state = q.get_state(k, i);
                             let ctx = make_context(&state, 0.0, 0.0, 0.0, (0.0, 0.0));
                             results[idx] = friction.evaluate(black_box(&ctx));
@@ -157,9 +158,9 @@ fn bench_bathymetry_source(c: &mut Criterion) {
             &n_elements,
             |b, _| {
                 b.iter(|| {
-                    for k in 0..q.n_elements {
+                    for k in ElementIndex::iter(q.n_elements) {
                         for i in 0..ops.n_nodes {
-                            let idx = k * ops.n_nodes + i;
+                            let idx = k.as_usize() * ops.n_nodes + i;
                             let state = q.get_state(k, i);
                             let bathy_val = bathy.data[idx];
                             let grad = (bathy.gradient_x[idx], bathy.gradient_y[idx]);
@@ -190,12 +191,12 @@ fn bench_combined_sources(c: &mut Criterion) {
     // Individual sources for comparison
     group.bench_function("coriolis_only", |b| {
         b.iter(|| {
-            for k in 0..q.n_elements {
+            for k in ElementIndex::iter(q.n_elements) {
                 let verts = mesh.element_vertices(k);
-                let cx = (verts[0].0 + verts[2].0) / 2.0;
-                let cy = (verts[0].1 + verts[2].1) / 2.0;
+                let cx = (verts[0][0] + verts[2][0]) / 2.0;
+                let cy = (verts[0][1] + verts[2][1]) / 2.0;
                 for i in 0..ops.n_nodes {
-                    let idx = k * ops.n_nodes + i;
+                    let idx = k.as_usize() * ops.n_nodes + i;
                     let state = q.get_state(k, i);
                     let ctx = make_context(&state, cx, cy, 0.0, (0.0, 0.0));
                     results[idx] = coriolis.evaluate(black_box(&ctx));
@@ -206,9 +207,9 @@ fn bench_combined_sources(c: &mut Criterion) {
 
     group.bench_function("friction_only", |b| {
         b.iter(|| {
-            for k in 0..q.n_elements {
+            for k in ElementIndex::iter(q.n_elements) {
                 for i in 0..ops.n_nodes {
-                    let idx = k * ops.n_nodes + i;
+                    let idx = k.as_usize() * ops.n_nodes + i;
                     let state = q.get_state(k, i);
                     let ctx = make_context(&state, 0.0, 0.0, 0.0, (0.0, 0.0));
                     results[idx] = friction.evaluate(black_box(&ctx));
@@ -219,9 +220,9 @@ fn bench_combined_sources(c: &mut Criterion) {
 
     group.bench_function("bathymetry_only", |b| {
         b.iter(|| {
-            for k in 0..q.n_elements {
+            for k in ElementIndex::iter(q.n_elements) {
                 for i in 0..ops.n_nodes {
-                    let idx = k * ops.n_nodes + i;
+                    let idx = k.as_usize() * ops.n_nodes + i;
                     let state = q.get_state(k, i);
                     let bathy_val = bathy.data[idx];
                     let grad = (bathy.gradient_x[idx], bathy.gradient_y[idx]);
@@ -236,12 +237,12 @@ fn bench_combined_sources(c: &mut Criterion) {
     let combined = CombinedSource2D::new(vec![&coriolis, &friction, &bathy_source]);
     group.bench_function("combined_all", |b| {
         b.iter(|| {
-            for k in 0..q.n_elements {
+            for k in ElementIndex::iter(q.n_elements) {
                 let verts = mesh.element_vertices(k);
-                let cx = (verts[0].0 + verts[2].0) / 2.0;
-                let cy = (verts[0].1 + verts[2].1) / 2.0;
+                let cx = (verts[0][0] + verts[2][0]) / 2.0;
+                let cy = (verts[0][1] + verts[2][1]) / 2.0;
                 for i in 0..ops.n_nodes {
-                    let idx = k * ops.n_nodes + i;
+                    let idx = k.as_usize() * ops.n_nodes + i;
                     let state = q.get_state(k, i);
                     let bathy_val = bathy.data[idx];
                     let grad = (bathy.gradient_x[idx], bathy.gradient_y[idx]);
@@ -259,7 +260,7 @@ fn bench_combined_sources(c: &mut Criterion) {
 fn bench_source_flow_conditions(c: &mut Criterion) {
     let mut group = c.benchmark_group("source_flow_conditions");
 
-    let (mesh, ops, geom, _, _) = setup_problem(16, 16, 3);
+    let (mesh, ops, _, _, _) = setup_problem(16, 16, 3);
 
     // Test different flow conditions
     let conditions = [
@@ -274,7 +275,7 @@ fn bench_source_flow_conditions(c: &mut Criterion) {
 
     for (name, h, u, v) in conditions {
         let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-        for k in 0..q.n_elements {
+        for k in ElementIndex::iter(q.n_elements) {
             for i in 0..ops.n_nodes {
                 q.set_state(k, i, SWEState2D::new(h, h * u, h * v));
             }
@@ -284,9 +285,9 @@ fn bench_source_flow_conditions(c: &mut Criterion) {
 
         group.bench_function(name, |b| {
             b.iter(|| {
-                for k in 0..q.n_elements {
+                for k in ElementIndex::iter(q.n_elements) {
                     for i in 0..ops.n_nodes {
-                        let idx = k * ops.n_nodes + i;
+                        let idx = k.as_usize() * ops.n_nodes + i;
                         let state = q.get_state(k, i);
                         let ctx = make_context(&state, 0.0, 0.0, 0.0, (0.0, 0.0));
                         results[idx] = friction.evaluate(black_box(&ctx));
@@ -310,12 +311,12 @@ fn bench_bathymetry_gradients(c: &mut Criterion) {
         // Create bathymetry without gradients
         let mut bathy = Bathymetry2D::flat(mesh.n_elements, ops.n_nodes);
         // Add some variation
-        for k in 0..mesh.n_elements {
+        for k in ElementIndex::iter(mesh.n_elements) {
             let verts = mesh.element_vertices(k);
-            let cx = (verts[0].0 + verts[2].0) / 2.0;
-            let cy = (verts[0].1 + verts[2].1) / 2.0;
+            let cx = (verts[0][0] + verts[2][0]) / 2.0;
+            let cy = (verts[0][1] + verts[2][1]) / 2.0;
             for i in 0..ops.n_nodes {
-                let idx = k * ops.n_nodes + i;
+                let idx = k.as_usize() * ops.n_nodes + i;
                 bathy.data[idx] = 50.0 - 0.01 * cx + 0.005 * (cy / 100.0).sin();
             }
         }
