@@ -4,7 +4,7 @@
 
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::time::{Integrable, LocalTimeStepping};
+use crate::time::{Integrable, LocalTimeStepping, SspScheme};
 
 // =============================================================================
 // PhysicsModuleInfo Trait (non-generic, dyn-compatible)
@@ -116,12 +116,29 @@ pub trait PhysicsModule<S: Integrable>: PhysicsModuleInfo {
     fn implicit_damping(&self, _stage: &mut S, _from: &S, _dt: f64) {}
 
     /// Largest CFL number for which this module's nonlinear stability
-    /// guarantees hold under forward Euler steps (e.g. the positivity bound of
-    /// a wet/dry scheme), if any. An SSP integrator keeps them up to its SSP
-    /// coefficient C times that: `Simulation` uses `min(cfl, C·max_cfl)`
-    /// ([`IntegratorInfo::ssp_coefficient`](crate::time::IntegratorInfo::ssp_coefficient)).
+    /// guarantees hold under forward Euler steps in every state (e.g. the
+    /// positivity bound of a wet/dry scheme), if any. An SSP integrator keeps
+    /// them up to its SSP coefficient C times that (see
+    /// [`Self::compute_dt_ssp`]).
     fn max_cfl(&self) -> Option<f64> {
         None
+    }
+
+    /// The time step of an integrator with the SSP scheme `scheme`
+    /// ([`IntegratorInfo::ssp_scheme`](crate::time::IntegratorInfo::ssp_scheme);
+    /// `None` counts as an SSP coefficient of 1): the linear bound at `cfl`
+    /// and this module's forward-Euler bounds times the scheme's SSP
+    /// coefficient. `Simulation` steps with it.
+    ///
+    /// The default caps the CFL at `C·max_cfl`. A module whose bound depends
+    /// on the state can do better (the wet/dry SWE relax their positivity
+    /// bound in well-filled elements).
+    fn compute_dt_ssp(&self, state: &S, cfl: f64, scheme: Option<SspScheme>) -> f64 {
+        let ssp_coefficient = scheme.map_or(1.0, SspScheme::ssp_coefficient);
+        let cfl = self
+            .max_cfl()
+            .map_or(cfl, |max| cfl.min(ssp_coefficient * max));
+        self.compute_dt(state, cfl)
     }
 
     /// Element-subset operations for local time stepping

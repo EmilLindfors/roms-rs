@@ -31,7 +31,9 @@ use dg_rs::solver::{
     KuzminParameter2D, SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
 };
 use dg_rs::source::{HorizontalViscosity2D, ManningFriction2D, SourceContext2D, SourceTerm2D};
-use dg_rs::time::{IntegratorInfo, Multirate, MultirateSSPRK3, SSPRK3, StandardIntegrator};
+use dg_rs::time::{
+    IntegratorInfo, Multirate, MultirateSSPRK3, SSPRK3, SspScheme, StandardIntegrator,
+};
 use dg_rs::types::{Depth, ElementIndex};
 
 const G: f64 = 9.81;
@@ -368,10 +370,15 @@ fn subset_rhs_matches_the_full_rhs() {
     let physics = shoreline_physics(&setup);
     let local = physics.local_time_stepping().expect("SWE supports LTS");
     let mut element_dt = vec![0.0; setup.mesh.n_elements];
-    local.element_dt(&q, 0.5, &mut element_dt);
+    local.element_dt(&q, 0.5, SspScheme::Rk3, &mut element_dt);
     let global_dt = physics.compute_dt(&q, 0.5);
     let min_dt = element_dt.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(min_dt <= global_dt, "{min_dt} > {global_dt}");
+    // The global step of the wet/dry run is the smallest element step
+    assert_eq!(
+        min_dt,
+        physics.compute_dt_ssp(&q, 0.5, Some(SspScheme::Rk3))
+    );
     assert!(
         min_dt > 0.5 * global_dt,
         "neighbour traces should matter little here"
@@ -604,7 +611,8 @@ fn runup_keeps_positivity_across_levels() {
 
     let mut coarse_steps = Vec::new();
     for base in BASES {
-        let sim = Simulation::new(physics(), multirate(base, 8)).with_cfl(1.0);
+        // A linear CFL above both positivity bounds, so they set the steps
+        let sim = Simulation::new(physics(), multirate(base, 8)).with_cfl(2.0);
         let mut q = q0.clone();
         let mut min_h = f64::INFINITY;
         let result = sim.run_with_callback(&mut q, 0.0, 300.0, |q, _| {
@@ -632,7 +640,7 @@ fn runup_keeps_positivity_across_levels() {
     assert!(result.success);
     let expected_dt = sim
         .physics()
-        .compute_dt(&q0, 2.0 * dg_rs::solver::positivity_cfl_swe_2d(2));
+        .compute_dt_ssp(&q0, 1.0, Some(SspScheme::Rk43));
     assert!(
         (result.dt_max / expected_dt - 1.0).abs() < 0.05,
         "dt {} against {expected_dt}",
