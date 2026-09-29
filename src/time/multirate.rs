@@ -137,6 +137,14 @@ pub trait LocalTimeStepping<S>: Sync {
         RhsStencil::Faces
     }
 
+    /// Whether the element operations below work in this configuration
+    /// (e.g. not with a limiter that reads the neighbours' means). `false`
+    /// makes `Simulation` run global SSP-RK3 through the whole-state stages
+    /// instead of the fused ones; local time stepping panics.
+    fn is_element_local(&self) -> bool {
+        true
+    }
+
     /// One stage for every listed element k, with stage `plan(k)` (see
     /// [`ElementStage`]): its RHS from `input`, which may read the values
     /// of its [`Self::stencil`], nothing further away; the new stage value
@@ -518,6 +526,28 @@ impl<S: Integrable> MultirateStepper<S> {
             &mut self.level_count,
         );
         dt
+    }
+
+    /// Put all `n_elements` elements on one level, for global SSP-RK3
+    /// steps through the fused per-element stages (no element time steps
+    /// needed: the caller takes the global step). Call it once; the levels
+    /// stay until the next [`Self::assign_levels`].
+    pub fn assign_one_level(&mut self, n_elements: usize) {
+        self.finest = 0;
+        self.level.clear();
+        self.level.resize(n_elements, 0);
+        for s in 0..3 {
+            self.rate[s].clear();
+            self.rate[s].resize(n_elements, 0);
+            sort_descending(
+                &self.rate[s],
+                0,
+                &mut self.rate_order[s],
+                &mut self.rate_count[s],
+            );
+        }
+        sort_descending(&self.level, 0, &mut self.level_order, &mut self.level_count);
+        self.evaluations_per_step = 3 * n_elements as u64;
     }
 
     /// Level of every element from the last [`Self::assign_levels`].

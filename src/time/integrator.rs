@@ -147,6 +147,17 @@ pub trait IntegratorInfo: Send + Sync {
     fn max_local_levels(&self) -> Option<usize> {
         None
     }
+
+    /// Whether a step of this integrator is a one-level
+    /// [`crate::time::MultirateSSPRK3`] step, which `Simulation` then runs
+    /// through the physics module's fused per-element stages
+    /// ([`crate::time::LocalTimeStepping::stage_where`]: RHS, stage
+    /// combination, implicit damping and post-processing in one pass per
+    /// stage) when the module supports local time stepping. True for
+    /// [`SSPRK3`], which that is bit for bit.
+    fn is_one_level_multirate(&self) -> bool {
+        false
+    }
 }
 
 // =============================================================================
@@ -298,6 +309,10 @@ pub struct SSPRK3;
 impl IntegratorInfo for SSPRK3 {
     fn name(&self) -> &'static str {
         "ssp-rk3"
+    }
+
+    fn is_one_level_multirate(&self) -> bool {
+        true
     }
 
     fn order(&self) -> usize {

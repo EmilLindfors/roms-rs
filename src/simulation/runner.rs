@@ -24,6 +24,11 @@ pub struct SimulationConfig {
     pub max_steps: Option<usize>,
     /// Whether to print progress to stdout.
     pub verbose: bool,
+    /// Run a one-level integrator (SSP-RK3) through the physics module's
+    /// fused per-element stages when it supports local time stepping (see
+    /// `IntegratorInfo::is_one_level_multirate`). The result is the same
+    /// bit for bit; `false` runs the whole-state stages instead.
+    pub fused_stages: bool,
 }
 
 impl Default for SimulationConfig {
@@ -35,6 +40,7 @@ impl Default for SimulationConfig {
             callback_interval: None,
             max_steps: None,
             verbose: false,
+            fused_stages: true,
         }
     }
 }
@@ -152,6 +158,13 @@ where
         self
     }
 
+    /// Whether to run SSP-RK3 through the fused per-element stages (default
+    /// `true`; see [`SimulationConfig::fused_stages`]).
+    pub fn with_fused_stages(mut self, fused: bool) -> Self {
+        self.config.fused_stages = fused;
+        self
+    }
+
     /// Set the maximum time step.
     pub fn with_dt_max(mut self, dt_max: f64) -> Self {
         self.config.dt_max = Some(dt_max);
@@ -260,6 +273,20 @@ where
             });
             (local, MultirateStepper::new(max_levels))
         });
+        // Global SSP-RK3 as one-level multirate steps: the same result, with
+        // the RHS, stage combination, damping and post-processing fused per
+        // element (one parallel pass per stage instead of several)
+        let mut fused = (multirate.is_none()
+            && self.config.fused_stages
+            && self.integrator.is_one_level_multirate())
+        .then(|| self.physics.local_time_stepping())
+        .flatten()
+        .filter(|local| local.is_element_local())
+        .map(|local| {
+            let mut stepper = MultirateStepper::new(0);
+            stepper.assign_one_level(self.physics.mesh().n_elements);
+            (local, stepper)
+        });
 
         // Call initial callback
         callback(state, t);
@@ -340,7 +367,7 @@ where
             // relaxation) is implicit in every RK stage; limiters
             // and wet/dry treatment run after every RK stage, so no RHS
             // evaluation sees an unlimited state.
-            match multirate.as_mut() {
+            match multirate.as_mut().or(fused.as_mut()) {
                 Some((local, stepper)) => stepper.step(*local, state, t, dt),
                 None => self.integrator.step_with_relaxation(
                     state,
