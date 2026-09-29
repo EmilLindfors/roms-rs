@@ -1063,8 +1063,10 @@ pub fn compute_dt_swe_2d_parallel(
 /// The cell mean stays non-negative under forward Euler when
 /// Δt·(λ_x/Δx + λ_y/Δy) ≤ ŵ₀ = 1/(N(N+1)), the first GLL weight on [0, 1].
 /// In this module's units that is CFL ≤ (2N+1)/(2N(N+1)): 0.75, 0.42, 0.29,
-/// 0.23 for N = 1–4, independent of element shape. SSP-RK3 (SSP coefficient 1)
-/// inherits it. Wet/dry runs should use `cfl.min(positivity_cfl_swe_2d(N))`.
+/// 0.23 for N = 1–4, independent of element shape. An SSP integrator with
+/// SSP coefficient C keeps it up to C times that: SSP-RK3 (C = 1) inherits
+/// it, SSP-RK(4,3) (C = 2) doubles it. Wet/dry runs should use
+/// `cfl.min(C·positivity_cfl_swe_2d(N))`, as `Simulation` does.
 pub const fn positivity_cfl_swe_2d(order: usize) -> f64 {
     assert!(order >= 1, "positivity bound needs N ≥ 1");
     let n = order as f64;

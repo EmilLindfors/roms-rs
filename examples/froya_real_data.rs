@@ -87,7 +87,7 @@
 //!     [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
-//!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [output=output/froya] \
+//!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=1] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw]
 //! ```
@@ -103,8 +103,12 @@
 //! `docs/gmsh-meshes.md`.
 //!
 //! `lts=N` (N > 0) steps the tidal run with local time stepping
-//! (`MultirateSSPRK3`, up to N levels of halved time steps): every element at
+//! (`Multirate`, up to N levels of halved time steps): every element at
 //! the largest power-of-two fraction of the step its own CFL allows.
+//!
+//! `rk=43` (the default) steps with SSP-RK(4,3), `rk=3` with SSP-RK3. The
+//! positivity bound of the wet/dry scheme sets the step, and SSP-RK(4,3)'s
+//! SSP coefficient of 2 doubles it for 4/3 of the RHS work per step.
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
 //! constituents: 15 days separate M2/S2 and K1/O1 (`hours=384` with the
@@ -160,7 +164,7 @@ use dg_rs::source::{
     ManningFriction2D, WindStress2D,
 };
 use dg_rs::tides::canonical_name;
-use dg_rs::time::{ModelClock, MultirateSSPRK3, SSPRK3};
+use dg_rs::time::{IntegratorInfo, ModelClock, Multirate, SSPRK3, StandardIntegrator};
 #[cfg(feature = "netcdf")]
 use dg_rs::types::Depth;
 use dg_rs::types::ElementIndex;
@@ -274,8 +278,14 @@ struct Options {
     /// `scripts/gmsh_coastline_mesh.py`) instead of the `nx` × `ny` grid
     mesh: Option<String>,
     /// Local time stepping with up to this many levels (`lts=`; 0: global
-    /// SSP-RK3)
+    /// steps)
     lts: usize,
+    /// SSP-RK(4,3) (`rk=43`, default) or SSP-RK3 (`rk=3`), globally or as
+    /// the base of local time stepping
+    integrator: StandardIntegrator,
+    /// CFL number of the tidal run (`cfl=`, default 1: the positivity bound
+    /// caps it)
+    cfl: f64,
     /// Smooth the bed to a slope factor r_x0 ≤ this between neighbouring
     /// nodes deeper than `rx0_min_depth` (`rx0=`, e.g. 0.3; off by default)
     rx0: Option<f64>,
@@ -324,6 +334,12 @@ impl Options {
             },
             profile: get("profile", 0.0)? as usize,
             lts: get("lts", 0.0)? as usize,
+            cfl: get("cfl", 1.0)?,
+            integrator: match args.get("rk").map_or("43", String::as_str) {
+                "43" => StandardIntegrator::SSPRK43,
+                "3" => StandardIntegrator::SSPRK3,
+                other => return Err(format!("bad rk={other}: 43 or 3")),
+            },
             rx0: args
                 .get("rx0")
                 .map(|v| v.parse().map_err(|_| format!("bad rx0={v}")))
@@ -1236,6 +1252,16 @@ fn tidal_run(
         output_dir.display()
     );
     println!(
+        "  Integrator: {}{}, CFL {} (capped by the positivity bound)",
+        opts.integrator.name(),
+        if opts.lts > 0 {
+            format!(", local time stepping up to {} levels", opts.lts)
+        } else {
+            String::new()
+        },
+        opts.cfl
+    );
+    println!(
         "  time  |  η range (m)     | η max at (x, y km; h m) | max |u| (m/s) at (x, y km; h m) | open water ≥ 3 m (m/s)         | wet nodes | volume change"
     );
 
@@ -1305,14 +1331,14 @@ fn tidal_run(
         frame += 1;
     };
     let (result, clips) = if opts.lts > 0 {
-        let sim = Simulation::new(physics, MultirateSSPRK3::new(opts.lts))
-            .with_cfl(1.0)
+        let sim = Simulation::new(physics, Multirate::with_base(opts.integrator, opts.lts))
+            .with_cfl(opts.cfl)
             .with_callback_interval(interval);
         let result = sim.run_with_callback(&mut q, 0.0, t_end, &mut callback);
         (result, sim.physics().negative_depth_clips())
     } else {
-        let sim = Simulation::new(physics, SSPRK3)
-            .with_cfl(1.0)
+        let sim = Simulation::new(physics, opts.integrator)
+            .with_cfl(opts.cfl)
             .with_callback_interval(interval);
         let result = sim.run_with_callback(&mut q, 0.0, t_end, &mut callback);
         (result, sim.physics().negative_depth_clips())

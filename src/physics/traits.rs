@@ -116,8 +116,10 @@ pub trait PhysicsModule<S: Integrable>: PhysicsModuleInfo {
     fn implicit_damping(&self, _stage: &mut S, _from: &S, _dt: f64) {}
 
     /// Largest CFL number for which this module's nonlinear stability
-    /// guarantees hold (e.g. the positivity bound of a wet/dry scheme), if any.
-    /// `Simulation` uses `min(cfl, max_cfl)`.
+    /// guarantees hold under forward Euler steps (e.g. the positivity bound of
+    /// a wet/dry scheme), if any. An SSP integrator keeps them up to its SSP
+    /// coefficient C times that: `Simulation` uses `min(cfl, C·max_cfl)`
+    /// ([`IntegratorInfo::ssp_coefficient`](crate::time::IntegratorInfo::ssp_coefficient)).
     fn max_cfl(&self) -> Option<f64> {
         None
     }

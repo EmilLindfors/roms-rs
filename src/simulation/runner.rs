@@ -12,7 +12,8 @@ use crate::time::{Integrable, MultirateStats, MultirateStepper, StageWorkspace, 
 /// Configuration for a simulation run.
 #[derive(Clone, Debug)]
 pub struct SimulationConfig {
-    /// CFL number for time step calculation (capped by `PhysicsModule::max_cfl`).
+    /// CFL number for time step calculation (capped by `PhysicsModule::max_cfl`
+    /// times the integrator's SSP coefficient).
     pub cfl: f64,
     /// Maximum time step (overrides CFL if smaller).
     pub dt_max: Option<f64>,
@@ -24,10 +25,10 @@ pub struct SimulationConfig {
     pub max_steps: Option<usize>,
     /// Whether to print progress to stdout.
     pub verbose: bool,
-    /// Run a one-level integrator (SSP-RK3) through the physics module's
-    /// fused per-element stages when it supports local time stepping (see
-    /// `IntegratorInfo::is_one_level_multirate`). The result is the same
-    /// bit for bit; `false` runs the whole-state stages instead.
+    /// Run an integrator with an SSP scheme (SSP-RK3, SSP-RK(4,3)) through
+    /// the physics module's fused per-element stages when it supports local
+    /// time stepping (see `IntegratorInfo::ssp_scheme`). The result is the
+    /// same bit for bit; `false` runs the whole-state stages instead.
     pub fused_stages: bool,
 }
 
@@ -158,7 +159,7 @@ where
         self
     }
 
-    /// Whether to run SSP-RK3 through the fused per-element stages (default
+    /// Whether to run SSP schemes through the fused per-element stages (default
     /// `true`; see [`SimulationConfig::fused_stages`]).
     pub fn with_fused_stages(mut self, fused: bool) -> Self {
         self.config.fused_stages = fused;
@@ -256,11 +257,11 @@ where
         };
         // Stage buffers reused for the whole run (no per-step allocation)
         let mut stages = StageWorkspace::new();
-        // e.g. the positivity bound of a wet/dry scheme
-        let cfl = self
-            .physics
-            .max_cfl()
-            .map_or(self.config.cfl, |max| self.config.cfl.min(max));
+        // e.g. the positivity bound of a wet/dry scheme: a forward-Euler
+        // bound, which an SSP integrator keeps up to its SSP coefficient
+        let cfl = self.physics.max_cfl().map_or(self.config.cfl, |max| {
+            self.config.cfl.min(max * self.integrator.ssp_coefficient())
+        });
         // Local time stepping: every element at its own power-of-two
         // fraction of the (coarse) step
         let mut multirate = self.integrator.max_local_levels().map(|max_levels| {
@@ -271,22 +272,28 @@ where
                     self.physics.name()
                 )
             });
-            (local, MultirateStepper::new(max_levels))
+            let scheme = self.integrator.ssp_scheme().unwrap_or_else(|| {
+                panic!("the {} integrator has no SSP scheme", self.integrator.name())
+            });
+            (local, MultirateStepper::new(max_levels, scheme))
         });
-        // Global SSP-RK3 as one-level multirate steps: the same result, with
-        // the RHS, stage combination, damping and post-processing fused per
-        // element (one parallel pass per stage instead of several)
-        let mut fused = (multirate.is_none()
-            && self.config.fused_stages
-            && self.integrator.is_one_level_multirate())
-        .then(|| self.physics.local_time_stepping())
-        .flatten()
-        .filter(|local| local.is_element_local())
-        .map(|local| {
-            let mut stepper = MultirateStepper::new(0);
-            stepper.assign_one_level(self.physics.mesh().n_elements);
-            (local, stepper)
-        });
+        // Global steps of an SSP scheme as one-level multirate steps: the
+        // same result, with the RHS, stage combination, damping and
+        // post-processing fused per element (one parallel pass per stage
+        // instead of several)
+        let mut fused = self
+            .integrator
+            .ssp_scheme()
+            .filter(|_| multirate.is_none() && self.config.fused_stages)
+            .and_then(|scheme| {
+                let local = self.physics.local_time_stepping()?;
+                local.is_element_local().then_some((local, scheme))
+            })
+            .map(|(local, scheme)| {
+                let mut stepper = MultirateStepper::new(0, scheme);
+                stepper.assign_one_level(self.physics.mesh().n_elements);
+                (local, stepper)
+            });
 
         // Call initial callback
         callback(state, t);

@@ -63,7 +63,7 @@ n= 24: error=6.52e-10, ratio=59.18, order=5.89
 ## Known Limitations
 
 ### Time Integration
-- SSP-RK3 is 3rd order in time
+- SSP-RK3 and SSP-RK(4,3) are 3rd order in time (`integrator::tests::test_ssp_schemes_converge_at_third_order`); multirate (local time stepping) is 2nd order across level interfaces, measured 2.4–2.8 against the global solution
 - For high spatial orders (P5+), temporal error can dominate on fine meshes
 - Mitigation: Use smaller CFL or shorter integration times for P5+ tests
 
