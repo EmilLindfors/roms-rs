@@ -224,11 +224,12 @@ fn one_level_matches_ssp_rk3(viscosity: Option<HorizontalViscosity2D>) {
     let run = |sim_q: &mut SWESolution2D, levels: Option<usize>| {
         let physics = physics();
         let result = match levels {
-            None => {
-                Simulation::new(physics, SSPRK3)
-                    .with_dt_max(dt)
-                    .run(sim_q, 3.0, 3.0 + 40.0 * dt)
-            }
+            // The whole-state stages: `Simulation` otherwise runs SSP-RK3
+            // through the fused ones too
+            None => Simulation::new(physics, SSPRK3)
+                .with_fused_stages(false)
+                .with_dt_max(dt)
+                .run(sim_q, 3.0, 3.0 + 40.0 * dt),
             Some(l) => Simulation::new(physics, MultirateSSPRK3::new(l))
                 .with_dt_max(dt)
                 .run(sim_q, 3.0, 3.0 + 40.0 * dt),
@@ -253,6 +254,19 @@ fn one_level_matches_ssp_rk3(viscosity: Option<HorizontalViscosity2D>) {
                 "levels = {levels}: variable {var} differs from SSP-RK3"
             );
         }
+    }
+    // `Simulation` runs SSP-RK3 through the fused stages by default
+    let mut fused = q0.clone();
+    let result =
+        Simulation::new(physics(), SSPRK3)
+            .with_dt_max(dt)
+            .run(&mut fused, 3.0, 3.0 + 40.0 * dt);
+    assert!(result.success && result.local_time_stepping.is_none());
+    for var in 0..3 {
+        assert!(
+            global.data[var] == fused.data[var],
+            "fused SSP-RK3: variable {var} differs from the whole-state stages"
+        );
     }
     assert!(
         global.h_data() != q0.h_data(),

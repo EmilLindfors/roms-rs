@@ -215,6 +215,16 @@ impl StandardLimiter2D {
         }
     }
 
+    /// Whether the limiter works on each element alone
+    /// ([`Self::apply_element`]): not the Kuzmin limiters, whose bounds come
+    /// from the neighbours' means.
+    pub fn is_element_local(&self) -> bool {
+        matches!(
+            self,
+            StandardLimiter2D::None | StandardLimiter2D::Positivity(_)
+        )
+    }
+
     /// [`Self::apply_counting`] on element `k` (its SoA rows) alone, for
     /// local time stepping. Returns `true` if its negative mean depth had to
     /// be emptied.

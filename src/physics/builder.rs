@@ -352,6 +352,11 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
 /// point-implicit damping and horizontal viscosity (a two-hop stencil); not
 /// the Kuzmin limiters (not element-local; they panic).
 impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics2D<BC> {
+    /// Not with the Kuzmin limiters (bounds from the neighbours' means).
+    fn is_element_local(&self) -> bool {
+        self.limiter.is_element_local()
+    }
+
     /// Wider with horizontal viscosity: BR1 reads the neighbours' gradients.
     fn stencil(&self) -> RhsStencil {
         if self.viscosity.is_some() {
@@ -712,6 +717,23 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             eprintln!(
                 "warning: SWEPhysics2D with wetting/drying and the Roe flux: \
                  Roe is not positivity preserving; use HLL or Rusanov"
+            );
+        }
+
+        // Per-node fields must be the mesh's (the per-element damping of
+        // the fused and local stages does not check them)
+        let n_total = self.mesh.n_elements * self.ops.n_nodes;
+        if let Some(n) = self.friction.as_ref().and_then(|f| f.n_total_nodes()) {
+            assert_eq!(
+                n, n_total,
+                "the friction field was built for a different mesh or order"
+            );
+        }
+        if let Some(cages) = &self.cages {
+            assert_eq!(
+                cages.n_total_nodes(),
+                n_total,
+                "CageDrag2D was built for a different mesh or order"
             );
         }
 
