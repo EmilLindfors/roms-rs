@@ -320,7 +320,8 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
         implicit_damping(stage, from, dt, &self.damping());
     }
 
-    /// The DGSEM positivity bound when the run has wetting/drying.
+    /// The DGSEM positivity bound (for forward Euler) when the run has
+    /// wetting/drying.
     fn max_cfl(&self) -> Option<f64> {
         self.has_wetting_drying()
             .then(|| positivity_cfl_swe_2d(self.order))
@@ -347,7 +348,7 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
     }
 }
 
-/// Local time stepping ([`crate::time::MultirateSSPRK3`]). Supports every
+/// Local time stepping ([`crate::time::Multirate`]). Supports every
 /// formulation, source term, boundary condition, wetting/drying, the
 /// point-implicit damping and horizontal viscosity (a two-hop stencil); not
 /// the Kuzmin limiters (not element-local; they panic).

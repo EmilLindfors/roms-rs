@@ -1,7 +1,8 @@
-//! Gates for local time stepping (`MultirateSSPRK3`, TODO P2.5).
+//! Gates for local time stepping (`MultirateSSPRK3`, `MultirateSSPRK43`, TODO
+//! P2.5, P2.1). Every multirate gate runs on both base schemes.
 //!
-//! - One level is SSP-RK3 bit for bit, with wetting/drying, implicit friction
-//!   and a time-dependent source.
+//! - One level is the base scheme bit for bit (SSP-RK3, SSP-RK(4,3)), with
+//!   wetting/drying, implicit friction and a time-dependent source.
 //! - The element-subset RHS gives the selected elements exactly the full RHS.
 //! - Mass is conserved to rounding across level interfaces, and a lake at
 //!   rest over a rough bed with dry land stays at rest.
@@ -10,7 +11,8 @@
 //! - Temporal convergence to the global SSP-RK3 solution at (at least)
 //!   second order.
 //! - A wave running up a beach across several levels keeps h ≥ 0 without a
-//!   single negative-mean clip, and conserves mass.
+//!   single negative-mean clip, and conserves mass; SSP-RK(4,3) at twice
+//!   SSP-RK3's positivity-capped step.
 //! - With horizontal viscosity (a two-hop stencil): one level is still
 //!   SSP-RK3 bit for bit; several levels conserve mass and momentum to
 //!   rounding and converge to the global solution.
@@ -29,10 +31,17 @@ use dg_rs::solver::{
     KuzminParameter2D, SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
 };
 use dg_rs::source::{HorizontalViscosity2D, ManningFriction2D, SourceContext2D, SourceTerm2D};
-use dg_rs::time::{MultirateSSPRK3, SSPRK3};
+use dg_rs::time::{IntegratorInfo, Multirate, MultirateSSPRK3, SSPRK3, StandardIntegrator};
 use dg_rs::types::{Depth, ElementIndex};
 
 const G: f64 = 9.81;
+
+/// The base schemes of local time stepping.
+const BASES: [StandardIntegrator; 2] = [StandardIntegrator::SSPRK3, StandardIntegrator::SSPRK43];
+
+fn multirate(base: StandardIntegrator, max_levels: usize) -> Multirate<StandardIntegrator> {
+    Multirate::with_base(base, max_levels)
+}
 
 struct Setup {
     mesh: Arc<Mesh2D>,
@@ -201,15 +210,29 @@ fn shoreline_state(setup: &Setup) -> SWESolution2D {
 
 #[test]
 fn one_level_is_ssp_rk3_bit_for_bit() {
-    one_level_matches_ssp_rk3(None);
+    one_level_matches_global(StandardIntegrator::SSPRK3, None);
 }
 
 #[test]
 fn one_level_with_viscosity_is_ssp_rk3_bit_for_bit() {
-    one_level_matches_ssp_rk3(Some(HorizontalViscosity2D::constant(5.0)));
+    one_level_matches_global(
+        StandardIntegrator::SSPRK3,
+        Some(HorizontalViscosity2D::constant(5.0)),
+    );
 }
 
-fn one_level_matches_ssp_rk3(viscosity: Option<HorizontalViscosity2D>) {
+#[test]
+fn one_level_is_ssp_rk43_bit_for_bit() {
+    one_level_matches_global(StandardIntegrator::SSPRK43, None);
+    one_level_matches_global(
+        StandardIntegrator::SSPRK43,
+        Some(HorizontalViscosity2D::constant(5.0)),
+    );
+}
+
+/// One level of the multirate stepper, and `Simulation`'s fused stages, give
+/// the whole-state steps of `base` bit for bit.
+fn one_level_matches_global(base: StandardIntegrator, viscosity: Option<HorizontalViscosity2D>) {
     let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 500.0, 8, 4), 2);
     let q0 = shoreline_state(&setup);
     let physics = || {
@@ -224,13 +247,13 @@ fn one_level_matches_ssp_rk3(viscosity: Option<HorizontalViscosity2D>) {
     let run = |sim_q: &mut SWESolution2D, levels: Option<usize>| {
         let physics = physics();
         let result = match levels {
-            // The whole-state stages: `Simulation` otherwise runs SSP-RK3
-            // through the fused ones too
-            None => Simulation::new(physics, SSPRK3)
+            // The whole-state stages: `Simulation` otherwise runs the base
+            // scheme through the fused ones too
+            None => Simulation::new(physics, base)
                 .with_fused_stages(false)
                 .with_dt_max(dt)
                 .run(sim_q, 3.0, 3.0 + 40.0 * dt),
-            Some(l) => Simulation::new(physics, MultirateSSPRK3::new(l))
+            Some(l) => Simulation::new(physics, multirate(base, l))
                 .with_dt_max(dt)
                 .run(sim_q, 3.0, 3.0 + 40.0 * dt),
         };
@@ -251,21 +274,23 @@ fn one_level_matches_ssp_rk3(viscosity: Option<HorizontalViscosity2D>) {
         for var in 0..3 {
             assert!(
                 global.data[var] == local.data[var],
-                "levels = {levels}: variable {var} differs from SSP-RK3"
+                "{}, levels = {levels}: variable {var} differs from the base",
+                base.name()
             );
         }
     }
-    // `Simulation` runs SSP-RK3 through the fused stages by default
+    // `Simulation` runs the base scheme through the fused stages by default
     let mut fused = q0.clone();
     let result =
-        Simulation::new(physics(), SSPRK3)
+        Simulation::new(physics(), base)
             .with_dt_max(dt)
             .run(&mut fused, 3.0, 3.0 + 40.0 * dt);
     assert!(result.success && result.local_time_stepping.is_none());
     for var in 0..3 {
         assert!(
             global.data[var] == fused.data[var],
-            "fused SSP-RK3: variable {var} differs from the whole-state stages"
+            "fused {}: variable {var} differs from the whole-state stages",
+            base.name()
         );
     }
     assert!(
@@ -370,34 +395,41 @@ fn graded_bed(x: f64, y: f64) -> f64 {
 #[test]
 fn several_levels_conserve_mass() {
     let setup = graded_setup();
-    let physics = setup
-        .builder()
-        .with_bathymetry(setup.bathymetry(graded_bed))
-        .build();
-    let mut q = setup.fill(at_rest(graded_bed, |x, y| {
-        0.5 * gaussian(x, y, (2_000.0, 1_000.0), 800.0)
-    }));
-    let mass0 = setup.mass(&q);
+    for base in BASES {
+        let physics = setup
+            .builder()
+            .with_bathymetry(setup.bathymetry(graded_bed))
+            .build();
+        let mut q = setup.fill(at_rest(graded_bed, |x, y| {
+            0.5 * gaussian(x, y, (2_000.0, 1_000.0), 800.0)
+        }));
+        let mass0 = setup.mass(&q);
 
-    let sim = Simulation::new(physics, MultirateSSPRK3::new(8)).with_cfl(0.5);
-    let result = sim.run(&mut q, 0.0, 400.0);
-    assert!(result.success);
-    let stats = result.local_time_stepping.unwrap();
-    println!(
-        "levels up to {}, {:.2}x less RHS work, {} coarse steps",
-        stats.finest_level,
-        stats.speedup(),
-        stats.steps
-    );
-    assert!(stats.finest_level >= 3, "{stats:?}");
-    assert!(stats.speedup() > 1.3, "{stats:?}");
+        let sim = Simulation::new(physics, multirate(base, 8)).with_cfl(0.5);
+        let result = sim.run(&mut q, 0.0, 400.0);
+        assert!(result.success);
+        let stats = result.local_time_stepping.unwrap();
+        println!(
+            "{}: levels up to {}, {:.2}x less RHS work, {} coarse steps",
+            base.name(),
+            stats.finest_level,
+            stats.speedup(),
+            stats.steps
+        );
+        assert!(stats.finest_level >= 3, "{stats:?}");
+        assert!(stats.speedup() > 1.3, "{stats:?}");
 
-    // Rounding only: global SSP-RK3 drifts 4.6e-14 on this run
-    let drift = (setup.mass(&q) - mass0).abs() / mass0;
-    assert!(drift < 1e-13, "relative mass drift {drift:e}");
-    assert!(q.h_data().iter().all(|h| h.is_finite()));
-    // The wave has moved through the level interfaces
-    assert!(max_speed(&q) > 1e-3);
+        // Rounding only: global SSP-RK3 drifts 4.6e-14 on this run
+        let drift = (setup.mass(&q) - mass0).abs() / mass0;
+        assert!(
+            drift < 1e-13,
+            "{}: relative mass drift {drift:e}",
+            base.name()
+        );
+        assert!(q.h_data().iter().all(|h| h.is_finite()));
+        // The wave has moved through the level interfaces
+        assert!(max_speed(&q) > 1e-3);
+    }
 }
 
 #[test]
@@ -409,42 +441,43 @@ fn lake_at_rest_with_dry_land_across_levels() {
             + 8.0 * (x / 700.0).sin() * (y / 400.0).cos()
             + 140.0 * gaussian(x, y, (6_000.0, 1_000.0), 900.0)
     };
-    let physics = setup
-        .builder()
-        .with_bathymetry(setup.bathymetry(bed))
-        .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
-        .with_wet_dry(WetDryConfig::default())
-        .with_implicit_friction(ManningFriction2D::new(G, 0.025))
-        .build();
-    let mut q = setup.fill(at_rest(bed, |_, _| 0.0));
-    assert!(q.h_data().contains(&0.0), "the island must be dry");
-    let q0 = q.clone();
+    let q0 = setup.fill(at_rest(bed, |_, _| 0.0));
+    assert!(q0.h_data().contains(&0.0), "the island must be dry");
+    for base in BASES {
+        let physics = setup
+            .builder()
+            .with_bathymetry(setup.bathymetry(bed))
+            .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
+            .with_wet_dry(WetDryConfig::default())
+            .with_implicit_friction(ManningFriction2D::new(G, 0.025))
+            .build();
+        let mut q = q0.clone();
+        let sim = Simulation::new(physics, multirate(base, 8)).with_cfl(1.0);
+        let result = sim.run(&mut q, 0.0, 600.0);
+        assert!(result.success);
+        let stats = result.local_time_stepping.unwrap();
+        assert!(stats.finest_level >= 2, "{stats:?}");
+        assert_eq!(sim.physics().negative_depth_clips(), 0);
 
-    let sim = Simulation::new(physics, MultirateSSPRK3::new(8)).with_cfl(1.0);
-    let result = sim.run(&mut q, 0.0, 600.0);
-    assert!(result.success);
-    let stats = result.local_time_stepping.unwrap();
-    assert!(stats.finest_level >= 2, "{stats:?}");
-    assert_eq!(sim.physics().negative_depth_clips(), 0);
-
-    let speed = max_speed(&q);
-    let dh = q
-        .h_data()
-        .iter()
-        .zip(q0.h_data())
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0, f64::max);
-    assert!(speed < 1e-10, "spurious speed {speed:e}");
-    assert!(dh < 1e-10, "spurious depth change {dh:e}");
+        let speed = max_speed(&q);
+        let dh = q
+            .h_data()
+            .iter()
+            .zip(q0.h_data())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(speed < 1e-10, "{}: spurious speed {speed:e}", base.name());
+        assert!(dh < 1e-10, "{}: spurious depth change {dh:e}", base.name());
+    }
 }
 
 /// Stage times: a uniform body force h·A·cos(ωt) along y on a state at rest,
 /// over a mesh graded along x (levels 0–3 side by side). The flux along x
 /// of y-momentum is hu·v = 0 and the entropy-conservative flux adds no
 /// dissipation, so every element integrates the ODE on its own substeps.
-/// SSP-RK3's weights at c = (0, 1, ½) are Simpson's rule, so hv follows
-/// h·A·sin(ωt)/ω to O((ωΔt)⁴), unless an element evaluates the force at the
-/// wrong stage times (an O(Δt) error).
+/// SSP-RK3's weights at c = (0, 1, ½) and SSP-RK(4,3)'s at c = (0, ½, 1, ½)
+/// are both Simpson's rule, so hv follows h·A·sin(ωt)/ω to O((ωΔt)⁴), unless
+/// an element evaluates the force at the wrong stage times (an O(Δt) error).
 #[test]
 fn stage_times_follow_each_element() {
     let mut mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 2_000.0, 16, 2);
@@ -453,38 +486,41 @@ fn stage_times_follow_each_element() {
     }
     let setup = Setup::new(mesh, 2);
     let (amplitude, omega) = (1e-3, 2.0 * std::f64::consts::PI / 300.0);
-    let physics = setup
-        .builder()
-        .with_formulation(SWEFormulation2D::EntropyConservative)
-        .with_source(OscillatingForce { amplitude, omega })
-        .build();
     let depth = 50.0;
-    let mut q = setup.fill(|_, _| SWEState2D::new(depth, 0.0, 0.0));
+    for base in BASES {
+        let physics = setup
+            .builder()
+            .with_formulation(SWEFormulation2D::EntropyConservative)
+            .with_source(OscillatingForce { amplitude, omega })
+            .build();
+        let mut q = setup.fill(|_, _| SWEState2D::new(depth, 0.0, 0.0));
 
-    let sim = Simulation::new(physics, MultirateSSPRK3::new(8)).with_cfl(0.5);
-    let t_end = 250.0;
-    let result = sim.run(&mut q, 0.0, t_end);
-    let stats = result.local_time_stepping.unwrap();
-    assert!(stats.finest_level >= 3, "{stats:?}");
+        let sim = Simulation::new(physics, multirate(base, 8)).with_cfl(0.5);
+        let t_end = 250.0;
+        let result = sim.run(&mut q, 0.0, t_end);
+        let stats = result.local_time_stepping.unwrap();
+        assert!(stats.finest_level >= 3, "{stats:?}");
 
-    let exact = depth * amplitude * (omega * t_end).sin() / omega;
-    let error = q
-        .hv_data()
-        .iter()
-        .map(|hv| (hv - exact).abs())
-        .fold(0.0, f64::max);
-    // Coarsest steps ≈ 5 s: (ωΔt)⁴/180 ≈ 6e-7 per unit time
-    assert!(
-        error < 1e-6 * exact.abs(),
-        "hv error {error:e} against {exact:e}"
-    );
-    let still = |values: &[f64], reference: f64| {
-        values
+        let exact = depth * amplitude * (omega * t_end).sin() / omega;
+        let error = q
+            .hv_data()
             .iter()
-            .all(|&v| (v - reference).abs() < 1e-11 * depth)
-    };
-    assert!(still(q.hu_data(), 0.0), "no flow along x");
-    assert!(still(q.h_data(), depth), "no change of depth");
+            .map(|hv| (hv - exact).abs())
+            .fold(0.0, f64::max);
+        // Coarsest steps ≈ 5 s: (ωΔt)⁴/180 ≈ 6e-7 per unit time
+        assert!(
+            error < 1e-6 * exact.abs(),
+            "{}: hv error {error:e} against {exact:e}",
+            base.name()
+        );
+        let still = |values: &[f64], reference: f64| {
+            values
+                .iter()
+                .all(|&v| (v - reference).abs() < 1e-11 * depth)
+        };
+        assert!(still(q.hu_data(), 0.0), "no flow along x");
+        assert!(still(q.h_data(), depth), "no change of depth");
+    }
 }
 /// The multirate solution converges to the (spatially identical) global
 /// SSP-RK3 solution at second order in the time step at least.
@@ -508,60 +544,106 @@ fn converges_to_the_global_solution() {
         .run(&mut reference, 0.0, t_end);
     assert!(result.success);
 
-    let errors: Vec<f64> = [0.8, 0.4, 0.2]
-        .iter()
-        .map(|&cfl| {
-            let mut q = q0.clone();
-            let result = Simulation::new(physics(), MultirateSSPRK3::new(8))
-                .with_cfl(cfl)
-                .run(&mut q, 0.0, t_end);
-            assert!(result.local_time_stepping.unwrap().finest_level >= 2);
-            setup.l2_difference(&q, &reference)
-        })
-        .collect();
-    let orders: Vec<f64> = errors.windows(2).map(|e| (e[0] / e[1]).log2()).collect();
-    println!("errors {errors:?}, orders {orders:?}");
-    for order in orders {
-        assert!(order > 1.8, "temporal order {order:.2} (errors {errors:?})");
+    for base in BASES {
+        let errors: Vec<f64> = [0.8, 0.4, 0.2]
+            .iter()
+            .map(|&cfl| {
+                let mut q = q0.clone();
+                let result = Simulation::new(physics(), multirate(base, 8))
+                    .with_cfl(cfl)
+                    .run(&mut q, 0.0, t_end);
+                assert!(result.local_time_stepping.unwrap().finest_level >= 2);
+                setup.l2_difference(&q, &reference)
+            })
+            .collect();
+        let orders: Vec<f64> = errors.windows(2).map(|e| (e[0] / e[1]).log2()).collect();
+        println!("{}: errors {errors:?}, orders {orders:?}", base.name());
+        for order in orders {
+            assert!(
+                order > 1.8,
+                "{}: temporal order {order:.2} (errors {errors:?})",
+                base.name()
+            );
+        }
     }
 }
 
 /// A wave runs up a beach; the offshore water sets the finest level. The
 /// positivity guarantee holds per element at its own time step: h ≥ 0, no
-/// negative-mean clip, mass conserved.
+/// negative-mean clip, mass conserved. SSP-RK(4,3) runs at twice SSP-RK3's
+/// capped CFL (its SSP coefficient), with local and with global steps.
 #[test]
 fn runup_keeps_positivity_across_levels() {
     let setup = Setup::new(graded_mesh(3_000.0, 600.0, 20, 3, 1.12), 2);
     // Deep water at the (large-element) right, a beach on the left
     let bed = |x: f64, y: f64| -60.0 * (x / 3_000.0).powi(2) + 2.0 - 0.5 * (y / 150.0).sin();
-    let physics = setup
-        .builder()
-        .with_bathymetry(setup.bathymetry(bed))
-        .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
-        .with_wet_dry(WetDryConfig::new(
-            Depth::new(WetDryConfig::DEFAULT_H_DRY),
-            G,
-        ))
-        .with_implicit_friction(ManningFriction2D::new(G, 0.02))
-        .build();
-    let mut q = setup.fill(at_rest(bed, |x, y| {
+    let physics = || {
+        setup
+            .builder()
+            .with_bathymetry(setup.bathymetry(bed))
+            .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
+            .with_wet_dry(WetDryConfig::new(
+                Depth::new(WetDryConfig::DEFAULT_H_DRY),
+                G,
+            ))
+            .with_implicit_friction(ManningFriction2D::new(G, 0.02))
+            .build()
+    };
+    let q0 = setup.fill(at_rest(bed, |x, y| {
         1.5 * gaussian(x, y, (2_000.0, 300.0), 300.0)
     }));
-    let mass0 = setup.mass(&q);
+    let mass0 = setup.mass(&q0);
 
-    let sim = Simulation::new(physics, MultirateSSPRK3::new(8)).with_cfl(1.0);
+    let check = |name: &str, q: &SWESolution2D, min_h: f64, clips: usize| {
+        assert_eq!(clips, 0, "{name}: negative-mean clips");
+        assert!(min_h >= 0.0, "{name}: min h {min_h:e}");
+        let drift = (setup.mass(q) - mass0).abs() / mass0;
+        assert!(drift < 1e-13, "{name}: relative mass drift {drift:e}");
+    };
+    let min_depth = |q: &SWESolution2D| q.h_data().iter().copied().fold(f64::INFINITY, f64::min);
+
+    let mut coarse_steps = Vec::new();
+    for base in BASES {
+        let sim = Simulation::new(physics(), multirate(base, 8)).with_cfl(1.0);
+        let mut q = q0.clone();
+        let mut min_h = f64::INFINITY;
+        let result = sim.run_with_callback(&mut q, 0.0, 300.0, |q, _| {
+            min_h = min_h.min(min_depth(q));
+        });
+        assert!(result.success);
+        let stats = result.local_time_stepping.unwrap();
+        println!("runup, {}: {stats:?}, {:.2}x", base.name(), stats.speedup());
+        assert!(stats.finest_level >= 2, "{stats:?}");
+        check(base.name(), &q, min_h, sim.physics().negative_depth_clips());
+        coarse_steps.push(stats.steps);
+    }
+    // The doubled positivity bound halves the steps (up to the levels'
+    // rounding)
+    let ratio = coarse_steps[0] as f64 / coarse_steps[1] as f64;
+    assert!(ratio > 1.6, "coarse steps {coarse_steps:?}");
+
+    // Global SSP-RK(4,3) at its capped CFL, 2·positivity_cfl_swe_2d(2)
+    let sim = Simulation::new(physics(), StandardIntegrator::SSPRK43).with_cfl(1.0);
+    let mut q = q0.clone();
     let mut min_h = f64::INFINITY;
     let result = sim.run_with_callback(&mut q, 0.0, 300.0, |q, _| {
-        min_h = min_h.min(q.h_data().iter().copied().fold(f64::INFINITY, f64::min));
+        min_h = min_h.min(min_depth(q));
     });
     assert!(result.success);
-    let stats = result.local_time_stepping.unwrap();
-    println!("runup: {stats:?}, {:.2}x", stats.speedup());
-    assert!(stats.finest_level >= 2, "{stats:?}");
-    assert_eq!(sim.physics().negative_depth_clips(), 0);
-    assert!(min_h >= 0.0, "min h {min_h:e}");
-    let drift = (setup.mass(&q) - mass0).abs() / mass0;
-    assert!(drift < 1e-13, "relative mass drift {drift:e}");
+    let expected_dt = sim
+        .physics()
+        .compute_dt(&q0, 2.0 * dg_rs::solver::positivity_cfl_swe_2d(2));
+    assert!(
+        (result.dt_max / expected_dt - 1.0).abs() < 0.05,
+        "dt {} against {expected_dt}",
+        result.dt_max
+    );
+    check(
+        "global ssp-rk43",
+        &q,
+        min_h,
+        sim.physics().negative_depth_clips(),
+    );
 }
 
 #[test]

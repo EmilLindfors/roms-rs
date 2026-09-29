@@ -14,10 +14,12 @@
 //! Constantinescu & Sandu (2007, J. Sci. Comput. 33:239–278,
 //! doi:10.1007/s10915-007-9151-y), which SLIM uses for DG ocean models (Seny
 //! et al. 2013, IJNMF 71:41–64, doi:10.1002/fld.3646; 2014, JCP 256:135–160,
-//! doi:10.1016/j.jcp.2013.07.041), here with SSP-RK3 as the base method.
+//! doi:10.1016/j.jcp.2013.07.041), on a base SSP scheme in Shu–Osher form
+//! ([`SspScheme`]: SSP-RK3, or SSP-RK(4,3) with twice its SSP coefficient).
 //!
 //! The coarse step is split into P = 2^L finest substeps. In finest substep p
-//! every element evaluates one SSP-RK3 step of its own (Shu–Osher form):
+//! every element evaluates one step of the base scheme of its own. For
+//! SSP-RK3:
 //!
 //! ```text
 //! Y₂ = S + Δt_ℓ F₁
@@ -29,26 +31,29 @@
 //! RHS with every face neighbour at *its* stage-s value of the same finest
 //! substep p. An element's substep result is the mean of H over the finest
 //! substeps it spans. Stage s of an element on level ℓ is evaluated at time
-//! tₖ + cₛΔt_ℓ, with c = (0, 1, ½) and tₖ its substep start.
+//! tₖ + cₛΔt_ℓ, with tₖ its substep start (c = (0, 1, ½) for SSP-RK3,
+//! (0, ½, 1, ½) for SSP-RK(4,3)).
 //!
 //! - **SSP / positivity:** every element update is a convex combination of
-//!   forward-Euler steps of size Δt_ℓ from limited stage values (limiters and
-//!   wet/dry correction run on every stage value). The Zhang–Shu positivity
-//!   bound therefore holds for each element at its own Δt_ℓ.
+//!   forward-Euler steps of size Δt_ℓ/C from limited stage values (limiters
+//!   and wet/dry correction run on every stage value), C the base scheme's
+//!   SSP coefficient. The Zhang–Shu positivity bound therefore holds for each
+//!   element at its own Δt_ℓ, up to C times the forward-Euler bound.
 //! - **Conservation:** every element gives stage s of finest substep p the
-//!   same weight, bₛΔt/P with b = (⅙, ⅙, ⅔). The flux through a face at
-//!   (p, s) comes from both sides' (p, s) values, so it is the same for both
-//!   sides. Mass is conserved to rounding.
-//! - **Order:** SSP-RK3 inside each level. Across level interfaces the
-//!   coupling satisfies the second-order partitioned conditions
-//!   (Σ bᵢcᵢ = ½ for every level) but not the third-order ones
-//!   (Σ bᵢ(A_coarse c_fine)ᵢ = 5/24 ≠ ⅙ for two levels). The gate
+//!   same weight, bₛΔt/P with b the base scheme's weights ((⅙, ⅙, ⅔) for
+//!   SSP-RK3). The flux through a face at (p, s) comes from both sides'
+//!   (p, s) values, so it is the same for both sides. Mass is conserved to
+//!   rounding.
+//! - **Order:** the base scheme's (third) inside each level. Across level
+//!   interfaces the coupling satisfies the second-order partitioned
+//!   conditions (Σ bᵢcᵢ = ½ for every level) but not the third-order ones
+//!   (for SSP-RK3, Σ bᵢ(A_coarse c_fine)ᵢ = 5/24 ≠ ⅙ for two levels). The gate
 //!   (`tests/local_time_stepping_test.rs`) measures orders 2.6–2.8 against the
 //!   global solution. The interface error dominates the time error, though:
 //!   ≈ 50× SSP-RK3's at the same CFL for a gravity wave crossing four levels,
 //!   1.5e-3 relative at CFL 0.8. It scales as (λΔt)², so it is negligible for
 //!   tides (ωΔt ~ 1e-3).
-//! - **One level** is SSP-RK3, bit for bit.
+//! - **One level** is the base scheme, bit for bit.
 //!
 //! # Levels
 //!
@@ -67,8 +72,9 @@
 //! its stage-s values change only when those within s stencil steps change.
 //! Its stage-s RHS is therefore evaluated only at the rate rₛ(k), the finest
 //! level within s stencil steps, and reused in between. Near a level
-//! interface the coarse side pays up to three stencil widths at the finer
-//! rate; elsewhere every element runs at its own level.
+//! interface the coarse side pays up to one stencil width per stage (three
+//! for SSP-RK3, four for SSP-RK(4,3)) at the finer rate; elsewhere every
+//! element runs at its own level.
 //!
 //! A reused RHS is the one the element would compute again: its inputs,
 //! including its substep's stage time, are unchanged. So the flux through a
@@ -80,7 +86,9 @@
 use crate::mesh::Mesh2D;
 use crate::types::ElementIndex;
 
-use super::integrator::{Integrable, IntegratorInfo, SSPRK3, StageWorkspace, TimeIntegrator};
+use super::integrator::{
+    Integrable, IntegratorInfo, SSPRK3, SSPRK43, SspScheme, StageWorkspace, TimeIntegrator,
+};
 
 /// What one element does in one stage of [`LocalTimeStepping::stage_where`].
 ///
@@ -139,7 +147,7 @@ pub trait LocalTimeStepping<S>: Sync {
 
     /// Whether the element operations below work in this configuration
     /// (e.g. not with a limiter that reads the neighbours' means). `false`
-    /// makes `Simulation` run global SSP-RK3 through the whole-state stages
+    /// makes `Simulation` run global steps through the whole-state stages
     /// instead of the fused ones; local time stepping panics.
     fn is_element_local(&self) -> bool {
         true
@@ -172,32 +180,62 @@ pub trait LocalTimeStepping<S>: Sync {
 // Integrator
 // =============================================================================
 
-/// Multirate SSP-RK3 (see the [module documentation](self)): `Simulation`
-/// gives every element its own time step, `Δt/2^ℓ` with `ℓ ≤ max_levels`.
+/// Multirate local time stepping on the SSP scheme of the base integrator
+/// `B` (see the [module documentation](self)): `Simulation` gives every
+/// element its own time step, `Δt/2^ℓ` with `ℓ ≤ max_levels`.
+/// [`MultirateSSPRK3`] and [`MultirateSSPRK43`] name the two bases.
 ///
 /// It needs a physics module with
 /// [`PhysicsModule::local_time_stepping`](crate::physics::PhysicsModule::local_time_stepping)
 /// (`SWEPhysics2D`). As a plain [`TimeIntegrator`], without a physics module,
-/// it takes global SSP-RK3 steps.
+/// it takes global steps of `B`.
 #[derive(Clone, Copy, Debug)]
-pub struct MultirateSSPRK3 {
+pub struct Multirate<B> {
+    base: B,
     max_levels: usize,
 }
 
-impl MultirateSSPRK3 {
+/// Multirate SSP-RK3: local time stepping on [`SSPRK3`].
+pub type MultirateSSPRK3 = Multirate<SSPRK3>;
+
+/// Multirate SSP-RK(4,3): local time stepping on [`SSPRK43`], whose SSP
+/// coefficient of 2 doubles every element's step under a positivity bound.
+pub type MultirateSSPRK43 = Multirate<SSPRK43>;
+
+/// Largest supported number of levels below the coarsest (a time-step ratio
+/// of 2¹⁶).
+const MAX_LEVELS: usize = 16;
+
+impl<B: IntegratorInfo + Default> Multirate<B> {
+    /// At most `max_levels` levels below the coarsest, i.e. time steps from
+    /// Δt down to Δt/2^max_levels. Zero gives global steps of `B`.
+    ///
+    /// # Panics
+    /// As [`Self::with_base`].
+    pub fn new(max_levels: usize) -> Self {
+        Self::with_base(B::default(), max_levels)
+    }
+}
+
+impl<B: IntegratorInfo> Multirate<B> {
     /// Largest supported number of levels below the coarsest (a time-step
     /// ratio of 2¹⁶).
-    pub const MAX_LEVELS: usize = 16;
+    pub const MAX_LEVELS: usize = MAX_LEVELS;
 
-    /// At most `max_levels` levels below the coarsest, i.e. time steps from
-    /// Δt down to Δt/2^max_levels. Zero gives global SSP-RK3.
-    pub fn new(max_levels: usize) -> Self {
+    /// [`Self::new`] with a base chosen at run time, e.g. a
+    /// [`StandardIntegrator`](crate::time::StandardIntegrator).
+    ///
+    /// # Panics
+    /// If `max_levels` exceeds [`Self::MAX_LEVELS`], or `base` has no
+    /// [`SspScheme`] to step elements with.
+    pub fn with_base(base: B, max_levels: usize) -> Self {
+        assert!(max_levels <= MAX_LEVELS, "at most {MAX_LEVELS} levels");
         assert!(
-            max_levels <= Self::MAX_LEVELS,
-            "at most {} levels",
-            Self::MAX_LEVELS
+            base.ssp_scheme().is_some(),
+            "{} has no SSP scheme for local time stepping",
+            base.name()
         );
-        Self { max_levels }
+        Self { base, max_levels }
     }
 
     /// The largest number of levels below the coarsest.
@@ -206,18 +244,22 @@ impl MultirateSSPRK3 {
     }
 }
 
-impl IntegratorInfo for MultirateSSPRK3 {
+impl<B: IntegratorInfo> IntegratorInfo for Multirate<B> {
     fn name(&self) -> &'static str {
-        "multirate-ssp-rk3"
+        match self.base.ssp_scheme() {
+            Some(SspScheme::Rk3) => "multirate-ssp-rk3",
+            Some(SspScheme::Rk43) => "multirate-ssp-rk43",
+            None => "multirate",
+        }
     }
 
-    /// Second order across level interfaces (third inside a level).
+    /// Second order across level interfaces (the base's inside a level).
     fn order(&self) -> usize {
         2
     }
 
     fn n_stages(&self) -> usize {
-        3
+        self.base.n_stages()
     }
 
     fn is_ssp(&self) -> bool {
@@ -225,16 +267,20 @@ impl IntegratorInfo for MultirateSSPRK3 {
     }
 
     fn stage_times(&self, dt: f64) -> Vec<f64> {
-        vec![0.0, dt, 0.5 * dt]
+        self.base.stage_times(dt)
     }
 
     fn max_local_levels(&self) -> Option<usize> {
         Some(self.max_levels)
     }
+
+    fn ssp_scheme(&self) -> Option<SspScheme> {
+        self.base.ssp_scheme()
+    }
 }
 
-/// Without a physics module there are no elements: global SSP-RK3.
-impl<S: Integrable> TimeIntegrator<S> for MultirateSSPRK3 {
+/// Without a physics module there are no elements: global steps of `B`.
+impl<S: Integrable, B: TimeIntegrator<S>> TimeIntegrator<S> for Multirate<B> {
     fn step_with_relaxation<F, R, H>(
         &self,
         state: &mut S,
@@ -249,7 +295,8 @@ impl<S: Integrable> TimeIntegrator<S> for MultirateSSPRK3 {
         R: FnMut(&mut S, &S, f64),
         H: FnMut(&mut S),
     {
-        SSPRK3.step_with_relaxation(state, dt, t, rhs, relax, stage_hook, workspace);
+        self.base
+            .step_with_relaxation(state, dt, t, rhs, relax, stage_hook, workspace);
     }
 }
 
@@ -269,7 +316,7 @@ pub fn assign_levels(
     dt_cap: Option<f64>,
     levels: &mut Vec<u8>,
 ) -> (f64, usize) {
-    assert!(max_levels <= MultirateSSPRK3::MAX_LEVELS);
+    assert!(max_levels <= MAX_LEVELS);
     let finite = element_dt.iter().copied().filter(|dt| dt.is_finite());
     let (dt_min, dt_max) = finite.fold((f64::INFINITY, 0.0_f64), |(lo, hi), dt| {
         (lo.min(dt), hi.max(dt))
@@ -419,8 +466,8 @@ pub struct MultirateStats {
     pub steps: u64,
     /// Element RHS evaluations.
     pub element_evaluations: u64,
-    /// Element RHS evaluations that global SSP-RK3 at the finest time step
-    /// would have needed for the same steps.
+    /// Element RHS evaluations that global steps of the base scheme at the
+    /// finest time step would have needed for the same steps.
     pub global_evaluations: u64,
     /// Finest level used (the largest time-step ratio is 2^this).
     pub finest_level: usize,
@@ -433,51 +480,56 @@ impl MultirateStats {
     }
 }
 
-/// Levels, stage storage and work counts of a multirate SSP-RK3 run; one per
+/// Levels, stage storage and work counts of a multirate run; one per
 /// simulation (`Simulation` keeps it).
 pub struct MultirateStepper<S> {
+    scheme: SspScheme,
     max_levels: usize,
     /// Finest level L of the current coarse step
     finest: usize,
     element_dt: Vec<f64>,
     level: Vec<u8>,
     /// `rate[s][k]`: the level whose substeps element k's stage-(s + 1) RHS
-    /// follows, the finest level within s + 1 steps of the RHS stencil
-    rate: [Vec<u8>; 3],
+    /// follows, the finest level within s + 1 steps of the RHS stencil (one
+    /// per stage)
+    rate: Vec<Vec<u8>>,
     /// Elements by decreasing `rate[s]` and by decreasing level, with the
     /// counts at or above each depth (see [`sort_descending`]): the active
     /// elements of a pass are a prefix
-    rate_order: [Vec<u32>; 3],
-    rate_count: [Vec<usize>; 3],
+    rate_order: Vec<Vec<u32>>,
+    rate_count: Vec<Vec<usize>>,
     level_order: Vec<u32>,
     level_count: Vec<usize>,
     /// Element RHS evaluations of one coarse step with the current levels
     evaluations_per_step: u64,
-    y2: Option<S>,
-    y3: Option<S>,
-    rhs: Option<S>,
+    /// Stage values 1 to s − 1 (the RHS arguments of stages 2 to s)
+    values: Vec<S>,
+    /// The last stage's value in the current finest substep
+    last: Option<S>,
     acc: Option<S>,
     stats: MultirateStats,
 }
 
 impl<S: Integrable> MultirateStepper<S> {
-    /// Empty stepper with up to `max_levels` levels below the coarsest.
-    pub fn new(max_levels: usize) -> Self {
-        assert!(max_levels <= MultirateSSPRK3::MAX_LEVELS);
+    /// Empty stepper for `scheme` with up to `max_levels` levels below the
+    /// coarsest.
+    pub fn new(max_levels: usize, scheme: SspScheme) -> Self {
+        assert!(max_levels <= MAX_LEVELS);
+        let n_stages = scheme.n_stages();
         Self {
+            scheme,
             max_levels,
             finest: 0,
             element_dt: Vec::new(),
             level: Vec::new(),
-            rate: Default::default(),
-            rate_order: Default::default(),
-            rate_count: Default::default(),
+            rate: vec![Vec::new(); n_stages],
+            rate_order: vec![Vec::new(); n_stages],
+            rate_count: vec![Vec::new(); n_stages],
             level_order: Vec::new(),
             level_count: Vec::new(),
             evaluations_per_step: 0,
-            y2: None,
-            y3: None,
-            rhs: None,
+            values: Vec::new(),
+            last: None,
             acc: None,
             stats: MultirateStats::default(),
         }
@@ -502,16 +554,39 @@ impl<S: Integrable> MultirateStepper<S> {
         self.finest = finest;
 
         let stencil = local.stencil();
-        let [r1, r2, r3] = &mut self.rate;
-        for r in [&mut *r1, &mut *r2, &mut *r3] {
-            r.resize(n, 0);
+        for rate in &mut self.rate {
+            rate.resize(n, 0);
         }
-        limit_level_jumps(mesh, &mut self.level, r1);
-        spread_over_stencil(mesh, &self.level, r1, stencil);
-        spread_over_stencil(mesh, r1, r2, stencil);
-        spread_over_stencil(mesh, r2, r3, stencil);
+        limit_level_jumps(mesh, &mut self.level, &mut self.rate[0]);
+        spread_over_stencil(mesh, &self.level, &mut self.rate[0], stencil);
+        for s in 1..self.rate.len() {
+            let (done, rest) = self.rate.split_at_mut(s);
+            spread_over_stencil(mesh, &done[s - 1], &mut rest[0], stencil);
+        }
+        self.sort_by_rates();
+        dt
+    }
+
+    /// Put all `n_elements` elements on one level, for global steps of the
+    /// scheme through the fused per-element stages (no element time steps
+    /// needed: the caller takes the global step). Call it once; the levels
+    /// stay until the next [`Self::assign_levels`].
+    pub fn assign_one_level(&mut self, n_elements: usize) {
+        self.finest = 0;
+        self.level.clear();
+        self.level.resize(n_elements, 0);
+        for rate in &mut self.rate {
+            rate.clear();
+            rate.resize(n_elements, 0);
+        }
+        self.sort_by_rates();
+    }
+
+    /// The element orders and the work count of the current levels and rates.
+    fn sort_by_rates(&mut self) {
+        let finest = self.finest;
         self.evaluations_per_step = self.rate.iter().flatten().map(|&r| 1u64 << r).sum();
-        for s in 0..3 {
+        for s in 0..self.rate.len() {
             sort_descending(
                 &self.rate[s],
                 finest,
@@ -525,29 +600,6 @@ impl<S: Integrable> MultirateStepper<S> {
             &mut self.level_order,
             &mut self.level_count,
         );
-        dt
-    }
-
-    /// Put all `n_elements` elements on one level, for global SSP-RK3
-    /// steps through the fused per-element stages (no element time steps
-    /// needed: the caller takes the global step). Call it once; the levels
-    /// stay until the next [`Self::assign_levels`].
-    pub fn assign_one_level(&mut self, n_elements: usize) {
-        self.finest = 0;
-        self.level.clear();
-        self.level.resize(n_elements, 0);
-        for s in 0..3 {
-            self.rate[s].clear();
-            self.rate[s].resize(n_elements, 0);
-            sort_descending(
-                &self.rate[s],
-                0,
-                &mut self.rate_order[s],
-                &mut self.rate_count[s],
-            );
-        }
-        sort_descending(&self.level, 0, &mut self.level_order, &mut self.level_count);
-        self.evaluations_per_step = 3 * n_elements as u64;
     }
 
     /// Level of every element from the last [`Self::assign_levels`].
@@ -570,12 +622,16 @@ impl<S: Integrable> MultirateStepper<S> {
     /// (all levels shrink with it).
     pub fn step(&mut self, local: &dyn LocalTimeStepping<S>, state: &mut S, t: f64, dt: f64) {
         let finest = self.finest;
+        let stages = self.scheme.stages();
+        let n_stages = stages.len();
         let (level, rate) = (&self.level, &self.rate);
         let (rate_order, rate_count) = (&self.rate_order, &self.rate_count);
         let (level_order, level_count) = (&self.level_order, &self.level_count);
-        let y2 = self.y2.get_or_insert_with(|| state.clone());
-        let y3 = self.y3.get_or_insert_with(|| state.clone());
-        let f = self.rhs.get_or_insert_with(|| state.clone());
+        if self.values.len() != n_stages - 1 {
+            self.values = vec![state.clone(); n_stages - 1];
+        }
+        let values = &mut self.values;
+        let last = self.last.get_or_insert_with(|| state.clone());
         let acc = self.acc.get_or_insert_with(|| state.clone());
 
         let step_of = |l: u8| dt / (1u64 << l) as f64;
@@ -588,69 +644,46 @@ impl<S: Integrable> MultirateStepper<S> {
                 let q = p >> (finest - l as usize);
                 (t + q as f64 * dt_l, dt_l)
             };
-            // The elements whose stage-(s + 1) RHS follows a level ≥ d
-            let active = |s: usize| &rate_order[s][..rate_count[s][d]];
 
-            // Stage 1: Y₂ = S + Δt_ℓ F(S)
-            local.stage_where(
-                state,
-                state,
-                active(0),
-                &|k| {
+            for (s, stage) in stages.iter().enumerate() {
+                // Stage s + 1 = start·S + input·Yₛ + βΔt_ℓ F(Yₛ), with Y₀ = S
+                let plan = |k: usize| {
                     let (t_k, dt_l) = substep(k);
                     ElementStage {
-                        time: t_k,
-                        a: 1.0,
-                        b: 0.0,
-                        c: dt_l,
+                        time: t_k + stage.c * dt_l,
+                        a: stage.start,
+                        b: stage.input,
+                        c: stage.beta * dt_l,
                         accumulate: None,
                     }
-                },
-                y2,
-                None,
-            );
-
-            // Stage 2: Y₃ = ¾S + ¼Y₂ + ¼Δt_ℓ F(Y₂)
-            local.stage_where(
-                state,
-                y2,
-                active(1),
-                &|k| {
-                    let (t_k, dt_l) = substep(k);
-                    ElementStage {
-                        time: t_k + dt_l,
-                        a: 0.75,
-                        b: 0.25,
-                        c: 0.25 * dt_l,
-                        accumulate: None,
-                    }
-                },
-                y3,
-                None,
-            );
-
-            // Stage 3: H = ⅓S + ⅔Y₃ + ⅔Δt_ℓ F(Y₃). The substep result is the
-            // mean of H over its 2^(r₃ − ℓ) blocks; a block starting with the
-            // substep restarts the sum
-            local.stage_where(
-                state,
-                y3,
-                active(2),
-                &|k| {
-                    let (t_k, dt_l) = substep(k);
-                    let blocks = 1u64 << (rate[2][k] - level[k]);
-                    let first = level[k] as usize >= d;
-                    ElementStage {
-                        time: t_k + 0.5 * dt_l,
-                        a: 1.0 / 3.0,
-                        b: 2.0 / 3.0,
-                        c: 2.0 / 3.0 * dt_l,
-                        accumulate: Some((1.0 / blocks as f64, if first { 0.0 } else { 1.0 })),
-                    }
-                },
-                f,
-                Some(&mut *acc),
-            );
+                };
+                // The elements whose stage-(s + 1) RHS follows a level ≥ d
+                let active = &rate_order[s][..rate_count[s][d]];
+                let (done, rest) = values.split_at_mut(s);
+                let input: &S = if s == 0 { &*state } else { &done[s - 1] };
+                if s + 1 < n_stages {
+                    local.stage_where(state, input, active, &plan, &mut rest[0], None);
+                    continue;
+                }
+                // The last stage, H: the substep result is the mean of H over
+                // its 2^(r − ℓ) blocks; a block starting with the substep
+                // restarts the sum
+                local.stage_where(
+                    state,
+                    input,
+                    active,
+                    &|k| {
+                        let blocks = 1u64 << (rate[s][k] - level[k]);
+                        let first = level[k] as usize >= d;
+                        ElementStage {
+                            accumulate: Some((1.0 / blocks as f64, if first { 0.0 } else { 1.0 })),
+                            ..plan(k)
+                        }
+                    },
+                    last,
+                    Some(&mut *acc),
+                );
+            }
 
             // Substeps ending here
             let next = depth(p + 1, finest);
@@ -659,7 +692,7 @@ impl<S: Integrable> MultirateStepper<S> {
 
         self.stats.steps += 1;
         self.stats.element_evaluations += self.evaluations_per_step;
-        self.stats.global_evaluations += 3 * self.level.len() as u64 * (1u64 << finest);
+        self.stats.global_evaluations += (n_stages * self.level.len()) as u64 * (1u64 << finest);
         self.stats.finest_level = self.stats.finest_level.max(finest);
     }
 }

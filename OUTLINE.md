@@ -65,8 +65,8 @@ src/
 │   ├── probe.rs      # Probe2D: the DG solution at a point (stations)
 │   └── burn/         # Burn GPU prototype — incomplete, deletion recommended
 │                     # (REVIEW.md §5; TODO P0.11/P2.7)
-├── time/             # Integrable + TimeIntegrator traits, generic SSPRK3,
-│                     # multirate (local time stepping, MultirateSSPRK3),
+├── time/             # Integrable + TimeIntegrator traits, generic SSPRK3, SSPRK43,
+│                     # multirate (local time stepping, Multirate<B>),
 │                     # mode_split (barotropic subcycling); legacy per-type
 │                     # ssp_rk3_* variants slated for deletion (REVIEW.md §6.2)
 │
@@ -98,7 +98,7 @@ are the adapter edge; the DG core must stay free of I/O and feature flags
 | 1D/2D DG core | Solid operators/fluxes/SSP-RK3: verified convergence (P1–P5 1D, P1–P3 2D) on flat/linear-bottom periodic problems, machine-precision conservation for continuous bathymetry, correct Roe/HLL (REVIEW.md §1.10) |
 | Well-balancing | `SWEFormulation2D::EntropyStable` (Wintermeyer split form) is well-balanced for any nodal bathymetry, including face jumps, with exact mass conservation and an entropy inequality; the default collocated form stays balanced only for deg B ≤ p/2. The reconstruction mass leak is fixed (1D and 2D). Open: η-based limiting (REVIEW.md §1.4), wetting/drying for the split form (REVIEW.md §1.5) |
 | Geometry | General straight-sided quadrilaterals: per-node isoparametric (bilinear) factors, conservative/curvilinear forms in the 2D SWE, tracer, advection and diffusion kernels, free-stream preserving and well-balanced (TODO P1.3). The 3D kernels and the Burn/batched prototypes still require parallelograms (asserted). All-quad Gmsh MSH 4.1/2.2 meshes load with validation and named boundary groups (`docs/gmsh-meshes.md`). Open: triangles, curved faces, CSR (REVIEW.md §4.1) |
-| Time integration | Generic `SSPRK3` over `Integrable` is the real path; five legacy copies pending deletion |
+| Time integration | Generic `SSPRK3`/`SSPRK43` over `Integrable` is the real path (fused per-element stages, local time stepping); five legacy copies pending deletion |
 | Mode splitting | Prototype: Hann filter correct, but the FE subcycle runs inside every RK stage (first-order, damps M2 3–14 %/period), G double-counts advection, stresses never reach the depth mean. Needs a ROMS-style once-per-step forward-backward pass (REVIEW.md §2) |
 | 3D physics | Scaffolding: sigma grid, tridiagonal and implicit diffusion solid; tracers not constancy-preserving, vertical advection ×D (fix in review), non-balanced PGF, no GLS; essentially untested (REVIEW.md §3, §6.1) |
 | Boundaries/nesting | One characteristic OBC (flux F(q_b)·n, independent of the Riemann solver; reflection ~1e-6), NorKyst boundary tides from a harmonic atlas, `ModelClock`; 2D NorKyst nesting (`OceanModelState`: precomputed stencils, rotation into mesh axes, transport scaling, relaxation band, bed blending, cubic time interpolation); gridded MET Nordic/MEPS wind and pressure (`GriddedAtmosphere2D`). Open: atlas tides + NorKyst residual, 3D nesting (TODO P1.5) |

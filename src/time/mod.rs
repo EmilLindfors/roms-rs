@@ -6,10 +6,13 @@
 //! This enables composable integrators and runtime selection:
 //!
 //! - [`SSPRK3`]: Strong Stability Preserving RK3 (optimal for hyperbolic systems)
+//! - [`SSPRK43`]: four-stage SSP-RK3 with SSP coefficient 2: 1.5× less work
+//!   where a positivity bound sets the step (wet/dry runs)
 //! - [`ForwardEuler`]: Simple 1st order (for testing)
 //! - [`StandardIntegrator`]: Enum for zero-cost dispatch
-//! - [`MultirateSSPRK3`]: local time stepping, every element at its own
-//!   power-of-two fraction of the time step (conservative, SSP)
+//! - [`MultirateSSPRK3`], [`MultirateSSPRK43`]: local time stepping, every
+//!   element at its own power-of-two fraction of the time step (conservative,
+//!   SSP)
 //!
 //! The [`Integrable`] trait marks solution types that can be time-stepped.
 
@@ -38,7 +41,8 @@ pub use mode_split::{
     ModeSplitIntegrator, ModeSplitPhysics, SplitMethod, step_average_weights,
 };
 pub use multirate::{
-    LocalTimeStepping, MultirateSSPRK3, MultirateStats, MultirateStepper, RhsStencil, assign_levels,
+    LocalTimeStepping, Multirate, MultirateSSPRK3, MultirateSSPRK43, MultirateStats,
+    MultirateStepper, RhsStencil, assign_levels,
 };
 pub use ssp_rk3::{compute_dt, ssp_rk3_step, ssp_rk3_step_timed};
 pub use ssp_rk3_2d::{run_advection_2d, ssp_rk3_step_2d, ssp_rk3_step_2d_timed};
@@ -52,8 +56,8 @@ pub use ssp_rk3_swe_2d::{
 
 // Integrator trait exports
 pub use integrator::{
-    BoxedIntegratorInfo, ForwardEuler, Integrable, IntegratorInfo, SSPRK3, StageWorkspace,
-    StandardIntegrator, TimeIntegrator, create_integrator_info,
+    BoxedIntegratorInfo, ForwardEuler, Integrable, IntegratorInfo, SSPRK3, SSPRK43, ShuOsherStage,
+    SspScheme, StageWorkspace, StandardIntegrator, TimeIntegrator, create_integrator_info,
 };
 
 // Burn GPU time integration exports

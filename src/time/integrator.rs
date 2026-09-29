@@ -148,15 +148,110 @@ pub trait IntegratorInfo: Send + Sync {
         None
     }
 
-    /// Whether a step of this integrator is a one-level
-    /// [`crate::time::MultirateSSPRK3`] step, which `Simulation` then runs
+    /// The [`SspScheme`] a step of this integrator is, stage for stage and
+    /// with the same arithmetic, if any. `Simulation` then runs global steps
     /// through the physics module's fused per-element stages
     /// ([`crate::time::LocalTimeStepping::stage_where`]: RHS, stage
     /// combination, implicit damping and post-processing in one pass per
-    /// stage) when the module supports local time stepping. True for
-    /// [`SSPRK3`], which that is bit for bit.
-    fn is_one_level_multirate(&self) -> bool {
-        false
+    /// stage) when the module supports local time stepping, bit for bit the
+    /// same; a multirate integrator steps every element with it.
+    fn ssp_scheme(&self) -> Option<SspScheme> {
+        None
+    }
+
+    /// SSP coefficient C: every step is a convex combination of forward
+    /// Euler steps of at most `dt/C`, so a nonlinear bound that holds for
+    /// forward Euler up to `Δt_FE` (positivity, a maximum principle) holds
+    /// up to `C·Δt_FE`. `Simulation` scales
+    /// [`PhysicsModule::max_cfl`](crate::physics::PhysicsModule::max_cfl) by
+    /// it. That of the [`Self::ssp_scheme`], else 1 (forward Euler).
+    fn ssp_coefficient(&self) -> f64 {
+        self.ssp_scheme().map_or(1.0, SspScheme::ssp_coefficient)
+    }
+}
+
+// =============================================================================
+// Two-register SSP schemes (Shu–Osher form)
+// =============================================================================
+
+/// One stage of an [`SspScheme`]: from the step start `u⁽⁰⁾` and the previous
+/// stage value `u⁽ⁱ⁻¹⁾`,
+/// `u⁽ⁱ⁾ = start·u⁽⁰⁾ + input·u⁽ⁱ⁻¹⁾ + beta·dt·L(u⁽ⁱ⁻¹⁾, t + c·dt)`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShuOsherStage {
+    /// Weight of the step start.
+    pub start: f64,
+    /// Weight of the previous stage value (the RHS argument).
+    pub input: f64,
+    /// Weight of `dt` times the RHS.
+    pub beta: f64,
+    /// Time of the RHS evaluation, as a fraction of `dt`.
+    pub c: f64,
+}
+
+/// SSP Runge–Kutta methods whose every stage combines only the step start
+/// and the previous stage value ([`ShuOsherStage`]), with non-negative
+/// weights (`start + input = 1`). The fused and the multirate steppers
+/// ([`crate::time::MultirateStepper`]) run any of them; the last stage is the
+/// new state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SspScheme {
+    /// SSP-RK3 (Shu & Osher 1988): three stages, SSP coefficient 1 (an
+    /// efficiency of 1/3 per RHS evaluation).
+    Rk3,
+    /// SSP-RK(4,3) (Kraaijevanger 1991; Spiteri & Ruuth 2002, SIAM J. Numer.
+    /// Anal. 40:469–491): four stages, SSP coefficient 2 (an efficiency of
+    /// 1/2): twice SSP-RK3's step under a forward-Euler bound for 4/3 of its
+    /// work.
+    Rk43,
+}
+
+impl SspScheme {
+    /// The stages, in order.
+    pub const fn stages(self) -> &'static [ShuOsherStage] {
+        const fn stage(start: f64, input: f64, beta: f64, c: f64) -> ShuOsherStage {
+            ShuOsherStage {
+                start,
+                input,
+                beta,
+                c,
+            }
+        }
+        const RK3: [ShuOsherStage; 3] = [
+            stage(1.0, 0.0, 1.0, 0.0),
+            stage(0.75, 0.25, 0.25, 1.0),
+            stage(1.0 / 3.0, 2.0 / 3.0, 2.0 / 3.0, 0.5),
+        ];
+        const RK43: [ShuOsherStage; 4] = [
+            stage(1.0, 0.0, 0.5, 0.0),
+            stage(0.0, 1.0, 0.5, 0.5),
+            stage(2.0 / 3.0, 1.0 / 3.0, 1.0 / 6.0, 1.0),
+            stage(0.0, 1.0, 0.5, 0.5),
+        ];
+        match self {
+            SspScheme::Rk3 => &RK3,
+            SspScheme::Rk43 => &RK43,
+        }
+    }
+
+    /// Number of stages (RHS evaluations per step).
+    pub const fn n_stages(self) -> usize {
+        self.stages().len()
+    }
+
+    /// SSP coefficient: the smallest ratio of a stage's weights on the
+    /// previous stage and on its RHS, `input/beta` (the first stage's
+    /// input is the step start).
+    pub const fn ssp_coefficient(self) -> f64 {
+        match self {
+            SspScheme::Rk3 => 1.0,
+            SspScheme::Rk43 => 2.0,
+        }
+    }
+
+    /// Stage times as offsets from the step start.
+    pub fn stage_times(self, dt: f64) -> Vec<f64> {
+        self.stages().iter().map(|stage| stage.c * dt).collect()
     }
 }
 
@@ -311,8 +406,8 @@ impl IntegratorInfo for SSPRK3 {
         "ssp-rk3"
     }
 
-    fn is_one_level_multirate(&self) -> bool {
-        true
+    fn ssp_scheme(&self) -> Option<SspScheme> {
+        Some(SspScheme::Rk3)
     }
 
     fn order(&self) -> usize {
@@ -371,6 +466,116 @@ impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
         state.axpy(2.0 / 3.0, u2);
         state.axpy(2.0 / 3.0 * dt, k);
         relax(state, u2, 2.0 / 3.0 * dt);
+        stage_hook(state);
+    }
+}
+
+// =============================================================================
+// SSP-RK(4,3)
+// =============================================================================
+
+/// Four-stage, third-order SSP Runge–Kutta method, SSP-RK(4,3)
+/// (Kraaijevanger 1991; Spiteri & Ruuth 2002), [`SspScheme::Rk43`]:
+///
+/// ```text
+/// u1    = u + dt/2 · L(u, t)
+/// u2    = u1 + dt/2 · L(u1, t + dt/2)
+/// u3    = 2/3 · u + 1/3 · u2 + dt/6 · L(u2, t + dt)
+/// u_new = u3 + dt/2 · L(u3, t + dt/2)
+/// ```
+///
+/// Every stage is a forward-Euler step of `dt/2` (stage 3 inside a convex
+/// combination), so its SSP coefficient is 2: a nonlinear bound that holds
+/// for forward Euler up to `Δt_FE`, such as the DGSEM positivity bound of
+/// wet/dry runs, holds up to `2·Δt_FE`, against `Δt_FE` for [`SSPRK3`]. That
+/// is 1.5× less RHS work where such a bound sets the step. Its linear
+/// stability region is larger than SSP-RK3's too (the negative real axis to
+/// 5.15 against 2.51, the imaginary axis to 2.16 against 1.73), and at CFL
+/// numbers up to that doubled bound DGSEM stays well inside it for N = 1–4.
+/// Where only linear stability limits the step (no wetting/drying), it saves
+/// nothing over SSP-RK3 unless the CFL number is raised.
+///
+/// Stage times: t, t + dt/2, t + dt, t + dt/2 (weights 1/6, 1/6, 1/6, 1/2).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SSPRK43;
+
+impl IntegratorInfo for SSPRK43 {
+    fn name(&self) -> &'static str {
+        "ssp-rk43"
+    }
+
+    fn ssp_scheme(&self) -> Option<SspScheme> {
+        Some(SspScheme::Rk43)
+    }
+
+    fn order(&self) -> usize {
+        3
+    }
+
+    fn n_stages(&self) -> usize {
+        4
+    }
+
+    fn is_ssp(&self) -> bool {
+        true
+    }
+
+    fn stage_times(&self, dt: f64) -> Vec<f64> {
+        SspScheme::Rk43.stage_times(dt)
+    }
+}
+
+impl<S: Integrable> TimeIntegrator<S> for SSPRK43 {
+    /// Two stage buffers: u3 reuses u1's. The weights are the
+    /// [`SspScheme::Rk43`] table's, multiplied in the order of the fused
+    /// stages, so both give the same result bit for bit.
+    fn step_with_relaxation<F, R, H>(
+        &self,
+        state: &mut S,
+        dt: f64,
+        t: f64,
+        mut rhs: F,
+        mut relax: R,
+        mut stage_hook: H,
+        workspace: &mut StageWorkspace<S>,
+    ) where
+        F: FnMut(&S, f64, &mut S),
+        R: FnMut(&mut S, &S, f64),
+        H: FnMut(&mut S),
+    {
+        let [s1, s2, s3, s4] = SspScheme::Rk43.stages() else {
+            unreachable!("SSP-RK(4,3) has four stages")
+        };
+        let (u1, u2, k) = workspace.buffers(state);
+
+        // Stage 1: u1 = u + dt/2 · L(u, t)
+        rhs(state, t + s1.c * dt, k);
+        u1.copy_from(state);
+        u1.axpy(s1.beta * dt, k);
+        relax(u1, state, s1.beta * dt);
+        stage_hook(u1);
+
+        // Stage 2: u2 = u1 + dt/2 · L(u1, t + dt/2)
+        rhs(u1, t + s2.c * dt, k);
+        u2.copy_from(u1);
+        u2.axpy(s2.beta * dt, k);
+        relax(u2, u1, s2.beta * dt);
+        stage_hook(u2);
+
+        // Stage 3: u3 = 2/3 · u + 1/3 · u2 + dt/6 · L(u2, t + dt), into u1
+        rhs(u2, t + s3.c * dt, k);
+        u1.copy_from(state);
+        u1.scale(s3.start);
+        u1.axpy(s3.input, u2);
+        u1.axpy(s3.beta * dt, k);
+        relax(u1, u2, s3.beta * dt);
+        stage_hook(u1);
+
+        // Stage 4: u_new = u3 + dt/2 · L(u3, t + dt/2)
+        rhs(u1, t + s4.c * dt, k);
+        state.copy_from(u1);
+        state.axpy(s4.beta * dt, k);
+        relax(state, u1, s4.beta * dt);
         stage_hook(state);
     }
 }
@@ -448,6 +653,8 @@ pub enum StandardIntegrator {
     /// SSP-RK3 (default, recommended for hyperbolic problems)
     #[default]
     SSPRK3,
+    /// SSP-RK(4,3): twice SSP-RK3's step under positivity bounds
+    SSPRK43,
     /// Forward Euler (1st order, for testing)
     ForwardEuler,
 }
@@ -455,14 +662,15 @@ pub enum StandardIntegrator {
 impl IntegratorInfo for StandardIntegrator {
     fn name(&self) -> &'static str {
         match self {
-            StandardIntegrator::SSPRK3 => "ssp-rk3",
-            StandardIntegrator::ForwardEuler => "forward-euler",
+            StandardIntegrator::SSPRK3 => SSPRK3.name(),
+            StandardIntegrator::SSPRK43 => SSPRK43.name(),
+            StandardIntegrator::ForwardEuler => ForwardEuler.name(),
         }
     }
 
     fn order(&self) -> usize {
         match self {
-            StandardIntegrator::SSPRK3 => 3,
+            StandardIntegrator::SSPRK3 | StandardIntegrator::SSPRK43 => 3,
             StandardIntegrator::ForwardEuler => 1,
         }
     }
@@ -470,18 +678,28 @@ impl IntegratorInfo for StandardIntegrator {
     fn n_stages(&self) -> usize {
         match self {
             StandardIntegrator::SSPRK3 => 3,
+            StandardIntegrator::SSPRK43 => 4,
             StandardIntegrator::ForwardEuler => 1,
         }
     }
 
     fn is_ssp(&self) -> bool {
-        true // Both are SSP
+        true // All are SSP
     }
 
     fn stage_times(&self, dt: f64) -> Vec<f64> {
         match self {
-            StandardIntegrator::SSPRK3 => vec![0.0, dt, 0.5 * dt],
+            StandardIntegrator::SSPRK3 => SSPRK3.stage_times(dt),
+            StandardIntegrator::SSPRK43 => SSPRK43.stage_times(dt),
             StandardIntegrator::ForwardEuler => vec![0.0],
+        }
+    }
+
+    fn ssp_scheme(&self) -> Option<SspScheme> {
+        match self {
+            StandardIntegrator::SSPRK3 => SSPRK3.ssp_scheme(),
+            StandardIntegrator::SSPRK43 => SSPRK43.ssp_scheme(),
+            StandardIntegrator::ForwardEuler => None,
         }
     }
 }
@@ -505,6 +723,9 @@ impl<S: Integrable> TimeIntegrator<S> for StandardIntegrator {
             StandardIntegrator::SSPRK3 => {
                 SSPRK3.step_with_relaxation(state, dt, t, rhs, relax, stage_hook, workspace)
             }
+            StandardIntegrator::SSPRK43 => {
+                SSPRK43.step_with_relaxation(state, dt, t, rhs, relax, stage_hook, workspace)
+            }
             StandardIntegrator::ForwardEuler => {
                 ForwardEuler.step_with_relaxation(state, dt, t, rhs, relax, stage_hook, workspace)
             }
@@ -527,6 +748,7 @@ pub type BoxedIntegratorInfo = Box<dyn IntegratorInfo>;
 pub fn create_integrator_info(integrator: StandardIntegrator) -> BoxedIntegratorInfo {
     match integrator {
         StandardIntegrator::SSPRK3 => Box::new(SSPRK3),
+        StandardIntegrator::SSPRK43 => Box::new(SSPRK43),
         StandardIntegrator::ForwardEuler => Box::new(ForwardEuler),
     }
 }
@@ -705,6 +927,112 @@ mod tests {
         }
     }
 
+    /// Error of `integrator` at t = 1 on du/dt = u(1 + cos t), whose exact
+    /// solution is exp(t + sin t): a time-dependent RHS, so wrong stage times
+    /// would lower the order.
+    fn exponential_error<I: TimeIntegrator<DGSolution1D>>(integrator: &I, n_steps: usize) -> f64 {
+        let dt = 1.0 / n_steps as f64;
+        let mut u = DGSolution1D::new(1, 1);
+        u.data[0] = 1.0;
+        for i in 0..n_steps {
+            integrator.step(&mut u, dt, i as f64 * dt, |state, time| {
+                let mut rhs = state.clone();
+                rhs.scale(1.0 + time.cos());
+                rhs
+            });
+        }
+        (u.data[0] - (1.0 + 1.0_f64.sin()).exp()).abs()
+    }
+
+    #[test]
+    fn test_ssp_schemes_converge_at_third_order() {
+        for integrator in [StandardIntegrator::SSPRK3, StandardIntegrator::SSPRK43] {
+            let (coarse, fine) = (
+                exponential_error(&integrator, 20),
+                exponential_error(&integrator, 40),
+            );
+            let rate = (coarse / fine).log2();
+            assert!(
+                (rate - 3.0).abs() < 0.1,
+                "{}: order {rate:.3} (errors {coarse:e}, {fine:e})",
+                integrator.name()
+            );
+        }
+    }
+
+    /// The Shu–Osher tables against their Butcher form: the order conditions
+    /// up to third order, convex non-negative weights, the stated SSP
+    /// coefficient and the stage times.
+    #[test]
+    fn test_ssp_scheme_tables() {
+        for scheme in [SspScheme::Rk3, SspScheme::Rk43] {
+            let stages = scheme.stages();
+            let s = stages.len();
+            // Butcher rows: stage value i (0 = the step start) as the start
+            // plus dt·Σ a[i][j] F_j, with F_j the RHS at stage value j. The
+            // start carries no RHS, so only the input's row propagates
+            let mut a = vec![vec![0.0; s]; s + 1];
+            for (i, stage) in stages.iter().enumerate() {
+                a[i + 1] = a[i].iter().map(|&x| stage.input * x).collect();
+                a[i + 1][i] += stage.beta;
+            }
+            let b = &a[s];
+            let c: Vec<f64> = (0..s).map(|i| a[i].iter().sum()).collect();
+            let close = |x: f64, y: f64| (x - y).abs() < 1e-15;
+            let dot = |x: &[f64], y: &[f64]| x.iter().zip(y).map(|(x, y)| x * y).sum::<f64>();
+            let ac: Vec<f64> = (0..s).map(|i| dot(&a[i], &c)).collect();
+            let c2: Vec<f64> = c.iter().map(|c| c * c).collect();
+            assert!(close(b.iter().sum(), 1.0), "{scheme:?}: Σb");
+            assert!(close(dot(b, &c), 0.5), "{scheme:?}: Σbc");
+            assert!(close(dot(b, &c2), 1.0 / 3.0), "{scheme:?}: Σbc²");
+            assert!(close(dot(b, &ac), 1.0 / 6.0), "{scheme:?}: Σb(Ac)");
+            for (i, stage) in stages.iter().enumerate() {
+                assert!(close(stage.c, c[i]), "{scheme:?}: c of stage {i}");
+                assert!(close(stage.start + stage.input, 1.0));
+                assert!(stage.start >= 0.0 && stage.input >= 0.0 && stage.beta > 0.0);
+            }
+            // SSP coefficient: min over the stages of (weight of the RHS
+            // argument)/beta; the first stage's argument is the start
+            let coefficient = stages
+                .iter()
+                .enumerate()
+                .map(|(i, st)| if i == 0 { st.start } else { st.input } / st.beta)
+                .fold(f64::INFINITY, f64::min);
+            assert!(close(coefficient, scheme.ssp_coefficient()), "{scheme:?}");
+        }
+        assert_eq!(SSPRK3.stage_times(0.1), SspScheme::Rk3.stage_times(0.1));
+        assert_eq!(SSPRK43.ssp_coefficient(), 2.0);
+        assert_eq!(SSPRK3.ssp_coefficient(), 1.0);
+        assert_eq!(ForwardEuler.ssp_coefficient(), 1.0);
+    }
+
+    #[test]
+    fn test_ssprk43_stage_hook_runs_after_each_stage() {
+        let mut u = DGSolution1D::new(1, 1);
+        u.data[0] = 1.0;
+        let mut times = Vec::new();
+        let mut n_hooks = 0;
+        SSPRK43.step_with_stage_hook(
+            &mut u,
+            0.1,
+            2.0,
+            |state, time| {
+                times.push(time);
+                state.clone()
+            },
+            |_| n_hooks += 1,
+        );
+        assert_eq!(n_hooks, 4);
+        let expected = [2.0, 2.05, 2.1, 2.05];
+        assert!(
+            times
+                .iter()
+                .zip(expected)
+                .all(|(t, e)| (t - e).abs() < 1e-15),
+            "stage times {times:?}"
+        );
+    }
+
     #[test]
     fn test_ssprk3_stage_hook_runs_after_each_stage() {
         let mut u = DGSolution1D::new(1, 1);
@@ -761,7 +1089,11 @@ mod tests {
         // however stiff Λ·dt is.
         let (forcing, drag) = (2.0_f64, 50.0);
         let u_star = (forcing / drag).sqrt();
-        for integrator in [StandardIntegrator::SSPRK3, StandardIntegrator::ForwardEuler] {
+        for integrator in [
+            StandardIntegrator::SSPRK3,
+            StandardIntegrator::SSPRK43,
+            StandardIntegrator::ForwardEuler,
+        ] {
             for dt in [1e-3, 1.0, 1e3] {
                 let mut u = DGSolution1D::new(1, 2);
                 u.data.fill(u_star);
@@ -783,10 +1115,12 @@ mod tests {
     fn test_relaxation_is_l_stable() {
         // Λ·dt → ∞ must remove the damped quantity within one step (relaxing
         // only the Euler substeps of SSP-RK3 would leave u/3)
-        let mut u = DGSolution1D::new(1, 1);
-        u.data[0] = 1.0;
-        step_forced_drag(&SSPRK3, &mut u, 1e8, 0.0, 1.0);
-        assert!(u.data[0] > 0.0 && u.data[0] < 1e-6, "{}", u.data[0]);
+        for integrator in [StandardIntegrator::SSPRK3, StandardIntegrator::SSPRK43] {
+            let mut u = DGSolution1D::new(1, 1);
+            u.data[0] = 1.0;
+            step_forced_drag(&integrator, &mut u, 1e8, 0.0, 1.0);
+            assert!(u.data[0] > 0.0 && u.data[0] < 1e-6, "{}", u.data[0]);
+        }
     }
 
     #[test]
