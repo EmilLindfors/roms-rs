@@ -1089,10 +1089,43 @@ pub const fn positivity_cfl_swe_2d(order: usize) -> f64 {
 /// This is above the Zhang–Shu positivity bound [`positivity_cfl_swe_2d`]
 /// times the SSP coefficient by 2.1–2.5 (SSP-RK3) and 1.5–2.0 (SSP-RK(4,3)):
 /// the room [`PositivityBound`] steps into where elements cannot run dry.
+///
+/// It holds for the flux-differencing volume term of fully wet elements.
+/// Elements with a dry node run the `WetDry` subcells, whose limit is lower:
+/// [`linear_cfl_subcells_swe_2d`].
 pub const fn linear_cfl_swe_2d(order: usize, scheme: SspScheme) -> Option<f64> {
     let limits = match scheme {
         SspScheme::Rk3 => [1.6, 1.04, 0.73, 0.56],
         SspScheme::Rk43 => [2.2, 1.51, 1.15, 0.93],
+    };
+    if order >= 1 && order <= limits.len() {
+        Some(limits[order - 1])
+    } else {
+        None
+    }
+}
+
+/// Stability limit of the `WetDry` subcell finite volumes (the volume term of
+/// elements with a node shallower than `h_dry`) under `scheme`, in the CFL
+/// units of [`compute_dt_swe_2d`], for N = 1–4 (`None` above).
+///
+/// Measured with every element on the subcells (`tests/linear_stability_test.rs`):
+/// the linear limit of the first-order scheme (a one-node perturbation of a
+/// uniform state leaves every limited slope zero) and the largest CFL at
+/// which a random perturbation stays bounded under the limited second-order
+/// reconstruction, on square to 30:1 rectangles at rest and with a flow at
+/// Froude 0.5. Elongated elements set it, and at N = 2 under SSP-RK(4,3) the
+/// reconstruction does (1.11 at 30:1 against 1.28 at first order).
+///
+/// The smallest subcells, at the element faces, are as wide as the first
+/// GLL weight, so the limit follows the Zhang–Shu positivity bound, 1.25–1.6
+/// times it with SSP-RK3 and 1.0–1.7 times it with SSP-RK(4,3). (At N = 1
+/// under SSP-RK(4,3) the plain bound, 1.5, is at the limit.) It is 0.6–0.85
+/// of [`linear_cfl_swe_2d`].
+pub const fn linear_cfl_subcells_swe_2d(order: usize, scheme: SspScheme) -> Option<f64> {
+    let limits = match scheme {
+        SspScheme::Rk3 => [0.94, 0.65, 0.47, 0.36],
+        SspScheme::Rk43 => [1.5, 1.1, 0.97, 0.75],
     };
     if order >= 1 && order <= limits.len() {
         Some(limits[order - 1])
@@ -1712,26 +1745,37 @@ fn element_dt(
 /// the weight ratio W/W_∂ (W = Σ w_i J_i): 1, 1.8, 3.3, 5.3 for N = 1–4 on a
 /// parallelogram (the interior nodes hold (1 − 2ŵ₀)² of it), so a well-filled
 /// element can step 1.8× (P2) to 3.3× (P3) past the bound. The relaxed CFL is
-/// capped at [`LINEAR_CFL_SAFETY`] times the linear stability limit
-/// ([`linear_cfl_swe_2d`]), which is 1.5–2.5× the bound: the positivity bound
-/// had kept every wet/dry run inside it, whatever CFL was asked for.
+/// capped at [`LINEAR_CFL_SAFETY`] times the linear stability limit of the
+/// element's volume term: [`linear_cfl_swe_2d`], 1.5–2.5× the bound, where
+/// every node is deeper than `h_dry`, and [`linear_cfl_subcells_swe_2d`],
+/// 1.0–1.7× the bound, on the `WetDry` subcells of elements with a node at or
+/// below it. The positivity bound had kept every wet/dry run inside both,
+/// whatever CFL was asked for.
 ///
 /// The stages of an SSP step start from later states than the one ρ is
 /// computed from, so ρ keeps a margin: [`POSITIVITY_RELAXATION_SAFETY`] times
 /// `min(M/M_∂, W/W_∂)`. The cap at the weight ratio keeps an element whose
-/// boundary nodes are nearly empty from stepping at a ρ that a stage filling
-/// them would void. Elements with a node at or below `h_dry` (shorelines, thin
-/// films) keep ρ = 1, the plain bound.
+/// boundary nodes are nearly empty (a shoreline with its dry nodes on the
+/// faces) from stepping at a ρ that a stage filling them would void.
+///
+/// The elements that set the global step of a coastal run are steep
+/// shorelines: a dry node beside 25–90 m of water (on the Mausund coastline
+/// mesh), whose deep nodes set the element's rate. Thin films on tidal flats
+/// are relaxed too but never bind: their wave speeds are small.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PositivityBound {
     /// The forward-Euler bound for elements that may run dry:
     /// [`positivity_cfl_swe_2d`] times the integrator's SSP coefficient.
     pub cfl: f64,
-    /// Largest relaxed CFL: [`LINEAR_CFL_SAFETY`] times the linear stability
-    /// limit (at least `cfl`; `cfl` itself, no relaxation, where the limit is
-    /// not known).
+    /// Largest relaxed CFL where every node is deeper than `h_dry`:
+    /// [`LINEAR_CFL_SAFETY`] times the linear stability limit (at least
+    /// `cfl`; `cfl` itself, no relaxation, where the limit is not known).
     pub max_cfl: f64,
-    /// Elements with a node at or below this depth keep the plain bound.
+    /// Largest relaxed CFL of an element with a node at or below `h_dry`,
+    /// from the subcells' limit in the same way.
+    pub max_cfl_subcells: f64,
+    /// Elements with a node at or below this depth are capped at
+    /// `max_cfl_subcells` (the `WetDry` subcell threshold).
     pub h_dry: f64,
 }
 
@@ -1745,51 +1789,65 @@ pub const LINEAR_CFL_SAFETY: f64 = 0.9;
 
 impl PositivityBound {
     /// The bound at order `order` for the SSP scheme `scheme` (`None`: an
-    /// SSP coefficient of 1 and no relaxation), relaxed only where every node
-    /// is deeper than `h_dry`.
+    /// SSP coefficient of 1 and no relaxation), with the subcell cap where a
+    /// node is at or below `h_dry`.
     pub fn new(order: usize, scheme: Option<SspScheme>, h_dry: f64) -> Self {
         let ssp_coefficient = scheme.map_or(1.0, SspScheme::ssp_coefficient);
         let cfl = ssp_coefficient * positivity_cfl_swe_2d(order);
-        let linear = scheme.and_then(|scheme| linear_cfl_swe_2d(order, scheme));
+        let cap =
+            |limit: Option<f64>| limit.map_or(cfl, |limit| cfl.max(LINEAR_CFL_SAFETY * limit));
         Self {
             cfl,
-            max_cfl: linear.map_or(cfl, |linear| cfl.max(LINEAR_CFL_SAFETY * linear)),
+            max_cfl: cap(scheme.and_then(|scheme| linear_cfl_swe_2d(order, scheme))),
+            max_cfl_subcells: cap(
+                scheme.and_then(|scheme| linear_cfl_subcells_swe_2d(order, scheme))
+            ),
             h_dry,
         }
     }
 
     /// The CFL of element `k` with nodal depths `h` (`n1` GLL nodes per
     /// direction): `cfl` times the relaxation factor ρ ≥ 1, at most
-    /// `max_cfl`.
+    /// `max_cfl`, or `max_cfl_subcells` if a node is at or below `h_dry`.
     #[inline]
     pub fn element_cfl(&self, h: &[f64], geom: &GeometricFactors2D, n1: usize, k: usize) -> f64 {
         let mass = &geom.mass[geom.node_index(k, 0)..][..h.len()];
-        (self.cfl * positivity_relaxation(h, mass, n1, self.h_dry)).min(self.max_cfl)
+        let (rho, subcells) = positivity_relaxation(h, mass, n1, self.h_dry);
+        let cap = if subcells {
+            self.max_cfl_subcells
+        } else {
+            self.max_cfl
+        };
+        (self.cfl * rho).min(cap)
     }
 }
 
 /// The relaxation factor ρ of [`PositivityBound`] for nodal depths `h` with
 /// nodal masses `mass` (GLL weight × J), `n1` nodes per direction (node
-/// `i = j·n1 + a`).
+/// `i = j·n1 + a`), and whether a node is at or below `h_dry`.
 #[inline]
-fn positivity_relaxation(h: &[f64], mass: &[f64], n1: usize, h_dry: f64) -> f64 {
+fn positivity_relaxation(h: &[f64], mass: &[f64], n1: usize, h_dry: f64) -> (f64, bool) {
     let last = n1 - 1;
     let (mut water, mut water_boundary) = (0.0, 0.0);
     let (mut weight, mut weight_boundary) = (0.0, 0.0);
+    let mut dry = false;
     for (i, (&h, &m)) in h.iter().zip(mass).enumerate() {
-        if h <= h_dry {
-            return 1.0;
-        }
-        water += m * h;
+        dry |= h <= h_dry;
+        // Negative round-off depths count as empty
+        let water_i = m * h.max(0.0);
+        water += water_i;
         weight += m;
         let (a, j) = (i % n1, i / n1);
         if a == 0 || a == last || j == 0 || j == last {
-            water_boundary += m * h;
+            water_boundary += water_i;
             weight_boundary += m;
         }
     }
+    // No water on the boundary nodes: nothing can leave in the first stage,
+    // and the weight ratio caps ρ (`f64::min` drops the NaN of an empty
+    // element)
     let ratio = (water / water_boundary).min(weight / weight_boundary);
-    (POSITIVITY_RELAXATION_SAFETY * ratio).max(1.0)
+    ((POSITIVITY_RELAXATION_SAFETY * ratio).max(1.0), dry)
 }
 
 #[cfg(test)]
@@ -3232,9 +3290,10 @@ mod tests {
     }
 
     /// ρ of a uniform depth on a parallelogram is the weight ratio
-    /// 1/(1 − (1 − 2ŵ₀)²), ŵ₀ = 1/(N(N+1)); a dry node, or water piled on
-    /// the boundary nodes, lowers it (to 1 at least); the linear limit caps
-    /// the relaxed CFL, and without a known limit nothing is relaxed.
+    /// 1/(1 − (1 − 2ŵ₀)²), ŵ₀ = 1/(N(N+1)); water piled on the boundary
+    /// nodes lowers it (to 1 at least); the linear limit caps the relaxed
+    /// CFL, the subcells' lower one where a node is dry, and without a known
+    /// limit nothing is relaxed.
     #[test]
     fn positivity_relaxation_follows_the_water_on_interior_nodes() {
         let mesh = Mesh2D::uniform_rectangle(0.0, 3.0, 0.0, 1.0, 1, 1);
@@ -3246,16 +3305,21 @@ mod tests {
             let w0 = 1.0 / (n * (n + 1.0));
             let weight_ratio = 1.0 / (1.0 - (1.0 - 2.0 * w0).powi(2));
             let uniform = vec![5.0; ops.n_nodes];
-            let rho = positivity_relaxation(&uniform, mass, ops.n_1d, 1e-3);
+            let (rho, dry) = positivity_relaxation(&uniform, mass, ops.n_1d, 1e-3);
+            assert!(!dry);
             let expected = (POSITIVITY_RELAXATION_SAFETY * weight_ratio).max(1.0);
             assert!(
                 (rho - expected).abs() < 1e-12,
                 "N = {order}: {rho} against {expected}"
             );
 
-            let mut dry = uniform.clone();
-            dry[ops.n_nodes / 2] = 1e-3;
-            assert_eq!(positivity_relaxation(&dry, mass, ops.n_1d, 1e-3), 1.0);
+            // A dry corner is flagged; it empties a boundary node, so M/M_∂
+            // rises and the weight ratio still caps ρ
+            let mut shore = uniform.clone();
+            shore[0] = 0.0;
+            let (rho_shore, dry) = positivity_relaxation(&shore, mass, ops.n_1d, 1e-3);
+            assert!(dry);
+            assert!((rho_shore - rho).abs() < 1e-12, "N = {order}: {rho_shore}");
 
             // Deeper on the boundary nodes: M/M_∂ below the weight ratio;
             // shallower there: capped at the weight ratio
@@ -3267,8 +3331,8 @@ mod tests {
                 .map(|i| if boundary(i) { 0.01 } else { 5.0 })
                 .collect();
             if order > 1 {
-                assert!(positivity_relaxation(&piled, mass, ops.n_1d, 1e-3) < rho);
-                let capped = positivity_relaxation(&thin, mass, ops.n_1d, 1e-3);
+                assert!(positivity_relaxation(&piled, mass, ops.n_1d, 1e-3).0 < rho);
+                let (capped, _) = positivity_relaxation(&thin, mass, ops.n_1d, 1e-3);
                 assert!((capped - rho).abs() < 1e-12, "N = {order}: {capped}");
             }
 
@@ -3283,10 +3347,22 @@ mod tests {
                     (cfl - (bound.cfl * rho).min(linear)).abs() < 1e-14,
                     "N = {order}, {scheme:?}"
                 );
+                // The subcells' limit is lower: at least the plain bound
+                let subcells = linear_cfl_subcells_swe_2d(order, scheme).unwrap();
+                assert!(subcells < linear_cfl_swe_2d(order, scheme).unwrap());
+                let subcells = bound.cfl.max(LINEAR_CFL_SAFETY * subcells);
+                assert_eq!(bound.max_cfl_subcells, subcells);
+                let cfl = bound.element_cfl(&shore, &geom, ops.n_1d, 0);
+                assert!(
+                    (cfl - (bound.cfl * rho_shore).min(subcells)).abs() < 1e-14,
+                    "N = {order}, {scheme:?}"
+                );
             }
             let plain = PositivityBound::new(order, None, 1e-3);
             assert_eq!(plain.max_cfl, plain.cfl);
+            assert_eq!(plain.max_cfl_subcells, plain.cfl);
             assert_eq!(plain.element_cfl(&uniform, &geom, ops.n_1d, 0), plain.cfl);
+            assert_eq!(plain.element_cfl(&shore, &geom, ops.n_1d, 0), plain.cfl);
         }
     }
 }

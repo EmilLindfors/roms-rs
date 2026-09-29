@@ -25,12 +25,12 @@ use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2DBuilder};
 use dg_rs::simulation::Simulation;
 use dg_rs::solver::{
-    KuzminParameter2D, POSITIVITY_RELAXATION_SAFETY, PositivityBound, SWEFormulation2D,
-    SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, element_dt_swe_2d,
-    positivity_cfl_swe_2d,
+    KuzminParameter2D, LINEAR_CFL_SAFETY, POSITIVITY_RELAXATION_SAFETY, PositivityBound,
+    SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
+    element_dt_swe_2d, linear_cfl_subcells_swe_2d, positivity_cfl_swe_2d,
 };
 use dg_rs::source::{BathymetrySource2D, ManningFriction2D, SpatiallyVaryingManning2D};
-use dg_rs::time::SSPRK3;
+use dg_rs::time::{SSPRK3, SspScheme};
 use dg_rs::types::{Depth, ElementIndex};
 
 const G: f64 = 9.81;
@@ -567,8 +567,9 @@ fn spatially_varying_manning_from_another_mesh_is_rejected() {
 // ---------------------------------------------------------------------------
 
 /// The Zhang–Shu positivity bound caps the step where an element may run
-/// dry; where every node is wet it is relaxed by the element's water on its
-/// interior nodes (`PositivityBound`), here 0.9 · 9/5 at P2.
+/// dry, relaxed by the element's water on its interior nodes
+/// (`PositivityBound`), here 0.9 · 9/5 at P2 where every node is wet, and up
+/// to the subcells' stability limit on shorelines.
 #[test]
 fn simulation_caps_cfl_at_positivity_bound() {
     let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4), 2);
@@ -605,10 +606,13 @@ fn simulation_caps_cfl_at_positivity_bound() {
     assert!(relaxed < expected_wet);
 
     // A shoreline in every element (a dry node on each element's west face):
-    // the plain bound
+    // ρ is the weight ratio again (the depth is linear), but the subcells'
+    // stability limit caps it, 0.9 · 0.65 against 0.9 · 9/5 · 5/12
     let shore_state = setup.fill(|x, _| SWEState2D::new(0.4 * (x % 2.5), 0.0, 0.0));
     let shore = first_dt(wet_dry(), &shore_state);
-    let bound = wet_dry().compute_dt(&shore_state, positivity_cfl_swe_2d(2));
+    let subcells = LINEAR_CFL_SAFETY * linear_cfl_subcells_swe_2d(2, SspScheme::Rk3).unwrap();
+    assert!(subcells < POSITIVITY_RELAXATION_SAFETY * 9.0 / 5.0 * positivity_cfl_swe_2d(2));
+    let bound = wet_dry().compute_dt(&shore_state, subcells);
     assert!(shore <= bound, "{shore} > {bound}");
     assert!(shore > 0.9 * bound, "{shore} against {bound}");
 }
@@ -669,11 +673,13 @@ fn relaxed_positivity_bound_keeps_the_mean_non_negative() {
         let plain = element_dt(Some(PositivityBound {
             cfl: pos,
             max_cfl: pos,
+            max_cfl_subcells: pos,
             h_dry,
         }));
         let relaxed = element_dt(Some(PositivityBound {
             cfl: pos,
             max_cfl: f64::INFINITY,
+            max_cfl_subcells: f64::INFINITY,
             h_dry,
         })) / POSITIVITY_RELAXATION_SAFETY;
         let rho = relaxed / plain;
