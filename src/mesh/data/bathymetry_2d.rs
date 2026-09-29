@@ -98,6 +98,108 @@ fn coincident_nodes(mesh: &Mesh2D, ops: &DGOperators2D) -> Vec<usize> {
     (0..parent.len()).map(|a| root(&mut parent, a)).collect()
 }
 
+/// The nodes of a continuous field: every set of coincident nodes is one
+/// global node, and neighbours along the elements' grid lines are joined.
+struct NodeGraph {
+    /// Global node of every `k·n_nodes + i`
+    global: Vec<usize>,
+    /// Mass `Σ w J` of every global node (over its coincident nodes)
+    area: Vec<f64>,
+    /// Neighbouring global nodes along the grid lines, each pair once
+    pairs: Vec<[usize; 2]>,
+}
+
+impl NodeGraph {
+    fn new(mesh: &Mesh2D, ops: &DGOperators2D, geom: &GeometricFactors2D) -> Self {
+        let group = coincident_nodes(mesh, ops);
+        let mut index = vec![usize::MAX; group.len()];
+        let mut global = Vec::with_capacity(group.len());
+        let mut area = Vec::new();
+        for (node, &g) in group.iter().enumerate() {
+            if index[g] == usize::MAX {
+                index[g] = area.len();
+                area.push(0.0);
+            }
+            global.push(index[g]);
+            area[index[g]] += geom.mass[node];
+        }
+        let (n, n_1d) = (ops.n_nodes, ops.n_1d);
+        let mut pairs = Vec::with_capacity(2 * group.len());
+        for k in 0..mesh.n_elements {
+            for i in 0..n {
+                let (a, b) = (i % n_1d, i / n_1d);
+                let right = (a + 1 < n_1d).then_some(i + 1);
+                let up = (b + 1 < n_1d).then_some(i + n_1d);
+                for j in [right, up].into_iter().flatten() {
+                    let (p, q) = (global[k * n + i], global[k * n + j]);
+                    if p != q {
+                        pairs.push([p.min(q), p.max(q)]);
+                    }
+                }
+            }
+        }
+        // Face lines are shared by two elements
+        pairs.sort_unstable();
+        pairs.dedup();
+        Self {
+            global,
+            area,
+            pairs,
+        }
+    }
+
+    /// Still-water depth −B of every global node (the mass-weighted mean
+    /// over its coincident nodes).
+    fn depths(&self, bed: &[f64], geom: &GeometricFactors2D) -> Vec<f64> {
+        let mut depth = vec![0.0; self.area.len()];
+        for (node, &g) in self.global.iter().enumerate() {
+            depth[g] -= geom.mass[node] * bed[node];
+        }
+        for (d, a) in depth.iter_mut().zip(&self.area) {
+            *d /= a;
+        }
+        depth
+    }
+
+    /// A node of every global node (`k·n_nodes + i`).
+    fn representatives(&self) -> Vec<usize> {
+        let mut node = vec![usize::MAX; self.area.len()];
+        for (i, &g) in self.global.iter().enumerate().rev() {
+            node[g] = i;
+        }
+        node
+    }
+}
+
+/// Slope factor r_x0 = |h₁ − h₂| / (h₁ + h₂) of two neighbouring depths.
+fn rx0(h1: f64, h2: f64) -> f64 {
+    (h1 - h2).abs() / (h1 + h2)
+}
+
+/// The largest slope factor of a bed and where it is, from
+/// [`Bathymetry2D::max_rx0`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rx0 {
+    /// r_x0 = |h₁ − h₂| / (h₁ + h₂)
+    pub value: f64,
+    /// The pair's nodes (`k·n_nodes + i`), the shallower first
+    pub nodes: [usize; 2],
+}
+
+/// What [`Bathymetry2D::smooth_rx0`] did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Rx0Smoothing {
+    /// Largest slope factor before and after
+    pub before: f64,
+    pub after: f64,
+    /// Global nodes (sets of coincident nodes) whose bed changed
+    pub changed: usize,
+    /// Largest change of the bed (m)
+    pub max_change: f64,
+    /// Sweeps over the constrained pairs
+    pub sweeps: usize,
+}
+
 /// A 1D quadrature rule on [−1, 1] with the orthonormal Legendre values of
 /// every degree ≤ N at its points (`legendre[point × (N + 1) + degree]`), for
 /// [`Bathymetry2D::project`].
@@ -475,6 +577,139 @@ impl Bathymetry2D {
         raised
     }
 
+    /// The largest slope factor r_x0 = |h₁ − h₂| / (h₁ + h₂) between
+    /// neighbouring nodes along the elements' grid lines, over the pairs
+    /// whose still-water depths h = −B are both at least `min_depth`, or
+    /// `None` if there is no such pair.
+    ///
+    /// r_x0 (Beckmann & Haidvogel 1993) is the relative depth change between
+    /// neighbours. It bounds the hydrostatic inconsistency of the σ-coordinate
+    /// pressure gradient (ROMS models are smoothed to r_x0 ≲ 0.2), and in 2D
+    /// it finds shoals and pits a node wide, over which the depth-averaged
+    /// velocity hu/h of a smooth transport spikes. Coincident nodes count
+    /// once, with their mass-weighted mean depth.
+    pub fn max_rx0(
+        &self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        min_depth: f64,
+    ) -> Option<Rx0> {
+        let graph = NodeGraph::new(mesh, ops, geom);
+        let depth = graph.depths(&self.data, geom);
+        let node = graph.representatives();
+        graph
+            .pairs
+            .iter()
+            .filter(|&&[a, b]| depth[a] >= min_depth && depth[b] >= min_depth)
+            .map(|&[a, b]| {
+                let [s, d] = if depth[a] <= depth[b] { [a, b] } else { [b, a] };
+                Rx0 {
+                    value: rx0(depth[a], depth[b]),
+                    nodes: [node[s], node[d]],
+                }
+            })
+            .max_by(|x, y| x.value.total_cmp(&y.value))
+    }
+
+    /// Largest number of sweeps of [`Self::smooth_rx0`].
+    pub const MAX_RX0_SWEEPS: usize = 10_000;
+
+    /// Smooth the bed to a slope factor r_x0 ≤ `r_max` between neighbouring
+    /// nodes whose depths h = −B are both at least `min_depth`, keeping the
+    /// volume `Σ w J B`, and recompute the gradients.
+    ///
+    /// This is the volume-preserving "PlusMinus" smoothing of Sikirić,
+    /// Janeković & Kuzmić (2009, Ocean Modelling 29): every pair over the
+    /// bound, deeper h_d and shallower h_s with node masses A_d and A_s, is
+    /// brought to r_x0 = `r_max` by moving the volume
+    ///
+    /// ```text
+    /// V = (h_d (1 − r) − h_s (1 + r)) / ((1 − r)/A_d + (1 + r)/A_s)
+    /// ```
+    ///
+    /// from the shallow node's water column to the deep one's (h_d −= V/A_d,
+    /// h_s += V/A_s), sweeping over the pairs until the largest r_x0 is
+    /// within 1e-6 of `r_max` (at most [`Self::MAX_RX0_SWEEPS`] sweeps; the
+    /// result reports what is left). Only local extremes and steep steps
+    /// change, by as little as the bound needs.
+    ///
+    /// Nodes shallower than `min_depth`, land and the shore, are left alone,
+    /// and no node crosses it (the shallower node of a pair only deepens, the
+    /// deeper one stays deeper), so the coastline and the dry area do not
+    /// move. Coincident nodes move together, so a continuous bed stays
+    /// continuous; a discontinuous one keeps its jumps.
+    pub fn smooth_rx0(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        r_max: f64,
+        min_depth: f64,
+    ) -> Rx0Smoothing {
+        assert!(
+            r_max > 0.0 && r_max < 1.0,
+            "r_max must lie in (0, 1), got {r_max}"
+        );
+        assert!(
+            min_depth > 0.0,
+            "min_depth must be positive, got {min_depth}"
+        );
+        let graph = NodeGraph::new(mesh, ops, geom);
+        let original = graph.depths(&self.data, geom);
+        let mut depth = original.clone();
+        let pairs: Vec<[usize; 2]> = graph
+            .pairs
+            .iter()
+            .copied()
+            .filter(|&[a, b]| depth[a] >= min_depth && depth[b] >= min_depth)
+            .collect();
+        let largest = |depth: &[f64]| {
+            pairs
+                .iter()
+                .map(|&[a, b]| rx0(depth[a], depth[b]))
+                .fold(0.0, f64::max)
+        };
+        let before = largest(&depth);
+        let area = &graph.area;
+        let tolerance = r_max * (1.0 + 1e-6);
+        let mut sweeps = 0;
+        while sweeps < Self::MAX_RX0_SWEEPS && largest(&depth) > tolerance {
+            for &[a, b] in &pairs {
+                let (d, s) = if depth[a] >= depth[b] { (a, b) } else { (b, a) };
+                let excess = depth[d] * (1.0 - r_max) - depth[s] * (1.0 + r_max);
+                if excess > 0.0 {
+                    let volume = excess / ((1.0 - r_max) / area[d] + (1.0 + r_max) / area[s]);
+                    depth[d] -= volume / area[d];
+                    depth[s] += volume / area[s];
+                }
+            }
+            sweeps += 1;
+        }
+
+        let mut changed = 0;
+        let mut max_change: f64 = 0.0;
+        for (&new, &old) in depth.iter().zip(&original) {
+            if new != old {
+                changed += 1;
+                max_change = max_change.max((new - old).abs());
+            }
+        }
+        if changed > 0 {
+            for (b, &g) in self.data.iter_mut().zip(&graph.global) {
+                *b -= depth[g] - original[g];
+            }
+            self.compute_gradients(ops, geom);
+        }
+        Rx0Smoothing {
+            before,
+            after: largest(&depth),
+            changed,
+            max_change,
+            sweeps,
+        }
+    }
+
     /// Bed from a merged elevation raster (bathymetry and land,
     /// [`crate::io::BedRaster`]), projected onto the nodes
     /// ([`Self::project`], at the raster's pixel size) through the map
@@ -659,57 +894,6 @@ impl Bathymetry2D {
         (gx * gx + gy * gy).sqrt()
     }
 
-    /// Smooth bathymetry by limiting gradient magnitude.
-    ///
-    /// For each node where |∇B| > max_gradient, the bathymetry value is adjusted
-    /// to reduce the gradient while preserving the mean value in each element.
-    ///
-    /// This is a simple iterative smoothing that helps with numerical stability
-    /// on steep bathymetry.
-    ///
-    /// # Arguments
-    /// * `max_gradient` - Maximum allowed gradient magnitude
-    /// * `ops` - DG operators for gradient recomputation
-    /// * `geom` - Geometric factors
-    /// * `iterations` - Number of smoothing iterations (more = smoother)
-    pub fn smooth_gradients(
-        &mut self,
-        max_gradient: f64,
-        ops: &DGOperators2D,
-        geom: &GeometricFactors2D,
-        iterations: usize,
-    ) {
-        let n = self.n_nodes;
-
-        for _iter in 0..iterations {
-            // For each element, limit the deviations from mean
-            for k in ElementIndex::iter(self.n_elements) {
-                let ki = k.as_usize();
-                // Compute element mean
-                let start = ki * n;
-                let elem_data = &self.data[start..start + n];
-                let mean: f64 = elem_data.iter().sum::<f64>() / n as f64;
-
-                // Check max gradient in element
-                let max_grad_in_elem = (0..n)
-                    .map(|i| self.gradient_magnitude(k, i))
-                    .fold(0.0_f64, f64::max);
-
-                if max_grad_in_elem > max_gradient {
-                    // Reduce deviations from mean by a factor
-                    let factor = max_gradient / max_grad_in_elem;
-                    for i in 0..n {
-                        let deviation = self.data[start + i] - mean;
-                        self.data[start + i] = mean + deviation * factor;
-                    }
-                }
-            }
-
-            // Recompute gradients after smoothing
-            self.compute_gradients(ops, geom);
-        }
-    }
-
     /// Project bathymetry to linear (planar) within each element.
     ///
     /// For each element, sets the nodal values to the planar function
@@ -817,203 +1001,6 @@ impl Bathymetry2D {
                 self.gradient_y[start + i] = 0.0;
             }
         }
-    }
-
-    /// Smooth bathymetry with Laplacian filter.
-    ///
-    /// Applies element-local Laplacian smoothing: each value is replaced by
-    /// a weighted average of itself and the element mean.
-    ///
-    /// # Arguments
-    /// * `alpha` - Smoothing strength: 0 = no change, 1 = replace with mean
-    /// * `ops` - DG operators
-    /// * `geom` - Geometric factors
-    /// * `iterations` - Number of smoothing passes
-    pub fn smooth_laplacian(
-        &mut self,
-        alpha: f64,
-        ops: &DGOperators2D,
-        geom: &GeometricFactors2D,
-        iterations: usize,
-    ) {
-        let n = self.n_nodes;
-        let alpha = alpha.clamp(0.0, 1.0);
-
-        for _iter in 0..iterations {
-            for k in 0..self.n_elements {
-                let start = k * n;
-                let elem_data = &self.data[start..start + n];
-                let mean: f64 = elem_data.iter().sum::<f64>() / n as f64;
-
-                // Blend each value toward the mean
-                for i in 0..n {
-                    let old_val = self.data[start + i];
-                    self.data[start + i] = (1.0 - alpha) * old_val + alpha * mean;
-                }
-            }
-
-            // Recompute gradients
-            self.compute_gradients(ops, geom);
-        }
-    }
-
-    /// Smooth bathymetry using cross-element neighbor averaging.
-    ///
-    /// Unlike element-local methods (`smooth_laplacian`, `smooth_gradients`),
-    /// this method communicates between face-adjacent elements, providing
-    /// more effective gradient reduction for steep real-world bathymetry.
-    ///
-    /// # Algorithm
-    ///
-    /// For each element:
-    /// 1. Find face-adjacent neighbors via mesh edge connectivity
-    /// 2. Compute element mean bathymetry
-    /// 3. If `max_gradient` is specified, skip elements below threshold
-    /// 4. Blend toward average of neighbor means:
-    ///    `B_new = (1 - alpha) * B_self + alpha * mean(B_neighbors)`
-    ///
-    /// # Arguments
-    ///
-    /// * `mesh` - Mesh with edge connectivity for neighbor lookup
-    /// * `ops` - DG operators for gradient recomputation
-    /// * `geom` - Geometric factors
-    /// * `alpha` - Smoothing strength in [0, 1]:
-    ///   - 0 = no smoothing
-    ///   - 1 = full neighbor average
-    ///   - Recommended: 0.3-0.5 for gentle smoothing
-    /// * `iterations` - Number of smoothing passes (more = smoother)
-    /// * `max_gradient` - Optional gradient threshold; only smooth elements
-    ///   exceeding this. Use `None` to smooth all elements.
-    ///
-    /// # Recommended Gradient Thresholds
-    ///
-    /// For numerical stability with well-balanced schemes:
-    /// - Conservative: 0.3 (gentle slopes)
-    /// - Moderate: 0.5 (typical coastal bathymetry)
-    /// - Aggressive: 1.0 (allow steeper slopes)
-    ///
-    /// Norwegian fjord bathymetry often has gradients up to 0.66.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// // Smooth steep regions (gradient > 0.5) with moderate strength
-    /// bathymetry.smooth_cross_element(&mesh, &ops, &geom, 0.4, 5, Some(0.5));
-    ///
-    /// // Smooth entire domain gently
-    /// bathymetry.smooth_cross_element(&mesh, &ops, &geom, 0.2, 3, None);
-    /// ```
-    pub fn smooth_cross_element(
-        &mut self,
-        mesh: &Mesh2D,
-        ops: &DGOperators2D,
-        geom: &GeometricFactors2D,
-        alpha: f64,
-        iterations: usize,
-        max_gradient: Option<f64>,
-    ) {
-        let n = self.n_nodes;
-        let alpha = alpha.clamp(0.0, 1.0);
-
-        if alpha == 0.0 || iterations == 0 {
-            return;
-        }
-
-        for _iter in 0..iterations {
-            // Compute element means (needed for neighbor averaging)
-            let element_means: Vec<f64> = (0..self.n_elements)
-                .map(|k| {
-                    let start = k * n;
-                    self.data[start..start + n].iter().sum::<f64>() / n as f64
-                })
-                .collect();
-
-            // Compute element max gradient magnitudes if threshold specified
-            let should_smooth: Vec<bool> = if let Some(threshold) = max_gradient {
-                (0..self.n_elements)
-                    .map(|k| {
-                        let max_grad = (0..n)
-                            .map(|i| self.gradient_magnitude(ElementIndex::new(k), i))
-                            .fold(0.0_f64, f64::max);
-                        max_grad > threshold
-                    })
-                    .collect()
-            } else {
-                vec![true; self.n_elements]
-            };
-
-            // Compute new element means based on neighbor averaging
-            let new_means: Vec<f64> = (0..self.n_elements)
-                .map(|k| {
-                    if !should_smooth[k] {
-                        return element_means[k];
-                    }
-
-                    // Get face-adjacent neighbors
-                    let neighbors = Self::get_neighbor_elements(mesh, k);
-
-                    if neighbors.is_empty() {
-                        // Boundary element with no neighbors - keep current value
-                        return element_means[k];
-                    }
-
-                    // Compute average of neighbor means
-                    let neighbor_avg: f64 =
-                        neighbors.iter().map(|&nk| element_means[nk]).sum::<f64>()
-                            / neighbors.len() as f64;
-
-                    // Blend self with neighbors
-                    (1.0 - alpha) * element_means[k] + alpha * neighbor_avg
-                })
-                .collect();
-
-            // Apply shift to all nodes in each element
-            for k in 0..self.n_elements {
-                if !should_smooth[k] {
-                    continue;
-                }
-
-                let shift = new_means[k] - element_means[k];
-                if shift.abs() < 1e-15 {
-                    continue;
-                }
-
-                let start = k * n;
-                for i in 0..n {
-                    self.data[start + i] += shift;
-                }
-            }
-
-            // Recompute gradients after smoothing
-            self.compute_gradients(ops, geom);
-        }
-    }
-
-    /// Get face-adjacent neighbor elements for element k.
-    ///
-    /// Returns a vector of element indices that share a face with element k.
-    /// Boundary faces have no neighbor and are excluded.
-    fn get_neighbor_elements(mesh: &Mesh2D, k: usize) -> Vec<usize> {
-        let mut neighbors = Vec::with_capacity(4);
-
-        for &edge_idx in &mesh.element_edges[k] {
-            let edge = &mesh.edges[edge_idx];
-
-            // Determine which side we are (left or right)
-            if edge.left.element == k {
-                // We're on left side, neighbor is on right (if exists)
-                if let Some(right) = &edge.right {
-                    neighbors.push(right.element);
-                }
-            } else if let Some(right) = &edge.right {
-                // We're on right side, neighbor is on left
-                if right.element == k {
-                    neighbors.push(edge.left.element);
-                }
-            }
-        }
-
-        neighbors
     }
 }
 
@@ -1374,154 +1361,6 @@ mod tests {
         assert!((b_edge - h_0).abs() < TOL);
     }
 
-    #[test]
-    fn test_smooth_cross_element_preserves_flat() {
-        let (mesh, ops, geom) = make_mesh_and_ops();
-        let mut bathy = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, 5.0);
-        bathy.compute_gradients(&ops, &geom);
-
-        let original_sum: f64 = bathy.data.iter().sum();
-
-        // Smooth should not change flat bathymetry
-        bathy.smooth_cross_element(&mesh, &ops, &geom, 0.5, 5, None);
-
-        let new_sum: f64 = bathy.data.iter().sum();
-        assert!(
-            (original_sum - new_sum).abs() < 1e-10,
-            "Cross-element smoothing changed total bathymetry on flat surface"
-        );
-
-        // All values should still be 5.0
-        for &b in &bathy.data {
-            assert!(
-                (b - 5.0).abs() < 1e-10,
-                "Flat bathymetry changed during smoothing"
-            );
-        }
-    }
-
-    #[test]
-    fn test_smooth_cross_element_reduces_gradient() {
-        let (mesh, ops, geom) = make_mesh_and_ops();
-
-        // Create steep bathymetry: B = x with gradient 1.0
-        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _y| x);
-
-        let initial_max_grad = bathy.max_gradient_magnitude();
-        assert!(initial_max_grad > 0.5, "Initial gradient should be steep");
-
-        // Smooth the bathymetry
-        bathy.smooth_cross_element(&mesh, &ops, &geom, 0.5, 10, None);
-
-        let final_max_grad = bathy.max_gradient_magnitude();
-
-        // Gradient should be reduced (though not necessarily to zero due to boundaries)
-        // The smoothing should reduce interior gradients
-        assert!(
-            final_max_grad <= initial_max_grad + 1e-10,
-            "Smoothing should not increase max gradient: {} -> {}",
-            initial_max_grad,
-            final_max_grad
-        );
-    }
-
-    #[test]
-    fn test_smooth_cross_element_with_threshold() {
-        let (mesh, ops, geom) = make_mesh_and_ops();
-
-        // Create bathymetry with steep gradient: B = 2*x (gradient = 2.0)
-        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _y| 2.0 * x);
-
-        // Also create a copy with low gradient threshold that won't trigger
-        let mut bathy_low_threshold = bathy.clone();
-
-        // Smooth only elements with gradient > 1.0 (all elements)
-        bathy.smooth_cross_element(&mesh, &ops, &geom, 0.5, 5, Some(1.0));
-
-        // Smooth only elements with gradient > 10.0 (no elements)
-        bathy_low_threshold.smooth_cross_element(&mesh, &ops, &geom, 0.5, 5, Some(10.0));
-
-        // The high threshold version should be unchanged
-        let original = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _y| 2.0 * x);
-        let diff: f64 = bathy_low_threshold
-            .data
-            .iter()
-            .zip(original.data.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-
-        assert!(diff < 1e-10, "High threshold should not trigger smoothing");
-
-        // The low threshold version should be different
-        let diff2: f64 = bathy
-            .data
-            .iter()
-            .zip(original.data.iter())
-            .map(|(a, b)| (a - b).abs())
-            .sum();
-
-        assert!(diff2 > 0.1, "Low threshold should trigger smoothing");
-    }
-
-    #[test]
-    fn test_get_neighbor_elements() {
-        // Create a 3x3 mesh to test neighbor finding
-        let mesh = Mesh2D::uniform_rectangle(0.0, 3.0, 0.0, 3.0, 3, 3);
-
-        // Center element (4) should have 4 neighbors
-        let center_neighbors = Bathymetry2D::get_neighbor_elements(&mesh, 4);
-        assert_eq!(
-            center_neighbors.len(),
-            4,
-            "Center element should have 4 neighbors"
-        );
-
-        // Corner element (0) should have 2 neighbors
-        let corner_neighbors = Bathymetry2D::get_neighbor_elements(&mesh, 0);
-        assert_eq!(
-            corner_neighbors.len(),
-            2,
-            "Corner element should have 2 neighbors"
-        );
-
-        // Edge element (1) should have 3 neighbors
-        let edge_neighbors = Bathymetry2D::get_neighbor_elements(&mesh, 1);
-        assert_eq!(
-            edge_neighbors.len(),
-            3,
-            "Edge element should have 3 neighbors"
-        );
-    }
-
-    #[test]
-    fn test_smooth_cross_element_no_op_with_alpha_zero() {
-        let (mesh, ops, geom) = make_mesh_and_ops();
-        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| x * y);
-
-        let original: Vec<f64> = bathy.data.clone();
-
-        // alpha = 0 should be a no-op
-        bathy.smooth_cross_element(&mesh, &ops, &geom, 0.0, 10, None);
-
-        assert_eq!(bathy.data, original, "alpha=0 should not change anything");
-    }
-
-    #[test]
-    fn test_smooth_cross_element_no_op_with_zero_iterations() {
-        let (mesh, ops, geom) = make_mesh_and_ops();
-        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| x * y);
-
-        let original: Vec<f64> = bathy.data.clone();
-
-        // iterations = 0 should be a no-op
-        bathy.smooth_cross_element(&mesh, &ops, &geom, 0.5, 0, None);
-
-        assert_eq!(
-            bathy.data, original,
-            "iterations=0 should not change anything"
-        );
-    }
-
     /// `n` × `n` mesh of [0, 1]² with interior vertices moved, so that
     /// the elements are general (non-parallelogram) quadrilaterals.
     fn distorted_mesh(n: usize) -> Mesh2D {
@@ -1749,5 +1588,123 @@ mod tests {
                 .fold(0.0, f64::max);
             assert!(diff < 1e-12, "{diff:e}");
         }
+    }
+
+    #[test]
+    fn test_max_rx0_of_a_slope() {
+        // P1 nodes at x = 0, 0.5, 1: depths 10, 15, 20 m, so r_x0 is 0.2
+        // between the first two and 1/7 between the last two
+        let (mesh, ops, geom) = setup(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 2, 2), 1);
+        let bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -10.0 - 10.0 * x);
+        let position = |node: usize| {
+            let (k, i) = (ElementIndex::new(node / ops.n_nodes), node % ops.n_nodes);
+            mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i])
+        };
+        let steepest = bathy.max_rx0(&mesh, &ops, &geom, 1.0).unwrap();
+        assert!((steepest.value - 0.2).abs() < 1e-14, "{steepest:?}");
+        assert!(position(steepest.nodes[0])[0].abs() < 1e-12);
+        assert!((position(steepest.nodes[1])[0] - 0.5).abs() < 1e-12);
+        // Pairs with a node shallower than `min_depth` do not count
+        let deep = bathy.max_rx0(&mesh, &ops, &geom, 12.0).unwrap();
+        assert!((deep.value - 1.0 / 7.0).abs() < 1e-14, "{deep:?}");
+        assert_eq!(bathy.max_rx0(&mesh, &ops, &geom, 25.0), None);
+    }
+
+    /// Distorted mesh with a sharp shoal rising from 40 m to 6 m in open
+    /// water (centred on a vertex the distortion leaves in place), and a 1 m
+    /// deep shore along x < 0.2.
+    fn shoal_bed(order: usize) -> (Mesh2D, DGOperators2D, GeometricFactors2D, Bathymetry2D) {
+        let (mesh, ops, geom) = setup(distorted_mesh(4), order);
+        let bed = |x: f64, y: f64| {
+            if x < 0.2 {
+                -1.0
+            } else {
+                -40.0 + 34.0 * (-((x - 0.5).powi(2) + (y - 0.5).powi(2)) / 0.01).exp()
+            }
+        };
+        let bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        (mesh, ops, geom, bathy)
+    }
+
+    fn volume(bathy: &Bathymetry2D, geom: &GeometricFactors2D) -> f64 {
+        bathy.data.iter().zip(&geom.mass).map(|(b, m)| b * m).sum()
+    }
+
+    #[test]
+    fn test_smooth_rx0_bounds_a_shoal_and_keeps_the_volume_and_the_shore() {
+        let (r_max, min_depth) = (0.2, 3.0);
+        for order in 1..=3 {
+            let (mesh, ops, geom, mut bathy) = shoal_bed(order);
+            let original = bathy.clone();
+            let before = bathy.max_rx0(&mesh, &ops, &geom, min_depth).unwrap();
+            let report = bathy.smooth_rx0(&mesh, &ops, &geom, r_max, min_depth);
+            assert_eq!(report.before, before.value);
+            assert!(report.before > 0.5, "N = {order}: {report:?}");
+            assert!(
+                report.after <= r_max * (1.0 + 1e-6),
+                "N = {order}: {report:?}"
+            );
+            let after = bathy.max_rx0(&mesh, &ops, &geom, min_depth).unwrap();
+            assert!((after.value - report.after).abs() < 1e-12);
+            // The volume is kept, the bed stays continuous
+            let (v0, v1) = (volume(&original, &geom), volume(&bathy, &geom));
+            assert!(
+                (v1 - v0).abs() < 1e-13 * v0.abs(),
+                "N = {order}: {v0} vs {v1}"
+            );
+            assert_continuous(&bathy, &mesh, &ops, order);
+            // The shoal is lowered, the shore untouched, and every node
+            // that changed stays deeper than `min_depth`
+            let mut change: f64 = 0.0;
+            for (node, (&b, &b0)) in bathy.data.iter().zip(&original.data).enumerate() {
+                change = change.max((b - b0).abs());
+                if b != b0 {
+                    assert!(
+                        -b >= min_depth && -b0 >= min_depth,
+                        "N = {order}: {b0} → {b}"
+                    );
+                }
+                if b0 > -min_depth {
+                    assert_eq!(b, b0, "N = {order}: node {node}");
+                }
+            }
+            assert!((change - report.max_change).abs() < 1e-12);
+            let top = original
+                .data
+                .iter()
+                .copied()
+                .fold(
+                    f64::NEG_INFINITY,
+                    |a, b| {
+                        if b < -min_depth { a.max(b) } else { a }
+                    },
+                );
+            assert!(top > -6.5, "N = {order}: top of the shoal {top}");
+            let new_top = bathy
+                .data
+                .iter()
+                .zip(&original.data)
+                .filter(|&(_, &b0)| b0 < -min_depth)
+                .map(|(&b, _)| b)
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(new_top < top - 2.0, "N = {order}: {top} → {new_top}");
+            // Gradients follow the new bed
+            let mut fresh = bathy.clone();
+            fresh.compute_gradients(&ops, &geom);
+            assert_eq!(fresh.gradient_x, bathy.gradient_x);
+            // A second pass has nothing to do
+            let again = bathy.smooth_rx0(&mesh, &ops, &geom, r_max, min_depth);
+            assert!(again.changed == 0 || again.max_change < 1e-6, "{again:?}");
+        }
+    }
+
+    #[test]
+    fn test_smooth_rx0_leaves_a_bed_within_the_bound_alone() {
+        let (mesh, ops, geom, bathy) = shoal_bed(2);
+        let bound = bathy.max_rx0(&mesh, &ops, &geom, 3.0).unwrap().value;
+        let mut smoothed = bathy.clone();
+        let report = smoothed.smooth_rx0(&mesh, &ops, &geom, bound, 3.0);
+        assert_eq!((report.changed, report.sweeps), (0, 0));
+        assert_eq!(smoothed.data, bathy.data);
     }
 }

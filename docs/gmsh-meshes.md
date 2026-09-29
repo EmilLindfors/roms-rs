@@ -178,6 +178,35 @@ reached 178° in 50–110 m of water and set a time step of 0.0096 s. Local time
 stepping then needed 8 levels and a 2.3 s coarse step at ≈ 140 ms: 3.6 min
 per simulated hour, 1.84× the current mesh.
 
+**Mausund sub-domain** (8.45–8.90°E, 63.78–63.95°N, 22 × 19 km around the
+Mausund gauge): for quicker checks. The same coastal sizes give 2,929 quads
+(2,799 in water, 9 islands), a quarter of Frøya, at ≈ 25 s per simulated
+hour with `lts=8` on 24 threads (a 3-day gauge comparison in ≈ 30 min). A
+sub-box needs its own boundary atlas, since the Frøya atlas only covers the
+Frøya perimeter (≈ 10 min over OPeNDAP, netCDF build):
+
+```bash
+uv run scripts/gmsh_coastline_mesh.py bbox=8.45,63.78,8.90,63.95 out=data/mausund_coast.msh
+cargo run --release --example norkyst_boundary_tides -- bbox=8.45,63.78,8.90,63.95 \
+    start=2025-06-01 days=30 out=data/mausund_boundary_tides.txt
+cargo run --release --no-default-features --features parallel,simd --example froya_real_data -- \
+    mesh=data/mausund_coast.msh bbox=8.45,63.78,8.90,63.95 \
+    tides=data/mausund_boundary_tides.txt tide_transport=3 lts=8 hours=72 ramp_hours=3
+```
+
+Use `tide_transport=3`: the sub-box's sides cross the skerries in 20–45 m of
+water, where the bed is on average 0.6 of NorKyst's smoothed one, and
+NorKyst's velocity unscaled pushes too little transport through them. At
+Mausund (hours 24–72 from 2025-06-15) the centred RMSE against the gauge's
+tidal prediction is 8.1 cm without scaling and 4.2 cm with it (M2 0.96× →
+1.01× the gauge's), against 2.3 cm for the full Frøya coastline mesh. The
+sub-domain is for relative comparisons (a bed or scheme change against a
+baseline), not for the absolute skill.
+
+The `bbox=` of the run must be the mesh's: both centre the local projection
+on it. For `scripts/norkyst_current_comparison.py` pass the same centre
+(`lat0=63.865 lon0=8.675`).
+
 ## Test meshes
 
 `scripts/gmsh_fixtures.py` builds the meshes in `tests/data/gmsh/` with the Gmsh
