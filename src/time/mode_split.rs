@@ -57,7 +57,7 @@ use crate::physics::PhysicsModule;
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
-use crate::time::{Integrable, IntegratorInfo, SSPRK3, StageWorkspace, TimeIntegrator};
+use crate::time::{Integrable, IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -500,7 +500,8 @@ impl ModeSplitIntegrator {
     }
 
     /// CFL number of the barotropic substeps, capped by the 2D module's
-    /// [`PhysicsModule::max_cfl`] (e.g. its wet/dry positivity bound).
+    /// forward-Euler bounds (e.g. its wet/dry positivity bound, see
+    /// [`PhysicsModule::compute_dt_ssp`]).
     pub fn with_barotropic_cfl(mut self, cfl: f64) -> Self {
         assert!(cfl > 0.0, "barotropic CFL must be positive, got {cfl}");
         self.barotropic_cfl = cfl;
@@ -564,10 +565,7 @@ impl ModeSplitIntegrator {
         to_transport(state, bathymetry, q);
 
         // 2. One filtered barotropic pass
-        let cfl = barotropic
-            .max_cfl()
-            .map_or(self.barotropic_cfl, |max| self.barotropic_cfl.min(max));
-        let dt_bt_max = barotropic.compute_dt(q, cfl);
+        let dt_bt_max = barotropic.compute_dt_ssp(q, self.barotropic_cfl, Some(SspScheme::Rk3));
         assert!(
             dt_bt_max > 0.0,
             "barotropic time step {dt_bt_max} is not positive"

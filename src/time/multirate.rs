@@ -136,9 +136,12 @@ pub enum RhsStencil {
 /// subsets), gives them bit for bit what the whole-state operations give
 /// them, and leaves the other elements untouched.
 pub trait LocalTimeStepping<S>: Sync {
-    /// Largest stable time step of every element for `cfl`, into `out` (one
-    /// value per mesh element; `f64::INFINITY` where nothing limits it).
-    fn element_dt(&self, state: &S, cfl: f64, out: &mut [f64]);
+    /// Largest stable time step of every element, into `out` (one value per
+    /// mesh element; `f64::INFINITY` where nothing limits it): the linear
+    /// bound at `cfl` and the module's forward-Euler bounds for the SSP
+    /// scheme `scheme`, as in
+    /// [`PhysicsModule::compute_dt_ssp`](crate::physics::PhysicsModule::compute_dt_ssp).
+    fn element_dt(&self, state: &S, cfl: f64, scheme: SspScheme, out: &mut [f64]);
 
     /// The elements whose state an element's RHS reads.
     fn stencil(&self) -> RhsStencil {
@@ -535,9 +538,10 @@ impl<S: Integrable> MultirateStepper<S> {
         }
     }
 
-    /// Assign levels from the current element time steps, and return the
-    /// coarse step (see [`assign_levels`]; at most `dt_cap`). Call it before
-    /// every [`Self::step`].
+    /// Assign levels from the current element time steps at the linear CFL
+    /// `cfl` (with the forward-Euler bounds of `local` for the scheme), and
+    /// return the coarse step (see [`assign_levels`]; at
+    /// most `dt_cap`). Call it before every [`Self::step`].
     pub fn assign_levels(
         &mut self,
         local: &dyn LocalTimeStepping<S>,
@@ -548,7 +552,7 @@ impl<S: Integrable> MultirateStepper<S> {
     ) -> f64 {
         let n = mesh.n_elements;
         self.element_dt.resize(n, 0.0);
-        local.element_dt(state, cfl, &mut self.element_dt);
+        local.element_dt(state, cfl, self.scheme, &mut self.element_dt);
         let (dt, finest) =
             assign_levels(&self.element_dt, self.max_levels, dt_cap, &mut self.level);
         self.finest = finest;

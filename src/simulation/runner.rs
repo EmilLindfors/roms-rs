@@ -12,8 +12,9 @@ use crate::time::{Integrable, MultirateStats, MultirateStepper, StageWorkspace, 
 /// Configuration for a simulation run.
 #[derive(Clone, Debug)]
 pub struct SimulationConfig {
-    /// CFL number for time step calculation (capped by `PhysicsModule::max_cfl`
-    /// times the integrator's SSP coefficient).
+    /// CFL number for time step calculation: the linear stability bound. The
+    /// physics module applies its forward-Euler bounds times the integrator's
+    /// SSP coefficient (`PhysicsModule::compute_dt_ssp`).
     pub cfl: f64,
     /// Maximum time step (overrides CFL if smaller).
     pub dt_max: Option<f64>,
@@ -257,11 +258,12 @@ where
         };
         // Stage buffers reused for the whole run (no per-step allocation)
         let mut stages = StageWorkspace::new();
-        // e.g. the positivity bound of a wet/dry scheme: a forward-Euler
-        // bound, which an SSP integrator keeps up to its SSP coefficient
-        let cfl = self.physics.max_cfl().map_or(self.config.cfl, |max| {
-            self.config.cfl.min(max * self.integrator.ssp_coefficient())
-        });
+        // The physics module's forward-Euler bounds (e.g. the positivity
+        // bound of a wet/dry scheme) hold up to the SSP coefficient times
+        // theirs; the module applies them with the linear CFL
+        let cfl = self.config.cfl;
+        let scheme = self.integrator.ssp_scheme();
+        let ssp_coefficient = self.integrator.ssp_coefficient();
         // Local time stepping: every element at its own power-of-two
         // fraction of the (coarse) step
         let mut multirate = self.integrator.max_local_levels().map(|max_levels| {
@@ -305,10 +307,12 @@ where
                 self.integrator.name()
             );
             println!("  t_start = {:.4}, t_end = {:.4}", t_start, t_end);
-            if cfl < self.config.cfl {
+            if let Some(max) = self.physics.max_cfl()
+                && ssp_coefficient * max < cfl
+            {
                 println!(
-                    "  CFL {} capped at {cfl:.3} by {}",
-                    self.config.cfl,
+                    "  CFL {cfl} capped at {:.3} by {} where elements may run dry",
+                    ssp_coefficient * max,
                     self.physics.name()
                 );
             }
@@ -336,7 +340,7 @@ where
                     cfl,
                     self.config.dt_max,
                 ),
-                None => self.physics.compute_dt(state, cfl),
+                None => self.physics.compute_dt_ssp(state, cfl, scheme),
             };
 
             // Apply dt limits

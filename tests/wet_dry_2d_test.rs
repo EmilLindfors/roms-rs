@@ -25,8 +25,9 @@ use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2DBuilder};
 use dg_rs::simulation::Simulation;
 use dg_rs::solver::{
-    KuzminParameter2D, SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D,
-    WetDryConfig, positivity_cfl_swe_2d,
+    KuzminParameter2D, POSITIVITY_RELAXATION_SAFETY, PositivityBound, SWEFormulation2D,
+    SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig, element_dt_swe_2d,
+    positivity_cfl_swe_2d,
 };
 use dg_rs::source::{BathymetrySource2D, ManningFriction2D, SpatiallyVaryingManning2D};
 use dg_rs::time::SSPRK3;
@@ -565,13 +566,15 @@ fn spatially_varying_manning_from_another_mesh_is_rejected() {
 // Positivity CFL
 // ---------------------------------------------------------------------------
 
+/// The Zhang–Shu positivity bound caps the step where an element may run
+/// dry; where every node is wet it is relaxed by the element's water on its
+/// interior nodes (`PositivityBound`), here 0.9 · 9/5 at P2.
 #[test]
 fn simulation_caps_cfl_at_positivity_bound() {
     let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 10.0, 0.0, 10.0, 4, 4), 2);
-    let q0 = setup.fill(|x, _| SWEState2D::new(1.0 + 0.1 * x, 0.0, 0.0));
     // Time of the first step, from the callback (called at t_start, then
     // after every step)
-    let first_dt = |physics| {
+    let first_dt = |physics, q0: &SWESolution2D| {
         let mut times = Vec::new();
         let mut q = q0.clone();
         Simulation::new(physics, SSPRK3)
@@ -584,12 +587,112 @@ fn simulation_caps_cfl_at_positivity_bound() {
         times[1] - times[0]
     };
 
+    let wet_state = setup.fill(|x, _| SWEState2D::new(1.0 + 0.1 * x, 0.0, 0.0));
     let wet = setup.builder().build();
-    let expected_wet = wet.compute_dt(&q0, 1.0);
-    assert_eq!(first_dt(wet), expected_wet);
+    let expected_wet = wet.compute_dt(&wet_state, 1.0);
+    assert_eq!(first_dt(wet, &wet_state), expected_wet);
 
-    let wet_dry = setup.builder().with_wet_dry_correction(true).build();
-    let expected = wet_dry.compute_dt(&q0, positivity_cfl_swe_2d(2));
-    assert_eq!(first_dt(wet_dry), expected);
-    assert!(expected < expected_wet);
+    // Wet everywhere: the linear depth has the same mean on the boundary
+    // nodes as over the element, so ρ is the weight ratio, 1/(1 − (2/3)²)
+    let wet_dry = || setup.builder().with_wet_dry_correction(true).build();
+    let bound = wet_dry().compute_dt(&wet_state, positivity_cfl_swe_2d(2));
+    let relaxed = first_dt(wet_dry(), &wet_state);
+    let rho = relaxed / bound;
+    assert!(
+        (rho - POSITIVITY_RELAXATION_SAFETY * 9.0 / 5.0).abs() < 1e-12,
+        "relaxed by {rho}"
+    );
+    assert!(relaxed < expected_wet);
+
+    // A shoreline in every element (a dry node on each element's west face):
+    // the plain bound
+    let shore_state = setup.fill(|x, _| SWEState2D::new(0.4 * (x % 2.5), 0.0, 0.0));
+    let shore = first_dt(wet_dry(), &shore_state);
+    let bound = wet_dry().compute_dt(&shore_state, positivity_cfl_swe_2d(2));
+    assert!(shore <= bound, "{shore} > {bound}");
+    assert!(shore > 0.9 * bound, "{shore} against {bound}");
+}
+
+/// One wet element draining at 3 m/s into dry neighbours, its water piled on
+/// its boundary nodes (so ρ = M/M_∂ < W/W_∂), keeps a non-negative mean under
+/// a forward-Euler step at the relaxed step without the safety margin (ρ
+/// times the plain Zhang–Shu step). Measured: the mean falls by 25 %
+/// (N = 2, ρ = 1.11) to 21 % (N = 4, ρ = 1.43) against 22 % and 15 % at the
+/// plain bound, so the bound, relaxed or not, is far from sharp here.
+#[test]
+fn relaxed_positivity_bound_keeps_the_mean_non_negative() {
+    for order in 2..=4 {
+        let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 3.0, 0.0, 3.0, 3, 3), order);
+        let h_dry = WetDryConfig::DEFAULT_H_DRY;
+        let physics = setup
+            .builder()
+            .with_limiter(StandardLimiter2D::Positivity(h_dry))
+            .with_wet_dry(WetDryConfig::new(Depth::new(h_dry), G))
+            .build();
+        let inside = |x: f64, y: f64| (1.0..=2.0).contains(&x) && (1.0..=2.0).contains(&y);
+        let edge = |z: f64| (z - 1.0).abs() < 1e-12 || (z - 2.0).abs() < 1e-12;
+        let q0 = setup.fill(|x, y| {
+            if !inside(x, y) {
+                return SWEState2D::new(0.0, 0.0, 0.0);
+            }
+            // 2 m on the boundary nodes, 0.2 m inside, 3 m/s outwards
+            let h = if edge(x) || edge(y) { 2.0 } else { 0.2 };
+            let out =
+                |z: f64| 3.0 * (z - 1.5).signum() * f64::from(u8::from((z - 1.5).abs() > 0.4));
+            SWEState2D::from_primitives(h, out(x), out(y))
+        });
+        let centre = ElementIndex::iter(setup.mesh.n_elements)
+            .find(|&k| {
+                let [x, y] = setup.mesh.reference_to_physical(k, 0.0, 0.0);
+                inside(x, y)
+            })
+            .unwrap();
+
+        // Element steps with ρ = min(M/M_∂, W/W_∂), no margin and no linear
+        // cap, against the plain bound
+        let pos = positivity_cfl_swe_2d(order);
+        let element_dt = |bound: Option<PositivityBound>| {
+            let mut dt = vec![0.0; setup.mesh.n_elements];
+            element_dt_swe_2d(
+                &q0,
+                &setup.mesh,
+                &setup.ops,
+                &setup.geom,
+                &ShallowWater2D::new(G),
+                order,
+                f64::INFINITY,
+                bound,
+                &mut dt,
+            );
+            dt[centre.as_usize()]
+        };
+        let plain = element_dt(Some(PositivityBound {
+            cfl: pos,
+            max_cfl: pos,
+            h_dry,
+        }));
+        let relaxed = element_dt(Some(PositivityBound {
+            cfl: pos,
+            max_cfl: f64::INFINITY,
+            h_dry,
+        })) / POSITIVITY_RELAXATION_SAFETY;
+        let rho = relaxed / plain;
+        assert!(rho > 1.05, "N = {order}: ρ = {rho}");
+
+        let mut rhs = q0.clone();
+        physics.compute_rhs_into(&q0, 0.0, &mut rhs);
+        let mean = |dt: f64| {
+            let h: Vec<f64> = (0..setup.ops.n_nodes)
+                .map(|i| q0.get_state(centre, i).h + dt * rhs.get_state(centre, i).h)
+                .collect();
+            setup.geom.integrate_element(centre.as_usize(), &h)
+        };
+        let mean0 = mean(0.0);
+        let (at_plain, at_relaxed) = (mean(plain), mean(relaxed));
+        println!(
+            "N = {order}: ρ = {rho:.3}, mean {mean0:.4} → {at_plain:.4} (plain), {at_relaxed:.4} (relaxed)"
+        );
+        assert!(at_relaxed >= -1e-12 * mean0, "N = {order}: {at_relaxed}");
+        assert!(at_relaxed < at_plain, "the element should drain");
+    }
 }

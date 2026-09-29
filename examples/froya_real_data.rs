@@ -87,7 +87,7 @@
 //!     [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
-//!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=1] [output=output/froya] \
+//!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw]
 //! ```
@@ -107,8 +107,11 @@
 //! the largest power-of-two fraction of the step its own CFL allows.
 //!
 //! `rk=43` (the default) steps with SSP-RK(4,3), `rk=3` with SSP-RK3. The
-//! positivity bound of the wet/dry scheme sets the step, and SSP-RK(4,3)'s
-//! SSP coefficient of 2 doubles it for 4/3 of the RHS work per step.
+//! positivity bound of the wet/dry scheme sets the step where elements may
+//! run dry, and SSP-RK(4,3)'s SSP coefficient of 2 doubles it for 4/3 of the
+//! RHS work per step. In well-filled elements the bound is relaxed up to
+//! `cfl=`, by default 0.9 of the integrator's linear stability limit
+//! (`linear_cfl_swe_2d`: 1.36 at P2 with SSP-RK(4,3)).
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
 //! constituents: 15 days separate M2/S2 and K1/O1 (`hours=384` with the
@@ -158,13 +161,16 @@ use dg_rs::mesh::{
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
 use dg_rs::simulation::Simulation;
-use dg_rs::solver::{Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
+use dg_rs::solver::{
+    LINEAR_CFL_SAFETY, Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
+    linear_cfl_swe_2d, positivity_cfl_swe_2d,
+};
 use dg_rs::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
     ManningFriction2D, WindStress2D,
 };
 use dg_rs::tides::canonical_name;
-use dg_rs::time::{IntegratorInfo, ModelClock, Multirate, SSPRK3, StandardIntegrator};
+use dg_rs::time::{IntegratorInfo, ModelClock, Multirate, SSPRK3, SspScheme, StandardIntegrator};
 #[cfg(feature = "netcdf")]
 use dg_rs::types::Depth;
 use dg_rs::types::ElementIndex;
@@ -283,8 +289,10 @@ struct Options {
     /// SSP-RK(4,3) (`rk=43`, default) or SSP-RK3 (`rk=3`), globally or as
     /// the base of local time stepping
     integrator: StandardIntegrator,
-    /// CFL number of the tidal run (`cfl=`, default 1: the positivity bound
-    /// caps it)
+    /// CFL number of the tidal run (`cfl=`): its linear stability bound. The
+    /// default is `LINEAR_CFL_SAFETY` (0.9) times the integrator's linear
+    /// limit (`linear_cfl_swe_2d`); the wet/dry positivity bound caps it
+    /// where elements may run dry
     cfl: f64,
     /// Smooth the bed to a slope factor r_x0 ≤ this between neighbouring
     /// nodes deeper than `rx0_min_depth` (`rx0=`, e.g. 0.3; off by default)
@@ -314,7 +322,7 @@ impl Options {
                 v.parse().map_err(|_| format!("bad {key}={v}"))
             })
         };
-        Ok(Self {
+        let mut opts = Self {
             nx: get("nx", 120.0)? as usize,
             ny: get("ny", 90.0)? as usize,
             order: get("order", 2.0)? as usize,
@@ -334,7 +342,7 @@ impl Options {
             },
             profile: get("profile", 0.0)? as usize,
             lts: get("lts", 0.0)? as usize,
-            cfl: get("cfl", 1.0)?,
+            cfl: get("cfl", f64::NAN)?,
             integrator: match args.get("rk").map_or("43", String::as_str) {
                 "43" => StandardIntegrator::SSPRK43,
                 "3" => StandardIntegrator::SSPRK3,
@@ -416,7 +424,13 @@ impl Options {
                 .filter(|n| !n.is_empty())
                 .map(|n| canonical_name(n).ok_or(format!("unknown constituent {n}")))
                 .collect::<Result<_, _>>()?,
-        })
+        };
+        if opts.cfl.is_nan() {
+            let scheme = opts.integrator.ssp_scheme().expect("an SSP integrator");
+            opts.cfl = linear_cfl_swe_2d(opts.order, scheme)
+                .map_or(1.0, |linear| LINEAR_CFL_SAFETY * linear);
+        }
+        Ok(opts)
     }
 }
 
@@ -1252,14 +1266,15 @@ fn tidal_run(
         output_dir.display()
     );
     println!(
-        "  Integrator: {}{}, CFL {} (capped by the positivity bound)",
+        "  Integrator: {}{}, CFL {:.3}, capped at {:.3} where elements may run dry",
         opts.integrator.name(),
         if opts.lts > 0 {
             format!(", local time stepping up to {} levels", opts.lts)
         } else {
             String::new()
         },
-        opts.cfl
+        opts.cfl,
+        opts.integrator.ssp_coefficient() * positivity_cfl_swe_2d(opts.order),
     );
     println!(
         "  time  |  η range (m)     | η max at (x, y km; h m) | max |u| (m/s) at (x, y km; h m) | open water ≥ 3 m (m/s)         | wet nodes | volume change"
@@ -1432,7 +1447,7 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
     let mut stages = dg_rs::time::StageWorkspace::new();
     while t < spin_up {
         let dt = physics
-            .compute_dt(&q, physics.max_cfl().unwrap_or(1.0))
+            .compute_dt_ssp(&q, 1.0, Some(SspScheme::Rk3))
             .min(spin_up - t);
         dg_rs::time::TimeIntegrator::step_with_relaxation(
             &SSPRK3,
@@ -1446,7 +1461,7 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
         );
         t += dt;
     }
-    let dt = physics.compute_dt(&q, physics.max_cfl().unwrap_or(1.0));
+    let dt = physics.compute_dt_ssp(&q, 1.0, Some(SspScheme::Rk3));
 
     // Median of `n` calls (after a warm-up): robust to the boost and thermal
     // swings of a laptop
@@ -1476,7 +1491,7 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
             physics.implicit_damping(&mut scratch, &q, dt);
         }) - copy;
         let dt_ms = time(&mut || {
-            std::hint::black_box(physics.compute_dt(&q, 1.0));
+            std::hint::black_box(physics.compute_dt_ssp(&q, 1.0, Some(SspScheme::Rk3)));
         });
         let step = 3.0 * (rhs + post + damping) + dt_ms;
         println!("\nPhases after {spin_up} s, {threads} threads: ms per call, share of a step");

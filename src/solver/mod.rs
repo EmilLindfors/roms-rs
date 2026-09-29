@@ -59,7 +59,10 @@ pub use rhs::{
     ExtrapolationTracerBC3D,
     FixedTracerBC,
     FixedTracerBC3D,
+    LINEAR_CFL_SAFETY,
+    POSITIVITY_RELAXATION_SAFETY,
     PeriodicBC2D,
+    PositivityBound,
     Rhs3DConfig,
     // 2D SWE
     SWE2DRhsConfig,
@@ -92,6 +95,8 @@ pub use rhs::{
     element_dt_swe_2d,
     element_dt_viscous_swe_2d,
     face_mass_len,
+    linear_cfl_swe_2d,
+    min_element_dt_swe_2d,
     positivity_cfl_swe_2d,
 };
 

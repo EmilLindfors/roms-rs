@@ -12,8 +12,8 @@ use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::disjoint::DisjointChunks;
 use crate::solver::{
-    ImplicitDamping2D, Limiter2D, LimiterContext2D, SWEFormulation2D, SWESolution2D,
-    StandardLimiter2D, WetDryConfig, positivity_cfl_swe_2d,
+    ImplicitDamping2D, Limiter2D, LimiterContext2D, PositivityBound, SWEFormulation2D,
+    SWESolution2D, StandardLimiter2D, WetDryConfig, positivity_cfl_swe_2d,
 };
 #[cfg(not(feature = "parallel"))]
 use crate::solver::{
@@ -27,14 +27,14 @@ use crate::solver::{
 };
 use crate::solver::{
     apply_wet_dry_correction_element, compute_rhs_swe_2d_subset_then, element_dt_swe_2d,
-    element_dt_viscous_swe_2d,
+    element_dt_viscous_swe_2d, min_element_dt_swe_2d,
 };
 use crate::source::{
     BottomFriction2D, CageDrag2D, HorizontalViscosity2D, SourceTerm2D, SourceTerms2D,
     ViscosityModel,
 };
-use crate::time::LocalTimeStepping;
 use crate::time::multirate::{ElementStage, RhsStencil};
+use crate::time::{LocalTimeStepping, SspScheme};
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -60,7 +60,9 @@ use super::traits::{PhysicsModule, PhysicsModuleInfo};
 /// [`WetDryConfig`] (`with_wet_dry`). Then:
 /// - the formulation defaults to `SWEFormulation2D::WetDry`, and the interface
 ///   flux of `Standard` to HLL (Roe is not positivity preserving);
-/// - `max_cfl` reports `positivity_cfl_swe_2d(N)`, which `Simulation` enforces;
+/// - `max_cfl` reports `positivity_cfl_swe_2d(N)`, and the time step
+///   (`compute_dt_ssp`, local time stepping) enforces it, relaxed per element
+///   where the water is not at risk of running out ([`PositivityBound`]);
 /// - after every RK stage, depths are limited to h ≥ 0 and near-dry velocities
 ///   desingularized ([`crate::solver::apply_wet_dry_correction_all`]);
 /// - in every RK stage, bottom friction (`with_implicit_friction`), net-cage
@@ -140,6 +142,18 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     /// [`WetDryConfig`]).
     pub fn has_wetting_drying(&self) -> bool {
         self.wet_dry.is_some() || self.limiter.preserves_positivity()
+    }
+
+    /// The positivity bound of a wet/dry run under the SSP scheme `scheme`,
+    /// relaxed in elements whose every node is deeper than the dry threshold
+    /// (`WetDryConfig::h_dry`, else the equation's `h_min`).
+    fn positivity_bound(&self, scheme: Option<SspScheme>) -> Option<PositivityBound> {
+        let h_dry = self
+            .wet_dry
+            .as_ref()
+            .map_or(self.equation.h_min.meters(), |config| config.h_dry.meters());
+        self.has_wetting_drying()
+            .then(|| PositivityBound::new(self.order, scheme, h_dry))
     }
 
     /// Number of elements (summed over all stages so far) whose mean depth
@@ -301,6 +315,31 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
         }
     }
 
+    /// With wetting/drying, the positivity bound relaxed per element
+    /// ([`PositivityBound`]): the smallest element step.
+    fn compute_dt_ssp(&self, state: &SWESolution2D, cfl: f64, scheme: Option<SspScheme>) -> f64 {
+        let Some(positivity) = self.positivity_bound(scheme) else {
+            return self.compute_dt(state, cfl);
+        };
+        let dt = min_element_dt_swe_2d(
+            state,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &self.equation,
+            self.order,
+            cfl,
+            Some(positivity),
+        );
+        match self.viscous_dt() {
+            Some(viscous) => {
+                let dt_viscous = viscous.iter().copied().fold(f64::INFINITY, f64::min);
+                combine_dt(dt, cfl * dt_viscous)
+            }
+            None => dt,
+        }
+    }
+
     /// Limiter, then positivity and velocity desingularization (wet/dry).
     fn post_process(&self, state: &mut SWESolution2D) {
         let ctx = LimiterContext2D::new(&self.mesh, &self.ops, &self.geom);
@@ -367,7 +406,7 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
         }
     }
 
-    fn element_dt(&self, state: &SWESolution2D, cfl: f64, out: &mut [f64]) {
+    fn element_dt(&self, state: &SWESolution2D, cfl: f64, scheme: SspScheme, out: &mut [f64]) {
         element_dt_swe_2d(
             state,
             &self.mesh,
@@ -376,6 +415,7 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             &self.equation,
             self.order,
             cfl,
+            self.positivity_bound(Some(scheme)),
             out,
         );
         if let Some(viscous) = self.viscous_dt() {
