@@ -86,10 +86,21 @@
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [currents=<file,…>] \
 //!     [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_ratios=N2,Q1] [land_elevation=5] \
-//!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [lts=0] [output=output/froya] \
+//!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
+//!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw]
 //! ```
+//!
+//! `rx0=r` smooths the bed, keeping its volume, until the slope factor
+//! r_x0 = |h₁ − h₂|/(h₁ + h₂) between neighbouring nodes at least
+//! `rx0_min_depth` (3 m) deep is at most r (`Bathymetry2D::smooth_rx0`):
+//! shoals a node wide otherwise carry spurious m/s currents.
+//!
+//! `bbox=west,south,east,north` runs a smaller box, e.g. the 22 × 19 km
+//! around Mausund (a quarter of the cost), with its own mesh and boundary
+//! atlas (use `tide_transport=3` there): see "Mausund sub-domain" in
+//! `docs/gmsh-meshes.md`.
 //!
 //! `lts=N` (N > 0) steps the tidal run with local time stepping
 //! (`MultirateSSPRK3`, up to N levels of halved time steps): every element at
@@ -166,6 +177,11 @@ const LAND_ELEVATION: f64 = 5.0;
 /// Default elevation model: Kartverket's topobathy model at 50 m
 /// (`scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif`)
 const DEM: &str = "data/froya_topobathy.tif";
+/// Frøya–Smøla–Hitra: west, south, east, north (°)
+const FROYA_BBOX: [f64; 4] = [8.0, 63.6, 9.2, 64.0];
+/// Default depth (m) below which `rx0=` leaves the bed alone: the shore and
+/// the dry area keep their shape
+const RX0_MIN_DEPTH: f64 = 3.0;
 /// Land-mask cells per bathymetry pixel and direction: the coastline is
 /// rasterised at ≈ 25 × 58 m
 const LAND_MASK_REFINEMENT: usize = 4;
@@ -260,6 +276,13 @@ struct Options {
     /// Local time stepping with up to this many levels (`lts=`; 0: global
     /// SSP-RK3)
     lts: usize,
+    /// Smooth the bed to a slope factor r_x0 ≤ this between neighbouring
+    /// nodes deeper than `rx0_min_depth` (`rx0=`, e.g. 0.3; off by default)
+    rx0: Option<f64>,
+    rx0_min_depth: f64,
+    /// Domain box `west,south,east,north` (°; `bbox=`). A smaller box needs
+    /// its own boundary atlas (`tides=`, from `norkyst_boundary_tides bbox=`)
+    bbox: [f64; 4],
     /// Scale the atlas velocity by NorKyst's total depth over the child's,
     /// by up to this factor (`tide_transport=`; 0: off)
     tide_transport: f64,
@@ -301,6 +324,22 @@ impl Options {
             },
             profile: get("profile", 0.0)? as usize,
             lts: get("lts", 0.0)? as usize,
+            rx0: args
+                .get("rx0")
+                .map(|v| v.parse().map_err(|_| format!("bad rx0={v}")))
+                .transpose()?,
+            rx0_min_depth: get("rx0_min_depth", RX0_MIN_DEPTH)?,
+            bbox: match args.get("bbox") {
+                None => FROYA_BBOX,
+                Some(v) => v
+                    .split(',')
+                    .map(|c| c.trim().parse::<f64>())
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+                    .and_then(|c| <[f64; 4]>::try_from(c).ok())
+                    .filter(|[w, s, e, n]| w < e && s < n)
+                    .ok_or(format!("bad bbox={v}: west,south,east,north"))?,
+            },
             tide_transport: get("tide_transport", 0.0)?,
             mesh: args.get("mesh").cloned(),
             output: args.get("output").map(PathBuf::from),
@@ -366,13 +405,16 @@ impl Options {
 }
 
 /// Surface range (and where the highest wet node is: x, y, h), largest speed
-/// where h > 10 cm (and where: x, y, h), and the number of wet nodes
-/// (h > 1 mm).
+/// where h > 10 cm (and where: x, y, h), the same in open water (still-water
+/// depth at least `STATION_MIN_DEPTH`, away from the foreshore films), and
+/// the number of wet nodes (h > 1 mm).
 struct Stats {
     eta: (f64, f64),
     highest: (f64, f64, f64),
     speed: f64,
     fastest: (f64, f64, f64),
+    open_speed: f64,
+    open_fastest: (f64, f64, f64),
     wet: usize,
 }
 
@@ -463,6 +505,38 @@ impl Domain {
         // Water one node wide is unresolved: make it shore
         let raised = grid_bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
         println!("  {raised} isolated wet nodes raised to the lowest of their neighbours");
+        // Shoals and pits a node wide: the depth-averaged velocity spikes over
+        // them (a 6 m shoal among 15–45 m nodes carried 2.2–2.8 m/s)
+        let min_depth = opts.rx0_min_depth;
+        let describe = |bed: &Bathymetry2D| match bed.max_rx0(&grid, &ops, &grid_geom, min_depth) {
+            Some(rx0) => {
+                let at = |node: usize| {
+                    let (k, i) = (ElementIndex::new(node / ops.n_nodes), node % ops.n_nodes);
+                    let [x, y] = grid.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                    (x / 1000.0, y / 1000.0, -bed.data[node])
+                };
+                let (s, d) = (at(rx0.nodes[0]), at(rx0.nodes[1]));
+                format!(
+                    "{:.2} between ({:.1}, {:.1}) km, {:.1} m and ({:.1}, {:.1}) km, {:.1} m",
+                    rx0.value, s.0, s.1, s.2, d.0, d.1, d.2
+                )
+            }
+            None => "none".into(),
+        };
+        println!(
+            "  Largest slope factor r_x0 (nodes ≥ {min_depth} m deep): {}",
+            describe(&grid_bed)
+        );
+        if let Some(r_max) = opts.rx0 {
+            let report = grid_bed.smooth_rx0(&grid, &ops, &grid_geom, r_max, min_depth);
+            println!(
+                "  Smoothed to r_x0 ≤ {r_max} ({} sweeps): {} nodes changed, by up to {:.1} m; now {}",
+                report.sweeps,
+                report.changed,
+                report.max_change,
+                describe(&grid_bed)
+            );
+        }
         let has_water = |k: ElementIndex| grid_bed.element(k).iter().any(|&b| b < 0.0);
         let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);
         let bathymetry = grid_bed.select_elements(&kept);
@@ -480,7 +554,8 @@ impl Domain {
 
     /// Frøya–Smøla–Hitra from the data files, or `None` if they are missing.
     fn froya(opts: &Options) -> Result<Option<Self>, Box<dyn std::error::Error>> {
-        let bbox = GeoBoundingBox::new(8.0, 63.6, 9.2, 64.0);
+        let [west, south, east, north] = opts.bbox;
+        let bbox = GeoBoundingBox::new(west, south, east, north);
         let (lat0, lon0) = bbox.center();
         let projection = LocalProjection::new(lat0, lon0);
         let dem_path = opts.dem.as_deref().map(Path::new).filter(|p| p.exists());
@@ -975,6 +1050,8 @@ impl Domain {
             highest: (0.0, 0.0, 0.0),
             speed: 0.0,
             fastest: (0.0, 0.0, 0.0),
+            open_speed: 0.0,
+            open_fastest: (0.0, 0.0, 0.0),
             wet: 0,
         };
         for k in ElementIndex::iter(self.mesh.n_elements) {
@@ -994,14 +1071,21 @@ impl Domain {
                     stats.eta = (stats.eta.0.min(eta), stats.eta.1.max(eta));
                 }
                 let speed = s.hu.hypot(s.hv) / s.h;
-                if s.h > 0.1 && speed > stats.speed {
+                let at = || {
                     let [x, y] = self.mesh.reference_to_physical(
                         k,
                         self.ops.nodes_r[i],
                         self.ops.nodes_s[i],
                     );
+                    (x, y, s.h)
+                };
+                if s.h > 0.1 && speed > stats.speed {
                     stats.speed = speed;
-                    stats.fastest = (x, y, s.h);
+                    stats.fastest = at();
+                }
+                if -self.bathymetry.get(k, i) >= STATION_MIN_DEPTH && speed > stats.open_speed {
+                    stats.open_speed = speed;
+                    stats.open_fastest = at();
                 }
             }
         }
@@ -1152,7 +1236,7 @@ fn tidal_run(
         output_dir.display()
     );
     println!(
-        "  time  |  η range (m)     | η max at (x, y km; h m) | max |u| (m/s) at (x, y km; h m) | wet nodes | volume change"
+        "  time  |  η range (m)     | η max at (x, y km; h m) | max |u| (m/s) at (x, y km; h m) | open water ≥ 3 m (m/s)         | wet nodes | volume change"
     );
 
     let mut q = domain.at_rest();
@@ -1180,8 +1264,9 @@ fn tidal_run(
         }
         let stats = domain.stats(q);
         let (x, y, h) = stats.fastest;
+        let (xo, yo, ho) = stats.open_fastest;
         println!(
-            "{:6.2} h | [{:+.3}, {:+.3}] | ({:6.1}, {:6.1}; {:.3}) | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {:9} | {:+.3e}",
+            "{:6.2} h | [{:+.3}, {:+.3}] | ({:6.1}, {:6.1}; {:.3}) | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {:5.2} at ({:6.1}, {:6.1}; {ho:6.1}) | {:9} | {:+.3e}",
             t / 3600.0,
             stats.eta.0,
             stats.eta.1,
@@ -1191,6 +1276,9 @@ fn tidal_run(
             stats.speed,
             x / 1e3,
             y / 1e3,
+            stats.open_speed,
+            xo / 1e3,
+            yo / 1e3,
             stats.wet,
             domain.volume(q) / volume0 - 1.0
         );
