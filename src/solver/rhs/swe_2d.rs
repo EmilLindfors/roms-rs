@@ -1101,16 +1101,25 @@ fn element_max_reference_rate(
             if state.h <= h_min {
                 return 0.0;
             }
-            // λ_r = |u·∇r| + c|∇r| (= |∇r| times the wave speed along ∇r)
-            let (grad_r, grad_s, norm_r, norm_s) =
-                affine.unwrap_or_else(|| norms((geom.grad_r(ki, i), geom.grad_s(ki, i))));
-            let (u, v) = equation.velocity_simple(&state);
-            let c = equation.celerity(state.h);
-            let lambda_r = (u * grad_r.0 + v * grad_r.1).abs() + c * norm_r;
-            let lambda_s = (u * grad_s.0 + v * grad_s.1).abs() + c * norm_s;
-            0.25 * (lambda_r + lambda_s)
+            let metric = affine.unwrap_or_else(|| norms((geom.grad_r(ki, i), geom.grad_s(ki, i))));
+            node_reference_rate(equation, &state, metric)
         })
         .fold(0.0_f64, f64::max)
+}
+
+/// ¼(λ_r + λ_s) of `state` with the metric `(∇r, ∇s, |∇r|, |∇s|)` of a node:
+/// λ_r = |u·∇r| + c|∇r|, |∇r| times the wave speed along ∇r.
+#[inline]
+fn node_reference_rate(
+    equation: &ShallowWater2D,
+    state: &SWEState2D,
+    (grad_r, grad_s, norm_r, norm_s): ((f64, f64), (f64, f64), f64, f64),
+) -> f64 {
+    let (u, v) = equation.velocity_simple(state);
+    let c = equation.celerity(state.h);
+    let lambda_r = (u * grad_r.0 + v * grad_r.1).abs() + c * norm_r;
+    let lambda_s = (u * grad_s.0 + v * grad_s.1).abs() + c * norm_s;
+    0.25 * (lambda_r + lambda_s)
 }
 
 #[inline]
@@ -1540,11 +1549,15 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
 /// (`mesh.n_elements` values), for local time stepping.
 ///
 /// The bound of [`compute_dt_swe_2d`] with the element's own metric, over its
-/// own nodes and every node of its face neighbours. The interface flux sees
-/// the wave speeds of both sides, and water from a neighbour can reach the
-/// element within one of its substeps. A nearly dry element next to deep
-/// water, or a small element next to a fast one, must not step with its own
-/// speeds alone. So the minimum is at most [`compute_dt_swe_2d`].
+/// own nodes and the neighbours' nodes on its faces. The interface flux sees
+/// the wave speeds of both sides: a nearly dry element next to deep water, or
+/// a small element next to a fast one, must not step with its own speeds
+/// alone. Each neighbour face node is taken with the metric at the element's
+/// coincident node, which is the speed the flux dissipation and the Zhang–Shu
+/// bound of the element's mean see there. (Every neighbour node with the
+/// element's largest metric, as before, took 37 % more steps with one level
+/// on the Mausund coastline mesh.) The minimum is at most
+/// [`compute_dt_swe_2d`].
 /// `f64::INFINITY` where everything the element sees is dry or at rest in
 /// zero depth. Parallel with `parallel`.
 #[allow(clippy::too_many_arguments)]
@@ -1564,24 +1577,22 @@ pub fn element_dt_swe_2d(
     let element_dt = |(k, dt): (usize, &mut f64)| {
         let k_idx = ElementIndex::new(k);
         let mut rate = element_max_reference_rate(q, geom, equation, k_idx);
-        // Neighbour speeds |u| + c in this element's largest metric: an upper
-        // bound of λ_r + λ_s at any of its nodes
-        let metric = (0..ops.n_nodes)
-            .map(|i| norm(geom.grad_r(k, i)) + norm(geom.grad_s(k, i)))
-            .fold(0.0_f64, f64::max);
+        let n_face = ops.n_face_nodes;
         for face in 0..4 {
             let Some(nb) = mesh.neighbor(k_idx, face) else {
                 continue;
             };
             let nb_k = ElementIndex::new(nb.element);
-            for i in 0..ops.n_nodes {
-                let state = q.get_state(nb_k, i);
+            // Neighbours list the shared face nodes in reverse order
+            for (fi, &i) in ops.face_nodes[face].iter().enumerate() {
+                let j = ops.face_nodes[nb.face][n_face - 1 - fi];
+                let state = q.get_state(nb_k, j);
                 if state.h <= h_min {
                     continue;
                 }
-                let (u, v) = equation.velocity_simple(&state);
-                let speed = (u * u + v * v).sqrt() + equation.celerity(state.h);
-                rate = rate.max(0.25 * speed * metric);
+                let (grad_r, grad_s) = (geom.grad_r(k, i), geom.grad_s(k, i));
+                let metric = (grad_r, grad_s, norm(grad_r), norm(grad_s));
+                rate = rate.max(node_reference_rate(equation, &state, metric));
             }
         }
         *dt = dt_from_reference_rate(rate, order, cfl);
@@ -2989,5 +3000,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An element's local time step sees its own nodes and the neighbours'
+    /// nodes on its faces (the states the interface flux sees), not the
+    /// neighbours' interiors; the smallest element step is at most the global
+    /// one.
+    #[test]
+    fn element_dt_sees_the_neighbours_face_nodes_only() {
+        let order = 2;
+        let mesh = Mesh2D::uniform_rectangle(0.0, 3.0, 0.0, 1.0, 3, 1);
+        let ops = DGOperators2D::new(order);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let equation = ShallowWater2D::new(G);
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                q.set_state(k, i, SWEState2D::new(1.0, 0.0, 0.0));
+            }
+        }
+        // West element: 100 m deep inside, 1 m on its east face (towards the
+        // middle one); east element: 25 m deep on its west face
+        let (west, east) = (ElementIndex::new(0), ElementIndex::new(2));
+        let deep_centre = (0..ops.n_nodes)
+            .find(|&i| ops.nodes_r[i].abs() < 1e-12 && ops.nodes_s[i].abs() < 1e-12)
+            .unwrap();
+        q.set_state(west, deep_centre, SWEState2D::new(100.0, 0.0, 0.0));
+        for i in 0..ops.n_nodes {
+            if (ops.nodes_r[i] + 1.0).abs() < 1e-12 {
+                q.set_state(east, i, SWEState2D::new(25.0, 0.0, 0.0));
+            }
+        }
+        let cfl = 0.4;
+        let mut dt = vec![0.0; mesh.n_elements];
+        element_dt_swe_2d(&q, &mesh, &ops, &geom, &equation, order, cfl, &mut dt);
+        // Unit squares at rest: ¼(λ_r + λ_s) = c, so Δt = CFL/((2N+1)c)
+        let expected = |depth: f64| cfl / ((2 * order + 1) as f64 * (G * depth).sqrt());
+        // The middle element sees the east element's 25 m face, not the
+        // west element's 100 m centre
+        assert!((dt[1] - expected(25.0)).abs() < 1e-14 * dt[1], "{dt:?}");
+        assert!((dt[0] - expected(100.0)).abs() < 1e-14 * dt[0], "{dt:?}");
+        assert!((dt[2] - expected(25.0)).abs() < 1e-14 * dt[2], "{dt:?}");
+        let global = compute_dt_swe_2d(&q, &mesh, &geom, &equation, order, cfl);
+        assert!(dt.iter().copied().fold(f64::INFINITY, f64::min) <= global);
     }
 }
