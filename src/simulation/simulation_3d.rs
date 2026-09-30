@@ -1702,7 +1702,7 @@ mod tests {
             _ctx: &crate::boundary::ColumnContext3D,
             sigma: &SigmaGrid,
             out: crate::boundary::ParentColumn<'_>,
-        ) {
+        ) -> bool {
             let eos = LinearEOS::default();
             for (l, &s) in sigma.sigma_rho().iter().enumerate() {
                 out.u[l] = -0.2 * (s + 0.5);
@@ -1710,17 +1710,28 @@ mod tests {
                 out.temp[l] = eos.t0 + self.delta_t * (s + 0.5);
                 out.salt[l] = eos.s0;
             }
+            true
         }
+    }
+
+    fn exchange(delta_t: f64) -> Option<Arc<dyn crate::boundary::ParentColumns3D>> {
+        Some(Arc::new(ExchangeParent { delta_t }))
     }
 
     type NestedPhysics =
         Hydrostatic3D<LinearEOS, ConstantMixing, OpenOrWall<crate::boundary::StillWater>>;
 
     /// An 8 km × 1 km channel, 10 m deep, open at its west end to still
-    /// water, with five levels, nested (or not) in an [`ExchangeParent`]
-    /// over a 2 km band with 1 h time scales, run for 12 h from rest at
-    /// `T₀`. Returns the physics, the state and the x of every node.
-    fn run_nested_channel(parent: Option<ExchangeParent>) -> (NestedPhysics, Solution3D, Vec<f64>) {
+    /// water, with five levels, nested (or not) in the parent `parent` gives
+    /// for its mesh and operators, over a 2 km band with 1 h time scales,
+    /// run for 12 h from rest at `T₀`. Returns the physics, the state and the
+    /// x of every node.
+    fn run_nested_channel(
+        parent: impl FnOnce(
+            &Mesh2D,
+            &DGOperators2D,
+        ) -> Option<Arc<dyn crate::boundary::ParentColumns3D>>,
+    ) -> (NestedPhysics, Solution3D, Vec<f64>) {
         use crate::boundary::{Nesting3D, NestingBand3D, StillWater};
         let mesh = Arc::new(Mesh2D::uniform_rectangle_with_sides(
             0.0,
@@ -1763,22 +1774,16 @@ mod tests {
             G,
             RHO0,
         );
-        if let Some(parent) = parent {
+        if let Some(parent) = parent(&mesh, &ops) {
             let band = NestingBand3D {
                 width: 2e3,
                 velocity_timescale: Some(3600.0),
                 tracer_timescale: Some(3600.0),
                 ..NestingBand3D::default()
             };
-            let nesting = Nesting3D::new(
-                Arc::new(parent),
-                &mesh,
-                &ops,
-                n_levels,
-                &[BoundaryTag::Open],
-                &band,
-            )
-            .expect("an open boundary to nest");
+            let nesting =
+                Nesting3D::new(parent, &mesh, &ops, n_levels, &[BoundaryTag::Open], &band)
+                    .expect("an open boundary to nest");
             physics = physics.with_nesting(nesting);
         }
         let eos = LinearEOS::default();
@@ -1812,7 +1817,7 @@ mod tests {
     /// neither the inflow nor the relaxation may change it.
     #[test]
     fn nesting_in_the_same_water_keeps_tracers_uniform() {
-        let (_, state, _) = run_nested_channel(Some(ExchangeParent { delta_t: 0.0 }));
+        let (_, state, _) = run_nested_channel(|_, _| exchange(0.0));
         let eos = LinearEOS::default();
         let drift = max_or_nan(state.temp.iter().map(|t| (t - eos.t0).abs()));
         let shear = max_or_nan(
@@ -1838,7 +1843,7 @@ mod tests {
     #[test]
     fn nesting_imposes_the_parent_profiles_at_the_boundary() {
         let delta_t = 4.0;
-        let (physics, state, x) = run_nested_channel(Some(ExchangeParent { delta_t }));
+        let (physics, state, x) = run_nested_channel(|_, _| exchange(delta_t));
         let sigma = physics.sigma.clone();
         let eos = LinearEOS::default();
         let nl = state.n_levels;
@@ -1867,7 +1872,7 @@ mod tests {
             "boundary shear off the parent's by {u_err:.3} of its amplitude"
         );
 
-        let (_, still, _) = run_nested_channel(None);
+        let (_, still, _) = run_nested_channel(|_, _| None);
         let moved = max_or_nan(
             still
                 .temp
@@ -1879,6 +1884,82 @@ mod tests {
         assert!(
             moved < 1e-10,
             "without nesting the channel moved: {moved:.3e}"
+        );
+    }
+
+    /// TODO P4.2 gate: a parent read from gridded profiles nests like the
+    /// analytic one. The exchange flow of
+    /// `nesting_imposes_the_parent_profiles_at_the_boundary`, written as an
+    /// [`crate::io::OceanModelReader`] on z-levels every 2 m around the
+    /// channel and sampled by [`crate::boundary::OceanModelColumns`]
+    /// (horizontal stencils, time, depths of the child layers), drives the
+    /// same run. The profiles are linear in depth, so the z-levels hold them
+    /// exactly; what differs is that the reader's profile follows depth
+    /// below the surface and the analytic one σ, by a relative `η/D`.
+    #[test]
+    fn a_parent_read_on_z_levels_nests_like_the_analytic_profiles() {
+        use crate::boundary::{OceanColumnsOptions, OceanModelColumns};
+        use crate::io::{
+            CoordinateProjection, FieldSeries, GeoGrid, LocalProjection, OceanModelReader,
+            ProfileLevels, ProfileSeries,
+        };
+        use crate::time::ModelClock;
+        let delta_t = 4.0;
+        let t0 = 1_706_594_400.0;
+        let eos = LinearEOS::default();
+        let reader_parent = |mesh: &Mesh2D, ops: &DGOperators2D| {
+            let projection = LocalProjection::new(63.5, 8.5);
+            let (lat0, lon0) = projection.xy_to_geo(-2000.0, -2000.0);
+            let (lat1, lon1) = projection.xy_to_geo(10_000.0, 3000.0);
+            let axis = |a: f64, b: f64| (0..7).map(|i| a + (b - a) * i as f64 / 6.0).collect();
+            let grid = GeoGrid::regular(axis(lon0, lon1), axis(lat0, lat1)).unwrap();
+            let m = grid.len();
+            let levels: Vec<f64> = (0..7).map(|i| 2.0 * i as f64).collect();
+            let profiles = |f: &dyn Fn(f64) -> f64| {
+                let data = (0..2 * m)
+                    .flat_map(|_| levels.iter().map(|&d| f(d) as f32))
+                    .collect();
+                ProfileSeries::new(m, ProfileLevels::Depth(levels.clone()), data)
+            };
+            let reader = OceanModelReader::new(grid, vec![t0, t0 + 13.0 * 3600.0])
+                .unwrap()
+                .with_ssh(FieldSeries::new(m, vec![0.0; 2 * m]))
+                .with_profiles(
+                    Some((profiles(&|d| -0.2 * (0.5 - d / 10.0)), profiles(&|_| 0.0))),
+                    Some(profiles(&|d| eos.t0 + delta_t * (0.5 - d / 10.0))),
+                    Some(profiles(&|_| eos.s0)),
+                );
+            let parent: Arc<dyn crate::boundary::ParentColumns3D> =
+                Arc::new(OceanModelColumns::new(
+                    Arc::new(reader),
+                    mesh,
+                    ops,
+                    projection,
+                    ModelClock::new(t0),
+                    OceanColumnsOptions::default(),
+                ));
+            Some(parent)
+        };
+        let (_, read, _) = run_nested_channel(reader_parent);
+        let (_, analytic, _) = run_nested_channel(|_, _| exchange(delta_t));
+        let t_diff = max_or_nan(
+            read.temp
+                .iter()
+                .zip(&analytic.temp)
+                .map(|(a, b)| (a - b).abs() / delta_t),
+        );
+        let u_diff = max_or_nan(
+            read.u
+                .iter()
+                .zip(&analytic.u)
+                .map(|(a, b)| (a - b).abs() / 0.08),
+        );
+        // Measured 1.9e-5 of ΔT and 3.7e-5 of the shear, with |η| up to
+        // 6.5e-4 m: the relative η/D
+        assert!(t_diff < 2e-4, "T differs by {t_diff:.3e} of ΔT");
+        assert!(
+            u_diff < 2e-4,
+            "u differs by {u_diff:.3e} of the shear amplitude"
         );
     }
 }

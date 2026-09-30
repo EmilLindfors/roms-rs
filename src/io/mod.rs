@@ -91,6 +91,7 @@ mod netcdf_read;
 mod norkyst_parquet;
 mod norkyst_reader;
 mod ocean_model;
+mod profile_series;
 mod projection;
 mod tide_gauge_reader;
 mod timeseries_reader;
@@ -126,6 +127,7 @@ pub use norkyst_reader::{
     read_norkyst_text_file,
 };
 pub use ocean_model::{OceanModelReader, OceanState};
+pub use profile_series::{ProfileLevels, ProfileSeries};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,
