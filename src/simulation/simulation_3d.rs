@@ -1962,4 +1962,155 @@ mod tests {
             "u differs by {u_diff:.3e} of the shear amplitude"
         );
     }
+
+    /// A mode-1 internal-wave pulse in the middle of a 20 km channel, 20 m
+    /// deep, linearly stratified (N = 0.05 s⁻¹, `c₁ = NH/π` ≈ 0.32 m/s), 1 km
+    /// wide and 0.8 m high, with the ends `ends`: walls, or open to still
+    /// water through a characteristic OBC, relaxed over `sponge` (if any) to
+    /// the stratification at rest ([`crate::boundary::ReferenceColumns`]).
+    /// P1 on 500 m, six levels, no tracer diffusion. Returns the largest
+    /// temperature anomaly `|T − T_bg(z)|` (°C) over the middle four levels
+    /// after every hour.
+    fn internal_wave_pulse(
+        ends: BoundaryTag,
+        hours: usize,
+        sponge: Option<crate::boundary::NestingBand3D>,
+    ) -> Vec<f64> {
+        use crate::boundary::{Nesting3D, ReferenceColumns, StillWater};
+        let (length, depth, width, height) = (20e3, 20.0, 1e3, 0.8);
+        let mesh = Arc::new(Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            length,
+            0.0,
+            1e3,
+            40,
+            1,
+            [BoundaryTag::Wall, ends, BoundaryTag::Wall, ends],
+        ));
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let sigma = SigmaGrid::new(6, UniformStretching);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            OpenOrWall(CharacteristicOBC::new(StillWater::default())),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let mut physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-4, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        let eos = LinearEOS::default();
+        // N² = gα dT/dz
+        let gradient = 0.05_f64.powi(2) / (G * eos.alpha);
+        let background = |z: f64| eos.t0 + gradient * (z + 0.5 * depth);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        state.salt.fill(eos.s0);
+        for column in state.temp.chunks_exact_mut(nl) {
+            for (t, &s) in column.iter_mut().zip(sigma.sigma_rho()) {
+                *t = background(s * depth);
+            }
+        }
+        if let Some(band) = sponge {
+            let rest = Arc::new(ReferenceColumns::from_state(&state));
+            let nesting = Nesting3D::new(rest, &mesh, &ops, nl, &[ends], &band)
+                .expect("open ends to relax at");
+            physics = physics.with_nesting(nesting);
+        }
+        for idx in 0..mesh.n_elements * nn {
+            let (k, i) = (idx / nn, idx % nn);
+            let [x, _] =
+                mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i]);
+            let pulse = height * (-((x - 0.5 * length) / width).powi(2)).exp();
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                let displacement = pulse * (std::f64::consts::PI * s).sin().abs();
+                state.temp[idx * nl + l] = background(s * depth - displacement);
+            }
+        }
+        physics.update_density(&mut state);
+        let sigma_rho = sigma.sigma_rho();
+        let anomaly = |s: &Solution3D| {
+            max_or_nan((0..s.eta.data.len()).flat_map(|idx| {
+                let (eta, d) = (s.eta.data[idx], s.eta.data[idx] - bathymetry.data[idx]);
+                (1..5).map(move |l| {
+                    let z = eta + sigma_rho[l] * d;
+                    (s.temp[idx * nl + l] - background(z)).abs()
+                })
+            }))
+        };
+        let dt = 240.0;
+        let steps_per_hour = (3600.0 / dt) as usize;
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut history = vec![anomaly(&state)];
+        for n in 0..hours * steps_per_hour {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+            if (n + 1) % steps_per_hour == 0 {
+                history.push(anomaly(&state));
+            }
+        }
+        history
+    }
+
+    /// TODO P4.2 gate: an internal wave leaves through a relaxed open
+    /// boundary. A mode-1 pulse splits into two, each half the initial
+    /// amplitude, which reach the open ends after ≈ 9 h. A 4 km band relaxing
+    /// to the stratification at rest (30 min on the boundary) lets them out:
+    /// what remains in the channel at 16 h, reflected, is 36 % of the
+    /// outgoing pulse (22 % at P2 on ten levels). With walls the pulses come
+    /// back whole (1.19 of it at 16 h, where they overlap).
+    ///
+    /// Without the band the open faces extrapolate, and that is unstable for
+    /// stratified flow: a pulse like this (P2, 50 m, N = 0.02 s⁻¹) drove an
+    /// exchange flow at the boundary that displaced its isopycnals without
+    /// bound (the anomaly grew from 0.24 to 6 °C and |u| to 0.26 m/s within
+    /// 8 h). Boundary values of the state at rest without a band are stable
+    /// but reflect the pulse completely.
+    #[test]
+    fn an_internal_wave_leaves_through_a_relaxed_open_boundary() {
+        use crate::boundary::NestingBand3D;
+        let band = NestingBand3D {
+            width: 4e3,
+            velocity_timescale: Some(1800.0),
+            tracer_timescale: Some(1800.0),
+            ..NestingBand3D::default()
+        };
+        let open = internal_wave_pulse(BoundaryTag::Open, 16, Some(band));
+        let (initial, outgoing, reflected) = (open[0], open[6], open[16]);
+        assert!(
+            (outgoing / initial - 0.5).abs() < 0.05,
+            "test regime: the pulse should split into halves ({outgoing:.4} of {initial:.4})"
+        );
+        // Measured 36 % (P2, ten levels, 50 m: 22 %; 2 km bands 27 % at 30 min
+        // and 32 % at 1 h, 6 km at 1 h 18 %)
+        let reflection = reflected / outgoing;
+        assert!(
+            reflection < 0.45,
+            "{:.1} % of the pulse reflected at the relaxed open ends",
+            100.0 * reflection
+        );
+        let walls = internal_wave_pulse(BoundaryTag::Wall, 16, None);
+        assert!(
+            walls[16] / walls[6] > 0.9,
+            "test regime: walls should reflect the pulse ({:.4} of {:.4})",
+            walls[16],
+            walls[6]
+        );
+    }
 }

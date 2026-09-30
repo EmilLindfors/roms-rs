@@ -27,7 +27,22 @@
 //!   The relaxation is explicit: keep `τ` well above the baroclinic step.
 //!
 //! The parent is any [`ParentColumns3D`]: it returns its profiles at the
-//! child's layer centres for a node, a time and the child's column.
+//! child's layer centres for a node, a time and the child's column. A parent
+//! model's output is [`crate::boundary::OceanModelColumns`]; without one,
+//! [`ReferenceColumns`] relaxes to a fixed state (ROMS's nudging to
+//! climatology), e.g. the initial stratification at rest.
+//!
+//! # Stratified open boundaries need the relaxation
+//!
+//! Without nesting, the 3D kernels extrapolate the velocity and the tracers
+//! at open faces and see no pressure outside them. For stratified flow that
+//! is unstable: an internal wave reaching such a boundary starts an exchange
+//! flow that displaces the boundary column's isopycnals without bound (a
+//! mode-1 pulse of 0.24 °C in a 50 m channel, `N = 0.02 s⁻¹`: 6 °C and
+//! 0.26 m/s at the boundary within 8 h, TODO P4.2). Boundary values alone
+//! (no band) are stable but reflect the wave completely; a band relaxing to
+//! the state at rest lets it out, reflecting 18–32 % of its amplitude for
+//! bands of 2–6 km and time scales of 30 min to 2 h at `c₁` ≈ 0.32 m/s.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -85,6 +100,55 @@ pub trait ParentColumns3D: Send + Sync {
     /// parent does not cover the column (the node then keeps its own values:
     /// extrapolation at the boundary, no relaxation).
     fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) -> bool;
+}
+
+/// A fixed reference state as the parent: the columns of a [`Solution3D`]
+/// (on the child's own grid), the same at every time. For open boundaries
+/// without a parent model: relax to the stratification at rest (see the
+/// module docs).
+pub struct ReferenceColumns {
+    n_levels: usize,
+    u: Vec<f64>,
+    v: Vec<f64>,
+    temp: Vec<f64>,
+    salt: Vec<f64>,
+}
+
+impl ReferenceColumns {
+    /// The velocity, temperature and salinity of `state`.
+    pub fn from_state(state: &Solution3D) -> Self {
+        Self {
+            n_levels: state.n_levels,
+            u: state.u.clone(),
+            v: state.v.clone(),
+            temp: state.temp.clone(),
+            salt: state.salt.clone(),
+        }
+    }
+}
+
+impl ParentColumns3D for ReferenceColumns {
+    fn supplies(&self) -> Supplied {
+        Supplied {
+            velocity: true,
+            tracers: true,
+        }
+    }
+
+    fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) -> bool {
+        let nl = self.n_levels;
+        assert_eq!(
+            sigma.n_levels(),
+            nl,
+            "ReferenceColumns: layers of the reference state"
+        );
+        let column = ctx.node * nl..(ctx.node + 1) * nl;
+        out.u.copy_from_slice(&self.u[column.clone()]);
+        out.v.copy_from_slice(&self.v[column.clone()]);
+        out.temp.copy_from_slice(&self.temp[column.clone()]);
+        out.salt.copy_from_slice(&self.salt[column]);
+        true
+    }
 }
 
 /// The relaxation band of a [`Nesting3D`].

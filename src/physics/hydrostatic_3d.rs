@@ -43,7 +43,7 @@
 //! jumps at element faces and could carry `−g∇η` too; the division of labour
 //! is kept, see TODO P4.1.)
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use crate::boundary::{Nesting3D, SWEBoundaryCondition2D};
 use crate::mesh::Mesh2D;
@@ -108,6 +108,8 @@ where
     /// A parent model's profiles at open boundaries and in a relaxation
     /// band, if nested (see [`Self::with_nesting`]).
     pub nesting: Option<Nesting3D>,
+    /// Warns once about stratified open boundaries without nesting.
+    open_boundary_check: Once,
     /// Layer transports (and their Ω) of the last 3D stage, and the
     /// transport kernels' buffers.
     transport_scratch: Mutex<(LayerTransport, TransportScratch)>,
@@ -166,6 +168,7 @@ where
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             bottom_drag: None,
             nesting: None,
+            open_boundary_check: Once::new(),
             transport_scratch,
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
@@ -218,6 +221,12 @@ where
     /// band (see [`Nesting3D`]). The depth mean stays the
     /// 2D module's: nest it there too (its open-boundary condition and
     /// [`crate::boundary::NestingRelaxation2D`]).
+    ///
+    /// Stratified runs with open boundaries need it, with a relaxation band:
+    /// without, the extrapolated open faces let the boundary columns'
+    /// stratification run away (see [`crate::boundary::Nesting3D`]'s module
+    /// docs; [`crate::boundary::ReferenceColumns`] relaxes to a fixed state
+    /// where there is no parent model).
     ///
     /// # Panics
     /// If a nested tag is a wall for the 3D kernels.
@@ -422,6 +431,8 @@ where
             .lock()
             .expect("Failed to lock transport_scratch");
         let (transport, scratch) = &mut *guard;
+        self.open_boundary_check
+            .call_once(|| self.warn_if_stratified_open_boundaries(state));
         let columns = self
             .nesting
             .as_ref()
@@ -454,6 +465,47 @@ where
             columns.relax_tracers(state, &self.bathymetry, &self.sigma, rhs, thin);
         }
         self.zero_thin_momentum(state, rhs);
+    }
+
+    /// Warn if `state` is stratified and has open 3D faces that no nesting
+    /// relaxes (see [`Self::with_nesting`]).
+    fn warn_if_stratified_open_boundaries(&self, state: &Solution3D) {
+        let nested = |tag| {
+            self.nesting
+                .as_ref()
+                .is_some_and(|n| n.tags().contains(&tag))
+        };
+        let open_tag = (0..self.mesh.n_elements).find_map(|k| {
+            (0..4).find_map(|f| {
+                match self
+                    .boundaries
+                    .exterior(&self.mesh, ElementIndex::new(k), f)
+                {
+                    crate::solver::rhs::FaceExterior::Open(tag) if !nested(tag) => Some(tag),
+                    _ => None,
+                }
+            })
+        });
+        let Some(tag) = open_tag else {
+            return;
+        };
+        let nl = state.n_levels;
+        let stratified = state.rho.chunks_exact(nl).any(|column| {
+            let (lo, hi) = column
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &r| {
+                    (lo.min(r), hi.max(r))
+                });
+            hi - lo > 1e-6 * self.rho0
+        });
+        if stratified {
+            eprintln!(
+                "warning: Hydrostatic3D: the open boundary {tag:?} is not nested, and the \
+                 water is stratified. Extrapolated open faces let the boundary columns' \
+                 stratification run away; relax it with `with_nesting` (a parent model, or \
+                 `ReferenceColumns` of the state at rest) and a relaxation band."
+            );
+        }
     }
 
     /// Largest surface residual of `Ω` in the last 3D stage before it was
