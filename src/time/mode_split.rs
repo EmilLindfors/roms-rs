@@ -20,17 +20,21 @@
 //!    barotropic state, with `ū = D̄ū / D̄`. The fluxes of every RK stage are
 //!    accumulated with the secondary weights into the transport that moved
 //!    `η` over the step, `η̄ − ηⁿ = −Δt·∇·DU_avg2` ([`BarotropicTransport`]).
-//! 3. **3D stages.** SSP-RK3 on the 3D fields. In every stage the depth mean of
-//!    the velocity tendency is replaced by the constant rate `(ūⁿ⁺¹ − ūⁿ)/Δt`,
-//!    and `η, ū, v̄` get the same constant rates. SSP-RK3 reproduces a
-//!    constant-rate solution exactly, so each stage sees the barotropic state
-//!    linearly interpolated to its stage time, and the depth mean of `u` stays
-//!    equal to `ū`. Stage 1 reuses the `R₃D` of step 1. The terms that move
-//!    with the layer volume fluxes ([`ModeSplitPhysics::transport_rhs_into`])
-//!    get the pass's `DU_avg2` and `∂η/∂t`, so that the layers carry exactly
-//!    the water the free surface moved. The tracers are stepped as inventories
-//!    `H_z C`, divided by the new `H_z` at the end of the step: constancy and
-//!    conservation of the tracers (see [`crate::solver::rhs::transport_3d`]).
+//! 3. **3D stages.** SSP-RK3 on the 3D fields, with the velocity and the
+//!    tracers stepped as inventories `H_z u`, `H_z C` and divided by the new
+//!    `H_z` at the end of the step. `η, ū, v̄` get the constant rates of the
+//!    pass, `(η̄ − ηⁿ)/Δt` etc.; SSP-RK3 reproduces a constant-rate solution
+//!    exactly, so each stage sees the barotropic state linearly interpolated
+//!    to its stage time. In every stage the column sum of the momentum
+//!    tendency is replaced by the constant rate of the barotropic transport,
+//!    `(D̄ūⁿ⁺¹ − Dⁿūⁿ)/Δt`, shared out by `Δσ_l`, so the depth mean of `u` is
+//!    `ūⁿ⁺¹` at the end. Stage 1 reuses the `R₃D` of step 1. The terms that
+//!    move with the layer volume fluxes
+//!    ([`ModeSplitPhysics::transport_rhs_into`]: momentum and tracer
+//!    advection) get the pass's `DU_avg2` and `∂η/∂t`, so that the layers
+//!    carry exactly the water the free surface moved: constancy and
+//!    conservation of the tracers and of the layer momentum (see
+//!    [`crate::solver::rhs::transport_3d`]).
 //! 4. **Implicit vertical terms** (diffusion with the surface and bottom
 //!    stresses), then the depth mean of `u` is reset to `ū`.
 //!
@@ -208,18 +212,21 @@ pub trait ModeSplitPhysics {
     /// Bed elevation `B`; the depth is `η − B`.
     fn bathymetry(&self) -> &Bathymetry2D;
 
-    /// Overwrite `out.u` and `out.v` with the explicit horizontal momentum
-    /// tendency of `state`: everything but the terms that move with the layer
-    /// volume fluxes. The slow forcing is built from it. Other fields of `out`
-    /// are overwritten by [`Self::transport_rhs_into`] or the splitter.
+    /// Overwrite `out.u` and `out.v` with the explicit velocity tendency of
+    /// `state` (`∂u/∂t`, m/s²): everything but the terms that move with the
+    /// layer volume fluxes. The slow forcing is built from it. Other fields
+    /// of `out` are overwritten by [`Self::transport_rhs_into`] or the
+    /// splitter.
     fn momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D);
 
-    /// Add the momentum terms that move with the layer volume fluxes (vertical
-    /// advection; zero depth mean) to `out.u` and `out.v`, and overwrite
+    /// Add the inventory tendency `∂(H_z u)/∂t` of the momentum terms that
+    /// move with the layer volume fluxes (advection) to `out.u` and `out.v`,
+    /// which the splitter has turned into inventory tendencies, and overwrite
     /// `out.temp` and `out.salt` with the tracers' inventory tendencies
     /// `∂(H_z C)/∂t`. The layer fluxes are corrected to the barotropic
     /// transport of the step, `barotropic` (see
-    /// [`crate::solver::rhs::transport_3d`]). `state` holds concentrations.
+    /// [`crate::solver::rhs::transport_3d`]). `state` holds velocities and
+    /// concentrations.
     fn transport_rhs_into(
         &self,
         state: &Solution3D,
@@ -229,8 +236,9 @@ pub trait ModeSplitPhysics {
     );
 
     /// Overwrite `g` with the slow forcing of the barotropic transport at time
-    /// `t`: `(0, G_hu, G_hv)` in m²/s², from `state` and its horizontal
-    /// momentum tendency `rhs` ([`Self::momentum_rhs_into`]).
+    /// `t`: `(0, G_hu, G_hv)` in m²/s², from `state` and its explicit
+    /// velocity tendency `rhs` ([`Self::momentum_rhs_into`]; the advection,
+    /// which needs layer transports, is the implementation's to add).
     ///
     /// `G` must hold exactly the depth-integrated terms that the 2D module does
     /// not compute itself, so that nothing is counted twice.
@@ -465,14 +473,14 @@ impl BarotropicFilter {
 struct Buffers {
     /// Horizontal momentum tendency `R₃D` at `tⁿ`, reused as the first 3D stage.
     rhs_n: Solution3D,
-    /// A 3D stage value with the tracers as concentrations (the stages carry
-    /// inventories `H_z C`).
+    /// A 3D stage value with velocities and concentrations (the stages carry
+    /// inventories `H_z u`, `H_z C`).
     concentrations: Solution3D,
-    /// The last concentrations of `(temp, salt)`: what an element without
-    /// water keeps.
-    last_tracers: (Vec<f64>, Vec<f64>),
-    /// Elements where the pass kept only the element balance: their tracers
-    /// are element means per level for the step.
+    /// The last values of the inventory fields ([`InventoryFields`]): what a
+    /// node or element without water keeps.
+    last_values: InventoryFields,
+    /// Elements where the pass kept only the element balance: their
+    /// inventory fields are element means per level for the step.
     element_means: Vec<bool>,
     /// `∇·DU_avg2` of the step.
     transport_divergence: DGSolution2D,
@@ -491,10 +499,13 @@ struct Buffers {
     /// Depth means of the u/v tendency (or of u/v after diffusion).
     mean_u: DGSolution2D,
     mean_v: DGSolution2D,
-    /// Constant barotropic rates over the step.
+    /// Constant barotropic rates over the step: of `η`, `ū`, `v̄`, and of
+    /// the transport `Dū`, `Dv̄`.
     rate_eta: DGSolution2D,
     rate_ubar: DGSolution2D,
     rate_vbar: DGSolution2D,
+    rate_hu: DGSolution2D,
+    rate_hv: DGSolution2D,
     /// Bottom-drag rate `r` of every column, frozen over the step.
     drag_rate: Vec<f64>,
 }
@@ -506,7 +517,7 @@ impl Buffers {
         Self {
             rhs_n: Solution3D::new(ne, nn, state.n_levels),
             concentrations: Solution3D::new(ne, nn, state.n_levels),
-            last_tracers: (state.temp.clone(), state.salt.clone()),
+            last_values: InventoryFields::of(state),
             element_means: vec![false; ne],
             transport_divergence: DGSolution2D::new(ne, nn),
             q: SWESolution2D::new(ne, nn),
@@ -520,6 +531,8 @@ impl Buffers {
             rate_eta: DGSolution2D::new(ne, nn),
             rate_ubar: DGSolution2D::new(ne, nn),
             rate_vbar: DGSolution2D::new(ne, nn),
+            rate_hu: DGSolution2D::new(ne, nn),
+            rate_hv: DGSolution2D::new(ne, nn),
             drag_rate: vec![0.0; ne * nn],
         }
     }
@@ -607,7 +620,7 @@ impl ModeSplitIntegrator {
         let Buffers {
             rhs_n,
             concentrations,
-            last_tracers: lent_tracers,
+            last_values: lent_values,
             element_means,
             transport_divergence,
             q,
@@ -621,6 +634,8 @@ impl ModeSplitIntegrator {
             rate_eta,
             rate_ubar,
             rate_vbar,
+            rate_hu,
+            rate_hv,
             drag_rate,
         } = self
             .buffers
@@ -690,14 +705,17 @@ impl ModeSplitIntegrator {
             for (i, &b) in bed.iter().enumerate() {
                 let idx = k * state.n_nodes + i;
                 let (eta, ubar, vbar) = filtered_barotropic_state(q_avg, idx, b);
+                let (depth, depth_n) = (eta - b, state.eta.data[idx] - b);
                 rate_eta.data[idx] = (eta - state.eta.data[idx]) / dt;
                 rate_ubar.data[idx] = (ubar - state.ubar.data[idx]) / dt;
                 rate_vbar.data[idx] = (vbar - state.vbar.data[idx]) / dt;
+                rate_hu.data[idx] = (depth * ubar - depth_n * state.ubar.data[idx]) / dt;
+                rate_hv.data[idx] = (depth * vbar - depth_n * state.vbar.data[idx]) / dt;
             }
         }
 
-        // 3. 3D stages with the barotropic state prescribed, the tracers as
-        // inventories H_z·C (the stage's η sets H_z)
+        // 3. 3D stages with the barotropic state prescribed, the velocity and
+        // the tracers as inventories H_z·u, H_z·C (the stage's η sets H_z)
         let barotropic_flux = BarotropicFlux {
             hu: &transport.hu.data,
             hv: &transport.hv.data,
@@ -728,23 +746,24 @@ impl ModeSplitIntegrator {
                 && residual * dt > DEPTH_ROUND_OFF * depth;
         }
         let means: &[bool] = element_means;
-        let to_concentrations = |s: &Solution3D, temp: &mut [f64], salt: &mut [f64]| {
+        // Inventories of `s` → velocities and concentrations in `out` (which
+        // holds the last values, kept where there is no water)
+        let to_values = |s: &Solution3D, out: &mut InventoryFields| {
             let eta = &s.eta.data;
-            inventory_to_concentration(&s.temp, eta, sigma, bathymetry, geom, means, temp);
-            inventory_to_concentration(&s.salt, eta, sigma, bathymetry, geom, means, salt);
+            for (q, out) in inventory_fields(s).into_iter().zip(out.fields_mut()) {
+                inventory_to_concentration(q, eta, sigma, bathymetry, geom, means, out);
+            }
         };
         let to_inventories = |s: &mut Solution3D| {
-            tracer_to_inventory(&mut s.temp, &s.eta.data, sigma, bathymetry);
-            tracer_to_inventory(&mut s.salt, &s.eta.data, sigma, bathymetry);
+            let eta = &s.eta.data;
+            for field in [&mut s.u, &mut s.v, &mut s.temp, &mut s.salt] {
+                tracer_to_inventory(field, eta, sigma, bathymetry);
+            }
         };
         // Lent to both stage closures for the step
-        let last_tracers_cell = RefCell::new(std::mem::take(lent_tracers));
-        {
-            let mut last = last_tracers_cell.borrow_mut();
-            last.0.copy_from_slice(&state.temp);
-            last.1.copy_from_slice(&state.salt);
-        }
-        let last_tracers = &last_tracers_cell;
+        let last_values_cell = RefCell::new(std::mem::take(lent_values));
+        last_values_cell.borrow_mut().copy_from_state(state);
+        let last_values = &last_values_cell;
         to_inventories(state);
         let mut first_stage = true;
         SSPRK3.step_with_workspace(
@@ -754,39 +773,36 @@ impl ModeSplitIntegrator {
             |s, time, out| {
                 concentrations.copy_from(s);
                 {
-                    let last = last_tracers.borrow();
-                    concentrations.temp.copy_from_slice(&last.0);
-                    concentrations.salt.copy_from_slice(&last.1);
+                    let mut last = last_values.borrow_mut();
+                    to_values(s, &mut last);
+                    last.copy_to_state(concentrations);
                 }
-                let (temp, salt) = (&mut concentrations.temp, &mut concentrations.salt);
-                to_concentrations(s, temp, salt);
                 if first_stage {
                     out.copy_from(rhs_n);
                     first_stage = false;
                 } else {
                     physics.momentum_rhs_into(concentrations, time, out);
                 }
+                // Velocity tendencies → inventory tendencies, then the
+                // advection's
+                tracer_to_inventory(&mut out.u, &s.eta.data, sigma, bathymetry);
+                tracer_to_inventory(&mut out.v, &s.eta.data, sigma, bathymetry);
                 physics.transport_rhs_into(concentrations, time, barotropic_flux, out);
                 // w and rho are diagnostics, refreshed after the stages
                 out.w.fill(0.0);
                 out.rho.fill(0.0);
-                depth_average(sigma, &out.u, mean_u);
-                depth_average(sigma, &out.v, mean_v);
-                shift_columns(&mut out.u, out.n_levels, mean_u, rate_ubar);
-                shift_columns(&mut out.v, out.n_levels, mean_v, rate_vbar);
+                set_column_sums(sigma, &mut out.u, rate_hu);
+                set_column_sums(sigma, &mut out.v, rate_hv);
                 out.eta.copy_from(rate_eta);
                 out.ubar.copy_from(rate_ubar);
                 out.vbar.copy_from(rate_vbar);
             },
             |s| {
-                let mut last = last_tracers.borrow_mut();
-                let (temp, salt) = &mut *last;
-                to_concentrations(s, temp, salt);
-                s.temp.copy_from_slice(temp);
-                s.salt.copy_from_slice(salt);
+                let mut last = last_values.borrow_mut();
+                to_values(s, &mut last);
+                last.copy_to_state(s);
                 physics.post_stage(s);
-                temp.copy_from_slice(&s.temp);
-                salt.copy_from_slice(&s.salt);
+                last.copy_from_state(s);
                 to_inventories(s);
             },
             &mut self.stages_3d,
@@ -806,15 +822,13 @@ impl ModeSplitIntegrator {
                 state.vbar.data[idx] = vbar;
             }
         }
-        // Tracer inventories back to concentrations, with the new H_z
+        // Inventories back to velocities and concentrations, with the new H_z
         {
-            let mut last = last_tracers.borrow_mut();
-            let (temp, salt) = &mut *last;
-            to_concentrations(state, temp, salt);
-            state.temp.copy_from_slice(temp);
-            state.salt.copy_from_slice(salt);
+            let mut last = last_values.borrow_mut();
+            to_values(state, &mut last);
+            last.copy_to_state(state);
         }
-        *lent_tracers = last_tracers_cell.into_inner();
+        *lent_values = last_values_cell.into_inner();
 
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the
@@ -879,6 +893,53 @@ fn depth_average(sigma: &SigmaGrid, field: &[f64], out: &mut DGSolution2D) {
         .zip(field.chunks_exact(sigma.n_levels()))
     {
         *mean = sigma.depth_average(column);
+    }
+}
+
+/// Replace the sum of every column of an inventory tendency by `rate`,
+/// sharing the difference out by the layer fractions `Δσ_l`.
+fn set_column_sums(sigma: &SigmaGrid, field: &mut [f64], rate: &DGSolution2D) {
+    let d_sigma = sigma.d_sigma();
+    for (column, &r) in field.chunks_exact_mut(sigma.n_levels()).zip(&rate.data) {
+        let difference = r - column.iter().sum::<f64>();
+        for (x, &ds) in column.iter_mut().zip(d_sigma) {
+            *x += ds * difference;
+        }
+    }
+}
+
+/// The fields a 3D step carries as inventories `H_z φ`: `u, v, temp, salt`.
+fn inventory_fields(state: &Solution3D) -> [&Vec<f64>; 4] {
+    [&state.u, &state.v, &state.temp, &state.salt]
+}
+
+/// Their values, kept between the stages of a step.
+#[derive(Default)]
+struct InventoryFields([Vec<f64>; 4]);
+
+impl InventoryFields {
+    fn of(state: &Solution3D) -> Self {
+        let mut fields = Self(std::array::from_fn(|_| vec![0.0; state.u.len()]));
+        fields.copy_from_state(state);
+        fields
+    }
+
+    fn fields_mut(&mut self) -> &mut [Vec<f64>; 4] {
+        &mut self.0
+    }
+
+    fn copy_from_state(&mut self, state: &Solution3D) {
+        for (a, b) in self.0.iter_mut().zip(inventory_fields(state)) {
+            a.copy_from_slice(b);
+        }
+    }
+
+    fn copy_to_state(&self, state: &mut Solution3D) {
+        let [u, v, temp, salt] = &self.0;
+        state.u.copy_from_slice(u);
+        state.v.copy_from_slice(v);
+        state.temp.copy_from_slice(temp);
+        state.salt.copy_from_slice(salt);
     }
 }
 

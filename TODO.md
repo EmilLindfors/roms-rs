@@ -103,7 +103,7 @@ This section only orders the existing items for that goal and adds the two farm-
 8. ~~Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7~~ done 2026-09-28.
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
-- P4.2 (tracer constancy and 3D open boundaries: done 2026-09-30; still nested 3D profiles at open faces, momentum in inventory form), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS; quadratic bottom drag: done 2026-09-30), P4.5 (3D wet/dry: done 2026-09-30; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
+- P4.2 (tracer constancy and 3D open boundaries: done 2026-09-30; momentum in inventory form: done 2026-09-30; still nested 3D profiles at open faces), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS; quadratic bottom drag: done 2026-09-30), P4.5 (3D wet/dry: done 2026-09-30; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
 - F.1 cage drag (3D form) and F.2 in 3D.
 
 Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
@@ -625,8 +625,11 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
   - [ ] The 3D classification must match the 2D module's boundary condition (a tag the 2D BC treats as a wall must be a wall here). Nothing checks it; a mismatch would give open-face layer exchange through a 2D wall with zero net flux. Consider deriving both from one tag table.
 - [x] Step Hz·C (inventory form), then divide by the new Hz. Done 2026-09-30: `ModeSplitIntegrator` carries the tracers as `H_z C` through the 3D stages. Gates `uniform_tracers_stay_uniform_under_a_tide_over_a_sloping_bed` (drift 9.3e-13 in one period; before 12.8) and `tracer_inventories_are_conserved_under_a_tide` (3.1e-15; before 1.1e-2). The seiche/wind/Ekman gates run with the T/S-dependent EOS again (the side effect below is gone).
   - Measured side effect (2026-09-26, fixed by the above): with a T/S-dependent EOS, the drift of T and S with η fed a spurious baroclinic PGF into the mode-split G. It damped a barotropic seiche by 0.6 % per period (P1), or amplified it by 0.4 % per period (P2), independent of amplitude and dt.
-- [ ] Step Hz·u as well. The 3D momentum is still in velocity form, and its horizontal advection is `∇·(u u)` with a Rusanov speed, not `(1/H_z)∇·(Q u)` with the layer transports; only its vertical advection uses the new Ω. The depth mean is reset to ū every step, so this affects the shear only, but momentum is neither conservative nor consistent with continuity over a sloping bed. Moving it onto `LayerTransport` needs the mean-flow part of G (`R_adv+Cor(ū)`, a one-level run of the same operator) moved with it.
-- [ ] Cost of the inventory form (noted 2026-09-30): each 3D stage copies the whole stage state to convert the tracers to concentrations (`Buffers::concentrations`), and `post_stage` converts back and forth. Cheap next to the 3D RHS today; with the P4.5 kernel work, have the RHS read `H_z C` and divide on the fly instead.
+- [x] Step Hz·u as well. Done 2026-09-30 (`apply_momentum_transport_3d`): `ModeSplitIntegrator` steps `H_z u`, `H_z v` as inventories with the tracers, advected by `−∇·(Q_l u↑) − δ(Ω u)` on the layer transports (upwind horizontally, centred vertically), the column sum of the stage tendency set to the rate of the barotropic transport `D̄ū`. `G` takes the same operator on the state's own layer transports (`LayerTransport::compute(state, None, …)`) minus a one-layer run on `ū`, so unsheared flow still gives exactly the stresses. Gate `layer_momentum_anomalies_are_conserved_across_a_tide` (Ω = 0 by construction, so each layer's anomaly `∫ H_z,l (u_l − ū)` is invariant): 9.6e-16 of the layer transport over a period; the velocity form drifted by 7.4e-3.
+  - [ ] `G`'s advection builds its own layer transports and a one-layer mean-flow run every step (an extra `LayerTransport::compute`, two advection passes). The last stage's transports are at `tⁿ⁻¹ + Δt/2`, not `tⁿ`; if the cost shows in a profile, consider evaluating G's advection from the stage-1 transports of the previous step, extrapolated with the AB3 history as G already is.
+  - [ ] `with_thin_columns_at_rest` copies the whole `Solution3D` every stage of a domain with any thin column (every realistic wet/dry run). Pass a thin-column mask into the transport kernels instead.
+  - [ ] `tracer_to_inventory` / `inventory_to_concentration` now convert the velocity too; rename them (e.g. `to_inventory` / `from_inventory`) when the P4.5 kernel work touches them.
+- [ ] Cost of the inventory form (noted 2026-09-30): each 3D stage copies the whole stage state to convert the inventory fields (u, v, T, S since 2026-09-30) to concentrations (`Buffers::concentrations`), and `post_stage` converts back and forth. Cheap next to the 3D RHS today; with the P4.5 kernel work, have the RHS read `H_z φ` and divide on the fly instead.
 - [ ] The `w` output of `Hydrostatic3D::post_process` is still Ω of the 3D velocities alone (`compute_vertical_velocity`, closed with their own ∂η/∂t): there is no barotropic transport between steps. Output the last step's layer-transport Ω instead (e.g. keep the stage-3 Ω or recompute at tⁿ⁺¹ with DU_avg2), and then drop `compute_vertical_velocity`.
 
 ### P4.3 Pressure gradient and vertical grid
@@ -652,7 +655,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] Surface heat-flux budget (shortwave, longwave, sensible/latent) for multi-day SST evolution (formerly "P3.1 Surface Heat Flux Budget").
 
 ### P4.5 Remaining 3D physics and numerics
-- [ ] Higher-order vertical advection (4th-order centred/Akima or HSIMT). First-order upwind today over-diffuses the halocline.
+- [ ] Higher-order vertical advection (4th-order centred/Akima or HSIMT). First-order upwind today over-diffuses the halocline (the tracers; the momentum is centred, second order).
 - [ ] Rotated/geopotential horizontal diffusion via BR1 (no 3D horizontal diffusion exists).
 - [x] 3D wetting/drying (any dry node gave NaN). Done 2026-09-30:
   - Thin columns (D < `Hydrostatic3D::with_min_column_depth`, default 0.1 m, ROMS's Dcrit) carry no shear (u = ū, zero 3D momentum tendency, no vertical diffusion), get no stress through G, and exert no baroclinic pressure. The 3D momentum advection and the mean-flow part of G see them with zero velocity, so films at the 2D velocity cap (20 m/s) stay the 2D module's.
@@ -663,7 +666,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] EOS: delegate the physics trait to the fixed UNESCO EOS (P0.17) with a linear fast path; TEOS-10 later.
 - [ ] `compute_dt`: internal-wave speed from stratification (not a hardcoded 2 m/s) and the vertical CFL. Relabel or convert Ω vs w in output.
 - [ ] Parallelise the 3D kernels; no `Vec` allocation in inner loops (~186M malloc/free per 3D RHS at 50k × 30).
-  - E.g. `apply_horizontal_surface_terms` (3D momentum advection) and `compute_vertical_velocity` allocate `Vec`s per face per level, and `compute_strong_divergence` two per call; move them to workspaces as `LayerTransport` and `TracerTransportScratch` do (2026-09-30), and parallelise those over elements.
+  - E.g. `compute_vertical_velocity` allocates `Vec`s per face per level, and `compute_strong_divergence` two per call; move them to workspaces as `LayerTransport` and `TransportScratch` do (2026-09-30), and parallelise those over elements. (The allocating velocity-form momentum advection, `apply_horizontal_surface_terms`, is gone since 2026-09-30.)
 
 ### P4.6 3D validation (before any NorKyst 3D comparison)
 - [x] Stratified lake-at-rest, linear N² ≤ 1e-12: the PGF to ≤ 1.5e-14 m/s² over a 30→400 m slope; the mode-split model to 2.8e-11 m/s after 1 h (P4.3 gates, 2026-09-30).

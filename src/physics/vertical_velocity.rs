@@ -24,9 +24,10 @@ use crate::vertical::SigmaGrid;
 /// `[element][node][interface]` (interface 0 = bed, `n_levels` = surface; both are
 /// zero by the kinematic conditions). Keeping the interface values — rather than
 /// averaging to layer centres — preserves discrete layer continuity
-/// $\partial_t H_z + \nabla\cdot(H_z \mathbf{u}) + \Omega_{k+1/2} - \Omega_{k-1/2} = 0$,
-/// which the vertical advection in [`crate::solver::rhs::apply_vertical_advection_3d`]
-/// relies on.
+/// $\partial_t H_z + \nabla\cdot(H_z \mathbf{u}) + \Omega_{k+1/2} - \Omega_{k-1/2} = 0$.
+/// It feeds the diagnostic `w` output of
+/// [`crate::physics::Hydrostatic3D::post_process`]; the 3D stages use the Ω of
+/// [`crate::solver::rhs::LayerTransport`].
 pub fn compute_vertical_velocity(
     w_out: &mut [f64],
     state: &Solution3D,

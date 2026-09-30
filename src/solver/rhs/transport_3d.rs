@@ -44,9 +44,24 @@
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
 //! inventory form: upwind in `C` on the face fluxes and on `Ω`.
+//!
+//! # Momentum
+//!
+//! The horizontal velocity is advected with the same fluxes, also in
+//! inventory form ([`apply_momentum_transport_3d`]; ROMS `rhs3d`/`step3d_uv`):
+//!
+//! ```text
+//!     ∂(H_z u)_l/∂t = −∇·(Q_l u_l) − (Ω_{l+1/2} u_{l+1/2} − Ω_{l−1/2} u_{l−1/2}) + …
+//! ```
+//!
+//! upwind in `u` on the face fluxes and centred on `Ω`. A velocity that is
+//! uniform in space changes its inventory exactly as the layer thickness
+//! changes, and the layer momentum `∫ H_z,l u_l` is changed by the advection
+//! only through open boundaries.
 
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
+use crate::mesh::data::BoundaryTag;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, FaceExterior};
@@ -160,11 +175,17 @@ impl LayerTransport {
     /// Layer transports and `Ω` of `state` (its `η`, `u`, `v`), corrected to
     /// the barotropic transport `barotropic`, with the physical boundaries
     /// `boundaries`.
+    ///
+    /// With `barotropic = None` they are the state's own transports: `H_z u`
+    /// at the nodes and the central average on the faces, uncorrected, with
+    /// `Ω` closed by the free-surface rate their divergence implies,
+    /// `∂η/∂t = −Σ_l ∇·Q_l`. (The slow forcing of the mode splitter uses them
+    /// before the barotropic pass of a step exists.)
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
         state: &Solution3D,
-        barotropic: BarotropicFlux,
+        barotropic: Option<BarotropicFlux>,
         mesh: &Mesh2D,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
@@ -195,6 +216,9 @@ impl LayerTransport {
                     sum_u += *hu;
                     sum_v += *hv;
                 }
+                let Some(barotropic) = barotropic else {
+                    continue;
+                };
                 let (corr_u, corr_v) = (barotropic.hu[idx] - sum_u, barotropic.hv[idx] - sum_v);
                 for ((hu, hv), &ds) in self.hu[column.clone()]
                     .iter_mut()
@@ -237,6 +261,9 @@ impl LayerTransport {
                         });
                         sum += *flux;
                     }
+                    let Some(barotropic) = barotropic else {
+                        continue;
+                    };
                     let corr = barotropic.face[slot] - sum;
                     for (flux, &ds) in fluxes.iter_mut().zip(d_sigma) {
                         *flux += ds * corr;
@@ -269,7 +296,10 @@ impl LayerTransport {
             }
             for i in 0..nn {
                 let idx = k * nn + i;
-                let rate = barotropic.eta_rate[idx];
+                let rate = match barotropic {
+                    Some(barotropic) => barotropic.eta_rate[idx],
+                    None => -(0..nl).map(|l| self.layer_div[l * nn + i]).sum::<f64>(),
+                };
                 let omega = &mut self.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
                 omega[0] = 0.0;
                 for l in 0..nl {
@@ -403,59 +433,37 @@ pub fn apply_tracer_transport_3d(
     geom: &GeometricFactors2D,
     bc: &dyn TracerBoundaryCondition3D,
     boundaries: &Boundaries3D,
-    scratch: &mut TracerTransportScratch,
+    scratch: &mut TransportScratch,
 ) {
-    let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, transport.n_levels);
-    let TracerTransportScratch {
-        hu,
-        hv,
-        face,
-        div,
-        vertical,
-    } = scratch;
-
+    let (nn, nl) = (ops.n_nodes, transport.n_levels);
+    let context = LayerContext {
+        transport,
+        mesh,
+        ops,
+        geom,
+        boundaries,
+    };
     for k in 0..mesh.n_elements {
-        let el = ElementIndex::new(k);
         for l in 0..nl {
-            for i in 0..nn {
-                let idx = (k * nn + i) * nl + l;
-                hu[i] = transport.hu[idx] * tracer[idx];
-                hv[i] = transport.hv[idx] * tracer[idx];
-            }
-            for f in 0..4 {
-                let exterior = boundaries.exterior(mesh, el, f);
-                for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                    let slot = (k * 4 + f) * nfn + fi;
-                    let flux = transport.face[slot * nl + l];
-                    let interior = tracer[(k * nn + node) * nl + l];
-                    let upwind = match exterior {
-                        _ if flux >= 0.0 => interior,
-                        FaceExterior::Element(nb) => {
-                            let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
-                            tracer[(nb.element * nn + nb_node) * nl + l]
-                        }
-                        FaceExterior::Open(tag) => bc.exterior_value(&TracerBCContext3D {
-                            element: k,
-                            face: f,
-                            level: l,
-                            face_node: fi,
-                            boundary_tag: Some(tag),
-                            interior_value: interior,
-                            normal_velocity: flux,
-                        }),
-                        // A wall passes no volume: only a round-off flux
-                        FaceExterior::Wall => interior,
-                    };
-                    face[f * nfn + fi] = flux * upwind;
-                }
-            }
-            transport_divergence_element(ops, geom, k, hu, hv, face, div);
+            let inflow = |f, fi, tag, interior, flux| {
+                bc.exterior_value(&TracerBCContext3D {
+                    element: k,
+                    face: f,
+                    level: l,
+                    face_node: fi,
+                    boundary_tag: Some(tag),
+                    interior_value: interior,
+                    normal_velocity: flux,
+                })
+            };
+            let div = context.flux_divergence(k, l, tracer, inflow, scratch);
             for (i, &d) in div.iter().enumerate() {
                 rhs[(k * nn + i) * nl + l] = -d;
             }
         }
 
         // Vertical upwind flux through the σ-surfaces
+        let vertical = &mut scratch.vertical;
         for i in 0..nn {
             let idx = k * nn + i;
             let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
@@ -473,8 +481,134 @@ pub fn apply_tracer_transport_3d(
     }
 }
 
-/// Buffers of [`apply_tracer_transport_3d`], sized for one element.
-pub struct TracerTransportScratch {
+/// Add the inventory tendency `∂(H_z u)/∂t` of the momentum advection by the
+/// layer transports `transport` to `rhs_u` and `rhs_v`:
+///
+/// ```text
+///     ∂(H_z u)_l/∂t += −∇·(Q_l u_l) − (Ω_{l+1/2} u_{l+1/2} − Ω_{l−1/2} u_{l−1/2})
+/// ```
+///
+/// for the advected velocity `(u, v)`; `Q` and `Ω` come from `transport`.
+/// Horizontally the face flux is `F_l u↑`, with `u↑` upwind of the layer's
+/// face flux as for the tracers, and at an open boundary the interior's
+/// velocity (zero gradient, ROMS's "gradient" condition for the 3D velocity;
+/// see [`crate::solver::rhs::boundary_3d`]). Walls carry no volume, so no
+/// momentum. Vertically `u` is centred at the σ-surfaces.
+///
+/// A velocity uniform in space gets `u·Δσ_l ∂η/∂t`: divided by the new layer
+/// thickness it stays uniform. The layer momentum `∫ H_z,l u_l` changes
+/// only through open faces.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_momentum_transport_3d(
+    rhs_u: &mut [f64],
+    rhs_v: &mut [f64],
+    u: &[f64],
+    v: &[f64],
+    transport: &LayerTransport,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    boundaries: &Boundaries3D,
+    scratch: &mut TransportScratch,
+) {
+    let (nn, nl) = (ops.n_nodes, transport.n_levels);
+    let context = LayerContext {
+        transport,
+        mesh,
+        ops,
+        geom,
+        boundaries,
+    };
+    let extrapolated = |_, _, _, interior, _| interior;
+    for (rhs, field) in [(rhs_u, u), (rhs_v, v)] {
+        for k in 0..mesh.n_elements {
+            for l in 0..nl {
+                let div = context.flux_divergence(k, l, field, extrapolated, scratch);
+                for (i, &d) in div.iter().enumerate() {
+                    rhs[(k * nn + i) * nl + l] -= d;
+                }
+            }
+
+            // Centred flux through the σ-surfaces
+            let vertical = &mut scratch.vertical;
+            for i in 0..nn {
+                let idx = k * nn + i;
+                let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
+                let column = &field[idx * nl..(idx + 1) * nl];
+                vertical[0] = 0.0;
+                vertical[nl] = 0.0;
+                for l in 1..nl {
+                    vertical[l] = omega[l] * 0.5 * (column[l - 1] + column[l]);
+                }
+                for (l, r) in rhs[idx * nl..(idx + 1) * nl].iter_mut().enumerate() {
+                    *r -= vertical[l + 1] - vertical[l];
+                }
+            }
+        }
+    }
+}
+
+/// What the horizontal flux divergence of a layer needs.
+struct LayerContext<'a> {
+    transport: &'a LayerTransport,
+    mesh: &'a Mesh2D,
+    ops: &'a DGOperators2D,
+    geom: &'a GeometricFactors2D,
+    boundaries: &'a Boundaries3D,
+}
+
+impl LayerContext<'_> {
+    /// `∇·(Q_l φ)` on element `k`, layer `l`, of the field `φ` (layout of
+    /// [`Solution3D`]): nodal flux `Q_l φ`, face flux `F_l φ↑` with `φ↑`
+    /// upwind of `F_l`. On inflow through an open face `φ↑` is
+    /// `inflow(face, face_node, tag, interior value, F_l)`. Written to (and
+    /// returned from) `scratch.div`.
+    fn flux_divergence<'s>(
+        &self,
+        k: usize,
+        l: usize,
+        field: &[f64],
+        inflow: impl Fn(usize, usize, BoundaryTag, f64, f64) -> f64,
+        scratch: &'s mut TransportScratch,
+    ) -> &'s [f64] {
+        let (ops, transport) = (self.ops, self.transport);
+        let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, transport.n_levels);
+        let TransportScratch {
+            hu, hv, face, div, ..
+        } = scratch;
+        for i in 0..nn {
+            let idx = (k * nn + i) * nl + l;
+            hu[i] = transport.hu[idx] * field[idx];
+            hv[i] = transport.hv[idx] * field[idx];
+        }
+        let el = ElementIndex::new(k);
+        for f in 0..4 {
+            let exterior = self.boundaries.exterior(self.mesh, el, f);
+            for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
+                let slot = (k * 4 + f) * nfn + fi;
+                let flux = transport.face[slot * nl + l];
+                let interior = field[(k * nn + node) * nl + l];
+                let upwind = match exterior {
+                    _ if flux >= 0.0 => interior,
+                    FaceExterior::Element(nb) => {
+                        let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
+                        field[(nb.element * nn + nb_node) * nl + l]
+                    }
+                    FaceExterior::Open(tag) => inflow(f, fi, tag, interior, flux),
+                    // A wall passes no volume: only a round-off flux
+                    FaceExterior::Wall => interior,
+                };
+                face[f * nfn + fi] = flux * upwind;
+            }
+        }
+        transport_divergence_element(ops, self.geom, k, hu, hv, face, div);
+        div
+    }
+}
+
+/// Buffers of the transport kernels ([`apply_tracer_transport_3d`],
+/// [`apply_momentum_transport_3d`]), sized for one element.
+pub struct TransportScratch {
     hu: Vec<f64>,
     hv: Vec<f64>,
     face: Vec<f64>,
@@ -482,7 +616,7 @@ pub struct TracerTransportScratch {
     vertical: Vec<f64>,
 }
 
-impl TracerTransportScratch {
+impl TransportScratch {
     /// Buffers for elements of `ops` and `n_levels` layers.
     pub fn new(ops: &DGOperators2D, n_levels: usize) -> Self {
         Self {
@@ -644,7 +778,7 @@ mod tests {
             };
             transport.compute(
                 &self.state,
-                barotropic,
+                Some(barotropic),
                 &self.mesh,
                 &self.ops,
                 &self.geom,
@@ -662,7 +796,7 @@ mod tests {
             bc: &dyn TracerBoundaryCondition3D,
         ) -> Vec<f64> {
             let mut rhs = vec![f64::NAN; tracer.len()];
-            let mut scratch = TracerTransportScratch::new(&self.ops, self.sigma.n_levels());
+            let mut scratch = TransportScratch::new(&self.ops, self.sigma.n_levels());
             apply_tracer_transport_3d(
                 &mut rhs,
                 tracer,
@@ -941,7 +1075,7 @@ mod tests {
         let nl = 3;
         let mut transport = LayerTransport::new(1, &ops, nl);
         let tracer: Vec<f64> = (0..ops.n_nodes).flat_map(|_| [1.0, 2.0, 4.0]).collect();
-        let mut scratch = TracerTransportScratch::new(&ops, nl);
+        let mut scratch = TransportScratch::new(&ops, nl);
         for (w, expected) in [(1.0, [-1.0, -1.0, 2.0]), (-1.0, [2.0, 2.0, -4.0])] {
             for column in transport.omega.chunks_exact_mut(nl + 1) {
                 column.copy_from_slice(&[0.0, w, w, 0.0]);
@@ -964,6 +1098,216 @@ mod tests {
                 }
             }
         }
+    }
+
+    impl Case {
+        /// Momentum inventory tendencies `(∂(H_z u)/∂t, ∂(H_z v)/∂t)` of the
+        /// advection of `(u, v)`.
+        fn momentum_rhs(
+            &self,
+            transport: &LayerTransport,
+            u: &[f64],
+            v: &[f64],
+        ) -> (Vec<f64>, Vec<f64>) {
+            let mut rhs_u = vec![0.0; u.len()];
+            let mut rhs_v = vec![0.0; v.len()];
+            let mut scratch = TransportScratch::new(&self.ops, self.sigma.n_levels());
+            apply_momentum_transport_3d(
+                &mut rhs_u,
+                &mut rhs_v,
+                u,
+                v,
+                transport,
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                &self.boundaries,
+                &mut scratch,
+            );
+            (rhs_u, rhs_v)
+        }
+    }
+
+    /// Momentum constancy: a velocity uniform in space changes its inventory
+    /// exactly as the layer thickness changes, `∂(H_z u)/∂t = u Δσ_l ∂η/∂t`,
+    /// so it stays uniform, through walls, open faces and periodic ones. (The
+    /// old velocity-form advection, `∇·(u u)` with its own Rusanov flux and
+    /// `Ω` only in the vertical term, was not built on the layer transports.)
+    #[test]
+    fn uniform_velocity_follows_the_layer_thickness() {
+        let (u0, v0) = (0.7, -0.3);
+        for case in [Case::closed(), Case::open(), Case::periodic()] {
+            let transport = case.transport();
+            let n = case.state.u.len();
+            let (rhs_u, rhs_v) = case.momentum_rhs(&transport, &vec![u0; n], &vec![v0; n]);
+            let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+            let scale = max_abs(case.eta_rate.iter().copied());
+            for idx in 0..case.mesh.n_elements * nn {
+                for l in 0..nl {
+                    let thickness_rate = case.sigma.d_sigma()[l] * case.eta_rate[idx];
+                    for (c, rhs) in [(u0, &rhs_u), (v0, &rhs_v)] {
+                        let got = rhs[idx * nl + l];
+                        assert!(
+                            (got - c * thickness_rate).abs() < 1e-12 * scale,
+                            "node {idx}, layer {l}: {got:.6e} vs u·Δσ·∂η/∂t = {:.6e}",
+                            c * thickness_rate
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Conservation: the momentum advection moves momentum between layers and
+    /// elements but, summed over the layers, creates none in a closed basin
+    /// (walls carry no volume, so no momentum) or on a periodic mesh.
+    #[test]
+    fn momentum_advection_conserves_the_column_momentum() {
+        for case in [Case::closed(), Case::periodic()] {
+            let transport = case.transport();
+            let (rhs_u, rhs_v) = case.momentum_rhs(&transport, &case.state.u, &case.state.v);
+            let hu_scale = max_abs(transport.hu.iter().copied());
+            let u_scale = max_abs(case.state.u.iter().chain(&case.state.v).copied());
+            let scale = case.integral(&vec![hu_scale * u_scale / 1000.0; rhs_u.len()]);
+            assert!(
+                max_abs(rhs_u.iter().copied()) > 1e-3 * hu_scale * u_scale / 1000.0,
+                "test regime: no advection"
+            );
+            for rhs in [rhs_u, rhs_v] {
+                let tendency = case.integral(&rhs);
+                assert!(
+                    tendency.abs() < 1e-12 * scale,
+                    "momentum tendency {tendency:.3e} (advective scale {scale:.3e})"
+                );
+            }
+        }
+    }
+
+    /// Open faces: the column momentum changes by exactly what the layer
+    /// fluxes carry out, `−∮ Σ_l F_l u_l`, with the interior's velocity both
+    /// ways (zero gradient).
+    #[test]
+    fn open_boundaries_change_the_momentum_by_the_boundary_flux() {
+        let case = Case::open();
+        let transport = case.transport();
+        let (nn, nfn, nl) = (
+            case.ops.n_nodes,
+            case.ops.n_face_nodes,
+            case.sigma.n_levels(),
+        );
+        let (rhs_u, rhs_v) = case.momentum_rhs(&transport, &case.state.u, &case.state.v);
+        for (rhs, field) in [(&rhs_u, &case.state.u), (&rhs_v, &case.state.v)] {
+            let tendency = case.integral(rhs);
+            let (mut outflow, mut scale) = (0.0, 0.0);
+            for k in 0..case.mesh.n_elements {
+                for f in 0..4 {
+                    let exterior = case
+                        .boundaries
+                        .exterior(&case.mesh, ElementIndex::new(k), f);
+                    if !matches!(exterior, FaceExterior::Open(_)) {
+                        continue;
+                    }
+                    for (fi, &node) in case.ops.face_nodes[f].iter().enumerate() {
+                        let slot = (k * 4 + f) * nfn + fi;
+                        let weight = case.ops.weights_1d[fi] * case.geom.surface_jacobian(k, f, fi);
+                        for l in 0..nl {
+                            let carried = weight
+                                * transport.face[slot * nl + l]
+                                * field[(k * nn + node) * nl + l];
+                            outflow += carried;
+                            scale += carried.abs();
+                        }
+                    }
+                }
+            }
+            assert!(
+                (tendency + outflow).abs() < 1e-12 * scale,
+                "momentum tendency {tendency:.6e} vs boundary outflow {outflow:.6e}"
+            );
+        }
+    }
+
+    /// Vertically the velocity is centred at the σ-surfaces, in inventory
+    /// form: `−(Ω_{l+1/2} u_{l+1/2} − Ω_{l−1/2} u_{l−1/2})`, not divided by
+    /// `H_z`. Linear `Ω(σ)` and `u(σ)` make the centred values exact.
+    #[test]
+    fn vertical_momentum_flux_is_centred() {
+        let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 1, 1);
+        let ops = DGOperators2D::new(1);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let sigma = SigmaGrid::uniform(4);
+        let nl = sigma.n_levels();
+        let omega = |s: f64| 0.03 * (s + 1.0) * s;
+        let u = |s: f64| 0.4 - 0.5 * s;
+        let mut transport = LayerTransport::new(1, &ops, nl);
+        for column in transport.omega.chunks_exact_mut(nl + 1) {
+            for (w, &s) in column.iter_mut().zip(sigma.sigma_w()) {
+                *w = omega(s);
+            }
+        }
+        let column: Vec<f64> = sigma.sigma_rho().iter().map(|&s| u(s)).collect();
+        let field: Vec<f64> = (0..ops.n_nodes).flat_map(|_| column.clone()).collect();
+        let (mut rhs_u, mut rhs_v) = (vec![0.0; field.len()], vec![0.0; field.len()]);
+        apply_momentum_transport_3d(
+            &mut rhs_u,
+            &mut rhs_v,
+            &field,
+            &field,
+            &transport,
+            &mesh,
+            &ops,
+            &geom,
+            &Boundaries3D::default(),
+            &mut TransportScratch::new(&ops, nl),
+        );
+        let sw = sigma.sigma_w();
+        // Ω vanishes at the bed and the surface
+        let flux = |f: usize| omega(sw[f]) * u(sw[f]);
+        for rhs in [&rhs_u, &rhs_v] {
+            for (i, column) in rhs.chunks_exact(nl).enumerate() {
+                for (l, got) in column.iter().enumerate() {
+                    let expected = -(flux(l + 1) - flux(l));
+                    assert!(
+                        (got - expected).abs() < 1e-15,
+                        "node {i}, layer {l}: {got} vs {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// `None`: the state's own layer transports, `H_z u` uncorrected, with `Ω`
+    /// closed at the surface by the free-surface rate they imply.
+    #[test]
+    fn own_layer_transports_close_omega() {
+        let case = Case::closed();
+        let mut transport =
+            LayerTransport::new(case.mesh.n_elements, &case.ops, case.sigma.n_levels());
+        transport.compute(
+            &case.state,
+            None,
+            &case.mesh,
+            &case.ops,
+            &case.geom,
+            &case.sigma,
+            &case.bathymetry,
+            &case.boundaries,
+        );
+        let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+        for idx in 0..case.mesh.n_elements * nn {
+            let depth = case.state.eta.data[idx] - case.bathymetry.data[idx];
+            for l in 0..nl {
+                let expected = depth * case.sigma.d_sigma()[l] * case.state.u[idx * nl + l];
+                assert!((transport.hu[idx * nl + l] - expected).abs() < 1e-14 * expected.abs());
+            }
+        }
+        let scale = max_abs(transport.omega.iter().copied());
+        assert!(scale > 1e-4, "test flow should drive a non-trivial Ω");
+        assert!(
+            transport.surface_residual < 1e-12 * scale,
+            "surface residual {:.2e}",
+            transport.surface_residual
+        );
     }
 
     /// Inventory ↔ concentration: nodal in unmarked elements; in marked

@@ -1,7 +1,7 @@
 //! Physical boundaries of the 3D kernels.
 //!
 //! One classification of every element face, shared by the momentum
-//! advection ([`crate::solver::rhs::apply_horizontal_advection_3d`]), the
+//! advection ([`crate::solver::rhs::apply_momentum_transport_3d`]), the
 //! layer transports and their `Ω` ([`crate::solver::rhs::LayerTransport`])
 //! and the tracer transport ([`crate::solver::rhs::apply_tracer_transport_3d`]),
 //! so that the three agree on what a boundary is. (Each kernel used to decide

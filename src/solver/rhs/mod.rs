@@ -65,13 +65,14 @@ pub use boundary_3d::{Boundaries3D, FaceExterior};
 pub mod advection_3d;
 pub use advection_3d::{
     ExtrapolationTracerBC3D, FixedTracerBC3D, TracerBCContext3D, TracerBoundaryCondition3D,
-    UpwindTracerBC3D, apply_horizontal_advection_3d, apply_vertical_advection_3d,
+    UpwindTracerBC3D,
 };
 
 pub mod transport_3d;
 pub use transport_3d::{
-    BarotropicFlux, LayerTransport, TracerTransportScratch, apply_tracer_transport_3d,
-    inventory_to_concentration, tracer_to_inventory, transport_divergence_element,
+    BarotropicFlux, LayerTransport, TransportScratch, apply_momentum_transport_3d,
+    apply_tracer_transport_3d, inventory_to_concentration, tracer_to_inventory,
+    transport_divergence_element,
 };
 
 pub mod rhs_3d;

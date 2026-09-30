@@ -3,30 +3,27 @@
 //! Assembles the semi-discrete right-hand side of the 3D primitive equations
 //! in two parts, because under mode splitting they need different inputs:
 //!
-//! - [`compute_momentum_rhs_3d`]: the horizontal momentum terms (baroclinic
-//!   pressure gradient, horizontal advection, Coriolis). The slow forcing `G`
-//!   of the barotropic mode is built from their depth mean, before the
-//!   barotropic pass of the step.
+//! - [`compute_momentum_rhs_3d`]: the pointwise momentum terms (baroclinic
+//!   pressure gradient, Coriolis), as velocity tendencies.
 //! - [`compute_transport_rhs_3d`]: everything that moves with the layer volume
-//!   fluxes (vertical momentum advection, tracer advection). The fluxes are
+//!   fluxes (momentum and tracer advection), as inventory tendencies
+//!   `∂(H_z u)/∂t`, `∂(H_z C)/∂t`. Under mode splitting the fluxes are
 //!   corrected to the barotropic transport of the step
 //!   ([`crate::solver::rhs::LayerTransport`]), so they exist only after the
-//!   barotropic pass. Vertical momentum advection has zero depth mean, so `G`
-//!   does not depend on it.
+//!   barotropic pass; the slow forcing `G` of the pass uses the state's own
+//!   layer transports instead (see [`crate::physics::Hydrostatic3D`]).
 //!
 //! Vertical mixing is handled implicitly in the time stepper.
 
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::solver::rhs::advection_3d::{
-    TracerBoundaryCondition3D, apply_horizontal_advection_3d, apply_vertical_advection_3d,
-};
+use crate::solver::rhs::advection_3d::TracerBoundaryCondition3D;
 use crate::solver::rhs::baroclinic::compute_pressure_gradient;
 use crate::solver::rhs::boundary_3d::Boundaries3D;
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
-    LayerTransport, TracerTransportScratch, apply_tracer_transport_3d,
+    LayerTransport, TransportScratch, apply_momentum_transport_3d, apply_tracer_transport_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
@@ -50,9 +47,10 @@ pub struct Rhs3DConfig<'a> {
     pub min_column_depth: f64,
 }
 
-/// Overwrite `rhs.u` and `rhs.v` with the horizontal momentum tendency:
-/// baroclinic pressure gradient, horizontal advection and Coriolis. The other
-/// fields of `rhs` are left alone.
+/// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the pointwise
+/// momentum terms: baroclinic pressure gradient and Coriolis. The advection
+/// is [`compute_transport_rhs_3d`]'s. The other fields of `rhs` are left
+/// alone.
 ///
 /// `state.rho` must be current (density is refreshed by the caller, so that
 /// `state` stays immutable here).
@@ -77,35 +75,33 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         &mut rhs.u,
         &mut rhs.v,
     );
-    apply_horizontal_advection_3d(
-        rhs,
-        state,
-        config.mesh,
-        config.ops,
-        config.geom,
-        config.boundaries,
-    );
     apply_coriolis_3d(rhs, state, config.mesh, config.ops, config.coriolis);
     // TODO: horizontal viscosity/diffusion (P4.5)
 }
 
-/// Add the vertical momentum advection by `transport.omega` to `rhs.u` and
-/// `rhs.v`, and overwrite `rhs.temp` and `rhs.salt` with the tracers'
-/// **inventory** tendencies `∂(H_z C)/∂t` under the layer transports
-/// `transport` (computed from `state` for this stage).
+/// Add the inventory tendency `∂(H_z u)/∂t` of the momentum advection by the
+/// layer transports `transport` (computed from `state` for this stage) to
+/// `rhs.u` and `rhs.v`, and overwrite `rhs.temp` and `rhs.salt` with the
+/// tracers' inventory tendencies `∂(H_z C)/∂t`. The advected fields are
+/// `state`'s.
 pub fn compute_transport_rhs_3d(
     rhs: &mut Solution3D,
     state: &Solution3D,
     transport: &LayerTransport,
     config: &Rhs3DConfig,
-    scratch: &mut TracerTransportScratch,
+    scratch: &mut TransportScratch,
 ) {
-    apply_vertical_advection_3d(
-        rhs,
-        state,
-        &transport.omega,
-        config.sigma,
-        config.bathymetry,
+    apply_momentum_transport_3d(
+        &mut rhs.u,
+        &mut rhs.v,
+        &state.u,
+        &state.v,
+        transport,
+        config.mesh,
+        config.ops,
+        config.geom,
+        config.boundaries,
+        scratch,
     );
     let tracers = [
         (&mut rhs.temp, &state.temp, config.temp_bc),

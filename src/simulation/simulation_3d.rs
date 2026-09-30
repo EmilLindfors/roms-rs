@@ -733,6 +733,8 @@ mod tests {
         bathymetry: Arc<Bathymetry2D>,
         sigma: SigmaGrid,
         length: f64,
+        /// The coordinate the tide runs along (0: x, 1: y).
+        axis: usize,
     }
 
     impl SlopingTide {
@@ -751,10 +753,37 @@ mod tests {
                 bathymetry,
                 sigma: SigmaGrid::new(3, UniformStretching),
                 length,
+                axis: 0,
+            }
+        }
+
+        /// A 200 m × 1 km channel, periodic in x, with the tide across it
+        /// (along y) over a bed sloping in y alone: every field is uniform in
+        /// x.
+        fn across_channel() -> Self {
+            let length = 1000.0;
+            let mesh = Arc::new(Mesh2D::channel_periodic_x(0.0, 200.0, 0.0, length, 2, 8));
+            let ops = Arc::new(DGOperators2D::new(2));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+            let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |_, y| {
+                -12.0 + 8.0 * y / length
+            }));
+            Self {
+                mesh,
+                ops,
+                geom,
+                bathymetry,
+                sigma: SigmaGrid::new(3, UniformStretching),
+                length,
+                axis: 1,
             }
         }
 
         fn physics(&self) -> Physics {
+            self.physics_with(ConstantMixing::new(1e-3, 1e-4))
+        }
+
+        fn physics_with(&self, mixing: ConstantMixing) -> Physics {
             let swe = PhysicsBuilder::swe_2d(
                 self.mesh.clone(),
                 self.ops.clone(),
@@ -773,7 +802,7 @@ mod tests {
                 self.bathymetry.clone(),
                 Arc::new(CoriolisSource2D::f_plane(0.0)),
                 LinearEOS::default(),
-                ConstantMixing::new(1e-3, 1e-4),
+                mixing,
                 swe,
                 no_stress(),
                 G,
@@ -781,18 +810,18 @@ mod tests {
             )
         }
 
-        /// `η = 0.5 cos(πx/L)`, zero-mean shear `u = 0.1(σ + ½)`, and the
-        /// tracers from `tracer(x, σ)`.
+        /// `η = 0.5 cos(πx/L)` (x along the tide), zero-mean shear
+        /// `u = 0.1(σ + ½)` in x, and the tracers from `tracer(x, σ)`.
         fn state(&self, physics: &Physics, tracer: impl Fn(f64, f64) -> (f64, f64)) -> Solution3D {
             let (nn, nl) = (self.ops.n_nodes, self.sigma.n_levels());
             let mut state = Solution3D::new(self.mesh.n_elements, nn, nl);
             for k in 0..self.mesh.n_elements {
                 for i in 0..nn {
-                    let [x, _] = self.mesh.reference_to_physical(
+                    let x = self.mesh.reference_to_physical(
                         ElementIndex::new(k),
                         self.ops.nodes_r[i],
                         self.ops.nodes_s[i],
-                    );
+                    )[self.axis];
                     let idx = k * nn + i;
                     state.eta.data[idx] = 0.5 * (std::f64::consts::PI * x / self.length).cos();
                     for (l, &s) in self.sigma.sigma_rho().iter().enumerate() {
@@ -905,6 +934,60 @@ mod tests {
         assert!(
             max_err < 1e-12,
             "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
+    }
+
+    /// TODO P4.2 gate: the layer momentum moves with the layer transports. A
+    /// tide sloshes across a channel over a bed sloping across it, carrying a
+    /// sheared along-channel flow `u = 0.1(σ + ½)`; everything is uniform
+    /// along the channel. Without Coriolis, baroclinic pressure or viscosity,
+    /// the layers then exchange no volume (`Ω = 0`: each layer's transport
+    /// divergence is its share of `∂η/∂t`), and the along-channel momentum of
+    /// a layer changes only by the cross-channel advection, which conserves
+    /// it, and by its share `Δσ_l` of the depth-mean change. So each layer's
+    /// anomaly `∫ H_z,l (u_l − ū) dA` is conserved.
+    ///
+    /// The old velocity form `∂u/∂t = −∇·(u u)` moved `H_z u` by
+    /// `−Δσ_l D u ∂v/∂y` more than the flux form `−∂(H_z v u)/∂y`: the anomaly
+    /// drifted by 7.4e-3 of the layer transport within the period.
+    #[test]
+    fn layer_momentum_anomalies_are_conserved_across_a_tide() {
+        let case = SlopingTide::across_channel();
+        let physics = case.physics_with(ConstantMixing::new(0.0, 0.0));
+        let eos = LinearEOS::default();
+        let mut state = case.state(&physics, |_, _| (eos.t0, eos.s0));
+        let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+        let anomalies = |s: &Solution3D| -> Vec<f64> {
+            let mut column = DGSolution2D::new(case.mesh.n_elements, nn);
+            (0..nl)
+                .map(|l| {
+                    let ds = case.sigma.d_sigma()[l];
+                    for (idx, c) in column.data.iter_mut().enumerate() {
+                        let depth = s.eta.data[idx] - case.bathymetry.data[idx];
+                        *c = depth * ds * (s.u[idx * nl + l] - s.ubar.data[idx]);
+                    }
+                    column.integrate(&case.ops, &case.geom)
+                })
+                .collect()
+        };
+        let initial = anomalies(&state);
+        // The layer's transport over the channel (mean depth 8 m, u′ ≈ 0.1)
+        let scale = 8.0 / nl as f64 * 0.1 * 200.0 * case.length;
+        let (mut max_err, mut max_v) = (0.0_f64, 0.0_f64);
+        case.run(&physics, &mut state, |s, p| {
+            for (a, b) in anomalies(s).iter().zip(&initial) {
+                max_err = max_err.max((a - b).abs() / scale);
+            }
+            max_v = max_v.max(s.v.iter().fold(0.0, |m, v| m.max(v.abs())));
+            let omega = s.w.iter().fold(0.0_f64, |m, w| m.max(w.abs()));
+            assert!(omega < 1e-12, "the layers exchanged volume: Ω {omega:.2e}");
+            assert!(p.last_surface_residual() < 1e-12);
+        });
+        assert!(max_v > 1e-2, "test regime: no tide ({max_v:.2e} m/s)");
+        // Measured 9.6e-16; before, 7.4e-3
+        assert!(
+            max_err < 1e-12,
+            "layer momentum anomaly drifted by {max_err:.3e} of the layer transport"
         );
     }
 
@@ -1130,7 +1213,7 @@ mod tests {
                     .chain([drift]),
             );
         });
-        // Measured 5.3e-9 (4e-10 of the values): the 2D pass balances nearly
+        // Measured 4.7e-9 (4e-10 of the values): the 2D pass balances nearly
         // dry elements to round-off of the domain's η change, which their
         // tiny volumes amplify. Wet elements hold to ≈ 1e-13 (the P4.2 gate).
         assert!(drift < 5e-8, "uniform tracers drifted by {drift:.3e}");
@@ -1148,7 +1231,7 @@ mod tests {
                 (beach_inventory(&physics, s, &s.salt) - s0).abs() / s0,
             ]);
         });
-        // Measured 7.4e-12: elements too dry to define a concentration keep
+        // Measured 2.3e-11: elements too dry to define a concentration keep
         // their last one (3e-15 without wetting and drying, the P4.2 gate)
         assert!(max_err < 5e-11, "inventories drifted by {max_err:.3e}");
     }
@@ -1167,7 +1250,7 @@ mod tests {
                     .chain([max_speed]),
             );
         });
-        // Measured 2.0e-13 m/s
+        // Measured 1.3e-13 m/s
         assert!(max_speed < 1e-10, "the lake spun up {max_speed:.3e} m/s");
     }
 
@@ -1354,7 +1437,7 @@ mod tests {
             dragged = dragged.max(speed(s))
         });
         assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
-        // Measured 3.29 m/s free, 0.72 m/s with drag
+        // Measured 3.15 m/s free, 0.72 m/s with drag
         assert!(dragged < 0.5 * free, "drag {dragged} vs free {free}");
     }
 
@@ -1460,12 +1543,13 @@ mod tests {
 
         let (err, eta) = run(&[BoundaryTag::Wall]);
         let (closed_err, _) = run(&[BoundaryTag::Wall, BoundaryTag::Open]);
-        // Measured 6.5e-14 of v̄ and 3.6e-15 m; with the open faces as walls
-        // the flow is 1.9e-2 of v̄ off after a day
+        // Measured 5.7e-14 of v̄ and 3.6e-15 m; with the open faces as walls
+        // the flow is 2.6e-4 of v̄ off after a day (1.9e-2 with the old
+        // velocity-form advection, which also mirrored the velocity there)
         assert!(err < 1e-10, "the flow changed by {err:.3e} of v̄ in a day");
         assert!(eta < 1e-10, "η moved by {eta:.3e} m");
         assert!(
-            closed_err > 1e-3,
+            closed_err > 1e-4,
             "test regime: walls changed it by only {closed_err:.3e}"
         );
     }
