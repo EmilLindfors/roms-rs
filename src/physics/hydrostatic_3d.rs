@@ -51,7 +51,7 @@ use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::physics::vertical_velocity::compute_vertical_velocity;
 use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
-    BarotropicFlux, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
+    BarotropicFlux, Boundaries3D, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
     TracerBoundaryCondition3D, TracerTransportScratch, apply_coriolis_3d,
     apply_horizontal_advection_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
 };
@@ -89,6 +89,9 @@ where
     pub temp_bc: Arc<dyn TracerBoundaryCondition3D>,
     /// Salinity of water flowing in through a physical boundary (see `temp_bc`).
     pub salt_bc: Arc<dyn TracerBoundaryCondition3D>,
+    /// Walls and open faces of the 3D kernels (see
+    /// [`Self::with_wall_tags`]).
+    pub boundaries: Boundaries3D,
     pub tracer_limiter: TracerLimiter3DConfig,
     /// Columns shallower than this (m) are thin (3D wetting and drying; see
     /// [`Self::with_min_column_depth`]).
@@ -152,6 +155,7 @@ where
             rho0,
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
             salt_bc: Arc::new(ExtrapolationTracerBC3D),
+            boundaries: Boundaries3D::default(),
             tracer_limiter: TracerLimiter3DConfig::none(),
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             bottom_drag: None,
@@ -240,6 +244,21 @@ where
         }
     }
 
+    /// The boundary tags that are walls for the 3D kernels (default
+    /// [`crate::mesh::BoundaryTag::Wall`]; untagged faces are always walls).
+    /// Every other boundary is open: its layers carry the 2D open-boundary
+    /// flux in the interior's vertical profile, and the 3D velocity is
+    /// extrapolated there (see [`crate::solver::rhs::boundary_3d`]). Match
+    /// the 2D module's boundary condition: a tag it treats as a wall must be
+    /// a wall here.
+    pub fn with_wall_tags(
+        mut self,
+        tags: impl IntoIterator<Item = crate::mesh::BoundaryTag>,
+    ) -> Self {
+        self.boundaries = Boundaries3D::with_walls(tags);
+        self
+    }
+
     /// Override scalar tracer boundary conditions used by the high-level RHS path.
     pub fn with_tracer_boundary_conditions(
         mut self,
@@ -301,6 +320,7 @@ where
             coriolis: &self.coriolis,
             temp_bc: &*self.temp_bc,
             salt_bc: &*self.salt_bc,
+            boundaries: &self.boundaries,
             g: self.g,
             rho0: self.rho0,
             min_column_depth: self.min_column_depth,
@@ -362,6 +382,7 @@ where
             &self.geom,
             &self.sigma,
             &self.bathymetry,
+            &self.boundaries,
         );
         compute_transport_rhs_3d(rhs, state, transport, &self.rhs_config(), scratch);
         self.zero_thin_momentum(state, rhs);
@@ -557,7 +578,14 @@ where
         }
         bar_rhs.u.fill(0.0);
         bar_rhs.v.fill(0.0);
-        apply_horizontal_advection_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.geom);
+        apply_horizontal_advection_3d(
+            bar_rhs,
+            bar,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &self.boundaries,
+        );
         apply_coriolis_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.coriolis);
 
         let [tau_sx, tau_sy] = self.forcing.surface_stress;
