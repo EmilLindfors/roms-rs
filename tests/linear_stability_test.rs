@@ -13,6 +13,10 @@
 //! element 0): one small matrix per θ instead of the whole Jacobian. The gate
 //! uses it; distorted meshes and beds, which only raise the limit, need the
 //! whole Jacobian (`print_linear_cfl_limits`, ignored: slow in debug builds).
+//!
+//! Elements with a dry node replace the volume term by the `WetDry` subcell
+//! finite volumes, whose limit is lower and is measured separately, with
+//! every element on the subcells (`subcell_*`).
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -24,7 +28,7 @@ use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D};
 use dg_rs::solver::{
     SWEFormulation2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
-    linear_cfl_swe_2d, positivity_cfl_swe_2d,
+    linear_cfl_subcells_swe_2d, linear_cfl_swe_2d, positivity_cfl_swe_2d,
 };
 use dg_rs::time::SspScheme;
 use dg_rs::types::{Depth, ElementIndex};
@@ -66,6 +70,9 @@ struct Case {
     distorted: bool,
     /// Relative amplitude of a sinusoidal bed (lake at rest over it)
     bed_amplitude: f64,
+    /// Every element on the `WetDry` subcells (a dry threshold above the
+    /// depth), as elements with a dry node are
+    subcells: bool,
 }
 
 impl Case {
@@ -77,6 +84,7 @@ impl Case {
             froude,
             distorted: false,
             bed_amplitude: 0.0,
+            subcells: false,
         }
     }
 }
@@ -125,7 +133,11 @@ impl Linearised {
         .with_formulation(case.formulation)
         .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
         .with_wet_dry(WetDryConfig::new(
-            Depth::new(WetDryConfig::DEFAULT_H_DRY),
+            Depth::new(if case.subcells {
+                2.0 * DEPTH
+            } else {
+                WetDryConfig::DEFAULT_H_DRY
+            }),
             G,
         ))
         .build();
@@ -374,6 +386,194 @@ fn print_linear_cfl_limits() {
                 .to_vec();
             println!(
                 "N={order} size {size:?} Fr {froude} distorted {distorted} bed {bed_amplitude}: {limits:.3?}"
+            );
+        }
+    }
+}
+
+/// Whether a random perturbation of the equilibrium (1e-3 of the depth)
+/// stays bounded (below 100× its size) over `steps` steps of `scheme` at
+/// `cfl`, without post-processing. The subcell reconstruction's limiter is
+/// positively homogeneous, so the outcome does not depend on the amplitude.
+fn perturbation_stays_bounded(
+    linearised: &Linearised,
+    scheme: SspScheme,
+    cfl: f64,
+    steps: usize,
+) -> bool {
+    let mut state = 7_u64;
+    let mut rand = || {
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        ((z ^ (z >> 31)) as f64 / u64::MAX as f64) - 0.5
+    };
+    let q0 = &linearised.q0;
+    let mut q = q0.clone();
+    for var in 0..3 {
+        for v in &mut q.data[var] {
+            *v += 1e-3 * DEPTH * rand();
+        }
+    }
+    let size = |q: &SWESolution2D| {
+        q.data
+            .iter()
+            .flatten()
+            .zip(q0.data.iter().flatten())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+    };
+    let before = size(&q);
+    let dt = cfl * linearised.dt1;
+    let physics = &linearised.physics;
+    let mut rhs = q.clone();
+    // q ← a·u0 + b·(q + c·dt·L(q))
+    let mut stage = |q: &mut SWESolution2D, u0: &SWESolution2D, a: f64, b: f64, c: f64| {
+        physics.compute_rhs_into(q, 0.0, &mut rhs);
+        for ((x, r), y) in q
+            .data
+            .iter_mut()
+            .flatten()
+            .zip(rhs.data.iter().flatten())
+            .zip(u0.data.iter().flatten())
+        {
+            *x = a * y + b * (*x + c * dt * r);
+        }
+    };
+    for _ in 0..steps {
+        let u0 = q.clone();
+        match scheme {
+            SspScheme::Rk3 => {
+                stage(&mut q, &u0, 0.0, 1.0, 1.0);
+                stage(&mut q, &u0, 0.75, 0.25, 1.0);
+                stage(&mut q, &u0, 1.0 / 3.0, 2.0 / 3.0, 1.0);
+            }
+            SspScheme::Rk43 => {
+                stage(&mut q, &u0, 0.0, 1.0, 0.5);
+                stage(&mut q, &u0, 0.0, 1.0, 0.5);
+                stage(&mut q, &u0, 2.0 / 3.0, 1.0 / 3.0, 0.5);
+                stage(&mut q, &u0, 0.0, 1.0, 0.5);
+            }
+        }
+        let grown = size(&q);
+        if grown.is_nan() || grown >= 100.0 * before {
+            return false;
+        }
+    }
+    true
+}
+
+/// The subcells' limit, taken as the smaller of two measurements with every
+/// element on the subcells: the linear limit (the Bloch spectrum at rest:
+/// a one-node perturbation of a uniform state leaves every limited slope
+/// zero, so this is the first-order scheme), and the largest CFL at which
+/// the limited second-order reconstruction keeps a random perturbation
+/// bounded.
+fn subcell_case(order: usize, size: (f64, f64), froude: f64) -> Case {
+    Case {
+        subcells: true,
+        ..Case::new(order, SWEFormulation2D::WetDry, size, froude)
+    }
+}
+
+/// The tabulated subcell limits (`linear_cfl_subcells_swe_2d`) lie below
+/// the linear limits of the first-order subcells on squares, 3:1 and 10:1
+/// rectangles, and below the DGSEM ones: `PositivityBound` caps elements
+/// with a dry node at 0.9 of them.
+#[test]
+fn subcell_limits_are_inside_the_stability_regions() {
+    for size in [(1.0, 1.0), (3.0, 1.0), (10.0, 1.0)] {
+        for order in 1..=4 {
+            let case = subcell_case(order, size, 0.0);
+            let linearised = Linearised::new(&case, 3);
+            let eigenvalues = linearised.bloch_spectrum(&case, THETAS);
+            for (scheme, r) in SCHEMES {
+                let measured = cfl_limit(&eigenvalues, linearised.dt1, r);
+                let table = linear_cfl_subcells_swe_2d(order, scheme).unwrap();
+                println!("{case:?}: {scheme:?} {measured:.3} (table {table})");
+                assert!(
+                    table <= measured,
+                    "{case:?}: {scheme:?} limit {measured:.3} below the table's {table}"
+                );
+                assert!(table < linear_cfl_swe_2d(order, scheme).unwrap());
+                // At least the plain positivity bound (times the SSP
+                // coefficient), which every wet/dry run has stepped at
+                let positivity = scheme.ssp_coefficient() * positivity_cfl_swe_2d(order);
+                assert!(table >= positivity, "{scheme:?} N = {order}");
+            }
+        }
+    }
+}
+
+/// With the limited reconstruction a random perturbation stays bounded at
+/// the tabulated limit, and grows at the first-order linear limit: at N = 2
+/// under SSP-RK(4,3) on elongated elements the reconstruction, not the
+/// first-order scheme, sets the limit (1.13 against 1.30 on 10:1).
+#[test]
+fn subcell_reconstruction_is_stable_at_the_tabulated_limit() {
+    let case = subcell_case(2, (10.0, 1.0), 0.0);
+    let perturbed = Linearised::new(&case, 6);
+    for (scheme, _) in SCHEMES {
+        let table = linear_cfl_subcells_swe_2d(2, scheme).unwrap();
+        assert!(
+            perturbation_stays_bounded(&perturbed, scheme, table, 1000),
+            "{scheme:?} at {table}"
+        );
+    }
+    assert!(!perturbation_stays_bounded(
+        &perturbed,
+        SspScheme::Rk43,
+        1.25,
+        1000
+    ));
+}
+
+/// Both measurements over square to 30:1 rectangles, at rest and with a
+/// diagonal flow at Froude 0.5 (`--ignored`, in release).
+///
+/// Measured 2026-09-29 (linear / nonlinear, SSP-RK3 then SSP-RK(4,3)), for
+/// N = 1–4:
+/// - squares: 0.942 / 1.005, 1.764 / 1.761; 0.685 / 0.670, 1.267 / 1.244;
+///   0.520 / 0.519, 0.994 / 0.993; 0.407 / 0.407, 0.787 / 0.789;
+/// - 10:1: 0.942 / 1.000, 1.555 / 1.554; 0.660 / 0.662, 1.296 / 1.134; 0.478 /
+///   0.485, 0.980 / 0.990; 0.370 / 0.373, 0.759 / 0.766;
+/// - 30:1: 0.942 / 0.996, 1.525 / 1.520; 0.658 / 0.659, 1.282 / 1.111; 0.476 /
+///   0.480, 0.976 / 0.985; 0.369 / 0.373, 0.756 / 0.764;
+/// - 3:1 in between, and a flow raises every limit (squares at Froude 0.5:
+///   1.02–1.78 at N = 1 to 0.51–1.05 at N = 4).
+#[test]
+#[ignore = "measurement"]
+fn print_subcell_limits() {
+    let cases = [
+        ((1.0, 1.0), 0.0),
+        ((3.0, 1.0), 0.0),
+        ((10.0, 1.0), 0.0),
+        ((30.0, 1.0), 0.0),
+        ((1.0, 1.0), 0.5),
+        ((10.0, 1.0), 0.5),
+    ];
+    for (size, froude) in cases {
+        for order in 1..=4 {
+            let case = subcell_case(order, size, froude);
+            let linearised = Linearised::new(&case, 3);
+            let eigenvalues = linearised.bloch_spectrum(&case, THETAS);
+            let linear = SCHEMES.map(|(_, r)| cfl_limit(&eigenvalues, linearised.dt1, r));
+            let perturbed = Linearised::new(&case, 6);
+            let nonlinear = SCHEMES.map(|(scheme, _)| {
+                let (mut lo, mut hi) = (0.1, 4.0);
+                for _ in 0..12 {
+                    let mid = 0.5 * (lo + hi);
+                    if perturbation_stays_bounded(&perturbed, scheme, mid, 1000) {
+                        lo = mid
+                    } else {
+                        hi = mid
+                    }
+                }
+                lo
+            });
+            println!(
+                "N={order} size {size:?} Fr {froude}: linear {linear:.3?}, nonlinear {nonlinear:.3?}"
             );
         }
     }

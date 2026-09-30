@@ -109,9 +109,11 @@
 //! `rk=43` (the default) steps with SSP-RK(4,3), `rk=3` with SSP-RK3. The
 //! positivity bound of the wet/dry scheme sets the step where elements may
 //! run dry, and SSP-RK(4,3)'s SSP coefficient of 2 doubles it for 4/3 of the
-//! RHS work per step. In well-filled elements the bound is relaxed up to
-//! `cfl=`, by default 0.9 of the integrator's linear stability limit
-//! (`linear_cfl_swe_2d`: 1.36 at P2 with SSP-RK(4,3)).
+//! RHS work per step. The bound is relaxed per element by how its water is
+//! distributed, up to `cfl=`, by default 0.9 of the integrator's linear
+//! stability limit (`linear_cfl_swe_2d`: 1.36 at P2 with SSP-RK(4,3)), and
+//! in shoreline elements up to 0.9 of the subcells' lower limit
+//! (`linear_cfl_subcells_swe_2d`: 0.99 at P2).
 //!
 //! Harmonic validation needs the record after spin-up to resolve the main
 //! constituents: 15 days separate M2/S2 and K1/O1 (`hours=384` with the

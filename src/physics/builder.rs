@@ -145,13 +145,14 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     }
 
     /// The positivity bound of a wet/dry run under the SSP scheme `scheme`,
-    /// relaxed in elements whose every node is deeper than the dry threshold
-    /// (`WetDryConfig::h_dry`, else the equation's `h_min`).
+    /// capped at the subcells' stability limit in elements with a node at or
+    /// below the RHS's subcell threshold (`WetDryConfig::h_dry`, else its
+    /// default).
     fn positivity_bound(&self, scheme: Option<SspScheme>) -> Option<PositivityBound> {
         let h_dry = self
             .wet_dry
             .as_ref()
-            .map_or(self.equation.h_min.meters(), |config| config.h_dry.meters());
+            .map_or(WetDryConfig::DEFAULT_H_DRY, |config| config.h_dry.meters());
         self.has_wetting_drying()
             .then(|| PositivityBound::new(self.order, scheme, h_dry))
     }
