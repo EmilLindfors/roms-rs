@@ -6,6 +6,17 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **3D open boundaries (TODO P4.2).** The 3D kernels treated every physical boundary as a wall: the 3D velocity was reflected, and each layer took a depth-uniform share of the 2D boundary flux. A sheared or estuarine exchange flow could not leave through an open boundary with its shear.
+  - New `solver::rhs::boundary_3d`: `Boundaries3D` classifies every face once, for the momentum advection, the layer transports and Ω, and the tracer transport. A face is an element, a wall (`BoundaryTag::Wall` by default, and untagged faces) or open (every other tag); `Hydrostatic3D::with_wall_tags` changes the wall tags.
+  - At open faces the layers carry the 2D open-boundary flux in the interior's vertical profile, `F_l = Q_l·n + Δσ_l (F_2D − Σ Q·n)`, and the 3D velocity is extrapolated (zero gradient). Tracers flowing in take `TracerBoundaryCondition3D`, as before. Walls are unchanged.
+  - API: `apply_horizontal_advection_3d`, `LayerTransport::compute` and `apply_tracer_transport_3d` take the `Boundaries3D`; `Rhs3DConfig` has a `boundaries` field.
+  - Gates:
+    - `a_sheared_flow_passes_through_open_boundaries`: the steady wind-against-drag flow crosses a channel open at both ends unchanged, to 6.5e-14 of v̄ over a day. With the open faces as walls (the old behaviour) it is 1.9e-2 off.
+    - `a_tide_enters_through_an_open_boundary_as_in_the_2d_model`: M2 through a characteristic OBC into a shoaling channel; η follows the 2D model to 3.9e-6 m. It is the first 3D test with an open boundary.
+    - Unit tests: open-face layer fluxes keep the interior profile; Ω closes at the surface; constancy with open faces; the inventory changes by exactly the tracer carried through the open faces; uniform sheared flow has no advective tendency through open faces but does at walls.
+  - Not yet: prescribed 3D profiles at open faces (nesting of baroclinic u, v and T/S), and radiation of internal waves (TODO P4.2).
+  - Found on the way (TODO P1.2): `SWEPhysics2DBuilder::with_bathymetry` without wet/dry uses `Standard`, which needs an explicit `BathymetrySource2D` for the bed slope. Without it a lake at rest over a slope reaches η = +10 m within an hour.
+
 - **Quadratic bottom drag in 3D (TODO P4.4).** The 3D bottom stress was a user constant (`Forcing::bottom_stress`). `Hydrostatic3D::with_bottom_drag(BottomDrag3D)` now applies `τ_b/ρ₀ = C_d|u_b|u_b` of the bottom-layer velocity, with a constant `C_d` (`BottomDrag3D::quadratic`) or the log-layer `C_d = (κ/ln(z_b/z₀))²` at the bottom-layer centre, bounded to [0.0025, 0.1] (`BottomDrag3D::log_layer(z0)`, `with_bounds`).
   - Linearised over each baroclinic step with the rate `r = C_d|u_bⁿ|`. The mode splitter applies the depth-mean part `−r·ū` point-implicitly in every barotropic RK stage (stable for any `r·Δt/D`, like the 2D implicit friction); G carries the shear part `−r·(u_bⁿ − ūⁿ)`; the implicit vertical diffusion takes `r·u_bⁿ⁺¹` as its bottom flux. Without shear the 3D model therefore has the 2D quadratic friction `C_d|ū|ū/h` exactly. Thin columns (P4.5) drag with `C_d|ū|`.
   - API: `ModeSplitPhysics::bottom_drag_into` (default: none); `ModeSplitPhysics::vertical_implicit` and `apply_vertical_diffusion` take the drag rates (`Option<&[f64]>`).

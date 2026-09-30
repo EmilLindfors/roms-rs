@@ -23,6 +23,7 @@ use crate::solver::rhs::advection_3d::{
     TracerBoundaryCondition3D, apply_horizontal_advection_3d, apply_vertical_advection_3d,
 };
 use crate::solver::rhs::baroclinic::compute_pressure_gradient;
+use crate::solver::rhs::boundary_3d::Boundaries3D;
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
     LayerTransport, TracerTransportScratch, apply_tracer_transport_3d,
@@ -41,6 +42,8 @@ pub struct Rhs3DConfig<'a> {
     pub coriolis: &'a CoriolisSource2D,
     pub temp_bc: &'a dyn TracerBoundaryCondition3D,
     pub salt_bc: &'a dyn TracerBoundaryCondition3D,
+    /// Walls and open faces of the domain.
+    pub boundaries: &'a Boundaries3D,
     pub g: f64,
     pub rho0: f64,
     /// Columns shallower than this (m) are thin (3D wetting and drying).
@@ -74,7 +77,14 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         &mut rhs.u,
         &mut rhs.v,
     );
-    apply_horizontal_advection_3d(rhs, state, config.mesh, config.ops, config.geom);
+    apply_horizontal_advection_3d(
+        rhs,
+        state,
+        config.mesh,
+        config.ops,
+        config.geom,
+        config.boundaries,
+    );
     apply_coriolis_3d(rhs, state, config.mesh, config.ops, config.coriolis);
     // TODO: horizontal viscosity/diffusion (P4.5)
 }
@@ -110,6 +120,7 @@ pub fn compute_transport_rhs_3d(
             config.ops,
             config.geom,
             bc,
+            config.boundaries,
             scratch,
         );
     }

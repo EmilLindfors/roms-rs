@@ -12,6 +12,7 @@
 use crate::mesh::Mesh2D;
 use crate::mesh::data::{Bathymetry2D, BoundaryTag};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::rhs::boundary_3d::{Boundaries3D, FaceExterior};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -38,8 +39,9 @@ pub struct TracerBCContext3D {
 /// flux is the layer's volume flux times that concentration, so a wall (no
 /// volume flux; the 2D wall condition) passes no tracer, whatever the value,
 /// and an open boundary passes exactly the tracer its volume flux carries.
-/// The layer volume fluxes at open boundaries are the layer shares of the 2D
-/// open-boundary flux (no 3D open-boundary momentum condition yet, TODO P4.2).
+/// The layer volume fluxes at open boundaries carry the 2D open-boundary flux
+/// in the interior's vertical profile (see
+/// [`crate::solver::rhs::boundary_3d`]).
 pub trait TracerBoundaryCondition3D: Send + Sync {
     fn exterior_value(&self, ctx: &TracerBCContext3D) -> f64;
 }
@@ -94,15 +96,16 @@ impl TracerBoundaryCondition3D for UpwindTracerBC3D {
 /// Apply horizontal advection to 3D fields.
 ///
 /// Computes $-\nabla_H \cdot (\mathbf{u}_H \phi)$ for $\phi = u, v$.
-/// (Tracers not yet connected, but same logic applies).
-///
-/// This implementation uses a strong-form DG kernel layer-by-layer.
+/// Strong-form DG kernel level by level, with a Rusanov face flux. Physical
+/// boundaries follow `boundaries`: walls mirror the velocity, open faces
+/// extrapolate it (see [`crate::solver::rhs::boundary_3d`]).
 pub fn apply_horizontal_advection_3d(
     rhs: &mut Solution3D,
     state: &Solution3D,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
+    boundaries: &Boundaries3D,
 ) {
     let n_levels = state.n_levels;
     let n_nodes = ops.n_nodes;
@@ -186,7 +189,7 @@ pub fn apply_horizontal_advection_3d(
 
         // --- Surface Terms ---
         // We apply surface terms separately as they involve neighbor lookups
-        apply_horizontal_surface_terms(rhs, state, mesh, ops, geom, k);
+        apply_horizontal_surface_terms(rhs, state, mesh, ops, geom, boundaries, k);
     }
 }
 
@@ -246,6 +249,7 @@ fn apply_horizontal_surface_terms(
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
+    boundaries: &Boundaries3D,
     k: usize,
 ) {
     let el_idx = ElementIndex::new(k);
@@ -261,8 +265,7 @@ fn apply_horizontal_surface_terms(
 
         let face_nodes = &ops.face_nodes[face];
 
-        // Identify neighbor
-        let neighbor_info = mesh.neighbor(el_idx, face);
+        let exterior = boundaries.exterior(mesh, el_idx, face);
 
         // Loop over levels
         for l in 0..n_levels {
@@ -280,24 +283,34 @@ fn apply_horizontal_surface_terms(
             let mut u_ext = vec![0.0; n_face_nodes];
             let mut v_ext = vec![0.0; n_face_nodes];
 
-            if let Some(nb) = neighbor_info {
-                let nb_idx = ElementIndex::new(nb.element);
-                let nb_face_nodes = &ops.face_nodes[nb.face];
+            match exterior {
+                FaceExterior::Element(nb) => {
+                    let nb_idx = ElementIndex::new(nb.element);
+                    let nb_face_nodes = &ops.face_nodes[nb.face];
 
-                // Neighbor orientation reversal
-                for i in 0..n_face_nodes {
-                    let ni = nb_face_nodes[n_face_nodes - 1 - i];
-                    u_ext[i] = state.u_column(nb_idx, ni)[l];
-                    v_ext[i] = state.v_column(nb_idx, ni)[l];
+                    // Neighbor orientation reversal
+                    for i in 0..n_face_nodes {
+                        let ni = nb_face_nodes[n_face_nodes - 1 - i];
+                        u_ext[i] = state.u_column(nb_idx, ni)[l];
+                        v_ext[i] = state.v_column(nb_idx, ni)[l];
+                    }
                 }
-            } else {
-                // Physical boundary: solid (land) wall with free slip. Mirror the
-                // normal velocity (u_ext·n = −u_int·n) and preserve the tangential
-                // component, so no momentum is advected through the coastline.
-                // Copying the interior (transmissive) would let momentum leak out.
-                for i in 0..n_face_nodes {
-                    (u_ext[i], v_ext[i]) =
-                        crate::boundary::reflect_velocity(u_int[i], v_int[i], normal.0, normal.1);
+                FaceExterior::Wall => {
+                    // Solid (land) wall with free slip. Mirror the normal
+                    // velocity (u_ext·n = −u_int·n) and preserve the tangential
+                    // component, so no momentum is advected through the
+                    // coastline. Copying the interior would let momentum leak
+                    // out.
+                    for i in 0..n_face_nodes {
+                        (u_ext[i], v_ext[i]) = crate::boundary::reflect_velocity(
+                            u_int[i], v_int[i], normal.0, normal.1,
+                        );
+                    }
+                }
+                FaceExterior::Open(_) => {
+                    // Zero gradient: the flux is the interior's own
+                    u_ext.copy_from_slice(&u_int);
+                    v_ext.copy_from_slice(&v_int);
                 }
             }
 
@@ -453,6 +466,43 @@ mod tests {
             "expected {b}, got {a}, error {}",
             (a - b).abs()
         );
+    }
+
+    /// A uniform, sheared flow (different in every level) has no advective
+    /// tendency when it crosses open faces: the momentum leaves and enters
+    /// with the flow. Through walls the mirrored velocity pushes back.
+    #[test]
+    fn uniform_flow_crosses_open_faces_without_tendency() {
+        let ops = DGOperators2D::new(2);
+        let n_levels = 3;
+        let run = |tag: BoundaryTag| {
+            let mesh = Mesh2D::uniform_rectangle_with_bc(0.0, 3.0, 0.0, 2.0, 3, 2, tag);
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
+            for column in state.u.chunks_exact_mut(n_levels) {
+                column.copy_from_slice(&[0.2, 0.5, 0.9]);
+            }
+            for column in state.v.chunks_exact_mut(n_levels) {
+                column.copy_from_slice(&[-0.1, 0.3, 0.0]);
+            }
+            let mut rhs = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
+            apply_horizontal_advection_3d(
+                &mut rhs,
+                &state,
+                &mesh,
+                &ops,
+                &geom,
+                &Boundaries3D::default(),
+            );
+            rhs.u
+                .iter()
+                .chain(&rhs.v)
+                .fold(0.0_f64, |m, x| m.max(x.abs()))
+        };
+        let open = run(BoundaryTag::Open);
+        assert!(open < 1e-12, "open faces: tendency {open:.3e}");
+        let wall = run(BoundaryTag::Wall);
+        assert!(wall > 0.1, "walls: tendency {wall:.3e}");
     }
 
     /// Regression: Ω from `compute_vertical_velocity` is a volume flux per unit

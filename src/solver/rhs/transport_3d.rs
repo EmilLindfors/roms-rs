@@ -21,7 +21,8 @@
 //! corrector step):
 //!
 //! 1. `Q_l = H_z,l u_l` at the nodes, and the central average
-//!    `{{Q_l}}·n` at the element faces;
+//!    `{{Q_l}}·n` at the element faces (at open boundaries the interior's
+//!    `Q_l·n`, at walls none; [`crate::solver::rhs::boundary_3d`]);
 //! 2. corrected by the layer's share of the difference to the barotropic
 //!    transport, `Q_l += Δσ_l (DU_avg2 − Σ_m Q_m)` at the nodes and on the
 //!    faces, so that `Σ_l Q_l = DU_avg2` exactly. The dissipative part of the
@@ -48,6 +49,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
+use crate::solver::rhs::boundary_3d::{Boundaries3D, FaceExterior};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -156,7 +158,8 @@ impl LayerTransport {
     }
 
     /// Layer transports and `Ω` of `state` (its `η`, `u`, `v`), corrected to
-    /// the barotropic transport `barotropic`.
+    /// the barotropic transport `barotropic`, with the physical boundaries
+    /// `boundaries`.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
@@ -167,6 +170,7 @@ impl LayerTransport {
         geom: &GeometricFactors2D,
         sigma: &SigmaGrid,
         bathymetry: &Bathymetry2D,
+        boundaries: &Boundaries3D,
     ) {
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, self.n_levels);
         assert_eq!(state.n_levels, nl, "layer count of the state");
@@ -208,20 +212,25 @@ impl LayerTransport {
         for k in 0..state.n_elements {
             let el = ElementIndex::new(k);
             for f in 0..4 {
-                let neighbor = mesh.neighbor(el, f);
+                let exterior = boundaries.exterior(mesh, el, f);
                 for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
                     let (nx, ny) = geom.normal(k, f, fi);
                     let interior = (k * nn + node) * nl;
-                    let exterior = neighbor
-                        .map(|nb| (nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl);
+                    // The profile of the layer fluxes: central between
+                    // elements, the interior's at open boundaries (the shear
+                    // leaves with the flow), none at walls
+                    let across = match exterior {
+                        FaceExterior::Element(nb) => {
+                            Some((nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl)
+                        }
+                        FaceExterior::Open(_) => Some(interior),
+                        FaceExterior::Wall => None,
+                    };
                     let slot = (k * 4 + f) * nfn + fi;
                     let fluxes = &mut self.face[slot * nl..(slot + 1) * nl];
                     let mut sum = 0.0;
                     for (l, flux) in fluxes.iter_mut().enumerate() {
-                        // A physical boundary carries no layer flux of its own:
-                        // all of it comes from the barotropic flux (zero at
-                        // walls, the 2D open-boundary flux elsewhere).
-                        *flux = exterior.map_or(0.0, |e| {
+                        *flux = across.map_or(0.0, |e| {
                             let q_in = nx * self.hu[interior + l] + ny * self.hv[interior + l];
                             let q_ex = nx * self.hu[e + l] + ny * self.hv[e + l];
                             0.5 * (q_in + q_ex)
@@ -393,6 +402,7 @@ pub fn apply_tracer_transport_3d(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     bc: &dyn TracerBoundaryCondition3D,
+    boundaries: &Boundaries3D,
     scratch: &mut TracerTransportScratch,
 ) {
     let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, transport.n_levels);
@@ -413,26 +423,28 @@ pub fn apply_tracer_transport_3d(
                 hv[i] = transport.hv[idx] * tracer[idx];
             }
             for f in 0..4 {
-                let neighbor = mesh.neighbor(el, f);
+                let exterior = boundaries.exterior(mesh, el, f);
                 for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
                     let slot = (k * 4 + f) * nfn + fi;
                     let flux = transport.face[slot * nl + l];
                     let interior = tracer[(k * nn + node) * nl + l];
-                    let upwind = if flux >= 0.0 {
-                        interior
-                    } else if let Some(nb) = neighbor {
-                        let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
-                        tracer[(nb.element * nn + nb_node) * nl + l]
-                    } else {
-                        bc.exterior_value(&TracerBCContext3D {
+                    let upwind = match exterior {
+                        _ if flux >= 0.0 => interior,
+                        FaceExterior::Element(nb) => {
+                            let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
+                            tracer[(nb.element * nn + nb_node) * nl + l]
+                        }
+                        FaceExterior::Open(tag) => bc.exterior_value(&TracerBCContext3D {
                             element: k,
                             face: f,
                             level: l,
                             face_node: fi,
-                            boundary_tag: mesh.boundary_tag(el, f),
+                            boundary_tag: Some(tag),
                             interior_value: interior,
                             normal_velocity: flux,
-                        })
+                        }),
+                        // A wall passes no volume: only a round-off flux
+                        FaceExterior::Wall => interior,
                     };
                     face[f * nfn + fi] = flux * upwind;
                 }
@@ -486,6 +498,7 @@ impl TracerTransportScratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::data::BoundaryTag;
     use crate::solver::rhs::advection_3d::{
         ExtrapolationTracerBC3D, FixedTracerBC3D, UpwindTracerBC3D,
     };
@@ -494,9 +507,10 @@ mod tests {
     const LX: f64 = 2000.0;
     const LY: f64 = 1000.0;
 
-    /// A closed (or periodic) basin over a sloping, uneven bed with a sheared,
-    /// non-uniform flow, a barotropic transport that is not the depth integral
-    /// of the 3D velocities, and the free-surface rate that transport implies.
+    /// A closed, periodic or open basin over a sloping, uneven bed with a
+    /// sheared, non-uniform flow, a barotropic transport that is not the depth
+    /// integral of the 3D velocities, and the free-surface rate that transport
+    /// implies.
     struct Case {
         mesh: Mesh2D,
         ops: DGOperators2D,
@@ -508,6 +522,7 @@ mod tests {
         du_hv: Vec<f64>,
         du_face: Vec<f64>,
         eta_rate: Vec<f64>,
+        boundaries: Boundaries3D,
     }
 
     fn wave(x: f64, y: f64) -> f64 {
@@ -550,21 +565,28 @@ mod tests {
             }
             // The barotropic face flux as a 2D kernel gives it: central average
             // of the nodal transport plus a jump term, single-valued on each
-            // face, zero through walls
+            // face, zero through walls; at open faces the interior's normal
+            // transport plus an offset (an open-boundary condition's flux
+            // differs from the interior's)
+            let boundaries = Boundaries3D::default();
             let mut du_face = vec![0.0; mesh.n_elements * 4 * nfn];
             for k in 0..mesh.n_elements {
                 let el = ElementIndex::new(k);
                 for f in 0..4 {
-                    let neighbor = mesh.neighbor(el, f);
+                    let exterior = boundaries.exterior(&mesh, el, f);
                     for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
                         let (nx, ny) = geom.normal(k, f, fi);
                         let a = k * nn + node;
-                        du_face[(k * 4 + f) * nfn + fi] = neighbor.map_or(0.0, |nb| {
-                            let b = nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi];
-                            let qa = nx * du_hu[a] + ny * du_hv[a];
-                            let qb = nx * du_hu[b] + ny * du_hv[b];
-                            0.5 * (qa + qb) - 0.3 * (state.eta.data[b] - state.eta.data[a])
-                        });
+                        let qa = nx * du_hu[a] + ny * du_hv[a];
+                        du_face[(k * 4 + f) * nfn + fi] = match exterior {
+                            FaceExterior::Element(nb) => {
+                                let b = nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi];
+                                let qb = nx * du_hu[b] + ny * du_hv[b];
+                                0.5 * (qa + qb) - 0.3 * (state.eta.data[b] - state.eta.data[a])
+                            }
+                            FaceExterior::Open(_) => qa + 0.4 * state.eta.data[a],
+                            FaceExterior::Wall => 0.0,
+                        };
                     }
                 }
             }
@@ -593,11 +615,18 @@ mod tests {
                 du_hv,
                 du_face,
                 eta_rate,
+                boundaries,
             }
         }
 
         fn closed() -> Self {
             Self::new(Mesh2D::uniform_rectangle(0.0, LX, 0.0, LY, 4, 3), true)
+        }
+
+        /// Open on all four sides, with flow through them.
+        fn open() -> Self {
+            let mesh = Mesh2D::uniform_rectangle_with_bc(0.0, LX, 0.0, LY, 4, 3, BoundaryTag::Open);
+            Self::new(mesh, false)
         }
 
         fn periodic() -> Self {
@@ -621,6 +650,7 @@ mod tests {
                 &self.geom,
                 &self.sigma,
                 &self.bathymetry,
+                &self.boundaries,
             );
             transport
         }
@@ -641,6 +671,7 @@ mod tests {
                 &self.ops,
                 &self.geom,
                 bc,
+                &self.boundaries,
                 &mut scratch,
             );
             rhs
@@ -668,7 +699,12 @@ mod tests {
     /// and on every face, and walls carry nothing.
     #[test]
     fn layer_transports_add_up_to_the_barotropic_transport() {
-        let case = Case::closed();
+        for case in [Case::closed(), Case::open()] {
+            layer_transports_add_up(&case);
+        }
+    }
+
+    fn layer_transports_add_up(case: &Case) {
         let transport = case.transport();
         let (nn, nfn, nl) = (
             case.ops.n_nodes,
@@ -692,7 +728,10 @@ mod tests {
         }
         for k in 0..case.mesh.n_elements {
             for f in 0..4 {
-                if case.mesh.neighbor(ElementIndex::new(k), f).is_none() {
+                let exterior = case
+                    .boundaries
+                    .exterior(&case.mesh, ElementIndex::new(k), f);
+                if exterior == FaceExterior::Wall {
                     let slots = (k * 4 + f) * nfn * nl..(k * 4 + f + 1) * nfn * nl;
                     assert_eq!(max_abs(transport.face[slots].iter().copied()), 0.0);
                 }
@@ -700,12 +739,63 @@ mod tests {
         }
     }
 
+    /// At an open face each layer carries the 2D flux in the interior's
+    /// vertical profile: `F_l = Q_l·n + Δσ_l (F_2D − Σ_m Q_m·n)`, so the
+    /// shear leaves (and enters) with the flow. Before, every layer took the
+    /// uniform share `Δσ_l F_2D`, as at a wall.
+    #[test]
+    fn open_faces_carry_the_interior_layer_profile() {
+        let case = Case::open();
+        let transport = case.transport();
+        let (nn, nfn, nl) = (
+            case.ops.n_nodes,
+            case.ops.n_face_nodes,
+            case.sigma.n_levels(),
+        );
+        let d_sigma = case.sigma.d_sigma();
+        let scale = max_abs(transport.face.iter().copied());
+        let (mut max_err, mut max_shear) = (0.0_f64, 0.0_f64);
+        for k in 0..case.mesh.n_elements {
+            for f in 0..4 {
+                let el = ElementIndex::new(k);
+                if !matches!(
+                    case.boundaries.exterior(&case.mesh, el, f),
+                    FaceExterior::Open(_)
+                ) {
+                    continue;
+                }
+                for (fi, &node) in case.ops.face_nodes[f].iter().enumerate() {
+                    let (nx, ny) = case.geom.normal(k, f, fi);
+                    let column = (k * nn + node) * nl;
+                    let q: Vec<f64> = (0..nl)
+                        .map(|l| nx * transport.hu[column + l] + ny * transport.hv[column + l])
+                        .collect();
+                    let q_sum: f64 = q.iter().sum();
+                    let slot = (k * 4 + f) * nfn + fi;
+                    for l in 0..nl {
+                        let expected = q[l] + d_sigma[l] * (case.du_face[slot] - q_sum);
+                        max_err = max_err.max((transport.face[slot * nl + l] - expected).abs());
+                        max_shear = max_shear.max((q[l] - d_sigma[l] * q_sum).abs());
+                    }
+                }
+            }
+        }
+        assert!(
+            max_shear > 0.05 * scale,
+            "test regime: no shear at the open faces"
+        );
+        assert!(
+            max_err < 1e-14 * scale,
+            "open-face layer fluxes off the interior profile by {max_err:.3e}"
+        );
+    }
+
     /// With `∂η/∂t = −∇·DU_avg2` (the barotropic pass's nodal identity), Ω
     /// integrated from the bed closes at the surface to round-off: nothing is
     /// left for the linear correction.
     #[test]
     fn omega_vanishes_at_the_surface_without_correction() {
-        for case in [Case::closed(), Case::periodic()] {
+        for case in [Case::closed(), Case::periodic(), Case::open()] {
             let transport = case.transport();
             let scale = max_abs(transport.omega.iter().copied());
             assert!(scale > 1e-4, "test flow should drive a non-trivial Ω");
@@ -722,14 +812,24 @@ mod tests {
     /// boundary value must not matter (walls carry no volume).
     #[test]
     fn uniform_tracer_follows_the_layer_thickness() {
-        let case = Case::closed();
-        let transport = case.transport();
         let c = 34.7;
+        let fixed = FixedTracerBC3D::new(5.0);
+        let same = FixedTracerBC3D::new(c);
+        let cases: [(Case, [&dyn TracerBoundaryCondition3D; 2]); 2] = [
+            (Case::closed(), [&ExtrapolationTracerBC3D, &fixed]),
+            // Open: the inflow must be the same water
+            (Case::open(), [&ExtrapolationTracerBC3D, &same]),
+        ];
+        for (case, bcs) in cases {
+            uniform_tracer_follows(&case, c, bcs);
+        }
+    }
+
+    fn uniform_tracer_follows(case: &Case, c: f64, bcs: [&dyn TracerBoundaryCondition3D; 2]) {
+        let transport = case.transport();
         let tracer = vec![c; case.state.temp.len()];
         let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
         let scale = c * max_abs(case.eta_rate.iter().copied());
-        let bcs: [&dyn TracerBoundaryCondition3D; 2] =
-            [&ExtrapolationTracerBC3D, &FixedTracerBC3D::new(5.0)];
         for bc in bcs {
             let rhs = case.tracer_rhs(&transport, &tracer, bc);
             for idx in 0..case.mesh.n_elements * nn {
@@ -772,6 +872,64 @@ mod tests {
         }
     }
 
+    /// Open faces: the inventory changes by exactly the tracer carried through
+    /// them, `d/dt ∫ Σ_l H_z C = −∮ Σ_l F_l C_up` (the interior's value on
+    /// outflow, the boundary condition's on inflow): nothing is created or
+    /// lost at the boundary.
+    #[test]
+    fn open_boundaries_change_the_inventory_by_the_boundary_flux() {
+        let case = Case::open();
+        let transport = case.transport();
+        let (nn, nfn, nl) = (
+            case.ops.n_nodes,
+            case.ops.n_face_nodes,
+            case.sigma.n_levels(),
+        );
+        let tracer = &case.state.temp;
+        let bcs: [&dyn TracerBoundaryCondition3D; 2] =
+            [&ExtrapolationTracerBC3D, &UpwindTracerBC3D::new(5.0)];
+        for bc in bcs {
+            let tendency = case.integral(&case.tracer_rhs(&transport, tracer, bc));
+            let (mut outflow, mut scale) = (0.0, 0.0);
+            for k in 0..case.mesh.n_elements {
+                let el = ElementIndex::new(k);
+                for f in 0..4 {
+                    let FaceExterior::Open(tag) = case.boundaries.exterior(&case.mesh, el, f)
+                    else {
+                        continue;
+                    };
+                    for (fi, &node) in case.ops.face_nodes[f].iter().enumerate() {
+                        let slot = (k * 4 + f) * nfn + fi;
+                        let weight = case.ops.weights_1d[fi] * case.geom.surface_jacobian(k, f, fi);
+                        for l in 0..nl {
+                            let flux = transport.face[slot * nl + l];
+                            let interior = tracer[(k * nn + node) * nl + l];
+                            let c = if flux >= 0.0 {
+                                interior
+                            } else {
+                                bc.exterior_value(&TracerBCContext3D {
+                                    element: k,
+                                    face: f,
+                                    level: l,
+                                    face_node: fi,
+                                    boundary_tag: Some(tag),
+                                    interior_value: interior,
+                                    normal_velocity: flux,
+                                })
+                            };
+                            outflow += weight * flux * c;
+                            scale += (weight * flux * c).abs();
+                        }
+                    }
+                }
+            }
+            assert!(
+                (tendency + outflow).abs() < 1e-12 * scale,
+                "inventory tendency {tendency:.6e} vs boundary outflow {outflow:.6e}"
+            );
+        }
+    }
+
     /// Vertically the tracer is upwinded on Ω: upward flux takes the lower
     /// layer's value, downward the upper layer's. Inventory form: the flux
     /// difference is not divided by `H_z`.
@@ -797,6 +955,7 @@ mod tests {
                 &ops,
                 &geom,
                 &ExtrapolationTracerBC3D,
+                &Boundaries3D::default(),
                 &mut scratch,
             );
             for column in rhs.chunks_exact(nl) {

@@ -59,6 +59,9 @@ pub use baroclinic::compute_pressure_gradient;
 pub mod coriolis_3d;
 pub use coriolis_3d::apply_coriolis_3d;
 
+pub mod boundary_3d;
+pub use boundary_3d::{Boundaries3D, FaceExterior};
+
 pub mod advection_3d;
 pub use advection_3d::{
     ExtrapolationTracerBC3D, FixedTracerBC3D, TracerBCContext3D, TracerBoundaryCondition3D,

@@ -197,16 +197,20 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boundary::Reflective2D;
+    use crate::boundary::{
+        BCContext2D, BoundaryState, CharacteristicOBC, ExternalState, HarmonicTide, Reflective2D,
+        SWEBoundaryCondition2D,
+    };
     use crate::equations::ShallowWater2D;
     use crate::mesh::data::Bathymetry2D;
+    use crate::mesh::data::BoundaryTag;
     use crate::mesh::{Mesh2D, Mesh2DBuilder};
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::physics::vertical_mixing::{ConstantMixing, Forcing};
     use crate::physics::{BottomDrag3D, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D};
     use crate::simulation::Simulation;
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
-    use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D};
+    use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
     use crate::source::CoriolisSource2D;
     use crate::time::{ModeSplitIntegrator, SSPRK3};
     use crate::types::ElementIndex;
@@ -1352,5 +1356,240 @@ mod tests {
         assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
         // Measured 3.29 m/s free, 0.72 m/s with drag
         assert!(dragged < 0.5 * free, "drag {dragged} vs free {free}");
+    }
+
+    /// Uniform far field `(η = 0, ū = 0, v̄)` for a characteristic OBC.
+    #[derive(Clone, Copy, Debug)]
+    struct UniformFarField(f64);
+
+    impl crate::boundary::ExternalStateProvider for UniformFarField {
+        fn external_state(&self, _ctx: &crate::boundary::BCContext2D) -> ExternalState {
+            ExternalState::new(0.0, 0.0, self.0)
+        }
+    }
+
+    type OpenPhysics = Hydrostatic3D<LinearEOS, ConstantMixing, CharacteristicOBC<UniformFarField>>;
+
+    /// TODO P4.2 gate: open boundaries pass a sheared flow through. A
+    /// channel, periodic in x and open at y = 0 and y = 40 km, carries the
+    /// steady wind-against-drag flow of
+    /// `wind_against_bottom_drag_reaches_the_quadratic_balance` (along y,
+    /// linear shear, `C_d v_b² = τ/ρ₀`), with a characteristic OBC whose far
+    /// field is that flow's depth mean. The flow must stay exactly as it is:
+    /// every layer leaves through one open end and enters through the other
+    /// with its own velocity. Treating the open faces as walls for the 3D
+    /// kernels (the behaviour before) gives the layers a depth-uniform share
+    /// of the boundary flux and reflects their momentum there.
+    #[test]
+    fn a_sheared_flow_passes_through_open_boundaries() {
+        let (depth, tau, cd, nu, n_levels) = (10.0, 0.1, 2.5e-3, 0.01, 10);
+        let v_b = (tau / (RHO0 * cd)).sqrt();
+        let step = tau / (RHO0 * nu) * depth / n_levels as f64;
+        let profile: Vec<f64> = (0..n_levels).map(|l| v_b + l as f64 * step).collect();
+        let v_mean = profile.iter().sum::<f64>() / n_levels as f64;
+
+        let run = |walls: &[BoundaryTag]| -> (f64, f64) {
+            let mut mesh = Mesh2D::channel_periodic_x(0.0, 40e3, 0.0, 40e3, 4, 4);
+            for edge in &mut mesh.edges {
+                if edge.right.is_none() {
+                    edge.boundary_tag = Some(BoundaryTag::Open);
+                }
+            }
+            let mesh = Arc::new(mesh);
+            let ops = Arc::new(DGOperators2D::new(1));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+            let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+            let swe = PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(G),
+                CharacteristicOBC::new(UniformFarField(v_mean)),
+            )
+            .with_bathymetry(bathymetry.clone())
+            .build();
+            let physics: OpenPhysics = Hydrostatic3D::new(
+                mesh.clone(),
+                ops.clone(),
+                geom,
+                Arc::new(SigmaGrid::new(n_levels, UniformStretching)),
+                bathymetry,
+                Arc::new(CoriolisSource2D::f_plane(0.0)),
+                LinearEOS::default(),
+                ConstantMixing::new(nu, nu),
+                swe,
+                Forcing {
+                    surface_stress: [0.0, tau],
+                    ..no_stress()
+                },
+                G,
+                RHO0,
+            )
+            .with_bottom_drag(BottomDrag3D::quadratic(cd))
+            .with_wall_tags(walls.iter().copied());
+
+            let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
+            let eos = LinearEOS::default();
+            state.temp.fill(eos.t0);
+            state.salt.fill(eos.s0);
+            for column in state.v.chunks_exact_mut(n_levels) {
+                column.copy_from_slice(&profile);
+            }
+            state.vbar.data.fill(v_mean);
+            physics.update_density(&mut state);
+
+            let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+                .with_cfl(10.0)
+                .with_dt_max(600.0);
+            let result = sim.run(&mut state, 0.0, 86400.0);
+            assert!(
+                result.success,
+                "open-channel run failed: {:?}",
+                result.error
+            );
+            let velocity_err = max_or_nan(
+                state
+                    .v
+                    .chunks_exact(n_levels)
+                    .flat_map(|col| col.iter().zip(&profile).map(|(v, p)| (v - p).abs()))
+                    .chain(state.u.iter().map(|u| u.abs())),
+            );
+            let eta = max_or_nan(state.eta.data.iter().map(|e| e.abs()));
+            (velocity_err / v_mean, eta)
+        };
+
+        let (err, eta) = run(&[BoundaryTag::Wall]);
+        let (closed_err, _) = run(&[BoundaryTag::Wall, BoundaryTag::Open]);
+        // Measured 6.5e-14 of v̄ and 3.6e-15 m; with the open faces as walls
+        // the flow is 1.9e-2 of v̄ off after a day
+        assert!(err < 1e-10, "the flow changed by {err:.3e} of v̄ in a day");
+        assert!(eta < 1e-10, "η moved by {eta:.3e} m");
+        assert!(
+            closed_err > 1e-3,
+            "test regime: walls changed it by only {closed_err:.3e}"
+        );
+    }
+
+    /// The M2 tide through faces tagged [`BoundaryTag::Open`], walls elsewhere.
+    #[derive(Clone, Debug)]
+    struct TideOrWall(CharacteristicOBC<HarmonicTide>);
+
+    impl SWEBoundaryCondition2D for TideOrWall {
+        fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
+            match ctx.boundary_tag {
+                Some(BoundaryTag::Open) => self.0.ghost_state(ctx),
+                _ => Reflective2D::default().ghost_state(ctx),
+            }
+        }
+
+        fn boundary_state(&self, ctx: &BCContext2D) -> BoundaryState {
+            match ctx.boundary_tag {
+                Some(BoundaryTag::Open) => self.0.boundary_state(ctx),
+                _ => Reflective2D::default().boundary_state(ctx),
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            "tide_or_wall"
+        }
+    }
+
+    /// TODO P4.2 gate: a tide enters the 3D model through an open boundary as
+    /// it enters the 2D model. A 30 km channel shoaling from 20 to 10 m, open
+    /// at its west end to an M2 tide (characteristic OBC, 3 h ramp), walls
+    /// elsewhere, run for a day: without stresses or density differences the
+    /// flow has no shear, and the mode-split η must follow the 2D model's.
+    #[test]
+    fn a_tide_enters_through_an_open_boundary_as_in_the_2d_model() {
+        let (length, amplitude) = (30e3, 0.5);
+        let mesh = Arc::new(Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            length,
+            0.0,
+            3e3,
+            10,
+            1,
+            [
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Open,
+            ],
+        ));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            -20.0 + 10.0 * x / length
+        }));
+        let swe = || {
+            let tide = TideOrWall(CharacteristicOBC::new(
+                HarmonicTide::m2(amplitude, 0.0).with_ramp_up(3.0 * 3600.0),
+            ));
+            PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(G),
+                tide,
+            )
+            .with_bathymetry(bathymetry.clone())
+            // Balanced over the slope (`Standard` would need a
+            // `BathymetrySource2D`)
+            .with_formulation(SWEFormulation2D::EntropyStable)
+            .build()
+        };
+        let t_end = 86400.0;
+
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for (h, b) in q.data[SWE_VAR_H].iter_mut().zip(&bathymetry.data) {
+            *h = -b;
+        }
+        let result = Simulation::new(swe(), SSPRK3)
+            .with_cfl(0.5)
+            .run(&mut q, 0.0, t_end);
+        assert!(result.success, "2D reference failed: {:?}", result.error);
+
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(SigmaGrid::new(4, UniformStretching)),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-3, 1e-3),
+            swe(),
+            no_stress(),
+            G,
+            RHO0,
+        );
+        let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, 4);
+        let eos = LinearEOS::default();
+        state.temp.fill(eos.t0);
+        state.salt.fill(eos.s0);
+        physics.update_density(&mut state);
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+            .with_cfl(10.0)
+            .with_dt_max(300.0);
+        let result = sim.run(&mut state, 0.0, t_end);
+        assert!(result.success, "mode-split run failed: {:?}", result.error);
+
+        let max_diff = max_or_nan(
+            q.data[SWE_VAR_H]
+                .iter()
+                .zip(&bathymetry.data)
+                .zip(&state.eta.data)
+                .map(|((h, b), eta)| (h + b - eta).abs()),
+        );
+        let max_eta = max_or_nan(state.eta.data.iter().map(|e| e.abs()));
+        assert!(
+            max_eta > 0.3 * amplitude,
+            "test regime: no tide in the channel"
+        );
+        // Measured 3.9e-6 m (|η| up to 0.38 m)
+        assert!(
+            max_diff < 1e-4 * amplitude,
+            "η differs from the 2D model by {max_diff:.3e} m"
+        );
     }
 }
