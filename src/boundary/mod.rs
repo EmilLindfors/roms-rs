@@ -62,6 +62,7 @@ mod characteristic;
 mod harmonic_tide;
 mod multi_bc_2d;
 mod nesting_3d;
+mod ocean_columns;
 mod ocean_nesting;
 mod radiation;
 mod reflective;
@@ -89,6 +90,7 @@ pub use nesting_3d::{
     ColumnContext3D, Nesting3D, NestingBand3D, NestingColumns, ParentColumn, ParentColumns3D,
     Supplied,
 };
+pub use ocean_columns::{OceanColumnsOptions, OceanModelColumns};
 pub use ocean_nesting::{NestingError, NestingOptions, NestingRelaxation2D, OceanModelState};
 pub use tidal_atlas::{AtlasConstituent, AtlasPoint, BoundaryTides, TidalAtlas, TidalAtlasError};
 pub use tidal_config::{SpongeConfig, TidalBCType, TidalSimulationBuilder};

@@ -20,6 +20,7 @@
 
 use super::field_series::{FieldSeries, TimeInterpolation, TimeStencil};
 use super::geo_grid::{GeoGrid, GridPoint, Stencil};
+use super::profile_series::ProfileSeries;
 
 /// Parent state at one point and time.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -72,6 +73,13 @@ pub struct OceanModelReader {
     /// How the velocity was obtained (e.g. `ubar_eastward/vbar_northward`,
     /// `u_eastward/v_northward averaged over z-levels`)
     pub velocity_source: Option<String>,
+    /// Profiles of the eastward and northward velocity (m/s), for 3D nesting
+    /// (see [`Self::with_profiles`]).
+    pub u_profile: Option<ProfileSeries>,
+    pub v_profile: Option<ProfileSeries>,
+    /// Profiles of temperature (°C) and salinity.
+    pub temperature_profile: Option<ProfileSeries>,
+    pub salinity_profile: Option<ProfileSeries>,
 }
 
 impl OceanModelReader {
@@ -94,6 +102,10 @@ impl OceanModelReader {
             temperature: None,
             salinity: None,
             velocity_source: None,
+            u_profile: None,
+            v_profile: None,
+            temperature_profile: None,
+            salinity_profile: None,
         })
     }
 
@@ -146,6 +158,49 @@ impl OceanModelReader {
         self.temperature = temperature;
         self.salinity = salinity;
         self
+    }
+
+    /// Set the profiles for 3D nesting: velocity (east, north; m/s) and
+    /// temperature and salinity, those present.
+    pub fn with_profiles(
+        mut self,
+        velocity: Option<(ProfileSeries, ProfileSeries)>,
+        temperature: Option<ProfileSeries>,
+        salinity: Option<ProfileSeries>,
+    ) -> Self {
+        let (u, v) = velocity.unzip();
+        for (name, p) in [
+            ("u profile", &u),
+            ("v profile", &v),
+            ("temperature profile", &temperature),
+            ("salinity profile", &salinity),
+        ] {
+            if let Some(p) = p {
+                assert!(
+                    p.n_points() == self.grid.len() && p.n_times() == self.time.len(),
+                    "OceanModelReader: {name} has {} × {} profiles, expected {} snapshots × {} points",
+                    p.n_times(),
+                    p.n_points(),
+                    self.time.len(),
+                    self.grid.len()
+                );
+            }
+        }
+        self.u_profile = u;
+        self.v_profile = v;
+        self.temperature_profile = temperature;
+        self.salinity_profile = salinity;
+        self
+    }
+
+    /// Whether the parent has velocity profiles.
+    pub fn has_current_profiles(&self) -> bool {
+        self.u_profile.is_some() && self.v_profile.is_some()
+    }
+
+    /// Whether the parent has temperature and salinity profiles.
+    pub fn has_tracer_profiles(&self) -> bool {
+        self.temperature_profile.is_some() && self.salinity_profile.is_some()
     }
 
     /// Grid dimensions `(ny, nx)`.
@@ -291,6 +346,12 @@ impl OceanModelReader {
         }
         if self.has_salinity() {
             vars.push("salinity".into());
+        }
+        if let Some(p) = &self.u_profile {
+            vars.push(format!("current profiles ({} levels)", p.n_levels()));
+        }
+        if let Some(p) = &self.temperature_profile {
+            vars.push(format!("T/S profiles ({} levels)", p.n_levels()));
         }
         format!(
             "Ocean model: {ny}x{nx} {} grid, {} times, lon [{x0:.2}, {x1:.2}], lat [{y0:.2}, {y1:.2}], vars: {}",

@@ -81,8 +81,10 @@ pub trait ParentColumns3D: Send + Sync {
     fn supplies(&self) -> Supplied;
 
     /// Write the parent's profiles at the layer centres of `sigma` in the
-    /// child column `ctx` to `out`.
-    fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>);
+    /// child column `ctx` to `out`, and return `true`; `false` where the
+    /// parent does not cover the column (the node then keeps its own values:
+    /// extrapolation at the boundary, no relaxation).
+    fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) -> bool;
 }
 
 /// The relaxation band of a [`Nesting3D`].
@@ -246,7 +248,7 @@ impl Nesting3D {
             for (slot, (&flat, &position)) in self.nodes.iter().zip(&self.positions).enumerate() {
                 eta[slot] = state.eta.data[flat];
                 let values = slot * nl..(slot + 1) * nl;
-                self.parent.column(
+                let covered = self.parent.column(
                     &ColumnContext3D {
                         time: t,
                         node: flat,
@@ -259,9 +261,16 @@ impl Nesting3D {
                         u: &mut u[values.clone()],
                         v: &mut v[values.clone()],
                         temp: &mut temp[values.clone()],
-                        salt: &mut salt[values],
+                        salt: &mut salt[values.clone()],
                     },
                 );
+                if !covered {
+                    let column = flat * nl..(flat + 1) * nl;
+                    u[values.clone()].copy_from_slice(&state.u[column.clone()]);
+                    v[values.clone()].copy_from_slice(&state.v[column.clone()]);
+                    temp[values.clone()].copy_from_slice(&state.temp[column.clone()]);
+                    salt[values].copy_from_slice(&state.salt[column]);
+                }
             }
         }
         NestingColumns {
@@ -414,13 +423,15 @@ mod tests {
             }
         }
 
-        fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) {
+        fn column(&self, ctx: &ColumnContext3D, sigma: &SigmaGrid, out: ParentColumn<'_>) -> bool {
             for (l, &s) in sigma.sigma_rho().iter().enumerate() {
                 out.u[l] = 0.2 + 0.1 * s + 1e-3 * ctx.time;
                 out.v[l] = -0.1 * s + ctx.eta;
                 out.temp[l] = 10.0 + 4.0 * s;
                 out.salt[l] = 34.0 - s;
             }
+            // Not covered beyond x = 500 m
+            ctx.position.0 < 500.0
         }
     }
 
@@ -454,7 +465,8 @@ mod tests {
 
     /// The band covers the boundary nodes and those within its width, the
     /// relaxation of the shear has no depth mean, the tracers relax as
-    /// inventories, and the exterior values apply only to the nested tag.
+    /// inventories, the exterior values apply only to the nested tag, and
+    /// nodes the parent does not cover keep their own values.
     #[test]
     fn relaxation_keeps_the_depth_mean_and_weights_the_band() {
         let band = NestingBand3D {
@@ -486,8 +498,9 @@ mod tests {
                 );
                 let column = &rhs.u[flat * 4..(flat + 1) * 4];
                 assert!(sigma.depth_average(column).abs() < 1e-15);
-                let in_band = x < 1500.0;
-                assert_eq!(column[0] != 0.0, in_band, "x = {x}");
+                // Relaxed within the band where the parent covers the column
+                let relaxed_here = x < 500.0;
+                assert_eq!(column[0] != 0.0, relaxed_here, "x = {x}");
                 if x == 0.0 {
                     // Weight 1: the shear's rate is (u_p − ⟨u_p⟩)/τ, the
                     // tracer's H_z (C_p − C)/τ

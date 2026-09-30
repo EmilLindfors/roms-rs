@@ -21,6 +21,7 @@ use super::field_series::FieldSeries;
 use super::geo_grid::GeoGrid;
 use super::netcdf_io::NetCDFError;
 use super::ocean_model::OceanModelReader;
+use super::profile_series::{ProfileLevels, ProfileSeries};
 use super::z_levels::{depth_average_z, s_level_weights, weighted_mean};
 
 /// A numeric attribute as `f64`.
@@ -443,6 +444,36 @@ impl Vertical {
         }
     }
 
+    /// Where the levels lie from the surface down, and the file's level of
+    /// each: z-levels at their depths; s-levels at the fraction of the column
+    /// of their layer's centre, halfway between its interfaces (the weights
+    /// of the depth mean; ROMS's `s_rho`/`Cs_r` differ by the curvature of
+    /// the stretching).
+    fn profile_levels(&self, n_points: usize) -> (ProfileLevels, Vec<usize>) {
+        match self {
+            Self::Z(levels) => {
+                let order = self.order();
+                let depths = order.iter().map(|&l| levels[l]).collect();
+                (ProfileLevels::Depth(depths), order)
+            }
+            Self::S(weights) => {
+                let n = weights.iter().flatten().next().map_or(0, Vec::len);
+                // Bottom first in the file
+                let order: Vec<usize> = (0..n).rev().collect();
+                let mut fractions = vec![f64::NAN; n_points * n];
+                for (k, w) in weights.iter().enumerate() {
+                    let Some(w) = w else { continue };
+                    let mut above = 0.0;
+                    for (j, &l) in order.iter().enumerate() {
+                        fractions[k * n + j] = above + 0.5 * w[l];
+                        above += w[l];
+                    }
+                }
+                (ProfileLevels::Fraction(fractions), order)
+            }
+        }
+    }
+
     /// Level order from the surface down (z-levels).
     fn order(&self) -> Vec<usize> {
         match self {
@@ -542,6 +573,52 @@ impl FieldReader<'_> {
         Ok(out)
     }
 
+    /// The profiles of the 3D field `var` on the ρ-grid per snapshot, levels
+    /// from the surface down (see [`ProfileSeries`]).
+    fn read_profiles(&self, var: &Variable, shape: &Shape) -> Result<ProfileSeries, NetCDFError> {
+        let n = self.n_points();
+        let Some((_, dim)) = &shape.vertical else {
+            return Err(NetCDFError::InvalidData(format!(
+                "{} has no vertical axis",
+                var.name()
+            )));
+        };
+        let vertical = Vertical::read(self.file, dim, self.depth.as_deref(), n)?;
+        let (levels, order) = vertical.profile_levels(n);
+        let snapshots = if shape.time_axis.is_some() {
+            self.n_times
+        } else {
+            1
+        };
+        let mut data = Vec::with_capacity(self.n_times * n * order.len());
+        for t in 0..snapshots {
+            let raw = read_values(var, shape.at_time(t))?;
+            let layers: Vec<Vec<f64>> = raw
+                .chunks_exact(shape.plane())
+                .map(|layer| destagger(layer, shape.stagger, self.dims))
+                .collect();
+            for k in 0..n {
+                let land = self.land.as_ref().is_some_and(|land| land[k]);
+                data.extend(order.iter().map(|&l| {
+                    let x = layers[l][k];
+                    if land || !x.is_finite() {
+                        f32::NAN
+                    } else {
+                        x as f32
+                    }
+                }));
+            }
+        }
+        // A time-invariant field holds for every snapshot
+        if snapshots == 1 && self.n_times > 1 {
+            let snapshot = data.clone();
+            for _ in 1..self.n_times {
+                data.extend_from_slice(&snapshot);
+            }
+        }
+        Ok(ProfileSeries::new(n, levels, data))
+    }
+
     /// The first of `names` that fits the grid, as a series.
     fn series(
         &self,
@@ -573,6 +650,26 @@ fn rotate_to_east_north(a: &mut [f64], b: &mut [f64], angles: &[f64]) {
         let (s, c) = angles[k % n].sin_cos();
         (*x, *y) = (*x * c - *y * s, *x * s + *y * c);
     }
+}
+
+/// [`rotate_to_east_north`] for profiles: the angle of each point for all
+/// its levels.
+fn rotate_profiles_to_east_north(u: &mut ProfileSeries, v: &mut ProfileSeries, angles: &[f64]) {
+    let (n, nl) = (angles.len(), u.n_levels());
+    let mut rotated_u = Vec::with_capacity(u.n_times() * n * nl);
+    let mut rotated_v = Vec::with_capacity(rotated_u.capacity());
+    for t in 0..u.n_times() {
+        for (k, &angle) in angles.iter().enumerate() {
+            let (s, c) = angle.sin_cos();
+            for (&a, &b) in u.column(t, k).iter().zip(v.column(t, k)) {
+                let (a, b) = (a as f64, b as f64);
+                rotated_u.push((a * c - b * s) as f32);
+                rotated_v.push((a * s + b * c) as f32);
+            }
+        }
+    }
+    *u = ProfileSeries::new(n, u.levels().clone(), rotated_u);
+    *v = ProfileSeries::new(n, v.levels().clone(), rotated_v);
 }
 
 /// Axes of a pair of vector components in a file.
@@ -608,6 +705,22 @@ impl OceanModelReader {
     ///   grid angle from the coordinates.
     /// - Temperature and salinity: the surface level.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, NetCDFError> {
+        Self::read_file(path.as_ref(), false)
+    }
+
+    /// [`Self::from_file`], and the profiles of the 3D velocity (the first
+    /// 3D pair of those listed there), temperature and salinity for 3D
+    /// nesting ([`ProfileSeries`]: z-levels at their depths, s-levels at the
+    /// fraction of the column of their layer centres). Grid-relative
+    /// components are rotated to east/north as the depth means are.
+    ///
+    /// The profiles are `n_times × n_points × n_levels` values each (a
+    /// 3-day hourly 100 × 100 NorKyst subset on 16 levels: 46 MB per field).
+    pub fn from_file_with_profiles(path: impl AsRef<Path>) -> Result<Self, NetCDFError> {
+        Self::read_file(path.as_ref(), true)
+    }
+
+    fn read_file(path: &Path, profiles: bool) -> Result<Self, NetCDFError> {
         let file = netcdf::open(path)?;
         let grid = read_grid(
             &file,
@@ -702,16 +815,67 @@ impl OceanModelReader {
             break;
         }
 
+        let mut velocity_profiles = None;
+        if profiles {
+            for (u_name, v_name, axes) in PAIRS {
+                let (Some(u_var), Some(v_var)) = (file.variable(u_name), file.variable(v_name))
+                else {
+                    continue;
+                };
+                let (Some(u_shape), Some(v_shape)) = (fields.shape(&u_var)?, fields.shape(&v_var)?)
+                else {
+                    continue;
+                };
+                if u_shape.vertical.is_none() || v_shape.vertical.is_none() {
+                    continue;
+                }
+                let (mut u, mut v) = (
+                    fields.read_profiles(&u_var, &u_shape)?,
+                    fields.read_profiles(&v_var, &v_shape)?,
+                );
+                if axes == Axes::Grid {
+                    let angles =
+                        match read_static(&file, &["angle"], fields.time_dim.as_deref(), dims)? {
+                            Some(a) => a,
+                            None => reader.grid.x_axis_angles(),
+                        };
+                    rotate_profiles_to_east_north(&mut u, &mut v, &angles);
+                }
+                velocity_profiles = Some((u, v));
+                break;
+            }
+        }
+
         let temperature = fields.series(
             &["temperature", "temp", "sea_water_temperature"],
             Reduce::Surface,
         )?;
         let salinity =
             fields.series(&["salinity", "salt", "sea_water_salinity"], Reduce::Surface)?;
-        Ok(reader.with_tracers(
+        let reader = reader.with_tracers(
             temperature.map(|(_, t)| to_series(n_points, &t)),
             salinity.map(|(_, s)| to_series(n_points, &s)),
-        ))
+        );
+        if !profiles {
+            return Ok(reader);
+        }
+        let profile = |names: &[&str]| -> Result<Option<ProfileSeries>, NetCDFError> {
+            for name in names {
+                let Some(var) = file.variable(name) else {
+                    continue;
+                };
+                match fields.shape(&var)? {
+                    Some(shape) if shape.vertical.is_some() => {
+                        return fields.read_profiles(&var, &shape).map(Some);
+                    }
+                    _ => continue,
+                }
+            }
+            Ok(None)
+        };
+        let temperature = profile(&["temperature", "temp", "sea_water_temperature"])?;
+        let salinity = profile(&["salinity", "salt", "sea_water_salinity"])?;
+        Ok(reader.with_profiles(velocity_profiles, temperature, salinity))
     }
 }
 
@@ -936,6 +1100,7 @@ mod test_files {
 mod tests {
     use super::test_files::{self, CENTRE, T0, Zeta};
     use super::*;
+    use std::path::PathBuf;
 
     const HOURS: &str = "hours since 2024-01-30 06:00:00";
 
@@ -1036,12 +1201,11 @@ mod tests {
         (dir, path)
     }
 
-    /// NorKyst z-level files: level 0 is the surface (`positive = "down"`),
-    /// and the velocity is averaged down to the bed `h`. The old reader took
-    /// the last level, the deepest, as the surface (P1.5).
-    #[test]
-    fn z_level_velocity_is_averaged_to_the_bed() {
-        let (_dir, path) = write_file(|file| {
+    /// A NorKyst-like z-level file: `depth` 0, 10, 50 m (`positive = "down"`),
+    /// `h` 20 m in the first column and 60 m elsewhere, `u_eastward` 1, 0.5, 0
+    /// (fill below the bed), `temperature` 12, 8, 8.
+    fn z_level_file() -> (tempfile::TempDir, PathBuf) {
+        write_file(|file| {
             file.add_dimension("depth", 3).unwrap();
             let mut depth = file.add_variable::<f64>("depth", &["depth"]).unwrap();
             depth.put_attribute("positive", "down").unwrap();
@@ -1066,7 +1230,15 @@ mod tests {
             let mut temps = vec![12.0_f32; 6];
             temps.extend([8.0_f32; 12]);
             t.put_values(&temps, ..).unwrap();
-        });
+        })
+    }
+
+    /// NorKyst z-level files: level 0 is the surface (`positive = "down"`),
+    /// and the velocity is averaged down to the bed `h`. The old reader took
+    /// the last level, the deepest, as the surface (P1.5).
+    #[test]
+    fn z_level_velocity_is_averaged_to_the_bed() {
+        let (_dir, path) = z_level_file();
         let reader = OceanModelReader::from_file(path).unwrap();
         let u = reader.u.as_ref().unwrap();
         // 20 m column: (0.75·10 + 0.5·10)/20; 60 m column: (0.75·10 + 0.25·40 + 0·10)/60
@@ -1082,12 +1254,11 @@ mod tests {
         assert!((reader.temperature.as_ref().unwrap().get(0, 2) - 12.0).abs() < 1e-6);
     }
 
-    /// ROMS s-levels (bottom first) with Vtransform 2, and grid-relative `u`
-    /// on u-points rotated by `angle` to east/north.
-    #[test]
-    fn s_level_grid_relative_velocity() {
-        let angle = 30f64.to_radians();
-        let (_dir, path) = write_file(|file| {
+    /// A ROMS-like s-level file: two layers (Vtransform 2, `hc` 0, the
+    /// bottom layer 80 % of the column), `h` 100 m, `angle` 30°, along-grid
+    /// `u` 1.0 at the bottom and 2.0 on top on u-points, `v` 0.
+    fn s_level_file(angle: f64) -> (tempfile::TempDir, PathBuf) {
+        write_file(|file| {
             file.add_dimension("s_rho", 2).unwrap();
             file.add_dimension("s_w", 3).unwrap();
             file.add_dimension("X_u", 2).unwrap();
@@ -1120,13 +1291,69 @@ mod tests {
                 .add_variable::<f64>("v", &["time", "s_rho", "Y_v", "X"])
                 .unwrap();
             v.put_values(&[0.0; 6], ..).unwrap();
-        });
+        })
+    }
+
+    /// ROMS s-levels (bottom first) with Vtransform 2, and grid-relative `u`
+    /// on u-points rotated by `angle` to east/north.
+    #[test]
+    fn s_level_grid_relative_velocity() {
+        let angle = 30f64.to_radians();
+        let (_dir, path) = s_level_file(angle);
         let reader = OceanModelReader::from_file(path).unwrap();
         let (lat, lon) = (63.05, 8.1);
         let (e, n) = reader.get_state(lon, lat, 0).unwrap().velocity.unwrap();
         assert!((e - 1.2 * angle.cos()).abs() < 1e-6, "{e}");
         assert!((n - 1.2 * angle.sin()).abs() < 1e-6, "{n}");
         assert!(reader.velocity_source.as_ref().unwrap().contains("angle"));
+    }
+
+    /// Profiles for 3D nesting keep the z-levels: from the surface down, NaN
+    /// below the bed, interpolated in depth; the 2D fields are as without.
+    #[test]
+    fn z_level_profiles_keep_the_levels() {
+        let (_dir, path) = z_level_file();
+        let reader = OceanModelReader::from_file_with_profiles(&path).unwrap();
+        let u = reader.u_profile.as_ref().unwrap();
+        assert_eq!(u.levels(), &ProfileLevels::Depth(vec![0.0, 10.0, 50.0]));
+        let column = u.column(0, 0);
+        assert_eq!(&column[..2], &[1.0, 0.5]);
+        assert!(column[2].is_nan());
+        assert_eq!(u.value_at(0, 0, 5.0, 20.0), Some(0.75));
+        // Below the bed of the 20 m column: its deepest value
+        assert_eq!(u.value_at(0, 0, 30.0, 20.0), Some(0.5));
+        assert_eq!(u.value_at(0, 1, 30.0, 60.0), Some(0.25));
+        let t = reader.temperature_profile.as_ref().unwrap();
+        assert_eq!(t.column(0, 3), &[12.0, 8.0, 8.0]);
+        assert!(reader.has_current_profiles());
+        // No salinity in the file
+        assert!(!reader.has_tracer_profiles());
+        let plain = OceanModelReader::from_file(&path).unwrap();
+        assert_eq!(plain.u, reader.u);
+        assert!(plain.u_profile.is_none());
+    }
+
+    /// Profiles on ROMS s-levels are fractions of the column at the layer
+    /// centres, surface first (the top layer is 20 % of the column: centre
+    /// at 0.1, the bottom layer's at 0.6), rotated to east/north per level.
+    #[test]
+    fn s_level_profiles_are_fractions_of_the_column() {
+        let angle = 30f64.to_radians();
+        let (_dir, path) = s_level_file(angle);
+        let reader = OceanModelReader::from_file_with_profiles(path).unwrap();
+        let (u, v) = (
+            reader.u_profile.as_ref().unwrap(),
+            reader.v_profile.as_ref().unwrap(),
+        );
+        let ProfileLevels::Fraction(fractions) = u.levels() else {
+            panic!("s-levels should be fractions");
+        };
+        assert!((fractions[0] - 0.1).abs() < 1e-12 && (fractions[1] - 0.6).abs() < 1e-12);
+        let (e, n) = (u.column(0, 1), v.column(0, 1));
+        for (l, along) in [(0, 2.0), (1, 1.0)] {
+            assert!((e[l] as f64 - along * angle.cos()).abs() < 1e-6, "{e:?}");
+            assert!((n[l] as f64 - along * angle.sin()).abs() < 1e-6, "{n:?}");
+        }
     }
 
     /// A MEPS-like file: grid-relative 10 m wind with a singleton height

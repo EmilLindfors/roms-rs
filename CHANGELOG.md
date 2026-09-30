@@ -12,6 +12,18 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Parent 3D fields for the nesting (TODO P4.2).** `OceanModelReader` collapsed the parent's velocity to a depth mean and T/S to the surface.
+  - `OceanModelReader::from_file_with_profiles` (with `netcdf`) also keeps the profiles of the 3D velocity, temperature and salinity (`io::ProfileSeries`, `[time][point][level]`, levels from the surface down):
+    - z-levels at their depths;
+    - ROMS s-levels at the fraction of the column of their layer centres, which with either Vtransform does not depend on ζ;
+    - grid-relative velocity rotated per level.
+  - `ProfileSeries::sample` interpolates each parent column linearly in depth between its valid levels, holding the shallowest value up to the surface and the deepest below (NorKyst's files end at 300 m). It then combines columns and snapshots, renormalising over columns with data.
+  - New `boundary::OceanModelColumns`: the `ParentColumns3D` of such a reader. Horizontal stencils are computed per node on first use (wet corners, else the nearest wet point within `max_snap`). Linear or cubic in time, sampled at the child's layer centres, rotated to the mesh axes. Nodes it does not cover keep their own values, now that `ParentColumns3D::column` returns whether it covered the node.
+  - Gates:
+    - `a_parent_read_on_z_levels_nests_like_the_analytic_profiles`: the nested exchange flow, read on z-levels, drives the same run as the analytic parent to 1.9e-5 of ΔT and 3.7e-5 of the shear (the relative η/D).
+    - NetCDF: z-level profiles keep their levels and NaN below the bed; s-level profiles are fractions of the column and rotated per level.
+    - Unit tests: sampling, s-level scaling, renormalisation, coverage and times outside the parent.
+
 - **3D nesting at open boundaries (TODO P4.2).** The 3D kernels could only extrapolate the interior at open faces, so a parent model's stratification and baroclinic currents could not enter a 3D child.
   - New `boundary::Nesting3D` and `Hydrostatic3D::with_nesting`. A `ParentColumns3D` gives the parent's u, v, T, S at the child's layer centres per node and time; `Nesting3D` evaluates it at the nested tags' open-face nodes and within a band around them (cached per stage time and free surface).
   - At nested open faces (`solver::rhs::Exterior3D`, `ExteriorField`):
