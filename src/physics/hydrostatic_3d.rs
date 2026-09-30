@@ -141,6 +141,8 @@ where
             LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels()),
             TransportScratch::new(&ops, sigma.n_levels()),
         ));
+        // The 3D walls are the 2D boundary condition's
+        let boundaries = Boundaries3D::matching(&mesh, &swe_physics.bc);
         Self {
             mesh,
             ops,
@@ -156,7 +158,7 @@ where
             rho0,
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
             salt_bc: Arc::new(ExtrapolationTracerBC3D),
-            boundaries: Boundaries3D::default(),
+            boundaries,
             tracer_limiter: TracerLimiter3DConfig::none(),
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             bottom_drag: None,
@@ -277,13 +279,16 @@ where
         }
     }
 
-    /// The boundary tags that are walls for the 3D kernels (default
-    /// [`crate::mesh::BoundaryTag::Wall`]; untagged faces are always walls).
-    /// Every other boundary is open: its layers carry the 2D open-boundary
-    /// flux in the interior's vertical profile, and the 3D velocity is
-    /// extrapolated there (see [`crate::solver::rhs::boundary_3d`]). Match
-    /// the 2D module's boundary condition: a tag it treats as a wall must be
-    /// a wall here.
+    /// Override the boundary tags that are walls for the 3D kernels (untagged
+    /// faces are then walls too). Every other boundary is open: its layers
+    /// carry the 2D open-boundary flux in the interior's vertical profile,
+    /// and the 3D velocity is extrapolated there (see
+    /// [`crate::solver::rhs::boundary_3d`]).
+    ///
+    /// [`Self::new`] already derives the walls from the 2D module's boundary
+    /// condition ([`Boundaries3D::matching`]); override only for a condition
+    /// that cannot tell (`SWEBoundaryCondition2D::is_wall` is `None`). A tag
+    /// the 2D condition treats as a wall must be a wall here.
     pub fn with_wall_tags(
         mut self,
         tags: impl IntoIterator<Item = crate::mesh::BoundaryTag>,

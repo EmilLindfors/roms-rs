@@ -1576,6 +1576,10 @@ mod tests {
         fn name(&self) -> &'static str {
             "tide_or_wall"
         }
+
+        fn is_wall(&self, tag: Option<BoundaryTag>) -> Option<bool> {
+            Some(tag != Some(BoundaryTag::Open))
+        }
     }
 
     /// TODO P4.2 gate: a tide enters the 3D model through an open boundary as

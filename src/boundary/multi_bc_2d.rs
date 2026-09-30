@@ -147,6 +147,13 @@ impl<'a> SWEBoundaryCondition2D for MultiBoundaryCondition2D<'a> {
         "multi_bc_2d"
     }
 
+    fn is_wall(&self, tag: Option<BoundaryTag>) -> Option<bool> {
+        match &tag {
+            Some(t) => self.bc_for_tag(t).is_wall(tag),
+            None => self.default_bc.is_wall(tag),
+        }
+    }
+
     fn allows_inflow(&self) -> bool {
         // Conservative: allow if any component allows
         true
