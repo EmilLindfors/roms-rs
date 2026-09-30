@@ -88,7 +88,7 @@ pub use harmonic_tide::{HarmonicTide, tidal_ramp};
 pub use multi_bc_2d::MultiBoundaryCondition2D;
 pub use nesting_3d::{
     ColumnContext3D, Nesting3D, NestingBand3D, NestingColumns, ParentColumn, ParentColumns3D,
-    Supplied,
+    ReferenceColumns, Supplied,
 };
 pub use ocean_columns::{OceanColumnsOptions, OceanModelColumns};
 pub use ocean_nesting::{NestingError, NestingOptions, NestingRelaxation2D, OceanModelState};

@@ -12,6 +12,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Internal waves at open boundaries (TODO P4.2).**
+  - Measured: a mode-1 internal-wave pulse meeting a 3D open face that extrapolates (open faces without nesting) is unstable. It starts an exchange flow at the boundary that displaces the isopycnals without bound (0.24 → 6 °C and 0.26 m/s within 8 h, P2, 50 m, N = 0.02 s⁻¹). Boundary values of the state at rest alone are stable but reflect the wave completely.
+  - New `boundary::ReferenceColumns`: a fixed state, e.g. the initial stratification at rest, as the parent of a `Nesting3D`. It gives runs without a parent model a relaxation band (ROMS's nudging to climatology). Bands of 2–6 km reflect 18–32 % of the wave's amplitude.
+  - `Hydrostatic3D` warns once when a stratified state has open 3D faces that no nesting relaxes.
+  - Gate `an_internal_wave_leaves_through_a_relaxed_open_boundary`: with a 4 km band (30 min), 36 % of the pulse remains in the channel after it has left (P1, six levels); with walls 1.19.
+
 - **Parent 3D fields for the nesting (TODO P4.2).** `OceanModelReader` collapsed the parent's velocity to a depth mean and T/S to the surface.
   - `OceanModelReader::from_file_with_profiles` (with `netcdf`) also keeps the profiles of the 3D velocity, temperature and salinity (`io::ProfileSeries`, `[time][point][level]`, levels from the surface down):
     - z-levels at their depths;
