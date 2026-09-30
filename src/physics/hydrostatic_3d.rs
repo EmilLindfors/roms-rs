@@ -25,8 +25,10 @@
 //! reduces to the stresses exactly. Coriolis is pointwise and linear, so its
 //! share cancels exactly.
 //!
-//! The 3D PGF stays baroclinic-only: it has no face coupling of `η` (TODO
-//! P4.3), so the barotropic pressure gradient must come from the 2D module.
+//! The 3D PGF is baroclinic-only (`ρ − ρ₀`), so the barotropic pressure
+//! gradient comes from the 2D module. (Since P4.3 the 3D PGF lifts pressure
+//! jumps at element faces and could carry `−g∇η` too; the division of labour
+//! is kept, see TODO P4.1.)
 
 use std::sync::{Arc, Mutex};
 

@@ -11,7 +11,7 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `REVIEW.md`
   - Flather-type open boundaries reflect about 1/3 of outgoing waves. (Since fixed, P0.12.)
   - Coastline-fitted meshes cannot be loaded.
   - Mode splitting is first-order and damps the barotropic mode.
-  - The 3D layer is scaffolding with three blocker-level math errors. (Vertical advection ×D since fixed, P0.16; tracer constancy and the σ pressure gradient remain, P4.2/P4.3.)
+  - The 3D layer is scaffolding with three blocker-level math errors. (Vertical advection ×D since fixed, P0.16; tracer constancy and the σ pressure gradient since fixed, P4.2/P4.3, 2026-09-30.)
 - **Cost:** as configured, roughly ~50× ROMS core-hours for a 2D tidal run (cost-model estimate, `REVIEW.md` §5).
 
 **Strategic direction.**
@@ -93,7 +93,7 @@ This section only orders the existing items for that goal and adds the two farm-
 8. ~~Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7~~ done 2026-09-28.
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
-- P4.2 (tracer constancy: done 2026-09-30; still 3D open boundaries for momentum and T/S profiles, momentum in inventory form), P4.3 (balanced PGF, vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry, which gives NaN today; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
+- P4.2 (tracer constancy: done 2026-09-30; still 3D open boundaries for momentum and T/S profiles, momentum in inventory form), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry, which gives NaN today; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
 - F.1 cage drag (3D form) and F.2 in 3D.
 
 Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
@@ -559,7 +559,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
   - G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀: the same 3D advection + Coriolis operator applied to columns of uniform ū removes the mean-flow part. What is left is the baroclinic PGF, the shear dispersion −∇·⟨u′u′⟩ and the stresses. For unsheared flow G is exactly the stress.
   - The 3D PGF stays baroclinic-only (P0.6).
   - Rule: configure the 2D module with the same Coriolis parameter, and without wind/friction sources that duplicate `Forcing` (`Hydrostatic3D` module docs).
-  - Revisit the ROMS form once P4.3 lifts the 3D pressure/η jumps at faces.
+  - Revisit the ROMS form once P4.3 lifts the 3D pressure/η jumps at faces. (P4.3 does since 2026-09-30: the 3D PGF with `rho_ref = 0` has the DG face coupling of η.)
 
 **PR 1: one barotropic pass** — done on `feat/p4-1-barotropic-pass`
 - [x] The fast pass steps transport (h, hu, hv) in a `SWESolution2D` through `SWEPhysics2D`: positivity, limiter, wet/dry and implicit damping at every stage. The unguarded 1/h (`Hydrostatic3D::compute_rhs_2d`) is gone.
@@ -613,8 +613,14 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] The `w` output of `Hydrostatic3D::post_process` is still Ω of the 3D velocities alone (`compute_vertical_velocity`, closed with their own ∂η/∂t): there is no barotropic transport between steps. Output the last step's layer-transport Ω instead (e.g. keep the stage-3 Ω or recompute at tⁿ⁺¹ with DU_avg2), and then drop `compute_vertical_velocity`.
 
 ### P4.3 Pressure gradient and vertical grid
-- [ ] Balanced PGF: Shchepetkin & McWilliams (2003) density-Jacobian, or z-level interpolation. Lift pressure/η jumps at element faces.
-  - Today: ~1e-4 m/s² spurious forcing in a stratified fjord at rest (P3/250 m), the size of real estuarine forcing.
+- [x] Balanced PGF. Lift pressure/η jumps at element faces. Done 2026-09-30 (`solver::rhs::baroclinic`): ∇p|_z directly, as the DG derivative of pairwise pressure differences at a common depth (Stelling & van Kester 1994 in a flux-differencing form), each column's ρ a monotone Hermite cubic in z integrated exactly (the Shchepetkin & McWilliams 2003 ingredient), one-sided pairs where a node lies below the other column's bed, and the pressure jump at every face lifted with a central flux.
+  - Constant N² at rest over a 30→400 m slope: round-off (≤ 1.5e-14 m/s²) at P1–P4, uniform and stretched levels; the σ form gave 1.3e-5 – 2.5e-3.
+  - The review's pycnocline fjord on 30 stretched levels (θs 5): 2.0e-7 / 1.5e-6 / 3.3e-6 m/s² at P1 500 m / P3 250 m / P3 100 m, against 1.6e-3 / 1.1e-4 / 2.2e-5 for the σ form and ≈ 5e-5 of real estuarine forcing.
+  - Mode-split fjord at rest (10→150 m over ≈ 400 m, linear N²): 2.8e-11 m/s after 1 h; on `main` it blew up within 16 steps.
+  - [ ] On 30 *uniform* levels the pycnocline case stays at 2–4e-4 m/s² (σ form 4e-4 – 1.6e-3): 13 m apart at 400 m, the deep columns do not sample a 3 m pycnocline. Resolve it in every column (stretched levels, as NorKyst), or subtract a finely tabulated horizontal-mean reference profile ρ̄(z) before integrating (Mellor et al. 1998) — an option to add if real stratification needs it.
+  - [ ] Second order for smooth fields at P2 (measured 1.7–1.8 in the max norm, pre-asymptotic); first order in the one-sided pairs at the bottom of steep slopes. Higher-order vertical reconstruction (unlimited slopes where monotone) is the lever if needed.
+  - [ ] Cost: n_nodes²/2 pair evaluations per level per element, each a binary search and a cubic integral in two columns (81/2 pairs at P2). Not profiled; parallelise with the rest of the 3D kernels (P4.5).
+  - [ ] Curvilinear elements: the pairs use the affine metric (`Hydrostatic3D` asserts affine); the collocated chain rule `rx_i Dr + sx_i Ds` extends it.
 - [ ] rx0/rx1 diagnostics and ROMS-style bathymetry smoothing. r_x0 is done in 2D (`Bathymetry2D::max_rx0`, volume-preserving `smooth_rx0`, 2026-09-29, P1.3). Still open: r_x1 (Haney number), which needs the σ levels, and an r_x1 bound for the 3D grid.
 - [ ] Vtransform 2 + the true Vstretching 4. `ROMSVstretching4` is not ROMS Vs4, and `hc` is unused; Ω must use ∇·(Hz·u) once Hz varies horizontally.
 
@@ -635,7 +641,8 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
   - E.g. `apply_horizontal_surface_terms` (3D momentum advection) and `compute_vertical_velocity` allocate `Vec`s per face per level, and `compute_strong_divergence` two per call; move them to workspaces as `LayerTransport` and `TracerTransportScratch` do (2026-09-30), and parallelise those over elements.
 
 ### P4.6 3D validation (before any NorKyst 3D comparison)
-- [ ] Stratified lake-at-rest: linear N² ≤ 1e-12; tanh pycnocline over a seamount (Beckmann & Haidvogel 1993).
+- [x] Stratified lake-at-rest, linear N² ≤ 1e-12: the PGF to ≤ 1.5e-14 m/s² over a 30→400 m slope; the mode-split model to 2.8e-11 m/s after 1 h (P4.3 gates, 2026-09-30).
+- [ ] Tanh pycnocline over a seamount (Beckmann & Haidvogel 1993): the spin-up of spurious currents over days. The PGF-level fjord pycnocline gate is done (P4.3).
 - [x] Constant-T preservation under tide over a sloping bed; Hz·T inventory conservation (P4.2 gates, 2026-09-30).
 - [x] Wind setup τ/(ρgD); Ekman transport τ/(ρ₀f); column momentum after one implicit diffusion step = Δt·τ/ρ₀ (P4.1 gate tests).
 - [x] Temporal convergence of the coupled scheme; barotropic energy decay (P4.1 gate tests).
@@ -755,7 +762,7 @@ Details are in `CHANGELOG.md` and git history. Caveats found on 2026-09-25 are n
 | 2D tidal cost vs ROMS (model estimate) | ~47× core-hours | ≤ 1× per unit accuracy (P3.2) |
 | Validated against observations | Mausund (Kartverket MSU), 15 days at 1 km: M2 1.03×, +5.4° (≈ +2.3° at 500 m); tidal-prediction RMSE 9.8 cm | 5+ tide gauges, ADCP |
 | Multi-day stability | One M2 cycle on Frøya (9,653 P2 elements, 11.4 min wall, 0 clips) | 30+ days, real domain |
-| 3D | Scaffolding; 2 blockers (tracer constancy P4.2, σ PGF P4.3); vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting: one filtered barotropic pass (0.035 % seiche damping per period), second-order slow coupling, wind setup/Ekman to < 0.1 % (P4.1 PR 1–2; DU_avg2 is PR 3) | stratified lake-at-rest, constancy, lock exchange |
+| 3D | Scaffolding; tracer constancy (P4.2) and the balanced PGF (P4.3) fixed 2026-09-30; vertical advection ×D (P0.16) and the tracer wall leak (P0.22) fixed; mode splitting: one filtered barotropic pass (0.035 % seiche damping per period), second-order slow coupling, wind setup/Ekman to < 0.1 % (P4.1 PR 1–2; DU_avg2 is PR 3) | lock exchange, mode-1 internal wave, seamount spin-up |
 | GPU | Non-functional (P0.11) | fixed or replaced (P2.7) |
 
 ---
