@@ -64,8 +64,9 @@
 //!
 //!   Subcell `a` has width `w_a` (the GLL weight) and contains node `a`.
 //!   `h`, `η`, `u`, `v` are reconstructed linearly from the node values with a
-//!   monotonized-central limiter; end subcells take their outer neighbour
-//!   from the next element. `F̂` is the same hydrostatic HLL flux on the
+//!   monotonized-central limiter (`η` not through a dry node below the
+//!   water beside it: its `η` is its bed, not a water level); end subcells
+//!   take their outer neighbour from the next element. `F̂` is the same hydrostatic HLL flux on the
 //!   reconstructed face states `q_a,L`, `q_a,R`, and `S_a` is the Audusse et al.
 //!   (2004) second-order bed term. At the element faces `F̂` is the physical
 //!   flux `F(q)·m` of the node, which the surface term replaces by `F*`.
@@ -124,9 +125,19 @@ fn limited_slope(q: [f64; 3], xi: [f64; 3], (x_l, x_r): (f64, f64)) -> f64 {
 /// the nodes `ξ_m < ξ < ξ_p` (second-order Audusse et al. 2004). The bed at
 /// a face is `B = η − h`.
 ///
+/// A dry node (shallower than `h_dry`) has no water level: its `η` is its
+/// bed. As a bank above the wet surfaces of the stencil that closes the
+/// interface either way, but below one the node must flood, and a monotone
+/// stencil through its bed sets the limited face value of a wet node to
+/// that bed (the stencil bank, strip, sill) or lifts the dry node's face bed
+/// to the wet neighbour's surface (the stencil high water, dry, low water):
+/// the interface closes, the node never floods, and the bed term of the
+/// tilted subcell pushes the water against it. So `η` is not reconstructed
+/// (zero slope) in a stencil with a dry node below one of its wet surfaces.
+///
 /// Every face value lies between the neighbouring node values, so `h ≥ 0` at
-/// faces, and lake at rest (wet nodes at `η₀`, dry nodes with `B ≥ η₀`) stays
-/// balanced, also across shorelines:
+/// faces, and lake at rest (wet nodes at `η₀`, dry nodes with `B ≥ η₀`, so
+/// every dry node is a bank) stays balanced, also across shorelines:
 /// - at a wet node `η` is constant or has a minimum (a dry neighbour has
 ///   `η = B ≥ η₀`), so its slope is zero and `h + B = η₀` at both faces;
 /// - at a dry node the depth has a minimum, so its face depths are zero, and
@@ -139,12 +150,22 @@ fn reconstruct_subcell(
     nodes: [&SWENodeState2D; 3],
     xi: [f64; 3],
     subcell: (f64, f64),
+    h_dry: f64,
 ) -> (SWENodeState2D, SWENodeState2D) {
     let [m, c, p] = nodes;
     let slope = |f: fn(&SWENodeState2D) -> f64| limited_slope([f(m), f(c), f(p)], xi, subcell);
+    let wet_surface = nodes
+        .iter()
+        .filter(|n| n.h >= h_dry)
+        .fold(f64::NEG_INFINITY, |top, n| top.max(n.eta()));
+    let flooding = nodes.iter().any(|n| n.h < h_dry && n.eta() < wet_surface);
     let (s_h, s_eta, s_u, s_v) = (
         slope(|n| n.h),
-        slope(SWENodeState2D::eta),
+        if flooding {
+            0.0
+        } else {
+            slope(SWENodeState2D::eta)
+        },
         slope(|n| n.u),
         slope(|n| n.v),
     );
@@ -227,9 +248,10 @@ pub(super) struct SplitFormSWE2D<'a, 'c, BC: SWEBoundaryCondition2D> {
     config: &'a SWE2DRhsConfig<'c, BC>,
     time: f64,
     surface: SurfaceFlux,
-    /// Subcell finite volumes in elements with a node shallower than this
-    /// (`WetDry` only)
-    h_dry: Option<f64>,
+    /// `WetDry` only: subcell finite volumes in elements with a node
+    /// shallower than `.0` (`subcell_depth`), and the dry-node depth `.1`
+    /// (`h_dry`) of their reconstruction
+    subcells: Option<(f64, f64)>,
     reconstruction: HydrostaticReconstruction2D,
 }
 
@@ -247,11 +269,14 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         config: &'a SWE2DRhsConfig<'c, BC>,
         time: f64,
     ) -> Option<Self> {
-        let (surface, h_dry) = match config.formulation {
+        let (surface, subcells) = match config.formulation {
             SWEFormulation2D::Standard => return None,
             SWEFormulation2D::EntropyConservative => (SurfaceFlux::EntropyConservative, None),
             SWEFormulation2D::EntropyStable => (SurfaceFlux::EntropyStable, None),
-            SWEFormulation2D::WetDry => (SurfaceFlux::HydrostaticHll, Some(config.h_dry)),
+            SWEFormulation2D::WetDry => (
+                SurfaceFlux::HydrostaticHll,
+                Some((config.subcell_depth.unwrap_or(config.h_dry), config.h_dry)),
+            ),
         };
         assert!(
             !config
@@ -270,7 +295,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             config,
             time,
             surface,
-            h_dry,
+            subcells,
             reconstruction: HydrostaticReconstruction2D::new(
                 config.equation.g,
                 config.equation.h_min.meters(),
@@ -399,8 +424,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         //    subcell finite volumes in elements with dry nodes. Each line uses
         //    the contravariant vector of its direction at its nodes.
         let subcells = self
-            .h_dry
-            .is_some_and(|h_dry| ws.nodes.iter().any(|n| n.h < h_dry));
+            .subcells
+            .is_some_and(|(depth, _)| ws.nodes.iter().any(|n| n.h < depth));
         if subcells {
             self.outer_nodes(k, ws);
         }
@@ -688,6 +713,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let w = &self.ops.weights_1d;
         let xi = &self.ops.nodes_1d;
         let d1 = &self.ops.dr_1d_row_major;
+        // Subcells run only in the wet/dry formulation, which sets h_dry
+        let h_dry = self.subcells.map_or(0.0, |(_, h_dry)| h_dry);
 
         // Interface metrics, m_{a,a+1} = m_{a−1,a} + Σ_{c≠a} 2 w_a D_ac {{Ja}}_ac
         // from zero (the telescoping sum of the flux-differencing term)
@@ -734,7 +761,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             };
             ws.faces[a] = match (left, right) {
                 (Some((l, x_l)), Some((r, x_r))) => {
-                    reconstruct_subcell([&l, &q, &r], [x_l, xi[a], x_r], (x_left, x_right))
+                    reconstruct_subcell([&l, &q, &r], [x_l, xi[a], x_r], (x_left, x_right), h_dry)
                 }
                 _ => (q, q),
             };
@@ -1316,6 +1343,77 @@ mod tests {
             mass_rate.abs() < 1e-14 * scale,
             "d(mass)/dt = {mass_rate:.3e} (scale {scale:.3e})"
         );
+    }
+
+    /// A dry node below the water beside it must flood. Two P2 stencils
+    /// closed that interface: a wet node between a bank and the dry node
+    /// (the Frøya strait, a one-node strip between land at +4 m and a sill
+    /// at +0.35 m, where the sill stayed dry under 0.65 m of water while a
+    /// 5 m/s jet pushed at it), and a dry node between a higher and a lower
+    /// wet node. Both took the dry node's η = B for a water level, so the
+    /// limited η slope set the reconstructed face to the dry node's bed.
+    #[test]
+    fn test_wet_dry_floods_a_dry_node_below_the_water() {
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let ops = DGOperators2D::new(2);
+        // (bed, surface) at the GLL nodes along x, uniform in y; the surface
+        // of a dry node is ignored
+        let cases: [(&str, &[(f64, f64)]); 2] = [
+            (
+                "bank | strip | sill | strip | bank",
+                &[
+                    (4.0, 0.0),
+                    (-3.8, 0.8),
+                    (0.35, 0.0),
+                    (-3.8, 0.8),
+                    (4.0, 0.0),
+                ],
+            ),
+            (
+                "high water | dry | low water",
+                &[(-3.0, 0.8), (0.5, 0.0), (-3.0, -0.2)],
+            ),
+        ];
+        for (name, nodes) in cases {
+            let nx = (nodes.len() - 1) / (ops.n_1d - 1);
+            let width = 100.0 * nx as f64;
+            let mesh = Mesh2D::uniform_rectangle(0.0, width, 0.0, 100.0, nx, 1);
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |_, _| 0.0);
+            let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+            let position = |k: ElementIndex, i: usize| {
+                let [x, _] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                (x / width * (nodes.len() - 1) as f64).round() as usize
+            };
+            for k in ElementIndex::iter(mesh.n_elements) {
+                for i in 0..ops.n_nodes {
+                    let (b, eta) = nodes[position(k, i)];
+                    bathymetry.data[k.as_usize() * ops.n_nodes + i] = b;
+                    q.set_state(k, i, SWEState2D::new((eta - b).max(0.0), 0.0, 0.0));
+                }
+            }
+            bathymetry.compute_gradients(&ops, &geom);
+            let config = SWE2DRhsConfig::new(&equation, &bc)
+                .with_coriolis(false)
+                .with_formulation(SWEFormulation2D::WetDry)
+                .with_bathymetry(&bathymetry);
+            let rhs = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+            for k in ElementIndex::iter(mesh.n_elements) {
+                for i in 0..ops.n_nodes {
+                    let (b, eta) = nodes[position(k, i)];
+                    let below_water = nodes
+                        .iter()
+                        .skip(position(k, i).saturating_sub(1))
+                        .take(if position(k, i) == 0 { 2 } else { 3 })
+                        .any(|&(nb, n_eta)| n_eta > nb && n_eta > b);
+                    if eta <= b && below_water {
+                        let dh = rhs.get_var(k, i, 0);
+                        assert!(dh > 1e-3, "{name}: dry node {i} of {k:?}: dh/dt = {dh:.3e}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
