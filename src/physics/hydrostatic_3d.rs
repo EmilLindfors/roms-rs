@@ -10,11 +10,11 @@
 //! coupling of `η`), advection of `ū`, Coriolis on `ū`, and any bottom friction
 //! on `ū`. Configure it with the same Coriolis parameter as the 3D model
 //! (`with_source(CoriolisSource2D::…)`), and without wind or friction sources
-//! that duplicate [`Forcing`]. The slow forcing it receives
-//! ([`ModeSplitPhysics::slow_forcing_into`]) is
+//! that duplicate [`Forcing`] or [`Hydrostatic3D::with_bottom_drag`]. The
+//! slow forcing it receives ([`ModeSplitPhysics::slow_forcing_into`]) is
 //!
 //! ```text
-//!     G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀
+//!     G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀ − r·(u_b − ū)
 //! ```
 //!
 //! `⟨R₃D(u)⟩` is the depth mean of the 3D momentum tendency (baroclinic PGF,
@@ -24,6 +24,12 @@
 //! dispersion of the vertical shear, `−∇·⟨u′u′⟩`. For flow without shear, `G`
 //! reduces to the stresses exactly. Coriolis is pointwise and linear, so its
 //! share cancels exactly.
+//!
+//! The last term is the vertical-shear part of the quadratic bottom drag
+//! ([`Hydrostatic3D::with_bottom_drag`], rate `r = C_d|u_b|`); the splitter
+//! applies its depth-mean part `−r·ū` implicitly in the barotropic pass (see
+//! [`crate::physics::bottom_drag`]). `τ_b` is the prescribed stress of
+//! [`Forcing`], if any.
 //!
 //! The 3D PGF is baroclinic-only (`ρ − ρ₀`), so the barotropic pressure
 //! gradient comes from the 2D module. (Since P4.3 the 3D PGF lifts pressure
@@ -37,6 +43,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::SWEPhysics2D;
+use crate::physics::bottom_drag::BottomDrag3D;
 use crate::physics::eos::EquationOfState;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
 use crate::physics::vertical_diffusion::apply_vertical_diffusion;
@@ -86,6 +93,9 @@ where
     /// Columns shallower than this (m) are thin (3D wetting and drying; see
     /// [`Self::with_min_column_depth`]).
     pub min_column_depth: f64,
+    /// Quadratic drag of the bottom-layer velocity, if any (see
+    /// [`Self::with_bottom_drag`]).
+    pub bottom_drag: Option<BottomDrag3D>,
     /// Ω of the 3D velocities alone, for the `w` output of [`Self::post_process`].
     pub w_scratch: Mutex<Vec<f64>>,
     /// Layer transports (and their Ω) of the last 3D stage, and the tracer
@@ -144,6 +154,7 @@ where
             salt_bc: Arc::new(ExtrapolationTracerBC3D),
             tracer_limiter: TracerLimiter3DConfig::none(),
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
+            bottom_drag: None,
             w_scratch: Mutex::new(vec![0.0; n_w]),
             transport_scratch,
             mean_flow_scratch: Mutex::new(None),
@@ -176,6 +187,39 @@ where
         );
         self.min_column_depth = depth;
         self
+    }
+
+    /// Quadratic bottom drag `τ_b/ρ₀ = C_d|u_b|u_b` of the bottom-layer
+    /// velocity, with a constant or log-layer `C_d` (see
+    /// [`crate::physics::bottom_drag`] for the time discretisation). It adds
+    /// to any prescribed `Forcing::bottom_stress`.
+    ///
+    /// Thin columns ([`Self::with_min_column_depth`]) have no shear, so their
+    /// drag is `C_d|ū|ū` (with the `C_d` of their thin bottom layer, which a
+    /// log layer puts at its upper bound). The 2D module should then carry no
+    /// bottom friction of its own: it would count the drag twice.
+    pub fn with_bottom_drag(mut self, drag: BottomDrag3D) -> Self {
+        self.bottom_drag = Some(drag);
+        self
+    }
+
+    /// Drag rate `r = C_d(z_b)·|u_b|` (m/s) of the column at node `idx`
+    /// (`[element][node]`), with `z_b` the height of the bottom-layer centre
+    /// above the bed; zero where the column is dry.
+    #[inline]
+    fn drag_rate(&self, drag: &BottomDrag3D, state: &Solution3D, idx: usize) -> f64 {
+        let depth = state.eta.data[idx] - self.bathymetry.data[idx];
+        if depth <= 0.0 {
+            return 0.0;
+        }
+        let bottom = idx * state.n_levels;
+        let (u, v) = if depth < self.min_column_depth {
+            (state.ubar.data[idx], state.vbar.data[idx])
+        } else {
+            (state.u[bottom], state.v[bottom])
+        };
+        let z_b = (1.0 + self.sigma.sigma_rho()[0]) * depth;
+        drag.rate(z_b, (u * u + v * v).sqrt())
     }
 
     /// Whether the column at node `idx` (`[element][node]`) is thin.
@@ -484,7 +528,8 @@ where
         self.compute_transport_rhs_into(state, barotropic, out);
     }
 
-    /// `G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀` (see the module docs).
+    /// `G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀ − r·(u_b − ū)` (see
+    /// the module docs).
     fn slow_forcing_into(
         &self,
         state: &Solution3D,
@@ -536,13 +581,38 @@ where
                 } else {
                     1.0
                 };
-                g.data[SWE_VAR_HU][idx] = depth * (mean_u - bar_rhs.u[idx]) + wet * stress_x;
-                g.data[SWE_VAR_HV][idx] = depth * (mean_v - bar_rhs.v[idx]) + wet * stress_y;
+                // The shear part of the bottom drag; the pass applies −r·ū
+                let (drag_x, drag_y) = match &self.bottom_drag {
+                    Some(drag) if wet > 0.0 => {
+                        let r = self.drag_rate(drag, state, idx);
+                        (
+                            r * (state.u[idx * nl] - state.ubar.data[idx]),
+                            r * (state.v[idx * nl] - state.vbar.data[idx]),
+                        )
+                    }
+                    _ => (0.0, 0.0),
+                };
+                g.data[SWE_VAR_HU][idx] =
+                    depth * (mean_u - bar_rhs.u[idx]) + wet * stress_x - drag_x;
+                g.data[SWE_VAR_HV][idx] =
+                    depth * (mean_v - bar_rhs.v[idx]) + wet * stress_y - drag_y;
             }
         }
     }
 
-    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64) {
+    /// `r = C_d|u_b|` of every column from the bottom-layer velocity (the
+    /// depth mean in thin columns), if a drag is set.
+    fn bottom_drag_into(&self, state: &Solution3D, _t: f64, rate: &mut [f64]) -> bool {
+        let Some(drag) = &self.bottom_drag else {
+            return false;
+        };
+        for (idx, r) in rate.iter_mut().enumerate() {
+            *r = self.drag_rate(drag, state, idx);
+        }
+        true
+    }
+
+    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64, bottom_drag: Option<&[f64]>) {
         apply_vertical_diffusion(
             state,
             &self.sigma,
@@ -552,6 +622,7 @@ where
             &self.forcing,
             self.rho0,
             self.min_column_depth,
+            bottom_drag,
         );
         // Thin columns carry the depth mean only
         let nl = state.n_levels;
