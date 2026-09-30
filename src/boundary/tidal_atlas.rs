@@ -260,7 +260,10 @@ impl TidalAtlas {
     /// alike: inference, for a constituent the source misrepresents but
     /// whose ratio to a neighbour in frequency is known (e.g. from a long
     /// gauge record). Constituents close in frequency share their spatial
-    /// structure, so one ratio serves a small domain.
+    /// structure, so one ratio serves a small domain. With `from == name`
+    /// it is a complex gain on the constituent itself: calibration of one
+    /// the source has the right structure for but the wrong amplitude or
+    /// phase (e.g. its ratio to a gauge where both are known).
     pub fn infer(
         &mut self,
         name: &str,
@@ -804,6 +807,15 @@ mod tests {
         assert_eq!(atlas.names(), vec!["M2", "S2", "N2"]);
         atlas.validate().unwrap();
         assert!(atlas.infer("Q1", "O1", 0.19, 0.0).is_err());
+
+        // From itself: a complex gain, in place, velocities included
+        atlas.infer("M2", "M2", 1.1, -15.0).unwrap();
+        let m2 = atlas.points[1].constituents[0];
+        assert_eq!(atlas.names(), vec!["M2", "S2", "N2"]);
+        assert!((m2.eta.0 - 1.1).abs() < 1e-12 && (m2.eta.1 - 355.0).abs() < 1e-12);
+        let ((ua, ug), (va, vg)) = m2.velocity.unwrap();
+        assert!((ua - 0.11).abs() < 1e-12 && (ug - 85.0).abs() < 1e-12);
+        assert!((va - 0.22).abs() < 1e-12 && (vg - 175.0).abs() < 1e-12);
     }
 
     /// Corrected minus raw is the correction alone: zero where nothing
