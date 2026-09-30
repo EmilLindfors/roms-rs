@@ -62,9 +62,14 @@ pub use coriolis_3d::apply_coriolis_3d;
 pub mod advection_3d;
 pub use advection_3d::{
     ExtrapolationTracerBC3D, FixedTracerBC3D, TracerBCContext3D, TracerBoundaryCondition3D,
-    UpwindTracerBC3D, apply_horizontal_advection_3d, apply_tracer_advection_3d,
-    apply_vertical_advection_3d,
+    UpwindTracerBC3D, apply_horizontal_advection_3d, apply_vertical_advection_3d,
+};
+
+pub mod transport_3d;
+pub use transport_3d::{
+    BarotropicFlux, LayerTransport, TracerTransportScratch, apply_tracer_transport_3d,
+    scale_tracers_by_layer_thickness, transport_divergence_element,
 };
 
 pub mod rhs_3d;
-pub use rhs_3d::{Rhs3DConfig, compute_rhs_3d};
+pub use rhs_3d::{Rhs3DConfig, compute_momentum_rhs_3d, compute_transport_rhs_3d};

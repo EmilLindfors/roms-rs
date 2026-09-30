@@ -245,14 +245,10 @@ mod tests {
             Arc::new(SigmaGrid::new(3, UniformStretching)),
             bathymetry.clone(),
             Arc::new(CoriolisSource2D::f_plane(f)),
-            // Density independent of T and S: the 3D tracers are not yet
-            // constancy-preserving (TODO P4.2), so under the tide T and S
-            // drift with η and would feed a spurious baroclinic PGF into G.
-            LinearEOS {
-                alpha: 0.0,
-                beta: 0.0,
-                ..LinearEOS::default()
-            },
+            // T/S-dependent: uniform tracers stay uniform under the tide
+            // (P4.2), so they feed no baroclinic PGF into G. Before, T and S
+            // drifted with η and damped a seiche by 0.6 % per period.
+            LinearEOS::default(),
             ConstantMixing::new(viscosity, viscosity),
             swe,
             forcing,
@@ -713,5 +709,186 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A closed channel over a bed rising from 12 m to 4 m, a 0.5 m seiche
+    /// (so the layers thin and thicken by up to an eighth), sheared columns,
+    /// and the T/S-dependent linear EOS.
+    struct SlopingTide {
+        mesh: Arc<Mesh2D>,
+        ops: Arc<DGOperators2D>,
+        geom: Arc<GeometricFactors2D>,
+        bathymetry: Arc<Bathymetry2D>,
+        sigma: SigmaGrid,
+        length: f64,
+    }
+
+    impl SlopingTide {
+        fn new() -> Self {
+            let length = 1000.0;
+            let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 100.0, 8, 2));
+            let ops = Arc::new(DGOperators2D::new(2));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+            let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+                -12.0 + 8.0 * x / length + 0.5 * (std::f64::consts::PI * y / 100.0).cos()
+            }));
+            Self {
+                mesh,
+                ops,
+                geom,
+                bathymetry,
+                sigma: SigmaGrid::new(3, UniformStretching),
+                length,
+            }
+        }
+
+        fn physics(&self) -> Physics {
+            let swe = PhysicsBuilder::swe_2d(
+                self.mesh.clone(),
+                self.ops.clone(),
+                self.geom.clone(),
+                ShallowWater2D::new(G),
+                Reflective2D::default(),
+            )
+            .with_bathymetry(self.bathymetry.clone())
+            .with_formulation(SWEFormulation2D::EntropyStable)
+            .build();
+            Hydrostatic3D::new(
+                self.mesh.clone(),
+                self.ops.clone(),
+                self.geom.clone(),
+                Arc::new(self.sigma.clone()),
+                self.bathymetry.clone(),
+                Arc::new(CoriolisSource2D::f_plane(0.0)),
+                LinearEOS::default(),
+                ConstantMixing::new(1e-3, 1e-4),
+                swe,
+                no_stress(),
+                G,
+                RHO0,
+            )
+        }
+
+        /// `η = 0.5 cos(πx/L)`, zero-mean shear `u = 0.1(σ + ½)`, and the
+        /// tracers from `tracer(x, σ)`.
+        fn state(&self, physics: &Physics, tracer: impl Fn(f64, f64) -> (f64, f64)) -> Solution3D {
+            let (nn, nl) = (self.ops.n_nodes, self.sigma.n_levels());
+            let mut state = Solution3D::new(self.mesh.n_elements, nn, nl);
+            for k in 0..self.mesh.n_elements {
+                for i in 0..nn {
+                    let [x, _] = self.mesh.reference_to_physical(
+                        ElementIndex::new(k),
+                        self.ops.nodes_r[i],
+                        self.ops.nodes_s[i],
+                    );
+                    let idx = k * nn + i;
+                    state.eta.data[idx] = 0.5 * (std::f64::consts::PI * x / self.length).cos();
+                    for (l, &s) in self.sigma.sigma_rho().iter().enumerate() {
+                        state.u[idx * nl + l] = 0.1 * (s + 0.5);
+                        (state.temp[idx * nl + l], state.salt[idx * nl + l]) = tracer(x, s);
+                    }
+                }
+            }
+            physics.update_density(&mut state);
+            state
+        }
+
+        /// `∫ Σ_l H_z C dA` of a tracer.
+        fn inventory(&self, state: &Solution3D, tracer: &[f64]) -> f64 {
+            let (nn, nl) = (self.ops.n_nodes, self.sigma.n_levels());
+            let mut column = DGSolution2D::new(self.mesh.n_elements, nn);
+            for (idx, c) in column.data.iter_mut().enumerate() {
+                let depth = state.eta.data[idx] - self.bathymetry.data[idx];
+                *c = (0..nl)
+                    .map(|l| depth * self.sigma.d_sigma()[l] * tracer[idx * nl + l])
+                    .sum();
+            }
+            column.integrate(&self.ops, &self.geom)
+        }
+
+        /// One seiche period at 40 steps per period, calling `check` after
+        /// every step.
+        fn run(
+            &self,
+            physics: &Physics,
+            state: &mut Solution3D,
+            mut check: impl FnMut(&Solution3D, &Physics),
+        ) {
+            let period = 2.0 * self.length / (G * 8.0).sqrt();
+            let dt = period / 40.0;
+            let mut integrator = ModeSplitIntegrator::new();
+            for n in 0..40 {
+                physics.update_density(state);
+                integrator.step(state, physics, dt, n as f64 * dt);
+                physics.post_process(state);
+                check(state, physics);
+            }
+        }
+    }
+
+    /// TODO P4.2/P4.6 gate: uniform T and S stay uniform under a large tide
+    /// over a sloping bed. Before, the tracers were stepped as
+    /// concentrations with an inventory tendency, and Ω closed at the surface
+    /// with the 3D velocities' own ∂η/∂t instead of the barotropic pass's: a
+    /// 1 m tide over 20 m pumped salinity by about ±1.7 psu, and through a
+    /// T/S-dependent EOS fed a spurious baroclinic pressure gradient into G.
+    #[test]
+    fn uniform_tracers_stay_uniform_under_a_tide_over_a_sloping_bed() {
+        let case = SlopingTide::new();
+        let physics = case.physics();
+        let eos = LinearEOS::default();
+        let mut state = case.state(&physics, |_, _| (eos.t0 + 2.3, eos.s0 - 0.9));
+        let (mut drift, mut residual, mut omega_scale) = (0.0_f64, 0.0_f64, 0.0_f64);
+        case.run(&physics, &mut state, |s, p| {
+            for t in &s.temp {
+                drift = drift.max((t - (eos.t0 + 2.3)).abs());
+            }
+            for salt in &s.salt {
+                drift = drift.max((salt - (eos.s0 - 0.9)).abs());
+            }
+            residual = residual.max(p.last_surface_residual());
+            omega_scale = omega_scale.max(s.w.iter().fold(0.0, |m, w| m.max(w.abs())));
+        });
+        // Measured 9.3e-13 after one period; before, 12.8 (psu and °C)
+        assert!(
+            drift < 1e-11 * eos.s0,
+            "uniform tracers drifted by {drift:.3e} under the tide"
+        );
+        // Measured 3.0e-15 against Ω of 6.8e-3 m/s
+        // The barotropic pass's nodal identity closes Ω at the surface
+        assert!(omega_scale > 1e-5, "test regime: Ω {omega_scale:.2e}");
+        assert!(
+            residual < 1e-10 * omega_scale,
+            "Ω surface residual {residual:.2e} (Ω scale {omega_scale:.2e})"
+        );
+    }
+
+    /// TODO P4.2/P4.6 gate: the tracer inventories `∫ Σ H_z C dA` are
+    /// conserved to round-off in a closed basin, with horizontal and vertical
+    /// gradients, the tide, the sheared flow, the baroclinic flow they drive
+    /// and implicit vertical diffusion.
+    #[test]
+    fn tracer_inventories_are_conserved_under_a_tide() {
+        let case = SlopingTide::new();
+        let physics = case.physics();
+        let mut state = case.state(&physics, |x, s| {
+            (
+                10.0 + 3.0 * x / case.length - 2.0 * s,
+                33.0 + x / case.length + s,
+            )
+        });
+        let t0 = case.inventory(&state, &state.temp);
+        let s0 = case.inventory(&state, &state.salt);
+        let mut max_err = 0.0_f64;
+        case.run(&physics, &mut state, |s, _| {
+            max_err = max_err
+                .max((case.inventory(s, &s.temp) - t0).abs() / t0)
+                .max((case.inventory(s, &s.salt) - s0).abs() / s0);
+        });
+        // Measured 3.1e-15; before, 1.1e-2 within one period
+        assert!(
+            max_err < 1e-12,
+            "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
     }
 }
