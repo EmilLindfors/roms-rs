@@ -109,7 +109,7 @@ impl Setup {
         &self,
         q: &SWESolution2D,
         formulation: SWEFormulation2D,
-        h_dry: f64,
+        subcell_depth: f64,
         bed: Option<&Bathymetry2D>,
     ) -> SWESolution2D {
         let equation = ShallowWater2D::new(G);
@@ -117,7 +117,7 @@ impl Setup {
         let mut config = SWE2DRhsConfig::new(&equation, &bc)
             .with_coriolis(false)
             .with_formulation(formulation)
-            .with_dry_threshold(h_dry);
+            .with_subcell_depth(subcell_depth);
         if let Some(bed) = bed {
             config = config.with_bathymetry(bed);
         }
@@ -125,8 +125,8 @@ impl Setup {
     }
 }
 
-/// The formulations under test, with the dry threshold that selects them:
-/// `WetDry` with a threshold above every depth runs the subcell finite volumes
+/// The formulations under test, with the subcell depth that selects them:
+/// `WetDry` with a subcell depth above every depth runs the subcell finite volumes
 /// in every element.
 fn formulations(depth_scale: f64) -> Vec<(&'static str, SWEFormulation2D, f64)> {
     vec![
@@ -165,8 +165,8 @@ fn uniform_flow_is_preserved_on_distorted_elements() {
         // Scale of the individual terms: the momentum flux divergence per
         // element, g h² / Δx
         let scale = G * h * h / (L / 5.0);
-        for (name, formulation, h_dry) in formulations(h) {
-            let rhs = s.rhs(&q, formulation, h_dry, None);
+        for (name, formulation, subcell_depth) in formulations(h) {
+            let rhs = s.rhs(&q, formulation, subcell_depth, None);
             let err = max_abs(&rhs);
             assert!(
                 err < 1e-12 * scale,
@@ -192,8 +192,8 @@ fn lake_at_rest_over_rough_bed_on_distorted_elements() {
             q.set_state(k, i, SWEState2D::new(-bed.get(k, i), 0.0, 0.0));
         }
         let scale = G * 60.0 * 20.0 / (L / 5.0);
-        for (name, formulation, h_dry) in formulations(60.0).into_iter().skip(1) {
-            let rhs = s.rhs(&q, formulation, h_dry, Some(&bed));
+        for (name, formulation, subcell_depth) in formulations(60.0).into_iter().skip(1) {
+            let rhs = s.rhs(&q, formulation, subcell_depth, Some(&bed));
             let err = max_abs(&rhs);
             assert!(
                 err < 1e-11 * scale,
@@ -261,11 +261,11 @@ fn mass_and_momentum_are_conserved_on_distorted_elements() {
             q
         };
 
-        for (name, formulation, h_dry) in formulations(40.0) {
+        for (name, formulation, subcell_depth) in formulations(40.0) {
             // Mass, with the bed (split forms) or without (Standard)
             let bed_arg = (formulation != SWEFormulation2D::Standard).then_some(&bed);
             let state = if bed_arg.is_some() { &q_bed } else { &q };
-            let rhs = s.rhs(state, formulation, h_dry, bed_arg);
+            let rhs = s.rhs(state, formulation, subcell_depth, bed_arg);
             let rate = s.integrate(|k, i| rhs.get_state(k, i).h);
             let scale = s.integrate(|k, i| rhs.get_state(k, i).h.abs());
             assert!(
@@ -274,7 +274,7 @@ fn mass_and_momentum_are_conserved_on_distorted_elements() {
             );
 
             // Momentum on a flat bed
-            let rhs = s.rhs(&q, formulation, h_dry, None);
+            let rhs = s.rhs(&q, formulation, subcell_depth, None);
             for (c, label) in [(1, "x"), (2, "y")] {
                 let rate = s.integrate(|k, i| rhs.get_var(k, i, c));
                 let scale = s.integrate(|k, i| rhs.get_var(k, i, c).abs());

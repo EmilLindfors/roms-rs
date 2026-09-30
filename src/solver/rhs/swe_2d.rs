@@ -66,9 +66,9 @@ pub enum SWEFormulation2D {
     /// Split form for wetting and drying:
     /// - fully wet elements use the flux-differencing volume term of
     ///   [`Self::EntropyStable`];
-    /// - elements with a node shallower than `SWE2DRhsConfig::h_dry` use a
-    ///   second-order (limited linear reconstruction) finite-volume update on
-    ///   their GLL subcells;
+    /// - elements with a node shallower than `SWE2DRhsConfig::h_dry` (or
+    ///   `subcell_depth`) use a second-order (limited linear reconstruction)
+    ///   finite-volume update on their GLL subcells;
     /// - every interface, faces and subcell faces alike, uses HLL on
     ///   Audusse et al. (2004) hydrostatically reconstructed states.
     ///
@@ -136,8 +136,14 @@ pub struct SWE2DRhsConfig<'a, BC: SWEBoundaryCondition2D> {
     pub viscosity: Option<&'a HorizontalViscosity2D>,
     /// Depth (m) below which a node counts as dry for
     /// [`SWEFormulation2D::WetDry`]: elements with such a node use the subcell
-    /// finite-volume update. Default 1 mm (`WetDryConfig::DEFAULT_H_DRY`).
+    /// finite-volume update, and the subcells do not reconstruct the surface
+    /// through it. Default 1 mm (`WetDryConfig::DEFAULT_H_DRY`).
     pub h_dry: f64,
+    /// Depth (m) below which a node puts its element on the subcell update
+    /// (default: `h_dry`). A larger depth runs the subcells in wet elements
+    /// too, e.g. to measure their accuracy on wet flow; which nodes are dry
+    /// is still decided by `h_dry` alone.
+    pub subcell_depth: Option<f64>,
 }
 
 impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
@@ -154,6 +160,7 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
             well_balanced: false,
             viscosity: None,
             h_dry: crate::solver::WetDryConfig::DEFAULT_H_DRY,
+            subcell_depth: None,
         }
     }
 
@@ -269,6 +276,14 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
     pub fn with_dry_threshold(mut self, h_dry: f64) -> Self {
         assert!(h_dry >= 0.0, "dry threshold must be non-negative");
         self.h_dry = h_dry;
+        self
+    }
+
+    /// Run the `WetDry` subcell update in every element with a node shallower
+    /// than `depth` (default: `h_dry`; see [`Self::subcell_depth`]).
+    pub fn with_subcell_depth(mut self, depth: f64) -> Self {
+        assert!(depth >= 0.0, "subcell depth must be non-negative");
+        self.subcell_depth = Some(depth);
         self
     }
 }

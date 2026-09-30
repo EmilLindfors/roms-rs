@@ -1039,10 +1039,10 @@ fn periodic_mesh(l: f64, n: usize, distorted: bool) -> Mesh2D {
 }
 
 /// L2 depth error of a split form on an n×n periodic mesh (`WetDry`: subcell
-/// finite volumes in elements with a node shallower than `h_dry`).
+/// finite volumes in elements with a node shallower than `subcell_depth`).
 fn run_swe_2d_split_form_manufactured(
     formulation: dg_rs::SWEFormulation2D,
-    h_dry: f64,
+    subcell_depth: f64,
     distorted: bool,
     n: usize,
     order: usize,
@@ -1065,7 +1065,7 @@ fn run_swe_2d_split_form_manufactured(
         .with_formulation(formulation)
         .with_bathymetry(&bathymetry)
         .with_source_terms(&source)
-        .with_dry_threshold(h_dry);
+        .with_subcell_depth(subcell_depth);
 
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
     q.set_from_functions(&mesh, &ops, |x, y| depth(x, y, 0.0), |_, _| U, |_, _| V);
@@ -1109,7 +1109,7 @@ fn check_split_form_convergence(
 
 fn check_split_form_convergence_with(
     formulation: dg_rs::SWEFormulation2D,
-    h_dry: f64,
+    subcell_depth: f64,
     distorted: bool,
     resolutions: &[usize],
     order: usize,
@@ -1122,7 +1122,7 @@ fn check_split_form_convergence_with(
         .map(|&n| {
             run_swe_2d_split_form_manufactured(
                 formulation,
-                h_dry,
+                subcell_depth,
                 distorted,
                 n,
                 order,
@@ -1133,7 +1133,7 @@ fn check_split_form_convergence_with(
         .collect();
 
     println!(
-        "\nSWE 2D split form {formulation:?} P{order}, h_dry = {h_dry:e}, distorted = {distorted} \
+        "\nSWE 2D split form {formulation:?} P{order}, subcell depth {subcell_depth:e}, distorted = {distorted} \
          (manufactured, bathymetry):"
     );
     for (i, (&n, &err)) in resolutions.iter().zip(errors.iter()).enumerate() {
@@ -1173,8 +1173,8 @@ fn test_convergence_swe_2d_wet_dry_split_form() {
 
 #[test]
 fn test_convergence_swe_2d_wet_dry_subcells() {
-    // Subcell finite volumes forced in every element (every node is "dry"
-    // below an infinite threshold): the limited linear reconstruction on the
+    // Subcell finite volumes forced in every element (an infinite subcell
+    // depth; the nodes are wet, so the surface is reconstructed): the limited linear reconstruction on the
     // GLL subcells converges at second order for any N. Measured 8 → 16:
     // P1 1.90, P2 1.87, P3 1.92 (1.96 / 1.90 / 2.04 from 16 → 32). Without the
     // reconstruction: P2 1.37, then 0.68 from 16 → 32.
