@@ -203,7 +203,7 @@ mod tests {
     use crate::mesh::{Mesh2D, Mesh2DBuilder};
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::physics::vertical_mixing::{ConstantMixing, Forcing};
-    use crate::physics::{Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D};
+    use crate::physics::{BottomDrag3D, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D};
     use crate::simulation::Simulation;
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D};
@@ -1165,5 +1165,192 @@ mod tests {
         });
         // Measured 2.0e-13 m/s
         assert!(max_speed < 1e-10, "the lake spun up {max_speed:.3e} m/s");
+    }
+
+    /// A flat, doubly periodic ocean `depth` deep, 40 km square (4 × 4 P1),
+    /// without rotation, on `n_levels` uniform σ-levels, with the reference
+    /// T and S (no baroclinic pressure) at rest, and its 2D module (no
+    /// friction of its own).
+    fn flat_periodic_3d(
+        depth: f64,
+        n_levels: usize,
+        forcing: Forcing,
+        viscosity: f64,
+    ) -> (Physics, Solution3D) {
+        let mesh = Arc::new(
+            Mesh2DBuilder::new(0.0, 40e3, 0.0, 40e3)
+                .with_resolution(4, 4)
+                .fully_periodic()
+                .build(),
+        );
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(SigmaGrid::new(n_levels, UniformStretching)),
+            bathymetry,
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(viscosity, viscosity),
+            swe,
+            forcing,
+            G,
+            RHO0,
+        );
+        let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
+        let eos = LinearEOS::default();
+        state.temp.fill(eos.t0);
+        state.salt.fill(eos.s0);
+        physics.update_density(&mut state);
+        (physics, state)
+    }
+
+    /// TODO P4.4 gate: wind against quadratic bottom drag over a flat,
+    /// periodic, non-rotating ocean. The steady state passes the wind stress
+    /// through the column unchanged: a linear profile of shear `τ/(ρ₀ν)`,
+    /// and a bottom layer with `C_d u_b² = τ/ρ₀`. The depth mean gets there
+    /// only if the pass (`−r·ū`) and `G` (`−r·(u_b − ū)`) together apply the
+    /// drag of the bottom layer, not of the depth mean.
+    #[test]
+    fn wind_against_bottom_drag_reaches_the_quadratic_balance() {
+        let (depth, tau, cd, nu, n_levels) = (10.0, 0.1, 2.5e-3, 0.01, 10);
+        let forcing = Forcing {
+            surface_stress: [tau, 0.0],
+            ..no_stress()
+        };
+        let (physics, mut state) = flat_periodic_3d(depth, n_levels, forcing, nu);
+        let physics = physics.with_bottom_drag(BottomDrag3D::quadratic(cd));
+        // The depth mean relaxes at 2C_d u_b/D ≈ 1e-4 /s: 40 e-foldings
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+            .with_cfl(10.0)
+            .with_dt_max(600.0);
+        let result = sim.run(&mut state, 0.0, 4e5);
+        assert!(result.success, "drag run failed: {:?}", result.error);
+
+        let u_b = (tau / (RHO0 * cd)).sqrt();
+        let step = tau / (RHO0 * nu) * depth / n_levels as f64;
+        let (mut bottom_err, mut shear_err, mut v_max) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for col in 0..state.eta.data.len() {
+            let u = &state.u[col * n_levels..(col + 1) * n_levels];
+            let v = &state.v[col * n_levels..(col + 1) * n_levels];
+            bottom_err = max_or_nan([bottom_err, (u[0] - u_b).abs() / u_b]);
+            for pair in u.windows(2) {
+                shear_err = max_or_nan([shear_err, (pair[1] - pair[0] - step).abs() / step]);
+            }
+            v_max = max_or_nan(v.iter().map(|v| v.abs()).chain([v_max]));
+        }
+        // Measured 1.2e-13 and 2.1e-13. With the pass's −r·ū alone (no shear
+        // part in G) the bottom layer settles 9.4 % off, the shear 16 %.
+        assert!(
+            bottom_err < 1e-10,
+            "bottom-layer velocity off C_d u_b² = τ/ρ₀ by {bottom_err:.3e} of u_b = {u_b:.4}"
+        );
+        assert!(
+            shear_err < 1e-10,
+            "layer shear off τ/(ρ₀ν) by {shear_err:.3e}"
+        );
+        assert!(v_max < 1e-12, "cross-wind flow {v_max:.3e} m/s");
+    }
+
+    /// TODO P4.4 gate: without vertical shear the 3D bottom drag is the 2D
+    /// quadratic friction `C_d|ū|ū/h`. A uniform flow over a flat, periodic
+    /// ocean on one σ-level decays as `u₀/(1 + C_d u₀ t/D)`; the mode split
+    /// (rate frozen over each step) converges to it at first order in Δt.
+    #[test]
+    fn unsheared_bottom_drag_decays_like_the_2d_quadratic_friction() {
+        let (depth, cd, u0, t_end) = (10.0, 2.5e-3, 1.0, 8000.0);
+        let exact = u0 / (1.0 + cd * u0 * t_end / depth);
+
+        let mut errors = Vec::new();
+        for dt in [400.0, 200.0, 100.0] {
+            let (physics, mut state) = flat_periodic_3d(depth, 1, no_stress(), 0.0);
+            let physics = physics.with_bottom_drag(BottomDrag3D::quadratic(cd));
+            state.u.fill(u0);
+            state.ubar.data.fill(u0);
+            let mut integrator = ModeSplitIntegrator::new();
+            let steps = (t_end / dt).round() as usize;
+            for n in 0..steps {
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            }
+            let err = max_or_nan(state.ubar.data.iter().map(|u| (u - exact).abs()));
+            let spread = max_or_nan(state.u.iter().map(|u| (u - state.ubar.data[0]).abs()));
+            assert!(
+                spread < 1e-14,
+                "dt {dt}: the uniform flow lost uniformity by {spread:.3e}"
+            );
+            errors.push(err);
+        }
+
+        // The 2D model with the same C_d (Chézy), implicit friction
+        let (physics, _) = flat_periodic_3d(depth, 1, no_stress(), 0.0);
+        let swe = PhysicsBuilder::swe_2d(
+            physics.mesh.clone(),
+            physics.ops.clone(),
+            physics.geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(physics.bathymetry.clone())
+        .with_implicit_friction(crate::source::ChezyFriction2D::new(cd))
+        .build();
+        let mut q = SWESolution2D::new(physics.mesh.n_elements, physics.ops.n_nodes);
+        q.data[SWE_VAR_H].fill(depth);
+        q.data[SWE_VAR_HU].fill(depth * u0);
+        let result = Simulation::new(swe, SSPRK3)
+            .with_cfl(0.5)
+            .run(&mut q, 0.0, t_end);
+        assert!(result.success, "2D reference failed: {:?}", result.error);
+        let err_2d = max_or_nan(
+            q.data[SWE_VAR_HU]
+                .iter()
+                .map(|hu| (hu / depth - exact).abs()),
+        );
+
+        // Measured 4.8e-3, 2.4e-3, 1.2e-3 at Δt = 400, 200, 100 s (rates
+        // 1.01, 1.01); the 2D model at CFL 0.5: 2.1e-3
+        assert!(err_2d < 1e-2 * exact, "2D reference off by {err_2d:.3e}");
+        for pair in errors.windows(2) {
+            let rate = (pair[0] / pair[1]).log2();
+            assert!(
+                (0.9..1.3).contains(&rate),
+                "convergence rate {rate:.2} (errors {errors:?})"
+            );
+        }
+        assert!(errors[2] < 1e-2 * exact, "error {:.3e}", errors[2]);
+    }
+
+    /// TODO P4.4 gate: the beach of the P4.5 gates with log-layer drag. Its
+    /// thin bottom layers put `C_d` at its upper bound (0.1), so in the
+    /// shallows `r·Δt/D` is far beyond an explicit drag's limit (≈ 2); the
+    /// implicit drag keeps the run finite, without clips, and takes energy
+    /// out of the slosh.
+    #[test]
+    fn a_beach_wets_and_dries_with_log_layer_drag() {
+        let speed = |s: &Solution3D| max_or_nan(s.ubar.data.iter().map(|u| u.abs()));
+        let (physics, mut state, _) = beach_3d(0.3);
+        let mut free = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| free = free.max(speed(s)));
+
+        let (physics, mut state, _) = beach_3d(0.3);
+        let physics = physics.with_bottom_drag(BottomDrag3D::log_layer(0.005));
+        let mut dragged = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| {
+            dragged = dragged.max(speed(s))
+        });
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+        // Measured 3.29 m/s free, 0.72 m/s with drag
+        assert!(dragged < 0.5 * free, "drag {dragged} vs free {free}");
     }
 }

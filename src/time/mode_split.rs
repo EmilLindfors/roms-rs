@@ -34,6 +34,13 @@
 //! 4. **Implicit vertical terms** (diffusion with the surface and bottom
 //!    stresses), then the depth mean of `u` is reset to `ū`.
 //!
+//! A bottom drag `τ_b/ρ₀ = r·u_b` ([`ModeSplitPhysics::bottom_drag_into`])
+//! is linearised with `r` frozen at `tⁿ`. Its depth-mean part `−r·ū` is
+//! applied point-implicitly in every barotropic RK stage, like the 2D
+//! friction, so no `r·Δt/D` destabilises it; `G` carries the part of the
+//! vertical shear, `−r·(u_b − ū)`, and the vertical diffusion takes
+//! `r·u_bⁿ⁺¹` as its bottom flux.
+//!
 //! The 2D positivity limiter and wet/dry treatment run after every barotropic
 //! RK stage (and on the filtered state, since the filter has small negative
 //! weights), and stiff 2D damping (implicit friction) is applied per stage, as
@@ -43,10 +50,11 @@
 //!
 //! The 2D module owns the depth-mean flow: the barotropic pressure gradient
 //! (with the DG face coupling of `η`), advection of `ū`, Coriolis on `ū` and
-//! its own bottom friction. `G` carries only what depends on the vertical
-//! structure: the baroclinic pressure gradient, the momentum dispersion of the
-//! vertical shear and the surface/bottom stresses of the 3D columns (see
-//! [`crate::physics::Hydrostatic3D`]).
+//! its own bottom friction (none when the 3D model has a bottom drag, whose
+//! depth-mean part the splitter applies). `G` carries only what depends on
+//! the vertical structure: the baroclinic pressure gradient, the momentum
+//! dispersion of the vertical shear and the surface/bottom stresses of the 3D
+//! columns (see [`crate::physics::Hydrostatic3D`]).
 //!
 //! # Accuracy and known gaps (TODO P4.1)
 //!
@@ -234,9 +242,24 @@ pub trait ModeSplitPhysics {
         g: &mut SWESolution2D,
     );
 
+    /// Bottom drag of the step: overwrite `rate` (one entry per column,
+    /// `[element][node]`) with the linear rate `r` (m/s) of the bottom stress,
+    /// `τ_b/ρ₀ = r·u_b`, from `state` at `t`, and return `true`; `false` (the
+    /// default) for none.
+    ///
+    /// The splitter freezes `r` over the step. It applies `−r·ū` to the depth
+    /// mean in the barotropic pass, point-implicitly, and hands the rates to
+    /// [`Self::vertical_implicit`]. [`Self::slow_forcing_into`] must add the
+    /// rest of the drag on the depth mean, `−r·(u_b − ū)`.
+    fn bottom_drag_into(&self, _state: &Solution3D, _t: f64, _rate: &mut [f64]) -> bool {
+        false
+    }
+
     /// Implicit vertical terms over `dt`: vertical diffusion, with the surface
-    /// and bottom stresses as its boundary fluxes.
-    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64);
+    /// and bottom stresses as its boundary fluxes, and the bottom drag
+    /// `r·u_b` at the new time if `bottom_drag` holds the rates `r` of
+    /// [`Self::bottom_drag_into`].
+    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64, bottom_drag: Option<&[f64]>);
 
     /// Runs on every 3D stage value (with the tracers as concentrations),
     /// including the last: limiters, density.
@@ -472,6 +495,8 @@ struct Buffers {
     rate_eta: DGSolution2D,
     rate_ubar: DGSolution2D,
     rate_vbar: DGSolution2D,
+    /// Bottom-drag rate `r` of every column, frozen over the step.
+    drag_rate: Vec<f64>,
 }
 
 impl Buffers {
@@ -495,6 +520,7 @@ impl Buffers {
             rate_eta: DGSolution2D::new(ne, nn),
             rate_ubar: DGSolution2D::new(ne, nn),
             rate_vbar: DGSolution2D::new(ne, nn),
+            drag_rate: vec![0.0; ne * nn],
         }
     }
 }
@@ -595,11 +621,15 @@ impl ModeSplitIntegrator {
             rate_eta,
             rate_ubar,
             rate_vbar,
+            drag_rate,
         } = self
             .buffers
             .get_or_insert_with(|| Buffers::new(state, barotropic.operators().n_face_nodes));
 
-        // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3)
+        // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3);
+        // the bottom-drag rates of the step
+        let bottom_drag = physics.bottom_drag_into(state, t, drag_rate);
+        let drag_rate: &[f64] = drag_rate;
         physics.momentum_rhs_into(state, t, rhs_n);
         physics.slow_forcing_into(state, rhs_n, t, history.push(t, dt));
         history.step_average(dt, g_term);
@@ -640,7 +670,12 @@ impl ModeSplitIntegrator {
                     transport.accumulate(c, s, face_mass);
                     stage += 1;
                 },
-                |stage, from, dt_stage| barotropic.implicit_damping(stage, from, dt_stage),
+                |stage, from, dt_stage| {
+                    barotropic.implicit_damping(stage, from, dt_stage);
+                    if bottom_drag {
+                        damp_depth_mean(stage, drag_rate, dt_stage);
+                    }
+                },
                 |s| barotropic.post_process(s),
                 &mut self.stages_2d,
             );
@@ -784,11 +819,25 @@ impl ModeSplitIntegrator {
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the
         // barotropic mode: reset it to ū.
-        physics.vertical_implicit(state, dt);
+        physics.vertical_implicit(state, dt, bottom_drag.then_some(drag_rate));
         depth_average(sigma, &state.u, mean_u);
         depth_average(sigma, &state.v, mean_v);
         shift_columns(&mut state.u, state.n_levels, mean_u, &state.ubar);
         shift_columns(&mut state.v, state.n_levels, mean_v, &state.vbar);
+    }
+}
+
+/// The depth-mean part of the bottom drag, `∂(hu, hv)/∂t = −r·(hu, hv)/h`,
+/// point-implicitly on a barotropic stage value: `(hu, hv) ← (hu, hv)/(1 +
+/// dt·r/h)` with the stage's own depth (only ever shrinks the transport).
+fn damp_depth_mean(stage: &mut SWESolution2D, rate: &[f64], dt: f64) {
+    let [h, hu, hv] = &mut stage.data;
+    for (((&h, hu), hv), &r) in h.iter().zip(hu.iter_mut()).zip(hv.iter_mut()).zip(rate) {
+        if h > 0.0 && r > 0.0 {
+            let factor = 1.0 / (1.0 + dt * r / h);
+            *hu *= factor;
+            *hv *= factor;
+        }
     }
 }
 
@@ -1161,7 +1210,7 @@ mod tests {
             g.data[SWE_VAR_HU].fill(self.amplitude * (self.omega * t + PHASE).cos());
         }
 
-        fn vertical_implicit(&self, _state: &mut Solution3D, _dt: f64) {}
+        fn vertical_implicit(&self, _state: &mut Solution3D, _dt: f64, _drag: Option<&[f64]>) {}
 
         fn post_stage(&self, _state: &mut Solution3D) {}
     }

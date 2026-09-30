@@ -6,6 +6,15 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Quadratic bottom drag in 3D (TODO P4.4).** The 3D bottom stress was a user constant (`Forcing::bottom_stress`). `Hydrostatic3D::with_bottom_drag(BottomDrag3D)` now applies `τ_b/ρ₀ = C_d|u_b|u_b` of the bottom-layer velocity, with a constant `C_d` (`BottomDrag3D::quadratic`) or the log-layer `C_d = (κ/ln(z_b/z₀))²` at the bottom-layer centre, bounded to [0.0025, 0.1] (`BottomDrag3D::log_layer(z0)`, `with_bounds`).
+  - Linearised over each baroclinic step with the rate `r = C_d|u_bⁿ|`. The mode splitter applies the depth-mean part `−r·ū` point-implicitly in every barotropic RK stage (stable for any `r·Δt/D`, like the 2D implicit friction); G carries the shear part `−r·(u_bⁿ − ūⁿ)`; the implicit vertical diffusion takes `r·u_bⁿ⁺¹` as its bottom flux. Without shear the 3D model therefore has the 2D quadratic friction `C_d|ū|ū/h` exactly. Thin columns (P4.5) drag with `C_d|ū|`.
+  - API: `ModeSplitPhysics::bottom_drag_into` (default: none); `ModeSplitPhysics::vertical_implicit` and `apply_vertical_diffusion` take the drag rates (`Option<&[f64]>`).
+  - Gates:
+    - `wind_against_bottom_drag_reaches_the_quadratic_balance` (flat periodic ocean, 10 levels): the steady state has `C_d u_b² = τ/ρ₀` and shear `τ/(ρ₀ν)` to 1.2e-13 / 2.1e-13. With the pass's `−r·ū` alone (no shear part in G) the bottom layer settles 9.4 % off.
+    - `unsheared_bottom_drag_decays_like_the_2d_quadratic_friction`: a uniform flow on one level decays as `u₀/(1 + C_d u₀ t/D)`, converging at first order in Δt (errors 4.8e-3, 2.4e-3, 1.2e-3 at Δt = 400, 200, 100 s; the 2D model with Chézy friction 2.1e-3).
+    - `a_beach_wets_and_dries_with_log_layer_drag`: the P4.5 beach with `C_d` at its upper bound in the films stays finite with 0 clips; max |ū| 3.29 → 0.72 m/s.
+    - Unit tests: the log law and its bounds; one implicit column step removes exactly `Δt·r·u_bⁿ⁺¹` and never reverses the bottom layer (`r·Δt/Δz_b` up to 10⁴).
+
 - **3D wetting and drying (TODO P4.5).** Any dry node gave NaN in the first 3D step: vertical diffusion divided by a zero-thickness column.
   - Thin columns, shallower than `Hydrostatic3D::with_min_column_depth` (default 0.1 m, ROMS's Dcrit; Warner et al. 2013):
     - carry no shear: their velocity is ū, their 3D momentum tendency is zero, and they get no vertical diffusion;

@@ -103,7 +103,7 @@ This section only orders the existing items for that goal and adds the two farm-
 8. ~~Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7~~ done 2026-09-28.
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
-- P4.2 (tracer constancy: done 2026-09-30; still 3D open boundaries for momentum and T/S profiles, momentum in inventory form), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry: done 2026-09-30; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
+- P4.2 (tracer constancy: done 2026-09-30; still 3D open boundaries for momentum and T/S profiles, momentum in inventory form), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS; quadratic bottom drag: done 2026-09-30), P4.5 (3D wet/dry: done 2026-09-30; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
 - F.1 cage drag (3D form) and F.2 in 3D.
 
 Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
@@ -588,7 +588,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [x] G without the double count: D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) instead of D·⟨R₃D(u)⟩, with AB3 step averages (`step_average_weights`, variable steps; the history restarts when a run does not continue).
   - In a nonlinear unsheared seiche the old G drifted from the 2D model by 0.14 of the amplitude in two periods; the new G drifts by 1.8e-3, falling with dt.
 - [x] Surface and bottom stress into G, as (τ_s − τ_b)/ρ₀ from `Forcing`. The vertical diffusion now also divides by the model's ρ₀, not 1025, so G and the columns agree.
-  - τ_b is still the user's constant; a quadratic drag from the bottom-layer velocity, consistent with the 2D friction, is P4.4.
+  - τ_b is still the user's constant; a quadratic drag from the bottom-layer velocity, consistent with the 2D friction, is P4.4. (Done 2026-09-30: `with_bottom_drag`, see P4.4.)
 - [x] ~~Full PGF in the 3D RHS~~: dropped, see the design decisions.
 - [x] `ModeSplitPhysics` trait: the splitter's view of the 3D model (2D module, 3D RHS, slow forcing, implicit vertical terms, stage hook). `Hydrostatic3D` implements it; `ModeSplitIntegrator::step(state, physics, dt, t)`.
 
@@ -637,7 +637,10 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 ### P4.4 Vertical mixing and boundary layers
 - [ ] GLS k-ε (NorKyst's closure) as a per-column solve reusing the tridiagonal solver (Umlauf & Burchard 2003; Warner et al. 2005). KPP as an alternative.
 - [ ] Convective adjustment (low-shear unstable columns currently get background mixing).
-- [ ] Implicit quadratic bottom drag with a log-layer Cd; consistent with 2D friction.
+- [x] Implicit quadratic bottom drag with a log-layer Cd; consistent with 2D friction. Done 2026-09-30 (`physics::bottom_drag`, `Hydrostatic3D::with_bottom_drag`): `τ_b/ρ₀ = C_d|u_b|u_b`, constant or log-layer `C_d` bounded to [0.0025, 0.1]; rate `r = C_d|u_bⁿ|` frozen over the step, `−r·ū` point-implicit in the barotropic pass, `−r·(u_b − ū)` in G, `r·u_bⁿ⁺¹` implicit in the vertical diffusion. Without shear it is the 2D quadratic friction exactly (converges at first order in Δt); wind against drag reaches `C_d u_b² = τ/ρ₀` to 1e-13; the P4.5 beach runs with it.
+  - [ ] Second order in time: `r` lags a step (first order, as the 2D point-implicit friction). Re-evaluate `r` from the pass's `ū` per stage, with the frozen shear deviation `u_b − ū` (Thetis-style), if the drag's time error matters.
+  - [ ] A spatially varying `z₀` (sediment map, as the 2D roughness-map item in P1.2), and a drag coefficient consistent with the 2D module's Manning n for runs that compare 2D and 3D.
+  - [ ] ROMS's `LIMIT_BSTRESS` is not needed (the drag is implicit), but thin columns take `C_d,max = 0.1` from their thin bottom layer: check the wet/dry front speed on a real beach against the 2D `WetDry` with Manning.
 - [ ] Surface heat flux Q_net/(ρ₀c_p) (currently fed a buoyancy flux). The momentum stresses use the model's ρ₀ since P4.1 PR 2; the heat flux still needs it.
 - [ ] Surface heat-flux budget (shortwave, longwave, sensible/latent) for multi-day SST evolution (formerly "P3.1 Surface Heat Flux Budget").
 

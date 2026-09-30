@@ -22,6 +22,12 @@ use crate::vertical::SigmaGrid;
 /// column ends, so over `dt` the depth-integrated velocity of every column
 /// changes by `dt·(τ_s − τ_b)/ρ₀`.
 ///
+/// `bottom_drag`, if given, holds a linear drag rate `r` (m/s) per column
+/// (`[element][node]`): the bottom flux `r·u_b` of the new bottom-layer
+/// velocity joins `τ_b`, implicitly, so it cannot reverse the flow for any
+/// `dt` (the quadratic drag linearised with `r = C_d|u_b|`, see
+/// [`crate::physics::BottomDrag3D`]).
+///
 /// Columns shallower than `min_column_depth` (m) are left alone: they carry
 /// no vertical structure (3D wetting and drying, see
 /// [`crate::physics::Hydrostatic3D::with_min_column_depth`]), and the solve
@@ -36,6 +42,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     forcing: &Forcing,
     rho0: f64,
     min_column_depth: f64,
+    bottom_drag: Option<&[f64]>,
 ) {
     let n_levels = state.n_levels;
     let mut a = vec![0.0; n_levels];
@@ -93,6 +100,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 .copy_from_slice(&kt[0..n_levels]);
 
             // 3. Solve diffusion
+            let drag = bottom_drag.map_or(0.0, |rate| rate[k * state.n_nodes + i]);
 
             // U-momentum
             solve_diffusion_column(
@@ -102,6 +110,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 dt,
                 forcing.surface_stress[0] / rho0, // kinematic
                 forcing.bottom_stress[0] / rho0,
+                drag,
                 &mut a,
                 &mut b,
                 &mut c,
@@ -119,6 +128,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 dt,
                 forcing.surface_stress[1] / rho0,
                 forcing.bottom_stress[1] / rho0,
+                drag,
                 &mut a,
                 &mut b,
                 &mut c,
@@ -135,6 +145,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 &dz,
                 dt,
                 forcing.surface_buoyancy_flux,
+                0.0,
                 0.0,
                 &mut a,
                 &mut b,
@@ -153,6 +164,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 dt,
                 0.0,
                 0.0,
+                0.0,
                 &mut a,
                 &mut b,
                 &mut c,
@@ -165,6 +177,10 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     }
 }
 
+/// One backward-Euler step of `∂φ/∂t = ∂/∂z(ν ∂φ/∂z)` in a column, with the
+/// upward fluxes `flux_top` at the surface and `flux_bot + drag_bot·φ₀` at the
+/// bed (`drag_bot·φ₀` at the new time).
+#[allow(clippy::too_many_arguments)]
 fn solve_diffusion_column(
     phi: &mut [f64],
     nu: &[f64],
@@ -172,6 +188,7 @@ fn solve_diffusion_column(
     dt: f64,
     flux_top: f64,
     flux_bot: f64,
+    drag_bot: f64,
     a: &mut [f64],
     b: &mut [f64],
     c: &mut [f64],
@@ -215,9 +232,10 @@ fn solve_diffusion_column(
     }
 
     // Apply Boundary Conditions to RHS
-    // Bottom: - lambda * Flux_{bot}
+    // Bottom: - lambda * Flux_{bot}, the drag part implicit
     let lambda_bot = dt / dz[0];
     d[0] -= lambda_bot * flux_bot;
+    b[0] += lambda_bot * drag_bot;
 
     // Top: + lambda * Flux_{top}
     let lambda_top = dt / dz[n - 1];
@@ -262,6 +280,7 @@ mod tests {
             dt,
             flux_top,
             flux_bot,
+            0.0,
             &mut a,
             &mut b,
             &mut c,
@@ -322,6 +341,7 @@ mod tests {
             dt,
             flux_top,
             flux_bot,
+            0.0,
             &mut a,
             &mut b,
             &mut c,
@@ -376,6 +396,7 @@ mod tests {
                 &forcing,
                 1025.0,
                 0.0,
+                None,
             );
             state.u_column(ElementIndex::new(0), 0).to_vec()
         };
@@ -435,6 +456,7 @@ mod tests {
             &forcing,
             rho0,
             0.0,
+            None,
         );
 
         let el = ElementIndex::new(0);
@@ -450,5 +472,72 @@ mod tests {
             (dv - expect_v).abs() < 1e-12 * expect_v.abs(),
             "{dv} vs {expect_v}"
         );
+    }
+
+    /// The implicit bottom drag is a flux `r·u_b` of the *new* bottom-layer
+    /// velocity: one step changes the column transport by exactly
+    /// `−dt·r·u_bⁿ⁺¹`, and even at `r·dt/Δz_b = 10⁴` the bottom layer only
+    /// slows down, it does not reverse.
+    #[test]
+    fn implicit_bottom_drag_removes_r_times_the_new_bottom_velocity() {
+        use crate::mesh::data::Bathymetry2D;
+        use crate::types::ElementIndex;
+        use crate::vertical::{SigmaGrid, SongHaidvogelStretching};
+
+        let n_levels = 8;
+        let sigma = SigmaGrid::new(
+            n_levels,
+            SongHaidvogelStretching {
+                theta_s: 3.0,
+                theta_b: 0.4,
+                hc: 10.0,
+            },
+        );
+        let mixing = ConstantMixing::new(0.01, 0.0);
+        let forcing = Forcing {
+            surface_stress: [0.0, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        };
+        let depth = 20.0;
+        let mut dz = vec![0.0; n_levels];
+        sigma.layer_thicknesses_into(0.0, depth, &mut dz);
+        let transport = |col: &[f64]| -> f64 { col.iter().zip(&dz).map(|(u, h)| u * h).sum() };
+        let bathymetry = Bathymetry2D::constant(1, 1, -depth);
+        let el = ElementIndex::new(0);
+
+        for (dt, rate) in [(60.0, 2.5e-3), (1e4, 1.0)] {
+            let mut state = Solution3D::new(1, 1, n_levels);
+            state.u.fill(0.8);
+            state.v.fill(-0.3);
+            let before = (transport(&state.u), transport(&state.v));
+            apply_vertical_diffusion(
+                &mut state,
+                &sigma,
+                &bathymetry,
+                dt,
+                &mixing,
+                &forcing,
+                1025.0,
+                0.0,
+                Some(&[rate]),
+            );
+            let (u, v) = (state.u_column(el, 0), state.v_column(el, 0));
+            for (after, before, bottom) in [
+                (transport(u), before.0, u[0]),
+                (transport(v), before.1, v[0]),
+            ] {
+                let expect = -dt * rate * bottom;
+                assert!(
+                    (after - before - expect).abs() < 1e-12 * before.abs(),
+                    "dt {dt}: transport change {} vs −dt·r·u_b = {expect}",
+                    after - before
+                );
+                assert!(
+                    bottom * before > 0.0 && bottom.abs() < before.abs() / depth,
+                    "dt {dt}: bottom velocity {bottom} reversed or grew"
+                );
+            }
+        }
     }
 }
