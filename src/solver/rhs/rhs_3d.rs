@@ -20,7 +20,7 @@ use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::rhs::advection_3d::TracerBoundaryCondition3D;
 use crate::solver::rhs::baroclinic::compute_pressure_gradient;
-use crate::solver::rhs::boundary_3d::Boundaries3D;
+use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
     LayerTransport, TransportScratch, apply_momentum_transport_3d, apply_tracer_transport_3d,
@@ -41,6 +41,9 @@ pub struct Rhs3DConfig<'a> {
     pub salt_bc: &'a dyn TracerBoundaryCondition3D,
     /// Walls and open faces of the domain.
     pub boundaries: &'a Boundaries3D,
+    /// Values outside the open faces (a nesting parent's), where not the
+    /// interior's.
+    pub exterior: Exterior3D<'a>,
     pub g: f64,
     pub rho0: f64,
     /// Columns shallower than this (m) are thin (3D wetting and drying).
@@ -101,13 +104,24 @@ pub fn compute_transport_rhs_3d(
         config.ops,
         config.geom,
         config.boundaries,
+        config.exterior.velocity,
         scratch,
     );
     let tracers = [
-        (&mut rhs.temp, &state.temp, config.temp_bc),
-        (&mut rhs.salt, &state.salt, config.salt_bc),
+        (
+            &mut rhs.temp,
+            &state.temp,
+            config.temp_bc,
+            config.exterior.temp,
+        ),
+        (
+            &mut rhs.salt,
+            &state.salt,
+            config.salt_bc,
+            config.exterior.salt,
+        ),
     ];
-    for (out, tracer, bc) in tracers {
+    for (out, tracer, bc, exterior) in tracers {
         apply_tracer_transport_3d(
             out,
             tracer,
@@ -116,6 +130,7 @@ pub fn compute_transport_rhs_3d(
             config.ops,
             config.geom,
             bc,
+            exterior,
             config.boundaries,
             scratch,
         );

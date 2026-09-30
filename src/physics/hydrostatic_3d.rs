@@ -45,7 +45,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::boundary::SWEBoundaryCondition2D;
+use crate::boundary::{Nesting3D, SWEBoundaryCondition2D};
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
@@ -57,7 +57,7 @@ use crate::physics::vertical_diffusion::apply_vertical_diffusion;
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
-    BarotropicFlux, Boundaries3D, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
+    BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
     TracerBoundaryCondition3D, TransportScratch, apply_coriolis_3d, apply_momentum_transport_3d,
     compute_momentum_rhs_3d, compute_transport_rhs_3d,
 };
@@ -105,6 +105,9 @@ where
     /// Quadratic drag of the bottom-layer velocity, if any (see
     /// [`Self::with_bottom_drag`]).
     pub bottom_drag: Option<BottomDrag3D>,
+    /// A parent model's profiles at open boundaries and in a relaxation
+    /// band, if nested (see [`Self::with_nesting`]).
+    pub nesting: Option<Nesting3D>,
     /// Layer transports (and their Ω) of the last 3D stage, and the
     /// transport kernels' buffers.
     transport_scratch: Mutex<(LayerTransport, TransportScratch)>,
@@ -162,6 +165,7 @@ where
             tracer_limiter: TracerLimiter3DConfig::none(),
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             bottom_drag: None,
+            nesting: None,
             transport_scratch,
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
@@ -206,6 +210,25 @@ where
     /// bottom friction of its own: it would count the drag twice.
     pub fn with_bottom_drag(mut self, drag: BottomDrag3D) -> Self {
         self.bottom_drag = Some(drag);
+        self
+    }
+
+    /// Nest the 3D fields in a parent model: its velocity and tracer profiles
+    /// at the open faces of the nesting's tags, and relaxation within its
+    /// band (see [`Nesting3D`]). The depth mean stays the
+    /// 2D module's: nest it there too (its open-boundary condition and
+    /// [`crate::boundary::NestingRelaxation2D`]).
+    ///
+    /// # Panics
+    /// If a nested tag is a wall for the 3D kernels.
+    pub fn with_nesting(mut self, nesting: Nesting3D) -> Self {
+        for tag in nesting.tags() {
+            assert!(
+                !self.boundaries.wall_tags.contains(tag),
+                "nested boundary tag {tag:?} is a wall for the 3D kernels"
+            );
+        }
+        self.nesting = Some(nesting);
         self
     }
 
@@ -359,6 +382,7 @@ where
             temp_bc: &*self.temp_bc,
             salt_bc: &*self.salt_bc,
             boundaries: &self.boundaries,
+            exterior: Exterior3D::default(),
             g: self.g,
             rho0: self.rho0,
             min_column_depth: self.min_column_depth,
@@ -366,11 +390,17 @@ where
     }
 
     /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the
-    /// pointwise momentum terms of `state` (baroclinic PGF, Coriolis; see
-    /// [`compute_momentum_rhs_3d`]), zero in thin columns. `state.rho` must be
-    /// current.
-    pub fn compute_momentum_rhs_into(&self, state: &Solution3D, rhs: &mut Solution3D) {
+    /// pointwise momentum terms of `state` at time `t` (baroclinic PGF,
+    /// Coriolis; see [`compute_momentum_rhs_3d`]; and the nesting's
+    /// relaxation of the shear, which has no depth mean), zero in thin
+    /// columns. `state.rho` must be current.
+    pub fn compute_momentum_rhs_into(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D) {
         compute_momentum_rhs_3d(rhs, state, &self.rhs_config());
+        if let Some(nesting) = &self.nesting {
+            nesting
+                .columns(state, &self.bathymetry, &self.sigma, t)
+                .relax_shear(state, &self.sigma, rhs, |idx| self.is_thin(state, idx));
+        }
         self.zero_thin_momentum(state, rhs);
     }
 
@@ -378,10 +408,12 @@ where
     /// inventory tendency of the momentum advection added to `rhs.u`, `rhs.v`
     /// (zero in thin columns, which the advection sees at rest) and the tracer
     /// inventory tendencies written to `rhs.temp`, `rhs.salt` (see
-    /// [`compute_transport_rhs_3d`]).
+    /// [`compute_transport_rhs_3d`]), with the nesting parent's values at
+    /// time `t` outside its open faces and its relaxation of the tracers.
     pub fn compute_transport_rhs_into(
         &self,
         state: &Solution3D,
+        t: f64,
         barotropic: BarotropicFlux,
         rhs: &mut Solution3D,
     ) {
@@ -390,6 +422,13 @@ where
             .lock()
             .expect("Failed to lock transport_scratch");
         let (transport, scratch) = &mut *guard;
+        let columns = self
+            .nesting
+            .as_ref()
+            .map(|nesting| nesting.columns(state, &self.bathymetry, &self.sigma, t));
+        let exterior = columns
+            .as_ref()
+            .map_or_else(Exterior3D::default, |c| c.exterior());
         // Thin columns at rest change no layer transport: theirs are uniform
         // in σ, which the correction to the barotropic transport replaces
         self.with_thin_columns_at_rest(state, |state| {
@@ -402,9 +441,18 @@ where
                 &self.sigma,
                 &self.bathymetry,
                 &self.boundaries,
+                &exterior,
             );
-            compute_transport_rhs_3d(rhs, state, transport, &self.rhs_config(), scratch);
+            let config = Rhs3DConfig {
+                exterior,
+                ..self.rhs_config()
+            };
+            compute_transport_rhs_3d(rhs, state, transport, &config, scratch);
         });
+        if let Some(columns) = &columns {
+            let thin = |idx| self.is_thin(state, idx);
+            columns.relax_tracers(state, &self.bathymetry, &self.sigma, rhs, thin);
+        }
         self.zero_thin_momentum(state, rhs);
     }
 
@@ -525,6 +573,7 @@ where
                 &self.sigma,
                 &self.bathymetry,
                 &self.boundaries,
+                &Exterior3D::default(),
             );
         });
         let nl = state.n_levels;
@@ -561,18 +610,18 @@ where
         &self.bathymetry
     }
 
-    fn momentum_rhs_into(&self, state: &Solution3D, _t: f64, out: &mut Solution3D) {
-        self.compute_momentum_rhs_into(state, out);
+    fn momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {
+        self.compute_momentum_rhs_into(state, t, out);
     }
 
     fn transport_rhs_into(
         &self,
         state: &Solution3D,
-        _t: f64,
+        t: f64,
         barotropic: BarotropicFlux,
         out: &mut Solution3D,
     ) {
-        self.compute_transport_rhs_into(state, barotropic, out);
+        self.compute_transport_rhs_into(state, t, barotropic, out);
     }
 
     /// `G = D·⟨R_PGF+Cor(u)⟩ + Σ_l A_l(u) − A(ū) − D·R_Cor(ū) + (τ_s − τ_b)/ρ₀
@@ -616,6 +665,7 @@ where
                 &self.sigma,
                 &self.bathymetry,
                 &self.boundaries,
+                &Exterior3D::default(),
             );
             advection_u.fill(0.0);
             advection_v.fill(0.0);
@@ -629,6 +679,7 @@ where
                 &self.ops,
                 &self.geom,
                 &self.boundaries,
+                None,
                 transport_scratch,
             );
 
@@ -645,6 +696,7 @@ where
                 bar_sigma,
                 &self.bathymetry,
                 &self.boundaries,
+                &Exterior3D::default(),
             );
             bar_rhs.u.fill(0.0);
             bar_rhs.v.fill(0.0);
@@ -668,6 +720,7 @@ where
                 &self.ops,
                 &self.geom,
                 &self.boundaries,
+                None,
                 bar_scratch,
             );
         });

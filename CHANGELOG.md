@@ -12,6 +12,23 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **3D nesting at open boundaries (TODO P4.2).** The 3D kernels could only extrapolate the interior at open faces, so a parent model's stratification and baroclinic currents could not enter a 3D child.
+  - New `boundary::Nesting3D` and `Hydrostatic3D::with_nesting`. A `ParentColumns3D` gives the parent's u, v, T, S at the child's layer centres per node and time; `Nesting3D` evaluates it at the nested tags' open-face nodes and within a band around them (cached per stage time and free surface).
+  - At nested open faces (`solver::rhs::Exterior3D`, `ExteriorField`):
+    - the layer volume fluxes take the central average of the interior's and the parent's `H_z u`, corrected to the 2D boundary flux as everywhere;
+    - water flowing in brings the parent's velocity and tracers, taking precedence over `TracerBoundaryCondition3D`.
+  - Relaxation within the band (`NestingBand3D`: width, `SpongeProfile`, time scales):
+    - the shear relaxes to the parent's, with no depth mean, so ū stays the 2D module's and nothing enters G;
+    - T/S relax in inventory form.
+    - Both are explicit.
+  - The distance-to-boundary code of the 2D nesting moved to `boundary::band::boundary_distances`, shared by both bands.
+  - API: `LayerTransport::compute`, `apply_momentum_transport_3d` and `apply_tracer_transport_3d` take the exterior values; `Rhs3DConfig.exterior`; `Hydrostatic3D::compute_momentum_rhs_into` and `compute_transport_rhs_into` take the time.
+  - Gates:
+    - `nesting_in_the_same_water_keeps_tracers_uniform`: a nested exchange flow (0.10 m/s shear) of the interior's own water keeps T uniform to 3.8e-12 °C over 12 h.
+    - `nesting_imposes_the_parent_profiles_at_the_boundary`: a stratified exchange flow (ΔT = 4 °C) holds the boundary columns to 2.3 % of ΔT and 5.2 % of the shear after 12 h; without nesting nothing moves.
+    - Unit tests: the open-face layer fluxes average the parent's profile and add up to the 2D flux; inflow budgets with the parent's values for T, u and v; constancy with a parent; band weights, depth-mean-free shear relaxation and column caching.
+  - Not yet: a reader for the parent's 3D fields (NorKyst z-levels, ROMS s-levels).
+
 - **The 3D walls follow the 2D boundary condition (TODO P4.2).** The 3D kernels classified faces from their own tag list (`BoundaryTag::Wall` by default), and nothing checked it against the 2D module's condition. A tag the 2D condition treats as a wall but the 3D side as open would exchange layer volume through a 2D wall with zero net flux; the reverse would reflect the shear at an open boundary.
   - New `SWEBoundaryCondition2D::is_wall(tag) -> Option<bool>`, with a default of `None` (cannot tell). `Reflective2D` is a wall. `CharacteristicOBC`, `Tidal2D`, `HarmonicTidal2D`, `Discharge2D`, `ConstantDischarge2D`, `Extrapolation2D` and `FixedState2D` are open. `MultiBoundaryCondition2D` forwards by tag.
   - New `Boundaries3D::matching(mesh, bc)`; `Hydrostatic3D::new` uses it, falling back to the old default where the condition cannot tell. `with_wall_tags` now overrides it. `Boundaries3D` has an `untagged_are_walls` flag (untagged faces follow `is_wall(None)`).

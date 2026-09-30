@@ -64,7 +64,7 @@ use crate::mesh::data::Bathymetry2D;
 use crate::mesh::data::BoundaryTag;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
-use crate::solver::rhs::boundary_3d::{Boundaries3D, FaceExterior};
+use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -192,6 +192,7 @@ impl LayerTransport {
         sigma: &SigmaGrid,
         bathymetry: &Bathymetry2D,
         boundaries: &Boundaries3D,
+        exterior: &Exterior3D,
     ) {
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, self.n_levels);
         assert_eq!(state.n_levels, nl, "layer count of the state");
@@ -236,29 +237,44 @@ impl LayerTransport {
         for k in 0..state.n_elements {
             let el = ElementIndex::new(k);
             for f in 0..4 {
-                let exterior = boundaries.exterior(mesh, el, f);
+                let face_exterior = boundaries.exterior(mesh, el, f);
                 for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
                     let (nx, ny) = geom.normal(k, f, fi);
-                    let interior = (k * nn + node) * nl;
+                    let flat = k * nn + node;
+                    let interior = flat * nl;
                     // The profile of the layer fluxes: central between
                     // elements, the interior's at open boundaries (the shear
-                    // leaves with the flow), none at walls
-                    let across = match exterior {
-                        FaceExterior::Element(nb) => {
-                            Some((nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl)
-                        }
-                        FaceExterior::Open(_) => Some(interior),
-                        FaceExterior::Wall => None,
+                    // leaves with the flow) or central with a nesting
+                    // parent's, none at walls
+                    let across = match face_exterior {
+                        FaceExterior::Element(nb) => Across::Node(
+                            (nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl,
+                        ),
+                        FaceExterior::Open(tag) => match exterior.velocity {
+                            Some([u, v]) if u.at(tag, flat, 0).is_some() => {
+                                let depth = state.eta.data[flat] - bathymetry.data[flat];
+                                Across::Parent(u, v, tag, depth)
+                            }
+                            _ => Across::Node(interior),
+                        },
+                        FaceExterior::Wall => Across::Nothing,
                     };
                     let slot = (k * 4 + f) * nfn + fi;
                     let fluxes = &mut self.face[slot * nl..(slot + 1) * nl];
                     let mut sum = 0.0;
                     for (l, flux) in fluxes.iter_mut().enumerate() {
-                        *flux = across.map_or(0.0, |e| {
-                            let q_in = nx * self.hu[interior + l] + ny * self.hv[interior + l];
-                            let q_ex = nx * self.hu[e + l] + ny * self.hv[e + l];
-                            0.5 * (q_in + q_ex)
-                        });
+                        let q_in = nx * self.hu[interior + l] + ny * self.hv[interior + l];
+                        *flux = match across {
+                            Across::Node(e) => {
+                                0.5 * (q_in + nx * self.hu[e + l] + ny * self.hv[e + l])
+                            }
+                            Across::Parent(u, v, tag, depth) => {
+                                let u = u.at(tag, flat, l).expect("checked");
+                                let v = v.at(tag, flat, l).expect("checked");
+                                0.5 * (q_in + depth * d_sigma[l] * (nx * u + ny * v))
+                            }
+                            Across::Nothing => 0.0,
+                        };
                         sum += *flux;
                     }
                     let Some(barotropic) = barotropic else {
@@ -313,6 +329,22 @@ impl LayerTransport {
             }
         }
     }
+}
+
+/// What lies across a face for the layer volume fluxes.
+#[derive(Clone, Copy)]
+enum Across<'a> {
+    /// A node's layer transports, at this offset.
+    Node(usize),
+    /// A nesting parent's velocity, over the interior's depth.
+    Parent(
+        ExteriorField<'a>,
+        ExteriorField<'a>,
+        crate::mesh::data::BoundaryTag,
+        f64,
+    ),
+    /// A wall.
+    Nothing,
 }
 
 /// Layer thickness `H_z = D·Δσ` (m), floored at the same small positive value
@@ -417,8 +449,9 @@ pub fn inventory_to_concentration(
 /// Horizontally the nodal flux is `Q_l C_l` and the face flux `F_l C↑`, with
 /// `C↑` the concentration upwind of the layer's face flux `F_l`: the element's
 /// own on outflow, the neighbour's on inflow, and `bc`'s exterior value on
-/// inflow through a physical boundary. Vertically `C` is upwinded on `Ω`
-/// (first order, TODO P4.5).
+/// inflow through a physical boundary (a nesting parent's value, from
+/// `exterior`, where it has one). Vertically `C` is upwinded on `Ω` (first
+/// order, TODO P4.5).
 ///
 /// For constant `C` the tendency is `C·(−∇·Q_l − δΩ_l) = C·Δσ_l ∂η/∂t`, the
 /// change of the layer's thickness: constancy. Both fluxes are single-valued
@@ -432,6 +465,7 @@ pub fn apply_tracer_transport_3d(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     bc: &dyn TracerBoundaryCondition3D,
+    exterior: Option<ExteriorField>,
     boundaries: &Boundaries3D,
     scratch: &mut TransportScratch,
 ) {
@@ -445,16 +479,20 @@ pub fn apply_tracer_transport_3d(
     };
     for k in 0..mesh.n_elements {
         for l in 0..nl {
-            let inflow = |f, fi, tag, interior, flux| {
-                bc.exterior_value(&TracerBCContext3D {
-                    element: k,
-                    face: f,
-                    level: l,
-                    face_node: fi,
-                    boundary_tag: Some(tag),
-                    interior_value: interior,
-                    normal_velocity: flux,
-                })
+            let inflow = |f, fi, node, tag, interior, flux| {
+                exterior
+                    .and_then(|e| e.at(tag, node, l))
+                    .unwrap_or_else(|| {
+                        bc.exterior_value(&TracerBCContext3D {
+                            element: k,
+                            face: f,
+                            level: l,
+                            face_node: fi,
+                            boundary_tag: Some(tag),
+                            interior_value: interior,
+                            normal_velocity: flux,
+                        })
+                    })
             };
             let div = context.flux_divergence(k, l, tracer, inflow, scratch);
             for (i, &d) in div.iter().enumerate() {
@@ -490,9 +528,10 @@ pub fn apply_tracer_transport_3d(
 ///
 /// for the advected velocity `(u, v)`; `Q` and `Ω` come from `transport`.
 /// Horizontally the face flux is `F_l u↑`, with `u↑` upwind of the layer's
-/// face flux as for the tracers, and at an open boundary the interior's
-/// velocity (zero gradient, ROMS's "gradient" condition for the 3D velocity;
-/// see [`crate::solver::rhs::boundary_3d`]). Walls carry no volume, so no
+/// face flux as for the tracers. Flowing in through an open boundary it is
+/// a nesting parent's velocity (`exterior`) where there is one, otherwise
+/// the interior's (zero gradient, ROMS's "gradient" condition for the 3D
+/// velocity; see [`crate::solver::rhs::boundary_3d`]). Walls carry no volume, so no
 /// momentum. Vertically `u` is centred at the σ-surfaces.
 ///
 /// A velocity uniform in space gets `u·Δσ_l ∂η/∂t`: divided by the new layer
@@ -509,6 +548,7 @@ pub fn apply_momentum_transport_3d(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     boundaries: &Boundaries3D,
+    exterior: Option<[ExteriorField; 2]>,
     scratch: &mut TransportScratch,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
@@ -519,11 +559,16 @@ pub fn apply_momentum_transport_3d(
         geom,
         boundaries,
     };
-    let extrapolated = |_, _, _, interior, _| interior;
-    for (rhs, field) in [(rhs_u, u), (rhs_v, v)] {
+    let [exterior_u, exterior_v] = exterior.map_or([None, None], |[u, v]| [Some(u), Some(v)]);
+    for (rhs, field, exterior) in [(rhs_u, u, exterior_u), (rhs_v, v, exterior_v)] {
         for k in 0..mesh.n_elements {
             for l in 0..nl {
-                let div = context.flux_divergence(k, l, field, extrapolated, scratch);
+                let inflow = |_, _, node, tag, interior, _| {
+                    exterior
+                        .and_then(|e| e.at(tag, node, l))
+                        .unwrap_or(interior)
+                };
+                let div = context.flux_divergence(k, l, field, inflow, scratch);
                 for (i, &d) in div.iter().enumerate() {
                     rhs[(k * nn + i) * nl + l] -= d;
                 }
@@ -561,14 +606,15 @@ impl LayerContext<'_> {
     /// `∇·(Q_l φ)` on element `k`, layer `l`, of the field `φ` (layout of
     /// [`Solution3D`]): nodal flux `Q_l φ`, face flux `F_l φ↑` with `φ↑`
     /// upwind of `F_l`. On inflow through an open face `φ↑` is
-    /// `inflow(face, face_node, tag, interior value, F_l)`. Written to (and
-    /// returned from) `scratch.div`.
+    /// `inflow(face, face_node, node, tag, interior value, F_l)`, with `node`
+    /// the face node's `[element][node]` index. Written to (and returned
+    /// from) `scratch.div`.
     fn flux_divergence<'s>(
         &self,
         k: usize,
         l: usize,
         field: &[f64],
-        inflow: impl Fn(usize, usize, BoundaryTag, f64, f64) -> f64,
+        inflow: impl Fn(usize, usize, usize, BoundaryTag, f64, f64) -> f64,
         scratch: &'s mut TransportScratch,
     ) -> &'s [f64] {
         let (ops, transport) = (self.ops, self.transport);
@@ -594,7 +640,7 @@ impl LayerContext<'_> {
                         let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
                         field[(nb.element * nn + nb_node) * nl + l]
                     }
-                    FaceExterior::Open(tag) => inflow(f, fi, tag, interior, flux),
+                    FaceExterior::Open(tag) => inflow(f, fi, k * nn + node, tag, interior, flux),
                     // A wall passes no volume: only a round-off flux
                     FaceExterior::Wall => interior,
                 };
@@ -768,6 +814,10 @@ mod tests {
         }
 
         fn transport(&self) -> LayerTransport {
+            self.transport_with(&Exterior3D::default())
+        }
+
+        fn transport_with(&self, exterior: &Exterior3D) -> LayerTransport {
             let mut transport =
                 LayerTransport::new(self.mesh.n_elements, &self.ops, self.sigma.n_levels());
             let barotropic = BarotropicFlux {
@@ -785,6 +835,7 @@ mod tests {
                 &self.sigma,
                 &self.bathymetry,
                 &self.boundaries,
+                exterior,
             );
             transport
         }
@@ -805,6 +856,7 @@ mod tests {
                 &self.ops,
                 &self.geom,
                 bc,
+                None,
                 &self.boundaries,
                 &mut scratch,
             );
@@ -1089,6 +1141,7 @@ mod tests {
                 &ops,
                 &geom,
                 &ExtrapolationTracerBC3D,
+                None,
                 &Boundaries3D::default(),
                 &mut scratch,
             );
@@ -1122,6 +1175,7 @@ mod tests {
                 &self.ops,
                 &self.geom,
                 &self.boundaries,
+                None,
                 &mut scratch,
             );
             (rhs_u, rhs_v)
@@ -1258,6 +1312,7 @@ mod tests {
             &ops,
             &geom,
             &Boundaries3D::default(),
+            None,
             &mut TransportScratch::new(&ops, nl),
         );
         let sw = sigma.sigma_w();
@@ -1292,6 +1347,7 @@ mod tests {
             &case.sigma,
             &case.bathymetry,
             &case.boundaries,
+            &Exterior3D::default(),
         );
         let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
         for idx in 0..case.mesh.n_elements * nn {
@@ -1345,6 +1401,7 @@ mod tests {
             &sigma,
             &bathymetry,
             &Boundaries3D::default(),
+            &Exterior3D::default(),
         );
         let scale = max_abs(transport.omega.iter().copied());
         assert!(scale > 1e-3, "test flow should drive a non-trivial Ω");
@@ -1359,6 +1416,232 @@ mod tests {
                 assert!(
                     (increment - expected).abs() < tol,
                     "layer {l}: Ω increment {increment}, continuity requires {expected}"
+                );
+            }
+        }
+    }
+
+    /// A nesting parent at every node of the open case: a sheared velocity
+    /// unlike the interior's, and `temp`, as `[u, v, temp]` per node and
+    /// layer (slot = node).
+    struct Parent {
+        tags: Vec<BoundaryTag>,
+        slot_of_node: Vec<u32>,
+        fields: [Vec<f64>; 3],
+        n_levels: usize,
+    }
+
+    impl Parent {
+        fn new(case: &Case, temp: impl Fn(f64) -> f64) -> Self {
+            let nl = case.sigma.n_levels();
+            let n = case.state.u.len() / nl;
+            let mut fields: [Vec<f64>; 3] = std::array::from_fn(|_| Vec::with_capacity(n * nl));
+            for _ in 0..n {
+                for &s in case.sigma.sigma_rho() {
+                    fields[0].push(0.3 - 0.4 * s);
+                    fields[1].push(0.2 * s);
+                    fields[2].push(temp(s));
+                }
+            }
+            Self {
+                tags: vec![BoundaryTag::Open],
+                slot_of_node: (0..n as u32).collect(),
+                fields,
+                n_levels: nl,
+            }
+        }
+
+        fn field(&self, i: usize) -> ExteriorField<'_> {
+            ExteriorField {
+                tags: &self.tags,
+                slot_of_node: &self.slot_of_node,
+                n_levels: self.n_levels,
+                values: &self.fields[i],
+            }
+        }
+
+        fn exterior(&self) -> Exterior3D<'_> {
+            Exterior3D {
+                velocity: Some([self.field(0), self.field(1)]),
+                temp: Some(self.field(2)),
+                salt: None,
+            }
+        }
+    }
+
+    /// With a nesting parent, an open face's layer fluxes are the central
+    /// average of the interior's and the parent's `H_z u`, corrected to the
+    /// 2D flux, which they still add up to.
+    #[test]
+    fn open_faces_average_the_parent_profile() {
+        let case = Case::open();
+        let parent = Parent::new(&case, |s| 5.0 + s);
+        let transport = case.transport_with(&parent.exterior());
+        let (nn, nfn, nl) = (
+            case.ops.n_nodes,
+            case.ops.n_face_nodes,
+            case.sigma.n_levels(),
+        );
+        let d_sigma = case.sigma.d_sigma();
+        let scale = max_abs(transport.face.iter().copied());
+        let mut open_faces = 0;
+        for k in 0..case.mesh.n_elements {
+            for f in 0..4 {
+                let el = ElementIndex::new(k);
+                if case.boundaries.exterior(&case.mesh, el, f)
+                    != FaceExterior::Open(BoundaryTag::Open)
+                {
+                    continue;
+                }
+                open_faces += 1;
+                for (fi, &node) in case.ops.face_nodes[f].iter().enumerate() {
+                    let (nx, ny) = case.geom.normal(k, f, fi);
+                    let flat = k * nn + node;
+                    let depth = case.state.eta.data[flat] - case.bathymetry.data[flat];
+                    let central: Vec<f64> = (0..nl)
+                        .map(|l| {
+                            let (i, p) = (flat * nl + l, flat * nl + l);
+                            let q_in = nx * transport.hu[i] + ny * transport.hv[i];
+                            let q_ex = depth
+                                * d_sigma[l]
+                                * (nx * parent.fields[0][p] + ny * parent.fields[1][p]);
+                            0.5 * (q_in + q_ex)
+                        })
+                        .collect();
+                    let slot = (k * 4 + f) * nfn + fi;
+                    let correction = case.du_face[slot] - central.iter().sum::<f64>();
+                    let fluxes = &transport.face[slot * nl..(slot + 1) * nl];
+                    for l in 0..nl {
+                        let expected = central[l] + d_sigma[l] * correction;
+                        assert!((fluxes[l] - expected).abs() < 1e-14 * scale);
+                    }
+                    let sum: f64 = fluxes.iter().sum();
+                    assert!((sum - case.du_face[slot]).abs() < 1e-14 * scale);
+                }
+            }
+        }
+        assert!(open_faces > 0);
+    }
+
+    /// Water flowing in through a nested open face brings the parent's
+    /// tracer and velocity (and the tracer boundary condition is not
+    /// consulted): the inventories change by exactly `−∮ Σ_l F_l φ↑`, with
+    /// `φ↑` the parent's on inflow and the interior's on outflow.
+    #[test]
+    fn nested_inflow_brings_the_parent_values() {
+        let case = Case::open();
+        let parent = Parent::new(&case, |s| 5.0 + s);
+        let exterior = parent.exterior();
+        let transport = case.transport_with(&exterior);
+        let (nn, nfn, nl) = (
+            case.ops.n_nodes,
+            case.ops.n_face_nodes,
+            case.sigma.n_levels(),
+        );
+        // Tracer: a boundary condition that would give nonsense
+        let mut rhs_t = vec![0.0; case.state.temp.len()];
+        apply_tracer_transport_3d(
+            &mut rhs_t,
+            &case.state.temp,
+            &transport,
+            &case.mesh,
+            &case.ops,
+            &case.geom,
+            &FixedTracerBC3D::new(-1e6),
+            exterior.temp,
+            &case.boundaries,
+            &mut TransportScratch::new(&case.ops, nl),
+        );
+        let (mut rhs_u, mut rhs_v) = (vec![0.0; rhs_t.len()], vec![0.0; rhs_t.len()]);
+        apply_momentum_transport_3d(
+            &mut rhs_u,
+            &mut rhs_v,
+            &case.state.u,
+            &case.state.v,
+            &transport,
+            &case.mesh,
+            &case.ops,
+            &case.geom,
+            &case.boundaries,
+            exterior.velocity,
+            &mut TransportScratch::new(&case.ops, nl),
+        );
+        let fields = [
+            (&rhs_t, &case.state.temp, 2),
+            (&rhs_u, &case.state.u, 0),
+            (&rhs_v, &case.state.v, 1),
+        ];
+        for (rhs, field, p) in fields {
+            let tendency = case.integral(rhs);
+            let (mut outflow, mut scale, mut inflows) = (0.0, 0.0, 0);
+            for k in 0..case.mesh.n_elements {
+                for f in 0..4 {
+                    let el = ElementIndex::new(k);
+                    if !matches!(
+                        case.boundaries.exterior(&case.mesh, el, f),
+                        FaceExterior::Open(_)
+                    ) {
+                        continue;
+                    }
+                    for (fi, &node) in case.ops.face_nodes[f].iter().enumerate() {
+                        let slot = (k * 4 + f) * nfn + fi;
+                        let weight = case.ops.weights_1d[fi] * case.geom.surface_jacobian(k, f, fi);
+                        for l in 0..nl {
+                            let flux = transport.face[slot * nl + l];
+                            let idx = (k * nn + node) * nl + l;
+                            let value = if flux >= 0.0 {
+                                field[idx]
+                            } else {
+                                inflows += 1;
+                                parent.fields[p][idx]
+                            };
+                            outflow += weight * flux * value;
+                            scale += (weight * flux * value).abs();
+                        }
+                    }
+                }
+            }
+            assert!(inflows > 0, "test regime: no inflow");
+            assert!(
+                (tendency + outflow).abs() < 1e-12 * scale,
+                "tendency {tendency:.6e} vs boundary outflow {outflow:.6e}"
+            );
+        }
+    }
+
+    /// Constancy with a nesting parent: a uniform tracer, and a parent of the
+    /// same tracer, stays uniform however the parent shears the boundary
+    /// fluxes (the layers still carry exactly the water the free surface
+    /// moved).
+    #[test]
+    fn uniform_tracer_stays_uniform_with_a_parent() {
+        let case = Case::open();
+        let c = 34.7;
+        let parent = Parent::new(&case, |_| c);
+        let exterior = parent.exterior();
+        let transport = case.transport_with(&exterior);
+        let nl = case.sigma.n_levels();
+        let tracer = vec![c; case.state.temp.len()];
+        let mut rhs = vec![0.0; tracer.len()];
+        apply_tracer_transport_3d(
+            &mut rhs,
+            &tracer,
+            &transport,
+            &case.mesh,
+            &case.ops,
+            &case.geom,
+            &ExtrapolationTracerBC3D,
+            exterior.temp,
+            &case.boundaries,
+            &mut TransportScratch::new(&case.ops, nl),
+        );
+        let scale = c * max_abs(case.eta_rate.iter().copied());
+        for (idx, column) in rhs.chunks_exact(nl).enumerate() {
+            for (l, got) in column.iter().enumerate() {
+                let expected = c * case.sigma.d_sigma()[l] * case.eta_rate[idx];
+                assert!(
+                    (got - expected).abs() < 1e-12 * scale,
+                    "{got} vs {expected}"
                 );
             }
         }
