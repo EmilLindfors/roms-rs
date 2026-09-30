@@ -93,7 +93,7 @@ This section only orders the existing items for that goal and adds the two farm-
 8. ~~Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7~~ done 2026-09-28.
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
-- P4.2 (tracer constancy, 3D open boundaries for T/S), P4.3 (balanced PGF, vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry, which gives NaN today; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
+- P4.2 (tracer constancy: done 2026-09-30; still 3D open boundaries for momentum and T/S profiles, momentum in inventory form), P4.3 (balanced PGF, vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry, which gives NaN today; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
 - F.1 cage drag (3D form) and F.2 in 3D.
 
 Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
@@ -600,12 +600,17 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [x] Column momentum after one implicit diffusion step = Δt·(τ_s − τ_b)/ρ₀: `column_momentum_changes_by_the_stress_impulse`.
 
 ### P4.2 Consistent continuity, tracers and momentum
-- [ ] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2 (available since P4.1 PR 3: `ModeSplitIntegrator::barotropic_transport`, nodal + face parts, see its docs for the `WetDry` caveat); η advanced by the divergence of the same flux.
+- [x] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2; η advanced by the divergence of the same flux. Done 2026-09-30 (`solver::rhs::transport_3d`, `LayerTransport`): nodal `H_z u` and the central face average, plus each layer's `Δσ_l` share of the difference to DU_avg2, nodally and on every face; Ω from the bed with each layer's share of the pass's ∂η/∂t.
 - [x] Ω stored at w-points (not layer centres re-averaged to faces) — done in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
-- [ ] Assert Ω(0) = 0 instead of forcing it with the linear correction.
-- [ ] One 3D face-state helper for physical boundaries shared by the Ω, momentum and tracer kernels (today each has its own copy of the wall logic; P0.7/P0.22 were the same bug found twice). It should take the boundary tag, so 3D open boundaries (volume flux from the 2D OBC / nesting, tracer from `TracerBoundaryCondition3D` on inflow) are added in one place for all three.
-- [ ] Step Hz·C and Hz·u (inventory form), then divide by the new Hz. Today a 1 m tide over 20 m of water pumps salinity by about ±1.7 psu.
-  - Measured side effect (2026-09-26): with a T/S-dependent EOS, the drift of T and S with η feeds a spurious baroclinic PGF into the mode-split G. It damps a barotropic seiche by 0.6 % per period (P1), or amplifies it by 0.4 % per period (P2), independent of amplitude and dt. The seiche tests use a density independent of T and S until this is fixed.
+- [x] ~~Assert Ω(0) = 0 instead of forcing it with the linear correction.~~ Measured and gated instead of asserted (2026-09-30): `LayerTransport::surface_residual` / `Hydrostatic3D::last_surface_residual` is 3e-15 against Ω of 7e-3 m/s under a tide over a slope. The linear correction stays, because `WetDry` elements with a dry node and positivity-limited elements only keep the pass's element balance, not the nodal identity, so there the residual is O(1) and must go somewhere.
+  - [ ] In those elements, correct per element (or subcell) so that constancy holds there too (see `BarotropicTransport` docs). Needed with 3D wet/dry (P4.5).
+- [ ] One 3D face-state helper for physical boundaries shared by the Ω, momentum and tracer kernels (P0.7/P0.22 were the same bug found twice). It should take the boundary tag, so 3D open boundaries (volume flux from the 2D OBC / nesting, tracer from `TracerBoundaryCondition3D` on inflow) are added in one place for all three.
+  - Partly done 2026-09-30: Ω and the tracers now share one volume flux (`LayerTransport`), which at a physical boundary is the layer share of the 2D boundary flux (zero at walls), and the tracer consults `TracerBoundaryCondition3D` on inflow. Momentum still has its own wall reflection and no open-boundary condition; the 3D velocity profile at open boundaries (nesting of baroclinic u, v) is still to do.
+- [x] Step Hz·C (inventory form), then divide by the new Hz. Done 2026-09-30: `ModeSplitIntegrator` carries the tracers as `H_z C` through the 3D stages. Gates `uniform_tracers_stay_uniform_under_a_tide_over_a_sloping_bed` (drift 9.3e-13 in one period; before 12.8) and `tracer_inventories_are_conserved_under_a_tide` (3.1e-15; before 1.1e-2). The seiche/wind/Ekman gates run with the T/S-dependent EOS again (the side effect below is gone).
+  - Measured side effect (2026-09-26, fixed by the above): with a T/S-dependent EOS, the drift of T and S with η fed a spurious baroclinic PGF into the mode-split G. It damped a barotropic seiche by 0.6 % per period (P1), or amplified it by 0.4 % per period (P2), independent of amplitude and dt.
+- [ ] Step Hz·u as well. The 3D momentum is still in velocity form, and its horizontal advection is `∇·(u u)` with a Rusanov speed, not `(1/H_z)∇·(Q u)` with the layer transports; only its vertical advection uses the new Ω. The depth mean is reset to ū every step, so this affects the shear only, but momentum is neither conservative nor consistent with continuity over a sloping bed. Moving it onto `LayerTransport` needs the mean-flow part of G (`R_adv+Cor(ū)`, a one-level run of the same operator) moved with it.
+- [ ] Cost of the inventory form (noted 2026-09-30): each 3D stage copies the whole stage state to convert the tracers to concentrations (`Buffers::concentrations`), and `post_stage` converts back and forth. Cheap next to the 3D RHS today; with the P4.5 kernel work, have the RHS read `H_z C` and divide on the fly instead.
+- [ ] The `w` output of `Hydrostatic3D::post_process` is still Ω of the 3D velocities alone (`compute_vertical_velocity`, closed with their own ∂η/∂t): there is no barotropic transport between steps. Output the last step's layer-transport Ω instead (e.g. keep the stage-3 Ω or recompute at tⁿ⁺¹ with DU_avg2), and then drop `compute_vertical_velocity`.
 
 ### P4.3 Pressure gradient and vertical grid
 - [ ] Balanced PGF: Shchepetkin & McWilliams (2003) density-Jacobian, or z-level interpolation. Lift pressure/η jumps at element faces.
@@ -627,11 +632,11 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] EOS: delegate the physics trait to the fixed UNESCO EOS (P0.17) with a linear fast path; TEOS-10 later.
 - [ ] `compute_dt`: internal-wave speed from stratification (not a hardcoded 2 m/s) and the vertical CFL. Relabel or convert Ω vs w in output.
 - [ ] Parallelise the 3D kernels; no `Vec` allocation in inner loops (~186M malloc/free per 3D RHS at 50k × 30).
-  - E.g. `apply_tracer_advection_3d` allocates five `Vec`s per face per level and recomputes `layer_thickness` for every node in the lift loop of every face; hoist both (Hz per element-level once, face buffers in a workspace).
+  - E.g. `apply_horizontal_surface_terms` (3D momentum advection) and `compute_vertical_velocity` allocate `Vec`s per face per level, and `compute_strong_divergence` two per call; move them to workspaces as `LayerTransport` and `TracerTransportScratch` do (2026-09-30), and parallelise those over elements.
 
 ### P4.6 3D validation (before any NorKyst 3D comparison)
 - [ ] Stratified lake-at-rest: linear N² ≤ 1e-12; tanh pycnocline over a seamount (Beckmann & Haidvogel 1993).
-- [ ] Constant-T preservation under tide over a sloping bed; Hz·T inventory conservation.
+- [x] Constant-T preservation under tide over a sloping bed; Hz·T inventory conservation (P4.2 gates, 2026-09-30).
 - [x] Wind setup τ/(ρgD); Ekman transport τ/(ρ₀f); column momentum after one implicit diffusion step = Δt·τ/ρ₀ (P4.1 gate tests).
 - [x] Temporal convergence of the coupled scheme; barotropic energy decay (P4.1 gate tests).
 - [ ] Lock exchange; mode-1 internal-wave speed; idealised fjord estuarine circulation (Sognefjord-like).

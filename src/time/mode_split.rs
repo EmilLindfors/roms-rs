@@ -7,7 +7,8 @@
 //! One baroclinic step `tⁿ → tⁿ⁺¹ = tⁿ + Δt` (Shchepetkin & McWilliams 2005, with
 //! SSP-RK3 in place of their forward-backward barotropic stepping):
 //!
-//! 1. **Slow forcing.** The 3D RHS `R₃D` at `tⁿ` and, from it, the slow forcing
+//! 1. **Slow forcing.** The horizontal 3D momentum tendency `R₃D` at `tⁿ`
+//!    ([`ModeSplitPhysics::momentum_rhs_into`]) and, from it, the slow forcing
 //!    `Gⁿ` of the barotropic transport ([`ModeSplitPhysics::slow_forcing_into`]).
 //!    The pass uses the average of `G` over the step, extrapolated from
 //!    `Gⁿ, Gⁿ⁻¹, Gⁿ⁻²` (AB3 with variable steps; [`step_average_weights`]).
@@ -24,7 +25,12 @@
 //!    and `η, ū, v̄` get the same constant rates. SSP-RK3 reproduces a
 //!    constant-rate solution exactly, so each stage sees the barotropic state
 //!    linearly interpolated to its stage time, and the depth mean of `u` stays
-//!    equal to `ū`. Stage 1 reuses the `R₃D` of step 1.
+//!    equal to `ū`. Stage 1 reuses the `R₃D` of step 1. The terms that move
+//!    with the layer volume fluxes ([`ModeSplitPhysics::transport_rhs_into`])
+//!    get the pass's `DU_avg2` and `∂η/∂t`, so that the layers carry exactly
+//!    the water the free surface moved. The tracers are stepped as inventories
+//!    `H_z C`, divided by the new `H_z` at the end of the step: constancy and
+//!    conservation of the tracers (see [`crate::solver::rhs::transport_3d`]).
 //! 4. **Implicit vertical terms** (diffusion with the surface and bottom
 //!    stresses), then the depth mean of `u` is reset to `ū`.
 //!
@@ -54,6 +60,9 @@
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
+use crate::solver::rhs::{
+    BarotropicFlux, scale_tracers_by_layer_thickness, transport_divergence_element,
+};
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
@@ -154,30 +163,15 @@ impl BarotropicTransport {
     ) {
         let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
         for k in 0..out.n_elements {
-            let hu = &self.hu.data[k * nn..(k + 1) * nn];
-            let hv = &self.hv.data[k * nn..(k + 1) * nn];
-            let div = &mut out.data[k * nn..(k + 1) * nn];
-            for (i, d) in div.iter_mut().enumerate() {
-                let (mut dr, mut ds) = (0.0, 0.0);
-                for j in 0..nn {
-                    let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
-                    let (fr, fs) = (ar_x * hu[j] + ar_y * hv[j], as_x * hu[j] + as_y * hv[j]);
-                    dr += ops.dr[(i, j)] * fr;
-                    ds += ops.ds[(i, j)] * fs;
-                }
-                *d = geom.jacobian_inv(k, i) * (dr + ds);
-            }
-            for face in 0..4 {
-                let f_star = &self.face[(k * 4 + face) * nfn..][..nfn];
-                for (fi, &node) in ops.face_nodes[face].iter().enumerate() {
-                    let (nx, ny) = geom.normal(k, face, fi);
-                    let scale = geom.lift_scale(k, face, fi, node);
-                    let jump = nx * hu[node] + ny * hv[node] - f_star[fi];
-                    for (i, d) in div.iter_mut().enumerate() {
-                        *d -= scale * ops.lift[face][(i, fi)] * jump;
-                    }
-                }
-            }
+            transport_divergence_element(
+                ops,
+                geom,
+                k,
+                &self.hu.data[k * nn..(k + 1) * nn],
+                &self.hv.data[k * nn..(k + 1) * nn],
+                &self.face[k * 4 * nfn..(k + 1) * 4 * nfn],
+                &mut out.data[k * nn..(k + 1) * nn],
+            );
         }
     }
 }
@@ -196,12 +190,29 @@ pub trait ModeSplitPhysics {
     /// Bed elevation `B`; the depth is `η − B`.
     fn bathymetry(&self) -> &Bathymetry2D;
 
-    /// Overwrite `out` with the explicit 3D tendency of `u, v, temp, salt`.
-    /// The barotropic entries of `out` are replaced by the splitter.
-    fn rhs_3d_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D);
+    /// Overwrite `out.u` and `out.v` with the explicit horizontal momentum
+    /// tendency of `state`: everything but the terms that move with the layer
+    /// volume fluxes. The slow forcing is built from it. Other fields of `out`
+    /// are overwritten by [`Self::transport_rhs_into`] or the splitter.
+    fn momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D);
+
+    /// Add the momentum terms that move with the layer volume fluxes (vertical
+    /// advection; zero depth mean) to `out.u` and `out.v`, and overwrite
+    /// `out.temp` and `out.salt` with the tracers' inventory tendencies
+    /// `∂(H_z C)/∂t`. The layer fluxes are corrected to the barotropic
+    /// transport of the step, `barotropic` (see
+    /// [`crate::solver::rhs::transport_3d`]). `state` holds concentrations.
+    fn transport_rhs_into(
+        &self,
+        state: &Solution3D,
+        t: f64,
+        barotropic: BarotropicFlux,
+        out: &mut Solution3D,
+    );
 
     /// Overwrite `g` with the slow forcing of the barotropic transport at time
-    /// `t`: `(0, G_hu, G_hv)` in m²/s², from `state` and its 3D tendency `rhs`.
+    /// `t`: `(0, G_hu, G_hv)` in m²/s², from `state` and its horizontal
+    /// momentum tendency `rhs` ([`Self::momentum_rhs_into`]).
     ///
     /// `G` must hold exactly the depth-integrated terms that the 2D module does
     /// not compute itself, so that nothing is counted twice.
@@ -217,7 +228,8 @@ pub trait ModeSplitPhysics {
     /// and bottom stresses as its boundary fluxes.
     fn vertical_implicit(&self, state: &mut Solution3D, dt: f64);
 
-    /// Runs on every 3D stage value, including the last: limiters, density.
+    /// Runs on every 3D stage value (with the tracers as concentrations),
+    /// including the last: limiters, density.
     fn post_stage(&self, state: &mut Solution3D);
 }
 
@@ -418,8 +430,11 @@ impl BarotropicFilter {
 
 /// Field buffers sized on the first step and reused afterwards.
 struct Buffers {
-    /// `R₃D` at `tⁿ`, reused as the first 3D stage.
+    /// Horizontal momentum tendency `R₃D` at `tⁿ`, reused as the first 3D stage.
     rhs_n: Solution3D,
+    /// A 3D stage value with the tracers as concentrations (the stages carry
+    /// inventories `H_z C`).
+    concentrations: Solution3D,
     /// Barotropic transport during the pass.
     q: SWESolution2D,
     /// Filtered transport.
@@ -447,6 +462,7 @@ impl Buffers {
         let n_face_values = ne * 4 * n_face_nodes;
         Self {
             rhs_n: Solution3D::new(ne, nn, state.n_levels),
+            concentrations: Solution3D::new(ne, nn, state.n_levels),
             q: SWESolution2D::new(ne, nn),
             q_avg: SWESolution2D::new(ne, nn),
             forcing: SWESolution2D::new(ne, nn),
@@ -543,6 +559,7 @@ impl ModeSplitIntegrator {
         let barotropic = physics.barotropic();
         let Buffers {
             rhs_n,
+            concentrations,
             q,
             q_avg,
             forcing: g_term,
@@ -559,7 +576,7 @@ impl ModeSplitIntegrator {
             .get_or_insert_with(|| Buffers::new(state, barotropic.operators().n_face_nodes));
 
         // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3)
-        physics.rhs_3d_into(state, t, rhs_n);
+        physics.momentum_rhs_into(state, t, rhs_n);
         physics.slow_forcing_into(state, rhs_n, t, history.push(t, dt));
         history.step_average(dt, g_term);
         to_transport(state, bathymetry, q);
@@ -620,19 +637,33 @@ impl ModeSplitIntegrator {
             }
         }
 
-        // 3. 3D stages with the barotropic state prescribed
+        // 3. 3D stages with the barotropic state prescribed, the tracers as
+        // inventories H_z·C (the stage's η sets H_z)
+        let barotropic_flux = BarotropicFlux {
+            hu: &transport.hu.data,
+            hv: &transport.hv.data,
+            face: &transport.face,
+            eta_rate: &rate_eta.data,
+        };
+        scale_tracers_by_layer_thickness(state, sigma, bathymetry, true);
         let mut first_stage = true;
         SSPRK3.step_with_workspace(
             state,
             dt,
             t,
             |s, time, out| {
+                concentrations.copy_from(s);
+                scale_tracers_by_layer_thickness(concentrations, sigma, bathymetry, false);
                 if first_stage {
                     out.copy_from(rhs_n);
                     first_stage = false;
                 } else {
-                    physics.rhs_3d_into(s, time, out);
+                    physics.momentum_rhs_into(concentrations, time, out);
                 }
+                physics.transport_rhs_into(concentrations, time, barotropic_flux, out);
+                // w and rho are diagnostics, refreshed after the stages
+                out.w.fill(0.0);
+                out.rho.fill(0.0);
                 depth_average(sigma, &out.u, mean_u);
                 depth_average(sigma, &out.v, mean_v);
                 shift_columns(&mut out.u, out.n_levels, mean_u, rate_ubar);
@@ -641,7 +672,11 @@ impl ModeSplitIntegrator {
                 out.ubar.copy_from(rate_ubar);
                 out.vbar.copy_from(rate_vbar);
             },
-            |s| physics.post_stage(s),
+            |s| {
+                scale_tracers_by_layer_thickness(s, sigma, bathymetry, false);
+                physics.post_stage(s);
+                scale_tracers_by_layer_thickness(s, sigma, bathymetry, true);
+            },
             &mut self.stages_3d,
         );
 
@@ -659,6 +694,8 @@ impl ModeSplitIntegrator {
                 state.vbar.data[idx] = vbar;
             }
         }
+        // Tracer inventories back to concentrations, with the new H_z
+        scale_tracers_by_layer_thickness(state, sigma, bathymetry, false);
 
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the
@@ -1014,8 +1051,19 @@ mod tests {
             &self.bathymetry
         }
 
-        fn rhs_3d_into(&self, _state: &Solution3D, _t: f64, out: &mut Solution3D) {
+        fn momentum_rhs_into(&self, _state: &Solution3D, _t: f64, out: &mut Solution3D) {
             out.scale(0.0);
+        }
+
+        fn transport_rhs_into(
+            &self,
+            _state: &Solution3D,
+            _t: f64,
+            _barotropic: BarotropicFlux,
+            out: &mut Solution3D,
+        ) {
+            out.temp.fill(0.0);
+            out.salt.fill(0.0);
         }
 
         fn slow_forcing_into(

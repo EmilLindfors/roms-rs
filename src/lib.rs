@@ -130,7 +130,8 @@ pub use solver::{
     compute_dt_tracer_2d,
     compute_dt_viscosity,
     // 3D RHS
-    compute_rhs_3d,
+    compute_momentum_rhs_3d,
+    compute_transport_rhs_3d,
     compute_rhs_advection_2d,
     compute_rhs_swe_2d,
     compute_rhs_swe_2d_into,

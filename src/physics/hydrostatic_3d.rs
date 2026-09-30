@@ -42,8 +42,9 @@ use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::physics::vertical_velocity::compute_vertical_velocity;
 use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
-    ExtrapolationTracerBC3D, Rhs3DConfig, TracerBoundaryCondition3D, apply_coriolis_3d,
-    apply_horizontal_advection_3d, compute_rhs_3d,
+    BarotropicFlux, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
+    TracerBoundaryCondition3D, TracerTransportScratch, apply_coriolis_3d,
+    apply_horizontal_advection_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -74,13 +75,17 @@ where
     pub forcing: Forcing,
     pub g: f64,
     pub rho0: f64,
-    /// Temperature BC. Not consulted yet: every physical boundary is a closed
-    /// wall in 3D (see `TracerBoundaryCondition3D`).
+    /// Temperature of water flowing in through a physical boundary (walls
+    /// carry none; see `TracerBoundaryCondition3D`).
     pub temp_bc: Arc<dyn TracerBoundaryCondition3D>,
-    /// Salinity BC. Not consulted yet (see `temp_bc`).
+    /// Salinity of water flowing in through a physical boundary (see `temp_bc`).
     pub salt_bc: Arc<dyn TracerBoundaryCondition3D>,
     pub tracer_limiter: TracerLimiter3DConfig,
+    /// Ω of the 3D velocities alone, for the `w` output of [`Self::post_process`].
     pub w_scratch: Mutex<Vec<f64>>,
+    /// Layer transports (and their Ω) of the last 3D stage, and the tracer
+    /// kernel's buffers.
+    transport_scratch: Mutex<(LayerTransport, TracerTransportScratch)>,
     /// One-level states for the mean-flow part of the slow forcing:
     /// `(uniform ū columns, their advection + Coriolis tendency)`.
     mean_flow_scratch: Mutex<Option<(Solution3D, Solution3D)>>,
@@ -110,6 +115,10 @@ where
         geom.assert_affine("Hydrostatic3D (the 3D horizontal kernels)");
         // Omega lives at the w-points: n_levels + 1 interfaces per column.
         let n_w = mesh.n_elements * ops.n_nodes * (sigma.n_levels() + 1);
+        let transport_scratch = Mutex::new((
+            LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels()),
+            TracerTransportScratch::new(&ops, sigma.n_levels()),
+        ));
         Self {
             mesh,
             ops,
@@ -127,6 +136,7 @@ where
             salt_bc: Arc::new(ExtrapolationTracerBC3D),
             tracer_limiter: TracerLimiter3DConfig::none(),
             w_scratch: Mutex::new(vec![0.0; n_w]),
+            transport_scratch,
             mean_flow_scratch: Mutex::new(None),
         }
     }
@@ -182,52 +192,64 @@ where
         stats
     }
 
-    /// Compute the 3D Right-Hand Side.
-    pub fn compute_rhs_3d(&self, state: &Solution3D, time: f64) -> Solution3D {
-        let mut rhs = Solution3D::new(state.n_elements, state.n_nodes, state.n_levels);
-        self.compute_rhs_3d_into(state, time, &mut rhs);
-        rhs
-    }
-
-    /// [`Self::compute_rhs_3d`] into `rhs`, which is overwritten: tendencies of
-    /// `u, v, temp, salt`, and zero for the barotropic fields, `w` and `rho`
-    /// (the mode splitter supplies the barotropic rates; `w` and `rho` are
-    /// diagnostics).
-    pub fn compute_rhs_3d_into(&self, state: &Solution3D, _time: f64, rhs: &mut Solution3D) {
-        rhs.eta.fill(0.0);
-        rhs.ubar.fill(0.0);
-        rhs.vbar.fill(0.0);
-        rhs.w.fill(0.0);
-        rhs.rho.fill(0.0);
-
-        let config = Rhs3DConfig {
+    fn rhs_config(&self) -> Rhs3DConfig<'_> {
+        Rhs3DConfig {
             mesh: &self.mesh,
             ops: &self.ops,
             geom: &self.geom,
             bathymetry: &self.bathymetry,
             sigma: &self.sigma,
             coriolis: &self.coriolis,
-            eos: &self.eos,
             temp_bc: &*self.temp_bc,
             salt_bc: &*self.salt_bc,
             g: self.g,
             rho0: self.rho0,
-        };
+        }
+    }
 
-        // Compute Vertical Velocity (Diagnostic)
-        let mut w_vel = self.w_scratch.lock().expect("Failed to lock w_scratch");
-        compute_vertical_velocity(
-            &mut *w_vel,
+    /// Overwrite `rhs.u` and `rhs.v` with the horizontal momentum tendency of
+    /// `state` (baroclinic PGF, horizontal advection, Coriolis; see
+    /// [`compute_momentum_rhs_3d`]). `state.rho` must be current.
+    pub fn compute_momentum_rhs_into(&self, state: &Solution3D, rhs: &mut Solution3D) {
+        compute_momentum_rhs_3d(rhs, state, &self.rhs_config());
+    }
+
+    /// The layer transports of `state` corrected to `barotropic`, then the
+    /// vertical momentum advection added to `rhs.u`, `rhs.v` and the tracer
+    /// inventory tendencies written to `rhs.temp`, `rhs.salt` (see
+    /// [`compute_transport_rhs_3d`]).
+    pub fn compute_transport_rhs_into(
+        &self,
+        state: &Solution3D,
+        barotropic: BarotropicFlux,
+        rhs: &mut Solution3D,
+    ) {
+        let mut guard = self
+            .transport_scratch
+            .lock()
+            .expect("Failed to lock transport_scratch");
+        let (transport, scratch) = &mut *guard;
+        transport.compute(
             state,
+            barotropic,
             &self.mesh,
             &self.ops,
+            &self.geom,
             &self.sigma,
             &self.bathymetry,
-            &self.geom,
-            self.g,
         );
+        compute_transport_rhs_3d(rhs, state, transport, &self.rhs_config(), scratch);
+    }
 
-        compute_rhs_3d(rhs, state, &w_vel, &config);
+    /// Largest surface residual of `Ω` in the last 3D stage before it was
+    /// spread over the column (m/s): round-off where the barotropic pass keeps
+    /// its nodal identity (see [`LayerTransport::surface_residual`]).
+    pub fn last_surface_residual(&self) -> f64 {
+        self.transport_scratch
+            .lock()
+            .expect("Failed to lock transport_scratch")
+            .0
+            .surface_residual
     }
 
     /// Update density field based on current temperature and salinity.
@@ -307,10 +329,11 @@ where
     pub fn post_process(&self, state: &mut Solution3D) {
         self.apply_tracer_limiters(state);
 
-        // Update Vertical Velocity for output
+        // Vertical velocity for output. Between steps there is no barotropic
+        // transport, so this is Ω of the 3D velocities alone, with ∂η/∂t from
+        // their divergence (`compute_vertical_velocity`); the stages use the Ω
+        // of the layer transports.
         let mut w_vel = self.w_scratch.lock().expect("Failed to lock w_scratch");
-
-        // Re-compute vertical velocity
         compute_vertical_velocity(
             &mut *w_vel,
             state,
@@ -361,8 +384,18 @@ where
         &self.bathymetry
     }
 
-    fn rhs_3d_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {
-        self.compute_rhs_3d_into(state, t, out);
+    fn momentum_rhs_into(&self, state: &Solution3D, _t: f64, out: &mut Solution3D) {
+        self.compute_momentum_rhs_into(state, out);
+    }
+
+    fn transport_rhs_into(
+        &self,
+        state: &Solution3D,
+        _t: f64,
+        barotropic: BarotropicFlux,
+        out: &mut Solution3D,
+    ) {
+        self.compute_transport_rhs_into(state, barotropic, out);
     }
 
     /// `G = D·(⟨R₃D(u)⟩ − R_adv+Cor(ū)) + (τ_s − τ_b)/ρ₀` (see the module docs).
