@@ -20,12 +20,16 @@
 //!   [`crate::solver::rhs::TracerBoundaryCondition3D`].
 //!
 //! The depth mean at open faces is the 2D module's (its open-boundary
-//! condition); the classification must match it: a tag the 2D boundary
+//! condition), so the classification must match it: a tag the 2D boundary
 //! condition treats as a wall must be a wall here too.
+//! [`Boundaries3D::matching`] derives it from the 2D boundary condition
+//! (`SWEBoundaryCondition2D::is_wall`), which `Hydrostatic3D` does by
+//! default.
 //!
 //! Not yet: prescribed 3D velocity profiles at open faces (nesting of the
 //! baroclinic velocity, TODO P4.2).
 
+use crate::boundary::SWEBoundaryCondition2D;
 use crate::mesh::data::BoundaryTag;
 use crate::mesh::{ElementFace, Mesh2D};
 use crate::types::ElementIndex;
@@ -44,8 +48,10 @@ pub enum FaceExterior {
 /// Which boundary tags are walls for the 3D kernels (see the module docs).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Boundaries3D {
-    /// Tags of the wall faces; faces without a tag are walls too.
+    /// Tags of the wall faces.
     pub wall_tags: Vec<BoundaryTag>,
+    /// Whether faces without a tag are walls (the default).
+    pub untagged_are_walls: bool,
 }
 
 impl Default for Boundaries3D {
@@ -62,7 +68,34 @@ impl Boundaries3D {
     pub fn with_walls(tags: impl IntoIterator<Item = BoundaryTag>) -> Self {
         Self {
             wall_tags: tags.into_iter().collect(),
+            untagged_are_walls: true,
         }
+    }
+
+    /// The classification of the 2D boundary condition `bc` for the boundary
+    /// faces of `mesh`: a tag is a wall where `bc.is_wall(tag)` says so, and
+    /// as in [`Self::default`] where `bc` cannot tell.
+    pub fn matching(mesh: &Mesh2D, bc: &dyn SWEBoundaryCondition2D) -> Self {
+        let default = Self::default();
+        let mut boundaries = Self {
+            wall_tags: Vec::new(),
+            untagged_are_walls: bc.is_wall(None).unwrap_or(default.untagged_are_walls),
+        };
+        for edge in mesh.edges.iter().filter(|edge| edge.right.is_none()) {
+            let Some(tag) = edge.boundary_tag else {
+                continue;
+            };
+            if boundaries.wall_tags.contains(&tag) {
+                continue;
+            }
+            let wall = bc
+                .is_wall(Some(tag))
+                .unwrap_or_else(|| default.wall_tags.contains(&tag));
+            if wall {
+                boundaries.wall_tags.push(tag);
+            }
+        }
+        boundaries
     }
 
     /// What lies beyond face `face` of `element`.
@@ -72,7 +105,11 @@ impl Boundaries3D {
             Some(neighbor) => FaceExterior::Element(neighbor),
             None => match mesh.boundary_tag(element, face) {
                 Some(tag) if !self.wall_tags.contains(&tag) => FaceExterior::Open(tag),
-                _ => FaceExterior::Wall,
+                Some(_) => FaceExterior::Wall,
+                None if self.untagged_are_walls => FaceExterior::Wall,
+                // An untagged open face: the tracer boundary conditions see
+                // the default open tag
+                None => FaceExterior::Open(BoundaryTag::Open),
             },
         }
     }
@@ -111,5 +148,90 @@ mod tests {
 
         mesh.edges.iter_mut().for_each(|e| e.boundary_tag = None);
         assert_eq!(default.exterior(&mesh, el, 0), FaceExterior::Wall);
+    }
+
+    /// The classification follows the 2D boundary condition: tags it
+    /// dispatches to a wall are walls, tags it keeps open are open, and tags
+    /// it cannot tell about fall back to the default.
+    #[test]
+    fn walls_are_derived_from_the_2d_boundary_condition() {
+        use crate::boundary::{BCContext2D, MultiBoundaryCondition2D, Reflective2D};
+        use crate::boundary::{CharacteristicOBC, StillWater};
+        use crate::solver::SWEState2D;
+
+        // South: Custom(7), north: River, east: Open, west: Wall
+        let mut mesh = Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            2.0,
+            0.0,
+            1.0,
+            2,
+            1,
+            [
+                BoundaryTag::Custom(7),
+                BoundaryTag::Open,
+                BoundaryTag::River,
+                BoundaryTag::Wall,
+            ],
+        );
+        let open = CharacteristicOBC::new(StillWater::default());
+        let wall = Reflective2D::default();
+        // Walls by default, the characteristic OBC on Open, and Custom(7)
+        // also a wall
+        let bc = MultiBoundaryCondition2D::new(&wall)
+            .with_open(&open)
+            .with_custom(7, &wall);
+        let boundaries = Boundaries3D::matching(&mesh, &bc);
+        let mut walls = boundaries.wall_tags.clone();
+        walls.sort_by_key(|t| format!("{t:?}"));
+        assert_eq!(
+            walls,
+            vec![
+                BoundaryTag::Custom(7),
+                BoundaryTag::River,
+                BoundaryTag::Wall
+            ]
+        );
+        assert!(boundaries.untagged_are_walls);
+
+        // Open by default: River opens, untagged faces too
+        let bc = MultiBoundaryCondition2D::new(&open).with_wall(&wall);
+        let boundaries = Boundaries3D::matching(&mesh, &bc);
+        assert_eq!(boundaries.wall_tags, vec![BoundaryTag::Wall]);
+        assert!(!boundaries.untagged_are_walls);
+        mesh.edges.iter_mut().for_each(|e| e.boundary_tag = None);
+        let east = (0..4)
+            .map(|f| boundaries.exterior(&mesh, ElementIndex::new(1), f))
+            .find(|e| matches!(e, FaceExterior::Open(_)));
+        assert_eq!(east, Some(FaceExterior::Open(BoundaryTag::Open)));
+
+        // A condition that cannot tell: the default
+        struct Unknown;
+        impl crate::boundary::SWEBoundaryCondition2D for Unknown {
+            fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
+                ctx.interior_state
+            }
+            fn name(&self) -> &'static str {
+                "unknown"
+            }
+        }
+        let tagged = Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            2.0,
+            0.0,
+            1.0,
+            2,
+            1,
+            [
+                BoundaryTag::Custom(7),
+                BoundaryTag::Open,
+                BoundaryTag::River,
+                BoundaryTag::Wall,
+            ],
+        );
+        assert_eq!(
+            Boundaries3D::matching(&tagged, &Unknown),
+            Boundaries3D::default()
+        );
     }
 }

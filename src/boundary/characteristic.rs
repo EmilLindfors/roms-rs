@@ -66,6 +66,7 @@ use std::sync::atomic::AtomicBool;
 use super::bathymetry_validation::warn_once_if_misconfigured;
 use super::{BCContext2D, BoundaryState, SWEBoundaryCondition2D};
 use crate::io::BoundaryTimeSeries;
+use crate::mesh::BoundaryTag;
 use crate::solver::SWEState2D;
 use crate::types::Depth;
 
@@ -309,6 +310,10 @@ impl CharacteristicOBC<StillWater> {
 }
 
 impl<P: ExternalStateProvider> SWEBoundaryCondition2D for CharacteristicOBC<P> {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(false)
+    }
+
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         self.state(ctx)
     }

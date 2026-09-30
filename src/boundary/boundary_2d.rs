@@ -189,6 +189,16 @@ pub trait SWEBoundaryCondition2D: Send + Sync {
     fn allows_outflow(&self) -> bool {
         true
     }
+
+    /// Whether faces tagged `tag` (`None`: untagged faces) are walls, with
+    /// no mass flux, or open, for the 3D kernels' face classification
+    /// ([`crate::solver::rhs::Boundaries3D::matching`]). `None` if the
+    /// condition cannot tell (the default); the 3D kernels then treat
+    /// [`BoundaryTag::Wall`] and untagged faces as walls. Wrappers that
+    /// dispatch to other boundary conditions must forward this.
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        None
+    }
 }
 
 /// Reflective (wall) boundary condition for 2D.
@@ -225,6 +235,10 @@ impl Reflective2D {
 }
 
 impl SWEBoundaryCondition2D for Reflective2D {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(true)
+    }
+
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         let h = ctx.interior_state.h;
         let (nx, ny) = ctx.normal;
@@ -286,6 +300,10 @@ impl<F> SWEBoundaryCondition2D for Tidal2D<F>
 where
     F: Fn(f64, f64, f64) -> f64 + Send + Sync,
 {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(false)
+    }
+
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         let (x, y) = ctx.position;
         let t = ctx.time;
@@ -349,6 +367,10 @@ impl<F> SWEBoundaryCondition2D for Discharge2D<F>
 where
     F: Fn(f64, f64, f64) -> f64 + Send + Sync,
 {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(false)
+    }
+
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         let (x, y) = ctx.position;
         let t = ctx.time;
@@ -390,6 +412,10 @@ where
 pub struct Extrapolation2D;
 
 impl SWEBoundaryCondition2D for Extrapolation2D {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(false)
+    }
+
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         ctx.interior_state
     }
@@ -423,6 +449,10 @@ impl FixedState2D {
 }
 
 impl SWEBoundaryCondition2D for FixedState2D {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(false)
+    }
+
     fn ghost_state(&self, _ctx: &BCContext2D) -> SWEState2D {
         self.state
     }
@@ -514,6 +544,10 @@ impl HarmonicTidal2D {
 }
 
 impl SWEBoundaryCondition2D for HarmonicTidal2D {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(false)
+    }
+
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         let eta = self.elevation(ctx.time);
         let h_ghost = (eta - ctx.bathymetry).max(self.h_min);
@@ -563,6 +597,10 @@ impl ConstantDischarge2D {
 }
 
 impl SWEBoundaryCondition2D for ConstantDischarge2D {
+    fn is_wall(&self, _tag: Option<BoundaryTag>) -> Option<bool> {
+        Some(false)
+    }
+
     fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
         let (nx, ny) = ctx.normal;
         let h = self

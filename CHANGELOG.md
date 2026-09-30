@@ -12,6 +12,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The 3D walls follow the 2D boundary condition (TODO P4.2).** The 3D kernels classified faces from their own tag list (`BoundaryTag::Wall` by default), and nothing checked it against the 2D module's condition. A tag the 2D condition treats as a wall but the 3D side as open would exchange layer volume through a 2D wall with zero net flux; the reverse would reflect the shear at an open boundary.
+  - New `SWEBoundaryCondition2D::is_wall(tag) -> Option<bool>`, with a default of `None` (cannot tell). `Reflective2D` is a wall. `CharacteristicOBC`, `Tidal2D`, `HarmonicTidal2D`, `Discharge2D`, `ConstantDischarge2D`, `Extrapolation2D` and `FixedState2D` are open. `MultiBoundaryCondition2D` forwards by tag.
+  - New `Boundaries3D::matching(mesh, bc)`; `Hydrostatic3D::new` uses it, falling back to the old default where the condition cannot tell. `with_wall_tags` now overrides it. `Boundaries3D` has an `untagged_are_walls` flag (untagged faces follow `is_wall(None)`).
+  - Unit test `walls_are_derived_from_the_2d_boundary_condition`.
+
 - **3D momentum in inventory form on the layer transports (TODO P4.2).** The 3D velocity was advected in velocity form, `∂u/∂t = −∇·(u u)` with its own Rusanov face flux, and only its vertical advection used the layer transports' Ω. Over a sloping bed that was inconsistent with continuity, and the layer momentum was not conserved.
   - `ModeSplitIntegrator` now steps `H_z u` and `H_z v` as inventories, like the tracers, and divides by the new `H_z` at the end of the step. In the stages the column sum of the momentum tendency is replaced by the constant rate of the barotropic transport, `(D̄ūⁿ⁺¹ − Dⁿūⁿ)/Δt`, shared out by `Δσ_l`. Elements where the pass kept only the element balance use element means per level, as the tracers do.
   - New `apply_momentum_transport_3d`: `−∇·(Q_l u↑) − δ(Ω u)` with the layer transports and `Ω` of `LayerTransport` (upwind on the face fluxes, extrapolated at open faces, centred in the vertical). The horizontal flux divergence is shared with the tracer kernel. The old `apply_horizontal_advection_3d` (which allocated per face and level) and `apply_vertical_advection_3d` are gone.
