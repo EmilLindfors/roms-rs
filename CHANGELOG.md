@@ -4,6 +4,12 @@ All notable changes to this project should be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **3D `w` output from the layer transports (TODO P4.2).** `Hydrostatic3D::post_process` wrote Ω of the 3D velocities alone, from a separate strong-form kernel that allocated per element and assumed affine elements (`compute_vertical_velocity`). The new `Hydrostatic3D::update_vertical_velocity` uses the same `LayerTransport` as the stages, on the end state's own layer transports. After a mode-split step their column sum is `Dū`, the filtered barotropic transport. Thin columns are at rest, as in the stages.
+  - Removed: `physics::compute_vertical_velocity` (module `physics::vertical_velocity`), `Hydrostatic3D::w_scratch`, `solver::rhs::advection_3d::compute_strong_divergence`.
+  - Its layer-continuity regression test moved to `transport_3d` (`own_omega_of_a_zero_mean_shear_has_layer_continuity`).
+
 ### Added
 
 - **3D momentum in inventory form on the layer transports (TODO P4.2).** The 3D velocity was advected in velocity form, `∂u/∂t = −∇·(u u)` with its own Rusanov face flux, and only its vertical advection used the layer transports' Ω. Over a sloping bed that was inconsistent with continuity, and the layer momentum was not conserved.

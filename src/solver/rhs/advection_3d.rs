@@ -1,11 +1,9 @@
-//! Boundary conditions of the 3D tracers, and the strong-form divergence of
-//! the diagnostic vertical velocity.
+//! Boundary conditions of the 3D tracers.
 //!
 //! The advection of the 3D momentum and tracers, in inventory form with the
 //! layer transports, is in [`crate::solver::rhs::transport_3d`].
 
 use crate::mesh::data::BoundaryTag;
-use crate::operators::DGOperators2D;
 
 pub(crate) const MIN_LAYER_THICKNESS: f64 = 1.0e-12;
 
@@ -80,56 +78,6 @@ impl TracerBoundaryCondition3D for UpwindTracerBC3D {
         } else {
             ctx.interior_value
         }
-    }
-}
-
-/// Compute volume divergence term assuming constant geometric factors.
-///
-/// Output:
-/// out_dr = Dr * (rx*Fx + ry*Fy)
-/// out_ds = Ds * (sx*Fx + sy*Fy)
-///
-/// So Div = out_dr + out_ds
-pub fn compute_strong_divergence(
-    fx: &[f64],
-    fy: &[f64],
-    ops: &DGOperators2D,
-    rx: f64,
-    ry: f64,
-    sx: f64,
-    sy: f64,
-    out_dr: &mut [f64],
-    out_ds: &mut [f64],
-) {
-    let n = ops.n_nodes;
-
-    // Temp buffers for transformed flux components
-    // Fr = rx*Fx + ry*Fy
-    // Fs = sx*Fx + sy*Fy
-    let mut fr = vec![0.0; n];
-    let mut fs = vec![0.0; n];
-
-    for i in 0..n {
-        fr[i] = rx * fx[i] + ry * fy[i];
-        fs[i] = sx * fx[i] + sy * fy[i];
-    }
-
-    // Matmul: out_dr = Dr * fr
-    for i in 0..n {
-        let mut sum = 0.0;
-        for j in 0..n {
-            sum += ops.dr[(i, j)] * fr[j];
-        }
-        out_dr[i] = sum;
-    }
-
-    // Matmul: out_ds = Ds * fs
-    for i in 0..n {
-        let mut sum = 0.0;
-        for j in 0..n {
-            sum += ops.ds[(i, j)] * fs[j];
-        }
-        out_ds[i] = sum;
     }
 }
 

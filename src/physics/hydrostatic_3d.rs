@@ -55,7 +55,6 @@ use crate::physics::eos::EquationOfState;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
 use crate::physics::vertical_diffusion::apply_vertical_diffusion;
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
-use crate::physics::vertical_velocity::compute_vertical_velocity;
 use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
     BarotropicFlux, Boundaries3D, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
@@ -106,8 +105,6 @@ where
     /// Quadratic drag of the bottom-layer velocity, if any (see
     /// [`Self::with_bottom_drag`]).
     pub bottom_drag: Option<BottomDrag3D>,
-    /// Ω of the 3D velocities alone, for the `w` output of [`Self::post_process`].
-    pub w_scratch: Mutex<Vec<f64>>,
     /// Layer transports (and their Ω) of the last 3D stage, and the
     /// transport kernels' buffers.
     transport_scratch: Mutex<(LayerTransport, TransportScratch)>,
@@ -140,8 +137,6 @@ where
         rho0: f64,
     ) -> Self {
         geom.assert_affine("Hydrostatic3D (the 3D horizontal kernels)");
-        // Omega lives at the w-points: n_levels + 1 interfaces per column.
-        let n_w = mesh.n_elements * ops.n_nodes * (sigma.n_levels() + 1);
         let transport_scratch = Mutex::new((
             LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels()),
             TransportScratch::new(&ops, sigma.n_levels()),
@@ -165,7 +160,6 @@ where
             tracer_limiter: TracerLimiter3DConfig::none(),
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             bottom_drag: None,
-            w_scratch: Mutex::new(vec![0.0; n_w]),
             transport_scratch,
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
@@ -501,37 +495,43 @@ where
     pub fn post_process(&self, state: &mut Solution3D) {
         self.apply_tracer_limiters(state);
 
-        // Vertical velocity for output. Between steps there is no barotropic
-        // transport, so this is Ω of the 3D velocities alone, with ∂η/∂t from
-        // their divergence (`compute_vertical_velocity`); the stages use the Ω
-        // of the layer transports.
-        let mut w_vel = self.w_scratch.lock().expect("Failed to lock w_scratch");
-        compute_vertical_velocity(
-            &mut *w_vel,
-            state,
-            &self.mesh,
-            &self.ops,
-            &self.sigma,
-            &self.bathymetry,
-            &self.geom,
-            self.g,
-        );
+        self.update_vertical_velocity(state);
+    }
 
-        // state.w is an output field at the layer centres: average the two
-        // bounding interface values of each layer.
-        let n_levels = state.n_levels;
+    /// Write `Ω` (m/s) at the layer centres to `state.w`, for output: the
+    /// mean of the two bounding σ-surfaces, from the state's own layer
+    /// transports ([`LayerTransport::compute`] without a barotropic flux, thin
+    /// columns at rest as in the stages). Their column sum is `Dū`, which
+    /// after a mode-split step is the filtered barotropic transport, and `Ω`
+    /// closes with the free-surface rate its divergence implies.
+    pub fn update_vertical_velocity(&self, state: &mut Solution3D) {
+        let mut guard = self
+            .transport_scratch
+            .lock()
+            .expect("Failed to lock transport_scratch");
+        let (transport, _) = &mut *guard;
+        self.with_thin_columns_at_rest(state, |state| {
+            transport.compute(
+                state,
+                None,
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                &self.sigma,
+                &self.bathymetry,
+                &self.boundaries,
+            );
+        });
+        let nl = state.n_levels;
         for (w_col, omega_col) in state
             .w
-            .chunks_exact_mut(n_levels)
-            .zip(w_vel.chunks_exact(n_levels + 1))
+            .chunks_exact_mut(nl)
+            .zip(transport.omega.chunks_exact(nl + 1))
         {
             for (l, w) in w_col.iter_mut().enumerate() {
                 *w = 0.5 * (omega_col[l] + omega_col[l + 1]);
             }
         }
-
-        // Could also apply equation of state update here to ensure rho is fresh
-        // self.eos.update_density(state);
     }
 }
 

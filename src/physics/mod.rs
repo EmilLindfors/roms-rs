@@ -32,7 +32,6 @@ pub mod hydrostatic_3d;
 pub mod traits;
 pub mod vertical_diffusion;
 pub mod vertical_mixing;
-pub mod vertical_velocity;
 
 pub use bottom_drag::BottomDrag3D;
 pub use builder::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
@@ -43,4 +42,3 @@ pub use vertical_diffusion::apply_vertical_diffusion;
 pub use vertical_mixing::{
     Column, ConstantMixing, Forcing, PacanowskiPhilanderMixing, VerticalMixing,
 };
-pub use vertical_velocity::compute_vertical_velocity;

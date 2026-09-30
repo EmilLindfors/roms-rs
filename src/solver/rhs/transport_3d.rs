@@ -1310,6 +1310,60 @@ mod tests {
         );
     }
 
+    /// Ω of the own transports is stored at the w-points and satisfies layer
+    /// continuity (the regression of the old `compute_vertical_velocity`,
+    /// whose layer-centre storage mixed neighbouring layers). A zero-mean
+    /// shear `u_l = U_l sin(2πx)` over a flat bed has no column divergence,
+    /// so Ω closes at the surface by itself and each layer's increment
+    /// `Ω_{l+1/2} − Ω_{l−1/2} = −Δσ_l ∇·(D u_l)` scales with `U_l`.
+    #[test]
+    fn own_omega_of_a_zero_mean_shear_has_layer_continuity() {
+        let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 4, 1);
+        let ops = DGOperators2D::new(3);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let sigma = SigmaGrid::uniform(4);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let bathymetry = Bathymetry2D::constant(mesh.n_elements, nn, -10.0);
+        let shear: Vec<f64> = sigma.sigma_rho().iter().map(|&s| s + 0.5).collect();
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        for k in 0..mesh.n_elements {
+            let el = ElementIndex::new(k);
+            for i in 0..nn {
+                let [x, _] = mesh.reference_to_physical(el, ops.nodes_r[i], ops.nodes_s[i]);
+                for (u, &shear_l) in state.u_column_mut(el, i).iter_mut().zip(&shear) {
+                    *u = shear_l * (2.0 * PI * x).sin();
+                }
+            }
+        }
+        let mut transport = LayerTransport::new(mesh.n_elements, &ops, nl);
+        transport.compute(
+            &state,
+            None,
+            &mesh,
+            &ops,
+            &geom,
+            &sigma,
+            &bathymetry,
+            &Boundaries3D::default(),
+        );
+        let scale = max_abs(transport.omega.iter().copied());
+        assert!(scale > 1e-3, "test flow should drive a non-trivial Ω");
+        let tol = 1e-12 * scale;
+        let d_sigma = sigma.d_sigma();
+        for col in transport.omega.chunks_exact(nl + 1) {
+            assert!(col[0].abs() < tol && col[nl].abs() < tol, "{col:?}");
+            let rate = (col[1] - col[0]) / (shear[0] * d_sigma[0]);
+            for l in 0..nl {
+                let increment = col[l + 1] - col[l];
+                let expected = rate * shear[l] * d_sigma[l];
+                assert!(
+                    (increment - expected).abs() < tol,
+                    "layer {l}: Ω increment {increment}, continuity requires {expected}"
+                );
+            }
+        }
+    }
+
     /// Inventory ↔ concentration: nodal in unmarked elements; in marked
     /// elements the element's inventory over its volume per level, which
     /// converts back to the same element inventory; a dry node, or a dry
