@@ -314,6 +314,12 @@ impl GeometricFactors2D {
         mass.iter().zip(u).map(|(m, u)| m * u).sum::<f64>() / self.area[k]
     }
 
+    /// Quadrature mass `w_i J_i` of node `i` of element `k`.
+    #[inline]
+    pub fn node_mass(&self, k: usize, i: usize) -> f64 {
+        self.mass[self.node_index(k, i)]
+    }
+
     /// `∫_k u = Σ_i w_i J_i u_i` of the nodal values `u` of element `k`.
     #[inline]
     pub fn integrate_element(&self, k: usize, u: &[f64]) -> f64 {

@@ -43,6 +43,8 @@ pub struct Rhs3DConfig<'a> {
     pub salt_bc: &'a dyn TracerBoundaryCondition3D,
     pub g: f64,
     pub rho0: f64,
+    /// Columns shallower than this (m) are thin (3D wetting and drying).
+    pub min_column_depth: f64,
 }
 
 /// Overwrite `rhs.u` and `rhs.v` with the horizontal momentum tendency:
@@ -68,6 +70,7 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.g,
         config.rho0,
         config.rho0, // baroclinic-only PGF
+        config.min_column_depth,
         &mut rhs.u,
         &mut rhs.v,
     );

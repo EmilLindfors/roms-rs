@@ -21,6 +21,12 @@ use crate::vertical::SigmaGrid;
 /// The surface and bottom stresses enter as the momentum fluxes `τ/ρ₀` at the
 /// column ends, so over `dt` the depth-integrated velocity of every column
 /// changes by `dt·(τ_s − τ_b)/ρ₀`.
+///
+/// Columns shallower than `min_column_depth` (m) are left alone: they carry
+/// no vertical structure (3D wetting and drying, see
+/// [`crate::physics::Hydrostatic3D::with_min_column_depth`]), and the solve
+/// would divide by vanishing layers.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     state: &mut Solution3D,
     sigma: &SigmaGrid,
@@ -29,6 +35,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     mixing: &M,
     forcing: &Forcing,
     rho0: f64,
+    min_column_depth: f64,
 ) {
     let n_levels = state.n_levels;
     let mut a = vec![0.0; n_levels];
@@ -57,6 +64,9 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
             // under water). The sigma routines form the total column as eta + h, so
             // eta + h = eta - B = water_depth, matching the PGF/advection paths.
             let h = -bathymetry.get(elem_idx, i);
+            if eta + h < min_column_depth {
+                continue;
+            }
 
             sigma.z_at_levels_into(eta, h, &mut z_r);
             sigma.z_at_faces_into(eta, h, &mut z_w);
@@ -365,6 +375,7 @@ mod tests {
                 &mixing,
                 &forcing,
                 1025.0,
+                0.0,
             );
             state.u_column(ElementIndex::new(0), 0).to_vec()
         };
@@ -415,7 +426,16 @@ mod tests {
         let mut dz = vec![0.0; 12];
         sigma.layer_thicknesses_into(0.0, depth, &mut dz);
         let transport = |col: &[f64]| -> f64 { col.iter().zip(&dz).map(|(u, h)| u * h).sum() };
-        apply_vertical_diffusion(&mut state, &sigma, &bathymetry, dt, &mixing, &forcing, rho0);
+        apply_vertical_diffusion(
+            &mut state,
+            &sigma,
+            &bathymetry,
+            dt,
+            &mixing,
+            &forcing,
+            rho0,
+            0.0,
+        );
 
         let el = ElementIndex::new(0);
         let du = transport(state.u_column(el, 0));

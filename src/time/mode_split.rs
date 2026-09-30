@@ -61,7 +61,7 @@ use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
 use crate::solver::rhs::{
-    BarotropicFlux, scale_tracers_by_layer_thickness, transport_divergence_element,
+    BarotropicFlux, inventory_to_concentration, tracer_to_inventory, transport_divergence_element,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -69,10 +69,20 @@ use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::time::{Integrable, IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
+use std::cell::RefCell;
 
 /// Fewest barotropic substeps per baroclinic step. Below four the filter
 /// weights cannot be centred on `tⁿ⁺¹`.
 pub const MIN_BAROTROPIC_SUBSTEPS: usize = 4;
+
+/// Relative residual of `η̄ − ηⁿ = −Δt∇·DU_avg2` above which an element is
+/// treated as balanced only as a whole (round-off is ≈ 1e-13).
+const NODAL_IDENTITY_TOLERANCE: f64 = 1e-9;
+
+/// ... and whose depth change over the step (relative to the element's
+/// deepest column) is above round-off: a fluid at rest has a round-off
+/// transport, whose relative residual is O(1).
+const DEPTH_ROUND_OFF: f64 = 1e-12;
 
 /// The fast-mode module: a 2D shallow-water RHS in transport form that can
 /// also report the numerical mass flux at every element face.
@@ -435,6 +445,14 @@ struct Buffers {
     /// A 3D stage value with the tracers as concentrations (the stages carry
     /// inventories `H_z C`).
     concentrations: Solution3D,
+    /// The last concentrations of `(temp, salt)`: what an element without
+    /// water keeps.
+    last_tracers: (Vec<f64>, Vec<f64>),
+    /// Elements where the pass kept only the element balance: their tracers
+    /// are element means per level for the step.
+    element_means: Vec<bool>,
+    /// `∇·DU_avg2` of the step.
+    transport_divergence: DGSolution2D,
     /// Barotropic transport during the pass.
     q: SWESolution2D,
     /// Filtered transport.
@@ -463,6 +481,9 @@ impl Buffers {
         Self {
             rhs_n: Solution3D::new(ne, nn, state.n_levels),
             concentrations: Solution3D::new(ne, nn, state.n_levels),
+            last_tracers: (state.temp.clone(), state.salt.clone()),
+            element_means: vec![false; ne],
+            transport_divergence: DGSolution2D::new(ne, nn),
             q: SWESolution2D::new(ne, nn),
             q_avg: SWESolution2D::new(ne, nn),
             forcing: SWESolution2D::new(ne, nn),
@@ -560,6 +581,9 @@ impl ModeSplitIntegrator {
         let Buffers {
             rhs_n,
             concentrations,
+            last_tracers: lent_tracers,
+            element_means,
+            transport_divergence,
             q,
             q_avg,
             forcing: g_term,
@@ -645,7 +669,48 @@ impl ModeSplitIntegrator {
             face: &transport.face,
             eta_rate: &rate_eta.data,
         };
-        scale_tracers_by_layer_thickness(state, sigma, bathymetry, true);
+        let geom = barotropic.geometry();
+        // Elements where the pass broke the nodal identity ∂η/∂t = −∇·DU_avg2
+        // (WetDry subcells, positivity limiter) carry their tracers as element
+        // means for the step
+        transport.divergence_into(barotropic.operators(), geom, transport_divergence);
+        let nn = state.n_nodes;
+        for (k, mark) in element_means.iter_mut().enumerate() {
+            let nodes = k * nn..(k + 1) * nn;
+            let bed = bathymetry.element(ElementIndex::new(k));
+            let (mut residual, mut scale, mut depth) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for ((&rate, &div), (&eta, &b)) in rate_eta.data[nodes.clone()]
+                .iter()
+                .zip(&transport_divergence.data[nodes.clone()])
+                .zip(state.eta.data[nodes].iter().zip(bed))
+            {
+                residual = residual.max((rate + div).abs());
+                scale = scale.max(rate.abs()).max(div.abs());
+                depth = depth.max(eta - b);
+            }
+            // Relative to the flow, and not round-off of a fluid at rest
+            *mark = residual > NODAL_IDENTITY_TOLERANCE * scale
+                && residual * dt > DEPTH_ROUND_OFF * depth;
+        }
+        let means: &[bool] = element_means;
+        let to_concentrations = |s: &Solution3D, temp: &mut [f64], salt: &mut [f64]| {
+            let eta = &s.eta.data;
+            inventory_to_concentration(&s.temp, eta, sigma, bathymetry, geom, means, temp);
+            inventory_to_concentration(&s.salt, eta, sigma, bathymetry, geom, means, salt);
+        };
+        let to_inventories = |s: &mut Solution3D| {
+            tracer_to_inventory(&mut s.temp, &s.eta.data, sigma, bathymetry);
+            tracer_to_inventory(&mut s.salt, &s.eta.data, sigma, bathymetry);
+        };
+        // Lent to both stage closures for the step
+        let last_tracers_cell = RefCell::new(std::mem::take(lent_tracers));
+        {
+            let mut last = last_tracers_cell.borrow_mut();
+            last.0.copy_from_slice(&state.temp);
+            last.1.copy_from_slice(&state.salt);
+        }
+        let last_tracers = &last_tracers_cell;
+        to_inventories(state);
         let mut first_stage = true;
         SSPRK3.step_with_workspace(
             state,
@@ -653,7 +718,13 @@ impl ModeSplitIntegrator {
             t,
             |s, time, out| {
                 concentrations.copy_from(s);
-                scale_tracers_by_layer_thickness(concentrations, sigma, bathymetry, false);
+                {
+                    let last = last_tracers.borrow();
+                    concentrations.temp.copy_from_slice(&last.0);
+                    concentrations.salt.copy_from_slice(&last.1);
+                }
+                let (temp, salt) = (&mut concentrations.temp, &mut concentrations.salt);
+                to_concentrations(s, temp, salt);
                 if first_stage {
                     out.copy_from(rhs_n);
                     first_stage = false;
@@ -673,9 +744,15 @@ impl ModeSplitIntegrator {
                 out.vbar.copy_from(rate_vbar);
             },
             |s| {
-                scale_tracers_by_layer_thickness(s, sigma, bathymetry, false);
+                let mut last = last_tracers.borrow_mut();
+                let (temp, salt) = &mut *last;
+                to_concentrations(s, temp, salt);
+                s.temp.copy_from_slice(temp);
+                s.salt.copy_from_slice(salt);
                 physics.post_stage(s);
-                scale_tracers_by_layer_thickness(s, sigma, bathymetry, true);
+                temp.copy_from_slice(&s.temp);
+                salt.copy_from_slice(&s.salt);
+                to_inventories(s);
             },
             &mut self.stages_3d,
         );
@@ -695,7 +772,14 @@ impl ModeSplitIntegrator {
             }
         }
         // Tracer inventories back to concentrations, with the new H_z
-        scale_tracers_by_layer_thickness(state, sigma, bathymetry, false);
+        {
+            let mut last = last_tracers.borrow_mut();
+            let (temp, salt) = &mut *last;
+            to_concentrations(state, temp, salt);
+            state.temp.copy_from_slice(temp);
+            state.salt.copy_from_slice(salt);
+        }
+        *lent_tracers = last_tracers_cell.into_inner();
 
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the

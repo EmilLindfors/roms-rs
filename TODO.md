@@ -93,7 +93,7 @@ This section only orders the existing items for that goal and adds the two farm-
 8. ~~Minor: `SpatiallyVaryingManning2D` as `BottomFriction2D` (P1.2); the vacuous tests in P1.7~~ done 2026-09-28.
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
-- P4.2 (tracer constancy: done 2026-09-30; still 3D open boundaries for momentum and T/S profiles, momentum in inventory form), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry, which gives NaN today; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
+- P4.2 (tracer constancy: done 2026-09-30; still 3D open boundaries for momentum and T/S profiles, momentum in inventory form), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS, quadratic bottom drag), P4.5 (3D wet/dry: done 2026-09-30; vertical advection order; parallel, non-allocating 3D kernels), rivers (P1.6 volume sources, P5.1), then P4.6 validation.
 - F.1 cage drag (3D form) and F.2 in 3D.
 
 Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
@@ -603,7 +603,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [x] Hz-weighted per-level face fluxes corrected so their vertical sum equals DU_avg2; η advanced by the divergence of the same flux. Done 2026-09-30 (`solver::rhs::transport_3d`, `LayerTransport`): nodal `H_z u` and the central face average, plus each layer's `Δσ_l` share of the difference to DU_avg2, nodally and on every face; Ω from the bed with each layer's share of the pass's ∂η/∂t.
 - [x] Ω stored at w-points (not layer centres re-averaged to faces) — done in [PR #2](https://github.com/EmilLindfors/roms-rs/pull/2).
 - [x] ~~Assert Ω(0) = 0 instead of forcing it with the linear correction.~~ Measured and gated instead of asserted (2026-09-30): `LayerTransport::surface_residual` / `Hydrostatic3D::last_surface_residual` is 3e-15 against Ω of 7e-3 m/s under a tide over a slope. The linear correction stays, because `WetDry` elements with a dry node and positivity-limited elements only keep the pass's element balance, not the nodal identity, so there the residual is O(1) and must go somewhere.
-  - [ ] In those elements, correct per element (or subcell) so that constancy holds there too (see `BarotropicTransport` docs). Needed with 3D wet/dry (P4.5).
+  - [x] In those elements, correct per element so that constancy holds there too: done 2026-09-30 with 3D wet/dry (P4.5), element means per level (a subcell version is noted there).
 - [ ] One 3D face-state helper for physical boundaries shared by the Ω, momentum and tracer kernels (P0.7/P0.22 were the same bug found twice). It should take the boundary tag, so 3D open boundaries (volume flux from the 2D OBC / nesting, tracer from `TracerBoundaryCondition3D` on inflow) are added in one place for all three.
   - Partly done 2026-09-30: Ω and the tracers now share one volume flux (`LayerTransport`), which at a physical boundary is the layer share of the 2D boundary flux (zero at walls), and the tracer consults `TracerBoundaryCondition3D` on inflow. Momentum still has its own wall reflection and no open-boundary condition; the 3D velocity profile at open boundaries (nesting of baroclinic u, v) is still to do.
 - [x] Step Hz·C (inventory form), then divide by the new Hz. Done 2026-09-30: `ModeSplitIntegrator` carries the tracers as `H_z C` through the 3D stages. Gates `uniform_tracers_stay_uniform_under_a_tide_over_a_sloping_bed` (drift 9.3e-13 in one period; before 12.8) and `tracer_inventories_are_conserved_under_a_tide` (3.1e-15; before 1.1e-2). The seiche/wind/Ekman gates run with the T/S-dependent EOS again (the side effect below is gone).
@@ -634,7 +634,12 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 ### P4.5 Remaining 3D physics and numerics
 - [ ] Higher-order vertical advection (4th-order centred/Akima or HSIMT). First-order upwind today over-diffuses the halocline.
 - [ ] Rotated/geopotential horizontal diffusion via BR1 (no 3D horizontal diffusion exists).
-- [ ] 3D wetting/drying masks (any dry node gives NaN today).
+- [x] 3D wetting/drying (any dry node gave NaN). Done 2026-09-30:
+  - Thin columns (D < `Hydrostatic3D::with_min_column_depth`, default 0.1 m, ROMS's Dcrit) carry no shear (u = ū, zero 3D momentum tendency, no vertical diffusion), get no stress through G, and exert no baroclinic pressure. The 3D momentum advection and the mean-flow part of G see them with zero velocity, so films at the 2D velocity cap (20 m/s) stay the 2D module's.
+  - Tracers are element means per level for the step in elements where the 2D pass broke the nodal identity (`WetDry` subcells, positivity limiter): constant and conservative. Nodes (or marked elements) with essentially no water keep their last concentration.
+  - Gates (beach from −4 to +2 m, 0.3 m slosh, wind, stratified, ≈ 4 periods): no NaN, 0 clips, T within its initial range; uniform T/S drift 5.3e-9 (round-off amplified by nearly dry elements); inventories 7.4e-12; a stratified lake with dry land at rest 2.0e-13 m/s. Before: NaN in the first step.
+  - [ ] The shoreline elements' element means flatten the tracer along σ within them while the pass is inconsistent there (a band one element wide at moving shorelines). A subcell (GLL-cell) finite-volume tracer update, matching the 2D module's subcells, would keep the nodal structure; it needs the 2D subcell mass fluxes in DU_avg2.
+  - [ ] Films: ū = hu/h in columns of a few mm reaches the 2D cap (20 m/s). Harmless to the 3D fields now, but it sets output statistics; consider reporting speeds only where D ≥ the minimum column depth (as `froya_real_data` does with its open-water column).
 - [ ] EOS: delegate the physics trait to the fixed UNESCO EOS (P0.17) with a linear fast path; TEOS-10 later.
 - [ ] `compute_dt`: internal-wave speed from stratification (not a hardcoded 2 m/s) and the vertical CFL. Relabel or convert Ω vs w in output.
 - [ ] Parallelise the 3D kernels; no `Vec` allocation in inner loops (~186M malloc/free per 3D RHS at 50k × 30).

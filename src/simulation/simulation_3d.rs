@@ -972,4 +972,198 @@ mod tests {
             "a fjord at rest spun up {max_speed:.3e} m/s in 1 h"
         );
     }
+
+    /// A 3D beach: the bed rises from −4 m to +2 m along 1 km, water sloshing
+    /// up it with `amplitude`, `WetDry` 2D module, T/S-dependent EOS,
+    /// stratified linearly in z. With `amplitude > 0` a 0.05 Pa wind and
+    /// vertical tracer diffusion; at rest neither (diffusion bends the
+    /// profile at the bed and surface differently in columns of different
+    /// depth, which drives a real boundary flow on a slope: Phillips 1970,
+    /// Wunsch 1970; 1.9e-4 m/s here within 1000 s).
+    fn beach_3d(amplitude: f64) -> (Physics, Solution3D, Arc<Bathymetry2D>) {
+        let length = 1000.0;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 100.0, 10, 1));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            -4.0 + 6.0 * x / length
+        }));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(true)
+        .build();
+        let sigma = SigmaGrid::new(4, UniformStretching);
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-3, if amplitude > 0.0 { 1e-4 } else { 0.0 }),
+            swe,
+            Forcing {
+                surface_stress: [if amplitude > 0.0 { 0.05 } else { 0.0 }, 0.0],
+                ..no_stress()
+            },
+            G,
+            RHO0,
+        );
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        let eos = LinearEOS::default();
+        for k in 0..mesh.n_elements {
+            for i in 0..nn {
+                let el = ElementIndex::new(k);
+                let [x, _] = mesh.reference_to_physical(el, ops.nodes_r[i], ops.nodes_s[i]);
+                let idx = k * nn + i;
+                let b = bathymetry.data[idx];
+                let eta = (amplitude * (std::f64::consts::PI * x / length).cos()).max(b);
+                state.eta.data[idx] = eta;
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    // Linear in z (isopycnals level at rest): 0.5 °C/m
+                    let z = eta + s * (eta - b);
+                    state.temp[idx * nl + l] = eos.t0 + 0.5 * (z + 2.0);
+                    state.salt[idx * nl + l] = eos.s0;
+                }
+            }
+        }
+        physics.update_density(&mut state);
+        (physics, state, bathymetry)
+    }
+
+    /// Runs `steps` mode-split steps of 10 s on `state`, asserting every
+    /// step stays finite, calling `check` after each.
+    fn run_beach(
+        physics: &Physics,
+        state: &mut Solution3D,
+        steps: usize,
+        mut check: impl FnMut(&Solution3D),
+    ) {
+        let mut integrator = ModeSplitIntegrator::new();
+        let dt = 10.0;
+        for n in 0..steps {
+            physics.update_density(state);
+            integrator.step(state, physics, dt, n as f64 * dt);
+            physics.post_process(state);
+            assert!(
+                max_or_nan(state.u.iter().chain(&state.temp).map(|x| x.abs())).is_finite(),
+                "step {n}: the run blew up"
+            );
+            check(state);
+        }
+    }
+
+    /// `∫ Σ_l H_z C dA` of a tracer on the beach (dry columns hold none).
+    fn beach_inventory(physics: &Physics, state: &Solution3D, tracer: &[f64]) -> f64 {
+        let nl = state.n_levels;
+        let mut column = DGSolution2D::new(state.n_elements, state.n_nodes);
+        for (idx, c) in column.data.iter_mut().enumerate() {
+            let depth = state.eta.data[idx] - physics.bathymetry.data[idx];
+            *c = (0..nl)
+                .map(|l| depth * physics.sigma.d_sigma()[l] * tracer[idx * nl + l])
+                .sum();
+        }
+        column.integrate(&physics.ops, &physics.geom)
+    }
+
+    /// TODO P4.5 gate: 3D wetting and drying. Water sloshes up and down a
+    /// beach (bed from −4 m to +2 m, 0.3 m amplitude, wind, stratified) for
+    /// ≈ 4 periods through the `WetDry` 2D module. Before, the first dry node
+    /// gave NaN in the first step (vertical diffusion over a zero-thickness
+    /// column); then, once that was masked, films at the 2D velocity cap
+    /// (20 m/s) blew up the 3D momentum advection within 44 steps. Now: no
+    /// clips, and the temperature stays inside its initial range.
+    #[test]
+    fn a_beach_wets_and_dries_in_3d() {
+        let (physics, mut state, _) = beach_3d(0.3);
+        let (t_min, t_max) = (
+            state.temp.iter().copied().fold(f64::MAX, f64::min),
+            state.temp.iter().copied().fold(f64::MIN, f64::max),
+        );
+        let mut thin_seen = 0;
+        run_beach(&physics, &mut state, 200, |s| {
+            for &t in &s.temp {
+                assert!(
+                    t >= t_min - 1e-9 && t <= t_max + 1e-9,
+                    "temperature {t} left [{t_min}, {t_max}]"
+                );
+            }
+            thin_seen += (0..s.eta.data.len())
+                .filter(|&idx| {
+                    let d = s.eta.data[idx] - physics.bathymetry.data[idx];
+                    d > 0.0 && d < physics.min_column_depth
+                })
+                .count();
+        });
+        assert!(thin_seen > 0, "test regime: no thin wet column");
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+    }
+
+    /// TODO P4.5 gate: on the beach, uniform T and S stay uniform (constancy
+    /// in the shoreline elements, whose tracers are element means per level)
+    /// and stratified tracers keep their inventories.
+    #[test]
+    fn beach_tracers_are_constant_and_conserved() {
+        let (physics, mut state, _) = beach_3d(0.3);
+        state.temp.fill(12.3);
+        state.salt.fill(33.1);
+        let mut drift = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| {
+            drift = max_or_nan(
+                s.temp
+                    .iter()
+                    .map(|t| (t - 12.3).abs())
+                    .chain(s.salt.iter().map(|x| (x - 33.1).abs()))
+                    .chain([drift]),
+            );
+        });
+        // Measured 5.3e-9 (4e-10 of the values): the 2D pass balances nearly
+        // dry elements to round-off of the domain's η change, which their
+        // tiny volumes amplify. Wet elements hold to ≈ 1e-13 (the P4.2 gate).
+        assert!(drift < 5e-8, "uniform tracers drifted by {drift:.3e}");
+
+        let (physics, mut state, _) = beach_3d(0.3);
+        let (t0, s0) = (
+            beach_inventory(&physics, &state, &state.temp),
+            beach_inventory(&physics, &state, &state.salt),
+        );
+        let mut max_err = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| {
+            max_err = max_or_nan([
+                max_err,
+                (beach_inventory(&physics, s, &s.temp) - t0).abs() / t0,
+                (beach_inventory(&physics, s, &s.salt) - s0).abs() / s0,
+            ]);
+        });
+        // Measured 7.4e-12: elements too dry to define a concentration keep
+        // their last one (3e-15 without wetting and drying, the P4.2 gate)
+        assert!(max_err < 5e-11, "inventories drifted by {max_err:.3e}");
+    }
+
+    /// TODO P4.5 gate: a stratified lake at rest with dry land stays at
+    /// rest: the thin columns at the shoreline exert no baroclinic pressure.
+    #[test]
+    fn stratified_lake_with_dry_land_stays_at_rest() {
+        let (physics, mut state, _) = beach_3d(0.0);
+        let mut max_speed = 0.0_f64;
+        run_beach(&physics, &mut state, 100, |s| {
+            max_speed = max_or_nan(
+                s.u.iter()
+                    .zip(&s.v)
+                    .map(|(u, v)| u.hypot(*v))
+                    .chain([max_speed]),
+            );
+        });
+        // Measured 2.0e-13 m/s
+        assert!(max_speed < 1e-10, "the lake spun up {max_speed:.3e} m/s");
+    }
 }

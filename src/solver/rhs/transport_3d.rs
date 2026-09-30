@@ -35,7 +35,11 @@
 //! keeps the nodal identity; where it only keeps element balances (`WetDry`
 //! elements with a dry node, positivity-limited elements, see
 //! `BarotropicTransport`), the surface residual is spread linearly over the
-//! column, as before, and constancy holds only approximately there.
+//! column. It integrates to zero over the element (the element balance), so
+//! every layer's continuity still holds for the element as a whole, and the
+//! mode splitter carries the tracers of those elements as element means per
+//! level ([`inventory_to_concentration`]): constant and conservative there
+//! too. This is what makes 3D wetting and drying work.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
 //! inventory form: upwind in `C` on the face fluxes and on `Ω`.
@@ -279,34 +283,85 @@ pub(crate) fn layer_thickness_of(depth: f64, d_sigma: f64) -> f64 {
     (depth * d_sigma).max(crate::solver::rhs::advection_3d::MIN_LAYER_THICKNESS)
 }
 
-/// Multiply (`to_inventory`) or divide the tracers of `state` by the layer
-/// thickness `H_z` of its own `η`: concentration `C` ↔ inventory `H_z C`.
-pub fn scale_tracers_by_layer_thickness(
-    state: &mut Solution3D,
+/// Depth (m) below which a node's (or, as a mean, an element's) tracers are
+/// left as they were: it holds no water to define a concentration.
+const DRY_DEPTH: f64 = 1e-6;
+
+/// Multiply a tracer by the layer thickness of `η`: concentration `C` →
+/// inventory `H_z C`.
+pub fn tracer_to_inventory(
+    tracer: &mut [f64],
+    eta: &[f64],
     sigma: &SigmaGrid,
     bathymetry: &Bathymetry2D,
-    to_inventory: bool,
 ) {
-    let (nn, nl) = (state.n_nodes, state.n_levels);
+    let nl = sigma.n_levels();
     let d_sigma = sigma.d_sigma();
-    for k in 0..state.n_elements {
+    for ((column, &e), &b) in tracer.chunks_exact_mut(nl).zip(eta).zip(&bathymetry.data) {
+        for (c, &ds) in column.iter_mut().zip(d_sigma) {
+            *c *= layer_thickness_of(e - b, ds);
+        }
+    }
+}
+
+/// Inventory `q = H_z C` → concentration, written to `out`.
+///
+/// - Elements not marked in `element_means`: `C = q / H_z` at every node.
+/// - Marked elements: per level, the element's inventory over its volume,
+///   `Σ w_i J_i q_il / Σ w_i J_i H_z,il`, at every node. The mode splitter
+///   marks the elements where the barotropic pass kept only the element
+///   balance, not the nodal identity `η̄ − ηⁿ = −Δt∇·DU_avg2` (`WetDry`
+///   subcell and positivity-limited elements, see `BarotropicTransport`):
+///   there the nodal quotient is not constant for a constant tracer, but the
+///   element means are (and are conservative, see the module docs).
+/// - A node with (almost) no water, shallower than `DRY_DEPTH`, and a level
+///   of a marked element with a mean depth below it, keep the value `out`
+///   already holds (the last concentration) instead of dividing by a
+///   vanishing layer.
+///
+/// Converting back with [`tracer_to_inventory`] keeps each element's
+/// inventory per level exactly.
+#[allow(clippy::too_many_arguments)]
+pub fn inventory_to_concentration(
+    q: &[f64],
+    eta: &[f64],
+    sigma: &SigmaGrid,
+    bathymetry: &Bathymetry2D,
+    geom: &GeometricFactors2D,
+    element_means: &[bool],
+    out: &mut [f64],
+) {
+    let nl = sigma.n_levels();
+    let nn = bathymetry.n_nodes;
+    let d_sigma = sigma.d_sigma();
+    for k in 0..bathymetry.n_elements {
         let bed = bathymetry.element(ElementIndex::new(k));
-        for (i, &b) in bed.iter().enumerate() {
-            let idx = k * nn + i;
-            let depth = state.eta.data[idx] - b;
-            let column = idx * nl..(idx + 1) * nl;
-            for ((t, s), &ds) in state.temp[column.clone()]
-                .iter_mut()
-                .zip(&mut state.salt[column])
-                .zip(d_sigma)
-            {
-                let hz = layer_thickness_of(depth, ds);
-                if to_inventory {
-                    *t *= hz;
-                    *s *= hz;
-                } else {
-                    *t /= hz;
-                    *s /= hz;
+        let eta_k = &eta[k * nn..(k + 1) * nn];
+        let block = k * nn * nl..(k + 1) * nn * nl;
+        let (q_k, out_k) = (&q[block.clone()], &mut out[block]);
+        if !element_means[k] {
+            for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
+                if e - b < DRY_DEPTH {
+                    continue;
+                }
+                for (l, &ds) in d_sigma.iter().enumerate() {
+                    out_k[i * nl + l] = q_k[i * nl + l] / layer_thickness_of(e - b, ds);
+                }
+            }
+            continue;
+        }
+        let area: f64 = (0..nn).map(|i| geom.node_mass(k, i)).sum();
+        for (l, &ds) in d_sigma.iter().enumerate() {
+            let (mut inventory, mut volume) = (0.0, 0.0);
+            for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
+                let mass = geom.node_mass(k, i);
+                inventory += mass * q_k[i * nl + l];
+                volume += mass * layer_thickness_of(e - b, ds);
+            }
+            if volume > area * ds * DRY_DEPTH {
+                let mean = inventory / volume;
+                for i in 0..nn {
+                    out_k[i * nl + l] = mean;
                 }
             }
         }
@@ -749,6 +804,72 @@ mod tests {
                     assert!((got - want).abs() < 1e-14, "Ω = {w}: {column:?}");
                 }
             }
+        }
+    }
+
+    /// Inventory ↔ concentration: nodal in unmarked elements; in marked
+    /// elements the element's inventory over its volume per level, which
+    /// converts back to the same element inventory; a dry node, or a dry
+    /// marked element, keeps its last concentration.
+    #[test]
+    fn inventory_conversion_keeps_element_inventories() {
+        let case = Case::closed();
+        let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+        let n_el = case.mesh.n_elements;
+        // Element 0 dry at one node, element 1 dry everywhere, element 2 marked
+        let mut eta = case.state.eta.data.clone();
+        eta[0] = case.bathymetry.data[0];
+        eta[nn..2 * nn].copy_from_slice(&case.bathymetry.data[nn..2 * nn]);
+        let mut marked = vec![false; n_el];
+        marked[1] = true;
+        marked[2] = true;
+        let concentration = case.state.temp.clone();
+        let mut inventory = concentration.clone();
+        tracer_to_inventory(&mut inventory, &eta, &case.sigma, &case.bathymetry);
+        let last = vec![-1.0; concentration.len()];
+        let mut out = last.clone();
+        inventory_to_concentration(
+            &inventory,
+            &eta,
+            &case.sigma,
+            &case.bathymetry,
+            &case.geom,
+            &marked,
+            &mut out,
+        );
+        for k in 0..n_el {
+            for i in 0..nn {
+                let idx = k * nn + i;
+                let dry = eta[idx] - case.bathymetry.data[idx] < DRY_DEPTH;
+                for l in 0..nl {
+                    let (c, got) = (concentration[idx * nl + l], out[idx * nl + l]);
+                    match (k, dry) {
+                        // Dry: the last value; the other nodes nodal
+                        (0, true) | (1, _) => assert_eq!(got, -1.0, "element {k} node {i}"),
+                        (2, _) => {}
+                        _ => assert!((got - c).abs() < 1e-12 * c.abs(), "{got} vs {c}"),
+                    }
+                }
+            }
+        }
+        // Element 2: one value per level, and its inventory per level kept
+        let mut back = out.clone();
+        tracer_to_inventory(&mut back, &eta, &case.sigma, &case.bathymetry);
+        for l in 0..nl {
+            let level = |field: &[f64]| -> f64 {
+                (0..nn)
+                    .map(|i| case.geom.node_mass(2, i) * field[(2 * nn + i) * nl + l])
+                    .sum()
+            };
+            let value = out[(2 * nn) * nl + l];
+            for i in 0..nn {
+                assert_eq!(out[(2 * nn + i) * nl + l], value);
+            }
+            let (before, after) = (level(&inventory), level(&back));
+            assert!(
+                (before - after).abs() < 1e-13 * before.abs(),
+                "level {l}: {before} vs {after}"
+            );
         }
     }
 }

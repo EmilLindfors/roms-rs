@@ -68,7 +68,7 @@ pub use advection_3d::{
 pub mod transport_3d;
 pub use transport_3d::{
     BarotropicFlux, LayerTransport, TracerTransportScratch, apply_tracer_transport_3d,
-    scale_tracers_by_layer_thickness, transport_divergence_element,
+    inventory_to_concentration, tracer_to_inventory, transport_divergence_element,
 };
 
 pub mod rhs_3d;
