@@ -1746,11 +1746,20 @@ fn element_dt(
 /// parallelogram (the interior nodes hold (1 − 2ŵ₀)² of it), so a well-filled
 /// element can step 1.8× (P2) to 3.3× (P3) past the bound. The relaxed CFL is
 /// capped at [`LINEAR_CFL_SAFETY`] times the linear stability limit of the
-/// element's volume term: [`linear_cfl_swe_2d`], 1.5–2.5× the bound, where
-/// every node is deeper than `h_dry`, and [`linear_cfl_subcells_swe_2d`],
-/// 1.0–1.7× the bound, on the `WetDry` subcells of elements with a node at or
-/// below it. The positivity bound had kept every wet/dry run inside both,
-/// whatever CFL was asked for.
+/// element's volume term: [`linear_cfl_swe_2d`], 1.5–2.5× the bound, for
+/// the flux-differencing term of fully wet elements, and
+/// [`linear_cfl_subcells_swe_2d`], 1.0–1.7× the bound, for the `WetDry`
+/// subcells of elements with a node shallower than `h_dry`. The positivity
+/// bound had kept every wet/dry run inside both, whatever CFL was asked for.
+///
+/// An element switches to the subcells within a step once a stage takes a
+/// node below `h_dry`, and then runs them at the step chosen at its start.
+/// So every element with a node at or below [`SUBCELL_CAP_DEPTH_FACTOR`]
+/// times `h_dry` (10 cm for the 1 mm default) takes the subcell cap: far more
+/// than a node falls in one step as the tide drains a shore (a fraction of a
+/// mm), and free, since such elements hardly ever set the step (on the
+/// Mausund coastline mesh the global step is unchanged, and the ideal local
+/// time stepping work rises by 0.1 %).
 ///
 /// The stages of an SSP step start from later states than the one ρ is
 /// computed from, so ρ keeps a margin: [`POSITIVITY_RELAXATION_SAFETY`] times
@@ -1771,13 +1780,19 @@ pub struct PositivityBound {
     /// [`LINEAR_CFL_SAFETY`] times the linear stability limit (at least
     /// `cfl`; `cfl` itself, no relaxation, where the limit is not known).
     pub max_cfl: f64,
-    /// Largest relaxed CFL of an element with a node at or below `h_dry`,
-    /// from the subcells' limit in the same way.
+    /// Largest relaxed CFL of an element with a node at or below
+    /// [`SUBCELL_CAP_DEPTH_FACTOR`] times `h_dry`, from the subcells' limit in
+    /// the same way.
     pub max_cfl_subcells: f64,
-    /// Elements with a node at or below this depth are capped at
-    /// `max_cfl_subcells` (the `WetDry` subcell threshold).
+    /// The `WetDry` subcell threshold: elements with a node shallower than
+    /// this run the subcells.
     pub h_dry: f64,
 }
+
+/// Elements with a node at or below this multiple of the dry threshold take
+/// [`PositivityBound`]'s subcell cap: they may switch to the subcells during
+/// the step.
+pub const SUBCELL_CAP_DEPTH_FACTOR: f64 = 100.0;
 
 /// Margin of [`PositivityBound`]'s relaxation against the change of the
 /// water distribution between the stage values of one step.
@@ -1790,7 +1805,7 @@ pub const LINEAR_CFL_SAFETY: f64 = 0.9;
 impl PositivityBound {
     /// The bound at order `order` for the SSP scheme `scheme` (`None`: an
     /// SSP coefficient of 1 and no relaxation), with the subcell cap where a
-    /// node is at or below `h_dry`.
+    /// node is at or below [`SUBCELL_CAP_DEPTH_FACTOR`] times `h_dry`.
     pub fn new(order: usize, scheme: Option<SspScheme>, h_dry: f64) -> Self {
         let ssp_coefficient = scheme.map_or(1.0, SspScheme::ssp_coefficient);
         let cfl = ssp_coefficient * positivity_cfl_swe_2d(order);
@@ -1808,11 +1823,13 @@ impl PositivityBound {
 
     /// The CFL of element `k` with nodal depths `h` (`n1` GLL nodes per
     /// direction): `cfl` times the relaxation factor ρ ≥ 1, at most
-    /// `max_cfl`, or `max_cfl_subcells` if a node is at or below `h_dry`.
+    /// `max_cfl`, or `max_cfl_subcells` if a node is at or below
+    /// [`SUBCELL_CAP_DEPTH_FACTOR`] times `h_dry`.
     #[inline]
     pub fn element_cfl(&self, h: &[f64], geom: &GeometricFactors2D, n1: usize, k: usize) -> f64 {
         let mass = &geom.mass[geom.node_index(k, 0)..][..h.len()];
-        let (rho, subcells) = positivity_relaxation(h, mass, n1, self.h_dry);
+        let shallow = SUBCELL_CAP_DEPTH_FACTOR * self.h_dry;
+        let (rho, subcells) = positivity_relaxation(h, mass, n1, shallow);
         let cap = if subcells {
             self.max_cfl_subcells
         } else {
@@ -1824,15 +1841,15 @@ impl PositivityBound {
 
 /// The relaxation factor ρ of [`PositivityBound`] for nodal depths `h` with
 /// nodal masses `mass` (GLL weight × J), `n1` nodes per direction (node
-/// `i = j·n1 + a`), and whether a node is at or below `h_dry`.
+/// `i = j·n1 + a`), and whether a node is at or below `shallow`.
 #[inline]
-fn positivity_relaxation(h: &[f64], mass: &[f64], n1: usize, h_dry: f64) -> (f64, bool) {
+fn positivity_relaxation(h: &[f64], mass: &[f64], n1: usize, shallow: f64) -> (f64, bool) {
     let last = n1 - 1;
     let (mut water, mut water_boundary) = (0.0, 0.0);
     let (mut weight, mut weight_boundary) = (0.0, 0.0);
-    let mut dry = false;
+    let mut is_shallow = false;
     for (i, (&h, &m)) in h.iter().zip(mass).enumerate() {
-        dry |= h <= h_dry;
+        is_shallow |= h <= shallow;
         // Negative round-off depths count as empty
         let water_i = m * h.max(0.0);
         water += water_i;
@@ -1847,7 +1864,7 @@ fn positivity_relaxation(h: &[f64], mass: &[f64], n1: usize, h_dry: f64) -> (f64
     // and the weight ratio caps ρ (`f64::min` drops the NaN of an empty
     // element)
     let ratio = (water / water_boundary).min(weight / weight_boundary);
-    ((POSITIVITY_RELAXATION_SAFETY * ratio).max(1.0), dry)
+    ((POSITIVITY_RELAXATION_SAFETY * ratio).max(1.0), is_shallow)
 }
 
 #[cfg(test)]
@@ -3357,6 +3374,18 @@ mod tests {
                     (cfl - (bound.cfl * rho_shore).min(subcells)).abs() < 1e-14,
                     "N = {order}, {scheme:?}"
                 );
+                // Still wet but within SUBCELL_CAP_DEPTH_FACTOR · h_dry of
+                // drying (0.1 m here): the subcell cap; deeper: the DGSEM one
+                for (corner, cap) in [(0.05, subcells), (0.2, linear)] {
+                    let mut h = uniform.clone();
+                    h[0] = corner;
+                    let rho = positivity_relaxation(&h, mass, ops.n_1d, 0.0).0;
+                    let cfl = bound.element_cfl(&h, &geom, ops.n_1d, 0);
+                    assert!(
+                        (cfl - (bound.cfl * rho).min(cap)).abs() < 1e-14,
+                        "N = {order}, {scheme:?}, corner {corner}: {cfl}"
+                    );
+                }
             }
             let plain = PositivityBound::new(order, None, 1e-3);
             assert_eq!(plain.max_cfl, plain.cfl);

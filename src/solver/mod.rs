@@ -64,6 +64,7 @@ pub use rhs::{
     PeriodicBC2D,
     PositivityBound,
     Rhs3DConfig,
+    SUBCELL_CAP_DEPTH_FACTOR,
     // 2D SWE
     SWE2DRhsConfig,
     SWEFluxType,

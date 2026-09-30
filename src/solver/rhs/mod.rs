@@ -32,10 +32,11 @@ pub use advection_2d::{
 // 2D SWE
 pub use swe_2d::{
     ElementRhsThen, LINEAR_CFL_SAFETY, POSITIVITY_RELAXATION_SAFETY, PositivityBound,
-    SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d, compute_dt_viscosity, compute_rhs_swe_2d,
-    compute_rhs_swe_2d_face_mass_into, compute_rhs_swe_2d_into, compute_rhs_swe_2d_subset_then,
-    compute_rhs_swe_2d_where_into, element_dt_swe_2d, element_dt_viscous_swe_2d, face_mass_len,
-    linear_cfl_subcells_swe_2d, linear_cfl_swe_2d, min_element_dt_swe_2d, positivity_cfl_swe_2d,
+    SUBCELL_CAP_DEPTH_FACTOR, SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d,
+    compute_dt_viscosity, compute_rhs_swe_2d, compute_rhs_swe_2d_face_mass_into,
+    compute_rhs_swe_2d_into, compute_rhs_swe_2d_subset_then, compute_rhs_swe_2d_where_into,
+    element_dt_swe_2d, element_dt_viscous_swe_2d, face_mass_len, linear_cfl_subcells_swe_2d,
+    linear_cfl_swe_2d, min_element_dt_swe_2d, positivity_cfl_swe_2d,
 };
 #[cfg(feature = "parallel")]
 pub use swe_2d::{
