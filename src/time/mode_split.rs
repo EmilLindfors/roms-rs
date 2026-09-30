@@ -63,13 +63,13 @@ use crate::physics::PhysicsModule;
 use crate::solver::rhs::{
     BarotropicFlux, inventory_to_concentration, tracer_to_inventory, transport_divergence_element,
 };
-use std::cell::RefCell;
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::time::{Integrable, IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
+use std::cell::RefCell;
 
 /// Fewest barotropic substeps per baroclinic step. Below four the filter
 /// weights cannot be centred on `tⁿ⁺¹`.
@@ -241,7 +241,6 @@ pub trait ModeSplitPhysics {
     /// Runs on every 3D stage value (with the tracers as concentrations),
     /// including the last: limiters, density.
     fn post_stage(&self, state: &mut Solution3D);
-
 }
 
 /// Weights `w_j` such that `Σ w_j G(t_j)` is the average over `[tⁿ, tⁿ + Δt]`

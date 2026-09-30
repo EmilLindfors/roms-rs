@@ -427,7 +427,14 @@ mod tests {
         sigma.layer_thicknesses_into(0.0, depth, &mut dz);
         let transport = |col: &[f64]| -> f64 { col.iter().zip(&dz).map(|(u, h)| u * h).sum() };
         apply_vertical_diffusion(
-            &mut state, &sigma, &bathymetry, dt, &mixing, &forcing, rho0, 0.0,
+            &mut state,
+            &sigma,
+            &bathymetry,
+            dt,
+            &mixing,
+            &forcing,
+            rho0,
+            0.0,
         );
 
         let el = ElementIndex::new(0);

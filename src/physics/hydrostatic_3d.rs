@@ -170,7 +170,10 @@ where
     /// elements. The 2D module's own wetting and drying (`WetDry`) is
     /// unaffected.
     pub fn with_min_column_depth(mut self, depth: f64) -> Self {
-        assert!(depth > 0.0, "minimum column depth must be positive, got {depth}");
+        assert!(
+            depth > 0.0,
+            "minimum column depth must be positive, got {depth}"
+        );
         self.min_column_depth = depth;
         self
     }
@@ -528,7 +531,11 @@ where
                 let mean_v = self.sigma.depth_average(&rhs.v[columns]);
                 // Thin columns: no 3D stress (their depth mean is the 2D
                 // module's alone)
-                let wet = if depth < self.min_column_depth { 0.0 } else { 1.0 };
+                let wet = if depth < self.min_column_depth {
+                    0.0
+                } else {
+                    1.0
+                };
                 g.data[SWE_VAR_HU][idx] = depth * (mean_u - bar_rhs.u[idx]) + wet * stress_x;
                 g.data[SWE_VAR_HV][idx] = depth * (mean_v - bar_rhs.v[idx]) + wet * stress_y;
             }

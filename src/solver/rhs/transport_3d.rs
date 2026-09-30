@@ -866,7 +866,10 @@ mod tests {
                 assert_eq!(out[(2 * nn + i) * nl + l], value);
             }
             let (before, after) = (level(&inventory), level(&back));
-            assert!((before - after).abs() < 1e-13 * before.abs(), "level {l}: {before} vs {after}");
+            assert!(
+                (before - after).abs() < 1e-13 * before.abs(),
+                "level {l}: {before} vs {after}"
+            );
         }
     }
 }
