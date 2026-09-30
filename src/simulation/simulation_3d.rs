@@ -1554,11 +1554,12 @@ mod tests {
         );
     }
 
-    /// The M2 tide through faces tagged [`BoundaryTag::Open`], walls elsewhere.
+    /// A characteristic OBC on faces tagged [`BoundaryTag::Open`], walls
+    /// elsewhere.
     #[derive(Clone, Debug)]
-    struct TideOrWall(CharacteristicOBC<HarmonicTide>);
+    struct OpenOrWall<P>(CharacteristicOBC<P>);
 
-    impl SWEBoundaryCondition2D for TideOrWall {
+    impl<P: crate::boundary::ExternalStateProvider> SWEBoundaryCondition2D for OpenOrWall<P> {
         fn ghost_state(&self, ctx: &BCContext2D) -> SWEState2D {
             match ctx.boundary_tag {
                 Some(BoundaryTag::Open) => self.0.ghost_state(ctx),
@@ -1574,7 +1575,7 @@ mod tests {
         }
 
         fn name(&self) -> &'static str {
-            "tide_or_wall"
+            "open_or_wall"
         }
 
         fn is_wall(&self, tag: Option<BoundaryTag>) -> Option<bool> {
@@ -1610,7 +1611,7 @@ mod tests {
             -20.0 + 10.0 * x / length
         }));
         let swe = || {
-            let tide = TideOrWall(CharacteristicOBC::new(
+            let tide = OpenOrWall(CharacteristicOBC::new(
                 HarmonicTide::m2(amplitude, 0.0).with_ramp_up(3.0 * 3600.0),
             ));
             PhysicsBuilder::swe_2d(
@@ -1678,6 +1679,206 @@ mod tests {
         assert!(
             max_diff < 1e-4 * amplitude,
             "η differs from the 2D model by {max_diff:.3e} m"
+        );
+    }
+
+    /// A parent exchange flow for the 3D nesting: out at the surface, in at
+    /// the bed (`u = −0.2 (σ + ½)` m/s, no depth mean), temperature
+    /// `T₀ + ΔT (σ + ½)`.
+    struct ExchangeParent {
+        delta_t: f64,
+    }
+
+    impl crate::boundary::ParentColumns3D for ExchangeParent {
+        fn supplies(&self) -> crate::boundary::Supplied {
+            crate::boundary::Supplied {
+                velocity: true,
+                tracers: true,
+            }
+        }
+
+        fn column(
+            &self,
+            _ctx: &crate::boundary::ColumnContext3D,
+            sigma: &SigmaGrid,
+            out: crate::boundary::ParentColumn<'_>,
+        ) {
+            let eos = LinearEOS::default();
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                out.u[l] = -0.2 * (s + 0.5);
+                out.v[l] = 0.0;
+                out.temp[l] = eos.t0 + self.delta_t * (s + 0.5);
+                out.salt[l] = eos.s0;
+            }
+        }
+    }
+
+    type NestedPhysics =
+        Hydrostatic3D<LinearEOS, ConstantMixing, OpenOrWall<crate::boundary::StillWater>>;
+
+    /// An 8 km × 1 km channel, 10 m deep, open at its west end to still
+    /// water, with five levels, nested (or not) in an [`ExchangeParent`]
+    /// over a 2 km band with 1 h time scales, run for 12 h from rest at
+    /// `T₀`. Returns the physics, the state and the x of every node.
+    fn run_nested_channel(parent: Option<ExchangeParent>) -> (NestedPhysics, Solution3D, Vec<f64>) {
+        use crate::boundary::{Nesting3D, NestingBand3D, StillWater};
+        let mesh = Arc::new(Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            8e3,
+            0.0,
+            1e3,
+            8,
+            1,
+            [
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Open,
+            ],
+        ));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -10.0));
+        let n_levels = 5;
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            OpenOrWall(CharacteristicOBC::new(StillWater::default())),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let mut physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(SigmaGrid::new(n_levels, UniformStretching)),
+            bathymetry,
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-4, 1e-5),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        if let Some(parent) = parent {
+            let band = NestingBand3D {
+                width: 2e3,
+                velocity_timescale: Some(3600.0),
+                tracer_timescale: Some(3600.0),
+                ..NestingBand3D::default()
+            };
+            let nesting = Nesting3D::new(
+                Arc::new(parent),
+                &mesh,
+                &ops,
+                n_levels,
+                &[BoundaryTag::Open],
+                &band,
+            )
+            .expect("an open boundary to nest");
+            physics = physics.with_nesting(nesting);
+        }
+        let eos = LinearEOS::default();
+        let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
+        state.temp.fill(eos.t0);
+        state.salt.fill(eos.s0);
+        let x: Vec<f64> = (0..mesh.n_elements * ops.n_nodes)
+            .map(|flat| {
+                let (k, i) = (flat / ops.n_nodes, flat % ops.n_nodes);
+                mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])[0]
+            })
+            .collect();
+        let dt = 120.0;
+        let mut integrator = ModeSplitIntegrator::new();
+        for n in 0..360 {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+            assert!(
+                max_or_nan(state.u.iter().chain(&state.temp).copied()).is_finite(),
+                "step {n}: the run blew up"
+            );
+        }
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+        (physics, state, x)
+    }
+
+    /// TODO P4.2 gate: 3D nesting with the parent's own water keeps uniform
+    /// tracers uniform. The parent's exchange flow shears the boundary
+    /// fluxes and relaxes the band's shear; its tracer is the interior's, so
+    /// neither the inflow nor the relaxation may change it.
+    #[test]
+    fn nesting_in_the_same_water_keeps_tracers_uniform() {
+        let (_, state, _) = run_nested_channel(Some(ExchangeParent { delta_t: 0.0 }));
+        let eos = LinearEOS::default();
+        let drift = max_or_nan(state.temp.iter().map(|t| (t - eos.t0).abs()));
+        let shear = max_or_nan(
+            state
+                .u
+                .chunks_exact(state.n_levels)
+                .zip(&state.ubar.data)
+                .flat_map(|(column, ubar)| column.iter().map(move |u| (u - ubar).abs())),
+        );
+        // Measured 3.8e-12 °C under a 0.10 m/s exchange shear
+        assert!(
+            shear > 1e-2,
+            "test regime: no exchange flow ({shear:.2e} m/s)"
+        );
+        assert!(drift < 1e-10, "uniform temperature drifted by {drift:.3e}");
+    }
+
+    /// TODO P4.2 gate: the band takes on the parent's stratification and
+    /// shear. An exchange flow of warm surface water out and cold bottom
+    /// water in (ΔT = 4 °C) is nested at the west end of a channel at rest;
+    /// after 12 h (12 relaxation times) the boundary columns hold the
+    /// parent's profiles. Without nesting nothing happens.
+    #[test]
+    fn nesting_imposes_the_parent_profiles_at_the_boundary() {
+        let delta_t = 4.0;
+        let (physics, state, x) = run_nested_channel(Some(ExchangeParent { delta_t }));
+        let sigma = physics.sigma.clone();
+        let eos = LinearEOS::default();
+        let nl = state.n_levels;
+        let (mut t_err, mut u_err) = (0.0_f64, 0.0_f64);
+        for (flat, &x) in x.iter().enumerate() {
+            let column = flat * nl..(flat + 1) * nl;
+            let ubar = state.ubar.data[flat];
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                let t = state.temp[column.start + l];
+                if x == 0.0 {
+                    t_err = t_err.max((t - (eos.t0 + delta_t * (s + 0.5))).abs() / delta_t);
+                    let shear = state.u[column.start + l] - ubar;
+                    u_err = u_err.max((shear + 0.2 * (s + 0.5)).abs() / 0.08);
+                }
+            }
+        }
+        // Measured 2.3e-2 of ΔT and 5.2e-2 of the shear amplitude: the
+        // gravity current the stratification drives pulls against the
+        // relaxation
+        assert!(
+            t_err < 0.05,
+            "boundary temperature off the parent's by {t_err:.3} of ΔT"
+        );
+        assert!(
+            u_err < 0.1,
+            "boundary shear off the parent's by {u_err:.3} of its amplitude"
+        );
+
+        let (_, still, _) = run_nested_channel(None);
+        let moved = max_or_nan(
+            still
+                .temp
+                .iter()
+                .map(|t| (t - eos.t0).abs())
+                .chain(still.u.iter().map(|u| u.abs())),
+        );
+        // Measured 5.7e-12: round-off
+        assert!(
+            moved < 1e-10,
+            "without nesting the channel moved: {moved:.3e}"
         );
     }
 }

@@ -26,8 +26,12 @@
 //! (`SWEBoundaryCondition2D::is_wall`), which `Hydrostatic3D` does by
 //! default.
 //!
-//! Not yet: prescribed 3D velocity profiles at open faces (nesting of the
-//! baroclinic velocity, TODO P4.2).
+//! A nesting parent ([`crate::boundary::Nesting3D`]) replaces the interior's
+//! values outside the open faces of its tags by its own profiles
+//! ([`Exterior3D`]): the layer volume fluxes take the central average of the
+//! interior's and the parent's `H_z u` (then corrected to the 2D flux, as
+//! everywhere), and water flowing in brings the parent's velocity and
+//! tracers.
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::mesh::data::BoundaryTag;
@@ -113,6 +117,43 @@ impl Boundaries3D {
             },
         }
     }
+}
+
+/// Values of one field outside the open faces of some tags, per node and
+/// layer: a nesting parent's profiles (see [`crate::boundary::Nesting3D`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ExteriorField<'a> {
+    /// The open-boundary tags the values apply to.
+    pub tags: &'a [BoundaryTag],
+    /// Slot of every node (`[element][node]`), `u32::MAX` for none.
+    pub slot_of_node: &'a [u32],
+    /// Layers per slot.
+    pub n_levels: usize,
+    /// `[slot][level]`.
+    pub values: &'a [f64],
+}
+
+impl ExteriorField<'_> {
+    /// The value at `node` (`[element][node]`), layer `level`, outside a
+    /// face tagged `tag`, if there is one.
+    #[inline]
+    pub fn at(&self, tag: BoundaryTag, node: usize, level: usize) -> Option<f64> {
+        if !self.tags.contains(&tag) {
+            return None;
+        }
+        let slot = *self.slot_of_node.get(node)?;
+        (slot != u32::MAX).then(|| self.values[slot as usize * self.n_levels + level])
+    }
+}
+
+/// The exterior values of the 3D kernels at open faces: the interior's
+/// (extrapolation) unless a field is given.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Exterior3D<'a> {
+    /// `(u, v)` in mesh axes (m/s).
+    pub velocity: Option<[ExteriorField<'a>; 2]>,
+    pub temp: Option<ExteriorField<'a>>,
+    pub salt: Option<ExteriorField<'a>>,
 }
 
 #[cfg(test)]

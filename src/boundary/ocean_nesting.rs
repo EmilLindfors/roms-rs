@@ -76,6 +76,7 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use crate::boundary::band::boundary_distances;
 use crate::boundary::{
     BCContext2D, ExternalState, ExternalStateProvider, TidalAtlas, TidalAtlasError, tidal_ramp,
 };
@@ -258,41 +259,9 @@ impl OceanModelState {
             (x, y)
         };
 
-        // Open-boundary faces as polylines through their nodes
-        let mut boundary_nodes = Vec::new();
-        let mut segments = Vec::new();
-        for k in ElementIndex::iter(mesh.n_elements) {
-            for face in 0..4 {
-                if mesh.neighbor(k, face).is_some() || mesh.boundary_tag(k, face) != Some(tag) {
-                    continue;
-                }
-                let nodes: Vec<usize> = ops.face_nodes[face]
-                    .iter()
-                    .map(|&i| k.as_usize() * n_nodes + i)
-                    .collect();
-                for pair in nodes.windows(2) {
-                    segments.push((position(pair[0]), position(pair[1])));
-                }
-                boundary_nodes.extend(nodes);
-            }
-        }
-        if boundary_nodes.is_empty() {
-            return Err(NestingError::NoBoundary(tag));
-        }
-
         // Distance to the open boundary of every node within the band
-        let mut distance = vec![f64::INFINITY; mesh.n_elements * n_nodes];
-        for &flat in &boundary_nodes {
-            distance[flat] = 0.0;
-        }
-        if options.band_width > 0.0 {
-            let index = SegmentIndex::new(segments, options.band_width);
-            for (flat, d) in distance.iter_mut().enumerate() {
-                if *d > 0.0 {
-                    *d = index.distance(position(flat)).unwrap_or(f64::INFINITY);
-                }
-            }
-        }
+        let distance = boundary_distances(mesh, ops, &[tag], options.band_width)
+            .ok_or(NestingError::NoBoundary(tag))?;
 
         let wet = reader.wet_mask();
         let mut slot_of_node = vec![u32::MAX; distance.len()];
@@ -777,63 +746,6 @@ impl SourceTerm2D for NestingRelaxation2D {
     }
 }
 
-/// Line segments binned on a uniform grid of cells as large as the search
-/// radius, for distances up to that radius.
-struct SegmentIndex {
-    segments: Vec<((f64, f64), (f64, f64))>,
-    cells: std::collections::HashMap<(i64, i64), Vec<u32>>,
-    size: f64,
-}
-
-impl SegmentIndex {
-    fn new(segments: Vec<((f64, f64), (f64, f64))>, radius: f64) -> Self {
-        let mut cells: std::collections::HashMap<(i64, i64), Vec<u32>> =
-            std::collections::HashMap::new();
-        let cell = |v: f64| (v / radius).floor() as i64;
-        for (s, &(a, b)) in segments.iter().enumerate() {
-            for cx in cell(a.0.min(b.0))..=cell(a.0.max(b.0)) {
-                for cy in cell(a.1.min(b.1))..=cell(a.1.max(b.1)) {
-                    cells.entry((cx, cy)).or_default().push(s as u32);
-                }
-            }
-        }
-        Self {
-            segments,
-            cells,
-            size: radius,
-        }
-    }
-
-    /// Distance from `p` to the nearest segment, if one is within the radius.
-    fn distance(&self, p: (f64, f64)) -> Option<f64> {
-        let (cx, cy) = (
-            (p.0 / self.size).floor() as i64,
-            (p.1 / self.size).floor() as i64,
-        );
-        let mut best = f64::INFINITY;
-        for dx in -1..=1 {
-            for dy in -1..=1 {
-                for &s in self.cells.get(&(cx + dx, cy + dy)).into_iter().flatten() {
-                    let (a, b) = self.segments[s as usize];
-                    best = best.min(point_segment_distance(p, a, b));
-                }
-            }
-        }
-        (best <= self.size).then_some(best)
-    }
-}
-
-fn point_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx * dx + dy * dy;
-    let t = if len2 > 0.0 {
-        (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    (p.0 - a.0 - t * dx).hypot(p.1 - a.1 - t * dy)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1102,13 +1014,5 @@ mod tests {
             &NestingOptions::default(),
         );
         assert!(matches!(result, Err(NestingError::NotCovered { .. })));
-    }
-
-    #[test]
-    fn segment_distance() {
-        let index = SegmentIndex::new(vec![((0.0, 0.0), (10.0, 0.0))], 5.0);
-        assert_eq!(index.distance((5.0, 3.0)), Some(3.0));
-        assert_eq!(index.distance((13.0, 4.0)), Some(5.0));
-        assert_eq!(index.distance((5.0, 6.0)), None);
     }
 }

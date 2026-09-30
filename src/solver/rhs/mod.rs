@@ -60,7 +60,7 @@ pub mod coriolis_3d;
 pub use coriolis_3d::apply_coriolis_3d;
 
 pub mod boundary_3d;
-pub use boundary_3d::{Boundaries3D, FaceExterior};
+pub use boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
 
 pub mod advection_3d;
 pub use advection_3d::{
