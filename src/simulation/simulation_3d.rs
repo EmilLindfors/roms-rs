@@ -218,6 +218,14 @@ mod tests {
 
     type Physics = Hydrostatic3D<LinearEOS, ConstantMixing, Reflective2D>;
 
+    /// The largest value, or NaN if any is NaN (`f64::max` drops NaN, which
+    /// would let a blown-up run pass).
+    fn max_or_nan(values: impl IntoIterator<Item = f64>) -> f64 {
+        values
+            .into_iter()
+            .fold(0.0, |m, x| if x.is_nan() || x > m { x } else { m })
+    }
+
     fn no_stress() -> Forcing {
         Forcing {
             surface_stress: [0.0, 0.0],
@@ -821,6 +829,10 @@ mod tests {
                 physics.update_density(state);
                 integrator.step(state, physics, dt, n as f64 * dt);
                 physics.post_process(state);
+                assert!(
+                    max_or_nan(state.u.iter().chain(&state.temp).copied()).is_finite(),
+                    "step {n}: the run blew up"
+                );
                 check(state, physics);
             }
         }
@@ -886,6 +898,75 @@ mod tests {
         assert!(
             max_err < 1e-12,
             "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
+    }
+
+    /// TODO P4.3/P4.6 gate: a stratified fjord at rest stays at rest in the
+    /// whole mode-split model. The bed drops from 10 to 150 m within ≈ 400 m,
+    /// and the stratification is linear in z (temperature, T/S-dependent EOS,
+    /// no vertical tracer diffusion). The PGF is exact for it, so the only
+    /// currents are round-off.
+    #[test]
+    fn stratified_fjord_at_rest_stays_at_rest() {
+        let length = 1000.0;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 100.0, 8, 1));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            -(80.0 - 70.0 * ((x - 500.0) / 150.0).tanh())
+        }));
+        let sigma = SigmaGrid::new(10, UniformStretching);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::EntropyStable)
+        .build();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-3, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        let eos = LinearEOS::default();
+        for idx in 0..mesh.n_elements * nn {
+            let depth = -bathymetry.data[idx];
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                // 6 °C warmer at the surface than at 150 m: N² ≈ 7e-5 s⁻²
+                state.temp[idx * nl + l] = eos.t0 + 0.04 * (s * depth + 75.0);
+                state.salt[idx * nl + l] = eos.s0;
+            }
+        }
+        physics.update_density(&mut state);
+
+        let mut integrator = ModeSplitIntegrator::new();
+        let dt = 60.0;
+        for n in 0..60 {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+        }
+        let max_speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+        // Measured 2.8e-11 m/s after 1 h: round-off forcing (≈ 1e-14 m/s²)
+        // accumulating. The σ form started at 1.9e-4 m/s² and blew up (NaN)
+        // within 16 steps.
+        assert!(
+            max_speed < 1e-9,
+            "a fjord at rest spun up {max_speed:.3e} m/s in 1 h"
         );
     }
 }

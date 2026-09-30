@@ -60,6 +60,7 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
     // leaves only the density-driven baroclinic force.
     compute_pressure_gradient(
         state,
+        config.mesh,
         config.bathymetry,
         config.sigma,
         config.ops,
