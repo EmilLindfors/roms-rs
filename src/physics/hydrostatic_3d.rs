@@ -52,7 +52,7 @@ use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
 use crate::source::CoriolisSource2D;
-use crate::time::ModeSplitPhysics;
+use crate::time::{Integrable, ModeSplitPhysics};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -83,6 +83,9 @@ where
     /// Salinity of water flowing in through a physical boundary (see `temp_bc`).
     pub salt_bc: Arc<dyn TracerBoundaryCondition3D>,
     pub tracer_limiter: TracerLimiter3DConfig,
+    /// Columns shallower than this (m) are thin (3D wetting and drying; see
+    /// [`Self::with_min_column_depth`]).
+    pub min_column_depth: f64,
     /// Ω of the 3D velocities alone, for the `w` output of [`Self::post_process`].
     pub w_scratch: Mutex<Vec<f64>>,
     /// Layer transports (and their Ω) of the last 3D stage, and the tracer
@@ -91,6 +94,9 @@ where
     /// One-level states for the mean-flow part of the slow forcing:
     /// `(uniform ū columns, their advection + Coriolis tendency)`.
     mean_flow_scratch: Mutex<Option<(Solution3D, Solution3D)>>,
+    /// `state` with the velocity of thin columns zeroed, for the momentum
+    /// advection (allocated on the first step with a thin column).
+    masked_scratch: Mutex<Option<Solution3D>>,
 }
 
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
@@ -137,9 +143,53 @@ where
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
             salt_bc: Arc::new(ExtrapolationTracerBC3D),
             tracer_limiter: TracerLimiter3DConfig::none(),
+            min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             w_scratch: Mutex::new(vec![0.0; n_w]),
             transport_scratch,
             mean_flow_scratch: Mutex::new(None),
+            masked_scratch: Mutex::new(None),
+        }
+    }
+
+    /// Default of [`Self::with_min_column_depth`] (m), ROMS's usual `Dcrit`.
+    pub const DEFAULT_MIN_COLUMN_DEPTH: f64 = 0.1;
+
+    /// 3D wetting and drying: columns shallower than `depth` (m), down to dry
+    /// nodes, are thin (Warner et al. 2013, ROMS's `Dcrit` masks):
+    /// - they carry no vertical shear: their 3D velocity is the depth mean ū,
+    ///   their momentum tendency is zero, and they get no vertical diffusion;
+    /// - the surface and bottom stresses do not reach the depth mean through
+    ///   them (masked in G);
+    /// - they exert and feel no baroclinic pressure difference;
+    ///
+    /// (The tracers need no threshold: the mode splitter carries them as
+    /// element means per level wherever the 2D pass balanced an element only
+    /// as a whole, see [`crate::solver::rhs::inventory_to_concentration`].)
+    ///
+    /// Everything else stays 3D, including the wet nodes of shoreline
+    /// elements. The 2D module's own wetting and drying (`WetDry`) is
+    /// unaffected.
+    pub fn with_min_column_depth(mut self, depth: f64) -> Self {
+        assert!(depth > 0.0, "minimum column depth must be positive, got {depth}");
+        self.min_column_depth = depth;
+        self
+    }
+
+    /// Whether the column at node `idx` (`[element][node]`) is thin.
+    #[inline]
+    fn is_thin(&self, state: &Solution3D, idx: usize) -> bool {
+        state.eta.data[idx] - self.bathymetry.data[idx] < self.min_column_depth
+    }
+
+    /// Zero the momentum tendency of thin columns: they carry no shear, and
+    /// the splitter adds the depth-mean rate.
+    fn zero_thin_momentum(&self, state: &Solution3D, rhs: &mut Solution3D) {
+        let nl = state.n_levels;
+        for idx in 0..state.eta.data.len() {
+            if self.is_thin(state, idx) {
+                rhs.u[idx * nl..(idx + 1) * nl].fill(0.0);
+                rhs.v[idx * nl..(idx + 1) * nl].fill(0.0);
+            }
         }
     }
 
@@ -206,14 +256,40 @@ where
             salt_bc: &*self.salt_bc,
             g: self.g,
             rho0: self.rho0,
+            min_column_depth: self.min_column_depth,
         }
     }
 
     /// Overwrite `rhs.u` and `rhs.v` with the horizontal momentum tendency of
     /// `state` (baroclinic PGF, horizontal advection, Coriolis; see
     /// [`compute_momentum_rhs_3d`]). `state.rho` must be current.
+    ///
+    /// Thin columns enter with zero velocity (their momentum is the 2D
+    /// module's; a film at the 2D velocity cap would set the 3D advection's
+    /// dissipation speed), consistently with the mean-flow part of G.
     pub fn compute_momentum_rhs_into(&self, state: &Solution3D, rhs: &mut Solution3D) {
-        compute_momentum_rhs_3d(rhs, state, &self.rhs_config());
+        let nl = state.n_levels;
+        let n_columns = state.eta.data.len();
+        if (0..n_columns).any(|idx| self.is_thin(state, idx)) {
+            let mut guard = self
+                .masked_scratch
+                .lock()
+                .expect("Failed to lock masked_scratch");
+            let masked = guard.get_or_insert_with(|| {
+                Solution3D::new(state.n_elements, state.n_nodes, state.n_levels)
+            });
+            masked.copy_from(state);
+            for idx in 0..n_columns {
+                if self.is_thin(state, idx) {
+                    masked.u[idx * nl..(idx + 1) * nl].fill(0.0);
+                    masked.v[idx * nl..(idx + 1) * nl].fill(0.0);
+                }
+            }
+            compute_momentum_rhs_3d(rhs, masked, &self.rhs_config());
+        } else {
+            compute_momentum_rhs_3d(rhs, state, &self.rhs_config());
+        }
+        self.zero_thin_momentum(state, rhs);
     }
 
     /// The layer transports of `state` corrected to `barotropic`, then the
@@ -241,6 +317,7 @@ where
             &self.bathymetry,
         );
         compute_transport_rhs_3d(rhs, state, transport, &self.rhs_config(), scratch);
+        self.zero_thin_momentum(state, rhs);
     }
 
     /// Largest surface residual of `Ω` in the last 3D stage before it was
@@ -303,6 +380,10 @@ where
             let mut max_vel = 0.0;
             let el = crate::types::ElementIndex::new(k);
             for i in 0..state.n_nodes {
+                // Thin films are the 2D module's (and its own CFL's) business
+                if self.is_thin(state, k * state.n_nodes + i) {
+                    continue;
+                }
                 for l in 0..state.n_levels {
                     let u = state.u_column(el, i)[l];
                     let v = state.v_column(el, i)[l];
@@ -419,6 +500,13 @@ where
             scratch.get_or_insert_with(|| (Solution3D::new(ne, nn, 1), Solution3D::new(ne, nn, 1)));
         bar.u.copy_from_slice(&state.ubar.data);
         bar.v.copy_from_slice(&state.vbar.data);
+        // Thin columns masked as in `compute_momentum_rhs_into`
+        for idx in 0..state.eta.data.len() {
+            if self.is_thin(state, idx) {
+                bar.u[idx] = 0.0;
+                bar.v[idx] = 0.0;
+            }
+        }
         bar_rhs.u.fill(0.0);
         bar_rhs.v.fill(0.0);
         apply_horizontal_advection_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.geom);
@@ -438,8 +526,11 @@ where
                 let depth = state.eta.data[idx] - b;
                 let mean_u = self.sigma.depth_average(&rhs.u[columns.clone()]);
                 let mean_v = self.sigma.depth_average(&rhs.v[columns]);
-                g.data[SWE_VAR_HU][idx] = depth * (mean_u - bar_rhs.u[idx]) + stress_x;
-                g.data[SWE_VAR_HV][idx] = depth * (mean_v - bar_rhs.v[idx]) + stress_y;
+                // Thin columns: no 3D stress (their depth mean is the 2D
+                // module's alone)
+                let wet = if depth < self.min_column_depth { 0.0 } else { 1.0 };
+                g.data[SWE_VAR_HU][idx] = depth * (mean_u - bar_rhs.u[idx]) + wet * stress_x;
+                g.data[SWE_VAR_HV][idx] = depth * (mean_v - bar_rhs.v[idx]) + wet * stress_y;
             }
         }
     }
@@ -453,7 +544,16 @@ where
             &self.mixing,
             &self.forcing,
             self.rho0,
+            self.min_column_depth,
         );
+        // Thin columns carry the depth mean only
+        let nl = state.n_levels;
+        for idx in 0..state.eta.data.len() {
+            if self.is_thin(state, idx) {
+                state.u[idx * nl..(idx + 1) * nl].fill(state.ubar.data[idx]);
+                state.v[idx * nl..(idx + 1) * nl].fill(state.vbar.data[idx]);
+            }
+        }
     }
 
     /// Tracer limiters, then the density of the limited tracers.

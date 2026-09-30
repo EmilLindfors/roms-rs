@@ -79,6 +79,8 @@ struct ColumnView<'a> {
     pressure: &'a [f64],
     /// Bed elevation.
     bed: f64,
+    /// At least the minimum column depth deep.
+    wet: bool,
 }
 
 impl ColumnView<'_> {
@@ -121,9 +123,13 @@ fn hermite_integral(t: f64, column: &ColumnView, m: usize, h: f64) -> f64 {
 }
 
 /// `½[(p_b(z_a) − p_a(z_a)) + (p_b(z_b) − p_a(z_b))]` (per `g`), using only
-/// the depths both columns reach.
+/// the depths both columns reach; zero if either column is thin (a dry bank
+/// exerts no pressure on the water beside it).
 #[inline]
 fn pressure_difference(a: &ColumnView, za: f64, b: &ColumnView, zb: f64) -> f64 {
+    if !(a.wet && b.wet) {
+        return 0.0;
+    }
     let (pb_at_a, b_reaches_a) = b.pressure_at(za);
     let (pa_at_b, a_reaches_b) = a.pressure_at(zb);
     let (pa, pb) = (a.pressure_at(za).0, b.pressure_at(zb).0);
@@ -147,12 +153,16 @@ struct Columns {
     slope: Vec<f64>,
     pressure: Vec<f64>,
     bed: Vec<f64>,
+    wet: Vec<bool>,
+    min_column_depth: f64,
 }
 
 impl Columns {
-    fn new(n_columns: usize, n_levels: usize) -> Self {
+    fn new(n_columns: usize, n_levels: usize, min_column_depth: f64) -> Self {
         let n = n_columns * n_levels;
         Self {
+            min_column_depth,
+            wet: vec![true; n_columns],
             n_levels,
             z: vec![0.0; n],
             rho: vec![0.0; n],
@@ -170,6 +180,7 @@ impl Columns {
             slope: &self.slope[range.clone()],
             pressure: &self.pressure[range],
             bed: self.bed[c],
+            wet: self.wet[c],
         }
     }
 
@@ -192,6 +203,7 @@ impl Columns {
         let bed = bathymetry.get(el, node);
         let depth = eta - bed;
         self.bed[c] = bed;
+        self.wet[c] = depth >= self.min_column_depth;
         let z = &mut self.z[range.clone()];
         let rho = &mut self.rho[range.clone()];
         let slope = &mut self.slope[range.clone()];
@@ -265,6 +277,8 @@ impl Columns {
 /// * `g` - Gravitational acceleration (m/s²)
 /// * `rho_0` - Reference density ρ₀ used in the `-1/ρ₀` normalization (kg/m³)
 /// * `rho_ref` - Density subtracted from ρ before integrating (0 = full PGF, ρ₀ = baroclinic-only)
+/// * `min_column_depth` - Columns shallower than this (m) exert and feel no
+///   pressure difference (3D wetting and drying)
 /// * `grad_px` - Output x-component of PGF (m/s²)
 /// * `grad_py` - Output y-component of PGF (m/s²)
 #[allow(clippy::too_many_arguments)]
@@ -278,6 +292,7 @@ pub fn compute_pressure_gradient(
     g: f64,
     rho_0: f64,
     rho_ref: f64,
+    min_column_depth: f64,
     grad_px: &mut [f64],
     grad_py: &mut [f64],
 ) {
@@ -285,8 +300,8 @@ pub fn compute_pressure_gradient(
     let nl = sigma.n_levels();
     let scale = -g / rho_0;
 
-    let mut own = Columns::new(nn, nl);
-    let mut across = Columns::new(nfn, nl);
+    let mut own = Columns::new(nn, nl, min_column_depth);
+    let mut across = Columns::new(nfn, nl, min_column_depth);
     // ∂p/∂x, ∂p/∂y per g, [node][level]
     let mut px = vec![0.0; nn * nl];
     let mut py = vec![0.0; nn * nl];
@@ -434,6 +449,7 @@ mod tests {
                 G,
                 RHO0,
                 rho_ref,
+                0.0,
                 &mut fx,
                 &mut fy,
             );

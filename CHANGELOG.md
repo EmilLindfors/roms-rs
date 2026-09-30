@@ -6,6 +6,21 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **3D wetting and drying (TODO P4.5).** Any dry node gave NaN in the first 3D step: vertical diffusion divided by a zero-thickness column.
+  - Thin columns, shallower than `Hydrostatic3D::with_min_column_depth` (default 0.1 m, ROMS's Dcrit; Warner et al. 2013):
+    - carry no shear: their velocity is ū, their 3D momentum tendency is zero, and they get no vertical diffusion;
+    - get no surface or bottom stress through G;
+    - exert no baroclinic pressure difference.
+  - The 3D momentum advection and the mean-flow part of G see thin columns with zero velocity, the same way in both, so G stays exact for unsheared flow. Films at the 2D velocity cap (20 m/s) had blown up the explicit 3D advection within 44 steps; now they stay the 2D module's business. The 3D time step ignores them.
+  - Tracers: where the 2D pass broke its nodal identity for a step (`WetDry` subcells, positivity limiter), the element still balances every layer as a whole. `ModeSplitIntegrator` therefore carries those elements' tracers as element means per level (`inventory_to_concentration`), which stays constant and conservative. Nodes with essentially no water keep their last concentration. A fluid at rest marks no element (the residual test has a round-off floor), so its stratification is untouched.
+  - API: `apply_vertical_diffusion` takes the minimum column depth; `compute_pressure_gradient` and `Rhs3DConfig` take it too; `scale_tracers_by_layer_thickness` → `tracer_to_inventory` + `inventory_to_concentration`; new `GeometricFactors2D::node_mass`.
+  - Gates (beach from −4 to +2 m, 0.3 m slosh, wind, stratified, ≈ 4 periods, `WetDry`):
+    - `a_beach_wets_and_dries_in_3d`: no NaN, 0 clips, T within its initial range.
+    - `beach_tracers_are_constant_and_conserved`: uniform T/S drift 5.3e-9 (round-off of nearly dry elements); inventories 7.4e-12.
+    - `stratified_lake_with_dry_land_stays_at_rest`: 2.0e-13 m/s.
+    - Unit test of the conversion: element inventories kept per level, dry fallback.
+  - Found on the way: with vertical tracer diffusion, the "lake at rest" on a slope is not at rest. Diffusion bends the profile at the bed differently in columns of different depth, a real boundary flow (Phillips 1970, Wunsch 1970), 1.9e-4 m/s here. The at-rest gates run without tracer diffusion.
+
 - **Balanced baroclinic pressure gradient (TODO P4.3; `REVIEW.md` §3.3).** The σ-coordinate PGF computed `∇p|_σ + gρ∇z|_σ` from an element-local derivative of a pressure integrated with a first-order half layer, and never lifted pressure jumps at element faces. Over steep bathymetry the two cancelling terms left a spurious force as large as real estuarine forcing, and a stratified fjord at rest blew up.
   - `compute_pressure_gradient` now computes `∇p|_z` directly. Each term of the DG derivative is a pressure difference between two nodes' columns at a common depth, `Δp_ij = ½[(p_j(z_i) − p_i(z_i)) + (p_j(z_j) − p_i(z_j))]`, summed as `Σ_j Dx_ij Δp_ij` (Stelling & van Kester 1994, in a flux-differencing form).
   - Each column's `ρ − rho_ref` is a monotone Hermite cubic in z (harmonic-mean slopes, Shchepetkin & McWilliams 2003), integrated exactly from the surface.
