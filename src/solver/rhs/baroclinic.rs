@@ -471,7 +471,7 @@ mod tests {
         // N² = 1e-4 s⁻²: ∂ρ/∂z = −ρ₀N²/g
         let n2 = 1e-4;
         let linear = |_: f64, z: f64| RHO0 - RHO0 * n2 / G * z;
-                for order in 1..=4 {
+        for order in 1..=4 {
             for sigma in [
                 SigmaGrid::new(30, UniformStretching),
                 SigmaGrid::new(20, SongHaidvogelStretching::new(5.0, 0.4, 10.0)),
@@ -596,7 +596,10 @@ mod tests {
             .map(|v| (v - expected).abs())
             .fold(0.0, f64::max);
         let y_err = full_y.iter().map(|v| v.abs()).fold(0.0, f64::max);
-        assert!(x_err < 1e-9, "full PGF x error {x_err:.3e} (−g∇η = {expected:.3e})");
+        assert!(
+            x_err < 1e-9,
+            "full PGF x error {x_err:.3e} (−g∇η = {expected:.3e})"
+        );
         assert!(y_err < 1e-9, "full PGF y {y_err:.3e}");
         let baroclinic = case.max_force(RHO0);
         assert!(baroclinic < 1e-12, "baroclinic-only PGF {baroclinic:.3e}");
@@ -633,7 +636,10 @@ mod tests {
         };
         let (left, right) = (force(0), force(1));
         // Heavier water on the right pushes towards the left, on both sides
-        assert!(left < 0.0 && right < 0.0, "left {left:.3e}, right {right:.3e}");
+        assert!(
+            left < 0.0 && right < 0.0,
+            "left {left:.3e}, right {right:.3e}"
+        );
         assert!(
             (left - right).abs() < 1e-12 * left.abs(),
             "the face force is shared: left {left:.6e}, right {right:.6e}"
