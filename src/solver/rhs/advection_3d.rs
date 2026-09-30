@@ -455,7 +455,6 @@ mod tests {
         );
     }
 
-
     /// Regression: Ω from `compute_vertical_velocity` is a volume flux per unit
     /// area (m/s), so vertical momentum advection is −(1/Hz)·δ(Ω u) with
     /// Hz = D·Δσ. It used to divide by Δσ alone — D (here 200×) too large.

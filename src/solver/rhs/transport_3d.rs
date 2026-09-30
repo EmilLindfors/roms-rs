@@ -212,9 +212,8 @@ impl LayerTransport {
                 for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
                     let (nx, ny) = geom.normal(k, f, fi);
                     let interior = (k * nn + node) * nl;
-                    let exterior = neighbor.map(|nb| {
-                        (nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl
-                    });
+                    let exterior = neighbor
+                        .map(|nb| (nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl);
                     let slot = (k * 4 + f) * nfn + fi;
                     let fluxes = &mut self.face[slot * nl..(slot + 1) * nl];
                     let mut sum = 0.0;
@@ -671,7 +670,11 @@ mod tests {
     fn layer_transports_add_up_to_the_barotropic_transport() {
         let case = Case::closed();
         let transport = case.transport();
-        let (nn, nfn, nl) = (case.ops.n_nodes, case.ops.n_face_nodes, case.sigma.n_levels());
+        let (nn, nfn, nl) = (
+            case.ops.n_nodes,
+            case.ops.n_face_nodes,
+            case.sigma.n_levels(),
+        );
         let scale = max_abs(case.du_hu.iter().chain(&case.du_hv).copied());
         for idx in 0..case.mesh.n_elements * nn {
             let column = idx * nl..(idx + 1) * nl;

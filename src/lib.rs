@@ -131,11 +131,11 @@ pub use solver::{
     compute_dt_viscosity,
     // 3D RHS
     compute_momentum_rhs_3d,
-    compute_transport_rhs_3d,
     compute_rhs_advection_2d,
     compute_rhs_swe_2d,
     compute_rhs_swe_2d_into,
     compute_rhs_tracer_2d,
+    compute_transport_rhs_3d,
     current_cfl_2d,
     positivity_cfl_swe_2d,
     swe_kuzmin_limiter_2d,
