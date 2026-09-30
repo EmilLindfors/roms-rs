@@ -646,7 +646,12 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
         self
     }
 
-    /// Set the bathymetry.
+    /// Set the bathymetry (bed elevation `B`).
+    ///
+    /// A bed that is not flat needs a formulation that applies its slope (see
+    /// [`Self::with_formulation`]): without wetting/drying the default is then
+    /// `EntropyStable`, unless the source terms carry the slope
+    /// (`BathymetrySource2D`, for `Standard`).
     pub fn with_bathymetry(mut self, bathymetry: Arc<Bathymetry2D>) -> Self {
         self.bathymetry = Some(bathymetry);
         self
@@ -667,10 +672,17 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
     /// Set the spatial formulation of the SWE operator.
     ///
     /// Default: `WetDry` for runs with wetting/drying (a positivity limiter or
-    /// [`Self::with_wet_dry`]), `Standard` otherwise. The split-form
+    /// [`Self::with_wet_dry`]); otherwise `EntropyStable` over a bed that is
+    /// not flat, unless the source terms contain `BathymetrySource2D`, and
+    /// `Standard` for a flat bed or with that source. The split-form
     /// formulations include the bed slope in the operator, so the source terms
     /// must not contain `BathymetrySource2D`; choose `Standard` (with
     /// [`Self::with_well_balanced`]) to keep it.
+    ///
+    /// `Standard` gets the bed slope only from `BathymetrySource2D`: over a bed
+    /// that is not flat without it, [`Self::build`] panics (the bed would push
+    /// nothing, and a lake at rest over a slope would pile up at its shallow
+    /// end).
     pub fn with_formulation(mut self, formulation: SWEFormulation2D) -> Self {
         self.formulation = Some(formulation);
         self
@@ -736,9 +748,17 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             1 => self.sources.first().cloned(),
             _ => Some(Arc::new(SourceTerms2D::new(self.sources))),
         };
+        let slope_source = source
+            .as_ref()
+            .is_some_and(|s| s.includes_bathymetry_slope());
+        let sloped_bed = self.bathymetry.as_ref().is_some_and(|b| !is_flat(b));
         let formulation = self.formulation.unwrap_or_else(|| {
             if !wetting_drying {
-                return SWEFormulation2D::Standard;
+                return if sloped_bed && !slope_source {
+                    SWEFormulation2D::EntropyStable
+                } else {
+                    SWEFormulation2D::Standard
+                };
             }
             assert!(
                 !source
@@ -750,6 +770,12 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             );
             SWEFormulation2D::WetDry
         });
+        assert!(
+            !(formulation == SWEFormulation2D::Standard && sloped_bed && !slope_source),
+            "SWEFormulation2D::Standard gets the bed slope only from BathymetrySource2D: \
+             add it with .with_source(BathymetrySource2D::new(g)), or use a split form \
+             (EntropyStable, or WetDry for wetting and drying), which applies the slope itself"
+        );
         let flux = self.flux.unwrap_or(if wetting_drying {
             StandardFlux2D::HLL
         } else {
@@ -822,6 +848,17 @@ impl PhysicsBuilder {
     ) -> SWEPhysics2DBuilder<BC> {
         SWEPhysics2DBuilder::new(mesh, ops, geom, equation, bc)
     }
+}
+
+/// Whether every nodal bed elevation is the same (to round-off).
+fn is_flat(bathymetry: &Bathymetry2D) -> bool {
+    let (lo, hi) = bathymetry
+        .data
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &b| {
+            (lo.min(b), hi.max(b))
+        });
+    hi - lo <= 1e-12 * hi.abs().max(lo.abs()).max(1.0)
 }
 
 #[cfg(test)]
@@ -990,6 +1027,98 @@ mod tests {
         )
         .with_wet_dry_correction(true)
         .with_source(crate::source::BathymetrySource2D::new(9.81))
+        .build();
+    }
+
+    /// Regression: `with_bathymetry` without wet/dry used `Standard` with no
+    /// bed-slope term unless the caller added `BathymetrySource2D`, so a bed
+    /// that is not flat pushed nothing. A lake at rest in a 30 km channel over
+    /// a 20 → 10 m slope then piled up to η = +10 m at the shallow end within
+    /// an hour. The default is now the balanced `EntropyStable`: at rest to
+    /// round-off.
+    #[test]
+    fn a_sloping_bed_is_balanced_by_default() {
+        use crate::simulation::Simulation;
+        use crate::time::SSPRK3;
+
+        let length = 30e3;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 3e3, 10, 1));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            -20.0 + 10.0 * x / length
+        }));
+        let physics = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            ShallowWater2D::new(9.81),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        assert_eq!(physics.formulation, SWEFormulation2D::EntropyStable);
+
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for (h, b) in q.data[0].iter_mut().zip(&bathymetry.data) {
+            *h = -b;
+        }
+        let result = Simulation::new(physics, SSPRK3)
+            .with_cfl(0.5)
+            .run(&mut q, 0.0, 3600.0);
+        assert!(result.success, "{:?}", result.error);
+        let eta = q.data[0]
+            .iter()
+            .zip(&bathymetry.data)
+            .fold(0.0_f64, |m, (h, b)| m.max((h + b).abs()));
+        assert!(eta < 1e-10, "the lake moved: |η| up to {eta:.3e} m");
+    }
+
+    /// `Standard` stays the default where it is right: a flat bed, or a
+    /// sloping one with `BathymetrySource2D`.
+    #[test]
+    fn standard_stays_the_default_for_flat_beds_and_with_the_slope_source() {
+        let (mesh, ops, geom) = create_test_components();
+        let n = (mesh.n_elements, ops.n_nodes);
+        let build = |bed: Bathymetry2D, source: bool| {
+            let builder = PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(9.81),
+                Reflective2D::default(),
+            )
+            .with_bathymetry(Arc::new(bed));
+            let builder = if source {
+                builder.with_source(crate::source::BathymetrySource2D::new(9.81))
+            } else {
+                builder
+            };
+            builder.build().formulation
+        };
+        let sloped = || Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| -10.0 + x + y);
+        assert_eq!(
+            build(Bathymetry2D::constant(n.0, n.1, -10.0), false),
+            SWEFormulation2D::Standard
+        );
+        assert_eq!(build(sloped(), true), SWEFormulation2D::Standard);
+        assert_eq!(build(sloped(), false), SWEFormulation2D::EntropyStable);
+    }
+
+    #[test]
+    #[should_panic(expected = "gets the bed slope only from BathymetrySource2D")]
+    fn standard_over_a_sloping_bed_needs_the_slope_source() {
+        let (mesh, ops, geom) = create_test_components();
+        let bed = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -10.0 + x);
+        PhysicsBuilder::swe_2d(
+            mesh,
+            ops,
+            geom,
+            ShallowWater2D::new(9.81),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(Arc::new(bed))
+        .with_formulation(SWEFormulation2D::Standard)
         .build();
     }
 

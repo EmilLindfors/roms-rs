@@ -423,7 +423,10 @@ fn several_levels_conserve_mass() {
             stats.speedup(),
             stats.steps
         );
-        assert!(stats.finest_level >= 3, "{stats:?}");
+        // Levels 0–2. (Before the builder applied the bed slope by default,
+        // the bed pushed nothing: the "lake" ran downhill in h, and the faster
+        // flow made a third level.)
+        assert!(stats.finest_level >= 2, "{stats:?}");
         assert!(stats.speedup() > 1.3, "{stats:?}");
 
         // Rounding only: global SSP-RK3 drifts 4.6e-14 on this run
