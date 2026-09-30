@@ -872,7 +872,10 @@ mod tests {
         let case = SlopingTide::new();
         let physics = case.physics();
         let mut state = case.state(&physics, |x, s| {
-            (10.0 + 3.0 * x / case.length - 2.0 * s, 33.0 + x / case.length + s)
+            (
+                10.0 + 3.0 * x / case.length - 2.0 * s,
+                33.0 + x / case.length + s,
+            )
         });
         let t0 = case.inventory(&state, &state.temp);
         let s0 = case.inventory(&state, &state.salt);
