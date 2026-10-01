@@ -1506,6 +1506,57 @@ mod tests {
         assert!(v_max < 1e-12, "cross-wind flow {v_max:.3e} m/s");
     }
 
+    /// TODO P4.5 gate: the baroclinic step follows the internal-wave speed
+    /// of the stratification, not a fixed 2 m/s. Linear stratification at
+    /// rest, `N = 0.02 s⁻¹` over 100 m on 10 levels: the WKB speed over the
+    /// layer centres is `N D (1 − 1/n)/π` exactly, and the step
+    /// `cfl·h/c₁/(N+1)²`. Unstratified water at rest takes the floor
+    /// `MIN_INTERNAL_WAVE_SPEED`; vertical advection (`|Ω|Δt/H_z ≤ 1`) and
+    /// Coriolis (`|f|Δt ≤ 1`) bound it where they are tighter.
+    #[test]
+    fn the_3d_step_follows_the_internal_wave_speed() {
+        let (depth, n_levels, n_buoyancy, cfl) = (100.0, 10, 0.02, 1.0);
+        let (mut physics, mut state) = flat_periodic_3d(depth, n_levels, no_stress(), 0.0);
+        // P1 on 10 km squares: h = √J = 5 km, (N+1)² = 4
+        let h = 5_000.0;
+        let advective = |c: f64| cfl * h / c / 4.0;
+
+        let rest = state.clone();
+        let floor = Physics::MIN_INTERNAL_WAVE_SPEED;
+        let dt = physics.compute_dt(&rest, cfl);
+        assert!(
+            (dt / advective(floor) - 1.0).abs() < 1e-12,
+            "{dt} s at rest"
+        );
+
+        let eos = LinearEOS::default();
+        let gradient = n_buoyancy * n_buoyancy / (G * eos.alpha);
+        let sigma_rho = physics.sigma.sigma_rho().to_vec();
+        for column in state.temp.chunks_exact_mut(n_levels) {
+            for (t, s) in column.iter_mut().zip(&sigma_rho) {
+                *t = eos.t0 + gradient * s * depth;
+            }
+        }
+        physics.update_density(&mut state);
+        let c1 = n_buoyancy * depth * (1.0 - 1.0 / n_levels as f64) / std::f64::consts::PI;
+        let dt = physics.compute_dt(&state, cfl);
+        // The old bound with 2 m/s: 625 s
+        assert!(
+            (dt / advective(c1) - 1.0).abs() < 1e-12,
+            "{dt} s against {} s for c₁ = {c1:.4} m/s",
+            advective(c1)
+        );
+
+        // Ω = 0.01 m/s through 10 m layers: 1000 s
+        let mut rising = state.clone();
+        rising.w.fill(0.01);
+        assert!((physics.compute_dt(&rising, cfl) - 1000.0).abs() < 1e-9);
+
+        // f = 1e-3 s⁻¹: 1000 s
+        physics.coriolis = Arc::new(CoriolisSource2D::f_plane(1e-3));
+        assert!((physics.compute_dt(&state, cfl) - 1000.0).abs() < 1e-9);
+    }
+
     /// Node positions of `physics`' mesh, `[element][node]`.
     fn node_positions(physics: &Physics) -> Vec<[f64; 2]> {
         let (mesh, ops) = (&physics.mesh, &physics.ops);

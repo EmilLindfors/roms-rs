@@ -383,6 +383,7 @@ const KINDS: [(&str, f64, [f64; 2]); 3] = [
 /// Particles released from the cages and tracked online in the 3D flow.
 struct FarmParticles<'a> {
     tracker: ParticleTracker3D<'a>,
+    tracker_mesh: &'a Mesh2D,
     ops: &'a DGOperators2D,
     n: usize,
     release_time: f64,
@@ -400,6 +401,7 @@ impl<'a> FarmParticles<'a> {
                 .with_horizontal_diffusivity(kh)
                 .with_vertical_random_walk()
                 .with_bed_settling(),
+            tracker_mesh: mesh,
             ops,
             n,
             release_time,
@@ -476,6 +478,23 @@ impl<'a> FarmParticles<'a> {
             self.seconds
         );
         let field = Solution3DVelocity::steady(state, sigma, bed, 0.05);
+        // The vertical diffusivity the walk sees, 150 m up-current of the farm
+        let locator = PointLocator2D::new(self.tracker_mesh);
+        let ahead = [CAGES[0][0] - 150.0, CAGES[0][1]];
+        if let Some(point) = locator.locate(ahead) {
+            let w = self.ops.interpolation_weights(point.r, point.s);
+            let depth = field.depth(point.element, &w, 0.0);
+            let profile: Vec<String> = [1.0, 3.0, 6.0, 10.0, 15.0, 25.0, 35.0]
+                .iter()
+                .map(|&z| {
+                    let k = field
+                        .diffusivity(point.element, &w, -z / depth, 0.0)
+                        .map_or(0.0, |(k, _)| k);
+                    format!("{z:.0} m {k:.1e}")
+                })
+                .collect();
+            println!("  K (m²/s) up-current of the farm: {}", profile.join(", "));
+        }
         // Displacement from the cage, the nearest periodic image along x
         let offset = |p: &Particle3D, c: usize| {
             let [x, y] = p.position();
