@@ -93,7 +93,8 @@ src/
 │  # ---- Application layer ----
 ├── simulation/       # Simulation runner (2D), Simulation3D
 ├── particles/        # Lagrangian tracking: RK4 on the DG velocity, random
-│                     # walk, face-by-face walk with wall reflection, exits
+│                     # walk, face-by-face walk with wall reflection, exits;
+│                     # 3D: σ-levels, Visser's vertical walk, sinking/settling
 ├── io/               # NetCDF output; parent-ocean and weather-model readers
 │                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
 │                     # bathymetry, GSHHS coastline, projections, observations

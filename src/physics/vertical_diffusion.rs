@@ -93,8 +93,8 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
             &mut v[..n],
             &mut temp[..n],
             &mut salt[..n],
-            &mut eddy_viscosity[..n],
-            &mut eddy_diffusivity[..n],
+            &mut eddy_viscosity[..n_w],
+            &mut eddy_diffusivity[..n_w],
             &mut tke[..],
             &mut gls[..],
         ],
@@ -184,9 +184,10 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                     kt,
                 );
 
-                // Store diagnostics
-                eddy_viscosity[local.clone()].copy_from_slice(&av[0..nl]);
-                eddy_diffusivity[local.clone()].copy_from_slice(&kt[0..nl]);
+                // Store diagnostics, at the w-points
+                let w_points = i * (nl + 1)..(i + 1) * (nl + 1);
+                eddy_viscosity[w_points.clone()].copy_from_slice(av);
+                eddy_diffusivity[w_points].copy_from_slice(kt);
 
                 // 3. Solve diffusion: u, v with the stresses (kinematic) and
                 // the drags, T with the surface buoyancy flux, S without
@@ -881,7 +882,7 @@ mod gls_gates {
                 .iter()
                 .map(|k| (k / k_log - 1.0).abs())
                 .fold(0.0, f64::max);
-            // ν at w-point j (between layers j − 1 and j) is stored with layer j
+            // ν at w-point j, between layers j − 1 and j
             let stress_err = (1..n_levels)
                 .map(|j| {
                     let shear = (state.u[j] - state.u[j - 1]) / dz;

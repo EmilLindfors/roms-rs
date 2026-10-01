@@ -6,7 +6,7 @@ use crate::mesh::{BoundaryTag, Mesh2D, MeshPoint, PointLocator2D};
 use crate::operators::DGOperators2D;
 
 /// Largest element basis the tracker evaluates on the stack (order 15).
-const MAX_NODES: usize = 256;
+pub(super) const MAX_NODES: usize = 256;
 
 /// What a particle is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +19,10 @@ pub enum ParticleStatus {
     /// Left the domain through a boundary face that does not reflect (an
     /// open boundary), with that face's tag. It no longer moves.
     Exited(Option<BoundaryTag>),
+    /// Reached the bed and stays there (3D tracking with bed settling,
+    /// [`super::ParticleTracker3D::with_bed_settling`]): deposited feed or
+    /// faeces. It no longer moves.
+    Settled,
 }
 
 /// A particle: its position, where that is in the mesh, and its own random
@@ -26,11 +30,11 @@ pub enum ParticleStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Particle2D {
     id: u64,
-    position: [f64; 2],
-    point: MeshPoint,
-    status: ParticleStatus,
+    pub(super) position: [f64; 2],
+    pub(super) point: MeshPoint,
+    pub(super) status: ParticleStatus,
     /// SplitMix64 state
-    rng: u64,
+    pub(super) rng: u64,
 }
 
 impl Particle2D {
@@ -73,7 +77,7 @@ fn splitmix64(state: &mut u64) -> u64 {
 }
 
 /// Two independent standard normal numbers (Box–Muller).
-fn standard_normal_pair(state: &mut u64) -> [f64; 2] {
+pub(super) fn standard_normal_pair(state: &mut u64) -> [f64; 2] {
     // Uniform in (0, 1): 53 random bits, offset by half a unit
     let mut uniform = || ((splitmix64(state) >> 11) as f64 + 0.5) * (1.0 / (1u64 << 53) as f64);
     let (u1, u2) = (uniform(), uniform());
@@ -191,6 +195,16 @@ impl<'a> ParticleTracker2D<'a> {
             .for_each(|p| self.advance(p, field, t, dt));
     }
 
+    /// Horizontal diffusivity of the random walk (m²/s).
+    pub(super) fn diffusivity(&self) -> f64 {
+        self.diffusivity
+    }
+
+    /// Basis of the tracked field.
+    pub(super) fn ops(&self) -> &DGOperators2D {
+        self.ops
+    }
+
     /// Whether a boundary face with `tag` reflects.
     fn reflects(&self, tag: Option<BoundaryTag>) -> bool {
         tag.is_none_or(|tag| self.reflecting.contains(&tag))
@@ -207,20 +221,21 @@ impl<'a> ParticleTracker2D<'a> {
 
     /// Whether the water at `point` is too shallow to float in at `t`.
     fn aground(&self, field: &impl ParticleVelocity2D, point: MeshPoint, t: f64) -> bool {
-        let Some(limit) = self.stranding_depth else {
-            return false;
-        };
         let mut weights = [0.0; MAX_NODES];
         let weights = &mut weights[..self.ops.n_nodes];
         self.ops
             .interpolation_weights_into(point.r, point.s, weights);
-        field
-            .depth(point.element, weights, t)
-            .is_some_and(|h| h < limit)
+        self.too_shallow(field.depth(point.element, weights, t))
+    }
+
+    /// Whether a particle strands in water of depth `depth` (none: never).
+    pub(super) fn too_shallow(&self, depth: Option<f64>) -> bool {
+        self.stranding_depth
+            .is_some_and(|limit| depth.is_some_and(|h| h < limit))
     }
 
     /// Walk from the particle's position by `displacement`.
-    fn walk_by(&self, p: &Particle2D, displacement: [f64; 2]) -> WalkEnd {
+    pub(super) fn walk_by(&self, p: &Particle2D, displacement: [f64; 2]) -> WalkEnd {
         let [x, y] = p.position;
         walk(
             self.locator.mesh(),
@@ -234,7 +249,7 @@ impl<'a> ParticleTracker2D<'a> {
     /// One step of one particle (see the module docs).
     fn advance(&self, p: &mut Particle2D, field: &impl ParticleVelocity2D, t: f64, dt: f64) {
         match p.status {
-            ParticleStatus::Exited(_) => return,
+            ParticleStatus::Exited(_) | ParticleStatus::Settled => return,
             ParticleStatus::Stranded => {
                 if !self.aground(field, p.point, t + dt) {
                     p.status = ParticleStatus::Active;
