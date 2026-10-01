@@ -8,19 +8,31 @@
 //! particles released from the cages, tracked with the flow ([`particles`]).
 //!
 //! Scenarios ([`scenario`]): the farm fjord of `examples/local_time_stepping_farm.rs`,
-//! or Frøya–Smøla–Hitra on the coastline mesh with NorKyst-800 boundary tides, as
-//! `examples/froya_real_data.rs` runs it (its data files in `../data/`).
+//! Frøya–Smøla–Hitra on the coastline mesh with NorKyst-800 boundary tides, as
+//! `examples/froya_real_data.rs` runs it (its data files in `../data/`), or the
+//! stratified farm channel of `examples/farm_3d.rs` in 3D: there the water shows the
+//! depth-mean current or any σ-layer's, a vertical section along the flow through a
+//! cage shows the speed or temperature in the water column ([`layers`]), and lice
+//! larvae, faeces and feed are tracked in 3D ([`cloud_3d`]).
 //!
 //! ```bash
 //! cd viz && cargo run --release -- [options]
 //! ```
 //!
 //! Options (defaults in brackets):
-//! - `--scenario fjord|froya` [fjord]. Frøya reads `../data/froya_coast.msh` (from
+//! - `--scenario fjord|froya|channel` [fjord]. Frøya reads `../data/froya_coast.msh` (from
 //!   `scripts/gmsh_coastline_mesh.py`), `../data/froya_topobathy.tif` and
 //!   `../data/froya_boundary_tides.txt`; the close-up (F) is the Mausund tide gauge,
 //!   and it has no cages or particles. Its run is ≈ 30× faster than real time on 12
 //!   threads, so play it back at `--rate 30` or below to keep up with the solver.
+//!   The channel runs in 3D, from rest with the tide ramped up over an hour; its
+//!   particles start at once, three kinds per cage.
+//! - `--sigma N` σ-levels of a 3D run [16]; `--start TIME` the UTC instant of model
+//!   time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
+//!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
+//!   [ladim]; `--section speed|temperature|off` what the section shows at the start
+//!   [speed]; `--layer mean|surface|bed|N` the current the water shows at the start
+//!   (N: σ-layer from the bed, 0) [mean]
 //! - `--mesh PATH` Gmsh mesh [`../tests/data/gmsh/fjord_farm.msh`, or Frøya's]
 //! - `--order N` polynomial order [2]; `--levels N` local time stepping levels, 0 for
 //!   global SSP-RK3 [8]
@@ -37,22 +49,25 @@
 //!   the tidal current there [3600]
 //! - `--drag on|off` whether the nets drag on the flow (drawn either way) [on]
 //! - `--particles N` particles released in each cage every `--release S` model seconds
-//!   [20, 60]; 0 for none. `--kh K` horizontal diffusivity of their random walk (m²/s)
-//!   [0.1]
+//!   [20, 60] (in 3D, of each kind); 0 for none. `--kh K` horizontal diffusivity of
+//!   their random walk (m²/s) [0.1]
 //! - `--view farm|domain` starting framing: the close-up (the farm, or the gauge) or
 //!   the whole domain [farm]
 //! - `--screenshot PATH` save a frame once the shown time reaches `--at S` (model
 //!   seconds; default the end of the run) and quit: for checking a change headlessly.
 //!
-//! Keys: see [`hud`] (B: bed contours; - and =: water opacity).
+//! Keys: see [`hud`] (B: bed contours; - and =: water opacity; in 3D , and . the
+//! layer shown, V the section).
 
 mod arrows;
 mod cages;
 mod camera;
+mod cloud_3d;
 mod colormap;
 mod contours;
 mod field;
 mod hud;
+mod layers;
 mod particles;
 mod playback;
 mod scenario;
@@ -65,14 +80,16 @@ use std::sync::Mutex;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use dg_rs::mesh::PointLocator2D;
+use dg_rs::time::ModelClock;
 
 use arrows::{Arrows, ArrowsPlugin};
 use cages::{CageLayout, CagesPlugin};
 use camera::{CameraPlugin, OrbitCamera, Views};
 use contours::ContoursPlugin;
-use field::{Field, Frame, Nodes, Probe};
+use field::{Field, Frame, Nodes, Probe, ShownLayer};
 use hud::{HudPlugin, Title};
-use particles::{ParticleConfig, ParticlesPlugin};
+use layers::{LayersPlugin, Levels, Section, SectionShows};
+use particles::{Lice, ParticleConfig, ParticlesPlugin, Periodic};
 use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState};
 use scenario::Scenario;
 use solver::SolverConfig;
@@ -97,6 +114,10 @@ struct Args {
     view: String,
     screenshot: Option<String>,
     at: Option<f64>,
+    sigma: usize,
+    start: String,
+    section: SectionShows,
+    layer: String,
 }
 
 impl Args {
@@ -121,10 +142,15 @@ impl Args {
                 per_release: 20,
                 release_every: 60.0,
                 kh: 0.1,
+                lice: Lice::Ladim,
             },
             view: "farm".into(),
             screenshot: None,
             at: None,
+            sigma: 16,
+            start: "2025-06-15T00:00:00Z".into(),
+            section: SectionShows::Speed,
+            layer: "mean".into(),
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -158,6 +184,33 @@ impl Args {
                 "--particles" => args.particles.per_release = num(&flag, &value)?,
                 "--release" => args.particles.release_every = num(&flag, &value)?,
                 "--kh" => args.particles.kh = num(&flag, &value)?,
+                "--lice" => {
+                    args.particles.lice = match value.as_str() {
+                        "ladim" => Lice::Ladim,
+                        "johnsen" => Lice::Johnsen,
+                        "passive" => Lice::Passive,
+                        _ => {
+                            return Err(format!(
+                                "--lice takes ladim, johnsen or passive, not {value}"
+                            ));
+                        }
+                    }
+                }
+                "--sigma" => args.sigma = num(&flag, &value)?,
+                "--start" => args.start = value,
+                "--section" => {
+                    args.section = match value.as_str() {
+                        "speed" => SectionShows::Speed,
+                        "temperature" => SectionShows::Temperature,
+                        "off" => SectionShows::Off,
+                        _ => {
+                            return Err(format!(
+                                "--section takes speed, temperature or off, not {value}"
+                            ));
+                        }
+                    }
+                }
+                "--layer" => args.layer = value,
                 "--view" => args.view = value,
                 "--screenshot" => args.screenshot = Some(value),
                 "--at" => args.at = Some(num(&flag, &value)?),
@@ -221,8 +274,12 @@ fn main() -> AppExit {
                 args.hours * 3600.0,
             )
         }
+        "channel" => match ModelClock::parse(&args.start) {
+            Ok(clock) => Ok(Scenario::farm_channel(args.order, args.sigma, clock)),
+            Err(e) => Err(format!("--start {}: {e}", args.start).into()),
+        },
         other => {
-            eprintln!("unknown scenario {other}: fjord or froya");
+            eprintln!("unknown scenario {other}: fjord, froya or channel");
             return AppExit::from_code(2);
         }
     };
@@ -284,8 +341,8 @@ fn main() -> AppExit {
     let views = Views {
         farm: OrbitCamera {
             focus: frame.world(scenario.farm, 0.0),
-            yaw: 0.7,
-            pitch: 0.5,
+            yaw: scenario.close_up.yaw,
+            pitch: scenario.close_up.pitch,
             distance: scenario.close_up.distance,
         },
         domain: OrbitCamera {
@@ -301,6 +358,43 @@ fn main() -> AppExit {
         views.farm
     };
 
+    // The water column of a 3D run: its levels and the section
+    let column = scenario.three_d.as_ref().map(|three_d| {
+        let farm = Probe::at(&locator, &scenario, scenario.farm);
+        let bed: Vec<f32> = scenario.bathymetry.data.iter().map(|&b| b as f32).collect();
+        let mut section = Section::new(&locator, &scenario, three_d.section);
+        section.shows = args.section;
+        (
+            Levels {
+                sigma: three_d
+                    .sigma
+                    .sigma_rho()
+                    .iter()
+                    .map(|&s| s as f32)
+                    .collect(),
+                depth: farm.map_or(0.0, |p| -p.eval(&bed)),
+            },
+            section,
+        )
+    });
+    let top = scenario
+        .three_d
+        .as_ref()
+        .map_or(0, |three_d| three_d.sigma.n_levels() - 1);
+    let shown = match args.layer.as_str() {
+        "mean" => ShownLayer::DepthMean,
+        "surface" => ShownLayer::Level(top),
+        "bed" => ShownLayer::Level(0),
+        n => match n.parse::<usize>() {
+            Ok(l) if l <= top => ShownLayer::Level(l),
+            _ => {
+                eprintln!("--layer takes mean, surface, bed or 0 to {top}, not {n}");
+                return AppExit::from_code(2);
+            }
+        },
+    };
+    let periodic = Periodic(scenario.periodic.map(|p| p.map(|x| x as f32)));
+
     let t_end = args.hours * 3600.0;
     let channel = solver::spawn(
         &scenario,
@@ -314,76 +408,83 @@ fn main() -> AppExit {
         },
     );
 
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "dg-viz".into(),
-                resolution: (1600, 900).into(),
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "dg-viz".into(),
+            resolution: (1600, 900).into(),
+            ..default()
+        }),
+        ..default()
+    }))
+    .insert_resource(ClearColor(Color::srgb(0.05, 0.065, 0.08)))
+    .insert_resource(GlobalAmbientLight {
+        color: Color::srgb(0.75, 0.85, 1.0),
+        brightness: 350.0,
+        ..default()
+    })
+    .insert_resource(frame)
+    .insert_resource(nodes)
+    .insert_resource(cages)
+    .insert_resource(arrows)
+    .insert_resource(views)
+    .insert_resource(Field::default())
+    .insert_resource(shown)
+    .insert_resource(periodic)
+    .insert_resource(Colouring::new(args.speed_max))
+    .insert_resource(WaterOpacity(args.water_alpha))
+    .insert_resource(Title(scenario.name.clone()))
+    .insert_resource(Playback::new(
+        args.rate,
+        args.interval,
+        args.memory_mb << 20,
+    ))
+    .insert_resource(SolverChannel(Mutex::new(channel)))
+    .insert_resource(Capture {
+        path: args.screenshot,
+        at: args.at.unwrap_or(t_end),
+        frames: None,
+    })
+    .add_plugins((
+        PlaybackPlugin,
+        SurfacePlugin,
+        ContoursPlugin,
+        CagesPlugin,
+        ArrowsPlugin,
+        ParticlesPlugin,
+        CameraPlugin,
+        HudPlugin,
+    ))
+    .add_systems(Startup, move |mut commands: Commands| {
+        commands.spawn((
+            Camera3d::default(),
+            Projection::Perspective(PerspectiveProjection {
+                near: 1.0,
+                far: 400_000.0,
                 ..default()
             }),
-            ..default()
-        }))
-        .insert_resource(ClearColor(Color::srgb(0.05, 0.065, 0.08)))
-        .insert_resource(GlobalAmbientLight {
-            color: Color::srgb(0.75, 0.85, 1.0),
-            brightness: 350.0,
-            ..default()
-        })
-        .insert_resource(frame)
-        .insert_resource(nodes)
-        .insert_resource(cages)
-        .insert_resource(arrows)
-        .insert_resource(views)
-        .insert_resource(Field::default())
-        .insert_resource(Colouring::new(args.speed_max))
-        .insert_resource(WaterOpacity(args.water_alpha))
-        .insert_resource(Title(scenario.name.clone()))
-        .insert_resource(Playback::new(
-            args.rate,
-            args.interval,
-            args.memory_mb << 20,
-        ))
-        .insert_resource(SolverChannel(Mutex::new(channel)))
-        .insert_resource(Capture {
-            path: args.screenshot,
-            at: args.at.unwrap_or(t_end),
-            frames: None,
-        })
-        .add_plugins((
-            PlaybackPlugin,
-            SurfacePlugin,
-            ContoursPlugin,
-            CagesPlugin,
-            ArrowsPlugin,
-            ParticlesPlugin,
-            CameraPlugin,
-            HudPlugin,
-        ))
-        .add_systems(Startup, move |mut commands: Commands| {
-            commands.spawn((
-                Camera3d::default(),
-                Projection::Perspective(PerspectiveProjection {
-                    near: 1.0,
-                    far: 400_000.0,
-                    ..default()
-                }),
-                start.transform(),
-                start,
-            ));
-            // Sun from the south-west, 35° up.
-            commands.spawn((
-                DirectionalLight {
-                    illuminance: 9_000.0,
-                    shadow_maps_enabled: false,
-                    ..default()
-                },
-                Transform::from_xyz(-1.0, 1.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
-            ));
-        })
-        .add_systems(Update, field::interpolate)
-        .add_systems(Update, capture.after(field::interpolate))
-        .add_systems(Last, playback::settle)
-        .run()
+            start.transform(),
+            start,
+        ));
+        // Sun from the south-west, 35° up.
+        commands.spawn((
+            DirectionalLight {
+                illuminance: 9_000.0,
+                shadow_maps_enabled: false,
+                ..default()
+            },
+            Transform::from_xyz(-1.0, 1.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
+        ));
+    })
+    .add_systems(Update, field::interpolate)
+    .add_systems(Update, capture.after(field::interpolate))
+    .add_systems(Last, playback::settle);
+    if let Some((levels, section)) = column {
+        app.insert_resource(levels)
+            .insert_resource(section)
+            .add_plugins(LayersPlugin);
+    }
+    app.run()
 }
 
 fn capture(

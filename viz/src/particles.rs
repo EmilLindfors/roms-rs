@@ -1,19 +1,23 @@
 //! Particles released from the cages (sea-lice larvae, feed, faeces): tracked on the
-//! solver thread, drawn riding the water surface.
+//! solver thread, drawn riding the water surface (2D) or at their depth (3D).
 //!
-//! [`Cloud`] lives on the solver thread. At every snapshot it moves its particles from
+//! [`Cloud`] lives on the solver thread of a 2D run. At every snapshot it moves its particles from
 //! the previous snapshot to this one with `dg_rs::particles::ParticleTracker2D` (RK4
 //! on the depth-averaged current, linear in time between the two states, plus a
 //! horizontal random walk), then releases a new batch spread over each cage's
 //! footprint, and reports every particle's position, the surface η there, its state
 //! and its release time ([`ParticleSnapshot`]). Particles are only ever appended, so
-//! particle `i` is the same in every snapshot that has it.
+//! particle `i` is the same in every snapshot that has it. A 3D run's cloud
+//! ([`crate::cloud_3d::Cloud3D`]) reports each particle's height in the water column and
+//! its kind as well.
 //!
 //! The viewer interpolates the positions linearly between the snapshots around the
-//! shown time and draws each particle as a small octahedron just above the surface,
-//! coloured by age (young bright, old dark; stranded grey). Particles that left
-//! through the open boundary are not drawn. Their size follows the camera's distance,
-//! so the cloud stays visible from the farm to the whole fjord. P toggles them.
+//! shown time and draws each particle as a small octahedron: in 2D just above the
+//! surface, coloured by age (young bright, old dark; stranded grey); in 3D at its
+//! height, coloured by kind (lice larvae pink, faeces brown, feed yellow; dark on the
+//! bed, grey when dead). Particles that left through the open boundary are not drawn.
+//! Their size follows the camera's distance, so the cloud stays visible from the farm
+//! to the whole fjord. P toggles them.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -26,12 +30,18 @@ use dg_rs::solver::{SWESolution2D, WetDryConfig};
 use dg_rs::source::NetCage;
 
 use crate::camera::OrbitCamera;
+use crate::cloud_3d::KINDS;
 use crate::colormap::{Lut, PLASMA};
 use crate::field::Frame;
 use crate::playback::Playback;
 
 /// Longest tracking step (s); a snapshot interval is split into steps no longer.
-const MAX_STEP: f64 = 10.0;
+pub const MAX_STEP: f64 = 10.0;
+
+/// The mesh's periods along x and y (m) if it is periodic: a particle carried across
+/// is not interpolated through the domain.
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct Periodic(pub Option<[f32; 2]>);
 /// Particles in water shallower than this (m) strand.
 const STRANDING_DEPTH: f64 = 0.05;
 
@@ -39,16 +49,34 @@ const STRANDING_DEPTH: f64 = 0.05;
 pub const ACTIVE: u8 = 0;
 pub const STRANDED: u8 = 1;
 pub const EXITED: u8 = 2;
+/// On the bed (3D: sunk feed and faeces)
+pub const SETTLED: u8 = 3;
+/// Past its lifespan (3D: lice larvae)
+pub const DEAD: u8 = 4;
+pub const STATES: usize = 5;
+
+/// What the lice larvae of a 3D run do (`dg_rs::particles::SalmonLice`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lice {
+    /// The operational IMR model's parameters
+    Ladim,
+    /// Johnsen et al. (2014)
+    Johnsen,
+    /// Neutrally buoyant, no swimming
+    Passive,
+}
 
 /// What is released and how it disperses.
 #[derive(Clone, Copy, Debug)]
 pub struct ParticleConfig {
-    /// Particles released in each cage per release; 0 for none
+    /// Particles released in each cage per release (in 3D, of each kind); 0 for none
     pub per_release: usize,
     /// Model time between releases (s)
     pub release_every: f64,
     /// Horizontal diffusivity of the random walk (m²/s)
     pub kh: f64,
+    /// The lice larvae's behaviour (3D)
+    pub lice: Lice,
 }
 
 /// Every particle at one snapshot, in release order.
@@ -56,12 +84,14 @@ pub struct ParticleConfig {
 pub struct ParticleSnapshot {
     /// Position, mesh coordinates (m)
     pub xy: Vec<[f32; 2]>,
-    /// Surface elevation at the particle (m)
-    pub eta: Vec<f32>,
-    /// [`ACTIVE`], [`STRANDED`] or [`EXITED`]
+    /// Height (m): the surface at the particle in 2D, the particle's own in 3D
+    pub z: Vec<f32>,
+    /// [`ACTIVE`], [`STRANDED`], [`EXITED`], [`SETTLED`] or [`DEAD`]
     pub state: Vec<u8>,
     /// Model time of release (s)
     pub born: Vec<f32>,
+    /// Kind of every particle (3D, an index into `crate::cloud_3d::KINDS`); empty in 2D
+    pub kind: Vec<u8>,
 }
 
 impl ParticleSnapshot {
@@ -70,16 +100,27 @@ impl ParticleSnapshot {
     }
 
     pub fn bytes(&self) -> usize {
-        self.len() * (8 + 4 + 1 + 4)
+        self.len() * (8 + 4 + 1 + 4) + self.kind.len()
     }
 
-    /// Particles active, stranded and out of the domain.
-    pub fn counts(&self) -> [usize; 3] {
-        let mut counts = [0; 3];
+    /// Particles in each state.
+    pub fn counts(&self) -> [usize; STATES] {
+        let mut counts = [0; STATES];
         for &s in &self.state {
             counts[s as usize] += 1;
         }
         counts
+    }
+}
+
+/// The 2D tracker's status as sent to the viewer.
+pub fn state_of(status: ParticleStatus) -> u8 {
+    match status {
+        ParticleStatus::Active => ACTIVE,
+        ParticleStatus::Stranded => STRANDED,
+        ParticleStatus::Exited(_) => EXITED,
+        ParticleStatus::Settled => SETTLED,
+        ParticleStatus::Dead => DEAD,
     }
 }
 
@@ -179,9 +220,10 @@ impl<'a> Cloud<'a> {
         let n = self.ops.n_nodes;
         let mut out = ParticleSnapshot {
             xy: Vec::with_capacity(self.particles.len()),
-            eta: Vec::with_capacity(self.particles.len()),
+            z: Vec::with_capacity(self.particles.len()),
             state: Vec::with_capacity(self.particles.len()),
             born: self.born.clone(),
+            kind: Vec::new(),
         };
         for p in &self.particles {
             let [x, y] = p.position();
@@ -197,12 +239,8 @@ impl<'a> Cloud<'a> {
                 .zip(h.iter().zip(b))
                 .map(|(w, (h, b))| w * (h + b))
                 .sum();
-            out.eta.push(eta as f32);
-            out.state.push(match p.status() {
-                ParticleStatus::Active => ACTIVE,
-                ParticleStatus::Stranded | ParticleStatus::Settled | ParticleStatus::Dead => STRANDED,
-                ParticleStatus::Exited(_) => EXITED,
-            });
+            out.z.push(eta as f32);
+            out.state.push(state_of(p.status()));
         }
         out
     }
@@ -212,8 +250,10 @@ impl<'a> Cloud<'a> {
 #[derive(Resource)]
 pub struct Particles {
     pub on: bool,
-    /// Active, stranded and out, at the shown time
-    pub counts: [usize; 3],
+    /// Particles in each state at the shown time
+    pub counts: [usize; STATES],
+    /// Active particles of each kind (3D) at the shown time
+    pub kinds: Vec<usize>,
     /// Age (s) at the dark end of the colour map
     pub age_scale: f32,
     lut: Lut,
@@ -261,7 +301,8 @@ fn spawn(
     ));
     commands.insert_resource(Particles {
         on: true,
-        counts: [0; 3],
+        counts: [0; STATES],
+        kinds: Vec::new(),
         age_scale: 600.0,
         lut: Lut::new(PLASMA),
         mesh,
@@ -294,10 +335,12 @@ const FACES: [[u32; 3]; 8] = [
     [0, 3, 5],
 ];
 
+#[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its queries
 fn draw(
     mut particles: ResMut<Particles>,
     playback: Res<Playback>,
     frame: Res<Frame>,
+    periodic: Res<Periodic>,
     camera: Query<&OrbitCamera>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut visibility: Query<&mut Visibility, With<Cloudlet>>,
@@ -313,9 +356,19 @@ fn draw(
     let oldest = b.born.first().copied().unwrap_or(0.0);
     let age_scale = (t - oldest).max(600.0);
     let counts = b.counts();
-    if particles.counts != counts || particles.age_scale != age_scale {
+    let mut kinds = vec![0; KINDS.len()];
+    for (&kind, &state) in b.kind.iter().zip(&b.state) {
+        if state == ACTIVE {
+            kinds[kind as usize] += 1;
+        }
+    }
+    if b.kind.is_empty() {
+        kinds.clear();
+    }
+    if particles.counts != counts || particles.age_scale != age_scale || particles.kinds != kinds {
         particles.counts = counts;
         particles.age_scale = age_scale;
+        particles.kinds = kinds;
     }
     if !particles.on || b.len() == 0 {
         visible.set_if_neq(Visibility::Hidden);
@@ -329,6 +382,9 @@ fn draw(
         .single()
         .map_or(1.5, |c| (0.003 * c.distance).clamp(0.4, 60.0));
     let grey = [0.55, 0.55, 0.55, 1.0];
+    let in_3d = !b.kind.is_empty();
+    // In 2D the particles ride just above the surface; in 3D they sit at their height
+    let lift = if in_3d { 0.0 } else { 0.6 * size };
 
     let n = b.len();
     let mut positions = Vec::with_capacity(6 * n);
@@ -339,21 +395,32 @@ fn draw(
         if b.state[i] == EXITED || b.born[i] > t + 1e-3 {
             continue;
         }
-        // Released since the earlier snapshot: at its first position.
-        let (xy, eta) = if i < a.len() && a.state[i] != EXITED {
+        // Released since the earlier snapshot, or carried across a periodic boundary:
+        // at its later position.
+        let wrapped = periodic.0.is_some_and(|[lx, ly]| {
+            i < a.len()
+                && ((a.xy[i][0] - b.xy[i][0]).abs() > 0.5 * lx
+                    || (a.xy[i][1] - b.xy[i][1]).abs() > 0.5 * ly)
+        });
+        let (xy, z) = if i < a.len() && a.state[i] != EXITED && !wrapped {
             let lerp = |x: f32, y: f32| x + w * (y - x);
             (
                 [lerp(a.xy[i][0], b.xy[i][0]), lerp(a.xy[i][1], b.xy[i][1])],
-                lerp(a.eta[i], b.eta[i]),
+                lerp(a.z[i], b.z[i]),
             )
         } else {
-            (b.xy[i], b.eta[i])
+            (b.xy[i], b.z[i])
         };
-        let centre = frame.world([xy[0] as f64, xy[1] as f64], eta) + Vec3::Y * 0.6 * size;
-        let colour = if b.state[i] == STRANDED {
-            grey
-        } else {
-            particles.lut.at(1.0 - (t - b.born[i]) / age_scale)
+        let centre = frame.world([xy[0] as f64, xy[1] as f64], z) + Vec3::Y * lift;
+        let colour = match b.state[i] {
+            STRANDED | DEAD => grey,
+            state if in_3d => {
+                let [r, g, bl] = KINDS[b.kind[i] as usize].colour;
+                // On the bed: darker
+                let k = if state == SETTLED { 0.35 } else { 1.0 };
+                [k * r, k * g, k * bl, 1.0]
+            }
+            _ => particles.lut.at(1.0 - (t - b.born[i]) / age_scale),
         };
         let base = positions.len() as u32;
         for corner in CORNERS {
