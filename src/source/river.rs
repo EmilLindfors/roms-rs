@@ -544,6 +544,32 @@ impl RiverInflow<'_> {
             }
         }
     }
+
+    /// Add the inventory sources of a field `field` at the w-points
+    /// (`[element][node][w-point]`, `n_levels + 1` per column) that the river
+    /// water brings at the column's own value, so that its volume dilutes
+    /// nothing: `s_w φ`, with `s_w` the layer sources averaged to the
+    /// w-cells (half of the end layers', the mean of the two layers'
+    /// between; [`crate::solver::rhs::w_cell_thicknesses`]).
+    pub fn add_w_point_sources_at_own_value(&self, rhs: &mut [f64], field: &[f64], n_nodes: usize) {
+        let nw = self.rivers.n_levels() + 1;
+        for i in 0..self.rivers.len() {
+            let k = self.rivers.element(i).as_usize();
+            let rate = self.discharge[i] * self.rivers.inv_area[i];
+            let weights = self.rivers.level_weights(i);
+            let columns = k * n_nodes * nw..(k + 1) * n_nodes * nw;
+            for (r, phi) in rhs[columns.clone()]
+                .chunks_exact_mut(nw)
+                .zip(field[columns].chunks_exact(nw))
+            {
+                for j in 0..nw {
+                    let below = if j > 0 { weights[j - 1] } else { 0.0 };
+                    let above = weights.get(j).copied().unwrap_or(0.0);
+                    r[j] += 0.5 * (below + above) * rate * phi[j];
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

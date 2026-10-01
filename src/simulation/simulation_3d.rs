@@ -211,6 +211,7 @@ mod tests {
         AnalyticSurfaceStress, BottomDrag3D, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D,
     };
     use crate::simulation::Simulation;
+    use crate::solver::rhs::w_cell_thicknesses;
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
     use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
@@ -960,6 +961,114 @@ mod tests {
         );
     }
 
+    /// `∫ Σ_j H_w φ_j dA` of a field `field` at the w-points, over the
+    /// w-cells (dry columns hold none).
+    fn w_inventory(physics: &Physics, state: &Solution3D, field: &[f64]) -> f64 {
+        let nw = state.n_levels + 1;
+        let mut d_sigma_w = vec![0.0; nw];
+        w_cell_thicknesses(physics.sigma.d_sigma(), &mut d_sigma_w);
+        let mut column = DGSolution2D::new(state.n_elements, state.n_nodes);
+        for (idx, c) in column.data.iter_mut().enumerate() {
+            let depth = state.eta.data[idx] - physics.bathymetry.data[idx];
+            *c = (0..nw)
+                .map(|j| depth * d_sigma_w[j] * field[idx * nw + j])
+                .sum();
+        }
+        column.integrate(&physics.ops, &physics.geom)
+    }
+
+    /// `f(x, j)` at every w-point `j` of every column, with `x` the node's
+    /// coordinate along `axis`.
+    fn w_point_field(
+        physics: &Physics,
+        n_levels: usize,
+        axis: usize,
+        f: impl Fn(f64, usize) -> f64,
+    ) -> Vec<f64> {
+        let nn = physics.ops.n_nodes;
+        let mut field = Vec::with_capacity(physics.mesh.n_elements * nn * (n_levels + 1));
+        for k in 0..physics.mesh.n_elements {
+            for i in 0..nn {
+                let x = physics.mesh.reference_to_physical(
+                    ElementIndex::new(k),
+                    physics.ops.nodes_r[i],
+                    physics.ops.nodes_s[i],
+                )[axis];
+                field.extend((0..=n_levels).map(|j| f(x, j)));
+            }
+        }
+        field
+    }
+
+    /// TODO P4.4 gate: the turbulence at the w-points is advected with the
+    /// water of the layers (over the w-cells, `LayerTransport::stagger_from`):
+    /// under the tide over the sloping bed a uniform `k` stays uniform, with
+    /// and without a river, and a varying `ψ` keeps its inventory while it
+    /// moves. The constant mixing leaves the turbulence fields alone, so they
+    /// are passive here.
+    ///
+    /// The bed and surface w-points hold a closure's boundary values, which
+    /// are not their half-layers' means: here 50 times the interior's `k`.
+    /// They must not leak into the interior (regression: they were advected
+    /// through the end layers' centres, and the surface's wall length cut
+    /// the top viscosity to the background where Ω pointed down).
+    #[test]
+    fn turbulence_is_advected_with_constancy_and_conservation() {
+        let case = SlopingTide::new();
+        let eos = LinearEOS::default();
+        let (k0, nl) = (3.1e-4, case.sigma.n_levels());
+        let rivers = [false, true];
+        for with_river in rivers {
+            let physics = if with_river {
+                case.physics_with_rivers(vec![river(eos.t0, eos.s0)])
+            } else {
+                case.physics()
+            };
+            let mut state = case.state(&physics, |_, _| (eos.t0, eos.s0));
+            state.tke = w_point_field(&physics, nl, case.axis, |_, j| {
+                if j == 0 || j == nl { 50.0 * k0 } else { k0 }
+            });
+            state.gls = w_point_field(&physics, nl, case.axis, |x, j| {
+                1e-6 * (2.0 + (std::f64::consts::PI * x / case.length).sin() + j as f64)
+            });
+            let initial_gls = state.gls.clone();
+            let psi0 = w_inventory(&physics, &state, &state.gls);
+            let (mut drift, mut psi_error) = (0.0_f64, 0.0_f64);
+            case.run(&physics, &mut state, |s, p| {
+                let interior = s.tke.chunks_exact(nl + 1).flat_map(|c| &c[1..nl]);
+                drift = max_or_nan(interior.map(|k| (k - k0).abs()).chain([drift]));
+                psi_error =
+                    max_or_nan([psi_error, (w_inventory(p, s, &s.gls) - psi0).abs() / psi0]);
+            });
+            // Measured 7.9e-18 (8.2e-18 with the river). With Ω through the
+            // layer centres taken from the w-points above instead of their
+            // mean, 1.6e-4; with the end w-points advected at their own
+            // values, 2.1e-3; without the river's own-value source, 6e-5
+            assert!(
+                drift < 1e-13 * k0,
+                "uniform k drifted by {drift:.3e} (river: {with_river})"
+            );
+            let moved = max_or_nan(
+                state
+                    .gls
+                    .iter()
+                    .zip(&initial_gls)
+                    .map(|(a, b)| (a - b).abs()),
+            );
+            assert!(
+                moved > 0.05 * 1e-6,
+                "test regime: ψ moved only {moved:.3e} (river: {with_river})"
+            );
+            if !with_river {
+                // Measured 3.4e-15
+                assert!(
+                    psi_error < 1e-12,
+                    "ψ inventory drifted by {psi_error:.3e} (relative)"
+                );
+            }
+        }
+    }
+
     /// A river into the middle of [`SlopingTide`]'s basin, entering over the
     /// top 40 % of the column (levels weighted 0, 1/6, 5/6), 20 m³/s: over
     /// the period it raises the basin by ≈ 4.5 cm and its own element by far
@@ -1353,42 +1462,64 @@ mod tests {
     /// TODO P4.5 gate: on the beach, uniform T and S stay uniform (constancy
     /// in the shoreline elements, whose tracers are element means per level)
     /// and stratified tracers keep their inventories.
+    /// The turbulence at the w-points, advected over the w-cells, too.
     #[test]
     fn beach_tracers_are_constant_and_conserved() {
         let (physics, mut state, _) = beach_3d(0.3);
+        let nl = state.n_levels;
         state.temp.fill(12.3);
         state.salt.fill(33.1);
+        state.tke = w_point_field(&physics, nl, 0, |_, _| 12.3);
+        state.gls = w_point_field(&physics, nl, 0, |x, j| 1.0 + x / 1000.0 + 0.1 * j as f64);
         let mut drift = 0.0_f64;
         run_beach(&physics, &mut state, 200, |s| {
+            // The interior w-points: the bed and surface ones are advected
+            // at their neighbours' values (a closure's boundary values;
+            // `Hydrostatic3D::with_turbulence_advection`), so their own
+            // round-off is not kept constant (5.3e-8 here)
+            let tke = s.tke.chunks_exact(nl + 1).flat_map(|c| &c[1..nl]);
             drift = max_or_nan(
                 s.temp
                     .iter()
+                    .chain(tke)
                     .map(|t| (t - 12.3).abs())
                     .chain(s.salt.iter().map(|x| (x - 33.1).abs()))
                     .chain([drift]),
             );
         });
-        // Measured 4.7e-9 (4e-10 of the values): the 2D pass balances nearly
+        // Measured 4.7e-9 (4e-10 of the values; k at the interior w-points
+        // 1.7e-9): the 2D pass balances nearly
         // dry elements to round-off of the domain's η change, which their
         // tiny volumes amplify. Wet elements hold to ≈ 1e-13 (the P4.2 gate).
         assert!(drift < 5e-8, "uniform tracers drifted by {drift:.3e}");
 
         let (physics, mut state, _) = beach_3d(0.3);
-        let (t0, s0) = (
+        state.tke = w_point_field(&physics, nl, 0, |_, _| 1e-6);
+        state.gls = w_point_field(&physics, nl, 0, |x, j| 1.0 + x / 1000.0 + 0.1 * j as f64);
+        let (t0, s0, psi0) = (
             beach_inventory(&physics, &state, &state.temp),
             beach_inventory(&physics, &state, &state.salt),
+            w_inventory(&physics, &state, &state.gls),
         );
-        let mut max_err = 0.0_f64;
+        let (mut max_err, mut psi_err) = (0.0_f64, 0.0_f64);
         run_beach(&physics, &mut state, 200, |s| {
             max_err = max_or_nan([
                 max_err,
                 (beach_inventory(&physics, s, &s.temp) - t0).abs() / t0,
                 (beach_inventory(&physics, s, &s.salt) - s0).abs() / s0,
             ]);
+            psi_err = max_or_nan([
+                psi_err,
+                (w_inventory(&physics, s, &s.gls) - psi0).abs() / psi0,
+            ]);
         });
         // Measured 2.3e-11: elements too dry to define a concentration keep
         // their last one (3e-15 without wetting and drying, the P4.2 gate)
         assert!(max_err < 5e-11, "inventories drifted by {max_err:.3e}");
+        // Measured 7.9e-11, the same mechanism: ψ rises towards the shore,
+        // and nodes that dry and rewet keep their last value (2.4e-13 with
+        // only the vertical profile)
+        assert!(psi_err < 2e-10, "ψ inventory drifted by {psi_err:.3e}");
     }
 
     /// TODO P4.5 gate: a stratified lake at rest with dry land stays at
@@ -3611,6 +3742,131 @@ mod tests {
                 .count();
             assert_eq!(differing, 0, "{name} differs at {differing} values");
         }
+    }
+
+    /// TODO P4.4 gate: a current carries turbulence downstream. A patch of
+    /// `k` (Gaussian along a channel, 300 m wide, `l` = 1 m, k-ε) in a
+    /// uniform 0.5 m/s current through a periodic channel 10 m deep, with no
+    /// shear, drag or stratification: nothing produces turbulence, the
+    /// patch decays (to half its peak in 30 min) and is carried by the
+    /// current. Its centroid moves `U·t` = 900 m in 30 min; kept in its
+    /// columns (`with_turbulence_advection(None)`, as GOTM) it stays put.
+    #[test]
+    fn a_current_carries_turbulence_downstream() {
+        use crate::physics::GlsMixing;
+        use crate::physics::vertical_mixing::VerticalMixing;
+        use crate::solver::rhs::VerticalAdvection;
+
+        let (length, width, depth, speed) = (4e3, 200.0, 10.0, 0.5);
+        let (x0, spread, peak, scale_length) = (1e3, 300.0, 1e-5, 1.0);
+        let run = |advection: Option<VerticalAdvection>| {
+            let mesh = Arc::new(Mesh2D::channel_periodic_x(0.0, length, 0.0, width, 40, 1));
+            let ops = Arc::new(DGOperators2D::new(2));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+            let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+            let sigma = SigmaGrid::new(10, UniformStretching);
+            let swe = PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(G),
+                Reflective2D::default(),
+            )
+            .with_bathymetry(bathymetry.clone())
+            .build();
+            let gls = GlsMixing::k_epsilon().with_background(0.0, 0.0);
+            let cm0 = gls.cm0();
+            let physics = Hydrostatic3D::new(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                Arc::new(sigma.clone()),
+                bathymetry,
+                Arc::new(CoriolisSource2D::f_plane(0.0)),
+                LinearEOS::default(),
+                gls.clone(),
+                swe,
+                no_stress(),
+                G,
+                RHO0,
+            )
+            .with_turbulence_advection(advection);
+            let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+            let nw = nl + 1;
+            let eos = LinearEOS::default();
+            let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+            state.temp.fill(eos.t0);
+            state.salt.fill(eos.s0);
+            state.u.fill(speed);
+            state.ubar.data.fill(speed);
+            let [k_min, psi_min] = gls.initial_turbulence().expect("prognostic");
+            state.tke = vec![k_min; mesh.n_elements * nn * nw];
+            state.gls = vec![psi_min; mesh.n_elements * nn * nw];
+            let mut xs = Vec::with_capacity(mesh.n_elements * nn);
+            for k in 0..mesh.n_elements {
+                for i in 0..nn {
+                    let [x, _] = mesh.reference_to_physical(
+                        ElementIndex::new(k),
+                        ops.nodes_r[i],
+                        ops.nodes_s[i],
+                    );
+                    xs.push(x);
+                    let idx = k * nn + i;
+                    let k_patch = k_min + peak * (-((x - x0) / spread).powi(2)).exp();
+                    let eps = cm0.powi(3) * k_patch.powf(1.5) / scale_length;
+                    for j in 1..nl {
+                        state.tke[idx * nw + j] = k_patch;
+                        state.gls[idx * nw + j] = gls.psi(k_patch, eps);
+                    }
+                }
+            }
+            physics.update_density(&mut state);
+            let mut integrator = ModeSplitIntegrator::new();
+            let dt = 20.0;
+            for n in 0..90 {
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+            }
+            // The excess k's centroid and peak at mid-depth
+            let mid = nl / 2;
+            let (mut moment, mut mass, mut top) = (0.0, 0.0, 0.0_f64);
+            for k in 0..mesh.n_elements {
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let excess = state.tke[idx * nw + mid] - k_min;
+                    let weight = geom.node_mass(k, i) * excess;
+                    moment += weight * xs[idx];
+                    mass += weight;
+                    top = top.max(excess);
+                }
+            }
+            let speed_error = max_or_nan(state.u.iter().map(|u| (u - speed).abs()));
+            (moment / mass, top / peak, speed_error)
+        };
+        let travel = speed * 90.0 * 20.0;
+        let (advected, decay, speed_error) = run(Some(VerticalAdvection::LimitedAkima));
+        let (local, local_decay, _) = run(None);
+        // The current is untouched: no shear, no drag
+        assert!(
+            speed_error < 1e-10,
+            "the current changed by {speed_error:.3e} m/s"
+        );
+        // Measured 0.52 of the peak left, both runs
+        assert!(
+            (0.3..0.8).contains(&decay) && (0.3..0.8).contains(&local_decay),
+            "test regime: the patch kept {decay:.3} / {local_decay:.3} of its peak"
+        );
+        // Measured: 900.01 m (U·t = 900 m); in place, 1.3e-9 m
+        assert!(
+            (advected - x0 - travel).abs() < 0.01 * travel,
+            "the patch moved {:.2} m, the current {travel:.0} m",
+            advected - x0
+        );
+        assert!(
+            (local - x0).abs() < 1e-6 * travel,
+            "a column-local patch moved {:.3e} m",
+            local - x0
+        );
     }
 
     /// The sea outside the fjord: uniform temperature and salinity, no

@@ -97,8 +97,13 @@
 //! near-surface diffusivity. Use k-ω (`a` 2.5, `L` 0.24) or the generic
 //! model (2.0, 0.19, designed for it) with waves.
 //!
-//! The model is local to each column: `k` and `ψ` are not advected
-//! horizontally or vertically (as in GOTM; ROMS advects them).
+//! In the 3D model `k` and `ψ` are also advected by the flow, as ROMS does
+//! (`Hydrostatic3D::with_turbulence_advection`, on by default): carried
+//! through the baroclinic stages over the control volumes of the w-points,
+//! then stepped here in each column (operator splitting). The step takes a
+//! point that the advection left without positive `k` or `ψ` as having no
+//! turbulence (both at their minima). With the advection off the model is
+//! local to each column, as in GOTM.
 //!
 //! # Verification
 //!
@@ -908,9 +913,25 @@ impl VerticalMixing for GlsMixing {
         }
 
         if nl >= 2 {
-            // P, B, ε of the old turbulence
+            // P, B, ε of the old turbulence, at least the minima. Advection
+            // (`Hydrostatic3D::with_turbulence_advection`) can leave values
+            // below them, or not even positive: such a point is taken as
+            // having no turbulence (k and ε at their minima), not as `k`
+            // with the minimum ε, whose length `k^(3/2)/ε_min` would mix the
+            // column at tens of m²/s
             for j in 1..nl {
-                let eps = self.dissipation(tke[j], psi[j]);
+                let valid = tke[j] > 0.0 && psi[j] > 0.0;
+                let (k, unbounded) = if valid {
+                    let k = tke[j].max(self.k_min);
+                    (k, self.dissipation(k, psi[j]))
+                } else {
+                    (self.k_min, self.eps_min)
+                };
+                let eps = unbounded.max(self.eps_min);
+                if !valid || k != tke[j] || eps != unbounded {
+                    tke[j] = k;
+                    psi[j] = self.psi(k, eps);
+                }
                 let (num, nuh) = self.coefficients(tke[j], eps, f.n2[j]);
                 f.eps[j] = eps;
                 f.num[j] = num;
@@ -1204,6 +1225,66 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Advection can leave `k` or `ψ` not even positive (an upwind DG
+    /// undershoot): the step takes such a point as having no turbulence
+    /// (`k`, `ε` at their minima), and the rest of the column is stepped as
+    /// if it had been. Before, a negative `ψ` gave a negative or NaN `ε`
+    /// there, the implicit solve spread the NaN over the column, and the
+    /// final bounds reset the whole column's turbulence to the minima.
+    #[test]
+    fn turbulence_that_is_not_positive_is_taken_as_none() {
+        for gls in [
+            GlsMixing::k_epsilon(),
+            GlsMixing::k_omega(),
+            GlsMixing::generic(),
+        ] {
+            let [k_min, psi_min] = gls.initial_turbulence().expect("prognostic");
+            let run = |bad: bool| {
+                let mut column = Homogeneous::new(&gls, 10, 10.0, 0.01, 0.0, 1e-4, 1e-7);
+                if bad {
+                    column.tke[3] = -1e-6;
+                    column.gls[4] = -1e-9;
+                    column.gls[5] = 0.0;
+                    column.tke[6] = f64::NAN;
+                } else {
+                    // What they are taken as
+                    for j in 3..=6 {
+                        column.tke[j] = k_min;
+                        column.gls[j] = psi_min;
+                    }
+                }
+                let mut scratch = Vec::new();
+                let av = column.step(&gls, 60.0, &mut scratch);
+                (column.tke, column.gls, av)
+            };
+            let (bad, reference) = (run(true), run(false));
+            assert!(
+                bad.0
+                    .iter()
+                    .chain(&bad.1)
+                    .chain(&bad.2)
+                    .all(|x| x.is_finite() && *x > 0.0),
+                "{:?}: k {:?}, ψ {:?}",
+                gls.parameters(),
+                bad.0,
+                bad.1
+            );
+            // Away from the bad points the column is the reference's
+            for (name, a, b) in [("k", &bad.0, &reference.0), ("ψ", &bad.1, &reference.1)] {
+                for j in [1, 8, 9] {
+                    assert!(
+                        (a[j] - b[j]).abs() <= 1e-12 * b[j].abs(),
+                        "{:?}: {name} at w-point {j}: {:.6e} against {:.6e}",
+                        gls.parameters(),
+                        a[j],
+                        b[j]
+                    );
+                }
+            }
+            assert!(bad.0[1] > 10.0 * k_min, "test regime: k {:.3e}", bad.0[1]);
         }
     }
 
