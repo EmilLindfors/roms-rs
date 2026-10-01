@@ -1172,8 +1172,8 @@ mod tests {
     /// water shallower than 1 m, elsewhere to 2e-3 °C. The layer means may
     /// leave it: the water at the bed is 0.26 °C colder than the bed layer's
     /// mean, and rising, it cools the layer (1.0e-3 °C below the initial
-    /// range with Akima, 1.6e-3 °C with TVD). Upwind freezes the bed layer
-    /// at the wall and stays inside.
+    /// range with Akima and limited Akima, 1.6e-3 °C with TVD). Upwind
+    /// freezes the bed layer at the wall and stays inside.
     #[test]
     fn a_beach_wets_and_dries_in_3d() {
         let (physics, mut state, _) = beach_3d(0.3);
@@ -2315,28 +2315,40 @@ mod tests {
         );
     }
 
+    /// What [`lock_exchange`] measures.
+    struct LockExchange {
+        /// The Froude numbers `U/√(g′H)` of the dense and the light front
+        /// over the window (after the collapse of the lock).
+        froude: [f64; 2],
+        /// How far T left its initial range at the end (°C).
+        t_excess: f64,
+        /// The largest horizontal viscosity of each element at the end
+        /// (m²/s).
+        largest_viscosity: Vec<f64>,
+    }
+
     /// The lock exchange (Ilıcak et al. 2012, scaled): an 8 km channel,
     /// 20 m deep, 5 °C colder left of the middle, at rest (`g′ = gαΔT` =
     /// 8.3e-3 m/s², `√(g′H)` = 0.41 m/s), with the horizontal Kuzmin tracer
     /// limiter, vertical viscosity 1e-4 m²/s and `f = 0`. At `order` on `n_x`
-    /// elements along the channel and `levels` levels, with horizontal
-    /// viscosity `nu` (m²/s), the tracers' `vertical_advection` and steps of
-    /// `dt` (s).
+    /// elements along the channel and `levels` levels, with the horizontal
+    /// `viscosity` of the shear, the tracers' `vertical_advection` and steps
+    /// of `dt` (s), measured over the times `window` (s; see
+    /// [`LockExchange`]).
     ///
-    /// Returns the Froude numbers `U/√(g′H)` of the dense and the light
-    /// front between the times `window` (s; after the collapse of the lock),
-    /// and how far T left its initial range at the end (°C). The fronts are where the bed (surface)
-    /// layer's dense (light) water ends: the middle plus its length there,
-    /// from its fraction integrated along the channel.
+    /// The fronts are where the bed (surface) layer's dense (light) water
+    /// ends: the middle plus its length there, from its fraction integrated
+    /// along the channel.
     fn lock_exchange(
         order: usize,
         n_x: usize,
         levels: usize,
-        nu: f64,
+        viscosity: crate::solver::rhs::HorizontalViscosity3D,
         vertical_advection: crate::solver::rhs::VerticalAdvection,
         dt: f64,
         window: [f64; 2],
-    ) -> [f64; 3] {
+    ) -> LockExchange {
+        use crate::solver::rhs::{ViscosityScratch3D, largest_horizontal_viscosity_3d};
         use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
         let (length, width, depth, delta_t) = (8e3, 500.0, 20.0, 5.0);
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, n_x, 1));
@@ -2367,7 +2379,8 @@ mod tests {
             G,
             RHO0,
         )
-        .with_horizontal_viscosity(nu)
+        .with_horizontal_viscosity(viscosity.background)
+        .with_smagorinsky_viscosity(viscosity.smagorinsky)
         .with_vertical_advection(vertical_advection)
         .with_tracer_limiter(TracerLimiter3DConfig {
             limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
@@ -2423,10 +2436,28 @@ mod tests {
                 .iter()
                 .map(|&t| (t - cold).max(warm - t) - delta_t),
         );
+        // The largest horizontal viscosity of each element at the end
+        let mut largest_viscosity = vec![0.0; mesh.n_elements];
+        largest_horizontal_viscosity_3d(
+            &mut largest_viscosity,
+            &state,
+            viscosity,
+            &mesh,
+            &ops,
+            &geom,
+            &physics.bathymetry,
+            &sigma,
+            &physics.boundaries,
+            physics.min_column_depth,
+            &mut ViscosityScratch3D::new(mesh.n_elements, &ops),
+        );
         let span = (last - first) as f64 * dt;
-        let [dense, light] =
-            [0, 1].map(|f| (positions[1][f] - positions[0][f]).abs() / span / speed_scale);
-        [dense, light, t_excess]
+        let froude = [0, 1].map(|f| (positions[1][f] - positions[0][f]).abs() / span / speed_scale);
+        LockExchange {
+            froude,
+            t_excess,
+            largest_viscosity,
+        }
     }
 
     /// TODO P4.6 gate: the lock exchange ([`lock_exchange`]) at P1 on
@@ -2445,8 +2476,19 @@ mod tests {
     #[test]
     fn a_lock_exchange_runs_at_the_gravity_current_speed() {
         use crate::solver::rhs::VerticalAdvection::Akima;
-        let [dense, light, t_excess] =
-            lock_exchange(1, 32, 10, 0.0, Akima, 30.0, [3600.0, 10800.0]);
+        let LockExchange {
+            froude: [dense, light],
+            t_excess,
+            ..
+        } = lock_exchange(
+            1,
+            32,
+            10,
+            Default::default(),
+            Akima,
+            30.0,
+            [3600.0, 10800.0],
+        );
         assert!(
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
@@ -2484,14 +2526,26 @@ mod tests {
     /// Reynolds numbers `ΔU·Δx/ν` (ΔU = 0.4 m/s, Δx = element size / N) the
     /// bound is 7–10 at 250 m and below, 10–20 at 500 m.
     ///
-    /// With Akima vertical advection (the default) the same runs pass, but
-    /// at 125 m and ν = 10 the bed layers undershoot by 0.23 °C next to the
-    /// sharp interface: the horizontal Kuzmin limiter bounds T only along the
-    /// layers. TVD keeps it to 4e-12 °C.
+    /// With unlimited Akima vertical advection the same runs pass, but at
+    /// 125 m and ν = 10 the bed layers undershoot by 0.23 °C next to the
+    /// sharp interface, in their element means. TVD and the default limited
+    /// Akima keep it to 4e-12 °C ([`a_sharp_lock_exchange_interface_stays_in_range`]).
     #[test]
     fn a_p2_lock_exchange_runs_with_horizontal_viscosity() {
-        use crate::solver::rhs::VerticalAdvection::Tvd;
-        let [dense, light, t_excess] = lock_exchange(2, 32, 10, 10.0, Tvd, 40.0, [3600.0, 7200.0]);
+        use crate::solver::rhs::{HorizontalViscosity3D, VerticalAdvection::Tvd};
+        let LockExchange {
+            froude: [dense, light],
+            t_excess,
+            ..
+        } = lock_exchange(
+            2,
+            32,
+            10,
+            HorizontalViscosity3D::constant(10.0),
+            Tvd,
+            40.0,
+            [3600.0, 7200.0],
+        );
         assert!(
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
@@ -2507,6 +2561,109 @@ mod tests {
             (dense - light).abs() < 0.01,
             "the fronts run at Fr = {dense:.4} and {light:.4}"
         );
+    }
+
+    /// TODO P4.5 gate: Smagorinsky's viscosity holds the P2 lock exchange
+    /// ([`lock_exchange`]) without a constant one, and only where the flow
+    /// needs it. On 250 m, ten levels, 40 s steps, `C_s` = 0.7 and the
+    /// default (limited Akima) vertical advection the fronts run at
+    /// Fr = 0.504 (dense) and 0.499 (light) over hours 1–2, T stays in its
+    /// range to 2e-12 °C, and after 2 h ν reaches 19 m²/s at the fronts' heads
+    /// and ≈ 5 m²/s along the interface between them (the constant ν that
+    /// holds it is 5–7 m²/s everywhere), while the water at rest beyond the
+    /// fronts gets ≤ 0.1 m²/s (the median element 0.13 m²/s).
+    ///
+    /// `C_s` = 0.5 also holds it (Fr 0.503 and 0.497; ν ≤ 13), 0.4 does not
+    /// (NaN within 2 h). On 125 m `C_s` = 0.4 suffices: the strain at the
+    /// node spacing grows as the spacing shrinks, so ν falls with the grid
+    /// as the constant ν had to by hand (0.5: ν ≈ 1–3 m²/s along the
+    /// interface, ≤ 10 at the heads; Fr 0.505 and 0.505).
+    #[test]
+    fn a_p2_lock_exchange_runs_with_smagorinsky_viscosity() {
+        use crate::solver::rhs::{HorizontalViscosity3D, VerticalAdvection};
+        let LockExchange {
+            froude: [dense, light],
+            t_excess,
+            largest_viscosity,
+        } = lock_exchange(
+            2,
+            32,
+            10,
+            HorizontalViscosity3D::smagorinsky(0.7),
+            VerticalAdvection::default(),
+            40.0,
+            [3600.0, 7200.0],
+        );
+        assert!(
+            t_excess < 1e-9,
+            "T left its initial range by {t_excess:.3e} °C"
+        );
+        // Measured 0.504 and 0.499
+        for (front, froude) in [("dense", dense), ("light", light)] {
+            assert!(
+                (0.46..0.52).contains(&froude),
+                "the {front} front runs at Fr = {froude:.4}"
+            );
+        }
+        assert!(
+            (dense - light).abs() < 0.01,
+            "the fronts run at Fr = {dense:.4} and {light:.4}"
+        );
+        // Measured 18.9 at the heads, ≤ 0.1 within 2 km of the ends
+        let n = largest_viscosity.len();
+        let largest = max_or_nan(largest_viscosity.iter().copied());
+        let beyond = max_or_nan(
+            largest_viscosity[..n / 4]
+                .iter()
+                .chain(&largest_viscosity[3 * n / 4..])
+                .copied(),
+        );
+        assert!(largest > 10.0, "ν reaches only {largest:.3} m²/s");
+        assert!(
+            beyond < 0.5,
+            "ν reaches {beyond:.3} m²/s in the water beyond the fronts"
+        );
+    }
+
+    /// TODO P4.5 gate: the vertical advection keeps a sharp interface's
+    /// layer means in range. The P2 lock exchange ([`lock_exchange`]) on
+    /// 125 m, ten levels, ν = 10 m²/s, 40 s steps, over 3 h: with Akima the
+    /// bed layers undershoot by 0.23 °C next to the interface, in their
+    /// element means (one layer of an element at 7.27 °C in a 7.5–12.5 °C
+    /// range), which the horizontal Kuzmin limiter cannot change: it bounds
+    /// the nodes around those means. Akima under a TVD limiter (the default,
+    /// `LimitedAkima`) keeps T in range to 4e-12 °C (TVD: the same), with the
+    /// fronts at Fr 0.502 and 0.501 (Akima: 0.502 and 0.500).
+    ///
+    /// Akima's undershoot comes and goes with the interface: with ν = 15 it
+    /// is 0.016 °C after 2 h, with ν = 5–10 on 125–250 m ≤ 2e-8 °C at 2 h.
+    #[test]
+    fn a_sharp_lock_exchange_interface_stays_in_range() {
+        use crate::solver::rhs::{HorizontalViscosity3D, VerticalAdvection};
+        let LockExchange {
+            froude: [dense, light],
+            t_excess,
+            ..
+        } = lock_exchange(
+            2,
+            64,
+            10,
+            HorizontalViscosity3D::constant(10.0),
+            VerticalAdvection::default(),
+            40.0,
+            [3600.0, 10800.0],
+        );
+        assert!(
+            t_excess < 1e-9,
+            "T left its initial range by {t_excess:.3e} °C"
+        );
+        // Measured 0.502 and 0.501
+        for (front, froude) in [("dense", dense), ("light", light)] {
+            assert!(
+                (0.46..0.52).contains(&froude),
+                "the {front} front runs at Fr = {froude:.4}"
+            );
+        }
     }
 
     /// TODO P4.5 gate: the horizontal viscosity of the 3D shear in the mode
@@ -2622,5 +2779,131 @@ mod tests {
             "the shear left its profile by {rest:.3e} m/s"
         );
         assert!(mean < 1e-11, "the depth mean (or v, η) moved by {mean:.3e}");
+    }
+
+    /// TODO P4.5 gate: Smagorinsky's viscosity of the shear reaches the
+    /// depth mean through `G`, and the momentum is conserved. A shear
+    /// `u = p(σ)·cos(ky)` along a doubly periodic box (as in the shear-mode
+    /// gate) whose profile is lopsided (`Σ_l Δσ_l |p_l| p_l ≠ 0`): `ν_l`
+    /// follows `|p_l|`, so the column sum of the layers' stresses,
+    /// `∂_y(D Σ_l Δσ_l ν_l ∂_y u′_l)`, is not zero, and the depth mean, at
+    /// rest at first, moves. Its integral `∫ D ū`, the total momentum, stays
+    /// zero, and `ū` stays the layers' depth mean. The step bound follows ν:
+    /// at rest it is the advective one, and where the viscous one is the
+    /// tighter it falls as `1/C_s²`.
+    #[test]
+    fn smagorinsky_shear_stress_reaches_the_depth_mean_and_conserves_momentum() {
+        let (length, depth, levels) = (10e3, 20.0, 6);
+        let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, length, 0.0, length, 2, 8));
+        let ops = Arc::new(DGOperators2D::new(3));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let sigma = SigmaGrid::new(levels, UniformStretching);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let mut physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry,
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(0.0, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_smagorinsky_viscosity(0.5);
+        let k = 2.0 * std::f64::consts::PI / length;
+        // p = 0.1·((2σ + 1)² − ⅓): zero depth mean, lopsided
+        let raw: Vec<f64> = sigma
+            .sigma_rho()
+            .iter()
+            .map(|s| (2.0 * s + 1.0).powi(2))
+            .collect();
+        let offset = sigma.depth_average(&raw);
+        let profile: Vec<f64> = raw.iter().map(|r| 0.1 * (r - offset)).collect();
+        let (nn, nl) = (ops.n_nodes, levels);
+        let eos = LinearEOS::default();
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        state.temp.fill(eos.t0);
+        state.salt.fill(eos.s0);
+        for idx in 0..mesh.n_elements * nn {
+            let (e, i) = (idx / nn, idx % nn);
+            let [_, y] =
+                mesh.reference_to_physical(ElementIndex::new(e), ops.nodes_r[i], ops.nodes_s[i]);
+            for (l, p) in profile.iter().enumerate() {
+                state.u[idx * nl + l] = p * (k * y).cos();
+            }
+        }
+        physics.update_density(&mut state);
+        let momentum = |s: &Solution3D| {
+            let mut column = DGSolution2D::new(mesh.n_elements, nn);
+            for (idx, c) in column.data.iter_mut().enumerate() {
+                *c = (s.eta.data[idx] + depth) * s.ubar.data[idx];
+            }
+            column.integrate(&ops, &geom)
+        };
+
+        // The step bound follows Smagorinsky's ν: none at rest, ∝ 1/C_s²
+        // where the viscous bound is the tighter one
+        let mut rest = state.clone();
+        rest.u.fill(0.0);
+        let advective = physics.compute_dt(&rest, 1.0);
+        let viscous = |physics: &mut Physics, cs: f64| {
+            physics.horizontal_viscosity.smagorinsky = cs;
+            physics.compute_dt(&state, 1.0)
+        };
+        let (fifty, hundred) = (viscous(&mut physics, 50.0), viscous(&mut physics, 100.0));
+        assert!(fifty < 0.1 * advective, "{fifty} s against {advective} s");
+        assert!(
+            (fifty / hundred - 4.0).abs() < 1e-10,
+            "the bound fell by {} from C_s 50 to 100",
+            fifty / hundred
+        );
+        physics.horizontal_viscosity.smagorinsky = 0.5;
+
+        // ν ≤ 9 m²/s (C_s Δ = 0.5·833 m, |S| ≤ 5e-5 s⁻¹)
+        let dt = 500.0;
+        let mut integrator = ModeSplitIntegrator::new();
+        for n in 0..40 {
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+        }
+        let moved = max_or_nan(state.ubar.data.iter().map(|u| u.abs()));
+        // The momentum that moved, `∫ D|ū|`, and what is left of it in total
+        let mut speed = DGSolution2D::new(mesh.n_elements, nn);
+        for (idx, s) in speed.data.iter_mut().enumerate() {
+            *s = (state.eta.data[idx] + depth) * state.ubar.data[idx].abs();
+        }
+        let (total, moved_momentum) = (momentum(&state), speed.integrate(&ops, &geom));
+        let consistency = max_or_nan((0..mesh.n_elements * nn).map(|idx| {
+            (sigma.depth_average(&state.u[idx * nl..(idx + 1) * nl]) - state.ubar.data[idx]).abs()
+        }));
+        // Measured: ū up to 1.1e-4 m/s; the total 9e-10 of the moved
+        // momentum, growing with it step by step (round-off of the BR1
+        // sums, ≈ 7e-12 of ∫|G| per step); consistency 3e-18
+        assert!(
+            moved > 1e-5,
+            "test regime: the depth mean moved by {moved:.3e}"
+        );
+        assert!(
+            total.abs() < 1e-8 * moved_momentum,
+            "the momentum changed by {:.3e} of what moved",
+            total / moved_momentum
+        );
+        assert!(
+            consistency < 1e-12,
+            "ū left the layers' depth mean by {consistency:.3e}"
+        );
     }
 }
