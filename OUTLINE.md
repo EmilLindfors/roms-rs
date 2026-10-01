@@ -55,6 +55,9 @@ src/
 │  # ---- Solver ----
 ├── solver/
 │   ├── state/        # DGSolution1D/2D, SWESolution2D (SoA), Solution3D
+│   ├── core/         # Solution containers; element-block loops of the 3D
+│   │                 # kernels (blocks.rs: parallel with `parallel`, bit-
+│   │                 # identical to serial; thread-local scratch pool)
 │   ├── rhs/          # RHS kernels: scalar/SWE 1D/2D (collocated or entropy-stable
 │   │                 # split form), tracer, diffusion (BR1), 3D advection,
 │   │                 # 3D layer transports (Ω and inventory-form tracers,
