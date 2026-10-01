@@ -79,7 +79,7 @@ use crate::solver::rhs::{
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
-use crate::source::CoriolisSource2D;
+use crate::source::{CoriolisSource2D, RiverSources};
 use crate::time::{Integrable, ModeSplitPhysics};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -137,6 +137,9 @@ where
     /// A parent model's profiles at open boundaries and in a relaxation
     /// band, if nested (see [`Self::with_nesting`]).
     pub nesting: Option<Nesting3D>,
+    /// Rivers, as volume sources with their own tracers (see
+    /// [`Self::with_rivers`]).
+    pub rivers: Option<Arc<RiverSources>>,
     /// Warns once about stratified open boundaries without nesting.
     open_boundary_check: Once,
     /// Layer transports (and their Ω) of the last 3D stage.
@@ -203,6 +206,7 @@ where
             bottom_drag: None,
             horizontal_viscosity: HorizontalViscosity3D::default(),
             nesting: None,
+            rivers: None,
             open_boundary_check: Once::new(),
             transport_scratch,
             slow_forcing_scratch: Mutex::new(None),
@@ -210,6 +214,23 @@ where
             viscosity_scratch: Mutex::new(None),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
         }
+    }
+
+    /// Rivers as volume sources (see [`crate::source::river`]). The mode
+    /// splitter adds their discharge to every barotropic stage and to the
+    /// barotropic transport of the step; the 3D layers get it shared out by
+    /// each river's [`crate::source::RiverProfile`], with the river water's
+    /// temperature and salinity, and no momentum. Do not also give them to
+    /// the 2D module.
+    ///
+    /// # Panics
+    /// If a river's profile does not fit the σ-levels.
+    pub fn with_rivers(mut self, mut rivers: RiverSources) -> Self {
+        if let Err(error) = rivers.set_levels(&self.sigma) {
+            panic!("Hydrostatic3D::with_rivers: {error}");
+        }
+        self.rivers = Some(Arc::new(rivers));
+        self
     }
 
     /// Default of [`Self::with_min_column_depth`] (m), ROMS's usual `Dcrit`.
@@ -603,6 +624,13 @@ where
             };
             compute_transport_rhs_3d(rhs, state, transport, &config);
         });
+        // The river water's tracers, with the volume the layer transports
+        // gave the layers
+        if let Some(rivers) = barotropic.rivers {
+            let nn = state.n_nodes;
+            rivers.add_tracer_sources(&mut rhs.temp, nn, |r| r.temperature.at(t));
+            rivers.add_tracer_sources(&mut rhs.salt, nn, |r| r.salinity.at(t));
+        }
         if let Some(columns) = &columns {
             let thin = |idx| self.is_thin(state, idx);
             columns.relax_tracers(state, &self.bathymetry, &self.sigma, rhs, thin);
@@ -847,6 +875,10 @@ where
 
     fn bathymetry(&self) -> &Bathymetry2D {
         &self.bathymetry
+    }
+
+    fn rivers(&self) -> Option<&RiverSources> {
+        self.rivers.as_deref()
     }
 
     fn momentum_rhs_into(&self, state: &Solution3D, t: f64, out: &mut Solution3D) {

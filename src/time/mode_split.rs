@@ -20,6 +20,9 @@
 //!    barotropic state, with `ū = D̄ū / D̄`. The fluxes of every RK stage are
 //!    accumulated with the secondary weights into the transport that moved
 //!    `η` over the step, `η̄ − ηⁿ = −Δt·∇·DU_avg2` ([`BarotropicTransport`]).
+//!    Rivers ([`ModeSplitPhysics::rivers`]) add their discharge to every
+//!    stage and are averaged the same way, `+ Δt·Q̄/A_k` in their elements
+//!    (see [`crate::source::river`]).
 //! 3. **3D stages.** SSP-RK3 on the 3D fields, with the velocity and the
 //!    tracers stepped as inventories `H_z u`, `H_z C` and divided by the new
 //!    `H_z` at the end of the step. `η, ū, v̄` get the constant rates of the
@@ -78,6 +81,7 @@ use crate::solver::rhs::{
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
+use crate::source::{RiverInflow, RiverSources};
 use crate::time::{Integrable, IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -135,7 +139,11 @@ pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
 /// - elements the positivity limiter or wet/dry correction changed (they
 ///   keep the element mean).
 ///
-/// Mass sources in the 2D module are not part of the transport.
+/// The rivers of the 3D model ([`ModeSplitPhysics::rivers`]) add their
+/// discharge to every stage and are averaged the same way, into
+/// [`Self::discharge`], so that with them
+/// `η̄ − ηⁿ = −Δt·∇·DU_avg2 + Δt·Σ Q̄/A_k` (see [`crate::source::river`]).
+/// Other mass sources in the 2D module are not part of the transport.
 pub struct BarotropicTransport {
     /// Nodal transport `hu` (m²/s).
     pub hu: DGSolution2D,
@@ -144,14 +152,17 @@ pub struct BarotropicTransport {
     /// Mass flux out of every element face node (m²/s), laid out as
     /// `(k · 4 + face) · n_face_nodes + fi`.
     pub face: Vec<f64>,
+    /// Discharge of every river averaged with the same weights (m³/s).
+    pub discharge: Vec<f64>,
 }
 
 impl BarotropicTransport {
-    fn new(n_elements: usize, n_nodes: usize, n_face_values: usize) -> Self {
+    fn new(n_elements: usize, n_nodes: usize, n_face_values: usize, n_rivers: usize) -> Self {
         Self {
             hu: DGSolution2D::new(n_elements, n_nodes),
             hv: DGSolution2D::new(n_elements, n_nodes),
             face: vec![0.0; n_face_values],
+            discharge: vec![0.0; n_rivers],
         }
     }
 
@@ -159,6 +170,7 @@ impl BarotropicTransport {
         self.hu.fill(0.0);
         self.hv.fill(0.0);
         self.face.fill(0.0);
+        self.discharge.fill(0.0);
     }
 
     /// Add `c ×` the nodal transport of `state` and the face fluxes `face`.
@@ -211,6 +223,14 @@ pub trait ModeSplitPhysics {
 
     /// Bed elevation `B`; the depth is `η − B`.
     fn bathymetry(&self) -> &Bathymetry2D;
+
+    /// The rivers, with their levels set, if any. The splitter adds them to
+    /// every barotropic stage (they must not also be a source of the 2D
+    /// module) and hands their step-mean discharge to the 3D stages in
+    /// [`BarotropicFlux::rivers`] (see [`crate::source::river`]).
+    fn rivers(&self) -> Option<&RiverSources> {
+        None
+    }
 
     /// Overwrite `out.u` and `out.v` with the explicit velocity tendency of
     /// `state` (`∂u/∂t`, m/s²): everything but the terms that move with the
@@ -517,7 +537,7 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn new(state: &Solution3D, n_face_nodes: usize) -> Self {
+    fn new(state: &Solution3D, n_face_nodes: usize, n_rivers: usize) -> Self {
         let (ne, nn) = (state.n_elements, state.n_nodes);
         let n_face_values = ne * 4 * n_face_nodes;
         Self {
@@ -530,7 +550,7 @@ impl Buffers {
             q_avg: SWESolution2D::new(ne, nn),
             forcing: SWESolution2D::new(ne, nn),
             history: SlowForcingHistory::new(ne, nn),
-            transport: BarotropicTransport::new(ne, nn, n_face_values),
+            transport: BarotropicTransport::new(ne, nn, n_face_values, n_rivers),
             face_mass: vec![0.0; n_face_values],
             mean_u: DGSolution2D::new(ne, nn),
             mean_v: DGSolution2D::new(ne, nn),
@@ -623,6 +643,8 @@ impl ModeSplitIntegrator {
         let sigma = physics.sigma();
         let bathymetry = physics.bathymetry();
         let barotropic = physics.barotropic();
+        let rivers = physics.rivers();
+        let n_rivers = rivers.map_or(0, RiverSources::len);
         let Buffers {
             rhs_n,
             concentrations,
@@ -643,9 +665,15 @@ impl ModeSplitIntegrator {
             rate_hu,
             rate_hv,
             drag_rate,
-        } = self
-            .buffers
-            .get_or_insert_with(|| Buffers::new(state, barotropic.operators().n_face_nodes));
+        } = self.buffers.get_or_insert_with(|| {
+            Buffers::new(state, barotropic.operators().n_face_nodes, n_rivers)
+        });
+        assert_eq!(
+            transport.discharge.len(),
+            n_rivers,
+            "the number of rivers changed between steps"
+        );
+        let nn = state.n_nodes;
 
         // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3);
         // the bottom-drag rates of the step
@@ -689,6 +717,17 @@ impl ModeSplitIntegrator {
                     out.axpy(1.0, g_term);
                     let c = w_secondary * STAGE_WEIGHTS[stage] / n_bt as f64;
                     transport.accumulate(c, s, face_mass);
+                    if let Some(rivers) = rivers {
+                        for (i, mean) in transport.discharge.iter_mut().enumerate() {
+                            let discharge = rivers.discharge(i, time);
+                            let rate = discharge * rivers.inv_area(i);
+                            let k = rivers.element(i).as_usize();
+                            out.data[SWE_VAR_H][k * nn..(k + 1) * nn]
+                                .iter_mut()
+                                .for_each(|h| *h += rate);
+                            *mean += c * discharge;
+                        }
+                    }
                     stage += 1;
                 },
                 |stage, from, dt_stage| {
@@ -722,29 +761,34 @@ impl ModeSplitIntegrator {
 
         // 3. 3D stages with the barotropic state prescribed, the velocity and
         // the tracers as inventories H_z·u, H_z·C (the stage's η sets H_z)
+        let river_inflow = rivers.map(|rivers| RiverInflow {
+            rivers,
+            discharge: &transport.discharge,
+        });
         let barotropic_flux = BarotropicFlux {
             hu: &transport.hu.data,
             hv: &transport.hv.data,
             face: &transport.face,
             eta_rate: &rate_eta.data,
+            rivers: river_inflow,
         };
         let geom = barotropic.geometry();
         // Elements where the pass broke the nodal identity ∂η/∂t = −∇·DU_avg2
         // (WetDry subcells, positivity limiter) carry their tracers as element
         // means for the step
         transport.divergence_into(barotropic.operators(), geom, transport_divergence);
-        let nn = state.n_nodes;
         for (k, mark) in element_means.iter_mut().enumerate() {
             let nodes = k * nn..(k + 1) * nn;
             let bed = bathymetry.element(ElementIndex::new(k));
+            let source = river_inflow.map_or(0.0, |r| r.volume_rate(k));
             let (mut residual, mut scale, mut depth) = (0.0_f64, 0.0_f64, 0.0_f64);
             for ((&rate, &div), (&eta, &b)) in rate_eta.data[nodes.clone()]
                 .iter()
                 .zip(&transport_divergence.data[nodes.clone()])
                 .zip(state.eta.data[nodes].iter().zip(bed))
             {
-                residual = residual.max((rate + div).abs());
-                scale = scale.max(rate.abs()).max(div.abs());
+                residual = residual.max((rate + div - source).abs());
+                scale = scale.max(rate.abs()).max(div.abs()).max(source);
                 depth = depth.max(eta - b);
             }
             // Relative to the flow, and not round-off of a fluid at rest

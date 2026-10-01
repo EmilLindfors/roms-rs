@@ -213,7 +213,8 @@ mod tests {
     use crate::simulation::Simulation;
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
-    use crate::source::CoriolisSource2D;
+    use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+    use crate::source::{CoriolisSource2D, River, RiverProfile, RiverSeries, RiverSources};
     use crate::time::{ModeSplitIntegrator, SSPRK3};
     use crate::types::ElementIndex;
     use crate::vertical::{SigmaGrid, UniformStretching};
@@ -849,6 +850,23 @@ mod tests {
             column.integrate(&self.ops, &self.geom)
         }
 
+        /// `∫ (η − B) dA`.
+        fn volume(&self, state: &Solution3D) -> f64 {
+            let nl = self.sigma.n_levels();
+            self.inventory(state, &vec![1.0; state.n_elements * state.n_nodes * nl])
+        }
+
+        /// [`Self::physics`] with `rivers`.
+        fn physics_with_rivers(&self, rivers: Vec<River>) -> Physics {
+            let sources = RiverSources::new(rivers, &self.mesh, &self.geom, 0.0).unwrap();
+            self.physics().with_rivers(sources)
+        }
+
+        /// Seconds per step of [`Self::run`].
+        fn dt(&self) -> f64 {
+            2.0 * self.length / (G * 8.0).sqrt() / 40.0
+        }
+
         /// One seiche period at 40 steps per period, calling `check` after
         /// every step.
         fn run(
@@ -936,6 +954,127 @@ mod tests {
         assert!(
             max_err < 1e-12,
             "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
+    }
+
+    /// A river into the middle of [`SlopingTide`]'s basin, entering over the
+    /// top 40 % of the column (levels weighted 0, 1/6, 5/6), 20 m³/s: over
+    /// the period it raises the basin by ≈ 4.5 cm and its own element by far
+    /// more each step.
+    fn river(temperature: f64, salinity: f64) -> River {
+        River::new("river", [437.5, 25.0], 20.0)
+            .with_temperature(RiverSeries::constant(temperature))
+            .with_salinity(RiverSeries::constant(salinity))
+            .with_profile(RiverProfile::TopFraction(0.4))
+    }
+
+    /// TODO P1.6/P5.1 gate: a river of the ambient water keeps uniform
+    /// tracers uniform, under the tide over a sloping bed. The river's volume
+    /// enters the barotropic pass, `DU_avg2`'s free-surface rate and the
+    /// layers' Ω consistently, so Ω still closes at the surface; the basin's
+    /// volume grows by exactly `Q·t`.
+    #[test]
+    fn a_river_of_the_ambient_water_keeps_the_tracers_uniform() {
+        let case = SlopingTide::new();
+        let eos = LinearEOS::default();
+        let (t_river, s_river) = (eos.t0 + 2.3, eos.s0 - 0.9);
+        let physics = case.physics_with_rivers(vec![river(t_river, s_river)]);
+        let mut state = case.state(&physics, |_, _| (t_river, s_river));
+        let volume0 = case.volume(&state);
+        let (mut drift, mut residual, mut omega_scale) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let (mut volume_error, mut step) = (0.0_f64, 0);
+        case.run(&physics, &mut state, |s, p| {
+            step += 1;
+            for t in &s.temp {
+                drift = drift.max((t - t_river).abs());
+            }
+            for salt in &s.salt {
+                drift = drift.max((salt - s_river).abs());
+            }
+            residual = residual.max(p.last_surface_residual());
+            omega_scale = omega_scale.max(s.w.iter().fold(0.0, |m, w| m.max(w.abs())));
+            let expected = volume0 + 20.0 * step as f64 * case.dt();
+            volume_error = volume_error.max((case.volume(s) - expected).abs() / volume0);
+        });
+        let rise = (case.volume(&state) - volume0) / (case.length * 100.0);
+        assert!(
+            rise > 0.04,
+            "test regime: the river raised η by {rise:.3} m"
+        );
+        // Measured 8.9e-13
+        assert!(
+            drift < 1e-11 * eos.s0,
+            "uniform tracers drifted by {drift:.3e} with the river"
+        );
+        assert!(omega_scale > 1e-5, "test regime: Ω {omega_scale:.2e}");
+        // Measured 3.5e-18 against Ω of 6.8e-3 m/s
+        assert!(
+            residual < 1e-10 * omega_scale,
+            "Ω surface residual {residual:.2e} (Ω scale {omega_scale:.2e})"
+        );
+        // Measured 2.0e-14
+        assert!(
+            volume_error < 1e-13,
+            "the volume differs from V₀ + Q·t by {volume_error:.2e} (relative)"
+        );
+    }
+
+    /// TODO P1.6/P5.1 gate: fresh, warm river water adds exactly `Q·C·t` to
+    /// the tracer inventories, with gradients, the tide and vertical
+    /// diffusion, and stays near the surface it entered at.
+    #[test]
+    fn river_water_adds_exactly_its_tracer_inventory() {
+        let case = SlopingTide::new();
+        let (t_river, s_river) = (18.0, 0.0);
+        // The fresh front of the plume is a discontinuity: unlimited P2
+        // overshoots it (0.27 psu above the initial maximum within the
+        // period, where the tide alone gives 0.05)
+        let physics = case
+            .physics_with_rivers(vec![river(t_river, s_river)])
+            .with_tracer_limiter(TracerLimiter3DConfig {
+                limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                ..TracerLimiter3DConfig::default()
+            });
+        let mut state = case.state(&physics, |x, s| {
+            (
+                10.0 + 3.0 * x / case.length - 2.0 * s,
+                33.0 + x / case.length + s,
+            )
+        });
+        let t0 = case.inventory(&state, &state.temp);
+        let s0 = case.inventory(&state, &state.salt);
+        let salt_max = state.salt.iter().copied().fold(0.0, f64::max);
+        let (mut max_err, mut step, mut salt_range) = (0.0_f64, 0, (f64::INFINITY, 0.0_f64));
+        case.run(&physics, &mut state, |s, _| {
+            step += 1;
+            let volume = 20.0 * step as f64 * case.dt();
+            max_err = max_err
+                .max((case.inventory(s, &s.temp) - t0 - volume * t_river).abs() / t0)
+                .max((case.inventory(s, &s.salt) - s0 - volume * s_river).abs() / s0);
+            for &salt in &s.salt {
+                salt_range = (salt_range.0.min(salt), salt_range.1.max(salt));
+            }
+        });
+        // Measured 3.5e-15
+        assert!(
+            max_err < 1e-12,
+            "tracer inventory differs from the river input by {max_err:.3e} (relative)"
+        );
+        // The fresh water dilutes, it does not overshoot
+        assert!(
+            salt_range.0 >= -1e-9 && salt_range.1 <= salt_max + 1e-9,
+            "salinity left [0, {salt_max}]: {salt_range:?}"
+        );
+        // Fresher at the top of the river's element than at the bottom
+        let nl = case.sigma.n_levels();
+        let k = physics.rivers.as_ref().unwrap().element(0).as_usize();
+        let column = |i: usize| &state.salt[(k * case.ops.n_nodes + i) * nl..][..nl];
+        let (top, bottom): (f64, f64) = (0..case.ops.n_nodes)
+            .map(|i| (column(i)[nl - 1], column(i)[0]))
+            .fold((0.0, 0.0), |(a, b), (t, bt)| (a + t, b + bt));
+        assert!(
+            top < bottom - 0.1 * case.ops.n_nodes as f64,
+            "river element: top salinity {top:.3} against bottom {bottom:.3} (summed over nodes)"
         );
     }
 
@@ -2466,7 +2605,7 @@ mod tests {
         window: [f64; 2],
     ) -> LockExchange {
         use crate::solver::rhs::{ViscosityScratch3D, largest_horizontal_viscosity_3d};
-        use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+
         let (length, width, depth, delta_t) = (8e3, 500.0, 20.0, 5.0);
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, n_x, 1));
         let ops = Arc::new(DGOperators2D::new(order));
@@ -3038,7 +3177,7 @@ mod tests {
     fn the_3d_step_does_not_depend_on_the_thread_count() {
         use crate::physics::GlsMixing;
         use crate::solver::rhs::VerticalAdvection;
-        use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+
         use crate::vertical::SongHaidvogelStretching;
 
         let run = || {
@@ -3150,5 +3289,323 @@ mod tests {
                 .count();
             assert_eq!(differing, 0, "{name} differs at {differing} values");
         }
+    }
+
+    /// The sea outside the fjord: uniform temperature and salinity, no
+    /// velocity of its own (the open faces keep the interior's exchange
+    /// flow; only the tracers are relaxed).
+    struct Sea {
+        temp: f64,
+        salt: f64,
+    }
+
+    impl crate::boundary::ParentColumns3D for Sea {
+        fn supplies(&self) -> crate::boundary::Supplied {
+            crate::boundary::Supplied {
+                velocity: false,
+                tracers: true,
+            }
+        }
+
+        fn column(
+            &self,
+            _ctx: &crate::boundary::ColumnContext3D,
+            _sigma: &SigmaGrid,
+            out: crate::boundary::ParentColumn<'_>,
+        ) -> bool {
+            out.temp.fill(self.temp);
+            out.salt.fill(self.salt);
+            true
+        }
+    }
+
+    /// Exchange through a cross-section: the volume flux out of (seaward,
+    /// `u > 0`) and into the fjord (m³/s), and their salt fluxes (psu·m³/s).
+    #[derive(Clone, Copy, Debug, Default)]
+    struct Exchange {
+        out: f64,
+        into: f64,
+        salt_out: f64,
+        salt_in: f64,
+    }
+
+    impl Exchange {
+        fn add(&mut self, other: &Exchange, weight: f64) {
+            self.out += weight * other.out;
+            self.into += weight * other.into;
+            self.salt_out += weight * other.salt_out;
+            self.salt_in += weight * other.salt_in;
+        }
+    }
+
+    /// TODO P4.6 gate: a river drives an estuarine circulation in a fjord.
+    ///
+    /// An idealised fjord, 10 km long, 500 m wide and 10 m deep, with walls
+    /// at the head and sides, opens at x = 12 km to a sea of S = 30 through a
+    /// characteristic OBC (still water); the last 2 km are a band relaxing
+    /// the tracers to the sea's (30 min on the boundary; the velocity is not
+    /// relaxed, so the exchange flow leaves and enters freely). A river of
+    /// 200 m³/s of fresh water enters at the head over the top 30 % of the
+    /// column. P2 on 500 m elements, 10 levels, constant mixing
+    /// (ν = 1e-3, κ = 1e-4 m²/s), log-layer bottom drag, ν_h = 20 m²/s,
+    /// horizontal Kuzmin tracer limiter, 240 s steps (the fields are those
+    /// of 40 s steps to 0.02 psu), 24 h from a fjord full of sea water.
+    ///
+    /// The brackish water flows out on top and entrains salt water from
+    /// below, which a compensating inflow at depth replaces: the classical
+    /// two-layer estuarine circulation. Knudsen's relations, with the storage
+    /// of the water landward of a section (the fjord is still freshening),
+    ///
+    /// ```text
+    ///     dV/dt = Q_r − (Q_out − Q_in),    dM/dt = −(Q_out S_out − Q_in S_in),
+    /// ```
+    ///
+    /// hold at three sections over hours 12–24 (`V`, `M` the volume and salt
+    /// landward of the section). The section fluxes are the nodal `H_z u` and
+    /// `H_z u S` at the section, not the DG face fluxes the model moves its
+    /// water and salt with: the volume closes to 1e-5 of the river's, the
+    /// salt to 1–3 % of the outgoing salt flux, largest where the gradients
+    /// are sharpest (near the head).
+    ///
+    /// Run on to 48 h, the exchange at the sections grows to Q_in = 76, 127,
+    /// 176 m³/s (2.5, 5, 7.5 km) against Knudsen's steady-state 86, 142, 198
+    /// from the section salinities: the difference is the salt the fjord is
+    /// still losing.
+    ///
+    /// With ν_h = 5 m²/s the surface outflow at the face of the river's
+    /// element accelerates from 0.5 to 9 m/s within 20 min after 1.5 h, at
+    /// any step (40–240 s): the P2 momentum needs ν_h at a grid Reynolds
+    /// number of a few, as in the lock exchange.
+    #[test]
+    fn a_river_drives_an_estuarine_circulation_in_a_fjord() {
+        use crate::boundary::{Nesting3D, NestingBand3D, StillWater};
+        let (length, band, width, depth) = (12e3, 2e3, 500.0, 10.0);
+        let (n_levels, nx) = (10, 24);
+        let (discharge, s_sea) = (200.0, 30.0);
+        let mesh = Arc::new(Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            length,
+            0.0,
+            width,
+            nx,
+            1,
+            [
+                BoundaryTag::Wall,
+                BoundaryTag::Open,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+            ],
+        ));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let sigma = SigmaGrid::new(n_levels, UniformStretching);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            OpenOrWall(CharacteristicOBC::new(StillWater::default())),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let eos = LinearEOS::default();
+        let river = River::new("head", [0.5 * length / nx as f64, 0.5 * width], discharge)
+            .with_temperature(RiverSeries::constant(eos.t0))
+            .with_profile(RiverProfile::TopFraction(0.3));
+        let rivers = RiverSources::new(vec![river], &mesh, &geom, 0.0).unwrap();
+        let sea = Arc::new(Sea {
+            temp: eos.t0,
+            salt: s_sea,
+        });
+        let relaxation = NestingBand3D {
+            width: band,
+            tracer_timescale: Some(1800.0),
+            ..NestingBand3D::default()
+        };
+        let nesting = Nesting3D::new(
+            sea,
+            &mesh,
+            &ops,
+            n_levels,
+            &[BoundaryTag::Open],
+            &relaxation,
+        )
+        .unwrap();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            eos,
+            ConstantMixing::new(1e-3, 1e-4),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_rivers(rivers)
+        .with_nesting(nesting)
+        .with_horizontal_viscosity(20.0)
+        .with_bottom_drag(BottomDrag3D::log_layer(0.005))
+        .with_tracer_limiter(TracerLimiter3DConfig {
+            limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+            ..TracerLimiter3DConfig::default()
+        });
+
+        let (nn, nl) = (ops.n_nodes, n_levels);
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        state.temp.fill(eos.t0);
+        state.salt.fill(s_sea);
+        physics.update_density(&mut state);
+
+        let position = |idx: usize| {
+            let (k, i) = (idx / nn, idx % nn);
+            mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
+        };
+        let x_of = |idx: usize| position(idx)[0];
+        // The node at x on the centre line (the flow is uniform across)
+        let node_at = |x: f64| {
+            (0..mesh.n_elements * nn)
+                .find(|&idx| {
+                    let [px, py] = position(idx);
+                    (px - x).abs() < 1e-6 && (py - 0.5 * width).abs() < 1e-6
+                })
+                .expect("a node at x")
+        };
+        let exchange = |s: &Solution3D, x: f64| {
+            let idx = node_at(x);
+            let d = s.eta.data[idx] - bathymetry.data[idx];
+            let mut e = Exchange::default();
+            for (l, &ds) in sigma.d_sigma().iter().enumerate() {
+                let q = width * d * ds * s.u[idx * nl + l];
+                let salt = s.salt[idx * nl + l];
+                if q > 0.0 {
+                    e.out += q;
+                    e.salt_out += q * salt;
+                } else {
+                    e.into -= q;
+                    e.salt_in -= q * salt;
+                }
+            }
+            e
+        };
+        // Volume and salt landward of x (whole elements)
+        let landward = |s: &Solution3D, x: f64| {
+            let (mut volume, mut salt) = (0.0, 0.0);
+            for k in (0..mesh.n_elements).filter(|&k| x_of(k * nn + nn / 2) < x) {
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let d = s.eta.data[idx] - bathymetry.data[idx];
+                    for (l, &ds) in sigma.d_sigma().iter().enumerate() {
+                        let h = geom.node_mass(k, i) * d * ds;
+                        volume += h;
+                        salt += h * s.salt[idx * nl + l];
+                    }
+                }
+            }
+            (volume, salt)
+        };
+
+        let sections = [2.5e3, 5e3, 7.5e3];
+        let dt = 240.0;
+        let steps_per_hour = (3600.0 / dt) as usize;
+        let (window_start, n_end) = (12 * steps_per_hour, 24 * steps_per_hour);
+        let mut start = [(0.0, 0.0); 3];
+        // ∫ over the window of the section fluxes (trapezoidal in the steps)
+        let mut flux = [Exchange::default(); 3];
+        let (mut salt_low, mut salt_high) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut integrator = ModeSplitIntegrator::new();
+        for n in 0..n_end {
+            if n == window_start {
+                for ((s, f), &x) in start.iter_mut().zip(&mut flux).zip(&sections) {
+                    *s = landward(&state, x);
+                    f.add(&exchange(&state, x), 0.5 * dt);
+                }
+            }
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+            assert!(
+                max_or_nan(state.u.iter().chain(&state.salt).copied()).is_finite(),
+                "step {n}: the run blew up"
+            );
+            for &s in &state.salt {
+                (salt_low, salt_high) = (salt_low.min(s), salt_high.max(s));
+            }
+            if n >= window_start {
+                let weight = if n + 1 == n_end { 0.5 * dt } else { dt };
+                for (f, &x) in flux.iter_mut().zip(&sections) {
+                    f.add(&exchange(&state, x), weight);
+                }
+            }
+        }
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+        // Measured [0.65, 30 + 1.1e-11]
+        assert!(
+            salt_low >= -1e-9 && salt_high <= s_sea + 1e-9,
+            "salinity left [0, {s_sea}]: [{salt_low}, {salt_high}]"
+        );
+
+        // Two layers: brackish water flowing out over salt water flowing in,
+        // at every section; fresher towards the head at the surface
+        let surface = |x: f64| state.salt[node_at(x) * nl + nl - 1];
+        for &x in &sections {
+            let idx = node_at(x);
+            let (u, s) = (&state.u[idx * nl..][..nl], &state.salt[idx * nl..][..nl]);
+            assert!(
+                u[nl - 1] > 0.1 && u[0] < -0.02,
+                "x = {x}: no exchange flow, u = {u:?}"
+            );
+            assert!(
+                s[0] - s[nl - 1] > 10.0,
+                "x = {x}: not stratified, S = {s:?}"
+            );
+        }
+        for x in (0..10).map(|j| j as f64 * 1e3) {
+            assert!(
+                surface(x) < surface(x + 1e3),
+                "surface salinity does not rise seaward at {x} m: {} → {}",
+                surface(x),
+                surface(x + 1e3)
+            );
+        }
+
+        let window = (n_end - window_start) as f64 * dt;
+        let mut outflows = Vec::new();
+        for (j, &x) in sections.iter().enumerate() {
+            let (v1, m1) = landward(&state, x);
+            let (v0, m0) = start[j];
+            let f = &flux[j];
+            // The compensating inflow: entrainment
+            assert!(
+                f.into > 0.25 * discharge * window,
+                "x = {x}: inflow {:.1} m³/s against the river's {discharge}",
+                f.into / window
+            );
+            outflows.push(f.out);
+            // Measured 1.2e-5, 4.3e-5, 3.2e-5
+            let volume = ((v1 - v0) - (discharge * window - (f.out - f.into))).abs();
+            assert!(
+                volume < 1e-4 * discharge * window,
+                "x = {x}: the volume budget misses {:.2e} of the river's",
+                volume / (discharge * window)
+            );
+            // Measured 2.7e-2, 1.3e-2, 8.8e-3 (with storage dM of 0.90, 0.96,
+            // 0.98 of the net salt flux)
+            let salt = ((m1 - m0) + (f.salt_out - f.salt_in)).abs();
+            assert!(
+                salt < 0.05 * f.salt_out,
+                "x = {x}: the salt budget misses {:.2e} of the outgoing salt flux",
+                salt / f.salt_out
+            );
+        }
+        // The outflow grows seaward with the salt water it entrains
+        assert!(
+            outflows.windows(2).all(|w| w[0] < w[1]),
+            "outflow does not grow seaward: {outflows:?}"
+        );
     }
 }
