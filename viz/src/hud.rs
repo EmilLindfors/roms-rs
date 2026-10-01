@@ -1,14 +1,18 @@
 //! What is shown and how far the solver has got (top left), the colour scales of the
 //! water and of the bed's depth (bottom left) and the keys (bottom right; H hides
-//! them).
+//! them). In a 3D run the status also names the layer the water shows, what the
+//! section shows, and the particles of each kind.
 
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use bevy::ui::{BackgroundGradient, ColorStop, LinearGradient};
 
+use crate::cloud_3d::KINDS;
 use crate::colormap::{SEABED, srgb_at};
 use crate::contours::Contours;
-use crate::particles::Particles;
+use crate::field::ShownLayer;
+use crate::layers::{Levels, Section, SectionShows};
+use crate::particles::{ACTIVE, DEAD, EXITED, Particles, SETTLED, STRANDED};
 use crate::playback::{Playback, SolverState};
 use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 
@@ -17,6 +21,8 @@ const KEYS: &str = "Space pause   [ ] rate   Left/Right seek   Home/End\n\
 C colour   T water   - = water opacity   B contours   A arrows\n\
 P particles   F close-up   O overview   H keys\n\
 drag orbit   right-drag pan   wheel zoom";
+/// The keys of a 3D run, added to [`KEYS`].
+const KEYS_3D: &str = ", . layer (depth mean, surface ... bed)   V section";
 
 /// The scenario's one-line description, heading the status.
 #[derive(Resource)]
@@ -71,7 +77,11 @@ fn font(size: f32) -> TextFont {
     }
 }
 
-fn spawn(mut commands: Commands) {
+fn spawn(mut commands: Commands, levels: Option<Res<Levels>>) {
+    let keys = match levels {
+        Some(_) => format!("{KEYS_3D}\n{KEYS}"),
+        None => KEYS.to_string(),
+    };
     commands.spawn((
         Status,
         Text::new(""),
@@ -86,7 +96,7 @@ fn spawn(mut commands: Commands) {
     ));
     commands.spawn((
         Help,
-        Text::new(KEYS),
+        Text::new(keys),
         font(13.0),
         TextColor(Color::srgba(1.0, 1.0, 1.0, 0.8)),
         shadow(),
@@ -162,12 +172,15 @@ fn clock(t: f64) -> String {
     format!("{} h {:02} min", minutes / 60, minutes % 60)
 }
 
+#[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its queries
 fn status(
     playback: Res<Playback>,
     title: Res<Title>,
     style: Res<SurfaceStyle>,
     opacity: Res<WaterOpacity>,
     particles: Res<Particles>,
+    shown: Res<ShownLayer>,
+    column: Option<(Res<Levels>, Res<Section>)>,
     mut text: Query<&mut Text, With<Status>>,
 ) {
     let Ok(mut text) = text.single_mut() else {
@@ -209,13 +222,54 @@ fn status(
             playback.bytes() as f64 / 1e6
         );
     }
-    let [active, stranded, out] = particles.counts;
-    if active + stranded + out > 0 {
-        s += &format!(
-            "\nparticles: {active} in the water, {stranded} stranded, {out} out\n\
-             colour: age, yellow new to dark blue {}; grey stranded",
-            clock(particles.age_scale as f64)
-        );
+    if let Some((levels, section)) = &column {
+        let n = levels.sigma.len();
+        s += &match *shown {
+            ShownLayer::DepthMean => "\ncurrent: depth mean (, .)".to_string(),
+            ShownLayer::Level(l) => format!(
+                "\ncurrent: layer {} of {n} from the surface, {:.1} m deep (, .)",
+                n - l,
+                -levels.sigma[l] * levels.depth
+            ),
+        };
+        s += &match (section.shows, section.speed, section.temperature) {
+            (SectionShows::Speed, Some([lo, hi]), _) => {
+                format!("\nsection: current speed {lo:.2} (purple) to {hi:.2} m/s (yellow) (V)")
+            }
+            (SectionShows::Speed, None, _) => "\nsection: current speed (V)".into(),
+            (SectionShows::Temperature, _, Some([lo, hi])) => {
+                format!("\nsection: temperature {lo:.1} (dark) to {hi:.1} C (yellow) (V)")
+            }
+            (SectionShows::Temperature, _, None) => "\nsection: temperature (V)".into(),
+            (SectionShows::Off, ..) => "\nsection: off (V)".into(),
+        };
+    }
+    let counts = particles.counts;
+    if counts.iter().sum::<usize>() > 0 {
+        if particles.kinds.is_empty() {
+            s += &format!(
+                "\nparticles: {} in the water, {} stranded, {} out\n\
+                 colour: age, yellow new to dark blue {}; grey stranded",
+                counts[ACTIVE as usize],
+                counts[STRANDED as usize],
+                counts[EXITED as usize],
+                clock(particles.age_scale as f64)
+            );
+        } else {
+            let in_water: Vec<String> = KINDS
+                .iter()
+                .zip(&particles.kinds)
+                .map(|(kind, n)| format!("{n} {}", kind.name))
+                .collect();
+            s += &format!(
+                "\nparticles in the water: {}\n{} on the bed (dark), {} dead (grey), {} out\n\
+                 colour: pink lice larvae, brown faeces, yellow feed",
+                in_water.join(", "),
+                counts[SETTLED as usize],
+                counts[DEAD as usize],
+                counts[EXITED as usize]
+            );
+        }
         if !particles.on {
             s += " (hidden, P)";
         }
