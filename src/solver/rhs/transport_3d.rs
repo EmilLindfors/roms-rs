@@ -28,11 +28,12 @@
 //!    faces, so that `Σ_l Q_l = DU_avg2` exactly. The dissipative part of the
 //!    2D face flux is shared out the same way;
 //! 3. `Ω` integrated up from the bed, with the layer's share of the barotropic
-//!    `∂η/∂t`: `Ω_{l+1/2} = Ω_{l−1/2} − ∇·Q_l − Δσ_l ∂η/∂t`.
+//!    `∂η/∂t` and its volume source `s_l` from rivers ([`crate::source::river`]):
+//!    `Ω_{l+1/2} = Ω_{l−1/2} − ∇·Q_l − Δσ_l ∂η/∂t + s_l`.
 //!
 //! The DG divergence ([`transport_divergence_element`]) is linear in the nodal
-//! transport and the face flux, so `Σ_l ∇·Q_l = ∇·DU_avg2 = −∂η/∂t` and `Ω` at
-//! the surface vanishes to round-off. That holds wherever the barotropic pass
+//! transport and the face flux, so `Σ_l ∇·Q_l = ∇·DU_avg2 = Σ_l s_l − ∂η/∂t`
+//! and `Ω` at the surface vanishes to round-off. That holds wherever the barotropic pass
 //! keeps the nodal identity; where it only keeps element balances (`WetDry`
 //! elements with a dry node, positivity-limited elements, see
 //! `BarotropicTransport`), the surface residual is spread linearly over the
@@ -69,6 +70,7 @@ use crate::solver::core::blocks::{Pooled, for_each_block, max_over_blocks};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
 use crate::solver::state::Solution3D;
+use crate::source::RiverInflow;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -127,6 +129,9 @@ pub struct BarotropicFlux<'a> {
     pub face: &'a [f64],
     /// `∂η/∂t = (η̄ − ηⁿ)/Δt` over the step (m/s), `[element][node]`.
     pub eta_rate: &'a [f64],
+    /// The rivers of the step, if any: volume sources of the layers, so
+    /// that `∂η/∂t = −∇·DU_avg2 + Σ Q̄/A_k` (see [`crate::source::river`]).
+    pub rivers: Option<RiverInflow<'a>>,
 }
 
 /// Layer transports and `Ω` of one 3D stage (see the module docs).
@@ -320,7 +325,19 @@ impl LayerTransport {
                 )
             },
             |scratch, k, [omega_k]| {
-                let OmegaScratch { hu, hv, face, div } = &mut **scratch;
+                let OmegaScratch {
+                    hu,
+                    hv,
+                    face,
+                    div,
+                    source,
+                } = &mut **scratch;
+                // The rivers' volume sources of the layers, the same at
+                // every node of the element
+                source.fill(0.0);
+                if let Some(rivers) = barotropic.and_then(|b| b.rivers) {
+                    rivers.add_layer_rates(k, source);
+                }
                 for l in 0..nl {
                     for i in 0..nn {
                         hu[i] = layer_hu[(k * nn + i) * nl + l];
@@ -349,7 +366,7 @@ impl LayerTransport {
                     let omega = &mut omega_k[i * (nl + 1)..(i + 1) * (nl + 1)];
                     omega[0] = 0.0;
                     for l in 0..nl {
-                        omega[l + 1] = omega[l] - div[l * nn + i] - d_sigma[l] * rate;
+                        omega[l + 1] = omega[l] - div[l * nn + i] - d_sigma[l] * rate + source[l];
                     }
                     let residual = omega[nl];
                     largest = largest.max(residual.abs());
@@ -365,12 +382,14 @@ impl LayerTransport {
 }
 
 /// One element's layers of [`LayerTransport::compute`]: a layer's nodal
-/// transport and face fluxes, and the divergence of every layer.
+/// transport and face fluxes, the divergence of every layer, and the
+/// layers' volume sources.
 struct OmegaScratch {
     hu: Vec<f64>,
     hv: Vec<f64>,
     face: Vec<f64>,
     div: Vec<f64>,
+    source: Vec<f64>,
 }
 
 impl OmegaScratch {
@@ -380,11 +399,15 @@ impl OmegaScratch {
             hv: vec![0.0; nn],
             face: vec![0.0; 4 * nfn],
             div: vec![0.0; nn * nl],
+            source: vec![0.0; nl],
         }
     }
 
     fn fits(&self, nn: usize, nfn: usize, nl: usize) -> bool {
-        self.hu.len() == nn && self.face.len() == 4 * nfn && self.div.len() == nn * nl
+        self.hu.len() == nn
+            && self.face.len() == 4 * nfn
+            && self.div.len() == nn * nl
+            && self.source.len() == nl
     }
 }
 
@@ -1135,6 +1158,7 @@ mod tests {
                 hv: &self.du_hv,
                 face: &self.du_face,
                 eta_rate: &self.eta_rate,
+                rivers: None,
             };
             transport.compute(
                 &self.state,

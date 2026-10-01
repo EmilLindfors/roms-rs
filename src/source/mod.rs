@@ -8,6 +8,7 @@
 //! - Atmospheric pressure
 //! - Tidal potential
 //! - Sponge layers (boundary damping)
+//! - Rivers (volume sources)
 //!
 //! # Submodules
 //!
@@ -16,9 +17,11 @@
 //! - [`swe_2d`]: 2D shallow water source terms
 //! - [`tracer`]: Tracer-related source terms (baroclinic, heat flux)
 //! - [`boundary`]: Boundary treatment sources (sponge, strait friction)
+//! - [`river`]: Rivers as volume sources (2D and 3D)
 //! - [`wellbalanced`]: Well-balanced scheme components
 
 pub mod boundary;
+pub mod river;
 pub mod swe_1d;
 pub mod swe_2d;
 pub mod tracer;
@@ -55,6 +58,9 @@ pub use boundary::{
     SpongeLayer2D, SpongeProfile, StraitFriction2D, bathymetry_based_width, rectangular_sponge_fn,
     rectangular_strait, tapered_strait,
 };
+
+// Rivers as volume sources
+pub use river::{River, RiverError, RiverInflow, RiverProfile, RiverSeries, RiverSources};
 
 // Re-export well-balanced components
 pub use wellbalanced::HydrostaticReconstruction2D;

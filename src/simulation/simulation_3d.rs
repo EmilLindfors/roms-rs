@@ -213,7 +213,8 @@ mod tests {
     use crate::simulation::Simulation;
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
-    use crate::source::CoriolisSource2D;
+    use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+    use crate::source::{CoriolisSource2D, River, RiverProfile, RiverSeries, RiverSources};
     use crate::time::{ModeSplitIntegrator, SSPRK3};
     use crate::types::ElementIndex;
     use crate::vertical::{SigmaGrid, UniformStretching};
@@ -849,6 +850,23 @@ mod tests {
             column.integrate(&self.ops, &self.geom)
         }
 
+        /// `∫ (η − B) dA`.
+        fn volume(&self, state: &Solution3D) -> f64 {
+            let nl = self.sigma.n_levels();
+            self.inventory(state, &vec![1.0; state.n_elements * state.n_nodes * nl])
+        }
+
+        /// [`Self::physics`] with `rivers`.
+        fn physics_with_rivers(&self, rivers: Vec<River>) -> Physics {
+            let sources = RiverSources::new(rivers, &self.mesh, &self.geom, 0.0).unwrap();
+            self.physics().with_rivers(sources)
+        }
+
+        /// Seconds per step of [`Self::run`].
+        fn dt(&self) -> f64 {
+            2.0 * self.length / (G * 8.0).sqrt() / 40.0
+        }
+
         /// One seiche period at 40 steps per period, calling `check` after
         /// every step.
         fn run(
@@ -936,6 +954,127 @@ mod tests {
         assert!(
             max_err < 1e-12,
             "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
+    }
+
+    /// A river into the middle of [`SlopingTide`]'s basin, entering over the
+    /// top 40 % of the column (levels weighted 0, 1/6, 5/6), 20 m³/s: over
+    /// the period it raises the basin by ≈ 4.5 cm and its own element by far
+    /// more each step.
+    fn river(temperature: f64, salinity: f64) -> River {
+        River::new("river", [437.5, 25.0], 20.0)
+            .with_temperature(RiverSeries::constant(temperature))
+            .with_salinity(RiverSeries::constant(salinity))
+            .with_profile(RiverProfile::TopFraction(0.4))
+    }
+
+    /// TODO P1.6/P5.1 gate: a river of the ambient water keeps uniform
+    /// tracers uniform, under the tide over a sloping bed. The river's volume
+    /// enters the barotropic pass, `DU_avg2`'s free-surface rate and the
+    /// layers' Ω consistently, so Ω still closes at the surface; the basin's
+    /// volume grows by exactly `Q·t`.
+    #[test]
+    fn a_river_of_the_ambient_water_keeps_the_tracers_uniform() {
+        let case = SlopingTide::new();
+        let eos = LinearEOS::default();
+        let (t_river, s_river) = (eos.t0 + 2.3, eos.s0 - 0.9);
+        let physics = case.physics_with_rivers(vec![river(t_river, s_river)]);
+        let mut state = case.state(&physics, |_, _| (t_river, s_river));
+        let volume0 = case.volume(&state);
+        let (mut drift, mut residual, mut omega_scale) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let (mut volume_error, mut step) = (0.0_f64, 0);
+        case.run(&physics, &mut state, |s, p| {
+            step += 1;
+            for t in &s.temp {
+                drift = drift.max((t - t_river).abs());
+            }
+            for salt in &s.salt {
+                drift = drift.max((salt - s_river).abs());
+            }
+            residual = residual.max(p.last_surface_residual());
+            omega_scale = omega_scale.max(s.w.iter().fold(0.0, |m, w| m.max(w.abs())));
+            let expected = volume0 + 20.0 * step as f64 * case.dt();
+            volume_error = volume_error.max((case.volume(s) - expected).abs() / volume0);
+        });
+        let rise = (case.volume(&state) - volume0) / (case.length * 100.0);
+        assert!(
+            rise > 0.04,
+            "test regime: the river raised η by {rise:.3} m"
+        );
+        // Measured 8.9e-13
+        assert!(
+            drift < 1e-11 * eos.s0,
+            "uniform tracers drifted by {drift:.3e} with the river"
+        );
+        assert!(omega_scale > 1e-5, "test regime: Ω {omega_scale:.2e}");
+        // Measured 3.5e-18 against Ω of 6.8e-3 m/s
+        assert!(
+            residual < 1e-10 * omega_scale,
+            "Ω surface residual {residual:.2e} (Ω scale {omega_scale:.2e})"
+        );
+        // Measured 2.0e-14
+        assert!(
+            volume_error < 1e-13,
+            "the volume differs from V₀ + Q·t by {volume_error:.2e} (relative)"
+        );
+    }
+
+    /// TODO P1.6/P5.1 gate: fresh, warm river water adds exactly `Q·C·t` to
+    /// the tracer inventories, with gradients, the tide and vertical
+    /// diffusion, and stays near the surface it entered at.
+    #[test]
+    fn river_water_adds_exactly_its_tracer_inventory() {
+        let case = SlopingTide::new();
+        let (t_river, s_river) = (18.0, 0.0);
+        // The fresh front of the plume is a discontinuity: unlimited P2
+        // overshoots it (0.27 psu above the initial maximum within the
+        // period, where the tide alone gives 0.05)
+        let physics = case
+            .physics_with_rivers(vec![river(t_river, s_river)])
+            .with_tracer_limiter(TracerLimiter3DConfig {
+                limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                ..TracerLimiter3DConfig::default()
+            });
+        let mut state = case.state(&physics, |x, s| {
+            (
+                10.0 + 3.0 * x / case.length - 2.0 * s,
+                33.0 + x / case.length + s,
+            )
+        });
+        let t0 = case.inventory(&state, &state.temp);
+        let s0 = case.inventory(&state, &state.salt);
+        let salt_max = state.salt.iter().copied().fold(0.0, f64::max);
+        let (mut max_err, mut step, mut salt_range) = (0.0_f64, 0, (f64::INFINITY, 0.0_f64));
+        case.run(&physics, &mut state, |s, _| {
+            step += 1;
+            let volume = 20.0 * step as f64 * case.dt();
+            max_err = max_err
+                .max((case.inventory(s, &s.temp) - t0 - volume * t_river).abs() / t0)
+                .max((case.inventory(s, &s.salt) - s0 - volume * s_river).abs() / s0);
+            for &salt in &s.salt {
+                salt_range = (salt_range.0.min(salt), salt_range.1.max(salt));
+            }
+        });
+        // Measured 3.5e-15
+        assert!(
+            max_err < 1e-12,
+            "tracer inventory differs from the river input by {max_err:.3e} (relative)"
+        );
+        // The fresh water dilutes, it does not overshoot
+        assert!(
+            salt_range.0 >= -1e-9 && salt_range.1 <= salt_max + 1e-9,
+            "salinity left [0, {salt_max}]: {salt_range:?}"
+        );
+        // Fresher at the top of the river's element than at the bottom
+        let nl = case.sigma.n_levels();
+        let k = physics.rivers.as_ref().unwrap().element(0).as_usize();
+        let column = |i: usize| &state.salt[(k * case.ops.n_nodes + i) * nl..][..nl];
+        let (top, bottom): (f64, f64) = (0..case.ops.n_nodes)
+            .map(|i| (column(i)[nl - 1], column(i)[0]))
+            .fold((0.0, 0.0), |(a, b), (t, bt)| (a + t, b + bt));
+        assert!(
+            top < bottom - 0.1 * case.ops.n_nodes as f64,
+            "river element: top salinity {top:.3} against bottom {bottom:.3} (summed over nodes)"
         );
     }
 
@@ -2466,7 +2605,7 @@ mod tests {
         window: [f64; 2],
     ) -> LockExchange {
         use crate::solver::rhs::{ViscosityScratch3D, largest_horizontal_viscosity_3d};
-        use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+
         let (length, width, depth, delta_t) = (8e3, 500.0, 20.0, 5.0);
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, n_x, 1));
         let ops = Arc::new(DGOperators2D::new(order));
@@ -3038,7 +3177,7 @@ mod tests {
     fn the_3d_step_does_not_depend_on_the_thread_count() {
         use crate::physics::GlsMixing;
         use crate::solver::rhs::VerticalAdvection;
-        use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+
         use crate::vertical::SongHaidvogelStretching;
 
         let run = || {
