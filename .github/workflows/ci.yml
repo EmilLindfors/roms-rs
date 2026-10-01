@@ -72,8 +72,10 @@ jobs:
         with:
           key: test-${{ matrix.name }}
       - uses: taiki-e/install-action@nextest
+      # The `ci` profile (Cargo.toml) is the test profile at opt-level 1: the
+      # unoptimized suite spent ~10 min in a few dozen simulation gates.
       - name: cargo nextest run
-        run: cargo nextest run ${{ matrix.features }}
+        run: cargo nextest run --cargo-profile ci ${{ matrix.features }}
 
   clippy:
     name: clippy (parallel+simd)
