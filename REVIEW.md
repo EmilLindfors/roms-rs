@@ -325,6 +325,8 @@ P0.7 fixed Ω and momentum. The tracer kernel still sets `u_ext = u_int` at phys
 
 ### 3.5 [MAJOR] First-order upwind vertical tracer advection [V]
 
+*Status: fixed 2026-09-30 (TODO P4.5): fourth-order Akima (ROMS `TS_A4VADVECTION`) is the default vertical tracer advection (`VerticalAdvection`); upwind remains an option. A mode-1 internal seiche on 10 levels was 1.1 % slow and lost 1.2 % of its amplitude per period with upwind; with Akima 0.37 % and 0.14 %, second order in the level spacing.*
+
 `advection_3d.rs:652-690` is first-order upwind. Numerical diffusivity ≈ ½|W|Hz ≈ 1e-4 to 1e-3 m²/s, above fjord-basin diffusivities of 1e-5 to 1e-4 (Stigebrandt & Aure 1989), so the halocline smears numerically.
 
 **Fix:** 4th-order centred/Akima (ROMS) or TVD/HSIMT (Wu & Zhu 2010).

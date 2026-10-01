@@ -1168,7 +1168,12 @@ mod tests {
     /// gave NaN in the first step (vertical diffusion over a zero-thickness
     /// column); then, once that was masked, films at the 2D velocity cap
     /// (20 m/s) blew up the 3D momentum advection within 44 steps. Now: no
-    /// clips, and the temperature stays inside its initial range.
+    /// clips, and the temperature stays inside its initial range: exactly in
+    /// water shallower than 1 m, elsewhere to 2e-3 °C. The layer means may
+    /// leave it: the water at the bed is 0.26 °C colder than the bed layer's
+    /// mean, and rising, it cools the layer (1.0e-3 °C below the initial
+    /// range with Akima, 1.6e-3 °C with TVD). Upwind freezes the bed layer
+    /// at the wall and stays inside.
     #[test]
     fn a_beach_wets_and_dries_in_3d() {
         let (physics, mut state, _) = beach_3d(0.3);
@@ -1178,11 +1183,17 @@ mod tests {
         );
         let mut thin_seen = 0;
         run_beach(&physics, &mut state, 200, |s| {
-            for &t in &s.temp {
-                assert!(
-                    t >= t_min - 1e-9 && t <= t_max + 1e-9,
-                    "temperature {t} left [{t_min}, {t_max}]"
-                );
+            for (idx, column) in s.temp.chunks_exact(s.n_levels).enumerate() {
+                // Measured 1.0e-3 °C below, at the bed of the deepest column
+                // (see above)
+                let depth = s.eta.data[idx] - physics.bathymetry.data[idx];
+                let slack = if depth < 1.0 { 1e-9 } else { 2e-3 };
+                for &t in column {
+                    assert!(
+                        t >= t_min - slack && t <= t_max + slack,
+                        "temperature {t} left [{t_min}, {t_max}] in {depth:.3} m of water"
+                    );
+                }
             }
             thin_seen += (0..s.eta.data.len())
                 .filter(|&idx| {
@@ -2072,9 +2083,14 @@ mod tests {
     /// boundary. A mode-1 pulse splits into two, each half the initial
     /// amplitude, which reach the open ends after ≈ 9 h. A 4 km band relaxing
     /// to the stratification at rest (30 min on the boundary) lets them out:
-    /// what remains in the channel at 16 h, reflected, is 36 % of the
-    /// outgoing pulse (22 % at P2 on ten levels). With walls the pulses come
-    /// back whole (1.19 of it at 16 h, where they overlap).
+    /// what remains in the channel at 16 h is 4.5 % of the outgoing pulse.
+    /// With walls the pulses come back.
+    ///
+    /// With first-order upwind vertical advection (before P4.5's Akima) 36 %
+    /// remained, but most of it was not reflection: the scheme's mixing left
+    /// an anomaly of 0.2 °C along the pulses' path in the middle of the
+    /// channel from hour 4 on, before anything could return from the ends
+    /// (0.02 °C with Akima).
     ///
     /// Without the band the open faces extrapolate, and that is unstable for
     /// stratified flow: a pulse like this (P2, 50 m, N = 0.02 s⁻¹) drove an
@@ -2092,25 +2108,342 @@ mod tests {
             ..NestingBand3D::default()
         };
         let open = internal_wave_pulse(BoundaryTag::Open, 16, Some(band));
-        let (initial, outgoing, reflected) = (open[0], open[6], open[16]);
+        let (initial, split, outgoing, reflected) = (open[0], open[1], open[6], open[16]);
         assert!(
-            (outgoing / initial - 0.5).abs() < 0.05,
-            "test regime: the pulse should split into halves ({outgoing:.4} of {initial:.4})"
+            (split / initial - 0.5).abs() < 0.05,
+            "test regime: the pulse should split into halves ({split:.4} of {initial:.4})"
         );
-        // Measured 36 % (P2, ten levels, 50 m: 22 %; 2 km bands 27 % at 30 min
-        // and 32 % at 1 h, 6 km at 1 h 18 %)
+        // Measured 4.5 %. 2 km bands: 4.9 % (30 min), 12 % (1 h); 4 km at
+        // 1 h 4.4 %, at 2 h 14 %; 6 km at 1 h 2.5 %; 1 km at 30 min 18 %
         let reflection = reflected / outgoing;
         assert!(
-            reflection < 0.45,
+            reflection < 0.08,
             "{:.1} % of the pulse reflected at the relaxed open ends",
             100.0 * reflection
         );
+        // The P1 channel damps the 1 km pulse: 0.86 of it is back at 16 h
         let walls = internal_wave_pulse(BoundaryTag::Wall, 16, None);
         assert!(
-            walls[16] / walls[6] > 0.9,
+            walls[16] / walls[6] > 0.7,
             "test regime: walls should reflect the pulse ({:.4} of {:.4})",
             walls[16],
             walls[6]
+        );
+    }
+
+    /// Mode-1 internal seiche in a closed basin `L` = 5 km long, `H` = 20 m
+    /// deep, linearly stratified with N = 0.05 s⁻¹: isopycnals displaced by
+    /// `a cos(πx/L) sin(π(z + H)/H)` (a = 0.5 m) at rest. P2 on 500 m,
+    /// `levels` uniform levels, 480 s steps (65 per period), `f = 0`, no
+    /// mixing.
+    ///
+    /// The hydrostatic mode-1 speed under a free surface solves
+    /// `tan(NH/c₁) = N c₁/g` (`w'' + (N/c)² w = 0`, `w(−H) = 0`,
+    /// `w' = (g/c²) w` at the surface): `c₁` = 0.318 m/s, 0.05 % below the
+    /// rigid lid's `NH/π`, and the period `T = 2L/c₁` = 8.7 h.
+    ///
+    /// Runs 1.1 T and returns the measured period over `T` and the amplitude
+    /// lost in that period, from the displacement's projection on the
+    /// vertical mode at the wall column `x = 0`: the period from its zero
+    /// crossings at T/4 and 3T/4, the loss from its crest at T.
+    fn internal_seiche(levels: usize, scheme: crate::solver::rhs::VerticalAdvection) -> (f64, f64) {
+        internal_seiche_on(SigmaGrid::new(levels, UniformStretching), scheme)
+    }
+
+    /// [`internal_seiche`] on the levels `sigma`.
+    fn internal_seiche_on(
+        sigma: SigmaGrid,
+        scheme: crate::solver::rhs::VerticalAdvection,
+    ) -> (f64, f64) {
+        let (length, depth, amplitude, n_buoyancy) = (5e3, 20.0, 0.5, 0.05);
+        let mut c1 = n_buoyancy * depth / std::f64::consts::PI;
+        for _ in 0..20 {
+            c1 = n_buoyancy * depth / (std::f64::consts::PI + (n_buoyancy * c1 / G).atan());
+        }
+        let period = 2.0 * length / c1;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 500.0, 10, 1));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(sigma.clone()),
+            bathymetry,
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(0.0, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_vertical_advection(scheme);
+        let eos = LinearEOS::default();
+        // N² = gα dT/dz
+        let gradient = n_buoyancy.powi(2) / (G * eos.alpha);
+        let background = |z: f64| eos.t0 + gradient * (z + 0.5 * depth);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let sigma_rho = sigma.sigma_rho();
+        let shape: Vec<f64> = sigma_rho
+            .iter()
+            .map(|s| (std::f64::consts::PI * (s + 1.0)).sin())
+            .collect();
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        state.salt.fill(eos.s0);
+        for idx in 0..mesh.n_elements * nn {
+            let (k, i) = (idx / nn, idx % nn);
+            let [x, _] =
+                mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i]);
+            let crest = amplitude * (std::f64::consts::PI * x / length).cos();
+            for (l, &s) in sigma_rho.iter().enumerate() {
+                state.temp[idx * nl + l] = background(s * depth - crest * shape[l]);
+            }
+        }
+        // Node 0 of element 0 is the corner (0, 0)
+        let d_sigma = sigma.d_sigma();
+        let norm: f64 = shape.iter().zip(d_sigma).map(|(m, ds)| m * m * ds).sum();
+        let mode = |s: &Solution3D| {
+            let (eta, d) = (s.eta.data[0], s.eta.data[0] + depth);
+            (0..nl)
+                .map(|l| {
+                    let anomaly = s.temp[l] - background(eta + sigma_rho[l] * d);
+                    -anomaly / gradient * shape[l] * d_sigma[l]
+                })
+                .sum::<f64>()
+                / norm
+        };
+        let dt = 480.0;
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut history = vec![(0.0, mode(&state))];
+        for n in 0..(1.1 * period / dt).round() as usize {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+            history.push(((n + 1) as f64 * dt, mode(&state)));
+        }
+        let crossings: Vec<f64> = history
+            .windows(2)
+            .filter(|w| (w[0].1 >= 0.0) != (w[1].1 >= 0.0))
+            .map(|w| w[0].0 + (w[1].0 - w[0].0) * w[0].1 / (w[0].1 - w[1].1))
+            .collect();
+        assert_eq!(
+            crossings.len(),
+            2,
+            "test regime: zero crossings {crossings:?}"
+        );
+        // The crest, from the parabola through the highest sample after the
+        // trough and its neighbours
+        let highest = (history.len() / 2..history.len() - 1)
+            .max_by(|&a, &b| history[a].1.total_cmp(&history[b].1))
+            .expect("samples");
+        let [y0, y1, y2] = [highest - 1, highest, highest + 1].map(|n| history[n].1);
+        let crest = y1 - (y2 - y0).powi(2) / (8.0 * (y2 - 2.0 * y1 + y0));
+        let measured = 2.0 * (crossings[1] - crossings[0]);
+        (measured / period, 1.0 - crest / history[0].1)
+    }
+
+    /// TODO P4.6 gate: the mode-1 internal-wave speed. The internal seiche
+    /// ([`internal_seiche`]) oscillates at the free-surface hydrostatic
+    /// period `2L/c₁`: +0.04 % on 20 levels, +0.37 % on 10 (−0.04 % on 40,
+    /// −0.06 % on 80). The differences fall 3.9× and 4.4× per halving of the
+    /// spacing, second order, down to a floor that is the wave's own
+    /// nonlinearity (a/H = 0.025): on 80 levels −0.056 % at a = 0.5 m,
+    /// −0.011 % at 0.25 m, +0.004 % at 0.05 m. Smaller steps add a small
+    /// splitting error at any amplitude (−0.04 % at 60 s steps, 524 per
+    /// period), and 20 elements instead of 10 change it by < 0.01 %. The
+    /// seiche loses 0.13 % of its amplitude per period.
+    ///
+    /// The free surface matters at stronger stratification: at N = 0.1 and
+    /// 0.2 s⁻¹ the rigid lid's `NH/π` is 0.21 % and 0.83 % too fast, and the
+    /// model's period converges to 0.19 % and 0.7–0.8 % above `2πL/(NH)`.
+    /// P1 on the same mesh is 0.5 % slow and loses 1.3 % per period.
+    #[test]
+    fn a_mode_1_internal_seiche_has_the_internal_wave_speed() {
+        use crate::solver::rhs::VerticalAdvection::Akima;
+        let (fine, loss) = internal_seiche(20, Akima);
+        assert!(
+            (fine - 1.0).abs() < 1.5e-3,
+            "the internal seiche's period is {:+.3} % off 2L/c₁",
+            100.0 * (fine - 1.0)
+        );
+        assert!(
+            (0.0..5e-3).contains(&loss),
+            "the internal seiche loses {:.3} % of its amplitude per period",
+            100.0 * loss
+        );
+        let (coarse, _) = internal_seiche(10, Akima);
+        assert!(
+            coarse - 1.0 > 3.0 * (fine - 1.0).abs(),
+            "period error {:+.3} % on 10 levels, {:+.3} % on 20: not second order",
+            100.0 * (coarse - 1.0),
+            100.0 * (fine - 1.0)
+        );
+    }
+
+    /// TODO P4.5 gate: the Akima vertical advection neither slows nor damps
+    /// internal waves as first-order upwind does. On 10 levels the internal
+    /// seiche is 1.06 % slow with upwind (0.40 % on 20 levels, 0.15 % on 40:
+    /// about first order in the spacing) and loses 1.2 % of its amplitude
+    /// per period; with Akima 0.37 % and 0.14 %.
+    #[test]
+    fn akima_vertical_advection_keeps_internal_waves() {
+        use crate::solver::rhs::VerticalAdvection::{Akima, Upwind};
+        let (akima, akima_loss) = internal_seiche(10, Akima);
+        let (upwind, upwind_loss) = internal_seiche(10, Upwind);
+        assert!(
+            upwind - 1.0 > 2.0 * (akima - 1.0).abs(),
+            "period error: upwind {:+.3} %, Akima {:+.3} %",
+            100.0 * (upwind - 1.0),
+            100.0 * (akima - 1.0)
+        );
+        assert!(
+            upwind_loss > 5.0 * akima_loss.abs(),
+            "amplitude loss per period: upwind {:.3} %, Akima {:.3} %",
+            100.0 * upwind_loss,
+            100.0 * akima_loss
+        );
+    }
+
+    /// TODO P4.6 gate: the lock exchange (Ilıcak et al. 2012, scaled). An
+    /// 8 km channel, 20 m deep, 5 °C colder left of the middle, at rest
+    /// (`g′ = gαΔT` = 8.3e-3 m/s², `√(g′H)` = 0.41 m/s). P1 on 250 m, ten
+    /// levels, 30 s steps, the horizontal Kuzmin tracer limiter, vertical
+    /// viscosity 1e-4 m²/s, `f = 0`.
+    ///
+    /// The dense water runs right along the bed and the light water left
+    /// along the surface, each at the Froude number `U/√(g′H)` = 0.483
+    /// (0.475 at 125 m on 20 levels, 0.473 at 62 m), a little below
+    /// Benjamin's (1968) ½ for an energy-conserving current, as dissipative
+    /// currents in the laboratory and in hydrostatic models are. At the
+    /// middle the two layers move at ±0.20 m/s, Benjamin's ½√(g′H). The
+    /// interface between them thickens to ≈ 8 m (where the shear's Richardson
+    /// number reaches ≈ ¼), so the exchange transport is only 0.40 of
+    /// `(H/2)·½√(g′H)`. The limiter keeps T inside its initial range.
+    ///
+    /// Not at P2: without horizontal viscosity (P4.5) the interface's shear
+    /// instability grows at the grid scale, fastest in a hydrostatic model,
+    /// and P2 has too little numerical dissipation to stop it (NaN after
+    /// ≈ 1500 s, the same at 10 and 2 s steps; 1e-2 m²/s of vertical
+    /// viscosity holds it). The Kuzmin limiter also lets P2 overshoot by
+    /// 0.46 °C.
+    ///
+    /// The fronts are where the bed (surface) layer's dense (light) water
+    /// ends: the middle plus its length there, from its fraction integrated
+    /// along the channel. Their speed is taken over hours 1–3, after the
+    /// collapse of the lock.
+    #[test]
+    fn a_lock_exchange_runs_at_the_gravity_current_speed() {
+        use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+        let (length, width, depth, delta_t) = (8e3, 500.0, 20.0, 5.0);
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, 32, 1));
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let sigma = SigmaGrid::new(10, UniformStretching);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry,
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-4, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_tracer_limiter(TracerLimiter3DConfig {
+            limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+            ..TracerLimiter3DConfig::default()
+        });
+        let eos = LinearEOS::default();
+        let speed_scale = (G * eos.alpha * delta_t * depth).sqrt();
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let x_of = |idx: usize| {
+            let (k, i) = (idx / nn, idx % nn);
+            mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])[0]
+        };
+        let (cold, warm) = (eos.t0 - 0.5 * delta_t, eos.t0 + 0.5 * delta_t);
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        state.salt.fill(eos.s0);
+        for idx in 0..mesh.n_elements * nn {
+            let t = if x_of(idx) < 0.5 * length { cold } else { warm };
+            state.temp[idx * nl..(idx + 1) * nl].fill(t);
+        }
+        // Element k lies right of the middle if its centre does
+        let right = |k: usize| x_of(k * nn) + x_of(k * nn + nn - 1) > length;
+        let fronts = |s: &Solution3D| {
+            let dense = |t: f64| ((warm - t) / delta_t).clamp(0.0, 1.0);
+            let mut bed = DGSolution2D::new(mesh.n_elements, nn);
+            let mut surface = DGSolution2D::new(mesh.n_elements, nn);
+            for idx in 0..mesh.n_elements * nn {
+                if right(idx / nn) {
+                    bed.data[idx] = dense(s.temp[idx * nl]);
+                } else {
+                    surface.data[idx] = 1.0 - dense(s.temp[idx * nl + nl - 1]);
+                }
+            }
+            [
+                0.5 * length + bed.integrate(&ops, &geom) / width,
+                0.5 * length - surface.integrate(&ops, &geom) / width,
+            ]
+        };
+
+        let dt = 30.0;
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut positions = Vec::new();
+        for n in 0..(3.0 * 3600.0 / dt) as usize {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+            if (n + 1) % (3600.0 / dt) as usize == 0 {
+                positions.push(fronts(&state));
+            }
+        }
+        let t_range = max_or_nan(
+            state
+                .temp
+                .iter()
+                .map(|&t| (t - cold).max(warm - t) - delta_t),
+        );
+        assert!(
+            t_range < 1e-9,
+            "T left its initial range by {t_range:.3e} °C"
+        );
+        let [dense, light] = [0, 1]
+            .map(|f| (positions[2][f] - positions[0][f]).abs() / (2.0 * 3600.0) / speed_scale);
+        // Measured 0.483 for both
+        for (front, froude) in [("dense", dense), ("light", light)] {
+            assert!(
+                (0.44..0.5).contains(&froude),
+                "the {front} front runs at Fr = {froude:.4}"
+            );
+        }
+        assert!(
+            (dense - light).abs() < 0.01,
+            "the fronts run at Fr = {dense:.4} and {light:.4}"
         );
     }
 }

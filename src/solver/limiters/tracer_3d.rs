@@ -480,7 +480,9 @@ fn apply_horizontal_kuzmin_field(
             }
 
             let mut alpha = 1.0_f64;
-
+            // Every vertex within its own patch's bounds; every other node
+            // (P2 and up) within the union of the element's vertex patches
+            let (mut union_min, mut union_max) = (f64::INFINITY, f64::NEG_INFINITY);
             for (local_vertex, &global_vertex) in vertices.iter().enumerate() {
                 let (bound_min, bound_max) = vertex_patch_bounds(
                     global_vertex,
@@ -490,9 +492,15 @@ fn apply_horizontal_kuzmin_field(
                     n_levels,
                     relaxation,
                 );
+                union_min = union_min.min(bound_min);
+                union_max = union_max.max(bound_max);
                 let node_idx = vertex_to_node_index(local_vertex, ops.n_1d);
                 let value = field[index(k, node_idx, level, n_nodes, n_levels)];
                 alpha = alpha.min(compute_kuzmin_alpha(avg, value, bound_min, bound_max));
+            }
+            for i in 0..n_nodes {
+                let value = field[index(k, i, level, n_nodes, n_levels)];
+                alpha = alpha.min(compute_kuzmin_alpha(avg, value, union_min, union_max));
             }
 
             if alpha >= 1.0 - LIMITER_EPS {
@@ -749,6 +757,46 @@ mod tests {
         assert_eq!(stats.temperature_average_violations, 1);
         assert!(stats.temperature_inventory_correction > 0.0);
         assert!(state.temp.iter().all(|&value| value.abs() < 1e-12));
+    }
+
+    /// At P2 the vertices can sit at the element's mean while an edge or
+    /// the centre overshoots; those nodes are bounded by the element's
+    /// vertex patches too. Before, only the vertices were checked, and a
+    /// P2 lock exchange overshot by 0.46 °C.
+    #[test]
+    fn horizontal_kuzmin_bounds_every_node_at_p2() {
+        let (mesh, ops, geom, bathymetry, sigma, mut state) = setup(2, 1, 2, 1);
+        let n_nodes = state.n_nodes;
+        // Element 0: vertices 2 (its mean), edges −2, centre 6; element 1: 3
+        for i in 0..ops.n_nodes {
+            let (a, b) = (i % 3, i / 3);
+            let value = match (a == 1) as u8 + (b == 1) as u8 {
+                0 => 2.0,
+                1 => -2.0,
+                _ => 6.0,
+            };
+            state.temp[index(0, i, 0, n_nodes, 1)] = value;
+            state.temp[index(1, i, 0, n_nodes, 1)] = 3.0;
+        }
+        let before = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let config = TracerLimiter3DConfig::horizontal_kuzmin(
+            TracerBounds::new(-100.0, 100.0, 0.0, 40.0),
+            1.0,
+        );
+        let stats =
+            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let after = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        assert!(stats.limited_temperature_cells > 0);
+        for &value in &state.temp[..n_nodes] {
+            assert!(
+                (2.0 - 1e-12..=3.0 + 1e-12).contains(&value),
+                "a node left the patch bounds [2, 3]: {value}"
+            );
+        }
+        assert!(
+            (before - after).abs() < 1e-10,
+            "inventory changed: before={before}, after={after}"
+        );
     }
 
     #[test]

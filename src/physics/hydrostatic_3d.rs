@@ -58,8 +58,8 @@ use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
     BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
-    TracerBoundaryCondition3D, TransportScratch, apply_coriolis_3d, apply_momentum_transport_3d,
-    compute_momentum_rhs_3d, compute_transport_rhs_3d,
+    TracerBoundaryCondition3D, TransportScratch, VerticalAdvection, apply_coriolis_3d,
+    apply_momentum_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -102,6 +102,12 @@ where
     /// Columns shallower than this (m) are thin (3D wetting and drying; see
     /// [`Self::with_min_column_depth`]).
     pub min_column_depth: f64,
+    /// Reconstruction of the tracers at the σ-surfaces (see
+    /// [`Self::with_vertical_advection`]).
+    pub vertical_advection: VerticalAdvection,
+    /// Reconstruction of the velocity at the σ-surfaces (see
+    /// [`Self::with_momentum_vertical_advection`]).
+    pub momentum_vertical_advection: VerticalAdvection,
     /// Quadratic drag of the bottom-layer velocity, if any (see
     /// [`Self::with_bottom_drag`]).
     pub bottom_drag: Option<BottomDrag3D>,
@@ -166,6 +172,8 @@ where
             boundaries,
             tracer_limiter: TracerLimiter3DConfig::none(),
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
+            vertical_advection: VerticalAdvection::default(),
+            momentum_vertical_advection: VerticalAdvection::Centred,
             bottom_drag: None,
             nesting: None,
             open_boundary_check: Once::new(),
@@ -199,6 +207,21 @@ where
             "minimum column depth must be positive, got {depth}"
         );
         self.min_column_depth = depth;
+        self
+    }
+
+    /// The vertical advection of the tracers: fourth-order Akima by default
+    /// (see [`VerticalAdvection`]).
+    pub fn with_vertical_advection(mut self, scheme: VerticalAdvection) -> Self {
+        self.vertical_advection = scheme;
+        self
+    }
+
+    /// The vertical advection of the velocity, in the 3D stages and in the
+    /// slow forcing `G`: second-order centred by default (see
+    /// [`VerticalAdvection`]).
+    pub fn with_momentum_vertical_advection(mut self, scheme: VerticalAdvection) -> Self {
+        self.momentum_vertical_advection = scheme;
         self
     }
 
@@ -395,6 +418,8 @@ where
             g: self.g,
             rho0: self.rho0,
             min_column_depth: self.min_column_depth,
+            vertical_advection: self.vertical_advection,
+            momentum_vertical_advection: self.momentum_vertical_advection,
         }
     }
 
@@ -732,6 +757,7 @@ where
                 &self.geom,
                 &self.boundaries,
                 None,
+                self.momentum_vertical_advection,
                 transport_scratch,
             );
 
@@ -773,6 +799,7 @@ where
                 &self.geom,
                 &self.boundaries,
                 None,
+                self.momentum_vertical_advection,
                 bar_scratch,
             );
         });
