@@ -664,8 +664,10 @@ mod gls_gates {
     /// the classic GLS benchmark (Umlauf & Burchard 2005, §6.2). `D` is the
     /// depth where `k` first falls below 10⁻⁵ m²/s² (Burchard & Bolding
     /// 2001). Measured with k-ε at 30 h: 1.014 × Price's depth at Δt = 10 s
-    /// and 60 s alike (k-ω 1.000, generic 1.014). Heat is conserved and stays
-    /// within its initial range.
+    /// and 60 s alike (k-ω 1.000, generic 1.014). The entrainment is shear
+    /// driven: breaking waves with a wave height's roughness (z₀ = 0.5 m)
+    /// leave it at 1.000 / 1.000 / 1.014. Heat is conserved and stays within
+    /// its initial range.
     #[test]
     fn wind_mixed_layer_deepens_at_the_kato_phillips_rate() {
         let (depth, n_levels, u_star, n0, dt) = (50.0, 100, 0.01, 0.01, 60.0);
@@ -682,10 +684,17 @@ mod gls_gates {
         sigma.z_at_faces_into(0.0, depth, &mut z_w);
         let dtdz = n0 * n0 / (G * eos.alpha);
 
+        let waves = |gls: GlsMixing| {
+            gls.with_roughness(0.5, GlsMixing::DEFAULT_ROUGHNESS)
+                .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING)
+        };
         for (name, gls) in [
             ("k-ε", GlsMixing::k_epsilon()),
             ("k-ω", GlsMixing::k_omega()),
             ("generic", GlsMixing::generic()),
+            ("k-ε, waves", waves(GlsMixing::k_epsilon())),
+            ("k-ω, waves", waves(GlsMixing::k_omega())),
+            ("generic, waves", waves(GlsMixing::generic())),
         ] {
             let mut state = Solution3D::new(1, 1, n_levels);
             for (l, &s) in sigma.sigma_rho().iter().enumerate() {
@@ -743,6 +752,123 @@ mod gls_gates {
                 "{name}: k or ψ not positive"
             );
         }
+    }
+
+    /// Breaking waves (Craig & Banner 1994) under wind against a log-layer
+    /// drag, 10 m deep on 20 levels of 0.5 m, to steady state, against the
+    /// surface log layer:
+    /// - With a wave height's roughness (z₀ = 0.5 m) the wave-affected layer
+    ///   reaches the top interior w-points. k-ω and the generic model:
+    ///   measured `k` 4.4 / 4.3× the log layer's at the top one, 2.1 / 2.3×
+    ///   at the next, mid-depth within 3 %; the diffusivity there 2.9 / 2.3×
+    ///   the log surface's; the top w-point at 90 % of `u*²/(c_μ⁰)²` after
+    ///   one step instead of 15 / 31 min. k-ε's shear-free length is short
+    ///   (`l ≈ 0.09 s` against κs), so its diffusivity there drops to
+    ///   0.35× with 1.3× the `k`: use k-ω or the generic model with waves.
+    /// - With Charnock's roughness at u* = 1 cm/s (1.4 cm, so the 2 cm
+    ///   minimum), the wave-affected layer (≈ 2–4 z₀) is thinner than half
+    ///   the top layer and the column is the log layer's (`k` to 0.6 %, the
+    ///   diffusivity to 3 %).
+    #[test]
+    fn breaking_waves_raise_the_near_surface_mixing_under_wind() {
+        let (depth, n_levels, u_star, z0b, dt, rho0) = (10.0, 20, 0.01, 0.02, 60.0, 1025.0);
+        let sigma = SigmaGrid::uniform(n_levels);
+        let bathymetry = Bathymetry2D::constant(1, 1, -depth);
+        let z_b = (1.0 + sigma.sigma_rho()[0]) * depth;
+        let forcing = Forcing {
+            surface_stress: [rho0 * u_star * u_star, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        };
+        let drag = BottomDrag3D::log_layer(z0b).with_bounds(0.0, 1.0);
+        let top = n_levels - 1;
+        // The steady column, and the steps the top interior w-point takes to
+        // 90 % of the log layer's k
+        let run = |gls: &GlsMixing| {
+            let k_log = u_star * u_star / gls.cm0().powi(2);
+            let mut state = Solution3D::new(1, 1, n_levels);
+            state.rho.fill(rho0);
+            let mut spin_up = None;
+            for step in 1..=(24.0 * 3600.0 / dt) as usize {
+                let rate = drag.rate(z_b, state.u[0].abs());
+                apply_vertical_diffusion(
+                    &mut state,
+                    &sigma,
+                    &bathymetry,
+                    dt,
+                    gls,
+                    &forcing,
+                    None,
+                    G,
+                    rho0,
+                    0.0,
+                    StepDrag::bottom(&[rate]),
+                );
+                if spin_up.is_none() && state.tke[top] > 0.9 * k_log {
+                    spin_up = Some(step);
+                }
+            }
+            (
+                state,
+                spin_up.expect("the top never reached the log layer's k"),
+            )
+        };
+        for gls in [GlsMixing::k_omega(), GlsMixing::generic()] {
+            let gls = gls.with_background(0.0, 0.0);
+            let name = format!("{:?}", gls.parameters());
+            let k_log = u_star * u_star / gls.cm0().powi(2);
+            let (log, log_spin_up) = run(&gls);
+            let (waves, spin_up) = run(&gls
+                .clone()
+                .with_roughness(0.5, GlsMixing::DEFAULT_ROUGHNESS)
+                .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING));
+            assert!(
+                waves.tke[top] > 4.0 * k_log && waves.tke[top - 1] > 2.0 * k_log,
+                "{name}: k/k_log {} and {} at the top w-points",
+                waves.tke[top] / k_log,
+                waves.tke[top - 1] / k_log
+            );
+            assert!(
+                (waves.tke[n_levels / 2] / k_log - 1.0).abs() < 0.03,
+                "{name}: mid-depth k/k_log {}",
+                waves.tke[n_levels / 2] / k_log
+            );
+            assert!(
+                waves.eddy_diffusivity[top] > 2.0 * log.eddy_diffusivity[top],
+                "{name}: diffusivity {} under waves against {}",
+                waves.eddy_diffusivity[top],
+                log.eddy_diffusivity[top]
+            );
+            assert!(
+                spin_up == 1 && log_spin_up >= 10,
+                "{name}: spin-up {spin_up} steps under waves, {log_spin_up} without"
+            );
+
+            let (charnock, _) = run(&gls
+                .clone()
+                .with_charnock_roughness(GlsMixing::DEFAULT_CHARNOCK)
+                .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING));
+            for j in 1..n_levels {
+                let (k_ratio, kt_ratio) = (
+                    charnock.tke[j] / log.tke[j],
+                    charnock.eddy_diffusivity[j] / log.eddy_diffusivity[j],
+                );
+                assert!(
+                    (k_ratio - 1.0).abs() < 0.01 && (kt_ratio - 1.0).abs() < 0.05,
+                    "{name}, w-point {j}: k {k_ratio}, diffusivity {kt_ratio} × the log layer's"
+                );
+            }
+        }
+        let gls = GlsMixing::k_epsilon().with_background(0.0, 0.0);
+        let (log, _) = run(&gls);
+        let (waves, _) = run(&gls
+            .with_roughness(0.5, GlsMixing::DEFAULT_ROUGHNESS)
+            .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING));
+        let ratio = waves.eddy_diffusivity[top] / log.eddy_diffusivity[top];
+        assert!(
+            ratio < 0.5 && waves.tke[top] > log.tke[top],
+            "k-ε: diffusivity {ratio} × the log layer's under waves"
+        );
     }
 
     /// Open-channel flow driven by a body force against a log-layer drag,
