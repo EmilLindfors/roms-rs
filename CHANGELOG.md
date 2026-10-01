@@ -68,6 +68,8 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **`GriddedAtmosphere2D` could read another atmosphere's weather.** Its per-thread snapshot cache was keyed by the address of the shared state. The caches live on threads that outlive an atmosphere (rayon's workers), so an atmosphere allocated where a dropped one had been read the dropped one's regridded snapshots: in 6 of 10 reused addresses a 5 m/s wind applied the stress of the old 10 m/s (0.147 Pa instead of 0.037). Any process that builds a second atmosphere after dropping the first (a restart with a new weather file, an ensemble, the test suite) was exposed; a run with one atmosphere was not. The key is now a unique id per atmosphere. Regression test `a_new_atmosphere_does_not_read_a_dropped_ones_snapshots` (fails in its first round with the old key).
+
 - **The horizontal Kuzmin 3D tracer limiter checked only the vertices.** At P2 and up, edge and centre nodes could overshoot (0.46 °C in a P2 lock exchange). Every node is now bounded by the union of the element's vertex patches; P1 is unchanged. Test `horizontal_kuzmin_bounds_every_node_at_p2`.
 
 - **3D `w` output from the layer transports (TODO P4.2).** `Hydrostatic3D::post_process` wrote Ω of the 3D velocities alone, from a separate strong-form kernel that allocated per element and assumed affine elements (`compute_vertical_velocity`). The new `Hydrostatic3D::update_vertical_velocity` uses the same `LayerTransport` as the stages, on the end state's own layer transports. After a mode-split step their column sum is `Dū`, the filtered barotropic transport. Thin columns are at rest, as in the stages.

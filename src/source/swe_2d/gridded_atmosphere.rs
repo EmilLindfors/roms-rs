@@ -40,6 +40,7 @@
 //! [`crate::physics::Hydrostatic3D::with_surface_stress`]. Both share the
 //! node stencils and the regridded snapshots.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::boundary::{BCContext2D, BoundaryLevel, tidal_ramp};
@@ -90,6 +91,9 @@ impl AtmosphereNode {
 }
 
 struct Inner {
+    /// Unique per atmosphere (clones share it): the key of the per-thread
+    /// snapshot cache
+    id: u64,
     reader: Arc<AtmosphereReader>,
     projection: Arc<dyn CoordinateProjection + Send + Sync>,
     clock: ModelClock,
@@ -116,12 +120,17 @@ type Snapshot = Vec<[f32; 5]>;
 /// multirate step may reach.
 const CACHED_SNAPSHOTS: usize = 4;
 
+/// Source of [`Inner::id`]. Not the `Arc`'s address: the thread-local
+/// caches outlive an atmosphere (rayon's workers keep running), and a new
+/// one allocated at a dropped one's address would read its snapshots.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    /// Per-thread references to regridded snapshots, `(source, snapshot,
+    /// Per-thread references to regridded snapshots, `(source id, snapshot,
     /// values)`: the RHS kernels look snapshots up once per element on
     /// every thread, and a shared lock (or a shared reference count) there
     /// made the forcing cost 4× the RHS at 24 threads.
-    static LOCAL_SNAPSHOTS: std::cell::RefCell<Vec<(usize, usize, Arc<Snapshot>)>> =
+    static LOCAL_SNAPSHOTS: std::cell::RefCell<Vec<(u64, usize, Arc<Snapshot>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -179,6 +188,7 @@ impl GriddedAtmosphere2D {
         let (wind, pressure) = (reader.has_wind(), reader.has_pressure());
         Ok(Self {
             inner: Arc::new(Inner {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 reader,
                 projection,
                 clock,
@@ -423,7 +433,7 @@ impl GriddedAtmosphere2D {
         time: &TimeStencil,
         f: impl FnOnce(&[(&[[f32; 5]], f64)]) -> R,
     ) -> R {
-        let id = Arc::as_ptr(&self.inner) as usize;
+        let id = self.inner.id;
         for (t, _) in time.terms() {
             let hit = LOCAL_SNAPSHOTS.with_borrow(|l| l.iter().any(|e| e.0 == id && e.1 == t));
             if !hit {
@@ -779,6 +789,76 @@ mod tests {
         );
         for (g, a) in gx.iter().zip(&ax).chain(gy.iter().zip(&ay)) {
             assert!((g - a).abs() < 1e-6 * a.abs() + 1e-12, "{g} vs {a}");
+        }
+    }
+
+    /// Every atmosphere reads its own weather, also one allocated where a
+    /// dropped one was: the per-thread snapshot caches outlive both. Keyed
+    /// by the `Arc`'s address, 6 of 10 reused addresses read the dropped
+    /// atmosphere's wind (0.147 Pa from 10 m/s, for 0.037 Pa from 5 m/s).
+    #[test]
+    fn a_new_atmosphere_does_not_read_a_dropped_ones_snapshots() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let mesh = Mesh2D::uniform_rectangle(-10e3, 10e3, -10e3, 10e3, 2, 2);
+        let ops = DGOperators2D::new(1);
+        let grid = reader(&projection).grid.clone();
+        let m = grid.len();
+        let make = |speed: f32| {
+            let reader = AtmosphereReader::new(grid.clone(), vec![T0, T0 + 3600.0])
+                .unwrap()
+                .with_wind(
+                    FieldSeries::new(m, vec![speed; 2 * m]),
+                    FieldSeries::new(m, vec![0.0; 2 * m]),
+                );
+            GriddedAtmosphere2D::new(
+                Arc::new(reader),
+                &mesh,
+                &ops,
+                projection,
+                ModelClock::new(T0),
+            )
+            .unwrap()
+        };
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        q.h_data_mut().fill(10.0);
+        // The 2D source on this thread, then the columns' stress on rayon's
+        let source_hu = |atmosphere: &GriddedAtmosphere2D| {
+            let element = ElementSources {
+                element: ElementIndex::new(0),
+                time: 0.0,
+                solution: &q,
+                mesh: &mesh,
+                ops: &ops,
+                bathymetry: None,
+                g: G,
+                h_min: 1e-6,
+            };
+            let (mut sh, mut su, mut sv) = (vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]);
+            atmosphere.add_element(&element, &mut sh, &mut su, &mut sv);
+            su[0]
+        };
+        let stress = |speed: f64| RHO_AIR * 1.2e-3 * speed * speed;
+        let n = mesh.n_elements * ops.n_nodes;
+        let (mut tau_x, mut tau_y) = (vec![0.0; n], vec![0.0; n]);
+        for (round, speed) in [10.0, 5.0, 8.0, 3.0]
+            .into_iter()
+            .cycle()
+            .take(40)
+            .enumerate()
+        {
+            let atmosphere = make(speed as f32);
+            let hu = source_hu(&atmosphere);
+            assert!(
+                (hu * RHO_WATER - stress(speed)).abs() < 1e-12,
+                "round {round}: 2D source of a {speed} m/s wind is {hu}"
+            );
+            let (_, columns) = atmosphere.split_for_3d();
+            columns.surface_stress_into(0.0, &mut tau_x, &mut tau_y);
+            assert!(
+                tau_x.iter().all(|t| (t - stress(speed)).abs() < 1e-12),
+                "round {round}: column stress of a {speed} m/s wind is {:?}",
+                &tau_x[..4]
+            );
         }
     }
 
