@@ -10,8 +10,12 @@
 //! coupling of `η`), advection of `ū`, Coriolis on `ū`, and any bottom friction
 //! on `ū`. Configure it with the same Coriolis parameter as the 3D model
 //! (`with_source(CoriolisSource2D::…)`), and without wind or friction sources
-//! that duplicate [`Forcing`] or [`Hydrostatic3D::with_bottom_drag`]. The
-//! slow forcing it receives ([`ModeSplitPhysics::slow_forcing_into`]) is
+//! that duplicate [`Forcing`], [`Hydrostatic3D::with_surface_stress`] or
+//! [`Hydrostatic3D::with_bottom_drag`]: the wind belongs to the 3D columns
+//! (for a weather model's fields, [`crate::source::GriddedAtmosphere2D::split_for_3d`]
+//! keeps the pressure gradient, a depth-uniform force, in the 2D module and
+//! hands the wind stress to the columns). The slow forcing it receives
+//! ([`ModeSplitPhysics::slow_forcing_into`]) is
 //!
 //! ```text
 //!     G = D·⟨R_PGF+Cor(u)⟩ + Σ_l A_l(u) − A(ū) − D·R_Cor(ū) + (τ_s − τ_b)/ρ₀ − r·(u_b − ū)
@@ -38,9 +42,12 @@
 //! The last term is the vertical-shear part of the quadratic bottom drag
 //! ([`Hydrostatic3D::with_bottom_drag`], rate `r = C_d|u_b|`); the splitter
 //! applies its depth-mean part `−r·ū` implicitly in the barotropic pass (see
-//! [`crate::physics::bottom_drag`]). `τ_b` is the prescribed stress of
-//! [`Forcing`], if any. Thin columns ([`Hydrostatic3D::with_min_column_depth`])
-//! get no `G`: their depth mean is the 2D module's alone.
+//! [`crate::physics::bottom_drag`]). `τ_s` is the stress of [`Forcing`]
+//! plus the column's of [`Hydrostatic3D::with_surface_stress`], if any (see
+//! [`crate::physics::surface_stress`] for when it is evaluated), `τ_b` the
+//! prescribed stress of [`Forcing`], if any. Thin columns
+//! ([`Hydrostatic3D::with_min_column_depth`]) get no `G`: their depth mean
+//! is the 2D module's alone.
 //!
 //! The 3D PGF is baroclinic-only (`ρ − ρ₀`), so the barotropic pressure
 //! gradient comes from the 2D module. (Since P4.3 the 3D PGF lifts pressure
@@ -56,6 +63,7 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::SWEPhysics2D;
 use crate::physics::bottom_drag::BottomDrag3D;
 use crate::physics::eos::EquationOfState;
+use crate::physics::surface_stress::SurfaceStress3D;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
 use crate::physics::vertical_diffusion::apply_vertical_diffusion;
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
@@ -94,7 +102,11 @@ where
     pub eos: EOS,
     pub mixing: MIX,
     pub swe_physics: SWEPhysics2D<BC>, // 2D sub-model
+    /// Stresses and buoyancy flux, the same on every column.
     pub forcing: Forcing,
+    /// A surface stress field added to `forcing.surface_stress` column by
+    /// column, if any (see [`Self::with_surface_stress`]).
+    pub surface_stress: Option<Arc<dyn SurfaceStress3D>>,
     pub g: f64,
     pub rho0: f64,
     /// Temperature of water flowing in through a physical boundary (walls
@@ -136,6 +148,9 @@ where
     masked_scratch: Mutex<Option<Solution3D>>,
     /// Buffers of the horizontal viscosity (allocated on first use).
     viscosity_scratch: Mutex<Option<ViscosityScratch3D>>,
+    /// `[τ_x, τ_y]` of `surface_stress` on every column (allocated on first
+    /// use).
+    surface_stress_scratch: Mutex<[Vec<f64>; 2]>,
 }
 
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
@@ -175,6 +190,7 @@ where
             mixing,
             swe_physics,
             forcing,
+            surface_stress: None,
             g,
             rho0,
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
@@ -192,6 +208,7 @@ where
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
+            surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
         }
     }
 
@@ -250,6 +267,36 @@ where
     pub fn with_bottom_drag(mut self, drag: BottomDrag3D) -> Self {
         self.bottom_drag = Some(drag);
         self
+    }
+
+    /// A surface stress that varies from column to column, such as a
+    /// weather model's wind ([`crate::source::GriddedAtmosphere2D::split_for_3d`]),
+    /// added to the uniform `Forcing::surface_stress`. It reaches the depth
+    /// mean through `G`, the shear through the vertical diffusion's surface
+    /// flux, and the turbulence closure through the surface friction velocity
+    /// (see [`crate::physics::surface_stress`]). The 2D module must not carry
+    /// the same wind.
+    pub fn with_surface_stress(mut self, stress: impl SurfaceStress3D + 'static) -> Self {
+        self.surface_stress = Some(Arc::new(stress));
+        self
+    }
+
+    /// Call `f` with the field of [`Self::with_surface_stress`] at time `t`
+    /// on every column, `[τ_x, τ_y]`, or with `None` if there is none.
+    fn surface_stress_at<R>(&self, t: f64, f: impl FnOnce(Option<[&[f64]; 2]>) -> R) -> R {
+        let Some(stress) = &self.surface_stress else {
+            return f(None);
+        };
+        let mut guard = self
+            .surface_stress_scratch
+            .lock()
+            .expect("Failed to lock surface_stress_scratch");
+        let [tau_x, tau_y] = &mut *guard;
+        let n = self.mesh.n_elements * self.ops.n_nodes;
+        tau_x.resize(n, 0.0);
+        tau_y.resize(n, 0.0);
+        stress.surface_stress_into(t, tau_x, tau_y);
+        f(Some([tau_x, tau_y]))
     }
 
     /// Horizontal eddy viscosity `nu` (m²/s, constant) of the 3D momentum,
@@ -817,12 +864,13 @@ where
     }
 
     /// `G = D·⟨R_PGF+Cor(u)⟩ + Σ_l A_l(u) − A(ū) − D·R_Cor(ū) + (τ_s − τ_b)/ρ₀
-    /// − r·(u_b − ū)`, zero in thin columns (see the module docs).
+    /// − r·(u_b − ū)`, zero in thin columns (see the module docs), with the
+    /// surface stress at `t`.
     fn slow_forcing_into(
         &self,
         state: &Solution3D,
         rhs: &Solution3D,
-        _t: f64,
+        t: f64,
         g: &mut SWESolution2D,
     ) {
         let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
@@ -918,49 +966,53 @@ where
 
         let [tau_sx, tau_sy] = self.forcing.surface_stress;
         let [tau_bx, tau_by] = self.forcing.bottom_stress;
-        let stress_x = (tau_sx - tau_bx) / self.rho0;
-        let stress_y = (tau_sy - tau_by) / self.rho0;
 
         g.data[SWE_VAR_H].fill(0.0);
         let [_, g_hu, g_hv] = &mut g.data;
         let (advection_u, advection_v, bar_rhs): (&[f64], &[f64], &Solution3D) =
             (advection_u, advection_v, bar_rhs);
-        for_each_block(
-            ne,
-            [&mut g_hu[..ne * nn], &mut g_hv[..ne * nn]],
-            || (),
-            |_, k, [g_hu, g_hv]| {
-                let bed = self.bathymetry.element(ElementIndex::new(k));
-                for (i, &b) in bed.iter().enumerate() {
-                    let idx = k * nn + i;
-                    let depth = state.eta.data[idx] - b;
-                    // Thin columns: their depth mean is the 2D module's alone
-                    if depth < self.min_column_depth {
-                        g_hu[i] = 0.0;
-                        g_hv[i] = 0.0;
-                        continue;
-                    }
-                    let columns = idx * nl..(idx + 1) * nl;
-                    let mean_u = self.sigma.depth_average(&rhs.u[columns.clone()]);
-                    let mean_v = self.sigma.depth_average(&rhs.v[columns.clone()]);
-                    let advection_x: f64 = advection_u[columns.clone()].iter().sum();
-                    let advection_y: f64 = advection_v[columns].iter().sum();
-                    // The shear part of the bottom drag; the pass applies −r·ū
-                    let (drag_x, drag_y) = match &self.bottom_drag {
-                        Some(drag) => {
-                            let r = self.drag_rate(drag, state, idx);
-                            (
-                                r * (state.u[idx * nl] - state.ubar.data[idx]),
-                                r * (state.v[idx * nl] - state.vbar.data[idx]),
-                            )
+        self.surface_stress_at(t, |field| {
+            for_each_block(
+                ne,
+                [&mut g_hu[..ne * nn], &mut g_hv[..ne * nn]],
+                || (),
+                |_, k, [g_hu, g_hv]| {
+                    let bed = self.bathymetry.element(ElementIndex::new(k));
+                    for (i, &b) in bed.iter().enumerate() {
+                        let idx = k * nn + i;
+                        let depth = state.eta.data[idx] - b;
+                        // Thin columns: their depth mean is the 2D module's alone
+                        if depth < self.min_column_depth {
+                            g_hu[i] = 0.0;
+                            g_hv[i] = 0.0;
+                            continue;
                         }
-                        None => (0.0, 0.0),
-                    };
-                    g_hu[i] = depth * mean_u + advection_x - bar_rhs.u[idx] + stress_x - drag_x;
-                    g_hv[i] = depth * mean_v + advection_y - bar_rhs.v[idx] + stress_y - drag_y;
-                }
-            },
-        );
+                        let columns = idx * nl..(idx + 1) * nl;
+                        let mean_u = self.sigma.depth_average(&rhs.u[columns.clone()]);
+                        let mean_v = self.sigma.depth_average(&rhs.v[columns.clone()]);
+                        let advection_x: f64 = advection_u[columns.clone()].iter().sum();
+                        let advection_y: f64 = advection_v[columns].iter().sum();
+                        let (field_x, field_y) =
+                            field.map_or((0.0, 0.0), |[x, y]| (x[idx], y[idx]));
+                        let stress_x = (tau_sx + field_x - tau_bx) / self.rho0;
+                        let stress_y = (tau_sy + field_y - tau_by) / self.rho0;
+                        // The shear part of the bottom drag; the pass applies −r·ū
+                        let (drag_x, drag_y) = match &self.bottom_drag {
+                            Some(drag) => {
+                                let r = self.drag_rate(drag, state, idx);
+                                (
+                                    r * (state.u[idx * nl] - state.ubar.data[idx]),
+                                    r * (state.v[idx * nl] - state.vbar.data[idx]),
+                                )
+                            }
+                            None => (0.0, 0.0),
+                        };
+                        g_hu[i] = depth * mean_u + advection_x - bar_rhs.u[idx] + stress_x - drag_x;
+                        g_hv[i] = depth * mean_v + advection_y - bar_rhs.v[idx] + stress_y - drag_y;
+                    }
+                },
+            )
+        });
     }
 
     /// `r = C_d|u_b|` of every column from the bottom-layer velocity (the
@@ -975,19 +1027,30 @@ where
         true
     }
 
-    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64, bottom_drag: Option<&[f64]>) {
-        apply_vertical_diffusion(
-            state,
-            &self.sigma,
-            &self.bathymetry,
-            dt,
-            &self.mixing,
-            &self.forcing,
-            self.g,
-            self.rho0,
-            self.min_column_depth,
-            bottom_drag,
-        );
+    /// The vertical diffusion with the surface stress at the middle of the
+    /// step, `t + dt/2`.
+    fn vertical_implicit(
+        &self,
+        state: &mut Solution3D,
+        t: f64,
+        dt: f64,
+        bottom_drag: Option<&[f64]>,
+    ) {
+        self.surface_stress_at(t + 0.5 * dt, |field| {
+            apply_vertical_diffusion(
+                state,
+                &self.sigma,
+                &self.bathymetry,
+                dt,
+                &self.mixing,
+                &self.forcing,
+                field,
+                self.g,
+                self.rho0,
+                self.min_column_depth,
+                bottom_drag,
+            )
+        });
         // Thin columns carry the depth mean only
         let nl = state.n_levels;
         for idx in 0..state.eta.data.len() {

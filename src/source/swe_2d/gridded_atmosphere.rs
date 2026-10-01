@@ -29,7 +29,18 @@
 //! Both forcings can be ramped up from zero over a spin-up time
 //! ([`GriddedAtmosphere2D::with_ramp_up`]); the inverse-barometer level
 //! ramps with them.
+//!
+//! # 3D models
+//!
+//! In a mode-split 3D model ([`crate::physics::Hydrostatic3D`]) the wind
+//! stress is the surface boundary condition of the columns, while the
+//! pressure gradient is depth-uniform and stays with the 2D module.
+//! [`GriddedAtmosphere2D::split_for_3d`] makes the two parts: the source term
+//! without its wind for the 2D module, and a [`GriddedWindStress`] for
+//! [`crate::physics::Hydrostatic3D::with_surface_stress`]. Both share the
+//! node stencils and the regridded snapshots.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crate::boundary::{BCContext2D, BoundaryLevel, tidal_ramp};
@@ -39,7 +50,9 @@ use crate::io::{
 };
 use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
+use crate::physics::SurfaceStress3D;
 use crate::solver::SWEState2D;
+use crate::solver::core::blocks::for_each_block;
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
 use crate::time::ModelClock;
 use crate::types::ElementIndex;
@@ -78,6 +91,9 @@ impl AtmosphereNode {
 }
 
 struct Inner {
+    /// Unique per atmosphere (clones share it): the key of the per-thread
+    /// snapshot cache
+    id: u64,
     reader: Arc<AtmosphereReader>,
     projection: Arc<dyn CoordinateProjection + Send + Sync>,
     clock: ModelClock,
@@ -88,6 +104,8 @@ struct Inner {
     rho_water: f64,
     h_min: f64,
     ramp: Option<f64>,
+    /// Whether the source term applies the wind stress and the pressure
+    /// gradient; the snapshots carry whatever the reader has
     wind: bool,
     pressure: bool,
     /// Recently used snapshots regridded onto the nodes
@@ -102,12 +120,17 @@ type Snapshot = Vec<[f32; 5]>;
 /// multirate step may reach.
 const CACHED_SNAPSHOTS: usize = 4;
 
+/// Source of [`Inner::id`]. Not the `Arc`'s address: the thread-local
+/// caches outlive an atmosphere (rayon's workers keep running), and a new
+/// one allocated at a dropped one's address would read its snapshots.
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    /// Per-thread references to regridded snapshots, `(source, snapshot,
+    /// Per-thread references to regridded snapshots, `(source id, snapshot,
     /// values)`: the RHS kernels look snapshots up once per element on
     /// every thread, and a shared lock (or a shared reference count) there
     /// made the forcing cost 4× the RHS at 24 threads.
-    static LOCAL_SNAPSHOTS: std::cell::RefCell<Vec<(usize, usize, Arc<Snapshot>)>> =
+    static LOCAL_SNAPSHOTS: std::cell::RefCell<Vec<(u64, usize, Arc<Snapshot>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -165,6 +188,7 @@ impl GriddedAtmosphere2D {
         let (wind, pressure) = (reader.has_wind(), reader.has_pressure());
         Ok(Self {
             inner: Arc::new(Inner {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
                 reader,
                 projection,
                 clock,
@@ -200,6 +224,9 @@ impl GriddedAtmosphere2D {
     }
 
     /// Switch the wind stress off (pressure only).
+    ///
+    /// For a 3D model use [`Self::split_for_3d`], which hands the wind to the
+    /// columns instead.
     pub fn without_wind(mut self) -> Self {
         self.inner_mut().wind = false;
         self
@@ -209,6 +236,24 @@ impl GriddedAtmosphere2D {
     pub fn without_pressure(mut self) -> Self {
         self.inner_mut().pressure = false;
         self
+    }
+
+    /// Split for a mode-split 3D model ([`crate::physics::Hydrostatic3D`]):
+    /// this source term without its wind stress, for the 2D module (the
+    /// pressure gradient, if on), and the wind stress on the 3D columns, for
+    /// [`crate::physics::Hydrostatic3D::with_surface_stress`]. Both keep this
+    /// one's drag, ramp and clock, and share its stencils and snapshots.
+    ///
+    /// # Panics
+    /// If `self` has been cloned (configure it before cloning).
+    pub fn split_for_3d(self) -> (Self, GriddedWindStress) {
+        let wind = self.inner.wind;
+        let atmosphere = self.without_wind();
+        let stress = GriddedWindStress {
+            atmosphere: atmosphere.clone(),
+            wind,
+        };
+        (atmosphere, stress)
     }
 
     /// The weather fields.
@@ -250,19 +295,21 @@ impl GriddedAtmosphere2D {
         .unwrap_or_else(|| panic!("{}", self.coverage_message(t)))
     }
 
-    /// Wind (mesh axes) and pressure gradient at a node, ramped.
+    /// Wind (mesh axes) and pressure gradient at a node, ramped; each zero
+    /// unless `wind`, `pressure`.
     #[inline]
     fn fields(
         &self,
         node: &AtmosphereNode,
         time: &TimeStencil,
         ramp: f64,
+        [wind, pressure]: [bool; 2],
     ) -> ((f64, f64), (f64, f64)) {
         let inner = &self.inner;
         let reader = &inner.reader;
         let space = node.stencil.idx.iter().map(|&k| k as usize);
         let wind = match (&reader.u10, &reader.v10) {
-            (Some(u), Some(v)) if inner.wind => {
+            (Some(u), Some(v)) if wind => {
                 let w = space.clone().zip(node.stencil.w);
                 let (e, n) = (u.interpolate(time, w.clone()), v.interpolate(time, w));
                 let (c, s) = node.east;
@@ -271,7 +318,7 @@ impl GriddedAtmosphere2D {
             _ => (0.0, 0.0),
         };
         let gradient = match &reader.pressure {
-            Some(p) if inner.pressure => (
+            Some(p) if pressure => (
                 ramp * p.interpolate(time, space.clone().zip(node.gradient.map(|g| g.0))),
                 ramp * p.interpolate(time, space.zip(node.gradient.map(|g| g.1))),
             ),
@@ -287,12 +334,25 @@ impl GriddedAtmosphere2D {
         if h < inner.h_min {
             return (0.0, 0.0);
         }
-        let speed = u.hypot(v);
-        let stress = inner.rho_air * inner.drag.compute(speed) * speed / inner.rho_water;
+        let (tau_x, tau_y) = self.wind_stress(u, v);
         (
-            stress * u - h * px / inner.rho_water,
-            stress * v - h * py / inner.rho_water,
+            (tau_x - h * px) / inner.rho_water,
+            (tau_y - h * py) / inner.rho_water,
         )
+    }
+
+    /// Wind stress `ρ_air C_d(|U|) |U| U` (N/m²) of the wind `(u, v)`.
+    #[inline]
+    fn wind_stress(&self, u: f64, v: f64) -> (f64, f64) {
+        let inner = &self.inner;
+        let speed = u.hypot(v);
+        let stress = inner.rho_air * inner.drag.compute(speed) * speed;
+        (stress * u, stress * v)
+    }
+
+    /// Whether the source term applies the wind and the pressure gradient.
+    fn switches(&self) -> [bool; 2] {
+        [self.inner.wind, self.inner.pressure]
     }
 
     /// Node sampling at a mesh position, computed on the fly.
@@ -334,12 +394,14 @@ impl GriddedAtmosphere2D {
             w: [1.0, 0.0, 0.0, 0.0],
             len: 1,
         };
-        let pressure = inner.reader.pressure.as_ref().filter(|_| inner.pressure);
+        // Everything the reader has, whatever the switches: a split
+        // atmosphere's wind stress shares the snapshots
+        let pressure = inner.reader.pressure.as_ref();
         let values: Snapshot = inner
             .nodes
             .iter()
             .map(|node| {
-                let ((u, v), (px, py)) = self.fields(node, &single, 1.0);
+                let ((u, v), (px, py)) = self.fields(node, &single, 1.0, [true, true]);
                 let p = pressure.map_or(0.0, |p| {
                     let space = node
                         .stencil
@@ -371,7 +433,7 @@ impl GriddedAtmosphere2D {
         time: &TimeStencil,
         f: impl FnOnce(&[(&[[f32; 5]], f64)]) -> R,
     ) -> R {
-        let id = Arc::as_ptr(&self.inner) as usize;
+        let id = self.inner.id;
         for (t, _) in time.terms() {
             let hit = LOCAL_SNAPSHOTS.with_borrow(|l| l.iter().any(|e| e.0 == id && e.1 == t));
             if !hit {
@@ -418,7 +480,8 @@ impl SourceTerm2D for GriddedAtmosphere2D {
             return SWEState2D::zero();
         };
         let ramp = tidal_ramp(ctx.time, self.inner.ramp);
-        let (wind, gradient) = self.fields(&node, &self.time_stencil(ctx.time), ramp);
+        let time = self.time_stencil(ctx.time);
+        let (wind, gradient) = self.fields(&node, &time, ramp, self.switches());
         let (su, sv) = self.source(ctx.state.h, wind, gradient);
         SWEState2D::new(0.0, su, sv)
     }
@@ -431,7 +494,11 @@ impl SourceTerm2D for GriddedAtmosphere2D {
         hv: &mut [f64],
     ) {
         let inner = &self.inner;
+        if !inner.wind && !inner.pressure {
+            return;
+        }
         let ramp = tidal_ramp(element.time, inner.ramp);
+        let [wind, pressure] = self.switches().map(|on| if on { ramp } else { 0.0 });
         let base = element.element.as_usize() * inner.n_nodes;
         let depths = element.solution.element_h(element.element);
         self.with_snapshots(&self.time_stencil(element.time), |snapshots| {
@@ -439,8 +506,8 @@ impl SourceTerm2D for GriddedAtmosphere2D {
                 if h < inner.h_min {
                     continue;
                 }
-                let [u, v, px, py, _] = Self::cached(snapshots, base + i).map(|x| ramp * x);
-                let (su, sv) = self.source(h, (u, v), (px, py));
+                let [u, v, px, py, _] = Self::cached(snapshots, base + i);
+                let (su, sv) = self.source(h, (wind * u, wind * v), (pressure * px, pressure * py));
                 hu[i] += su;
                 hv[i] += sv;
             }
@@ -449,6 +516,51 @@ impl SourceTerm2D for GriddedAtmosphere2D {
 
     fn name(&self) -> &'static str {
         "gridded_atmosphere_2d"
+    }
+}
+
+/// The wind stress of a [`GriddedAtmosphere2D`] on the columns of a 3D model
+/// ([`crate::physics::Hydrostatic3D::with_surface_stress`]); made by
+/// [`GriddedAtmosphere2D::split_for_3d`].
+///
+/// `τ = ρ_air C_d(|U₁₀|) |U₁₀| U₁₀` (N/m²) of the 10 m wind interpolated
+/// linearly in time between the regridded snapshots, in the mesh axes, with
+/// the atmosphere's drag and ramp. Thin and dry columns are the 3D model's to
+/// mask.
+#[derive(Clone, Debug)]
+pub struct GriddedWindStress {
+    atmosphere: GriddedAtmosphere2D,
+    /// Whether the atmosphere's wind was on before the split
+    wind: bool,
+}
+
+impl SurfaceStress3D for GriddedWindStress {
+    fn surface_stress_into(&self, t: f64, tau_x: &mut [f64], tau_y: &mut [f64]) {
+        let atmosphere = &self.atmosphere;
+        let inner = &atmosphere.inner;
+        assert_eq!(tau_x.len(), inner.nodes.len(), "one stress per node");
+        assert_eq!(tau_y.len(), inner.nodes.len(), "one stress per node");
+        if !self.wind || !inner.reader.has_wind() {
+            tau_x.fill(0.0);
+            tau_y.fill(0.0);
+            return;
+        }
+        let ramp = tidal_ramp(t, inner.ramp);
+        let time = atmosphere.time_stencil(t);
+        let nn = inner.n_nodes;
+        for_each_block(
+            inner.nodes.len() / nn,
+            [tau_x, tau_y],
+            || (),
+            |_, k, [tau_x, tau_y]| {
+                atmosphere.with_snapshots(&time, |snapshots| {
+                    for (i, (tx, ty)) in tau_x.iter_mut().zip(tau_y).enumerate() {
+                        let [u, v, ..] = GriddedAtmosphere2D::cached(snapshots, k * nn + i);
+                        (*tx, *ty) = atmosphere.wind_stress(ramp * u, ramp * v);
+                    }
+                });
+            },
+        );
     }
 }
 
@@ -572,6 +684,182 @@ mod tests {
         // Per-node evaluation by position agrees
         let s = atmosphere.evaluate(&element.context(4));
         assert!((s.hu - expected).abs() < 1e-7, "{} vs {expected}", s.hu);
+    }
+
+    /// Split for a 3D model: the 2D source keeps the pressure gradient only,
+    /// and the columns get the wind stress the unsplit source applied (×ρ),
+    /// ramped with it; without wind before the split, none after.
+    #[test]
+    fn split_for_3d_hands_the_wind_to_the_columns() {
+        let (mesh, ops, atmosphere) = setup();
+        let n = mesh.n_elements * ops.n_nodes;
+        let (pressure_only, wind) = atmosphere.with_ramp_up(7200.0).split_for_3d();
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        let h = 20.0;
+        q.h_data_mut().fill(h);
+        let element = ElementSources {
+            element: ElementIndex::new(5),
+            time: 1800.0,
+            solution: &q,
+            mesh: &mesh,
+            ops: &ops,
+            bathymetry: None,
+            g: G,
+            h_min: 1e-6,
+        };
+        let (mut sh, mut su, mut sv) = (vec![0.0; 9], vec![0.0; 9], vec![0.0; 9]);
+        pressure_only.add_element(&element, &mut sh, &mut su, &mut sv);
+        let ramp = tidal_ramp(1800.0, Some(7200.0));
+        assert!(ramp > 0.0 && ramp < 1.0);
+        let gradient = -ramp * h * 0.015 / RHO_WATER;
+        for i in 0..9 {
+            assert!((su[i] - gradient).abs() < 1e-9, "{} vs {gradient}", su[i]);
+            assert!(sv[i].abs() < 1e-12);
+        }
+
+        let (mut tau_x, mut tau_y) = (vec![0.0; n], vec![0.0; n]);
+        wind.surface_stress_into(1800.0, &mut tau_x, &mut tau_y);
+        let speed = ramp * 10.0;
+        let expected = RHO_AIR * 1.2e-3 * speed * speed;
+        for (tx, ty) in tau_x.iter().zip(&tau_y) {
+            assert!((tx - expected).abs() < 1e-12, "{tx} vs {expected}");
+            assert!(ty.abs() < 1e-12);
+        }
+
+        let (_, none) = setup().2.without_wind().split_for_3d();
+        none.surface_stress_into(1800.0, &mut tau_x, &mut tau_y);
+        assert!(tau_x.iter().chain(&tau_y).all(|&t| t == 0.0));
+    }
+
+    /// A wind linear in mesh coordinates, which the bilinear stencils
+    /// reproduce: the columns' stress is `ρ_air C_d |U| U` of that wind at
+    /// every node, in the 3D model's `[element][node]` order (to the f32
+    /// storage of the snapshots).
+    #[test]
+    fn gridded_wind_stress_varies_from_node_to_node() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let wind = |x: f64, y: f64| (8.0 + 4.0 * x / 30e3, -2.0 + 3.0 * y / 30e3);
+        let (lat0, lon0) = projection.xy_to_geo(-30_000.0, -30_000.0);
+        let (lat1, lon1) = projection.xy_to_geo(30_000.0, 30_000.0);
+        let n = 7;
+        let lon: Vec<f64> = (0..n)
+            .map(|i| lon0 + (lon1 - lon0) * i as f64 / 6.0)
+            .collect();
+        let lat: Vec<f64> = (0..n)
+            .map(|j| lat0 + (lat1 - lat0) * j as f64 / 6.0)
+            .collect();
+        let grid = GeoGrid::regular(lon.clone(), lat.clone()).unwrap();
+        let m = grid.len();
+        let (mut u, mut v) = (Vec::new(), Vec::new());
+        for _ in 0..2 {
+            for k in 0..m {
+                let (x, y) = projection.geo_to_xy(lat[k / n], lon[k % n]);
+                let (e, nn) = wind(x, y);
+                u.push(e as f32);
+                v.push(nn as f32);
+            }
+        }
+        let reader = Arc::new(
+            AtmosphereReader::new(grid, vec![T0, T0 + 3600.0])
+                .unwrap()
+                .with_wind(FieldSeries::new(m, u), FieldSeries::new(m, v)),
+        );
+        let mesh = Mesh2D::uniform_rectangle(-20e3, 20e3, -15e3, 15e3, 4, 3);
+        let ops = DGOperators2D::new(2);
+        let (_, gridded) =
+            GriddedAtmosphere2D::new(reader, &mesh, &ops, projection, ModelClock::new(T0))
+                .unwrap()
+                .split_for_3d();
+        let analytic = crate::physics::AnalyticSurfaceStress::new(&mesh, &ops, move |x, y, _| {
+            let (u, v) = wind(x, y);
+            let speed = u.hypot(v);
+            let stress = RHO_AIR * DragCoefficient::LargePond.compute(speed) * speed;
+            [stress * u, stress * v]
+        });
+        let n_nodes = mesh.n_elements * ops.n_nodes;
+        let [mut gx, mut gy, mut ax, mut ay] = std::array::from_fn(|_| vec![0.0; n_nodes]);
+        gridded.surface_stress_into(1800.0, &mut gx, &mut gy);
+        analytic.surface_stress_into(1800.0, &mut ax, &mut ay);
+        let (lo, hi) = ax
+            .iter()
+            .fold((f64::MAX, 0.0_f64), |(lo, hi), &t| (lo.min(t), hi.max(t)));
+        assert!(
+            hi > 2.0 * lo,
+            "the test wind should vary: τ_x in [{lo}, {hi}]"
+        );
+        for (g, a) in gx.iter().zip(&ax).chain(gy.iter().zip(&ay)) {
+            assert!((g - a).abs() < 1e-6 * a.abs() + 1e-12, "{g} vs {a}");
+        }
+    }
+
+    /// Every atmosphere reads its own weather, also one allocated where a
+    /// dropped one was: the per-thread snapshot caches outlive both. Keyed
+    /// by the `Arc`'s address, 6 of 10 reused addresses read the dropped
+    /// atmosphere's wind (0.147 Pa from 10 m/s, for 0.037 Pa from 5 m/s).
+    #[test]
+    fn a_new_atmosphere_does_not_read_a_dropped_ones_snapshots() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let mesh = Mesh2D::uniform_rectangle(-10e3, 10e3, -10e3, 10e3, 2, 2);
+        let ops = DGOperators2D::new(1);
+        let grid = reader(&projection).grid.clone();
+        let m = grid.len();
+        let make = |speed: f32| {
+            let reader = AtmosphereReader::new(grid.clone(), vec![T0, T0 + 3600.0])
+                .unwrap()
+                .with_wind(
+                    FieldSeries::new(m, vec![speed; 2 * m]),
+                    FieldSeries::new(m, vec![0.0; 2 * m]),
+                );
+            GriddedAtmosphere2D::new(
+                Arc::new(reader),
+                &mesh,
+                &ops,
+                projection,
+                ModelClock::new(T0),
+            )
+            .unwrap()
+        };
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        q.h_data_mut().fill(10.0);
+        // The 2D source on this thread, then the columns' stress on rayon's
+        let source_hu = |atmosphere: &GriddedAtmosphere2D| {
+            let element = ElementSources {
+                element: ElementIndex::new(0),
+                time: 0.0,
+                solution: &q,
+                mesh: &mesh,
+                ops: &ops,
+                bathymetry: None,
+                g: G,
+                h_min: 1e-6,
+            };
+            let (mut sh, mut su, mut sv) = (vec![0.0; 4], vec![0.0; 4], vec![0.0; 4]);
+            atmosphere.add_element(&element, &mut sh, &mut su, &mut sv);
+            su[0]
+        };
+        let stress = |speed: f64| RHO_AIR * 1.2e-3 * speed * speed;
+        let n = mesh.n_elements * ops.n_nodes;
+        let (mut tau_x, mut tau_y) = (vec![0.0; n], vec![0.0; n]);
+        for (round, speed) in [10.0, 5.0, 8.0, 3.0]
+            .into_iter()
+            .cycle()
+            .take(40)
+            .enumerate()
+        {
+            let atmosphere = make(speed as f32);
+            let hu = source_hu(&atmosphere);
+            assert!(
+                (hu * RHO_WATER - stress(speed)).abs() < 1e-12,
+                "round {round}: 2D source of a {speed} m/s wind is {hu}"
+            );
+            let (_, columns) = atmosphere.split_for_3d();
+            columns.surface_stress_into(0.0, &mut tau_x, &mut tau_y);
+            assert!(
+                tau_x.iter().all(|t| (t - stress(speed)).abs() < 1e-12),
+                "round {round}: column stress of a {speed} m/s wind is {:?}",
+                &tau_x[..4]
+            );
+        }
     }
 
     /// The inverse-barometer level is −(p − p_ref)/(ρg), and ramps.

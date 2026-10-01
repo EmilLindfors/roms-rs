@@ -21,7 +21,10 @@ use crate::vertical::SigmaGrid;
 ///
 /// The surface and bottom stresses enter as the momentum fluxes `τ/ρ₀` at the
 /// column ends, so over `dt` the depth-integrated velocity of every column
-/// changes by `dt·(τ_s − τ_b)/ρ₀`.
+/// changes by `dt·(τ_s − τ_b)/ρ₀`. The surface stress of a column is
+/// `forcing.surface_stress` plus, if given, its entry of `surface_stress`
+/// (`[τ_x, τ_y]`, N/m², one per column, `[element][node]`); the closure
+/// receives the column's own [`Forcing`] and friction velocity.
 ///
 /// `bottom_drag`, if given, holds a linear drag rate `r` (m/s) per column
 /// (`[element][node]`): the bottom flux `r·u_b` of the new bottom-layer
@@ -49,6 +52,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     dt: f64,
     mixing: &M,
     forcing: &Forcing,
+    surface_stress: Option<[&[f64]; 2]>,
     g: f64,
     rho0: f64,
     min_column_depth: f64,
@@ -77,9 +81,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     } = state;
     let (eta, rho): (&[f64], &[f64]) = (&eta.data, rho);
     let n = state.n_elements * nn * nl;
-    let [tau_sx, tau_sy] = forcing.surface_stress;
     let [tau_bx, tau_by] = forcing.bottom_stress;
-    let surface_friction_velocity = (tau_sx.hypot(tau_sy) / rho0).sqrt();
     for_each_block(
         state.n_elements,
         [
@@ -132,8 +134,19 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 sigma.layer_thicknesses_into(eta[idx], h, dz);
 
                 // 2. Step the turbulence, if any, and compute the mixing
-                // coefficients. The bottom stress: the prescribed one plus
-                // the drag of the bottom-layer velocity
+                // coefficients. The surface stress: the uniform one plus the
+                // column's; the bottom stress: the prescribed one plus the
+                // drag of the bottom-layer velocity
+                let [mut tau_sx, mut tau_sy] = forcing.surface_stress;
+                if let Some([field_x, field_y]) = surface_stress {
+                    tau_sx += field_x[idx];
+                    tau_sy += field_y[idx];
+                }
+                let forcing = Forcing {
+                    surface_stress: [tau_sx, tau_sy],
+                    ..*forcing
+                };
+                let surface_friction_velocity = (tau_sx.hypot(tau_sy) / rho0).sqrt();
                 let drag = bottom_drag.map_or(0.0, |rate| rate[idx]);
                 let bottom_friction_velocity = ((tau_bx / rho0 + drag * u[i * nl])
                     .hypot(tau_by / rho0 + drag * v[i * nl]))
@@ -155,7 +168,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                         surface_friction_velocity,
                         bottom_friction_velocity,
                     },
-                    forcing,
+                    &forcing,
                     dt,
                     Turbulence {
                         tke: &mut tke[turbulence_column.clone()],
@@ -464,6 +477,7 @@ mod tests {
                 dt,
                 &mixing,
                 &forcing,
+                None,
                 9.81,
                 1025.0,
                 0.0,
@@ -525,6 +539,7 @@ mod tests {
             dt,
             &mixing,
             &forcing,
+            None,
             9.81,
             rho0,
             0.0,
@@ -590,6 +605,7 @@ mod tests {
                 dt,
                 &mixing,
                 &forcing,
+                None,
                 9.81,
                 1025.0,
                 0.0,
@@ -674,6 +690,7 @@ mod gls_gates {
                         dt,
                         &gls,
                         &forcing,
+                        None,
                         G,
                         rho0,
                         0.0,
@@ -755,6 +772,7 @@ mod gls_gates {
                     dt,
                     &gls,
                     &forcing,
+                    None,
                     G,
                     rho0,
                     0.0,
@@ -834,6 +852,7 @@ mod gls_gates {
                     dt,
                     &gls,
                     &forcing,
+                    None,
                     G,
                     eos.rho0,
                     0.0,
@@ -855,6 +874,80 @@ mod gls_gates {
             );
             let heat: f64 = state.temp.iter().sum();
             assert!((heat - heat0).abs() < 1e-12 * heat0, "{name}: heat changed");
+        }
+    }
+
+    /// A surface stress field reaches every column on its own: the momentum
+    /// flux and the friction velocity of the GLS surface boundary. Three
+    /// columns of a stratified layer under the uniform stress (0.05, 0) Pa
+    /// plus their entries of the field, (0.05, 0), (−0.05, 0) and (0, 0.08):
+    /// each ends bit for bit where a lone column under its total stress does,
+    /// in velocity, temperature, `k` and `ψ`.
+    #[test]
+    fn each_column_feels_its_own_surface_stress() {
+        let (depth, n_levels, dt, steps) = (30.0, 30, 60.0, 360);
+        let eos = LinearEOS::default();
+        let sigma = SigmaGrid::uniform(n_levels);
+        let gls = GlsMixing::k_epsilon();
+        let forcing = |tau: [f64; 2]| Forcing {
+            surface_stress: tau,
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        };
+        let stratified = |n_columns: usize| {
+            let mut state = Solution3D::new(1, n_columns, n_levels);
+            for column in state.temp.chunks_exact_mut(n_levels) {
+                for (t, &s) in column.iter_mut().zip(sigma.sigma_rho()) {
+                    *t = eos.t0 + 0.1 * s * depth;
+                }
+            }
+            state.salt.fill(eos.s0);
+            eos.update_density(&mut state);
+            state
+        };
+        let run = |state: &mut Solution3D, forcing: &Forcing, field: Option<[&[f64]; 2]>| {
+            let bathymetry = Bathymetry2D::constant(1, state.n_nodes, -depth);
+            for _ in 0..steps {
+                apply_vertical_diffusion(
+                    state,
+                    &sigma,
+                    &bathymetry,
+                    dt,
+                    &gls,
+                    forcing,
+                    field,
+                    G,
+                    eos.rho0,
+                    0.0,
+                    None,
+                );
+                eos.update_density(state);
+            }
+        };
+
+        let mut columns = stratified(3);
+        let (field_x, field_y) = ([0.05, -0.05, 0.0], [0.0, 0.0, 0.08]);
+        run(
+            &mut columns,
+            &forcing([0.05, 0.0]),
+            Some([&field_x, &field_y]),
+        );
+        assert!(columns.u[n_levels - 1] > 0.01, "the wind drove no current");
+        for (i, total) in [[0.1, 0.0], [0.0, 0.0], [0.05, 0.08]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut lone = stratified(1);
+            run(&mut lone, &forcing(total), None);
+            let (levels, faces) = (
+                i * n_levels..(i + 1) * n_levels,
+                i * (n_levels + 1)..(i + 1) * (n_levels + 1),
+            );
+            assert_eq!(&columns.u[levels.clone()], &lone.u[..], "column {i}: u");
+            assert_eq!(&columns.v[levels.clone()], &lone.v[..], "column {i}: v");
+            assert_eq!(&columns.temp[levels], &lone.temp[..], "column {i}: T");
+            assert_eq!(&columns.tke[faces.clone()], &lone.tke[..], "column {i}: k");
+            assert_eq!(&columns.gls[faces], &lone.gls[..], "column {i}: ψ");
         }
     }
 }
