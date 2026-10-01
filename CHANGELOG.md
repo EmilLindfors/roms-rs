@@ -6,6 +6,25 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **Fourth-order Akima vertical tracer advection (TODO P4.5, P4.6).** The 3D tracers were advected through the σ-surfaces first-order upwind, which diffuses with `κ ≈ |w|Δz/2` (`REVIEW.md` §3.5).
+  - New `solver::rhs::VerticalAdvection` (`Upwind`, `Akima`) and `Hydrostatic3D::with_vertical_advection`. The default is now `Akima`, ROMS's `TS_A4VADVECTION`: `C_{l+1/2} = ½(C_l + C_{l+1}) − (d_{l+1} − d_l)/6` with harmonic-mean slopes, zero at extrema. It is conservative and keeps constants constant, like upwind, but it is not monotone.
+  - API: `apply_tracer_transport_3d` takes the scheme; `Rhs3DConfig.vertical_advection`.
+  - Gates (a mode-1 internal seiche in a 5 km × 20 m basin, N = 0.05 s⁻¹, P2, against the free-surface hydrostatic speed from `tan(NH/c₁) = Nc₁/g`):
+    - `a_mode_1_internal_seiche_has_the_internal_wave_speed`: the period is +0.04 % off on 20 levels, +0.37 % on 10 (−0.04 % on 40, −0.06 % on 80). That is second order in the level spacing, down to a floor of −0.05 to −0.1 % that grows as the step shrinks. The seiche loses 0.13 % of its amplitude per period. At N = 0.1 and 0.2 s⁻¹ the model follows the free-surface correction to the rigid lid's `NH/π` (0.21 % and 0.83 %).
+    - `akima_vertical_advection_keeps_internal_waves`: on 10 levels, upwind is 1.06 % slow and loses 1.2 % per period, about first order in the spacing; Akima 0.37 % and 0.14 %.
+    - Unit test `vertical_akima_values_are_centred_and_exact_for_linear_profiles`.
+  - Re-measured with Akima: the internal-wave pulse at relaxed open boundaries (`an_internal_wave_leaves_through_a_relaxed_open_boundary`) leaves 4.5 % in the channel at 16 h, not 36 %. Most of the 36 % was not reflection: upwind's mixing left a 0.2 °C anomaly along the pulses' path, in the middle of the channel from hour 4 on (Akima: 0.02 °C). Bands with Akima: 2 km 4.9 % (30 min) and 12 % (1 h); 4 km 4.4 % (1 h) and 14 % (2 h); 6 km (1 h) 2.5 %; 1 km (30 min) 18 %.
+  - The 3D beach (`a_beach_wets_and_dries_in_3d`) now undershoots its initial temperature range by up to 1.0e-3 °C, at the bed of its deepest column, and there is none in water shallower than 1 m. That is not a defect: the water at the bed is 0.26 °C colder than the bed layer's initial mean, and rising, it cools the layer. Upwind stayed in range only because it freezes the bed layer at a wall.
+  - `VerticalAdvection::Tvd`: third-order upwind with a TVD limiter (Koren 1993), the spatial part of HSIMT (Wu & Zhu 2010). It is monotone in the interior and linear out of the end layers. `vertical_schemes_on_a_front_and_a_smooth_profile`: a front advected 16 layers stays in [0, 1] and spreads over 6 layers with TVD, 18 with upwind, while Akima overshoots 16 %. On a tanh halocline the error is 800× smaller than upwind's with Akima and 60× with TVD.
+  - Akima and TVD reconstruct on the layers' σ-thicknesses (new `LayerTransport::d_sigma`), not in index space as ROMS does. They are exact for linear profiles on stretched levels. There, on θs 5, θb 0.4 levels, index-space Akima's divergence error stalls (9.2e-3 at 160 levels, against 3.2e-4).
+  - `VerticalAdvection::Centred` (the momentum's second-order centred form) and `Hydrostatic3D::with_momentum_vertical_advection`. The momentum stays centred by default: Akima is 100× more accurate on a smooth profile, but a nonlinear internal seiche on 20 levels gains only 12–16 % of its period error. `apply_momentum_transport_3d` takes the scheme; `Rhs3DConfig.momentum_vertical_advection`.
+
+- **Lock exchange gate (TODO P4.6).** `a_lock_exchange_runs_at_the_gravity_current_speed`: an 8 km × 20 m channel with ΔT = 5 °C, run at P1. Both fronts move at Fr = 0.483 (0.473 at 62 m), a little below Benjamin's ½, and T stays in range. At P2 the run needs horizontal viscosity, which the 3D model does not have yet (TODO P4.5): the interface's hydrostatic shear instability blows it up after ≈ 1500 s.
+
+### Fixed
+
+- **The horizontal Kuzmin 3D tracer limiter checked only the vertices.** At P2 and up, edge and centre nodes could overshoot (0.46 °C in a P2 lock exchange). Every node is now bounded by the union of the element's vertex patches; P1 is unchanged. Test `horizontal_kuzmin_bounds_every_node_at_p2`.
+
 - **3D `w` output from the layer transports (TODO P4.2).** `Hydrostatic3D::post_process` wrote Ω of the 3D velocities alone, from a separate strong-form kernel that allocated per element and assumed affine elements (`compute_vertical_velocity`). The new `Hydrostatic3D::update_vertical_velocity` uses the same `LayerTransport` as the stages, on the end state's own layer transports. After a mode-split step their column sum is `Dū`, the filtered barotropic transport. Thin columns are at rest, as in the stages.
   - Removed: `physics::compute_vertical_velocity` (module `physics::vertical_velocity`), `Hydrostatic3D::w_scratch`, `solver::rhs::advection_3d::compute_strong_divergence`.
   - Its layer-continuity regression test moved to `transport_3d` (`own_omega_of_a_zero_mean_shear_has_layer_continuity`).
@@ -16,7 +35,7 @@ All notable changes to this project should be documented in this file.
   - Measured: a mode-1 internal-wave pulse meeting a 3D open face that extrapolates (open faces without nesting) is unstable. It starts an exchange flow at the boundary that displaces the isopycnals without bound (0.24 → 6 °C and 0.26 m/s within 8 h, P2, 50 m, N = 0.02 s⁻¹). Boundary values of the state at rest alone are stable but reflect the wave completely.
   - New `boundary::ReferenceColumns`: a fixed state, e.g. the initial stratification at rest, as the parent of a `Nesting3D`. It gives runs without a parent model a relaxation band (ROMS's nudging to climatology). Bands of 2–6 km reflect 18–32 % of the wave's amplitude.
   - `Hydrostatic3D` warns once when a stratified state has open 3D faces that no nesting relaxes.
-  - Gate `an_internal_wave_leaves_through_a_relaxed_open_boundary`: with a 4 km band (30 min), 36 % of the pulse remains in the channel after it has left (P1, six levels); with walls 1.19.
+  - Gate `an_internal_wave_leaves_through_a_relaxed_open_boundary`: with a 4 km band (30 min), 36 % of the pulse remains in the channel after it has left (P1, six levels); with walls 1.19. (These numbers are with upwind vertical advection; with Akima 4.5 %, see above.)
 
 - **Parent 3D fields for the nesting (TODO P4.2).** `OceanModelReader` collapsed the parent's velocity to a depth mean and T/S to the surface.
   - `OceanModelReader::from_file_with_profiles` (with `netcdf`) also keeps the profiles of the 3D velocity, temperature and salinity (`io::ProfileSeries`, `[time][point][level]`, levels from the surface down):

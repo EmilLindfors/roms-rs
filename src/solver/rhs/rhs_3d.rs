@@ -23,7 +23,8 @@ use crate::solver::rhs::baroclinic::compute_pressure_gradient;
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
-    LayerTransport, TransportScratch, apply_momentum_transport_3d, apply_tracer_transport_3d,
+    LayerTransport, TransportScratch, VerticalAdvection, apply_momentum_transport_3d,
+    apply_tracer_transport_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
@@ -48,6 +49,10 @@ pub struct Rhs3DConfig<'a> {
     pub rho0: f64,
     /// Columns shallower than this (m) are thin (3D wetting and drying).
     pub min_column_depth: f64,
+    /// Reconstruction of the tracers at the σ-surfaces.
+    pub vertical_advection: VerticalAdvection,
+    /// Reconstruction of the velocity at the σ-surfaces.
+    pub momentum_vertical_advection: VerticalAdvection,
 }
 
 /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the pointwise
@@ -105,6 +110,7 @@ pub fn compute_transport_rhs_3d(
         config.geom,
         config.boundaries,
         config.exterior.velocity,
+        config.momentum_vertical_advection,
         scratch,
     );
     let tracers = [
@@ -132,6 +138,7 @@ pub fn compute_transport_rhs_3d(
             bc,
             exterior,
             config.boundaries,
+            config.vertical_advection,
             scratch,
         );
     }

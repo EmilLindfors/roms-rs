@@ -43,7 +43,8 @@
 //! too. This is what makes 3D wetting and drying work.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
-//! inventory form: upwind in `C` on the face fluxes and on `Ω`.
+//! inventory form: upwind in `C` on the face fluxes, and on `Ω` either
+//! upwind or (the default) fourth-order Akima ([`VerticalAdvection`]).
 //!
 //! # Momentum
 //!
@@ -54,7 +55,7 @@
 //!     ∂(H_z u)_l/∂t = −∇·(Q_l u_l) − (Ω_{l+1/2} u_{l+1/2} − Ω_{l−1/2} u_{l−1/2}) + …
 //! ```
 //!
-//! upwind in `u` on the face fluxes and centred on `Ω`. A velocity that is
+//! upwind in `u` on the face fluxes and (by default) centred on `Ω`. A velocity that is
 //! uniform in space changes its inventory exactly as the layer thickness
 //! changes, and the layer momentum `∫ H_z,l u_l` is changed by the advection
 //! only through open boundaries.
@@ -138,6 +139,9 @@ pub struct LayerTransport {
     pub face: Vec<f64>,
     /// `Ω` at the w-points (m/s), `n_levels + 1` per column, bed first.
     pub omega: Vec<f64>,
+    /// σ-thickness `Δσ_l` of the layers (uniform until the first
+    /// [`Self::compute`]).
+    pub d_sigma: Vec<f64>,
     /// Largest `|Ω|` at the surface before the residual was spread over the
     /// column (m/s): round-off where the barotropic pass keeps the nodal
     /// identity `η̄ − ηⁿ = −Δt∇·DU_avg2`.
@@ -159,6 +163,7 @@ impl LayerTransport {
             hv: vec![0.0; n_elements * nn * n_levels],
             face: vec![0.0; n_elements * 4 * nfn * n_levels],
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
+            d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
             layer_hu: vec![0.0; nn],
             layer_hv: vec![0.0; nn],
@@ -197,6 +202,7 @@ impl LayerTransport {
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, self.n_levels);
         assert_eq!(state.n_levels, nl, "layer count of the state");
         let d_sigma = sigma.d_sigma();
+        self.d_sigma.copy_from_slice(d_sigma);
 
         // 1. Nodal layer transports, corrected to DU_avg2
         for k in 0..state.n_elements {
@@ -450,8 +456,8 @@ pub fn inventory_to_concentration(
 /// `C↑` the concentration upwind of the layer's face flux `F_l`: the element's
 /// own on outflow, the neighbour's on inflow, and `bc`'s exterior value on
 /// inflow through a physical boundary (a nesting parent's value, from
-/// `exterior`, where it has one). Vertically `C` is upwinded on `Ω` (first
-/// order, TODO P4.5).
+/// `exterior`, where it has one). Vertically `C_{l±1/2}` is reconstructed
+/// by `vertical` ([`VerticalAdvection`]).
 ///
 /// For constant `C` the tendency is `C·(−∇·Q_l − δΩ_l) = C·Δσ_l ∂η/∂t`, the
 /// change of the layer's thickness: constancy. Both fluxes are single-valued
@@ -467,6 +473,7 @@ pub fn apply_tracer_transport_3d(
     bc: &dyn TracerBoundaryCondition3D,
     exterior: Option<ExteriorField>,
     boundaries: &Boundaries3D,
+    vertical: VerticalAdvection,
     scratch: &mut TransportScratch,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
@@ -500,21 +507,190 @@ pub fn apply_tracer_transport_3d(
             }
         }
 
-        // Vertical upwind flux through the σ-surfaces
-        let vertical = &mut scratch.vertical;
-        for i in 0..nn {
-            let idx = k * nn + i;
-            let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
-            let column = &tracer[idx * nl..(idx + 1) * nl];
-            vertical[0] = 0.0;
-            vertical[nl] = 0.0;
-            for l in 1..nl {
-                let w = omega[l];
-                vertical[l] = w * if w >= 0.0 { column[l - 1] } else { column[l] };
+        subtract_vertical_flux(rhs, tracer, transport, k, nn, vertical, scratch);
+    }
+}
+
+/// Subtract `δ(Ω φ)`, with `φ` at the σ-surfaces reconstructed by `scheme`,
+/// from `rhs` in every column of element `k`.
+fn subtract_vertical_flux(
+    rhs: &mut [f64],
+    field: &[f64],
+    transport: &LayerTransport,
+    k: usize,
+    nn: usize,
+    scheme: VerticalAdvection,
+    scratch: &mut TransportScratch,
+) {
+    let nl = transport.n_levels;
+    let TransportScratch {
+        vertical: flux,
+        slope,
+        ..
+    } = scratch;
+    for i in 0..nn {
+        let idx = k * nn + i;
+        let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
+        let column = &field[idx * nl..(idx + 1) * nl];
+        scheme.surface_values(column, omega, &transport.d_sigma, slope, flux);
+        for l in 0..=nl {
+            flux[l] *= omega[l];
+        }
+        for (l, r) in rhs[idx * nl..(idx + 1) * nl].iter_mut().enumerate() {
+            *r -= flux[l + 1] - flux[l];
+        }
+    }
+}
+
+/// Reconstruction of a tracer at the σ-surfaces `l ± 1/2` for its vertical
+/// advection `−δ(Ω C)` ([`apply_tracer_transport_3d`]). All are
+/// conservative, keep a constant tracer constant and take the layers'
+/// thicknesses into account (`H_z ∝ Δσ` within a column), so a linear
+/// profile is reconstructed exactly on stretched levels too, except by
+/// `Upwind`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VerticalAdvection {
+    /// Second-order centred, `C_{l−1/2} = ½(C_{l−1} + C_l)`: non-dissipative
+    /// and linear, the momentum's default (ROMS `UV_C2VADVECTION`). It
+    /// oscillates at fronts and is exact for a linear profile only on
+    /// uniform levels. Stable with the SSP-RK3 stages up to a vertical
+    /// Courant number `|Ω|Δt/H_z` ≈ 1.7 (√3).
+    Centred,
+    /// First-order upwind on `Ω`: monotone, but it diffuses with
+    /// `κ ≈ |w|Δz/2`. A mode-1 internal seiche on 10 uniform levels runs
+    /// 1.1 % slow and loses 1.2 % of its amplitude per period (Akima: 0.37 %
+    /// and 0.14 %).
+    Upwind,
+    /// Fourth-order Akima (ROMS `TS_A4VADVECTION`; Shchepetkin & McWilliams
+    /// 2005, §3): the surface value of the cubic that has the two layers'
+    /// means and, at their centres, the harmonic-mean slopes
+    /// `d = 2δ₋δ₊/(δ₋ + δ₊)` of the neighbouring gradients (zero at an
+    /// extremum, one-sided at the bed and the surface). On layers `a` below
+    /// and `b` above,
+    ///
+    /// ```text
+    ///     C_{l−1/2} = (b C_{l−1} + a C_l)/(a + b) + ab (d_{l−1} − d_l) / (3(a + b)),
+    /// ```
+    ///
+    /// ROMS's `½(C_{l−1} + C_l) − (d_l − d_{l−1})/6` on uniform levels (ROMS
+    /// applies that in index space on stretched levels too). Centred: no
+    /// numerical diffusion, but not monotone; it over- and undershoots
+    /// slightly at extrema and fronts, where the zero slope leaves
+    /// second-order centred.
+    ///
+    /// With the SSP-RK3 stages it is stable up to a vertical Courant number
+    /// `|Ω|Δt/H_z` ≈ 1.2 (the fourth-order centred operator's eigenvalues
+    /// reach 1.37 `|Ω|/H_z` on the imaginary axis, RK3's limit there is √3);
+    /// upwind up to 1.
+    #[default]
+    Akima,
+    /// Third-order upwind-biased with a TVD limiter: the surface value of the
+    /// parabola with the means of the upwind layer, the one beyond it and the
+    /// downwind one (`C_{l−1/2} = (5C_{l−1} + 2C_l − C_{l−2})/6` on uniform
+    /// levels, upwind `C_{l−1}`), its increment over the upwind layer's mean
+    /// limited to at most the upwind and downwind differences and zero at an
+    /// extremum (Koren 1993). This is the spatial part of HSIMT (Wu & Zhu
+    /// 2010, ROMS `TS_HSIMT`), whose Courant-number terms the SSP-RK3 stages
+    /// replace. Out of the bed or the surface layer, where there is no layer
+    /// beyond, the surface value is linear through the two end layers'
+    /// means: first order there would freeze the end layer's mean where the
+    /// horizontal flow vanishes (at a wall), and a mode-1 internal seiche
+    /// with a thick bed layer drifted by a third of its amplitude per period.
+    ///
+    /// Monotone in the interior: no new extrema up to a vertical Courant
+    /// number `|Ω|Δt/H_z` of ½ (SSP-RK3 inherits the forward-Euler bound).
+    /// The end layers' means can leave the column's range slightly, as the
+    /// water at the bed or the surface is carried into the layer above or
+    /// below. The limiter adds some diffusion at extrema and fronts.
+    Tvd,
+}
+
+impl VerticalAdvection {
+    /// `C` at the `nl + 1` σ-surfaces of `column` (bed first) into
+    /// `surface`, for the volume fluxes `omega` (which decide the upwind
+    /// side) through layers of σ-thickness `d_sigma`. The bed and surface
+    /// pass no flux; their values are zero. `slope` holds `nl` values of
+    /// scratch.
+    fn surface_values(
+        self,
+        column: &[f64],
+        omega: &[f64],
+        d_sigma: &[f64],
+        slope: &mut [f64],
+        surface: &mut [f64],
+    ) {
+        let nl = column.len();
+        surface[0] = 0.0;
+        surface[nl] = 0.0;
+        match self {
+            Self::Centred => {
+                for l in 1..nl {
+                    surface[l] = 0.5 * (column[l - 1] + column[l]);
+                }
             }
-            for (l, r) in rhs[idx * nl..(idx + 1) * nl].iter_mut().enumerate() {
-                *r -= vertical[l + 1] - vertical[l];
+            Self::Upwind => {
+                for l in 1..nl {
+                    surface[l] = if omega[l] >= 0.0 {
+                        column[l - 1]
+                    } else {
+                        column[l]
+                    };
+                }
             }
+            Self::Akima if nl > 1 => {
+                // The gradient across surface l (between the centres of
+                // layers l − 1 and l), repeated at the bed and the surface
+                let gradient = |l: usize| {
+                    let l = l.clamp(1, nl - 1);
+                    2.0 * (column[l] - column[l - 1]) / (d_sigma[l - 1] + d_sigma[l])
+                };
+                for (l, d) in slope.iter_mut().enumerate() {
+                    let (below, above) = (gradient(l), gradient(l + 1));
+                    let product = below * above;
+                    *d = if product > 0.0 {
+                        2.0 * product / (below + above)
+                    } else {
+                        0.0
+                    };
+                }
+                for l in 1..nl {
+                    let (a, b) = (d_sigma[l - 1], d_sigma[l]);
+                    surface[l] = (b * column[l - 1]
+                        + a * column[l]
+                        + a * b * (slope[l - 1] - slope[l]) / 3.0)
+                        / (a + b);
+                }
+            }
+            Self::Tvd => {
+                for l in 1..nl {
+                    // Upwind layer `up`, the one beyond it `far` (if any), and
+                    // the downwind layer `down`
+                    let (up, far, down) = if omega[l] >= 0.0 {
+                        (l - 1, l.checked_sub(2), l)
+                    } else {
+                        (l, Some(l + 1).filter(|&f| f < nl), l - 1)
+                    };
+                    let Some(far) = far else {
+                        // Out of an end layer: linear through the two layers'
+                        // means (first order would freeze the end layer's
+                        // mean against a wall, where u = 0)
+                        let (a, b) = (d_sigma[up], d_sigma[down]);
+                        surface[l] = column[up] + a / (a + b) * (column[down] - column[up]);
+                        continue;
+                    };
+                    let (a, b, c) = (d_sigma[up], d_sigma[down], d_sigma[far]);
+                    let (behind, ahead) = (column[up] - column[far], column[down] - column[up]);
+                    let increment = a * b / ((a + c) * (a + b + c)) * behind
+                        + a * (a + c) / ((a + b) * (a + b + c)) * ahead;
+                    surface[l] = column[up]
+                        + if behind * ahead > 0.0 && increment * ahead > 0.0 {
+                            increment.signum() * increment.abs().min(behind.abs()).min(ahead.abs())
+                        } else {
+                            0.0
+                        };
+                }
+            }
+            Self::Akima => {}
         }
     }
 }
@@ -532,7 +708,8 @@ pub fn apply_tracer_transport_3d(
 /// a nesting parent's velocity (`exterior`) where there is one, otherwise
 /// the interior's (zero gradient, ROMS's "gradient" condition for the 3D
 /// velocity; see [`crate::solver::rhs::boundary_3d`]). Walls carry no volume, so no
-/// momentum. Vertically `u` is centred at the σ-surfaces.
+/// momentum. Vertically `u` at the σ-surfaces is reconstructed by `vertical`
+/// (`Hydrostatic3D` uses [`VerticalAdvection::Centred`] by default).
 ///
 /// A velocity uniform in space gets `u·Δσ_l ∂η/∂t`: divided by the new layer
 /// thickness it stays uniform. The layer momentum `∫ H_z,l u_l` changes
@@ -549,6 +726,7 @@ pub fn apply_momentum_transport_3d(
     geom: &GeometricFactors2D,
     boundaries: &Boundaries3D,
     exterior: Option<[ExteriorField; 2]>,
+    vertical: VerticalAdvection,
     scratch: &mut TransportScratch,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
@@ -574,21 +752,7 @@ pub fn apply_momentum_transport_3d(
                 }
             }
 
-            // Centred flux through the σ-surfaces
-            let vertical = &mut scratch.vertical;
-            for i in 0..nn {
-                let idx = k * nn + i;
-                let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
-                let column = &field[idx * nl..(idx + 1) * nl];
-                vertical[0] = 0.0;
-                vertical[nl] = 0.0;
-                for l in 1..nl {
-                    vertical[l] = omega[l] * 0.5 * (column[l - 1] + column[l]);
-                }
-                for (l, r) in rhs[idx * nl..(idx + 1) * nl].iter_mut().enumerate() {
-                    *r -= vertical[l + 1] - vertical[l];
-                }
-            }
+            subtract_vertical_flux(rhs, field, transport, k, nn, vertical, scratch);
         }
     }
 }
@@ -660,6 +824,7 @@ pub struct TransportScratch {
     face: Vec<f64>,
     div: Vec<f64>,
     vertical: Vec<f64>,
+    slope: Vec<f64>,
 }
 
 impl TransportScratch {
@@ -671,6 +836,7 @@ impl TransportScratch {
             face: vec![0.0; 4 * ops.n_face_nodes],
             div: vec![0.0; ops.n_nodes],
             vertical: vec![0.0; n_levels + 1],
+            slope: vec![0.0; n_levels],
         }
     }
 }
@@ -858,6 +1024,7 @@ mod tests {
                 bc,
                 None,
                 &self.boundaries,
+                VerticalAdvection::default(),
                 &mut scratch,
             );
             rhs
@@ -1143,6 +1310,7 @@ mod tests {
                 &ExtrapolationTracerBC3D,
                 None,
                 &Boundaries3D::default(),
+                VerticalAdvection::Upwind,
                 &mut scratch,
             );
             for column in rhs.chunks_exact(nl) {
@@ -1150,6 +1318,240 @@ mod tests {
                     assert!((got - want).abs() < 1e-14, "Ω = {w}: {column:?}");
                 }
             }
+        }
+    }
+
+    /// Surface values of `scheme` on `column` with layers `d_sigma` and a
+    /// uniform `Ω = w` through the interior surfaces.
+    fn surfaces(scheme: VerticalAdvection, column: &[f64], d_sigma: &[f64], w: f64) -> Vec<f64> {
+        let nl = column.len();
+        let mut omega = vec![w; nl + 1];
+        (omega[0], omega[nl]) = (0.0, 0.0);
+        let (mut slope, mut surface) = (vec![0.0; nl], vec![f64::NAN; nl + 1]);
+        scheme.surface_values(column, &omega, d_sigma, &mut slope, &mut surface);
+        surface
+    }
+
+    /// Layers stretched by up to 2.5× between neighbours, and a linear
+    /// profile `C = 3 + 2z` sampled as layer means (their centre values).
+    fn stretched_linear() -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        let d_sigma = vec![0.05, 0.125, 0.2, 0.25, 0.375];
+        let mut faces = vec![-1.0];
+        for ds in &d_sigma {
+            faces.push(faces.last().unwrap() + ds);
+        }
+        let column = (0..5).map(|l| 3.0 + (faces[l] + faces[l + 1])).collect();
+        (column, d_sigma, faces)
+    }
+
+    /// The Akima surface values: exact for a linear profile (on stretched
+    /// levels too), the plain average next to an extremum (zero slope
+    /// there), and independent of the sign of Ω (centred).
+    #[test]
+    fn vertical_akima_values_are_centred_and_exact_for_linear_profiles() {
+        let akima = VerticalAdvection::Akima;
+        let linear = [1.0, 3.0, 5.0, 7.0, 9.0];
+        for w in [1.0, -1.0] {
+            let surface = surfaces(akima, &linear, &[1.0; 5], w);
+            for l in 1..linear.len() {
+                assert!((surface[l] - (2.0 * l as f64)).abs() < 1e-14, "{surface:?}");
+            }
+        }
+        let (column, d_sigma, faces) = stretched_linear();
+        for w in [1.0, -1.0] {
+            let surface = surfaces(akima, &column, &d_sigma, w);
+            for l in 1..5 {
+                let want = 3.0 + 2.0 * faces[l];
+                assert!((surface[l] - want).abs() < 1e-13, "{surface:?}");
+            }
+        }
+        // Harmonic-mean slopes d = [1, 4/3, 2] (one-sided at the ends):
+        // C_{1/2} = ½(1 + 2 − (4/3 − 1)/3), C_{3/2} = ½(2 + 4 − (2 − 4/3)/3),
+        // ROMS's index-space formula on uniform levels
+        let surface = surfaces(akima, &[1.0, 2.0, 4.0], &[1.0; 3], 1.0);
+        assert!((surface[1] - 13.0 / 9.0).abs() < 1e-14, "{surface:?}");
+        assert!((surface[2] - 26.0 / 9.0).abs() < 1e-14, "{surface:?}");
+        // The same on uniform levels of any thickness
+        let thin = surfaces(akima, &[1.0, 2.0, 4.0], &[0.1; 3], 1.0);
+        assert!((thin[1] - 13.0 / 9.0).abs() < 1e-13, "{thin:?}");
+        // Level 1 is a maximum: its slope is zero
+        let peaked = [1.0, 3.0, 2.0, 1.0];
+        let surface = surfaces(akima, &peaked, &[1.0; 4], -1.0);
+        let d = [2.0, 0.0, -1.0, -1.0];
+        for l in 1..4 {
+            let want = 0.5 * (peaked[l - 1] + peaked[l] - (d[l] - d[l - 1]) / 3.0);
+            assert!((surface[l] - want).abs() < 1e-14, "{surface:?}");
+        }
+        // One level: nothing to reconstruct
+        assert_eq!(surfaces(akima, &[4.0], &[1.0], 1.0), vec![0.0, 0.0]);
+    }
+
+    /// The TVD surface values: third-order upwind `(5C_up + 2C_down −
+    /// C_far)/6` where the limiter allows it, linear out of an end layer,
+    /// exact for a linear profile (on stretched levels too), first order at
+    /// an extremum, and never outside the two neighbouring layers' values.
+    #[test]
+    fn vertical_tvd_values_are_third_order_upwind_and_bounded() {
+        let tvd = VerticalAdvection::Tvd;
+        // Smooth and monotone: 1, 2, 4, 7 (unlimited increments)
+        let column = [1.0, 2.0, 4.0, 7.0];
+        let up = surfaces(tvd, &column, &[1.0; 4], 1.0);
+        assert_eq!(up[1], 1.5, "linear out of the bed layer");
+        assert!((up[2] - (5.0 * 2.0 + 2.0 * 4.0 - 1.0) / 6.0).abs() < 1e-14);
+        assert!((up[3] - (5.0 * 4.0 + 2.0 * 7.0 - 2.0) / 6.0).abs() < 1e-14);
+        let down = surfaces(tvd, &column, &[1.0; 4], -1.0);
+        assert!((down[1] - (5.0 * 2.0 + 2.0 * 1.0 - 4.0) / 6.0).abs() < 1e-14);
+        assert!((down[2] - (5.0 * 4.0 + 2.0 * 2.0 - 7.0) / 6.0).abs() < 1e-14);
+        assert_eq!(down[3], 5.5, "linear out of the surface layer");
+
+        let (column, d_sigma, faces) = stretched_linear();
+        for w in [1.0, -1.0] {
+            let surface = surfaces(tvd, &column, &d_sigma, w);
+            for l in 1..5 {
+                let want = 3.0 + 2.0 * faces[l];
+                assert!((surface[l] - want).abs() < 1e-13, "Ω = {w}: {surface:?}");
+            }
+        }
+
+        // A step and a spike: no value outside its neighbours
+        for column in [
+            [0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ] {
+            for w in [1.0, -1.0] {
+                let surface = surfaces(tvd, &column, &[1.0; 6], w);
+                for l in 1..6 {
+                    let (lo, hi) = (column[l - 1].min(column[l]), column[l - 1].max(column[l]));
+                    assert!(
+                        (lo..=hi).contains(&surface[l]),
+                        "Ω = {w}: {surface:?} for {column:?}"
+                    );
+                }
+            }
+        }
+        // Upwind of the spike's peak (an extremum): first order
+        let surface = surfaces(tvd, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0], &[1.0; 6], 1.0);
+        assert_eq!(surface[3], 1.0);
+    }
+
+    /// `column` advected up a column of `d_sigma` layers by `Ω = w` for
+    /// `steps` SSP-RK3 steps at the Courant number `courant` (on the thinnest
+    /// layer), `scheme` at the interior surfaces, the same water flowing in
+    /// at the bed and out at the surface.
+    fn advect_column(
+        scheme: VerticalAdvection,
+        mut column: Vec<f64>,
+        d_sigma: &[f64],
+        courant: f64,
+        steps: usize,
+    ) -> Vec<f64> {
+        let nl = column.len();
+        let w = 1.0;
+        let dt = courant * d_sigma.iter().copied().fold(f64::MAX, f64::min) / w;
+        let omega = vec![w; nl + 1];
+        let (mut slope, mut surface) = (vec![0.0; nl], vec![0.0; nl + 1]);
+        let mut rate = |c: &[f64]| -> Vec<f64> {
+            scheme.surface_values(c, &omega, d_sigma, &mut slope, &mut surface);
+            (surface[0], surface[nl]) = (c[0], c[nl - 1]);
+            (0..nl)
+                .map(|l| -w * (surface[l + 1] - surface[l]) / d_sigma[l])
+                .collect()
+        };
+        for _ in 0..steps {
+            let q0 = column.clone();
+            let k: Vec<f64> = rate(&column);
+            let q1: Vec<f64> = q0.iter().zip(&k).map(|(q, k)| q + dt * k).collect();
+            let k: Vec<f64> = rate(&q1);
+            let q2: Vec<f64> = (0..nl)
+                .map(|l| 0.75 * q0[l] + 0.25 * (q1[l] + dt * k[l]))
+                .collect();
+            let k: Vec<f64> = rate(&q2);
+            column = (0..nl)
+                .map(|l| q0[l] / 3.0 + 2.0 / 3.0 * (q2[l] + dt * k[l]))
+                .collect();
+        }
+        column
+    }
+
+    /// A front advected 16 layers up a column: TVD stays within [0, 1] and
+    /// spreads it over 6 layers, upwind over 18; Akima overshoots by 16 %
+    /// (and spreads it over 19). A halocline-like tanh profile: the error is
+    /// 800× smaller than upwind's with Akima and 60× with TVD (whose limiter
+    /// acts in the profile's tails), and 450× and 40× on stretched layers.
+    #[test]
+    fn vertical_schemes_on_a_front_and_a_smooth_profile() {
+        use VerticalAdvection::{Akima, Tvd, Upwind};
+        let nl = 100;
+        let uniform = vec![1.0 / nl as f64; nl];
+        let front: Vec<f64> = (0..nl).map(|l| if l < 30 { 1.0 } else { 0.0 }).collect();
+        // 40 layers at 0.4 per step: the front moves 16 layers
+        let run = |scheme| advect_column(scheme, front.clone(), &uniform, 0.4, 40);
+        let (upwind, akima, tvd) = (run(Upwind), run(Akima), run(Tvd));
+        let range = |c: &[f64]| {
+            c.iter()
+                .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)))
+        };
+        let smeared = |c: &[f64]| c.iter().filter(|&&x| x > 0.01 && x < 0.99).count();
+        let (lo, hi) = range(&tvd);
+        assert!(
+            lo >= -1e-12 && hi <= 1.0 + 1e-12,
+            "TVD left [0, 1]: [{lo}, {hi}]"
+        );
+        let (lo, hi) = range(&upwind);
+        assert!(
+            lo >= -1e-12 && hi <= 1.0 + 1e-12,
+            "upwind left [0, 1]: [{lo}, {hi}]"
+        );
+        let (lo, hi) = range(&akima);
+        assert!(
+            hi > 1.1,
+            "test regime: Akima should overshoot: [{lo}, {hi}]"
+        );
+        assert!(
+            smeared(&tvd) * 2 < smeared(&upwind),
+            "TVD front over {} layers, upwind {}",
+            smeared(&tvd),
+            smeared(&upwind)
+        );
+
+        // A smooth profile on uniform and stretched layers (2.5 % thicker
+        // from each layer to the next), advected 16 thin layers
+        let stretched: Vec<f64> = {
+            let raw: Vec<f64> = (0..nl).map(|l| 1.05_f64.powf(l as f64 / 2.0)).collect();
+            let total: f64 = raw.iter().sum();
+            raw.iter().map(|r| r / total).collect()
+        };
+        for d_sigma in [&uniform, &stretched] {
+            let mut faces = vec![0.0];
+            for ds in d_sigma {
+                faces.push(faces.last().unwrap() + ds);
+            }
+            // Layer means of a halocline-like ½(1 + tanh((σ − 0.4)/0.08)), and
+            // of it shifted by the travel w·t
+            let mean = |shift: f64| -> Vec<f64> {
+                let primitive = |x: f64| {
+                    let y = (x - shift - 0.4) / 0.08;
+                    0.5 * (x + 0.08 * y.cosh().ln())
+                };
+                (0..nl)
+                    .map(|l| (primitive(faces[l + 1]) - primitive(faces[l])) / d_sigma[l])
+                    .collect()
+            };
+            let steps = 40;
+            let thinnest = d_sigma.iter().copied().fold(f64::MAX, f64::min);
+            let travel = 0.4 * thinnest * steps as f64;
+            let exact = mean(travel);
+            let error = |scheme| {
+                let c = advect_column(scheme, mean(0.0), d_sigma, 0.4, steps);
+                // Away from the inflow at the bed and the outflow at the
+                // surface (both first order here)
+                max_abs((nl / 4..nl - 4).map(|l| c[l] - exact[l]))
+            };
+            let (upwind, akima, tvd) = (error(Upwind), error(Akima), error(Tvd));
+            assert!(
+                akima * 200.0 < upwind && tvd * 20.0 < upwind,
+                "smooth profile: upwind {upwind:.3e}, Akima {akima:.3e}, TVD {tvd:.3e}"
+            );
         }
     }
 
@@ -1176,6 +1578,7 @@ mod tests {
                 &self.geom,
                 &self.boundaries,
                 None,
+                VerticalAdvection::Centred,
                 &mut scratch,
             );
             (rhs_u, rhs_v)
@@ -1313,6 +1716,7 @@ mod tests {
             &geom,
             &Boundaries3D::default(),
             None,
+            VerticalAdvection::Centred,
             &mut TransportScratch::new(&ops, nl),
         );
         let sw = sigma.sigma_w();
@@ -1550,6 +1954,7 @@ mod tests {
             &FixedTracerBC3D::new(-1e6),
             exterior.temp,
             &case.boundaries,
+            VerticalAdvection::default(),
             &mut TransportScratch::new(&case.ops, nl),
         );
         let (mut rhs_u, mut rhs_v) = (vec![0.0; rhs_t.len()], vec![0.0; rhs_t.len()]);
@@ -1564,6 +1969,7 @@ mod tests {
             &case.geom,
             &case.boundaries,
             exterior.velocity,
+            VerticalAdvection::Centred,
             &mut TransportScratch::new(&case.ops, nl),
         );
         let fields = [
@@ -1633,6 +2039,7 @@ mod tests {
             &ExtrapolationTracerBC3D,
             exterior.temp,
             &case.boundaries,
+            VerticalAdvection::default(),
             &mut TransportScratch::new(&case.ops, nl),
         );
         let scale = c * max_abs(case.eta_rate.iter().copied());
