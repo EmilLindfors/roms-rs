@@ -97,6 +97,10 @@ use std::cell::RefCell;
 /// weights cannot be centred on `tⁿ⁺¹`.
 pub const MIN_BAROTROPIC_SUBSTEPS: usize = 4;
 
+/// Most barotropic substeps per baroclinic step before the step is taken as
+/// blown up (a real run needs tens to hundreds).
+const MAX_BAROTROPIC_SUBSTEPS: usize = 1_000_000;
+
 /// Relative residual of `η̄ − ηⁿ = −Δt∇·DU_avg2` above which an element is
 /// treated as balanced only as a whole (round-off is ≈ 1e-13).
 const NODAL_IDENTITY_TOLERANCE: f64 = 1e-9;
@@ -781,7 +785,15 @@ impl ModeSplitIntegrator {
             dt_bt_max > 0.0,
             "barotropic time step {dt_bt_max} is not positive"
         );
-        let n_bt = ((dt / dt_bt_max).ceil() as usize).max(self.min_substeps);
+        // A blown-up state (wave speeds of 1e100 m/s) would ask for more
+        // substeps than memory holds ("capacity overflow" in the filter)
+        let substeps = (dt / dt_bt_max).ceil();
+        assert!(
+            substeps <= MAX_BAROTROPIC_SUBSTEPS as f64,
+            "{substeps:.3e} barotropic substeps for a {dt} s step (barotropic step \
+             {dt_bt_max:.3e} s): the state has blown up"
+        );
+        let n_bt = (substeps as usize).max(self.min_substeps);
         if self.filter.as_ref().is_none_or(|f| f.n_bt() != n_bt) {
             self.filter = Some(BarotropicFilter::new(n_bt));
         }

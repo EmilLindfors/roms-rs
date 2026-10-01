@@ -74,11 +74,12 @@ use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::core::blocks::{for_each_block, reduce_blocks};
 use crate::solver::rhs::{
-    BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, HorizontalViscosity3D,
-    LayerTransport, Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
-    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
-    apply_tracer_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
-    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
+    BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
+    HorizontalViscosity3D, LayerTransport, PressureGradientForm, Rhs3DConfig,
+    TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d,
+    apply_horizontal_viscosity_3d, apply_momentum_transport_3d, apply_tracer_transport_3d,
+    compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
+    largest_horizontal_viscosity_3d,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
@@ -131,6 +132,12 @@ where
     /// Reconstruction of the velocity at the σ-surfaces (see
     /// [`Self::with_momentum_vertical_advection`]).
     pub momentum_vertical_advection: VerticalAdvection,
+    /// How the baroclinic pressure gradient differences the columns (see
+    /// [`Self::with_pressure_gradient`]).
+    pub pressure_gradient: PressureGradientForm,
+    /// A reference state whose pressure gradient is the constant-depth
+    /// form's, if any (see [`Self::with_balanced_reference`]).
+    pub balanced_reference: Option<Arc<BalancedReference>>,
     /// Advection of a prognostic closure's turbulence, with this vertical
     /// reconstruction; `None` keeps it in its column (see
     /// [`Self::with_turbulence_advection`]).
@@ -216,6 +223,8 @@ where
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             vertical_advection: VerticalAdvection::default(),
             momentum_vertical_advection: VerticalAdvection::Centred,
+            pressure_gradient: PressureGradientForm::default(),
+            balanced_reference: None,
             turbulence_advection: Some(VerticalAdvection::LimitedAkima),
             bottom_drag: None,
             cage_drag: None,
@@ -298,6 +307,45 @@ where
     pub fn with_momentum_vertical_advection(mut self, scheme: VerticalAdvection) -> Self {
         self.momentum_vertical_advection = scheme;
         self
+    }
+
+    /// How the baroclinic pressure gradient differences two columns:
+    /// σ-pairs by default, the form consistent in energy with the advection
+    /// (a stratified fluid at rest over a slope stays at rest; the
+    /// constant-depth form let round-off grow tenfold every 6 h over a
+    /// seamount). See [`crate::solver::rhs::baroclinic`].
+    pub fn with_pressure_gradient(mut self, form: PressureGradientForm) -> Self {
+        self.pressure_gradient = form;
+        self
+    }
+
+    /// Balance `state`'s stratification (its `rho` must be current, see
+    /// [`Self::update_density`]) as the constant-depth form does, while the
+    /// dynamics keep the σ-pairs form ([`BalancedReference`]): a fluid
+    /// resting in that state stays at rest to the constant-depth form's
+    /// interpolation error, not the σ form's. Use the initial (or a parent
+    /// model's) stratification; [`Self::set_balanced_reference`] refreshes
+    /// it. No effect with [`PressureGradientForm::ConstantDepth`].
+    pub fn with_balanced_reference(mut self, state: &Solution3D) -> Self {
+        self.set_balanced_reference(state);
+        self
+    }
+
+    /// Replace the balanced reference state (see
+    /// [`Self::with_balanced_reference`]).
+    pub fn set_balanced_reference(&mut self, state: &Solution3D) {
+        self.balanced_reference = Some(Arc::new(BalancedReference::new(
+            state,
+            &self.mesh,
+            &self.bathymetry,
+            &self.sigma,
+            &self.ops,
+            &self.geom,
+            self.g,
+            self.rho0,
+            self.rho0,
+            self.min_column_depth,
+        )));
     }
 
     /// Advection of the turbulence `k`, `ψ` of a prognostic closure
@@ -630,6 +678,11 @@ where
             min_column_depth: self.min_column_depth,
             vertical_advection: self.vertical_advection,
             momentum_vertical_advection: self.momentum_vertical_advection,
+            pressure_gradient: self.pressure_gradient,
+            balanced_reference: match self.pressure_gradient {
+                PressureGradientForm::SigmaPairs => self.balanced_reference.as_deref(),
+                PressureGradientForm::ConstantDepth => None,
+            },
         }
     }
 

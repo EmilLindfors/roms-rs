@@ -19,7 +19,9 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::rhs::advection_3d::TracerBoundaryCondition3D;
-use crate::solver::rhs::baroclinic::compute_pressure_gradient;
+use crate::solver::rhs::baroclinic::{
+    BalancedReference, PressureGradientForm, compute_pressure_gradient,
+};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
@@ -52,6 +54,11 @@ pub struct Rhs3DConfig<'a> {
     pub vertical_advection: VerticalAdvection,
     /// Reconstruction of the velocity at the σ-surfaces.
     pub momentum_vertical_advection: VerticalAdvection,
+    /// How the baroclinic pressure gradient differences the columns.
+    pub pressure_gradient: PressureGradientForm,
+    /// A reference state balanced by the constant-depth form, if any (with
+    /// [`PressureGradientForm::SigmaPairs`]).
+    pub balanced_reference: Option<&'a BalancedReference>,
 }
 
 /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the pointwise
@@ -79,9 +86,13 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.rho0,
         config.rho0, // baroclinic-only PGF
         config.min_column_depth,
+        config.pressure_gradient,
         &mut rhs.u,
         &mut rhs.v,
     );
+    if let Some(reference) = config.balanced_reference {
+        reference.add_to(&mut rhs.u, &mut rhs.v);
+    }
     apply_coriolis_3d(rhs, state, config.mesh, config.ops, config.coriolis);
     // The horizontal viscosity needs scratch: see `Hydrostatic3D`
 }

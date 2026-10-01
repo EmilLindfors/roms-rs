@@ -1422,11 +1422,14 @@ mod tests {
     /// column); then, once that was masked, films at the 2D velocity cap
     /// (20 m/s) blew up the 3D momentum advection within 44 steps. Now: no
     /// clips, and the temperature stays inside its initial range: exactly in
-    /// water shallower than 1 m, elsewhere to 2e-3 °C. The layer means may
+    /// water shallower than 1 m, elsewhere to 8e-3 °C. The layer means may
     /// leave it: the water at the bed is 0.26 °C colder than the bed layer's
     /// mean, and rising, it cools the layer (1.0e-3 °C below the initial
-    /// range with Akima and limited Akima, 1.6e-3 °C with TVD). Upwind
-    /// freezes the bed layer at the wall and stays inside.
+    /// range with Akima and limited Akima, 1.6e-3 °C with TVD; 5.2e-3 °C
+    /// with limited Akima since the horizontal advection is in split form,
+    /// against 1.3e-3 °C in the conservative form,
+    /// 2026-10-01). Upwind freezes the bed layer at the wall and stays
+    /// inside.
     #[test]
     fn a_beach_wets_and_dries_in_3d() {
         let (physics, mut state, _) = beach_3d(0.3);
@@ -1437,14 +1440,14 @@ mod tests {
         let mut thin_seen = 0;
         run_beach(&physics, &mut state, 200, |s| {
             for (idx, column) in s.temp.chunks_exact(s.n_levels).enumerate() {
-                // Measured 1.0e-3 °C below, at the bed of the deepest column
-                // (see above)
+                // Measured 5.2e-3 °C below, in the bed layer of the deepest
+                // column (see above)
                 let depth = s.eta.data[idx] - physics.bathymetry.data[idx];
-                let slack = if depth < 1.0 { 1e-9 } else { 2e-3 };
-                for &t in column {
+                let slack = if depth < 1.0 { 1e-9 } else { 8e-3 };
+                for (l, &t) in column.iter().enumerate() {
                     assert!(
                         t >= t_min - slack && t <= t_max + slack,
-                        "temperature {t} left [{t_min}, {t_max}] in {depth:.3} m of water"
+                        "temperature {t} left [{t_min}, {t_max}] in layer {l} of {depth:.3} m of water"
                     );
                 }
             }
@@ -1538,6 +1541,149 @@ mod tests {
         });
         // Measured 1.3e-13 m/s
         assert!(max_speed < 1e-10, "the lake spun up {max_speed:.3e} m/s");
+    }
+
+    /// A stratified seamount at rest (Beckmann & Haidvogel 1993; TODO P4.6):
+    /// `H = 400 m · (1 − 0.9 e^{−r²/L²})`, `L` = 4 km, in a doubly periodic
+    /// 24 km square (6 × 6 P2), 10 stretched levels, f-plane, density
+    /// `rho(z)` through T, the PGF in `form`; no tracer diffusion (it would
+    /// drive a real boundary flow on the slope), 1e-4 m²/s vertical
+    /// viscosity.
+    fn seamount(
+        form: crate::solver::rhs::PressureGradientForm,
+        rho: impl Fn(f64) -> f64,
+    ) -> (Physics, Solution3D) {
+        use crate::vertical::SongHaidvogelStretching;
+        let mesh = Arc::new(
+            Mesh2DBuilder::new(-12e3, 12e3, -12e3, 12e3)
+                .with_resolution(6, 6)
+                .fully_periodic()
+                .build(),
+        );
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -400.0 * (1.0 - 0.9 * (-(x * x + y * y) / 4e3_f64.powi(2)).exp())
+        }));
+        let f = 1.2e-4;
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::EntropyStable)
+        .with_source(CoriolisSource2D::f_plane(f))
+        .build();
+        let sigma = SigmaGrid::new(10, SongHaidvogelStretching::new(5.0, 0.4, 20.0));
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(f)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-4, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_pressure_gradient(form);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        let eos = LinearEOS::default();
+        for idx in 0..mesh.n_elements * nn {
+            let depth = -bathymetry.data[idx];
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                state.temp[idx * nl + l] = eos.t0 + (1.0 - rho(s * depth) / eos.rho0) / eos.alpha;
+                state.salt[idx * nl + l] = eos.s0;
+            }
+        }
+        physics.update_density(&mut state);
+        (physics, state)
+    }
+
+    /// Largest layer speed of `seamount(form, linear N²)` after 36 h.
+    fn seamount_spin_up(form: crate::solver::rhs::PressureGradientForm) -> f64 {
+        // 3 kg/m³ from the surface to 400 m: N² ≈ 7e-5 s⁻²
+        let (physics, mut state) = seamount(form, |z| RHO0 - 3.0 * (1.0 + z / 400.0));
+        let mut integrator = ModeSplitIntegrator::new();
+        let dt = 300.0;
+        for n in 0..432 {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+        }
+        max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)))
+    }
+
+    /// TODO P4.6 gate (regression): a stratified fluid at rest over a steep
+    /// seamount (`r_x0` 0.5) stays at rest with the σ-pairs PGF and the
+    /// split-form tracer advection, the pair consistent in energy (see
+    /// [`crate::solver::rhs::baroclinic`]). With constant `N²` both PGF forms
+    /// are exact at rest, so whatever moves is round-off: with the
+    /// constant-depth form it grows tenfold every few hours (with the
+    /// conservative tracer advection too, which was the model before), an
+    /// instability of the rest state that no viscosity tried removed.
+    #[test]
+    fn a_stratified_seamount_at_rest_stays_at_rest() {
+        use crate::solver::rhs::PressureGradientForm;
+        // Measured 7.4e-11 m/s
+        let speed = seamount_spin_up(PressureGradientForm::SigmaPairs);
+        assert!(speed < 1e-9, "the seamount spun up {speed:.3e} m/s in 36 h");
+        // Measured 8.6e-8 m/s, 40-fold in the last 12 h
+        let unstable = seamount_spin_up(PressureGradientForm::ConstantDepth);
+        assert!(
+            unstable > 1e-8,
+            "test regime: the constant-depth form did not grow ({unstable:.3e} m/s)"
+        );
+    }
+
+    /// TODO P4.6 gate: with the initial state as its balanced reference
+    /// ([`Hydrostatic3D::with_balanced_reference`]), the σ-pairs model exerts
+    /// the constant-depth form's force on a fluid at rest in that state
+    /// (a pycnocline over the seamount, which the σ form gets badly wrong),
+    /// through the whole momentum tendency.
+    #[test]
+    fn a_balanced_reference_gives_the_constant_depth_force_at_rest() {
+        use crate::solver::rhs::PressureGradientForm;
+        // 3 kg/m³ across 10 m at 30 m
+        let pycnocline = |z: f64| RHO0 - 1.5 + 1.5 * (-(z + 30.0) / 10.0).tanh();
+        let tendency = |physics: &Physics, state: &Solution3D| {
+            let mut rhs = state.clone();
+            physics.compute_momentum_rhs_into(state, 0.0, &mut rhs);
+            (rhs.u, rhs.v)
+        };
+        let (depth, state) = seamount(PressureGradientForm::ConstantDepth, pycnocline);
+        let (sigma, _) = seamount(PressureGradientForm::SigmaPairs, pycnocline);
+        let balanced = seamount(PressureGradientForm::SigmaPairs, pycnocline)
+            .0
+            .with_balanced_reference(&state);
+        let (depth_u, depth_v) = tendency(&depth, &state);
+        let largest = |(u, v): (Vec<f64>, Vec<f64>)| {
+            max_or_nan((0..u.len()).map(|i| (u[i] - depth_u[i]).hypot(v[i] - depth_v[i])))
+        };
+        let reference = max_or_nan(depth_u.iter().zip(&depth_v).map(|(u, v)| u.hypot(*v)));
+        // Measured: constant depth 8.8e-6 m/s², σ-pairs off by 2.8e-4,
+        // balanced off by 5.9e-21
+        let balanced_error = largest(tendency(&balanced, &state));
+        let sigma_error = largest(tendency(&sigma, &state));
+        println!(
+            "constant depth {reference:.3e}, σ-pairs off by {sigma_error:.3e}, \
+             balanced off by {balanced_error:.3e} m/s²"
+        );
+        assert!(
+            balanced_error < 1e-15 + 1e-9 * reference,
+            "balanced σ-pairs differ from the constant-depth force by {balanced_error:.3e} m/s²"
+        );
+        assert!(
+            sigma_error > 10.0 * reference,
+            "test regime: σ-pairs alone are not worse ({sigma_error:.3e} against {reference:.3e})"
+        );
     }
 
     /// A flat, doubly periodic ocean `depth` deep, 40 km square (4 × 4 P1),

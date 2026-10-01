@@ -44,7 +44,10 @@
 //! too. This is what makes 3D wetting and drying work.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
-//! inventory form: upwind in `C` on the face fluxes, and on `Ω` by one of
+//! inventory form: in split form within the elements
+//! ([`advective_divergence_element`], which the 3D model's energy balance
+//! over sloping σ-levels needs), upwind in `C` on the face fluxes, and on
+//! `Ω` by one of
 //! the [`VerticalAdvection`] schemes (by default fourth-order Akima under a
 //! TVD limiter, [`VerticalAdvection::LimitedAkima`]).
 //!
@@ -110,6 +113,74 @@ pub fn transport_divergence_element(
             let (nx, ny) = geom.normal(k, f, fi);
             let scale = geom.lift_scale(k, f, fi, node);
             let jump = nx * hu[node] + ny * hv[node] - f_star[fi];
+            for (i, d) in div.iter_mut().enumerate() {
+                *d -= scale * ops.lift[f][(i, fi)] * jump;
+            }
+        }
+    }
+}
+
+/// The DG divergence of the advective flux `q φ` of a field `φ` carried by
+/// the transport `q = (hu, hv)` on element `k`, with the volume term in
+/// split (flux-differencing) form:
+///
+/// ```text
+///     J⁻¹ Σ_j [Dr_ij ({{J∇r·q}}_ij) + Ds_ij ({{J∇s·q}}_ij)] 2{{φ}}_ij
+///         − J⁻¹ Σ_f LIFT_f sJ_f (q·n φ − F*),
+/// ```
+///
+/// `{{a}}_ij = ½(a_i + a_j)`. It is `½[∇·(qφ) + q·∇φ + φ∇·q]` at the nodes
+/// (Kennedy & Gruber 2008; Gassner 2013 for the GLL summation-by-parts
+/// property that makes it conservative), where
+/// [`transport_divergence_element`] of `qφ` is `∇·(qφ)` alone, and the two
+/// differ by aliasing only. With `φ` constant both are `φ∇·q`, so the
+/// continuity of the layers (which keeps the conservative form) still
+/// keeps a constant field constant.
+///
+/// Why the split form: the 3D model's energy balance needs the advection of
+/// the background stratification to be the negative adjoint of the
+/// baroclinic pressure gradient's `ρ∇z` term (see
+/// [`crate::solver::rhs::baroclinic`]), and under GLL summation by parts
+/// that holds for this form, not for the conservative one. Over a
+/// stratified seamount at rest the conservative form let round-off grow
+/// tenfold every 6 h (`examples/seamount_3d.rs`).
+///
+/// `hu`, `hv` and `phi` are the element's nodal values, `face` the
+/// numerical flux `F*` of `qφ` out of every face node, `fr`, `fs` scratch
+/// of `n_nodes` values.
+#[allow(clippy::too_many_arguments)]
+pub fn advective_divergence_element(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    k: usize,
+    hu: &[f64],
+    hv: &[f64],
+    phi: &[f64],
+    face: &[f64],
+    fr: &mut [f64],
+    fs: &mut [f64],
+    div: &mut [f64],
+) {
+    let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
+    for j in 0..nn {
+        let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
+        fr[j] = ar_x * hu[j] + ar_y * hv[j];
+        fs[j] = as_x * hu[j] + as_y * hv[j];
+    }
+    for (i, d) in div.iter_mut().enumerate() {
+        let mut sum = 0.0;
+        for j in 0..nn {
+            let flux = ops.dr[(i, j)] * (fr[i] + fr[j]) + ops.ds[(i, j)] * (fs[i] + fs[j]);
+            sum += flux * (phi[i] + phi[j]);
+        }
+        *d = 0.5 * geom.jacobian_inv(k, i) * sum;
+    }
+    for f in 0..4 {
+        let f_star = &face[f * nfn..(f + 1) * nfn];
+        for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
+            let (nx, ny) = geom.normal(k, f, fi);
+            let scale = geom.lift_scale(k, f, fi, node);
+            let jump = (nx * hu[node] + ny * hv[node]) * phi[node] - f_star[fi];
             for (i, d) in div.iter_mut().enumerate() {
                 *d -= scale * ops.lift[f][(i, fi)] * jump;
             }
@@ -656,7 +727,7 @@ pub fn apply_tracer_transport_3d(
                             })
                         })
                 };
-                let div = context.flux_divergence(k, l, tracer, inflow, scratch);
+                let div = context.flux_divergence(k, l, tracer, true, inflow, scratch);
                 for (i, &d) in div.iter().enumerate() {
                     rhs_k[i * nl + l] = -d;
                 }
@@ -959,7 +1030,7 @@ pub fn apply_momentum_transport_3d(
                             .and_then(|e| e.at(tag, node, l))
                             .unwrap_or(interior)
                     };
-                    let div = context.flux_divergence(k, l, field, inflow, scratch);
+                    let div = context.flux_divergence(k, l, field, false, inflow, scratch);
                     for (i, &d) in div.iter().enumerate() {
                         rhs_k[i * nl + l] -= d;
                     }
@@ -982,8 +1053,10 @@ struct LayerContext<'a> {
 
 impl LayerContext<'_> {
     /// `∇·(Q_l φ)` on element `k`, layer `l`, of the field `φ` (layout of
-    /// [`Solution3D`]): nodal flux `Q_l φ`, face flux `F_l φ↑` with `φ↑`
-    /// upwind of `F_l`. On inflow through an open face `φ↑` is
+    /// [`Solution3D`]): in the element in split form
+    /// ([`advective_divergence_element`]) if `split`, else conservative
+    /// ([`transport_divergence_element`] of `Q_l φ`); face flux `F_l φ↑`
+    /// with `φ↑` upwind of `F_l`. On inflow through an open face `φ↑` is
     /// `inflow(face, face_node, node, tag, interior value, F_l)`, with `node`
     /// the face node's `[element][node]` index. Written to (and returned
     /// from) `scratch.div`.
@@ -992,18 +1065,27 @@ impl LayerContext<'_> {
         k: usize,
         l: usize,
         field: &[f64],
+        split: bool,
         inflow: impl Fn(usize, usize, usize, BoundaryTag, f64, f64) -> f64,
         scratch: &'s mut TransportScratch,
     ) -> &'s [f64] {
         let (ops, transport) = (self.ops, self.transport);
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, transport.n_levels);
         let TransportScratch {
-            hu, hv, face, div, ..
+            hu,
+            hv,
+            phi,
+            fr,
+            fs,
+            face,
+            div,
+            ..
         } = scratch;
         for i in 0..nn {
             let idx = (k * nn + i) * nl + l;
-            hu[i] = transport.hu[idx] * field[idx];
-            hv[i] = transport.hv[idx] * field[idx];
+            hu[i] = transport.hu[idx];
+            hv[i] = transport.hv[idx];
+            phi[i] = field[idx];
         }
         let el = ElementIndex::new(k);
         for f in 0..4 {
@@ -1025,7 +1107,15 @@ impl LayerContext<'_> {
                 face[f * nfn + fi] = flux * upwind;
             }
         }
-        transport_divergence_element(ops, self.geom, k, hu, hv, face, div);
+        if split {
+            advective_divergence_element(ops, self.geom, k, hu, hv, phi, face, fr, fs, div);
+        } else {
+            for ((hu, hv), &phi) in hu.iter_mut().zip(hv.iter_mut()).zip(phi.iter()) {
+                *hu *= phi;
+                *hv *= phi;
+            }
+            transport_divergence_element(ops, self.geom, k, hu, hv, face, div);
+        }
         div
     }
 }
@@ -1035,6 +1125,9 @@ impl LayerContext<'_> {
 struct TransportScratch {
     hu: Vec<f64>,
     hv: Vec<f64>,
+    phi: Vec<f64>,
+    fr: Vec<f64>,
+    fs: Vec<f64>,
     face: Vec<f64>,
     div: Vec<f64>,
     vertical: Vec<f64>,
@@ -1060,6 +1153,9 @@ impl TransportScratch {
         Self {
             hu: vec![0.0; ops.n_nodes],
             hv: vec![0.0; ops.n_nodes],
+            phi: vec![0.0; ops.n_nodes],
+            fr: vec![0.0; ops.n_nodes],
+            fs: vec![0.0; ops.n_nodes],
             face: vec![0.0; 4 * ops.n_face_nodes],
             div: vec![0.0; ops.n_nodes],
             vertical: vec![0.0; n_levels + 1],

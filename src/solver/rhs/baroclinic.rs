@@ -1,4 +1,5 @@
-//! Baroclinic pressure gradient in σ-coordinates, computed at constant depth.
+//! Baroclinic pressure gradient in σ-coordinates, from pairwise pressure
+//! differences.
 //!
 //! # The σ-coordinate problem
 //!
@@ -6,47 +7,119 @@
 //! σ-surface the chain rule gives two large terms that must cancel,
 //! `∇p|_z = ∇p|_σ + gρ ∇z|_σ`, and over steep bathymetry any inconsistency in
 //! their discretisations appears as a spurious force as large as the physical
-//! one (Haney 1991; Mellor et al. 1994). The previous discretisation — the
+//! one (Haney 1991; Mellor et al. 1994). An early discretisation — the
 //! element-local derivative of `p` along σ plus `gρ∇z`, with a first-order
 //! half-layer pressure — made ~1e-4 m/s² in a stratified fjord at rest.
 //!
-//! # Pressure differences at a common depth
+//! # Pairwise pressure differences
 //!
-//! Instead, every term of the DG derivative is a pressure difference taken at
-//! one depth (Stelling & van Kester 1994, in a DG form). With `D` the
-//! element's nodal differentiation matrix (`Dx = r_x D_r + s_x D_s`),
+//! Every term of the DG derivative is a pressure difference of a pair of
+//! columns. With `D` the element's nodal differentiation matrix
+//! (`Dx = r_x D_r + s_x D_s`),
 //!
 //! ```text
 //!     (∂p/∂x|_z)_i ≈ Σ_j Dx_ij Δp_ij,
-//!     Δp_ij = ½ [ (p_j(z_i) − p_i(z_i)) + (p_j(z_j) − p_i(z_j)) ],
 //! ```
 //!
-//! where `p_c(z)` is the hydrostatic pressure of column `c` evaluated at depth
-//! `z`, and `z_i`, `z_j` are the depths of nodes `i`, `j` on the σ-level.
-//! `Δp_ij` is antisymmetric and a smooth function of the node positions, so
-//! the sum is a high-order, consistent approximation of `∂p/∂x|_z` (`Σ_j Dx_ij
-//! (x_j − x_i) = 1`). Where a node lies below the other column's bed (a
-//! hydrostatically inconsistent pair, the discrete Haney condition), only the
-//! difference at the shallower node's depth, which both columns reach, is
-//! used; the scheme is first order there but stays balanced.
+//! with `Δp_ij` antisymmetric, in one of two forms ([`PressureGradientForm`]).
+//! `p_c(z)` is the hydrostatic pressure of column `c` at depth `z`, and `z_i`,
+//! `z_j` are the depths of nodes `i`, `j` on the σ-level.
+//!
+//! **Constant depth** (Stelling & van Kester 1994, in a DG form):
+//!
+//! ```text
+//!     Δp_ij = ½ [ (p_j(z_i) − p_i(z_i)) + (p_j(z_j) − p_i(z_j)) ].
+//! ```
+//!
+//! A smooth function of the node positions, so the sum is a high-order,
+//! consistent approximation of `∂p/∂x|_z` (`Σ_j Dx_ij (x_j − x_i) = 1`).
+//! Where a node lies below the other column's bed (a hydrostatically
+//! inconsistent pair, the discrete Haney condition), only the difference at
+//! the shallower node's depth, which both columns reach, is used; first order
+//! there, but balanced. In a fluid at rest with `ρ = ρ(z)` every column
+//! samples the same profile, so `Δp_ij` is the difference of two
+//! interpolants of one profile: zero when `ρ` is linear in `z` (constant
+//! `N²`), and the interpolation error otherwise — not amplified by the slope
+//! as in the σ form.
+//!
+//! **σ-pairs** (the σ form `∇_σp + gρ∇_σz` in flux-differencing form):
+//!
+//! ```text
+//!     Δp_ij = (p_j(z_j) − p_i(z_i)) + ½(ρ_i + ρ_j)(z_j − z_i),
+//! ```
+//!
+//! whose second term is `½[ρ∇z + ∇(ρz) − z∇ρ]` at the nodes, the split form
+//! of `ρ∇_σz`. Exact for linear `ρ(z)` as well (the trapezoid rule of the
+//! pressure along the pair); for a curved profile its error is that rule's,
+//! `ρ″Δz³/12` with `Δz` the depth difference of the pair, the σ form's
+//! hydrostatic inconsistency (Haney 1991; Mellor et al. 1994): a pycnocline
+//! sampled by levels far apart in neighbouring columns makes a large force.
+//!
+//! # Energy: why σ-pairs are the default
+//!
+//! In the continuum the work of the pressure gradient on the flow is the
+//! conversion to potential energy by the density advection, which is what
+//! keeps a stratified fluid at rest stable. Discretely that needs the PGF's
+//! `ρ∇z` term to be the negative adjoint of the advection of the background
+//! stratification along the sloping σ-levels. Under the GLL nodes'
+//! summation by parts `MD + DᵀM = B`, the σ-pairs' term is exactly that for
+//! the split-form advection of
+//! [`crate::solver::rhs::advective_divergence_element`]: with `ρ̄ = a + bz`,
+//! the advection makes `−b·½[∇·(Qz) + Q·∇z − z∇·Q]` of the background, and
+//! summed against the nodes it pairs with `½[ρ′∇z + ∇(ρ′z) − z∇ρ′]` up to
+//! face terms. In terms of the total potential energy `Σ gρz H_z` the
+//! horizontal exchange is exact for any `ρ`, not only about a linear
+//! background: both terms are sums of `(MD)_ij {{Q}}_ij {{ρ}}_ij (z_j − z_i)`
+//! with opposite signs. (The vertical half, the Hermite pressure integral
+//! against the vertical advection's face values, matches only for linear
+//! profiles.) The constant-depth form has no such partner: its vertical
+//! interpolation of the neighbour's pressure is not the transpose of
+//! anything the advection does.
+//!
+//! Measured over a stratified seamount at rest (`examples/seamount_3d.rs`:
+//! constant `N²`, 16 × 16 P2 elements of 4 km, 20 stretched levels, bed
+//! 40–400 m, `r_x0` 0.32), the growth of the round-off velocity every 6 h:
+//!
+//! | PGF | horizontal advection | growth per 6 h |
+//! |---|---|---|
+//! | constant depth | conservative `∇·(Qφ)` | × 11 (× 18 on 2 km elements) |
+//! | constant depth | split form | × 5 |
+//! | σ-pairs | conservative | × 3.5 |
+//! | σ-pairs | split form | none (7e-11 m/s after 2 days) |
+//!
+//! Neither horizontal viscosity (10 m²/s), vertical viscosity (1e-2 m²/s),
+//! a penalty on the layer velocities' face jumps, nor a gentler slope
+//! (`r_x0` 0.08: blew up after 3 days) stopped the growth of the first row.
+//!
+//! # Balanced reference
+//!
+//! The price of σ-pairs is the σ form's error at rest. A stored reference
+//! state `ρ_s` (the initial stratification, or a parent model's) takes it
+//! back ([`BalancedReference`]):
+//!
+//! ```text
+//!     F(ρ) = F_σ(ρ) + [F_z(ρ_s) − F_σ(ρ_s)],
+//! ```
+//!
+//! with `F_σ`, `F_z` the σ-pair and constant-depth forces. The bracket is a
+//! fixed field, so the dynamics (and their stability) are σ-pairs', while a
+//! fluid resting in the reference state feels the constant-depth form's
+//! force; for a horizontally uniform `ρ_s(z)` this is the subtraction of a
+//! reference profile of Mellor et al. (1998), here for any reference field.
+//!
+//! # Common to both forms
 //!
 //! Each column's density anomaly `ρ − ρ_ref` is a piecewise Hermite cubic in
 //! `z` through the level values, with monotone harmonic-mean slopes
 //! (Shchepetkin & McWilliams 2003, §5), continued linearly above the top and
 //! below the bottom level. `p_c(z)` integrates it exactly from the surface.
-//!
-//! **Balance.** In a fluid at rest with `ρ = ρ(z)` every column samples the
-//! same profile, so `Δp_ij` is the difference of two interpolants of one
-//! profile: zero for any bathymetry and stretching when `ρ` is linear in `z`
-//! (constant `N²`), and the interpolation error otherwise — not amplified by
-//! the slope as in the σ form. A horizontally uniform `ρ(x)` over a flat bed
-//! is exact too.
+//! A horizontally uniform `ρ(x)` over a flat bed is exact in both forms.
 //!
 //! **Faces.** The element-local sum ignores the neighbours. The jump of the
-//! pressure across each face, taken at a common depth in the same way, is
-//! lifted with a central flux (`p* − p⁻ = ½Δp`), so a density front (or an
-//! `η` jump, for the full PGF) sitting on a face exerts its force. In a fluid
-//! at rest the jump is zero.
+//! pressure across each face, in the same form, is lifted with a central
+//! flux (`p* − p⁻ = ½Δp`), so a density front (or an `η` jump, for the full
+//! PGF) sitting on a face exerts its force. In a fluid at rest the jump is
+//! zero.
 //!
 //! **Reference density.** The integrated density is `ρ − rho_ref`:
 //! `rho_ref = 0` gives the full PGF, whose `ρ`-uniform part is `−g∇η`
@@ -61,6 +134,94 @@ use crate::solver::core::blocks::{Pooled, for_each_block};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
+
+/// How [`compute_pressure_gradient`] differences the pressures of two columns
+/// (see the module docs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PressureGradientForm {
+    /// `(p_j − p_i) + ½(ρ_i + ρ_j)(z_j − z_i)` along the σ-level: consistent
+    /// in energy with the split-form advection, so a stratified fluid over a
+    /// slope stays stable; the σ form's error at rest for curved profiles
+    /// (take it back with a [`BalancedReference`]).
+    #[default]
+    SigmaPairs,
+    /// Differences at a common depth (Stelling & van Kester 1994): at rest
+    /// only the vertical interpolation error, but not consistent in energy:
+    /// over a slope a stratified fluid at rest is unstable (round-off grew
+    /// tenfold every 6 h over a seamount). For diagnostics and comparison.
+    ConstantDepth,
+}
+
+/// The force of a stored reference state in the constant-depth form minus
+/// that in the σ-pairs form, `F_z(ρ_s) − F_σ(ρ_s)` (m/s²,
+/// `[element][node][level]`), added to the σ-pairs force so that a fluid
+/// resting in the reference state is balanced as by the constant-depth form
+/// while the dynamics keep σ-pairs' energy consistency (see the module
+/// docs).
+///
+/// Built from a state at its free surface `η`: a tide that moves the levels
+/// by `η(1 + σ)` moves the reference's sampling with them, a relative error
+/// of `η/D` in the correction.
+#[derive(Clone, Debug)]
+pub struct BalancedReference {
+    /// x and y components of the correction.
+    pub correction: [Vec<f64>; 2],
+}
+
+impl BalancedReference {
+    /// The correction of `state` (its `rho` must be current), with the
+    /// arguments of [`compute_pressure_gradient`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        state: &Solution3D,
+        mesh: &Mesh2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        g: f64,
+        rho_0: f64,
+        rho_ref: f64,
+        min_column_depth: f64,
+    ) -> Self {
+        let n = state.n_elements * ops.n_nodes * sigma.n_levels();
+        let force = |form| {
+            let (mut fx, mut fy) = (vec![0.0; n], vec![0.0; n]);
+            compute_pressure_gradient(
+                state,
+                mesh,
+                bathymetry,
+                sigma,
+                ops,
+                geom,
+                g,
+                rho_0,
+                rho_ref,
+                min_column_depth,
+                form,
+                &mut fx,
+                &mut fy,
+            );
+            [fx, fy]
+        };
+        let [sx, sy] = force(PressureGradientForm::SigmaPairs);
+        let [mut zx, mut zy] = force(PressureGradientForm::ConstantDepth);
+        for (z, s) in zx.iter_mut().zip(&sx).chain(zy.iter_mut().zip(&sy)) {
+            *z -= s;
+        }
+        Self {
+            correction: [zx, zy],
+        }
+    }
+
+    /// Add the correction to the forces `fx`, `fy`.
+    pub fn add_to(&self, fx: &mut [f64], fy: &mut [f64]) {
+        let [cx, cy] = &self.correction;
+        for (f, c) in fx.iter_mut().zip(cx).chain(fy.iter_mut().zip(cy)) {
+            *f += c;
+        }
+    }
+}
 
 /// Level spacing (m) below which a column is treated as collapsed: its
 /// density slope is taken as zero.
@@ -138,18 +299,32 @@ fn hermite_integral_of(t: f64, rho: &[f64], slope: &[f64], m: usize, h: f64) -> 
     rho[m] * h00 + h * slope[m] * h10 + rho[m + 1] * h01 + h * slope[m + 1] * h11
 }
 
-/// `Δp_l = ½[(p_b(z_a) − p_a(z_a)) + (p_b(z_b) − p_a(z_b))]` (per `g`) at
-/// every level `l`, with `z_a`, `z_b` the two columns' own depths of that
-/// level, into `out`, using only the depths both columns reach; zero if
-/// either column is thin (a dry bank exerts no pressure on the water beside
-/// it).
+/// The pressure difference `Δp_l` (per `g`) of columns `a` and `b` at every
+/// level `l` into `out`, in `form`: for
+/// [`PressureGradientForm::ConstantDepth`]
+/// `½[(p_b(z_a) − p_a(z_a)) + (p_b(z_b) − p_a(z_b))]`, with `z_a`, `z_b` the
+/// two columns' own depths of that level, using only the depths both columns
+/// reach; for [`PressureGradientForm::SigmaPairs`]
+/// `(p_b(z_b) − p_a(z_a)) + ½(ρ_a + ρ_b)(z_b − z_a)`. Zero if either column
+/// is thin (a dry bank exerts no pressure on the water beside it).
 ///
 /// A column's pressure at its own level is its table value, and the depths
 /// at which each column is evaluated in the other rise with the level, so
 /// one upward walk per column finds every interval.
-fn pressure_differences(a: &ColumnView, b: &ColumnView, out: &mut [f64]) {
+fn pressure_differences(
+    a: &ColumnView,
+    b: &ColumnView,
+    form: PressureGradientForm,
+    out: &mut [f64],
+) {
     if !(a.wet && b.wet) {
         out.fill(0.0);
+        return;
+    }
+    if form == PressureGradientForm::SigmaPairs {
+        for (l, dp) in out.iter_mut().enumerate() {
+            *dp = (b.at_level[l] - a.at_level[l]) + 0.5 * (a.rho[l] + b.rho[l]) * (b.z[l] - a.z[l]);
+        }
         return;
     }
     let (mut cursor_a, mut cursor_b) = (0, 0);
@@ -321,6 +496,7 @@ impl Columns {
 /// * `rho_ref` - Density subtracted from ρ before integrating (0 = full PGF, ρ₀ = baroclinic-only)
 /// * `min_column_depth` - Columns shallower than this (m) exert and feel no
 ///   pressure difference (3D wetting and drying)
+/// * `form` - How two columns' pressures are differenced (see the module docs)
 /// * `grad_px` - Output x-component of PGF (m/s²)
 /// * `grad_py` - Output y-component of PGF (m/s²)
 #[allow(clippy::too_many_arguments)]
@@ -335,6 +511,7 @@ pub fn compute_pressure_gradient(
     rho_0: f64,
     rho_ref: f64,
     min_column_depth: f64,
+    form: PressureGradientForm,
     grad_px: &mut [f64],
     grad_py: &mut [f64],
 ) {
@@ -364,7 +541,8 @@ pub fn compute_pressure_gradient(
                 dp,
             } = &mut **scratch;
             pressure_gradient_element(
-                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, own, across, px, py, dp,
+                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, form, own, across, px, py,
+                dp,
             );
             for ((fx, fy), (&dx, &dy)) in out_x.iter_mut().zip(out_y).zip(px.iter().zip(&*py)) {
                 *fx = scale * dx;
@@ -415,6 +593,7 @@ fn pressure_gradient_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     rho_ref: f64,
+    form: PressureGradientForm,
     own: &mut Columns,
     across: &mut Columns,
     px: &mut [f64],
@@ -442,7 +621,7 @@ fn pressure_gradient_element(
                 let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
                 let (dx_ij, dy_ij) = (rx * dr_ij + sx * ds_ij, ry * dr_ij + sy * ds_ij);
                 let (dx_ji, dy_ji) = (rx * dr_ji + sx * ds_ji, ry * dr_ji + sy * ds_ji);
-                pressure_differences(&a, &b, dp);
+                pressure_differences(&a, &b, form, dp);
                 for (l, &dp) in dp.iter().enumerate() {
                     px[i * nl + l] += dx_ij * dp;
                     py[i * nl + l] += dy_ij * dp;
@@ -465,7 +644,7 @@ fn pressure_gradient_element(
             let (normal, s_jac) = geom.affine_face(k, f);
             let lift_scale = s_jac * metric.det_j_inv;
             for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                pressure_differences(&own.view(node), &across.view(fi), dp);
+                pressure_differences(&own.view(node), &across.view(fi), form, dp);
                 for (l, &dp) in dp.iter().enumerate() {
                     let jump = 0.5 * dp;
                     if jump == 0.0 {
@@ -543,7 +722,7 @@ mod tests {
         }
 
         /// The PGF (x, y) at every node and level.
-        fn pgf(&self, rho_ref: f64) -> (Vec<f64>, Vec<f64>) {
+        fn pgf(&self, rho_ref: f64, form: PressureGradientForm) -> (Vec<f64>, Vec<f64>) {
             let n = self.state.rho.len();
             let (mut fx, mut fy) = (vec![f64::NAN; n], vec![f64::NAN; n]);
             compute_pressure_gradient(
@@ -557,6 +736,7 @@ mod tests {
                 RHO0,
                 rho_ref,
                 0.0,
+                form,
                 &mut fx,
                 &mut fy,
             );
@@ -564,14 +744,46 @@ mod tests {
         }
 
         /// Largest |F| over every node and level.
-        fn max_force(&self, rho_ref: f64) -> f64 {
-            let (fx, fy) = self.pgf(rho_ref);
-            // NaN-propagating (f64::max would drop a NaN)
-            fx.iter()
-                .zip(&fy)
-                .map(|(x, y)| x.hypot(*y))
-                .fold(0.0, |m, f| if f.is_nan() || f > m { f } else { m })
+        fn max_force(&self, rho_ref: f64, form: PressureGradientForm) -> f64 {
+            let (fx, fy) = self.pgf(rho_ref, form);
+            largest(&fx, &fy)
         }
+
+        /// The σ-pairs force with the state itself as the balanced reference.
+        fn balanced_force(&self) -> f64 {
+            let reference = BalancedReference::new(
+                &self.state,
+                &self.mesh,
+                &self.bathymetry,
+                &self.sigma,
+                &self.ops,
+                &self.geom,
+                G,
+                RHO0,
+                RHO0,
+                0.0,
+            );
+            let (mut fx, mut fy) = self.pgf(RHO0, PressureGradientForm::SigmaPairs);
+            reference.add_to(&mut fx, &mut fy);
+            largest(&fx, &fy)
+        }
+    }
+
+    /// σ-pairs alone on the pycnocline fjord: measured ≤ 6.8e-4 m/s².
+    const SIGMA_PAIRS_BOUND: f64 = 1e-3;
+
+    const FORMS: [PressureGradientForm; 2] = [
+        PressureGradientForm::SigmaPairs,
+        PressureGradientForm::ConstantDepth,
+    ];
+
+    /// Largest |F| over every node and level.
+    fn largest(fx: &[f64], fy: &[f64]) -> f64 {
+        // NaN-propagating (f64::max would drop a NaN)
+        fx.iter()
+            .zip(fy)
+            .map(|(x, y)| x.hypot(*y))
+            .fold(0.0, |m, f| if f.is_nan() || f > m { f } else { m })
     }
 
     /// The review's fjord (REVIEW.md §3.3): the bed drops from 30 to 400 m
@@ -586,9 +798,10 @@ mod tests {
     }
 
     /// TODO P4.3 gate: constant N² at rest over the steep fjord slope, at
-    /// every order and for stretched levels, is balanced to round-off (the
-    /// σ form: 2.6e-6 m/s² for N² = 1e-4 s⁻² on a 30→400 m slope at every
-    /// resolution, REVIEW.md §3.3(a)).
+    /// every order and for stretched levels, is balanced to round-off in
+    /// both forms (the old element-local σ form: 2.6e-6 m/s² for
+    /// N² = 1e-4 s⁻² on a 30→400 m slope at every resolution, REVIEW.md
+    /// §3.3(a); σ-pairs integrate a linear profile exactly).
     #[test]
     fn constant_n2_at_rest_is_balanced_over_a_steep_slope() {
         // N² = 1e-4 s⁻²: ∂ρ/∂z = −ρ₀N²/g
@@ -601,12 +814,14 @@ mod tests {
             ] {
                 let case = Column3D::new(3000.0, 6, order, sigma, fjord_bed, |_| 0.0, linear);
                 for rho_ref in [RHO0, 0.0] {
-                    // Measured ≤ 1.5e-14 (the σ form: 1.3e-5 – 2.5e-3)
-                    let force = case.max_force(rho_ref);
-                    assert!(
-                        force < 1e-13,
-                        "P{order}, rho_ref {rho_ref}: spurious |F| = {force:.3e} m/s²"
-                    );
+                    for form in FORMS {
+                        // Measured ≤ 1.5e-14 (the old σ form: 1.3e-5 – 2.5e-3)
+                        let force = case.max_force(rho_ref, form);
+                        assert!(
+                            force < 1e-13,
+                            "P{order}, rho_ref {rho_ref}, {form:?}: spurious |F| = {force:.3e} m/s²"
+                        );
+                    }
                 }
             }
         }
@@ -619,8 +834,14 @@ mod tests {
     ///
     /// | | P1, 500 m | P3, 250 m | P3, 100 m |
     /// |---|---|---|---|
-    /// | σ form | 1.6e-3 | 1.1e-4 | 2.2e-5 |
+    /// | old element-local σ form | 1.6e-3 | 1.1e-4 | 2.2e-5 |
+    /// | σ-pairs | 6.8e-4 | 1.5e-4 | 1.7e-5 |
     /// | constant depth | 2.0e-7 | 1.5e-6 | 3.3e-6 |
+    /// | σ-pairs, balanced reference | 2.0e-7 | 1.5e-6 | 3.3e-6 |
+    ///
+    /// σ-pairs alone carry the σ form's error (their default use is with
+    /// a [`BalancedReference`], which gives a fluid resting in it the
+    /// constant-depth form's force).
     ///
     /// On 30 *uniform* levels both schemes stay at 2e-4 – 1.6e-3 (new 2.0e-4
     /// – 4.1e-4): 13 m apart at 400 m, the deep columns do not sample the 3 m
@@ -639,10 +860,24 @@ mod tests {
                 |_| 0.0,
                 |_, z| pycnocline(z),
             );
-            let force = case.max_force(RHO0);
+            let force = case.max_force(RHO0, PressureGradientForm::ConstantDepth);
+            let balanced = case.balanced_force();
+            let sigma_pairs = case.max_force(RHO0, PressureGradientForm::SigmaPairs);
+            println!(
+                "P{order}, {} m: constant depth {force:.3e}, balanced {balanced:.3e}, \
+                 σ-pairs {sigma_pairs:.3e} m/s²",
+                3000 / nx
+            );
+            for (name, force) in [("constant depth", force), ("balanced σ-pairs", balanced)] {
+                assert!(
+                    force < 5e-6,
+                    "P{order}, {} m, {name}: spurious |F| = {force:.3e} m/s²",
+                    3000 / nx
+                );
+            }
             assert!(
-                force < 5e-6,
-                "P{order}, {} m: spurious |F| = {force:.3e} m/s²",
+                sigma_pairs < SIGMA_PAIRS_BOUND,
+                "P{order}, {} m, σ-pairs: spurious |F| = {sigma_pairs:.3e} m/s²",
                 3000 / nx
             );
         }
@@ -663,16 +898,18 @@ mod tests {
             |_| 0.0,
             |x, _| RHO0 + a * x,
         );
-        let (fx, fy) = case.pgf(RHO0);
-        let nl = case.sigma.n_levels();
-        for (idx, (&x_force, &y_force)) in fx.iter().zip(&fy).enumerate() {
-            let z = case.sigma.sigma_rho()[idx % nl] * depth;
-            let expected = -G / RHO0 * (0.0 - z) * a;
-            assert!(
-                (x_force - expected).abs() < 1e-9 * expected.abs().max(1e-6),
-                "{x_force:.6e} vs {expected:.6e}"
-            );
-            assert!(y_force.abs() < 1e-15, "{y_force:.3e}");
+        for form in FORMS {
+            let (fx, fy) = case.pgf(RHO0, form);
+            let nl = case.sigma.n_levels();
+            for (idx, (&x_force, &y_force)) in fx.iter().zip(&fy).enumerate() {
+                let z = case.sigma.sigma_rho()[idx % nl] * depth;
+                let expected = -G / RHO0 * (0.0 - z) * a;
+                assert!(
+                    (x_force - expected).abs() < 1e-9 * expected.abs().max(1e-6),
+                    "{form:?}: {x_force:.6e} vs {expected:.6e}"
+                );
+                assert!(y_force.abs() < 1e-15, "{form:?}: {y_force:.3e}");
+            }
         }
     }
 
@@ -690,8 +927,13 @@ mod tests {
             |_, _| 1000.0,
         );
         for rho_ref in [0.0, 1000.0] {
-            let force = case.max_force(rho_ref);
-            assert!(force < 1e-12, "rho_ref {rho_ref}: |F| = {force:.3e}");
+            for form in FORMS {
+                let force = case.max_force(rho_ref, form);
+                assert!(
+                    force < 1e-12,
+                    "rho_ref {rho_ref}, {form:?}: |F| = {force:.3e}"
+                );
+            }
         }
     }
 
@@ -712,20 +954,25 @@ mod tests {
             |x| slope * x,
             |_, _| RHO0,
         );
-        let (full_x, full_y) = case.pgf(0.0);
-        let expected = -G * slope;
-        let x_err = full_x
-            .iter()
-            .map(|v| (v - expected).abs())
-            .fold(0.0, f64::max);
-        let y_err = full_y.iter().map(|v| v.abs()).fold(0.0, f64::max);
-        assert!(
-            x_err < 1e-9,
-            "full PGF x error {x_err:.3e} (−g∇η = {expected:.3e})"
-        );
-        assert!(y_err < 1e-9, "full PGF y {y_err:.3e}");
-        let baroclinic = case.max_force(RHO0);
-        assert!(baroclinic < 1e-12, "baroclinic-only PGF {baroclinic:.3e}");
+        for form in FORMS {
+            let (full_x, full_y) = case.pgf(0.0, form);
+            let expected = -G * slope;
+            let x_err = full_x
+                .iter()
+                .map(|v| (v - expected).abs())
+                .fold(0.0, f64::max);
+            let y_err = full_y.iter().map(|v| v.abs()).fold(0.0, f64::max);
+            assert!(
+                x_err < 1e-9,
+                "full PGF x error {x_err:.3e} (−g∇η = {expected:.3e})"
+            );
+            assert!(y_err < 1e-9, "full PGF y {y_err:.3e}");
+            let baroclinic = case.max_force(RHO0, form);
+            assert!(
+                baroclinic < 1e-12,
+                "{form:?}: baroclinic-only PGF {baroclinic:.3e}"
+            );
+        }
     }
 
     /// A density front on an element face: the element-local sums see two
@@ -749,78 +996,87 @@ mod tests {
         let nn = case.ops.n_nodes;
         // Heavier water in the right element, up to the shared face
         case.state.rho[nn * nl..].fill(RHO0 + 1.0);
-        let (fx, _) = case.pgf(RHO0);
-        // Depth-integrated, area-weighted force on each element
-        let force = |k: usize| -> f64 {
-            let per_node: Vec<f64> = (0..nn)
-                .map(|i| (0..nl).map(|l| fx[(k * nn + i) * nl + l]).sum::<f64>())
-                .collect();
-            case.geom.integrate_element(k, &per_node)
-        };
-        let (left, right) = (force(0), force(1));
-        // Heavier water on the right pushes towards the left, on both sides
-        assert!(
-            left < 0.0 && right < 0.0,
-            "left {left:.3e}, right {right:.3e}"
-        );
-        assert!(
-            (left - right).abs() < 1e-12 * left.abs(),
-            "the face force is shared: left {left:.6e}, right {right:.6e}"
-        );
+        for form in FORMS {
+            let (fx, _) = case.pgf(RHO0, form);
+            // Depth-integrated, area-weighted force on each element
+            let force = |k: usize| -> f64 {
+                let per_node: Vec<f64> = (0..nn)
+                    .map(|i| (0..nl).map(|l| fx[(k * nn + i) * nl + l]).sum::<f64>())
+                    .collect();
+                case.geom.integrate_element(k, &per_node)
+            };
+            let (left, right) = (force(0), force(1));
+            // Heavier water on the right pushes towards the left, on both sides
+            assert!(
+                left < 0.0 && right < 0.0,
+                "left {left:.3e}, right {right:.3e}"
+            );
+            assert!(
+                (left - right).abs() < 1e-12 * left.abs(),
+                "{form:?}: the face force is shared: left {left:.6e}, right {right:.6e}"
+            );
+        }
     }
 
     /// Smooth baroclinic field over a gentle slope: `ρ' = a sin(kx) e^{z/H}`,
     /// `∂p/∂x|_z = g a k H cos(kx) (1 − e^{z/H})`, at P2 under joint
     /// refinement of the mesh and the levels. The nodal P2 derivative is
-    /// second order; measured ratios 1.69, 1.80, 1.75 (1.74 over a flat bed, so
-    /// not the one-sided pairs at the bottom of the slope).
+    /// second order; measured ratios 1.69, 1.80, 1.75 for the constant-depth
+    /// form (1.74 over a flat bed, so not the one-sided pairs at the bottom
+    /// of the slope), 1.73, 1.93, 1.98 for σ-pairs (errors 2.3e-5 → 4.7e-7).
     #[test]
     fn smooth_baroclinic_force_converges() {
         let (a, h_scale, length) = (0.5, 40.0, 8000.0);
         let wavenumber = 2.0 * std::f64::consts::PI / length;
-        let errors: Vec<f64> = [(4, 10), (8, 20), (16, 40), (32, 80)]
-            .iter()
-            .map(|&(nx, levels)| {
-                let case = Column3D::new(
-                    length,
-                    nx,
-                    2,
-                    SigmaGrid::new(levels, UniformStretching),
-                    |x, _| -100.0 - 0.005 * x,
-                    |_| 0.0,
-                    |x, z| RHO0 + a * (wavenumber * x).sin() * (z / h_scale).exp(),
-                );
-                let (fx, _) = case.pgf(RHO0);
-                let nl = levels;
-                let mut err = 0.0_f64;
-                for k in 0..case.mesh.n_elements {
-                    let el = ElementIndex::new(k);
-                    for i in 0..case.ops.n_nodes {
-                        let [x, _] = case.mesh.reference_to_physical(
-                            el,
-                            case.ops.nodes_r[i],
-                            case.ops.nodes_s[i],
-                        );
-                        let idx = k * case.ops.n_nodes + i;
-                        let depth = -case.bathymetry.data[idx];
-                        for (l, &s) in case.sigma.sigma_rho().iter().enumerate() {
-                            let z = s * depth;
-                            let exact = -G / RHO0
-                                * a
-                                * wavenumber
-                                * h_scale
-                                * (wavenumber * x).cos()
-                                * (1.0 - (z / h_scale).exp());
-                            err = err.max((fx[idx * nl + l] - exact).abs());
+        for form in FORMS {
+            let errors: Vec<f64> = [(4, 10), (8, 20), (16, 40), (32, 80)]
+                .iter()
+                .map(|&(nx, levels)| {
+                    let case = Column3D::new(
+                        length,
+                        nx,
+                        2,
+                        SigmaGrid::new(levels, UniformStretching),
+                        |x, _| -100.0 - 0.005 * x,
+                        |_| 0.0,
+                        |x, z| RHO0 + a * (wavenumber * x).sin() * (z / h_scale).exp(),
+                    );
+                    let (fx, _) = case.pgf(RHO0, form);
+                    let nl = levels;
+                    let mut err = 0.0_f64;
+                    for k in 0..case.mesh.n_elements {
+                        let el = ElementIndex::new(k);
+                        for i in 0..case.ops.n_nodes {
+                            let [x, _] = case.mesh.reference_to_physical(
+                                el,
+                                case.ops.nodes_r[i],
+                                case.ops.nodes_s[i],
+                            );
+                            let idx = k * case.ops.n_nodes + i;
+                            let depth = -case.bathymetry.data[idx];
+                            for (l, &s) in case.sigma.sigma_rho().iter().enumerate() {
+                                let z = s * depth;
+                                let exact = -G / RHO0
+                                    * a
+                                    * wavenumber
+                                    * h_scale
+                                    * (wavenumber * x).cos()
+                                    * (1.0 - (z / h_scale).exp());
+                                err = err.max((fx[idx * nl + l] - exact).abs());
+                            }
                         }
                     }
-                }
-                err
-            })
-            .collect();
-        for pair in errors.windows(2) {
-            let order = (pair[0] / pair[1]).log2();
-            assert!(order > 1.6, "order {order:.2} (errors {errors:?})");
+                    err
+                })
+                .collect();
+            println!("{form:?}: errors {errors:?}");
+            for pair in errors.windows(2) {
+                let order = (pair[0] / pair[1]).log2();
+                assert!(
+                    order > 1.6,
+                    "{form:?}: order {order:.2} (errors {errors:?})"
+                );
+            }
         }
     }
 }
