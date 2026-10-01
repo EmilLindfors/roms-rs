@@ -117,9 +117,15 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         })
     }
 
-    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64, bottom_drag: Option<&[f64]>) {
+    fn vertical_implicit(
+        &self,
+        state: &mut Solution3D,
+        t: f64,
+        dt: f64,
+        bottom_drag: Option<&[f64]>,
+    ) {
         self.time("vertical_implicit", || {
-            self.inner.vertical_implicit(state, dt, bottom_drag)
+            self.inner.vertical_implicit(state, t, dt, bottom_drag)
         })
     }
 

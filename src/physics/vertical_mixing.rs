@@ -37,6 +37,12 @@ pub struct Turbulence<'a> {
 }
 
 /// Surface and bottom forcing for mixing.
+///
+/// As a model's configuration ([`crate::physics::Hydrostatic3D::forcing`]) it
+/// is the same on every column; a spatially varying surface stress adds to
+/// it ([`crate::physics::SurfaceStress3D`]). The closures receive each
+/// column's own.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Forcing {
     /// Surface wind stress (tx, ty) [N/m^2]
     pub surface_stress: [f64; 2],

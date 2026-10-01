@@ -263,11 +263,17 @@ pub trait ModeSplitPhysics {
         false
     }
 
-    /// Implicit vertical terms over `dt`: vertical diffusion, with the surface
-    /// and bottom stresses as its boundary fluxes, and the bottom drag
-    /// `r·u_b` at the new time if `bottom_drag` holds the rates `r` of
+    /// Implicit vertical terms over `[t, t + dt]`: vertical diffusion, with
+    /// the surface and bottom stresses as its boundary fluxes, and the bottom
+    /// drag `r·u_b` at the new time if `bottom_drag` holds the rates `r` of
     /// [`Self::bottom_drag_into`].
-    fn vertical_implicit(&self, state: &mut Solution3D, dt: f64, bottom_drag: Option<&[f64]>);
+    fn vertical_implicit(
+        &self,
+        state: &mut Solution3D,
+        t: f64,
+        dt: f64,
+        bottom_drag: Option<&[f64]>,
+    );
 
     /// Runs on every 3D stage value (with the tracers as concentrations),
     /// including the last: limiters, density.
@@ -833,7 +839,7 @@ impl ModeSplitIntegrator {
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the
         // barotropic mode: reset it to ū.
-        physics.vertical_implicit(state, dt, bottom_drag.then_some(drag_rate));
+        physics.vertical_implicit(state, t, dt, bottom_drag.then_some(drag_rate));
         depth_average(sigma, &state.u, mean_u);
         depth_average(sigma, &state.v, mean_v);
         shift_columns(&mut state.u, state.n_levels, mean_u, &state.ubar);
@@ -1271,7 +1277,14 @@ mod tests {
             g.data[SWE_VAR_HU].fill(self.amplitude * (self.omega * t + PHASE).cos());
         }
 
-        fn vertical_implicit(&self, _state: &mut Solution3D, _dt: f64, _drag: Option<&[f64]>) {}
+        fn vertical_implicit(
+            &self,
+            _state: &mut Solution3D,
+            _t: f64,
+            _dt: f64,
+            _drag: Option<&[f64]>,
+        ) {
+        }
 
         fn post_stage(&self, _state: &mut Solution3D) {}
     }

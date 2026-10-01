@@ -38,9 +38,9 @@ pub use swe_1d::{BathymetrySource, ChezyFriction, HydrostaticReconstruction, Man
 pub use swe_2d::{
     AtmosphericPressure2D, BathymetrySource2D, BottomFriction2D, CageDrag2D, CageFootprint,
     CageNode, ChezyFriction2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
-    HorizontalViscosity2D, ManningFriction2D, NetCage, P_STANDARD, RHO_AIR, RHO_WATER,
-    RHO_WATER_PRESSURE, SpatiallyVaryingManning2D, TidalPotential, TidalPotentialConstituent,
-    ViscosityModel, WindStress2D, loland_drag_coefficient,
+    GriddedWindStress, HorizontalViscosity2D, ManningFriction2D, NetCage, P_STANDARD, RHO_AIR,
+    RHO_WATER, RHO_WATER_PRESSURE, SpatiallyVaryingManning2D, TidalPotential,
+    TidalPotentialConstituent, ViscosityModel, WindStress2D, loland_drag_coefficient,
 };
 
 // Re-export tracer source terms

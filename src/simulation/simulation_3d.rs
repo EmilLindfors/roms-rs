@@ -207,7 +207,9 @@ mod tests {
     use crate::mesh::{Mesh2D, Mesh2DBuilder};
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::physics::vertical_mixing::{ConstantMixing, Forcing};
-    use crate::physics::{BottomDrag3D, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D};
+    use crate::physics::{
+        AnalyticSurfaceStress, BottomDrag3D, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D,
+    };
     use crate::simulation::Simulation;
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
@@ -1360,6 +1362,121 @@ mod tests {
             "layer shear off τ/(ρ₀ν) by {shear_err:.3e}"
         );
         assert!(v_max < 1e-12, "cross-wind flow {v_max:.3e} m/s");
+    }
+
+    /// Node positions of `physics`' mesh, `[element][node]`.
+    fn node_positions(physics: &Physics) -> Vec<[f64; 2]> {
+        let (mesh, ops) = (&physics.mesh, &physics.ops);
+        ElementIndex::iter(mesh.n_elements)
+            .flat_map(|k| {
+                (0..ops.n_nodes)
+                    .map(move |i| mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]))
+            })
+            .collect()
+    }
+
+    /// Gate: a surface stress that varies from column to column
+    /// ([`Hydrostatic3D::with_surface_stress`]) reaches each column, in `G`
+    /// and in the column's own flux. The wind-against-drag balance of
+    /// `wind_against_bottom_drag_reaches_the_quadratic_balance` under
+    /// `τ_x = τ₀(1 + ½ sin 2πy/L)` along a periodic ocean: the flow stays
+    /// along x and uniform in x, so every column settles at its own
+    /// `C_d u_b² = τ(y)/ρ₀` and shear `τ(y)/(ρ₀ν)`, with no pressure gradient.
+    /// Before, the 3D model had one stress for the whole domain.
+    #[test]
+    fn a_varying_wind_reaches_each_columns_drag_balance() {
+        let (depth, tau0, cd, nu, n_levels) = (10.0, 0.1, 2.5e-3, 0.01, 10);
+        let length = 40e3;
+        let tau =
+            move |y: f64| tau0 * (1.0 + 0.5 * (2.0 * std::f64::consts::PI * y / length).sin());
+        let (physics, mut state) = flat_periodic_3d(depth, n_levels, no_stress(), nu);
+        let stress =
+            AnalyticSurfaceStress::new(&physics.mesh, &physics.ops, move |_, y, _| [tau(y), 0.0]);
+        let positions = node_positions(&physics);
+        let physics = physics
+            .with_surface_stress(stress)
+            .with_bottom_drag(BottomDrag3D::quadratic(cd));
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+            .with_cfl(10.0)
+            .with_dt_max(600.0);
+        // The weakest column relaxes at 2C_d u_b/D ≈ 7e-5 /s: 42 e-foldings
+        let result = sim.run(&mut state, 0.0, 6e5);
+        assert!(result.success, "drag run failed: {:?}", result.error);
+
+        let (mut bottom_err, mut shear_err, mut v_max) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let (mut u_b_min, mut u_b_max) = (f64::INFINITY, 0.0_f64);
+        for (col, &[_, y]) in positions.iter().enumerate() {
+            let u = &state.u[col * n_levels..(col + 1) * n_levels];
+            let v = &state.v[col * n_levels..(col + 1) * n_levels];
+            let u_b = (tau(y) / (RHO0 * cd)).sqrt();
+            let step = tau(y) / (RHO0 * nu) * depth / n_levels as f64;
+            (u_b_min, u_b_max) = (u_b_min.min(u_b), u_b_max.max(u_b));
+            bottom_err = max_or_nan([bottom_err, (u[0] - u_b).abs() / u_b]);
+            for pair in u.windows(2) {
+                shear_err = max_or_nan([shear_err, (pair[1] - pair[0] - step).abs() / step]);
+            }
+            v_max = max_or_nan(v.iter().map(|v| v.abs()).chain([v_max]));
+        }
+        assert!(
+            u_b_max > 1.5 * u_b_min,
+            "the columns' balances should differ"
+        );
+        let eta_range = max_or_nan(state.eta.data.iter().map(|e| e.abs()));
+        // Measured 1.1e-13 and 1.9e-13 (1.3e-10 and 2.4e-10 at 4e5 s, still
+        // spinning up)
+        assert!(
+            bottom_err < 1e-10,
+            "bottom-layer velocity off the column's C_d u_b² = τ/ρ₀ by {bottom_err:.3e}"
+        );
+        assert!(
+            shear_err < 1e-10,
+            "layer shear off the column's τ/(ρ₀ν) by {shear_err:.3e}"
+        );
+        assert!(v_max < 1e-12, "cross-wind flow {v_max:.3e} m/s");
+        assert!(eta_range < 1e-12, "the surface tilted by {eta_range:.3e} m");
+    }
+
+    /// Gate: the surface stress field is evaluated at the times the mode
+    /// splitter needs. A uniform `τ = τ₀ sin ωt` over a flat, periodic ocean
+    /// accelerates the depth-integrated transport to
+    /// `Dū = τ₀(1 − cos ωt)/(ρ₀ω)`; `G` takes it at `tⁿ` and extrapolates to
+    /// the step average, which converges at second order (the AB3 starting
+    /// steps). Evaluated at the end of the step instead, it would be first
+    /// order.
+    #[test]
+    fn a_time_varying_surface_stress_reaches_the_depth_mean_at_second_order() {
+        let (depth, tau0, n_levels) = (10.0, 0.1, 3);
+        let period = 86_400.0;
+        let omega = 2.0 * std::f64::consts::PI / period;
+        let t_end = 0.4 * period;
+        let exact = tau0 * (1.0 - (omega * t_end).cos()) / (RHO0 * omega);
+
+        let mut errors = Vec::new();
+        for steps in [20, 40, 80] {
+            let (physics, mut state) = flat_periodic_3d(depth, n_levels, no_stress(), 0.01);
+            let stress = AnalyticSurfaceStress::new(&physics.mesh, &physics.ops, move |_, _, t| {
+                [tau0 * (omega * t).sin(), 0.0]
+            });
+            let physics = physics.with_surface_stress(stress);
+            let dt = t_end / steps as f64;
+            let mut integrator = ModeSplitIntegrator::new();
+            for n in 0..steps {
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            }
+            let err =
+                max_or_nan((0..state.eta.data.len()).map(|idx| {
+                    ((depth + state.eta.data[idx]) * state.ubar.data[idx] - exact).abs()
+                }));
+            errors.push(err / exact);
+        }
+        // Measured 4.1e-3, 1.1e-3, 2.7e-4 of the exact transport (rates 1.94,
+        // 1.98); with the stress taken 864 s late in G (a step of the 40-step
+        // run) the error stalls at 1.4e-2 to 1.8e-2
+        for pair in errors.windows(2) {
+            let rate = (pair[0] / pair[1]).log2();
+            assert!(rate > 1.8, "transport errors {errors:?}: rate {rate:.2}");
+        }
+        assert!(errors[2] < 1e-3, "transport errors {errors:?}");
     }
 
     /// TODO P4.4 gate: without vertical shear the 3D bottom drag is the 2D

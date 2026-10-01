@@ -159,8 +159,8 @@ pub use solver::burn::{
 };
 pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
-    GriddedAtmosphere2D, HorizontalViscosity2D, HydrostaticReconstruction2D, P_STANDARD,
-    RectangularBoundary, SourceContext2D, SourceTerm2D, SpongeLayer2D, SpongeProfile,
+    GriddedAtmosphere2D, GriddedWindStress, HorizontalViscosity2D, HydrostaticReconstruction2D,
+    P_STANDARD, RectangularBoundary, SourceContext2D, SourceTerm2D, SpongeLayer2D, SpongeProfile,
     TidalPotential, TidalPotentialConstituent, ViscosityModel, WindStress2D,
 };
 #[cfg(feature = "burn")]
