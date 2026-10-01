@@ -23,8 +23,7 @@ use crate::solver::rhs::baroclinic::compute_pressure_gradient;
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
-    LayerTransport, TransportScratch, VerticalAdvection, apply_momentum_transport_3d,
-    apply_tracer_transport_3d,
+    LayerTransport, VerticalAdvection, apply_momentum_transport_3d, apply_tracer_transport_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
@@ -97,7 +96,6 @@ pub fn compute_transport_rhs_3d(
     state: &Solution3D,
     transport: &LayerTransport,
     config: &Rhs3DConfig,
-    scratch: &mut TransportScratch,
 ) {
     apply_momentum_transport_3d(
         &mut rhs.u,
@@ -111,7 +109,6 @@ pub fn compute_transport_rhs_3d(
         config.boundaries,
         config.exterior.velocity,
         config.momentum_vertical_advection,
-        scratch,
     );
     let tracers = [
         (
@@ -139,7 +136,6 @@ pub fn compute_transport_rhs_3d(
             exterior,
             config.boundaries,
             config.vertical_advection,
-            scratch,
         );
     }
 }

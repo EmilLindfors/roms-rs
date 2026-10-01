@@ -57,6 +57,7 @@
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::core::blocks::{Pooled, for_each_block};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -300,13 +301,82 @@ pub fn compute_pressure_gradient(
     let nl = sigma.n_levels();
     let scale = -g / rho_0;
 
-    let mut own = Columns::new(nn, nl, min_column_depth);
-    let mut across = Columns::new(nfn, nl, min_column_depth);
-    // ∂p/∂x, ∂p/∂y per g, [node][level]
-    let mut px = vec![0.0; nn * nl];
-    let mut py = vec![0.0; nn * nl];
+    let n = state.n_elements * nn * nl;
+    for_each_block(
+        state.n_elements,
+        [&mut grad_px[..n], &mut grad_py[..n]],
+        || {
+            let mut scratch = Pooled::take(
+                |s: &PressureScratch| s.fits(nn, nfn, nl),
+                || PressureScratch::new(nn, nfn, nl),
+            );
+            scratch.own.min_column_depth = min_column_depth;
+            scratch.across.min_column_depth = min_column_depth;
+            scratch
+        },
+        |scratch, k, [out_x, out_y]| {
+            let PressureScratch {
+                own,
+                across,
+                px,
+                py,
+            } = &mut **scratch;
+            pressure_gradient_element(
+                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, own, across, px, py,
+            );
+            for ((fx, fy), (&dx, &dy)) in out_x.iter_mut().zip(out_y).zip(px.iter().zip(&*py)) {
+                *fx = scale * dx;
+                *fy = scale * dy;
+            }
+        },
+    );
+}
 
-    for k in 0..state.n_elements {
+/// Buffers of one element of [`compute_pressure_gradient`].
+struct PressureScratch {
+    own: Columns,
+    across: Columns,
+    /// ∂p/∂x, ∂p/∂y per g, [node][level]
+    px: Vec<f64>,
+    py: Vec<f64>,
+}
+
+impl PressureScratch {
+    fn new(nn: usize, nfn: usize, nl: usize) -> Self {
+        Self {
+            own: Columns::new(nn, nl, 0.0),
+            across: Columns::new(nfn, nl, 0.0),
+            px: vec![0.0; nn * nl],
+            py: vec![0.0; nn * nl],
+        }
+    }
+
+    fn fits(&self, nn: usize, nfn: usize, nl: usize) -> bool {
+        self.own.n_levels == nl && self.own.bed.len() == nn && self.across.bed.len() == nfn
+    }
+}
+
+/// `∂p/∂x`, `∂p/∂y` per `g` of element `k` into `px`, `py` (`[node][level]`),
+/// with the columns of its nodes in `own` and of a face's neighbours in
+/// `across` (see [`compute_pressure_gradient`]).
+#[allow(clippy::too_many_arguments)]
+fn pressure_gradient_element(
+    k: usize,
+    state: &Solution3D,
+    mesh: &Mesh2D,
+    bathymetry: &Bathymetry2D,
+    sigma: &SigmaGrid,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    rho_ref: f64,
+    own: &mut Columns,
+    across: &mut Columns,
+    px: &mut [f64],
+    py: &mut [f64],
+) {
+    let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
+    let nl = sigma.n_levels();
+    {
         let el = ElementIndex::new(k);
         for i in 0..nn {
             own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
@@ -362,16 +432,6 @@ pub fn compute_pressure_gradient(
                     }
                 }
             }
-        }
-
-        let out = k * nn * nl..(k + 1) * nn * nl;
-        for ((fx, fy), (&dx, &dy)) in grad_px[out.clone()]
-            .iter_mut()
-            .zip(&mut grad_py[out])
-            .zip(px.iter().zip(&py))
-        {
-            *fx = scale * dx;
-            *fy = scale * dy;
         }
     }
 }

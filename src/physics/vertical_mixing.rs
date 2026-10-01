@@ -35,7 +35,23 @@ pub trait VerticalMixing: Send + Sync {
     ///
     /// Note: Boundary values at top/bottom are usually determined by BCs or specific matching,
     /// but here we return the full profile.
-    fn compute_mixing(&self, column: &Column, forcing: &Forcing) -> (Vec<f64>, Vec<f64>);
+    fn compute_mixing(&self, column: &Column, forcing: &Forcing) -> (Vec<f64>, Vec<f64>) {
+        let n_w = column.z_w.len();
+        let (mut av, mut kt) = (vec![0.0; n_w], vec![0.0; n_w]);
+        self.compute_mixing_into(column, forcing, &mut av, &mut kt);
+        (av, kt)
+    }
+
+    /// [`Self::compute_mixing`] into `av` and `kt` (each of length N+1),
+    /// without allocating: the vertical diffusion calls it for every column
+    /// every step.
+    fn compute_mixing_into(
+        &self,
+        column: &Column,
+        forcing: &Forcing,
+        av: &mut [f64],
+        kt: &mut [f64],
+    );
 }
 
 /// Constant vertical mixing.
@@ -57,12 +73,15 @@ impl ConstantMixing {
 }
 
 impl VerticalMixing for ConstantMixing {
-    fn compute_mixing(&self, column: &Column, _forcing: &Forcing) -> (Vec<f64>, Vec<f64>) {
-        let n_w = column.z_w.len();
-        (
-            vec![self.eddy_viscosity; n_w],
-            vec![self.eddy_diffusivity; n_w],
-        )
+    fn compute_mixing_into(
+        &self,
+        _column: &Column,
+        _forcing: &Forcing,
+        av: &mut [f64],
+        kt: &mut [f64],
+    ) {
+        av.fill(self.eddy_viscosity);
+        kt.fill(self.eddy_diffusivity);
     }
 }
 
@@ -99,13 +118,18 @@ impl Default for PacanowskiPhilanderMixing {
 }
 
 impl VerticalMixing for PacanowskiPhilanderMixing {
-    fn compute_mixing(&self, column: &Column, _forcing: &Forcing) -> (Vec<f64>, Vec<f64>) {
+    fn compute_mixing_into(
+        &self,
+        column: &Column,
+        _forcing: &Forcing,
+        av: &mut [f64],
+        kt: &mut [f64],
+    ) {
         let n = column.z_r.len();
-        let n_w = column.z_w.len();
 
         // Initialize with background values
-        let mut av = vec![self.vb; n_w];
-        let mut kt = vec![self.kb; n_w];
+        av.fill(self.vb);
+        kt.fill(self.kb);
 
         // Loop over internal interfaces (1 to N-1)
         // Interfaces 0 (bottom) and N (surface) are boundaries.
@@ -167,8 +191,6 @@ impl VerticalMixing for PacanowskiPhilanderMixing {
         // Boundary values (bottom and surface)
         // Usually set to background or matched to log layer.
         // We leave them as background (initialized above).
-
-        (av, kt)
     }
 }
 

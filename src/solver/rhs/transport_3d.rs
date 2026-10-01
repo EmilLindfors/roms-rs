@@ -65,6 +65,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::mesh::data::BoundaryTag;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::core::blocks::{Pooled, for_each_block, max_over_blocks};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
 use crate::solver::state::Solution3D;
@@ -147,11 +148,6 @@ pub struct LayerTransport {
     /// column (m/s): round-off where the barotropic pass keeps the nodal
     /// identity `η̄ − ηⁿ = −Δt∇·DU_avg2`.
     pub surface_residual: f64,
-    // One element's layer: nodal transport, face fluxes, divergence
-    layer_hu: Vec<f64>,
-    layer_hv: Vec<f64>,
-    layer_face: Vec<f64>,
-    layer_div: Vec<f64>,
 }
 
 impl LayerTransport {
@@ -166,10 +162,6 @@ impl LayerTransport {
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
-            layer_hu: vec![0.0; nn],
-            layer_hv: vec![0.0; nn],
-            layer_face: vec![0.0; 4 * nfn],
-            layer_div: vec![0.0; nn * n_levels],
         }
     }
 
@@ -202,139 +194,197 @@ impl LayerTransport {
     ) {
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, self.n_levels);
         assert_eq!(state.n_levels, nl, "layer count of the state");
+        let n_elements = state.n_elements;
         let d_sigma = sigma.d_sigma();
         self.d_sigma.copy_from_slice(d_sigma);
+        let Self {
+            hu: layer_hu,
+            hv: layer_hv,
+            face: layer_face,
+            omega: layer_omega,
+            ..
+        } = self;
 
         // 1. Nodal layer transports, corrected to DU_avg2
-        for k in 0..state.n_elements {
-            let bed = bathymetry.element(ElementIndex::new(k));
-            for (i, &b) in bed.iter().enumerate() {
-                let idx = k * nn + i;
-                let depth = state.eta.data[idx] - b;
-                let column = idx * nl..(idx + 1) * nl;
-                let (mut sum_u, mut sum_v) = (0.0, 0.0);
-                for (((hu, hv), (&u, &v)), &ds) in self.hu[column.clone()]
-                    .iter_mut()
-                    .zip(&mut self.hv[column.clone()])
-                    .zip(state.u[column.clone()].iter().zip(&state.v[column.clone()]))
-                    .zip(d_sigma)
-                {
-                    *hu = depth * ds * u;
-                    *hv = depth * ds * v;
-                    sum_u += *hu;
-                    sum_v += *hv;
-                }
-                let Some(barotropic) = barotropic else {
-                    continue;
-                };
-                let (corr_u, corr_v) = (barotropic.hu[idx] - sum_u, barotropic.hv[idx] - sum_v);
-                for ((hu, hv), &ds) in self.hu[column.clone()]
-                    .iter_mut()
-                    .zip(&mut self.hv[column])
-                    .zip(d_sigma)
-                {
-                    *hu += ds * corr_u;
-                    *hv += ds * corr_v;
-                }
-            }
-        }
-
-        // 2. Face fluxes: central average of the nodal transports, corrected
-        // to the barotropic face flux
-        for k in 0..state.n_elements {
-            let el = ElementIndex::new(k);
-            for f in 0..4 {
-                let face_exterior = boundaries.exterior(mesh, el, f);
-                for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                    let (nx, ny) = geom.normal(k, f, fi);
-                    let flat = k * nn + node;
-                    let interior = flat * nl;
-                    // The profile of the layer fluxes: central between
-                    // elements, the interior's at open boundaries (the shear
-                    // leaves with the flow) or central with a nesting
-                    // parent's, none at walls
-                    let across = match face_exterior {
-                        FaceExterior::Element(nb) => Across::Node(
-                            (nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl,
-                        ),
-                        FaceExterior::Open(tag) => match exterior.velocity {
-                            Some([u, v]) if u.at(tag, flat, 0).is_some() => {
-                                let depth = state.eta.data[flat] - bathymetry.data[flat];
-                                Across::Parent(u, v, tag, depth)
-                            }
-                            _ => Across::Node(interior),
-                        },
-                        FaceExterior::Wall => Across::Nothing,
-                    };
-                    let slot = (k * 4 + f) * nfn + fi;
-                    let fluxes = &mut self.face[slot * nl..(slot + 1) * nl];
-                    let mut sum = 0.0;
-                    for (l, flux) in fluxes.iter_mut().enumerate() {
-                        let q_in = nx * self.hu[interior + l] + ny * self.hv[interior + l];
-                        *flux = match across {
-                            Across::Node(e) => {
-                                0.5 * (q_in + nx * self.hu[e + l] + ny * self.hv[e + l])
-                            }
-                            Across::Parent(u, v, tag, depth) => {
-                                let u = u.at(tag, flat, l).expect("checked");
-                                let v = v.at(tag, flat, l).expect("checked");
-                                0.5 * (q_in + depth * d_sigma[l] * (nx * u + ny * v))
-                            }
-                            Across::Nothing => 0.0,
-                        };
-                        sum += *flux;
+        for_each_block(
+            n_elements,
+            [&mut layer_hu[..], &mut layer_hv[..]],
+            || (),
+            |_, k, [hu_k, hv_k]| {
+                let bed = bathymetry.element(ElementIndex::new(k));
+                for (i, &b) in bed.iter().enumerate() {
+                    let idx = k * nn + i;
+                    let depth = state.eta.data[idx] - b;
+                    let column = idx * nl..(idx + 1) * nl;
+                    let local = i * nl..(i + 1) * nl;
+                    let (mut sum_u, mut sum_v) = (0.0, 0.0);
+                    for (((hu, hv), (&u, &v)), &ds) in hu_k[local.clone()]
+                        .iter_mut()
+                        .zip(&mut hv_k[local.clone()])
+                        .zip(state.u[column.clone()].iter().zip(&state.v[column]))
+                        .zip(d_sigma)
+                    {
+                        *hu = depth * ds * u;
+                        *hv = depth * ds * v;
+                        sum_u += *hu;
+                        sum_v += *hv;
                     }
                     let Some(barotropic) = barotropic else {
                         continue;
                     };
-                    let corr = barotropic.face[slot] - sum;
-                    for (flux, &ds) in fluxes.iter_mut().zip(d_sigma) {
-                        *flux += ds * corr;
+                    let (corr_u, corr_v) = (barotropic.hu[idx] - sum_u, barotropic.hv[idx] - sum_v);
+                    for ((hu, hv), &ds) in hu_k[local.clone()]
+                        .iter_mut()
+                        .zip(&mut hv_k[local])
+                        .zip(d_sigma)
+                    {
+                        *hu += ds * corr_u;
+                        *hv += ds * corr_v;
                     }
                 }
-            }
-        }
+            },
+        );
+        let (layer_hu, layer_hv): (&[f64], &[f64]) = (layer_hu, layer_hv);
+
+        // 2. Face fluxes: central average of the nodal transports, corrected
+        // to the barotropic face flux
+        for_each_block(
+            n_elements,
+            [&mut layer_face[..]],
+            || (),
+            |_, k, [face_k]| {
+                let el = ElementIndex::new(k);
+                for f in 0..4 {
+                    let face_exterior = boundaries.exterior(mesh, el, f);
+                    for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
+                        let (nx, ny) = geom.normal(k, f, fi);
+                        let flat = k * nn + node;
+                        let interior = flat * nl;
+                        // The profile of the layer fluxes: central between
+                        // elements, the interior's at open boundaries (the
+                        // shear leaves with the flow) or central with a
+                        // nesting parent's, none at walls
+                        let across = match face_exterior {
+                            FaceExterior::Element(nb) => Across::Node(
+                                (nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi]) * nl,
+                            ),
+                            FaceExterior::Open(tag) => match exterior.velocity {
+                                Some([u, v]) if u.at(tag, flat, 0).is_some() => {
+                                    let depth = state.eta.data[flat] - bathymetry.data[flat];
+                                    Across::Parent(u, v, tag, depth)
+                                }
+                                _ => Across::Node(interior),
+                            },
+                            FaceExterior::Wall => Across::Nothing,
+                        };
+                        let local = f * nfn + fi;
+                        let fluxes = &mut face_k[local * nl..(local + 1) * nl];
+                        let mut sum = 0.0;
+                        for (l, flux) in fluxes.iter_mut().enumerate() {
+                            let q_in = nx * layer_hu[interior + l] + ny * layer_hv[interior + l];
+                            *flux = match across {
+                                Across::Node(e) => {
+                                    0.5 * (q_in + nx * layer_hu[e + l] + ny * layer_hv[e + l])
+                                }
+                                Across::Parent(u, v, tag, depth) => {
+                                    let u = u.at(tag, flat, l).expect("checked");
+                                    let v = v.at(tag, flat, l).expect("checked");
+                                    0.5 * (q_in + depth * d_sigma[l] * (nx * u + ny * v))
+                                }
+                                Across::Nothing => 0.0,
+                            };
+                            sum += *flux;
+                        }
+                        let Some(barotropic) = barotropic else {
+                            continue;
+                        };
+                        let corr = barotropic.face[(k * 4 + f) * nfn + fi] - sum;
+                        for (flux, &ds) in fluxes.iter_mut().zip(d_sigma) {
+                            *flux += ds * corr;
+                        }
+                    }
+                }
+            },
+        );
+        let layer_face: &[f64] = layer_face;
 
         // 3. Ω from the bed up
-        self.surface_residual = 0.0;
         let sigma_w = sigma.sigma_w();
-        for k in 0..state.n_elements {
-            for l in 0..nl {
-                for i in 0..nn {
-                    self.layer_hu[i] = self.hu[(k * nn + i) * nl + l];
-                    self.layer_hv[i] = self.hv[(k * nn + i) * nl + l];
-                }
-                for (slot, flux) in self.layer_face.iter_mut().enumerate() {
-                    *flux = self.face[((k * 4 * nfn) + slot) * nl + l];
-                }
-                transport_divergence_element(
-                    ops,
-                    geom,
-                    k,
-                    &self.layer_hu,
-                    &self.layer_hv,
-                    &self.layer_face,
-                    &mut self.layer_div[l * nn..(l + 1) * nn],
-                );
-            }
-            for i in 0..nn {
-                let idx = k * nn + i;
-                let rate = match barotropic {
-                    Some(barotropic) => barotropic.eta_rate[idx],
-                    None => -(0..nl).map(|l| self.layer_div[l * nn + i]).sum::<f64>(),
-                };
-                let omega = &mut self.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
-                omega[0] = 0.0;
+        let residual = max_over_blocks(
+            n_elements,
+            [&mut layer_omega[..]],
+            || {
+                Pooled::take(
+                    |s: &OmegaScratch| s.fits(nn, nfn, nl),
+                    || OmegaScratch::new(nn, nfn, nl),
+                )
+            },
+            |scratch, k, [omega_k]| {
+                let OmegaScratch { hu, hv, face, div } = &mut **scratch;
                 for l in 0..nl {
-                    omega[l + 1] = omega[l] - self.layer_div[l * nn + i] - d_sigma[l] * rate;
+                    for i in 0..nn {
+                        hu[i] = layer_hu[(k * nn + i) * nl + l];
+                        hv[i] = layer_hv[(k * nn + i) * nl + l];
+                    }
+                    for (slot, flux) in face.iter_mut().enumerate() {
+                        *flux = layer_face[((k * 4 * nfn) + slot) * nl + l];
+                    }
+                    transport_divergence_element(
+                        ops,
+                        geom,
+                        k,
+                        hu,
+                        hv,
+                        face,
+                        &mut div[l * nn..(l + 1) * nn],
+                    );
                 }
-                let residual = omega[nl];
-                self.surface_residual = self.surface_residual.max(residual.abs());
-                for (w, &s) in omega.iter_mut().zip(sigma_w) {
-                    *w -= (s + 1.0) * residual;
+                let mut largest = 0.0_f64;
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let rate = match barotropic {
+                        Some(barotropic) => barotropic.eta_rate[idx],
+                        None => -(0..nl).map(|l| div[l * nn + i]).sum::<f64>(),
+                    };
+                    let omega = &mut omega_k[i * (nl + 1)..(i + 1) * (nl + 1)];
+                    omega[0] = 0.0;
+                    for l in 0..nl {
+                        omega[l + 1] = omega[l] - div[l * nn + i] - d_sigma[l] * rate;
+                    }
+                    let residual = omega[nl];
+                    largest = largest.max(residual.abs());
+                    for (w, &s) in omega.iter_mut().zip(sigma_w) {
+                        *w -= (s + 1.0) * residual;
+                    }
                 }
-            }
+                largest
+            },
+        );
+        self.surface_residual = residual.max(0.0);
+    }
+}
+
+/// One element's layers of [`LayerTransport::compute`]: a layer's nodal
+/// transport and face fluxes, and the divergence of every layer.
+struct OmegaScratch {
+    hu: Vec<f64>,
+    hv: Vec<f64>,
+    face: Vec<f64>,
+    div: Vec<f64>,
+}
+
+impl OmegaScratch {
+    fn new(nn: usize, nfn: usize, nl: usize) -> Self {
+        Self {
+            hu: vec![0.0; nn],
+            hv: vec![0.0; nn],
+            face: vec![0.0; 4 * nfn],
+            div: vec![0.0; nn * nl],
         }
+    }
+
+    fn fits(&self, nn: usize, nfn: usize, nl: usize) -> bool {
+        self.hu.len() == nn && self.face.len() == 4 * nfn && self.div.len() == nn * nl
     }
 }
 
@@ -373,13 +423,26 @@ pub fn tracer_to_inventory(
     sigma: &SigmaGrid,
     bathymetry: &Bathymetry2D,
 ) {
-    let nl = sigma.n_levels();
+    let (nn, nl) = (bathymetry.n_nodes, sigma.n_levels());
     let d_sigma = sigma.d_sigma();
-    for ((column, &e), &b) in tracer.chunks_exact_mut(nl).zip(eta).zip(&bathymetry.data) {
-        for (c, &ds) in column.iter_mut().zip(d_sigma) {
-            *c *= layer_thickness_of(e - b, ds);
-        }
-    }
+    let n_elements = bathymetry.n_elements;
+    for_each_block(
+        n_elements,
+        [&mut tracer[..n_elements * nn * nl]],
+        || (),
+        |_, k, [block]| {
+            let nodes = k * nn..(k + 1) * nn;
+            for ((column, &e), &b) in block
+                .chunks_exact_mut(nl)
+                .zip(&eta[nodes.clone()])
+                .zip(&bathymetry.data[nodes])
+            {
+                for (c, &ds) in column.iter_mut().zip(d_sigma) {
+                    *c *= layer_thickness_of(e - b, ds);
+                }
+            }
+        },
+    );
 }
 
 /// Inventory `q = H_z C` → concentration, written to `out`.
@@ -412,38 +475,43 @@ pub fn inventory_to_concentration(
     let nl = sigma.n_levels();
     let nn = bathymetry.n_nodes;
     let d_sigma = sigma.d_sigma();
-    for k in 0..bathymetry.n_elements {
-        let bed = bathymetry.element(ElementIndex::new(k));
-        let eta_k = &eta[k * nn..(k + 1) * nn];
-        let block = k * nn * nl..(k + 1) * nn * nl;
-        let (q_k, out_k) = (&q[block.clone()], &mut out[block]);
-        if !element_means[k] {
-            for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
-                if e - b < DRY_DEPTH {
-                    continue;
+    let n_elements = bathymetry.n_elements;
+    for_each_block(
+        n_elements,
+        [&mut out[..n_elements * nn * nl]],
+        || (),
+        |_, k, [out_k]| {
+            let bed = bathymetry.element(ElementIndex::new(k));
+            let eta_k = &eta[k * nn..(k + 1) * nn];
+            let q_k = &q[k * nn * nl..(k + 1) * nn * nl];
+            if !element_means[k] {
+                for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
+                    if e - b < DRY_DEPTH {
+                        continue;
+                    }
+                    for (l, &ds) in d_sigma.iter().enumerate() {
+                        out_k[i * nl + l] = q_k[i * nl + l] / layer_thickness_of(e - b, ds);
+                    }
                 }
-                for (l, &ds) in d_sigma.iter().enumerate() {
-                    out_k[i * nl + l] = q_k[i * nl + l] / layer_thickness_of(e - b, ds);
+                return;
+            }
+            let area: f64 = (0..nn).map(|i| geom.node_mass(k, i)).sum();
+            for (l, &ds) in d_sigma.iter().enumerate() {
+                let (mut inventory, mut volume) = (0.0, 0.0);
+                for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
+                    let mass = geom.node_mass(k, i);
+                    inventory += mass * q_k[i * nl + l];
+                    volume += mass * layer_thickness_of(e - b, ds);
+                }
+                if volume > area * ds * DRY_DEPTH {
+                    let mean = inventory / volume;
+                    for i in 0..nn {
+                        out_k[i * nl + l] = mean;
+                    }
                 }
             }
-            continue;
-        }
-        let area: f64 = (0..nn).map(|i| geom.node_mass(k, i)).sum();
-        for (l, &ds) in d_sigma.iter().enumerate() {
-            let (mut inventory, mut volume) = (0.0, 0.0);
-            for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
-                let mass = geom.node_mass(k, i);
-                inventory += mass * q_k[i * nl + l];
-                volume += mass * layer_thickness_of(e - b, ds);
-            }
-            if volume > area * ds * DRY_DEPTH {
-                let mean = inventory / volume;
-                for i in 0..nn {
-                    out_k[i * nl + l] = mean;
-                }
-            }
-        }
-    }
+        },
+    );
 }
 
 /// Overwrite `rhs` with the inventory tendency `∂(H_z C)/∂t` of the tracer
@@ -475,7 +543,6 @@ pub fn apply_tracer_transport_3d(
     exterior: Option<ExteriorField>,
     boundaries: &Boundaries3D,
     vertical: VerticalAdvection,
-    scratch: &mut TransportScratch,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
     let context = LayerContext {
@@ -485,37 +552,43 @@ pub fn apply_tracer_transport_3d(
         geom,
         boundaries,
     };
-    for k in 0..mesh.n_elements {
-        for l in 0..nl {
-            let inflow = |f, fi, node, tag, interior, flux| {
-                exterior
-                    .and_then(|e| e.at(tag, node, l))
-                    .unwrap_or_else(|| {
-                        bc.exterior_value(&TracerBCContext3D {
-                            element: k,
-                            face: f,
-                            level: l,
-                            face_node: fi,
-                            boundary_tag: Some(tag),
-                            interior_value: interior,
-                            normal_velocity: flux,
+    for_each_block(
+        mesh.n_elements,
+        [&mut rhs[..mesh.n_elements * nn * nl]],
+        || TransportScratch::take(ops, nl),
+        |scratch, k, [rhs_k]| {
+            for l in 0..nl {
+                let inflow = |f, fi, node, tag, interior, flux| {
+                    exterior
+                        .and_then(|e| e.at(tag, node, l))
+                        .unwrap_or_else(|| {
+                            bc.exterior_value(&TracerBCContext3D {
+                                element: k,
+                                face: f,
+                                level: l,
+                                face_node: fi,
+                                boundary_tag: Some(tag),
+                                interior_value: interior,
+                                normal_velocity: flux,
+                            })
                         })
-                    })
-            };
-            let div = context.flux_divergence(k, l, tracer, inflow, scratch);
-            for (i, &d) in div.iter().enumerate() {
-                rhs[(k * nn + i) * nl + l] = -d;
+                };
+                let div = context.flux_divergence(k, l, tracer, inflow, scratch);
+                for (i, &d) in div.iter().enumerate() {
+                    rhs_k[i * nl + l] = -d;
+                }
             }
-        }
 
-        subtract_vertical_flux(rhs, tracer, transport, k, nn, vertical, scratch);
-    }
+            subtract_vertical_flux(rhs_k, tracer, transport, k, nn, vertical, scratch);
+        },
+    );
 }
 
 /// Subtract `δ(Ω φ)`, with `φ` at the σ-surfaces reconstructed by `scheme`,
-/// from `rhs` in every column of element `k`.
+/// from `rhs_k` (element `k`'s block, `[node][level]`) in every column of
+/// element `k`.
 fn subtract_vertical_flux(
-    rhs: &mut [f64],
+    rhs_k: &mut [f64],
     field: &[f64],
     transport: &LayerTransport,
     k: usize,
@@ -537,7 +610,7 @@ fn subtract_vertical_flux(
         for l in 0..=nl {
             flux[l] *= omega[l];
         }
-        for (l, r) in rhs[idx * nl..(idx + 1) * nl].iter_mut().enumerate() {
+        for (l, r) in rhs_k[i * nl..(i + 1) * nl].iter_mut().enumerate() {
             *r -= flux[l + 1] - flux[l];
         }
     }
@@ -780,7 +853,6 @@ pub fn apply_momentum_transport_3d(
     boundaries: &Boundaries3D,
     exterior: Option<[ExteriorField; 2]>,
     vertical: VerticalAdvection,
-    scratch: &mut TransportScratch,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
     let context = LayerContext {
@@ -791,23 +863,29 @@ pub fn apply_momentum_transport_3d(
         boundaries,
     };
     let [exterior_u, exterior_v] = exterior.map_or([None, None], |[u, v]| [Some(u), Some(v)]);
-    for (rhs, field, exterior) in [(rhs_u, u, exterior_u), (rhs_v, v, exterior_v)] {
-        for k in 0..mesh.n_elements {
-            for l in 0..nl {
-                let inflow = |_, _, node, tag, interior, _| {
-                    exterior
-                        .and_then(|e| e.at(tag, node, l))
-                        .unwrap_or(interior)
-                };
-                let div = context.flux_divergence(k, l, field, inflow, scratch);
-                for (i, &d) in div.iter().enumerate() {
-                    rhs[(k * nn + i) * nl + l] -= d;
+    let n = mesh.n_elements * nn * nl;
+    for_each_block(
+        mesh.n_elements,
+        [&mut rhs_u[..n], &mut rhs_v[..n]],
+        || TransportScratch::take(ops, nl),
+        |scratch, k, [rhs_u, rhs_v]| {
+            for (rhs_k, field, exterior) in [(rhs_u, u, exterior_u), (rhs_v, v, exterior_v)] {
+                for l in 0..nl {
+                    let inflow = |_, _, node, tag, interior, _| {
+                        exterior
+                            .and_then(|e| e.at(tag, node, l))
+                            .unwrap_or(interior)
+                    };
+                    let div = context.flux_divergence(k, l, field, inflow, scratch);
+                    for (i, &d) in div.iter().enumerate() {
+                        rhs_k[i * nl + l] -= d;
+                    }
                 }
-            }
 
-            subtract_vertical_flux(rhs, field, transport, k, nn, vertical, scratch);
-        }
-    }
+                subtract_vertical_flux(rhs_k, field, transport, k, nn, vertical, scratch);
+            }
+        },
+    );
 }
 
 /// What the horizontal flux divergence of a layer needs.
@@ -871,7 +949,7 @@ impl LayerContext<'_> {
 
 /// Buffers of the transport kernels ([`apply_tracer_transport_3d`],
 /// [`apply_momentum_transport_3d`]), sized for one element.
-pub struct TransportScratch {
+struct TransportScratch {
     hu: Vec<f64>,
     hv: Vec<f64>,
     face: Vec<f64>,
@@ -881,8 +959,21 @@ pub struct TransportScratch {
 }
 
 impl TransportScratch {
+    /// Buffers for elements of `ops` and `n_levels` layers, from this
+    /// thread's cache.
+    fn take(ops: &DGOperators2D, n_levels: usize) -> Pooled<Self> {
+        Pooled::take(
+            |s: &Self| {
+                s.hu.len() == ops.n_nodes
+                    && s.face.len() == 4 * ops.n_face_nodes
+                    && s.slope.len() == n_levels
+            },
+            || Self::new(ops, n_levels),
+        )
+    }
+
     /// Buffers for elements of `ops` and `n_levels` layers.
-    pub fn new(ops: &DGOperators2D, n_levels: usize) -> Self {
+    fn new(ops: &DGOperators2D, n_levels: usize) -> Self {
         Self {
             hu: vec![0.0; ops.n_nodes],
             hv: vec![0.0; ops.n_nodes],
@@ -1066,7 +1157,6 @@ mod tests {
             bc: &dyn TracerBoundaryCondition3D,
         ) -> Vec<f64> {
             let mut rhs = vec![f64::NAN; tracer.len()];
-            let mut scratch = TransportScratch::new(&self.ops, self.sigma.n_levels());
             apply_tracer_transport_3d(
                 &mut rhs,
                 tracer,
@@ -1078,7 +1168,6 @@ mod tests {
                 None,
                 &self.boundaries,
                 VerticalAdvection::default(),
-                &mut scratch,
             );
             rhs
         }
@@ -1347,7 +1436,6 @@ mod tests {
         let nl = 3;
         let mut transport = LayerTransport::new(1, &ops, nl);
         let tracer: Vec<f64> = (0..ops.n_nodes).flat_map(|_| [1.0, 2.0, 4.0]).collect();
-        let mut scratch = TransportScratch::new(&ops, nl);
         for (w, expected) in [(1.0, [-1.0, -1.0, 2.0]), (-1.0, [2.0, 2.0, -4.0])] {
             for column in transport.omega.chunks_exact_mut(nl + 1) {
                 column.copy_from_slice(&[0.0, w, w, 0.0]);
@@ -1364,7 +1452,6 @@ mod tests {
                 None,
                 &Boundaries3D::default(),
                 VerticalAdvection::Upwind,
-                &mut scratch,
             );
             for column in rhs.chunks_exact(nl) {
                 for (got, want) in column.iter().zip(expected) {
@@ -1674,7 +1761,6 @@ mod tests {
         ) -> (Vec<f64>, Vec<f64>) {
             let mut rhs_u = vec![0.0; u.len()];
             let mut rhs_v = vec![0.0; v.len()];
-            let mut scratch = TransportScratch::new(&self.ops, self.sigma.n_levels());
             apply_momentum_transport_3d(
                 &mut rhs_u,
                 &mut rhs_v,
@@ -1687,7 +1773,6 @@ mod tests {
                 &self.boundaries,
                 None,
                 VerticalAdvection::Centred,
-                &mut scratch,
             );
             (rhs_u, rhs_v)
         }
@@ -1825,7 +1910,6 @@ mod tests {
             &Boundaries3D::default(),
             None,
             VerticalAdvection::Centred,
-            &mut TransportScratch::new(&ops, nl),
         );
         let sw = sigma.sigma_w();
         // Ω vanishes at the bed and the surface
@@ -2063,7 +2147,6 @@ mod tests {
             exterior.temp,
             &case.boundaries,
             VerticalAdvection::default(),
-            &mut TransportScratch::new(&case.ops, nl),
         );
         let (mut rhs_u, mut rhs_v) = (vec![0.0; rhs_t.len()], vec![0.0; rhs_t.len()]);
         apply_momentum_transport_3d(
@@ -2078,7 +2161,6 @@ mod tests {
             &case.boundaries,
             exterior.velocity,
             VerticalAdvection::Centred,
-            &mut TransportScratch::new(&case.ops, nl),
         );
         let fields = [
             (&rhs_t, &case.state.temp, 2),
@@ -2148,7 +2230,6 @@ mod tests {
             exterior.temp,
             &case.boundaries,
             VerticalAdvection::default(),
-            &mut TransportScratch::new(&case.ops, nl),
         );
         let scale = c * max_abs(case.eta_rate.iter().copied());
         for (idx, column) in rhs.chunks_exact(nl).enumerate() {
