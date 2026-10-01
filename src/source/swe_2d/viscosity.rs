@@ -74,21 +74,21 @@ impl HorizontalViscosity2D {
         match self.model {
             ViscosityModel::Constant(nu) => nu,
             ViscosityModel::Smagorinsky { cs } => {
-                // Strain rate tensor components:
-                //   S₁₁ = ∂u/∂x,  S₂₂ = ∂v/∂y,  S₁₂ = 0.5·(∂u/∂y + ∂v/∂x)
-                let s11 = du_dx;
-                let s22 = dv_dy;
-                let s12 = 0.5 * (du_dy + dv_dx);
-
-                // |S| = √(2·(S₁₁² + S₂₂² + 2·S₁₂²))
-                let strain_mag = (2.0 * (s11 * s11 + s22 * s22 + 2.0 * s12 * s12)).sqrt();
-
                 // ν = (C_s · Δ)² · |S|
                 let cs_delta = cs * delta;
-                cs_delta * cs_delta * strain_mag
+                cs_delta * cs_delta * strain_rate_magnitude(du_dx, du_dy, dv_dx, dv_dy)
             }
         }
     }
+}
+
+/// The magnitude `|S| = √(2·(S₁₁² + S₂₂² + 2·S₁₂²))` of the horizontal
+/// strain rate tensor, `S₁₁ = ∂u/∂x`, `S₂₂ = ∂v/∂y`,
+/// `S₁₂ = ½·(∂u/∂y + ∂v/∂x)`.
+#[inline]
+pub fn strain_rate_magnitude(du_dx: f64, du_dy: f64, dv_dx: f64, dv_dy: f64) -> f64 {
+    let s12 = 0.5 * (du_dy + dv_dx);
+    (2.0 * (du_dx * du_dx + dv_dy * dv_dy + 2.0 * s12 * s12)).sqrt()
 }
 
 #[cfg(test)]

@@ -76,7 +76,10 @@ pub use transport_3d::{
 };
 
 pub mod viscosity_3d;
-pub use viscosity_3d::{ViscosityScratch3D, apply_horizontal_viscosity_3d};
+pub use viscosity_3d::{
+    HorizontalViscosity3D, ViscosityScratch3D, apply_horizontal_viscosity_3d,
+    largest_horizontal_viscosity_3d,
+};
 
 pub mod rhs_3d;
 pub use rhs_3d::{Rhs3DConfig, compute_momentum_rhs_3d, compute_transport_rhs_3d};

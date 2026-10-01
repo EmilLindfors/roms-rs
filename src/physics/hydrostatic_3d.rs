@@ -21,8 +21,9 @@
 //! not move with the layer fluxes (baroclinic PGF, Coriolis, and the
 //! horizontal viscosity of the shear, [`Hydrostatic3D::with_horizontal_viscosity`],
 //! whose column integral is zero for a constant ν: the depth mean's viscosity
-//! is the 2D module's). `A_l(u)` is the momentum advection of layer
-//! `l` in inventory form, `−∇·(Q_l u_l) − δ(Ω u)_l`
+//! is the 2D module's; with [`Hydrostatic3D::with_smagorinsky_viscosity`] it
+//! is the stress of the shear on the mean flow). `A_l(u)` is the momentum
+//! advection of layer `l` in inventory form, `−∇·(Q_l u_l) − δ(Ω u)_l`
 //! ([`crate::solver::rhs::apply_momentum_transport_3d`]), with the state's own
 //! layer transports `Q_l = H_z u_l` (the barotropic transport of the step
 //! does not exist yet when `G` is built). `A(ū)` is the same operator on one
@@ -60,10 +61,11 @@ use crate::physics::vertical_diffusion::apply_vertical_diffusion;
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
-    BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
-    TracerBoundaryCondition3D, TransportScratch, VerticalAdvection, ViscosityScratch3D,
-    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
-    compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
+    BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, HorizontalViscosity3D,
+    LayerTransport, Rhs3DConfig, TracerBoundaryCondition3D, TransportScratch, VerticalAdvection,
+    ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
+    apply_momentum_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
+    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -115,9 +117,10 @@ where
     /// Quadratic drag of the bottom-layer velocity, if any (see
     /// [`Self::with_bottom_drag`]).
     pub bottom_drag: Option<BottomDrag3D>,
-    /// Horizontal eddy viscosity of the vertical shear (m²/s; see
-    /// [`Self::with_horizontal_viscosity`]).
-    pub horizontal_viscosity: f64,
+    /// Horizontal eddy viscosity of the vertical shear (see
+    /// [`Self::with_horizontal_viscosity`] and
+    /// [`Self::with_smagorinsky_viscosity`]).
+    pub horizontal_viscosity: HorizontalViscosity3D,
     /// A parent model's profiles at open boundaries and in a relaxation
     /// band, if nested (see [`Self::with_nesting`]).
     pub nesting: Option<Nesting3D>,
@@ -184,7 +187,7 @@ where
             vertical_advection: VerticalAdvection::default(),
             momentum_vertical_advection: VerticalAdvection::Centred,
             bottom_drag: None,
-            horizontal_viscosity: 0.0,
+            horizontal_viscosity: HorizontalViscosity3D::default(),
             nesting: None,
             open_boundary_check: Once::new(),
             transport_scratch,
@@ -221,8 +224,9 @@ where
         self
     }
 
-    /// The vertical advection of the tracers: fourth-order Akima by default
-    /// (see [`VerticalAdvection`]).
+    /// The vertical advection of the tracers: fourth-order Akima under a TVD
+    /// limiter by default ([`VerticalAdvection::LimitedAkima`]; see
+    /// [`VerticalAdvection`]).
     pub fn with_vertical_advection(mut self, scheme: VerticalAdvection) -> Self {
         self.vertical_advection = scheme;
         self
@@ -254,7 +258,8 @@ where
     /// along σ-surfaces, on the vertical shear `u − ū` only (BR1; see
     /// [`crate::solver::rhs::viscosity_3d`]). The depth mean is the 2D
     /// module's: give it its own `HorizontalViscosity2D` for a viscous mean
-    /// flow.
+    /// flow. With [`Self::with_smagorinsky_viscosity`] it is the background
+    /// added to Smagorinsky's.
     ///
     /// Higher orders need it in sheared, stratified flow: without it the
     /// shear instability of an interface grows at the grid scale (a P2 lock
@@ -264,7 +269,23 @@ where
             nu >= 0.0 && nu.is_finite(),
             "horizontal viscosity must be finite and non-negative, got {nu}"
         );
-        self.horizontal_viscosity = nu;
+        self.horizontal_viscosity.background = nu;
+        self
+    }
+
+    /// Smagorinsky's (1963) horizontal viscosity `(C_s Δ)²|S|` of the 3D
+    /// shear, with coefficient `cs`, the strain rate `|S|` of each layer's
+    /// velocity and the node spacing `Δ` (see
+    /// [`crate::solver::rhs::viscosity_3d`]); added to the constant
+    /// background of [`Self::with_horizontal_viscosity`], if any. Its column
+    /// integral, the stress of the shear on the mean flow, reaches the depth
+    /// mean through `G`.
+    pub fn with_smagorinsky_viscosity(mut self, cs: f64) -> Self {
+        assert!(
+            cs >= 0.0 && cs.is_finite(),
+            "Smagorinsky coefficient must be finite and non-negative, got {cs}"
+        );
+        self.horizontal_viscosity.smagorinsky = cs;
         self
     }
 
@@ -460,7 +481,7 @@ where
     /// `state.rho` must be current.
     pub fn compute_momentum_rhs_into(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D) {
         compute_momentum_rhs_3d(rhs, state, &self.rhs_config());
-        if self.horizontal_viscosity > 0.0 {
+        if !self.horizontal_viscosity.is_zero() {
             let mut guard = self
                 .viscosity_scratch
                 .lock()
@@ -669,16 +690,47 @@ where
                     min_dt = dt_loc;
                 }
             }
-            // The horizontal viscosity, explicit in the SSP-RK3 stages
-            min_dt = min_dt.min(element_dt_viscous_swe_2d(
+        }
+
+        // The horizontal viscosity, explicit in the SSP-RK3 stages: BR1
+        // couples an element to its face neighbours' gradients, so each
+        // element is bounded by the largest ν of its own and theirs
+        if !self.horizontal_viscosity.is_zero() {
+            let mut largest = vec![0.0; self.mesh.n_elements];
+            let mut guard = self
+                .viscosity_scratch
+                .lock()
+                .expect("Failed to lock viscosity_scratch");
+            let scratch = guard
+                .get_or_insert_with(|| ViscosityScratch3D::new(self.mesh.n_elements, &self.ops));
+            largest_horizontal_viscosity_3d(
+                &mut largest,
+                state,
+                self.horizontal_viscosity,
                 &self.mesh,
                 &self.ops,
                 &self.geom,
-                self.horizontal_viscosity,
-                self.ops.order,
-                cfl,
-                k,
-            ));
+                &self.bathymetry,
+                &self.sigma,
+                &self.boundaries,
+                self.min_column_depth,
+                scratch,
+            );
+            for k in 0..self.mesh.n_elements {
+                let nu = (0..4)
+                    .filter_map(|face| self.mesh.neighbor(ElementIndex::new(k), face))
+                    .map(|nb| largest[nb.element])
+                    .fold(largest[k], f64::max);
+                min_dt = min_dt.min(element_dt_viscous_swe_2d(
+                    &self.mesh,
+                    &self.ops,
+                    &self.geom,
+                    nu,
+                    self.ops.order,
+                    cfl,
+                    k,
+                ));
+            }
         }
 
         if min_dt == f64::INFINITY { 1.0 } else { min_dt }

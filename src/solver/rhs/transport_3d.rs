@@ -43,8 +43,9 @@
 //! too. This is what makes 3D wetting and drying work.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
-//! inventory form: upwind in `C` on the face fluxes, and on `Ω` either
-//! upwind or (the default) fourth-order Akima ([`VerticalAdvection`]).
+//! inventory form: upwind in `C` on the face fluxes, and on `Ω` by one of
+//! the [`VerticalAdvection`] schemes (by default fourth-order Akima under a
+//! TVD limiter, [`VerticalAdvection::LimitedAkima`]).
 //!
 //! # Momentum
 //!
@@ -582,7 +583,6 @@ pub enum VerticalAdvection {
     /// `|Ω|Δt/H_z` ≈ 1.2 (the fourth-order centred operator's eigenvalues
     /// reach 1.37 `|Ω|/H_z` on the imaginary axis, RK3's limit there is √3);
     /// upwind up to 1.
-    #[default]
     Akima,
     /// Third-order upwind-biased with a TVD limiter: the surface value of the
     /// parabola with the means of the upwind layer, the one beyond it and the
@@ -603,6 +603,25 @@ pub enum VerticalAdvection {
     /// water at the bed or the surface is carried into the layer above or
     /// below. The limiter adds some diffusion at extrema and fronts.
     Tvd,
+    /// [`Self::Akima`]'s surface values under [`Self::Tvd`]'s limiter: the
+    /// increment over the upwind layer's mean at most the upwind and
+    /// downwind differences and zero at an extremum (out of an end layer,
+    /// the value between the two layers'), i.e. bounded by the layers below
+    /// and above. Where a profile is smooth and monotone Akima's value lies
+    /// within those bounds and is kept. At the foot of a front, where the
+    /// upwind layer's harmonic-mean slope is small and the next one steep,
+    /// Akima's centred value lies far towards the downwind layer's, more
+    /// than the upwind gradient allows, and the scheme oscillates there; it
+    /// is clipped to the bound.
+    ///
+    /// Akima's undershoots at a sharp interface are in the layers' element
+    /// means, which no conservative slope limiter of the nodal values can
+    /// change: a P2 lock exchange on 125 m (ν = 10 m²/s) left 7.27 °C in a
+    /// layer of a 7.5–12.5 °C range. The bounds have to be on the flux.
+    /// Monotone in the interior up to a vertical Courant number of ½, as
+    /// [`Self::Tvd`]. The tracers' default.
+    #[default]
+    LimitedAkima,
 }
 
 impl VerticalAdvection {
@@ -637,39 +656,28 @@ impl VerticalAdvection {
                     };
                 }
             }
-            Self::Akima if nl > 1 => {
-                // The gradient across surface l (between the centres of
-                // layers l − 1 and l), repeated at the bed and the surface
-                let gradient = |l: usize| {
-                    let l = l.clamp(1, nl - 1);
-                    2.0 * (column[l] - column[l - 1]) / (d_sigma[l - 1] + d_sigma[l])
-                };
-                for (l, d) in slope.iter_mut().enumerate() {
-                    let (below, above) = (gradient(l), gradient(l + 1));
-                    let product = below * above;
-                    *d = if product > 0.0 {
-                        2.0 * product / (below + above)
-                    } else {
-                        0.0
-                    };
-                }
+            Self::Akima if nl > 1 => akima_surface_values(column, d_sigma, slope, surface),
+            Self::LimitedAkima if nl > 1 => {
+                akima_surface_values(column, d_sigma, slope, surface);
                 for l in 1..nl {
-                    let (a, b) = (d_sigma[l - 1], d_sigma[l]);
-                    surface[l] = (b * column[l - 1]
-                        + a * column[l]
-                        + a * b * (slope[l - 1] - slope[l]) / 3.0)
-                        / (a + b);
+                    let (up, far, down) = upwind_stencil(l, nl, omega[l]);
+                    let Some(far) = far else {
+                        // Out of an end layer: between the two layers' means
+                        let (lo, hi) = (column[up].min(column[down]), column[up].max(column[down]));
+                        surface[l] = surface[l].max(lo).min(hi);
+                        continue;
+                    };
+                    surface[l] = column[up]
+                        + tvd_limited(
+                            surface[l] - column[up],
+                            column[up] - column[far],
+                            column[down] - column[up],
+                        );
                 }
             }
             Self::Tvd => {
                 for l in 1..nl {
-                    // Upwind layer `up`, the one beyond it `far` (if any), and
-                    // the downwind layer `down`
-                    let (up, far, down) = if omega[l] >= 0.0 {
-                        (l - 1, l.checked_sub(2), l)
-                    } else {
-                        (l, Some(l + 1).filter(|&f| f < nl), l - 1)
-                    };
+                    let (up, far, down) = upwind_stencil(l, nl, omega[l]);
                     let Some(far) = far else {
                         // Out of an end layer: linear through the two layers'
                         // means (first order would freeze the end layer's
@@ -682,16 +690,61 @@ impl VerticalAdvection {
                     let (behind, ahead) = (column[up] - column[far], column[down] - column[up]);
                     let increment = a * b / ((a + c) * (a + b + c)) * behind
                         + a * (a + c) / ((a + b) * (a + b + c)) * ahead;
-                    surface[l] = column[up]
-                        + if behind * ahead > 0.0 && increment * ahead > 0.0 {
-                            increment.signum() * increment.abs().min(behind.abs()).min(ahead.abs())
-                        } else {
-                            0.0
-                        };
+                    surface[l] = column[up] + tvd_limited(increment, behind, ahead);
                 }
             }
-            Self::Akima => {}
+            Self::Akima | Self::LimitedAkima => {}
         }
+    }
+}
+
+/// The layers around σ-surface `l` of a column of `nl` for the volume flux
+/// `omega` through it: the upwind layer, the one beyond it (if any) and the
+/// downwind layer.
+fn upwind_stencil(l: usize, nl: usize, omega: f64) -> (usize, Option<usize>, usize) {
+    if omega >= 0.0 {
+        (l - 1, l.checked_sub(2), l)
+    } else {
+        (l, Some(l + 1).filter(|&f| f < nl), l - 1)
+    }
+}
+
+/// Koren's (1993) TVD bound on the `increment` of a surface value over its
+/// upwind layer's mean: at most the differences `behind` (upwind layer
+/// minus the one beyond) and `ahead` (downwind minus upwind), and zero at an
+/// extremum or against the flow's gradient.
+fn tvd_limited(increment: f64, behind: f64, ahead: f64) -> f64 {
+    if behind * ahead > 0.0 && increment * ahead > 0.0 {
+        increment.signum() * increment.abs().min(behind.abs()).min(ahead.abs())
+    } else {
+        0.0
+    }
+}
+
+/// [`VerticalAdvection::Akima`]'s values at the interior σ-surfaces of
+/// `column` (`nl > 1` layers of σ-thickness `d_sigma`) into `surface`, with
+/// the harmonic-mean slopes in `slope`.
+fn akima_surface_values(column: &[f64], d_sigma: &[f64], slope: &mut [f64], surface: &mut [f64]) {
+    let nl = column.len();
+    // The gradient across surface l (between the centres of layers l − 1
+    // and l), repeated at the bed and the surface
+    let gradient = |l: usize| {
+        let l = l.clamp(1, nl - 1);
+        2.0 * (column[l] - column[l - 1]) / (d_sigma[l - 1] + d_sigma[l])
+    };
+    for (l, d) in slope.iter_mut().enumerate() {
+        let (below, above) = (gradient(l), gradient(l + 1));
+        let product = below * above;
+        *d = if product > 0.0 {
+            2.0 * product / (below + above)
+        } else {
+            0.0
+        };
+    }
+    for l in 1..nl {
+        let (a, b) = (d_sigma[l - 1], d_sigma[l]);
+        surface[l] =
+            (b * column[l - 1] + a * column[l] + a * b * (slope[l - 1] - slope[l]) / 3.0) / (a + b);
     }
 }
 
@@ -1434,6 +1487,55 @@ mod tests {
         assert_eq!(surface[3], 1.0);
     }
 
+    /// The limited Akima surface values: Akima's where they lie within the
+    /// TVD bounds (a smooth monotone profile, a linear one on stretched
+    /// levels), never outside the two neighbouring layers' values, and the
+    /// upwind layer's value next to an extremum. At the foot of a front
+    /// Akima's value is clipped to the upwind gradient.
+    #[test]
+    fn vertical_limited_akima_values_are_akimas_within_the_tvd_bounds() {
+        let (akima, limited) = (VerticalAdvection::Akima, VerticalAdvection::LimitedAkima);
+        for w in [1.0, -1.0] {
+            let column = [1.0, 2.0, 4.0, 7.0, 11.0];
+            assert_eq!(
+                surfaces(limited, &column, &[1.0; 5], w),
+                surfaces(akima, &column, &[1.0; 5], w),
+                "Ω = {w}"
+            );
+            let (column, d_sigma, faces) = stretched_linear();
+            let surface = surfaces(limited, &column, &d_sigma, w);
+            for l in 1..5 {
+                let want = 3.0 + 2.0 * faces[l];
+                assert!((surface[l] - want).abs() < 1e-13, "Ω = {w}: {surface:?}");
+            }
+        }
+
+        // The foot of a front: harmonic-mean slopes 0, 0.18, 0 at layers
+        // 1–3, so Akima's value at surface 3 is ½(0.1 + 1 + 0.18/3) = 0.58,
+        // 0.48 above the upwind layer's 0.1 when the gradient behind it is
+        // 0.1: clipped to 0.2
+        let front = [0.0, 0.0, 0.1, 1.0, 1.0, 1.0];
+        let unlimited = surfaces(akima, &front, &[1.0; 6], 1.0);
+        assert!((unlimited[3] - 0.58).abs() < 1e-14, "{unlimited:?}");
+        let clipped = surfaces(limited, &front, &[1.0; 6], 1.0);
+        assert!((clipped[3] - 0.2).abs() < 1e-14, "{clipped:?}");
+        for column in [front, [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]] {
+            for w in [1.0, -1.0] {
+                let surface = surfaces(limited, &column, &[1.0; 6], w);
+                for l in 1..6 {
+                    let (lo, hi) = (column[l - 1].min(column[l]), column[l - 1].max(column[l]));
+                    assert!(
+                        (lo..=hi).contains(&surface[l]),
+                        "Ω = {w}: {surface:?} for {column:?}"
+                    );
+                }
+            }
+        }
+        // Upwind of the spike's peak (an extremum): first order
+        let surface = surfaces(limited, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0], &[1.0; 6], 1.0);
+        assert_eq!(surface[3], 1.0);
+    }
+
     /// `column` advected up a column of `d_sigma` layers by `Ω = w` for
     /// `steps` SSP-RK3 steps at the Courant number `courant` (on the thinnest
     /// layer), `scheme` at the interior surfaces, the same water flowing in
@@ -1473,30 +1575,41 @@ mod tests {
         column
     }
 
-    /// A front advected 16 layers up a column: TVD stays within [0, 1] and
-    /// spreads it over 6 layers, upwind over 18; Akima overshoots by 16 %
-    /// (and spreads it over 19). A halocline-like tanh profile: the error is
-    /// 800× smaller than upwind's with Akima and 60× with TVD (whose limiter
-    /// acts in the profile's tails), and 450× and 40× on stretched layers.
+    /// A front advected 16 layers up a column: TVD and limited Akima stay
+    /// within [0, 1] and spread it over 6 layers, upwind over 18; Akima
+    /// overshoots by 16 % (and spreads it over 19). A halocline-like tanh
+    /// profile: the error is 800× smaller than upwind's with Akima and with
+    /// limited Akima (whose limiter does not act on it: the same error to
+    /// the last digit), 60× with TVD (whose limiter acts in the profile's
+    /// tails), and 450× and 40× on stretched layers.
     #[test]
     fn vertical_schemes_on_a_front_and_a_smooth_profile() {
-        use VerticalAdvection::{Akima, Tvd, Upwind};
+        use VerticalAdvection::{Akima, LimitedAkima, Tvd, Upwind};
         let nl = 100;
         let uniform = vec![1.0 / nl as f64; nl];
         let front: Vec<f64> = (0..nl).map(|l| if l < 30 { 1.0 } else { 0.0 }).collect();
         // 40 layers at 0.4 per step: the front moves 16 layers
         let run = |scheme| advect_column(scheme, front.clone(), &uniform, 0.4, 40);
         let (upwind, akima, tvd) = (run(Upwind), run(Akima), run(Tvd));
+        let limited = run(LimitedAkima);
         let range = |c: &[f64]| {
             c.iter()
                 .fold((f64::MAX, f64::MIN), |(lo, hi), &x| (lo.min(x), hi.max(x)))
         };
         let smeared = |c: &[f64]| c.iter().filter(|&&x| x > 0.01 && x < 0.99).count();
-        let (lo, hi) = range(&tvd);
-        assert!(
-            lo >= -1e-12 && hi <= 1.0 + 1e-12,
-            "TVD left [0, 1]: [{lo}, {hi}]"
-        );
+        for (name, c) in [("TVD", &tvd), ("limited Akima", &limited)] {
+            let (lo, hi) = range(c);
+            assert!(
+                lo >= -1e-12 && hi <= 1.0 + 1e-12,
+                "{name} left [0, 1]: [{lo}, {hi}]"
+            );
+            assert!(
+                smeared(c) * 2 < smeared(&upwind),
+                "{name}: front over {} layers, upwind {}",
+                smeared(c),
+                smeared(&upwind)
+            );
+        }
         let (lo, hi) = range(&upwind);
         assert!(
             lo >= -1e-12 && hi <= 1.0 + 1e-12,
@@ -1506,12 +1619,6 @@ mod tests {
         assert!(
             hi > 1.1,
             "test regime: Akima should overshoot: [{lo}, {hi}]"
-        );
-        assert!(
-            smeared(&tvd) * 2 < smeared(&upwind),
-            "TVD front over {} layers, upwind {}",
-            smeared(&tvd),
-            smeared(&upwind)
         );
 
         // A smooth profile on uniform and stretched layers (2.5 % thicker
@@ -1548,9 +1655,10 @@ mod tests {
                 max_abs((nl / 4..nl - 4).map(|l| c[l] - exact[l]))
             };
             let (upwind, akima, tvd) = (error(Upwind), error(Akima), error(Tvd));
+            let limited = error(LimitedAkima);
             assert!(
-                akima * 200.0 < upwind && tvd * 20.0 < upwind,
-                "smooth profile: upwind {upwind:.3e}, Akima {akima:.3e}, TVD {tvd:.3e}"
+                akima * 200.0 < upwind && tvd * 20.0 < upwind && limited < 1.01 * akima,
+                "smooth profile: upwind {upwind:.3e}, Akima {akima:.3e}, TVD {tvd:.3e},                  limited Akima {limited:.3e}"
             );
         }
     }
