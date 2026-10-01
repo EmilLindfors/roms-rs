@@ -15,6 +15,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **CI runs the tests optimized.** New Cargo profile `ci` (the `test` profile at opt-level 1, line tables only, debug assertions and overflow checks kept); the CI `test` jobs run `cargo nextest run --cargo-profile ci`. Unoptimized, the parallel-only suite took 615 s on a 4-core runner, 90 % of it in 49 simulation gates (the slowest 141 s); with the profile it takes ~38 s locally on 4 cores for ~40 s more compile, and all 1414 tests pass. Use `cargo test --profile ci` to run the suite the same way locally.
+
 - **Fourth-order Akima vertical tracer advection (TODO P4.5, P4.6).** The 3D tracers were advected through the σ-surfaces first-order upwind, which diffuses with `κ ≈ |w|Δz/2` (`REVIEW.md` §3.5).
   - New `solver::rhs::VerticalAdvection` (`Upwind`, `Akima`) and `Hydrostatic3D::with_vertical_advection`. The default is now `Akima`, ROMS's `TS_A4VADVECTION`: `C_{l+1/2} = ½(C_l + C_{l+1}) − (d_{l+1} − d_l)/6` with harmonic-mean slopes, zero at extrema. It is conservative and keeps constants constant, like upwind, but it is not monotone.
   - API: `apply_tracer_transport_3d` takes the scheme; `Rhs3DConfig.vertical_advection`.

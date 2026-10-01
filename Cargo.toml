@@ -99,6 +99,20 @@ codegen-units = 1       # Single codegen unit for better optimization
 panic = "abort"         # Smaller binary, slightly faster (no unwinding)
 debug = 1               # Line tables only for stack traces
 
+# Test profile for CI (`cargo nextest run --cargo-profile ci`, or locally
+# `cargo test --profile ci`). The suite is dominated by long simulation gates
+# (lock exchange, Thacker, convergence studies) that run 10-40x slower
+# unoptimized: on a 4-core runner the debug suite took ~615 s, this one ~38 s
+# for ~40 s more compile. opt-level 1 has the lowest compile + run total
+# (opt-level 2 runs 4 s faster but compiles 14 s slower). Debug assertions and
+# overflow checks stay on, so the tests check what they check under `test`.
+[profile.ci]
+inherits = "test"
+opt-level = 1
+debug = "line-tables-only"
+debug-assertions = true
+overflow-checks = true
+
 # Release profile variant for faster compilation during development
 [profile.release-fast]
 inherits = "release"
