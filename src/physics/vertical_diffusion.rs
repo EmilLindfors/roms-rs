@@ -14,6 +14,7 @@ use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixin
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
 use crate::solver::core::blocks::{Pooled, for_each_block};
 use crate::solver::state::Solution3D;
+use crate::time::StepDrag;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -26,11 +27,14 @@ use crate::vertical::SigmaGrid;
 /// (`[τ_x, τ_y]`, N/m², one per column, `[element][node]`); the closure
 /// receives the column's own [`Forcing`] and friction velocity.
 ///
-/// `bottom_drag`, if given, holds a linear drag rate `r` (m/s) per column
+/// `drag.bottom`, if given, holds a linear drag rate `r` (m/s) per column
 /// (`[element][node]`): the bottom flux `r·u_b` of the new bottom-layer
 /// velocity joins `τ_b`, implicitly, so it cannot reverse the flow for any
 /// `dt` (the quadratic drag linearised with `r = C_d|u_b|`, see
-/// [`crate::physics::BottomDrag3D`]).
+/// [`crate::physics::BottomDrag3D`]). `drag.layers`, if given, holds a
+/// linear drag rate `λ_l` (1/s) per layer (`[element][node][level]`): the
+/// sink `−λ_l u_l` of the new velocity, implicitly (net cages, see
+/// [`crate::physics::cage_drag`]).
 ///
 /// Columns shallower than `min_column_depth` (m) are left alone: they carry
 /// no vertical structure (3D wetting and drying, see
@@ -56,7 +60,7 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     g: f64,
     rho0: f64,
     min_column_depth: f64,
-    bottom_drag: Option<&[f64]>,
+    drag: StepDrag<'_>,
 ) {
     let (nn, nl) = (state.n_nodes, state.n_levels);
     let n_w = state.n_elements * nn * (nl + 1);
@@ -147,9 +151,10 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                     ..*forcing
                 };
                 let surface_friction_velocity = (tau_sx.hypot(tau_sy) / rho0).sqrt();
-                let drag = bottom_drag.map_or(0.0, |rate| rate[idx]);
-                let bottom_friction_velocity = ((tau_bx / rho0 + drag * u[i * nl])
-                    .hypot(tau_by / rho0 + drag * v[i * nl]))
+                let bottom_drag = drag.bottom.map_or(0.0, |rate| rate[idx]);
+                let layer_drag = drag.layers.map(|rate| &rate[column.clone()]);
+                let bottom_friction_velocity = ((tau_bx / rho0 + bottom_drag * u[i * nl])
+                    .hypot(tau_by / rho0 + bottom_drag * v[i * nl]))
                 .sqrt();
                 let turbulence_column = if tke.is_empty() {
                     0..0
@@ -184,21 +189,23 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                 eddy_diffusivity[local.clone()].copy_from_slice(&kt[0..nl]);
 
                 // 3. Solve diffusion: u, v with the stresses (kinematic) and
-                // the drag, T with the surface buoyancy flux, S without
-                for (phi, nu, flux_top, flux_bot, drag) in [
+                // the drags, T with the surface buoyancy flux, S without
+                for (phi, nu, flux_top, flux_bot, bottom_drag, layer_drag) in [
                     (
                         &mut u[local.clone()],
                         &*av,
                         tau_sx / rho0,
                         tau_bx / rho0,
-                        drag,
+                        bottom_drag,
+                        layer_drag,
                     ),
                     (
                         &mut v[local.clone()],
                         &*av,
                         tau_sy / rho0,
                         tau_by / rho0,
-                        drag,
+                        bottom_drag,
+                        layer_drag,
                     ),
                     (
                         &mut temp[local.clone()],
@@ -206,11 +213,20 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
                         forcing.surface_buoyancy_flux,
                         0.0,
                         0.0,
+                        None,
                     ),
-                    (&mut salt[local], &*kt, 0.0, 0.0, 0.0),
+                    (&mut salt[local], &*kt, 0.0, 0.0, 0.0, None),
                 ] {
                     solve_diffusion_column(
-                        phi, nu, dz, dt, flux_top, flux_bot, drag, a, b, c, d, x, c_prime, d_prime,
+                        phi,
+                        nu,
+                        dz,
+                        dt,
+                        flux_top,
+                        flux_bot,
+                        bottom_drag,
+                        layer_drag,
+                        [a, b, c, d, x, c_prime, d_prime],
                     );
                 }
             }
@@ -260,9 +276,11 @@ impl ColumnScratch {
     }
 }
 
-/// One backward-Euler step of `∂φ/∂t = ∂/∂z(ν ∂φ/∂z)` in a column, with the
-/// upward fluxes `flux_top` at the surface and `flux_bot + drag_bot·φ₀` at the
-/// bed (`drag_bot·φ₀` at the new time).
+/// One backward-Euler step of `∂φ/∂t = ∂/∂z(ν ∂φ/∂z) − λ_l φ` in a column,
+/// with the upward fluxes `flux_top` at the surface and `flux_bot +
+/// drag_bot·φ₀` at the bed (`drag_bot·φ₀` and `λ_l φ` at the new time,
+/// `λ_l` from `drag_layers`, zero without). `work` holds the tridiagonal
+/// system and the solver's buffers.
 #[allow(clippy::too_many_arguments)]
 fn solve_diffusion_column(
     phi: &mut [f64],
@@ -272,13 +290,8 @@ fn solve_diffusion_column(
     flux_top: f64,
     flux_bot: f64,
     drag_bot: f64,
-    a: &mut [f64],
-    b: &mut [f64],
-    c: &mut [f64],
-    d: &mut [f64],
-    x: &mut [f64],
-    c_prime: &mut [f64],
-    d_prime: &mut [f64],
+    drag_layers: Option<&[f64]>,
+    [a, b, c, d, x, c_prime, d_prime]: [&mut [f64]; 7],
 ) {
     let n = phi.len();
 
@@ -311,7 +324,7 @@ fn solve_diffusion_column(
 
         a[k] = -val_lower;
         c[k] = -val_upper;
-        b[k] = 1.0 + val_lower + val_upper;
+        b[k] = 1.0 + val_lower + val_upper + drag_layers.map_or(0.0, |rate| dt * rate[k]);
     }
 
     // Apply Boundary Conditions to RHS
@@ -326,10 +339,7 @@ fn solve_diffusion_column(
 
     solve_tridiagonal(a, b, c, d, x, c_prime, d_prime);
 
-    // Copy result back
-    for i in 0..n {
-        phi[i] = x[i];
-    }
+    phi.copy_from_slice(x);
 }
 
 #[cfg(test)]
@@ -364,13 +374,16 @@ mod tests {
             flux_top,
             flux_bot,
             0.0,
-            &mut a,
-            &mut b,
-            &mut c,
-            &mut d,
-            &mut x,
-            &mut c_prime,
-            &mut d_prime,
+            None,
+            [
+                &mut a,
+                &mut b,
+                &mut c,
+                &mut d,
+                &mut x,
+                &mut c_prime,
+                &mut d_prime,
+            ],
         );
 
         for v in phi {
@@ -425,13 +438,16 @@ mod tests {
             flux_top,
             flux_bot,
             0.0,
-            &mut a,
-            &mut b,
-            &mut c,
-            &mut d,
-            &mut x,
-            &mut c_prime,
-            &mut d_prime,
+            None,
+            [
+                &mut a,
+                &mut b,
+                &mut c,
+                &mut d,
+                &mut x,
+                &mut c_prime,
+                &mut d_prime,
+            ],
         );
 
         for i in 0..n {
@@ -481,7 +497,7 @@ mod tests {
                 9.81,
                 1025.0,
                 0.0,
-                None,
+                StepDrag::NONE,
             );
             state.u_column(ElementIndex::new(0), 0).to_vec()
         };
@@ -543,7 +559,7 @@ mod tests {
             9.81,
             rho0,
             0.0,
-            None,
+            StepDrag::NONE,
         );
 
         let el = ElementIndex::new(0);
@@ -609,7 +625,7 @@ mod tests {
                 9.81,
                 1025.0,
                 0.0,
-                Some(&[rate]),
+                StepDrag::bottom(&[rate]),
             );
             let (u, v) = (state.u_column(el, 0), state.v_column(el, 0));
             for (after, before, bottom) in [
@@ -694,7 +710,7 @@ mod gls_gates {
                         G,
                         rho0,
                         0.0,
-                        None,
+                        StepDrag::NONE,
                     );
                     eos.update_density(&mut state);
                     t += dt;
@@ -776,7 +792,7 @@ mod gls_gates {
                     G,
                     rho0,
                     0.0,
-                    Some(&[rate]),
+                    StepDrag::bottom(&[rate]),
                 );
             }
 
@@ -856,7 +872,7 @@ mod gls_gates {
                     G,
                     rho0,
                     0.0,
-                    Some(&[rate]),
+                    StepDrag::bottom(&[rate]),
                 );
             }
             let name = format!("{:?}", gls.parameters());
@@ -930,7 +946,7 @@ mod gls_gates {
                     G,
                     eos.rho0,
                     0.0,
-                    None,
+                    StepDrag::NONE,
                 );
                 eos.update_density(&mut state);
             }
@@ -994,7 +1010,7 @@ mod gls_gates {
                     G,
                     eos.rho0,
                     0.0,
-                    None,
+                    StepDrag::NONE,
                 );
                 eos.update_density(state);
             }

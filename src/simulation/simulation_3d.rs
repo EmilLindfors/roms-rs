@@ -214,7 +214,10 @@ mod tests {
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
     use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
-    use crate::source::{CoriolisSource2D, River, RiverProfile, RiverSeries, RiverSources};
+    use crate::source::{
+        CageDrag2D, CageFootprint, CoriolisSource2D, NetCage, River, RiverProfile, RiverSeries,
+        RiverSources,
+    };
     use crate::time::{ModeSplitIntegrator, SSPRK3};
     use crate::types::ElementIndex;
     use crate::vertical::{SigmaGrid, UniformStretching};
@@ -1706,6 +1709,274 @@ mod tests {
         assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
         // Measured 3.15 m/s free, 0.72 m/s with drag
         assert!(dragged < 0.5 * free, "drag {dragged} vs free {free}");
+    }
+
+    /// A cage over the whole of `physics`' periodic 40 km square, net depth
+    /// `net_depth` (m) and `½C_d a = c` (1/m): every node at φ = 1.
+    fn domain_wide_cage(physics: &Physics, net_depth: f64, c: f64) -> CageDrag2D {
+        let footprint = CageFootprint::Polygon(vec![
+            [-1.0, -1.0],
+            [40e3 + 1.0, -1.0],
+            [40e3 + 1.0, 40e3 + 1.0],
+            [-1.0, 40e3 + 1.0],
+        ]);
+        let cage = NetCage::new(footprint, net_depth, 2.0 * c);
+        CageDrag2D::new(&physics.mesh, &physics.ops, &[cage])
+    }
+
+    /// TODO F.1 gate (3D form): without vertical shear the 3D cage drag is
+    /// the 2D cage drag `½C_d a |ū| ū min(d, D)/D`. A net deeper than the
+    /// column reaches every layer at the same rate, so a uniform flow over a
+    /// flat, periodic ocean stays uniform and decays as `u₀/(1 + c u₀ t)`,
+    /// `c = ½C_d a`; with the rates frozen over each step the mode split
+    /// converges to it at first order in Δt.
+    #[test]
+    fn unsheared_cage_drag_decays_like_the_2d_cage_drag() {
+        let (depth, c, u0, t_end) = (10.0, 1e-3, 1.0, 2000.0);
+        let exact = u0 / (1.0 + c * u0 * t_end);
+
+        let mut errors = Vec::new();
+        for dt in [100.0, 50.0, 25.0] {
+            let (physics, mut state) = flat_periodic_3d(depth, 3, no_stress(), 0.01);
+            let cages = domain_wide_cage(&physics, 1.5 * depth, c);
+            let physics = physics.with_cage_drag(cages);
+            state.u.fill(u0);
+            state.ubar.data.fill(u0);
+            let mut integrator = ModeSplitIntegrator::new();
+            let steps = (t_end / dt).round() as usize;
+            for n in 0..steps {
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            }
+            let err = max_or_nan(state.ubar.data.iter().map(|u| (u - exact).abs()));
+            let spread = max_or_nan(state.u.iter().map(|u| (u - state.ubar.data[0]).abs()));
+            assert!(
+                spread < 1e-14,
+                "dt {dt}: the uniform flow lost uniformity by {spread:.3e}"
+            );
+            errors.push(err);
+        }
+        // Measured 4.8e-3, 2.4e-3, 1.2e-3 at Δt = 100, 50, 25 s (rates 1.01,
+        // 1.01), uniform to 2e-16
+        for pair in errors.windows(2) {
+            let rate = (pair[0] / pair[1]).log2();
+            assert!(
+                (0.9..1.3).contains(&rate),
+                "convergence rate {rate:.2} (errors {errors:?})"
+            );
+        }
+        assert!(errors[2] < 1e-2 * exact, "error {:.3e}", errors[2]);
+    }
+
+    /// The layer rates of local, overlapping cages: every node's column mean
+    /// `Σ_l Δσ_l λ_l` in a uniform flow is the 2D cage drag's damping rate
+    /// at that node (independent code, `CageDrag2D::damping_rate`), and
+    /// nodes away from the cages get none.
+    #[test]
+    fn local_cages_give_each_column_the_2d_damping_rate() {
+        let (depth, n_levels, speed) = (10.0, 5, 0.3);
+        let (physics, mut state) = flat_periodic_3d(depth, n_levels, no_stress(), 0.0);
+        let cages = CageDrag2D::new(
+            &physics.mesh,
+            &physics.ops,
+            &[
+                NetCage::circular([15e3, 15e3], 6e3, 4.0, 0.25),
+                NetCage::circular([20e3, 18e3], 5e3, 7.0, 0.35),
+            ],
+        );
+        let reference = cages.clone();
+        let physics = physics.with_cage_drag(cages);
+        let (ux, uy) = (0.6 * speed, -0.8 * speed);
+        state.u.fill(ux);
+        state.v.fill(uy);
+        state.ubar.data.fill(ux);
+        state.vbar.data.fill(uy);
+
+        let mut rate = vec![f64::NAN; state.u.len()];
+        assert!(crate::time::ModeSplitPhysics::layer_drag_into(
+            &physics, &state, 0.0, &mut rate
+        ));
+        let d_sigma = physics.sigma.d_sigma();
+        let (mut caged, mut worst) = (0, 0.0_f64);
+        for (node, rates) in rate.chunks_exact(n_levels).enumerate() {
+            let column: f64 = rates.iter().zip(d_sigma).map(|(r, ds)| r * ds).sum();
+            let entries: Vec<_> = reference
+                .nodes()
+                .iter()
+                .filter(|e| e.node == node)
+                .copied()
+                .collect();
+            let expect = CageDrag2D::damping_rate(&entries, depth, speed);
+            if !entries.is_empty() {
+                caged += 1;
+            }
+            worst = max_or_nan([worst, (column - expect).abs()]);
+        }
+        let largest = reference
+            .nodes()
+            .iter()
+            .map(|e| e.coefficient)
+            .fold(0.0, f64::max)
+            * speed;
+        assert!(
+            caged > 0 && caged < state.eta.data.len(),
+            "{caged} caged nodes"
+        );
+        assert!(
+            worst <= 1e-14 * largest,
+            "column rate off the 2D damping rate by {worst:.3e} (largest {largest:.3e})"
+        );
+    }
+
+    /// TODO F.1 gate (3D form): the net slows only the layers it reaches.
+    /// Inviscid uniform flow under a net down to 6.25 m of a 10 m column on
+    /// four layers: the top two layers lie inside it, the second from the
+    /// bed half, the bed layer not at all. Each layer decays on its own,
+    /// `u_l = u₀/(1 + c χ_l u₀ t)` with `χ_l = (0, ½, 1, 1)`, and the bed
+    /// layer keeps `u₀`. The depth mean gets there only if the pass (`−Λ̄ū`)
+    /// and `G` (`−D Σ Δσ_l λ_l (u_l − ū)`) together apply the drag of the
+    /// layers, not of the mean.
+    #[test]
+    fn cage_drag_slows_only_the_layers_inside_the_net() {
+        let (depth, c, u0, t_end, n_levels) = (10.0, 1e-3, 1.0, 2000.0, 4);
+        let fraction = [0.0, 0.5, 1.0, 1.0];
+        let exact: Vec<f64> = fraction
+            .iter()
+            .map(|chi| u0 / (1.0 + c * chi * u0 * t_end))
+            .collect();
+
+        let mut errors = Vec::new();
+        for dt in [100.0, 50.0, 25.0] {
+            let (physics, mut state) = flat_periodic_3d(depth, n_levels, no_stress(), 0.0);
+            let cages = domain_wide_cage(&physics, 6.25, c);
+            let physics = physics.with_cage_drag(cages);
+            state.u.fill(u0);
+            state.ubar.data.fill(u0);
+            let mut integrator = ModeSplitIntegrator::new();
+            let steps = (t_end / dt).round() as usize;
+            for n in 0..steps {
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            }
+            let err = max_or_nan(
+                state
+                    .u
+                    .chunks_exact(n_levels)
+                    .flat_map(|column| column.iter().zip(&exact).map(|(u, e)| (u - e).abs())),
+            );
+            let mean_err = max_or_nan(
+                state
+                    .ubar
+                    .data
+                    .iter()
+                    .zip(state.u.chunks_exact(n_levels))
+                    .map(|(ubar, column)| {
+                        (ubar - column.iter().sum::<f64>() / n_levels as f64).abs()
+                    }),
+            );
+            assert!(
+                mean_err < 1e-14,
+                "dt {dt}: ū is not the mean of the layers ({mean_err:.3e})"
+            );
+            errors.push(err);
+        }
+        // Measured 3.3e-2, 1.6e-2, 8.2e-3 (rates 1.01, 1.01), most of it in
+        // the bed layer, which the splitting error reaches through the reset
+        // of the depth mean. Without G's shear part the error stalls at
+        // 7.4e-2 (the layers inside the net decay too slowly, the bed layer
+        // loses 7 %).
+        for pair in errors.windows(2) {
+            let rate = (pair[0] / pair[1]).log2();
+            assert!(
+                (0.9..1.3).contains(&rate),
+                "convergence rate {rate:.2} (errors {errors:?})"
+            );
+        }
+        assert!(errors[2] < 1e-2, "errors {errors:?}");
+    }
+
+    /// TODO F.1 gate (3D form): a strong drag at long steps. The pass and
+    /// the vertical solve take the drag implicitly, but `G`'s shear part is
+    /// explicit, so at `λΔt ≫ 1` it overshoots: up to `c u₀ Δt = 5` the flow
+    /// decays without reversing, at 10–30 it reverses by < 1 % of `u₀` (the
+    /// flow the drag has stopped), and it never grows.
+    #[test]
+    fn a_strong_cage_drag_is_stable_at_long_steps() {
+        let (depth, c, u0, n_levels) = (10.0, 1e-2, 1.0, 4);
+        for dt in [100.0, 500.0, 1000.0, 3000.0] {
+            let (physics, mut state) = flat_periodic_3d(depth, n_levels, no_stress(), 0.01);
+            let cages = domain_wide_cage(&physics, 6.25, c);
+            let physics = physics.with_cage_drag(cages);
+            state.u.fill(u0);
+            state.ubar.data.fill(u0);
+            let mut integrator = ModeSplitIntegrator::new();
+            let (mut lowest, mut highest) = (f64::INFINITY, f64::NEG_INFINITY);
+            for n in 0..20 {
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                for &u in &state.u {
+                    lowest = lowest.min(u);
+                    highest = highest.max(u);
+                }
+            }
+            // Measured [0.067, 0.72], [0.015, 0.12], [−0.0059, −0.0030],
+            // [−0.0083, −0.0020] over steps 1–20 at Δt = 100, 500, 1000, 3000 s
+            assert!(
+                highest.is_finite() && highest < u0,
+                "dt {dt}: the flow grew to {highest}"
+            );
+            let floor = if c * u0 * dt <= 5.0 { 0.0 } else { -1e-2 * u0 };
+            assert!(lowest >= floor, "dt {dt}: the flow reversed to {lowest}");
+        }
+    }
+
+    /// TODO F.1 gate (3D form): wind against net cages over a flat, periodic,
+    /// non-rotating ocean without bottom drag. The net reaches the top half
+    /// of the column; below it nothing removes momentum, so in the steady
+    /// state no stress crosses the net bottom, the water below moves with the
+    /// net bottom's speed, and the nets take the whole wind stress,
+    /// `Σ_l H_l λ_l u_l = τ/ρ₀`.
+    #[test]
+    fn wind_against_cages_reaches_the_column_balance() {
+        let (depth, tau, c, nu, n_levels) = (10.0, 0.1, 1e-3, 0.01, 10);
+        let forcing = Forcing {
+            surface_stress: [tau, 0.0],
+            ..no_stress()
+        };
+        let (physics, mut state) = flat_periodic_3d(depth, n_levels, forcing, nu);
+        let cages = domain_wide_cage(&physics, 0.5 * depth, c);
+        let physics = physics.with_cage_drag(cages);
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+            .with_cfl(10.0)
+            .with_dt_max(600.0);
+        let result = sim.run(&mut state, 0.0, 4e5);
+        assert!(result.success, "cage run failed: {:?}", result.error);
+
+        let dz = depth / n_levels as f64;
+        let (mut balance_err, mut below_spread, mut v_max) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for col in 0..state.eta.data.len() {
+            let u = &state.u[col * n_levels..(col + 1) * n_levels];
+            let v = &state.v[col * n_levels..(col + 1) * n_levels];
+            let drag: f64 = u[n_levels / 2..].iter().map(|u| dz * c * u.abs() * u).sum();
+            balance_err = max_or_nan([balance_err, (drag - tau / RHO0).abs() / (tau / RHO0)]);
+            let below = &u[..n_levels / 2];
+            below_spread = max_or_nan(
+                below
+                    .iter()
+                    .map(|x| (x - below[0]).abs())
+                    .chain([below_spread]),
+            );
+            v_max = max_or_nan(v.iter().map(|v| v.abs()).chain([v_max]));
+        }
+        // Measured 8.7e-14 and 7.8e-16. With the pass's −Λ̄ū alone (no shear
+        // part in G) the balance is 2.7 % off and the water below the net is
+        // still sheared (2.5e-4 m/s).
+        assert!(
+            balance_err < 1e-10,
+            "the nets' drag is off τ/ρ₀ by {balance_err:.3e}"
+        );
+        assert!(
+            below_spread < 1e-12,
+            "the water below the net is sheared by {below_spread:.3e} m/s"
+        );
+        assert!(v_max < 1e-12, "cross-wind flow {v_max:.3e} m/s");
     }
 
     /// Uniform far field `(η = 0, ū = 0, v̄)` for a characteristic OBC.

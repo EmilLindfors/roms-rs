@@ -104,14 +104,18 @@ This section only orders the existing items for that goal and adds the two farm-
 
 **Stage B: 3D.** Lice larvae live in the upper few metres and respond to salinity, so dispersion needs the stratified surface layer.
 - P4.2 (tracer constancy and 3D open boundaries: done 2026-09-30; momentum in inventory form: done 2026-09-30; 3D nesting with the NorKyst/ROMS 3D reader: done 2026-09-30; not yet run on real NorKyst output), P4.3 (balanced PGF: done 2026-09-30; vertical grid), P4.4 (GLS: done 2026-10-01, columns only; quadratic bottom drag: done 2026-09-30), P4.5 (3D wet/dry: done 2026-09-30; vertical advection order: done 2026-09-30; 3D horizontal viscosity: done 2026-10-01, with Smagorinsky and limited Akima at fronts: done 2026-10-01; parallel, non-allocating 3D kernels: done 2026-10-01), rivers (P1.6 volume sources: done 2026-10-01, `source::river`; the NVE/ROMS river-file reader is open, P5.1), then P4.6 validation (the idealised fjord estuary: done 2026-10-01).
-- F.1 cage drag (3D form) and F.2 in 3D.
+- ~~F.1 cage drag (3D form)~~ done 2026-10-01 (`Hydrostatic3D::with_cage_drag`); F.2 in 3D.
 
 Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 and P7. Until Stage B is validated, the particle tracker and the visualisation can be developed against NorKyst-800 3D fields.
 
 ### F.1 Cage drag
 - [x] Momentum sink from the net as a porous region: S = −½·C_d·a·|u|u per unit volume, with a (net area per volume) and C_d from the net solidity (Løland 1991; review in Klebert et al. 2013, Ocean Eng. 58). Fouling raises the solidity, so it is a per-cage parameter (`NetCage`, `NetCage::circular` with Løland's C_d and a = 4/(πR)).
   - [x] 2D (2026-09-26, `source/swe_2d/cage.rs`): integrated over the net depth only, Λ = ½C_d a |u| min(d_net, h)/h, over the cage footprint.
-  - [ ] 3D: apply per level, only to levels above the net bottom (Stage B).
+  - [x] 3D (2026-10-01, `physics::cage_drag`, `Hydrostatic3D::with_cage_drag`): per σ-layer, weighted by the layer's share above the net bottom; linearised like the 3D bottom drag (`−Λ̄ū` point-implicit in the barotropic pass, the shear part in `G`, `−λ_l u_l` implicit in the vertical solve). Gates in `simulation_3d.rs`: unsheared flow decays as the 2D drag (first order), only the layers inside the net slow down, wind against nets reaches `Σ H_l λ_l u_l = τ/ρ₀` to 8.7e-14.
+    - [ ] `G`'s shear part `−D Σ Δσ_l λ_l (u_l − ū)` is explicit (AB3-extrapolated with the rest of `G`): at `λΔt ≥ 10` it overshoots and reverses the stopped flow by < 1 % of `u₀` (`a_strong_cage_drag_is_stable_at_long_steps`; none up to 5). Harmless at farm steps (`λ ≈ 0.005–0.02 /s` at 0.5–1 m/s, Δt ≲ 60 s), but a coarse 3D run with long baroclinic steps through a farm should keep `λΔt` below ≈ 5. The bottom drag's shear part has the same structure. If it matters: damp the shear part by `1/(1 + Δtλ_l)` (costs the exact steady balance at O(Δtλ)) or take it out of the AB3 history.
+    - [ ] Wake turbulence: the nets produce TKE (`P = Σ λ_l |u_l|²` per unit mass, as in canopy models; Beudin et al. 2017 for vegetation in ROMS/COAWST) that GLS does not see; the wake's mixing below the cages comes only from the shear the drag makes.
+    - [ ] A 3D farm run (`local_time_stepping_farm` has no 3D counterpart): cages in a stratified fjord with a tide, the 3D wake against the 2D one.
+    - [ ] The splitter's layer-drag buffer is dense (`[element][node][level]`, `ModeSplitIntegrator` `layer_drag_rate`) and `Hydrostatic3D::layer_drag_into` zeroes all of it every step, though only the cage nodes are ever nonzero. Cheap next to a 3D step; a sparse form over `CageDrag2D::nodes` (rates per caged column) would also let the vertical solve skip the lookup.
   - [x] Cages are comparable to or smaller than an element: each node is weighted by the area of its GLL subcell inside the footprint over w·J (adaptive bisection on the signed distance), so Σ wJφ is the footprint area on any quadrilateral.
 - [x] Point-implicit with the bottom friction (`ImplicitDamping2D::cages`, `SWEPhysics2DBuilder::with_cage_drag`).
 - [x] Gate tests (`tests/cage_drag_test.rs`):

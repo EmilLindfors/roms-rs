@@ -27,6 +27,7 @@
 
 pub mod bottom_drag;
 pub mod builder;
+pub mod cage_drag;
 pub mod eos;
 pub mod gls;
 pub mod hydrostatic_3d;
