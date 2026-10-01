@@ -59,6 +59,16 @@ pub struct Solution3D {
     pub eddy_viscosity: Vec<f64>,
     /// Eddy diffusivity (m²/s) for tracers
     pub eddy_diffusivity: Vec<f64>,
+
+    // --- Turbulence (prognostic closures only) ---
+    /// Turbulent kinetic energy `k` (m²/s²) of a two-equation closure
+    /// ([`crate::physics::GlsMixing`]) at the w-points,
+    /// `[n_elements][n_nodes][n_levels + 1]`, bottom to surface; empty
+    /// without one (the vertical diffusion allocates it on first use).
+    /// Stepped once per baroclinic step, not by the RK stages.
+    pub tke: Vec<f64>,
+    /// The closure's length-scale variable `ψ` (GLS), like [`Self::tke`].
+    pub gls: Vec<f64>,
 }
 
 impl Solution3D {
@@ -98,6 +108,8 @@ impl Solution3D {
             rho: vec![0.0; n_3d],
             eddy_viscosity: vec![0.0; n_3d],
             eddy_diffusivity: vec![0.0; n_3d],
+            tke: Vec::new(),
+            gls: Vec::new(),
         }
     }
 
@@ -265,6 +277,8 @@ impl Solution3D {
         self.rho.fill(0.0);
         self.eddy_viscosity.fill(0.0);
         self.eddy_diffusivity.fill(0.0);
+        self.tke.fill(0.0);
+        self.gls.fill(0.0);
     }
 }
 

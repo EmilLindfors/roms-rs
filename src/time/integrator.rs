@@ -874,6 +874,14 @@ impl Integrable for Solution3D {
         ] {
             update_with(x, y, |x, y| *x = y);
         }
+        // Empty without a prognostic closure
+        for (x, y) in [(&mut self.tke, &other.tke), (&mut self.gls, &other.gls)] {
+            if x.len() == y.len() {
+                update_with(x, y, |x, y| *x = y);
+            } else {
+                x.clone_from(y);
+            }
+        }
     }
 }
 

@@ -28,6 +28,7 @@
 pub mod bottom_drag;
 pub mod builder;
 pub mod eos;
+pub mod gls;
 pub mod hydrostatic_3d;
 pub mod traits;
 pub mod vertical_diffusion;
@@ -36,9 +37,10 @@ pub mod vertical_mixing;
 pub use bottom_drag::BottomDrag3D;
 pub use builder::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
 pub use eos::{EquationOfState, LinearEOS, UnescoEOS};
+pub use gls::{GlsMixing, GlsParameters, StabilityFunctions};
 pub use hydrostatic_3d::Hydrostatic3D;
 pub use traits::{PhysicsConfig, PhysicsModule, PhysicsModuleInfo};
 pub use vertical_diffusion::apply_vertical_diffusion;
 pub use vertical_mixing::{
-    Column, ConstantMixing, Forcing, PacanowskiPhilanderMixing, VerticalMixing,
+    Column, ConstantMixing, Forcing, PacanowskiPhilanderMixing, Turbulence, VerticalMixing,
 };
