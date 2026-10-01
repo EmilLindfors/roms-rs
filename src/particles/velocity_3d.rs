@@ -13,7 +13,8 @@
 //! - `dσ/dt = Ω/D` from `Solution3D::w` (Ω at the layer centres) and
 //!   `Ω = 0` at the surface and the bed, linear in σ between them;
 //! - `K` from `Solution3D::eddy_diffusivity` at the w-points, linear in σ,
-//!   so `∂K/∂z` is constant within each layer.
+//!   so `∂K/∂z` is constant within each layer;
+//! - temperature and salinity at the layer centres like `u`, `v`.
 
 use crate::mesh::Bathymetry2D;
 use crate::solver::state::Solution3D;
@@ -39,6 +40,19 @@ pub trait ParticleVelocity3D: Sync {
         _sigma: f64,
         _t: f64,
     ) -> Option<(f64, f64)> {
+        None
+    }
+
+    /// Temperature (°C) and salinity at the point and σ-level, for the
+    /// particles' behaviour ([`super::ParticleBehaviour3D`]); `None` (the
+    /// default) for a field without them.
+    fn tracers(
+        &self,
+        _element: ElementIndex,
+        _weights: &[f64],
+        _sigma: f64,
+        _t: f64,
+    ) -> Option<[f64; 2]> {
         None
     }
 }
@@ -194,6 +208,19 @@ impl<'a> Solution3DVelocity<'a> {
         }
     }
 
+    /// Temperature and salinity of snapshot `s` at the point and σ-level,
+    /// between the layer centres and held outside them (in any depth: a
+    /// thin column keeps its water's properties).
+    fn tracers_of(&self, s: &Solution3D, k: usize, weights: &[f64], sigma: f64) -> [f64; 2] {
+        let nl = s.n_levels;
+        let (l, a) = bracket(self.sigma.sigma_rho(), sigma);
+        let upper = (l + 1).min(nl - 1);
+        [&s.temp, &s.salt].map(|field| {
+            (1.0 - a) * evaluate_level(weights, field, k, nl, l)
+                + a * evaluate_level(weights, field, k, nl, upper)
+        })
+    }
+
     fn blend(&self, k: usize, weights: &[f64], sigma: f64, t: f64) -> Sample {
         let a = self.fraction(t);
         let s0 = self.sample(self.before.1, k, weights, sigma);
@@ -238,6 +265,22 @@ impl ParticleVelocity3D for Solution3DVelocity<'_> {
         self.blend(element.as_usize(), weights, sigma, t)
             .diffusivity
     }
+
+    fn tracers(
+        &self,
+        element: ElementIndex,
+        weights: &[f64],
+        sigma: f64,
+        t: f64,
+    ) -> Option<[f64; 2]> {
+        let (a, k) = (self.fraction(t), element.as_usize());
+        let before = self.tracers_of(self.before.1, k, weights, sigma);
+        if a == 0.0 {
+            return Some(before);
+        }
+        let after = self.tracers_of(self.after.1, k, weights, sigma);
+        Some([0, 1].map(|i| (1.0 - a) * before[i] + a * after[i]))
+    }
 }
 
 #[cfg(test)]
@@ -248,8 +291,8 @@ mod tests {
 
     /// Linear profiles in σ are sampled exactly between the layer centres
     /// (and K between the w-points, with its z-derivative), on stretched
-    /// levels; Ω vanishes at the surface and the bed; snapshots blend
-    /// linearly in time.
+    /// levels, and so are temperature and salinity; Ω vanishes at the
+    /// surface and the bed; snapshots blend linearly in time.
     #[test]
     fn linear_profiles_are_sampled_exactly() {
         let ops = DGOperators2D::new(2);
@@ -265,6 +308,8 @@ mod tests {
                     s.u[i * nl + l] = scale * (0.3 + 0.2 * sr);
                     s.v[i * nl + l] = scale * (-0.1 * sr);
                     s.w[i * nl + l] = scale * 1e-3 * sr * (1.0 + sr);
+                    s.temp[i * nl + l] = scale * (8.0 + 2.0 * sr);
+                    s.salt[i * nl + l] = 30.0 + scale * sr;
                 }
                 for (j, &sw) in sigma.sigma_w().iter().enumerate() {
                     s.eddy_diffusivity[i * (nl + 1) + j] = scale * (1e-3 - 2e-3 * sw);
@@ -289,6 +334,12 @@ mod tests {
                     // in the centres' values (they are a parabola)
                     assert!(sdot.is_finite());
                 }
+                let [temp, salt] = field.tracers(k, &w, s, t).unwrap();
+                assert!(
+                    (temp - scale * (8.0 + 2.0 * held)).abs() < 1e-13,
+                    "T at σ {s}"
+                );
+                assert!((salt - 30.0 - scale * held).abs() < 1e-13, "S at σ {s}");
                 let (kz, dkdz) = field.diffusivity(k, &w, s, t).unwrap();
                 assert!((kz - scale * (1e-3 - 2e-3 * s)).abs() < 1e-15, "K at σ {s}");
                 assert!((dkdz + scale * 2e-3 / depth).abs() < 1e-15, "K' at σ {s}");

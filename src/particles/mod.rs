@@ -1,5 +1,6 @@
 //! Lagrangian particle tracking in the depth-averaged flow (TODO F.2), and
-//! in the 3D flow with a σ-level per particle ([`tracker_3d`]).
+//! in the 3D flow with a σ-level per particle ([`tracker_3d`]), where
+//! particles can swim by a behaviour ([`behaviour`]: salmon-lice larvae).
 //!
 //! Particles (sea-lice larvae, feed, faeces, drifters) move with a velocity
 //! field sampled from the DG solution at the particle itself: the element
@@ -62,12 +63,17 @@
 //!   model for well-mixed estuaries and coastal waters. *Estuar. Coast.
 //!   Shelf Sci.* 37, 99–110.
 
+pub mod behaviour;
 mod tracker;
 pub mod tracker_3d;
 mod velocity;
 pub mod velocity_3d;
 pub mod walk;
 
+pub use behaviour::{
+    ClearSkyLight, ConstantLight, LiceStage, ParticleBehaviour3D, Passive, SalmonLice,
+    SurfaceLight, Surroundings,
+};
 pub use tracker::{Particle2D, ParticleStatus, ParticleTracker2D};
 pub use tracker_3d::{Particle3D, ParticleTracker3D};
 pub use velocity::{NodalVelocity2D, ParticleVelocity2D, SWEVelocity2D};

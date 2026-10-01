@@ -23,17 +23,22 @@
 //! solver's states every `particle_seconds` (default 60), with a horizontal
 //! walk `kh` (m²/s, default 0.1) and Visser's vertical walk in the model's
 //! GLS diffusivity:
-//! - lice larvae, neutrally buoyant, released over the top 5 m;
+//! - lice larvae, neutrally buoyant, released over the top 5 m, swimming
+//!   by `lice` (`SalmonLice`: `ladim`, the default, the operational IMR
+//!   parameters; `johnsen`, Johnsen et al. 2014; `passive`): up towards the
+//!   light, a clear sky at Mausund (63.87° N, 8.67° E) from `start` (UTC),
+//!   and down out of water fresher than their threshold;
 //! - faeces, sinking at 3 cm/s, released over the net's depth;
 //! - feed pellets, sinking at 10 cm/s, released over the top 2 m.
 //!
-//! Faeces and feed settle on the bed; the report gives the larvae's depths
-//! and spread, and where the rest landed.
+//! Faeces and feed settle on the bed; the report gives the larvae's depths,
+//! spread and swimming, and where the rest landed.
 //!
 //! ```bash
 //! cargo run --release --no-default-features --features parallel,simd \
 //!     --example farm_3d -- [hours=3] [order=2] [levels=16] [dx=60] [nu=1] [cs=0.2] \
-//!     [particles=0] [release=2] [particle_seconds=60] [kh=0.1]
+//!     [particles=0] [release=2] [particle_seconds=60] [kh=0.1] \
+//!     [lice=ladim] [start=2025-06-15T00:00:00Z]
 //! ```
 
 use std::collections::HashMap;
@@ -47,7 +52,8 @@ use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::mesh::{Mesh2D, PointLocator2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::particles::{
-    Particle3D, ParticleStatus, ParticleTracker3D, ParticleVelocity3D, Solution3DVelocity,
+    ClearSkyLight, Particle3D, ParticleStatus, ParticleTracker3D, ParticleVelocity3D, SalmonLice,
+    Solution3DVelocity,
 };
 use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use dg_rs::physics::{
@@ -60,7 +66,7 @@ use dg_rs::source::{
     CageDrag2D, ChezyFriction2D, CoriolisSource2D, HorizontalViscosity2D, NetCage, SourceContext2D,
     SourceTerm2D,
 };
-use dg_rs::time::{ModeSplitIntegrator, SSPRK3};
+use dg_rs::time::{ModeSplitIntegrator, ModelClock, SSPRK3};
 use dg_rs::types::ElementIndex;
 use dg_rs::vertical::{SigmaGrid, UniformStretching};
 
@@ -74,6 +80,8 @@ const RADIUS: f64 = 25.0;
 /// Cage centres: a row across the flow in the middle of the channel
 const CAGES: [[f64; 2]; 2] = [[3_000.0, 240.0], [3_000.0, 360.0]];
 const M2: f64 = 2.0 * PI / 44_714.16;
+/// Where the sun is: Mausund, off Frøya (longitude, latitude)
+const SITE: [f64; 2] = [8.67, 63.87];
 /// Tidal current amplitude without drag (m/s)
 const U_TIDE: f64 = 0.5;
 const RAMP: f64 = 3_600.0;
@@ -123,6 +131,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let release_time = get("release", 2.0)? * 3600.0;
     let particle_seconds: f64 = get("particle_seconds", 60.0)?;
     let kh: f64 = get("kh", 0.1)?;
+    let clock = ModelClock::parse(
+        args.get("start")
+            .map_or("2025-06-15T00:00:00Z", String::as_str),
+    )?;
+    let light = ClearSkyLight::new(clock, SITE[0], SITE[1]);
+    let lice = match args.get("lice").map_or("ladim", String::as_str) {
+        "ladim" => Some(SalmonLice::ladim(light)),
+        "johnsen" => Some(SalmonLice::johnsen_2014(light)),
+        "passive" => None,
+        other => return Err(format!("lice={other}: ladim, johnsen or passive").into()),
+    };
     let t_end = hours * 3600.0;
 
     let (nx, ny) = ((LX / dx).round() as usize, (LY / dx).round() as usize);
@@ -223,7 +242,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let label = if with_cages { "3D cages" } else { "3D open" };
         let start = Instant::now();
         let mut tracking = (with_cages && particles_per_kind > 0)
-            .then(|| FarmParticles::new(&mesh, &ops, particles_per_kind, release_time, kh));
+            .then(|| FarmParticles::new(&mesh, &ops, particles_per_kind, release_time, kh, lice));
         let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
         if tracking.is_some() {
             sim = sim.with_callback_interval(particle_seconds);
@@ -380,6 +399,9 @@ const KINDS: [(&str, f64, [f64; 2]); 3] = [
     ("feed", -0.10, [0.0, 2.0]),
 ];
 
+/// Index of the larvae in [`KINDS`].
+const LARVAE: usize = 0;
+
 /// Particles released from the cages and tracked online in the 3D flow.
 struct FarmParticles<'a> {
     tracker: ParticleTracker3D<'a>,
@@ -387,15 +409,24 @@ struct FarmParticles<'a> {
     ops: &'a DGOperators2D,
     n: usize,
     release_time: f64,
-    /// Particles once released, with their kind and cage
-    particles: Vec<Particle3D>,
-    origins: Vec<(usize, usize)>,
+    /// The larvae's behaviour (`None`: passive)
+    lice: Option<SalmonLice<ClearSkyLight>>,
+    /// Particles of each kind once released, with the cage of each
+    particles: [Vec<Particle3D>; 3],
+    cages: [Vec<usize>; 3],
     previous: Option<(f64, Solution3D)>,
     seconds: f64,
 }
 
 impl<'a> FarmParticles<'a> {
-    fn new(mesh: &'a Mesh2D, ops: &'a DGOperators2D, n: usize, release_time: f64, kh: f64) -> Self {
+    fn new(
+        mesh: &'a Mesh2D,
+        ops: &'a DGOperators2D,
+        n: usize,
+        release_time: f64,
+        kh: f64,
+        lice: Option<SalmonLice<ClearSkyLight>>,
+    ) -> Self {
         Self {
             tracker: ParticleTracker3D::new(mesh, ops)
                 .with_horizontal_diffusivity(kh)
@@ -405,17 +436,23 @@ impl<'a> FarmParticles<'a> {
             ops,
             n,
             release_time,
-            particles: Vec::new(),
-            origins: Vec::new(),
+            lice,
+            particles: Default::default(),
+            cages: Default::default(),
             previous: None,
             seconds: 0.0,
         }
+    }
+
+    fn released(&self) -> usize {
+        self.particles.iter().map(Vec::len).sum()
     }
 
     /// `n` particles of each kind in each cage: a sunflower pattern over
     /// the footprint, evenly over the kind's depth range.
     fn release(&mut self) {
         let golden_angle = PI * (3.0 - 5.0_f64.sqrt());
+        let mut id = 0;
         for (c, center) in CAGES.iter().enumerate() {
             for (kind, &(_, speed, [top, bottom])) in KINDS.iter().enumerate() {
                 for i in 0..self.n {
@@ -423,13 +460,13 @@ impl<'a> FarmParticles<'a> {
                     let angle = i as f64 * golden_angle;
                     let p = [center[0] + r * angle.cos(), center[1] + r * angle.sin()];
                     let below = top + (bottom - top) * (i as f64 + 0.5) / self.n as f64;
-                    let id = self.particles.len() as u64;
                     let particle = self
                         .tracker
                         .release(id, p, -below / DEPTH, speed)
                         .expect("cages are in the channel");
-                    self.particles.push(particle);
-                    self.origins.push((kind, c));
+                    id += 1;
+                    self.particles[kind].push(particle);
+                    self.cages[kind].push(c);
                 }
             }
         }
@@ -439,7 +476,7 @@ impl<'a> FarmParticles<'a> {
     /// steps of at most 10 s, linear in time between the two.
     fn advance(&mut self, state: &Solution3D, t: f64, sigma: &SigmaGrid, bed: &Bathymetry2D) {
         let start = Instant::now();
-        if self.previous.is_some() && t > self.release_time && self.particles.is_empty() {
+        if self.previous.is_some() && t > self.release_time && self.released() == 0 {
             self.release();
         }
         if let Some((t0, s0)) = &self.previous
@@ -450,8 +487,15 @@ impl<'a> FarmParticles<'a> {
             let n = ((t - from) / 10.0).ceil().max(1.0) as usize;
             let dt = (t - from) / n as f64;
             for s in 0..n {
-                self.tracker
-                    .step(&mut self.particles, &field, from + s as f64 * dt, dt);
+                let t = from + s as f64 * dt;
+                for (kind, particles) in self.particles.iter_mut().enumerate() {
+                    match &self.lice {
+                        Some(lice) if kind == LARVAE => {
+                            self.tracker.step_with(particles, &field, lice, t, dt)
+                        }
+                        _ => self.tracker.step(particles, &field, t, dt),
+                    }
+                }
             }
         }
         match &mut self.previous {
@@ -467,16 +511,26 @@ impl<'a> FarmParticles<'a> {
     /// Per kind: in the water and on the bed; depths, drift and spread of
     /// those in the water; where the settled ones landed.
     fn report(&self, state: &Solution3D, sigma: &SigmaGrid, bed: &Bathymetry2D) {
-        if self.particles.is_empty() {
+        if self.released() == 0 {
             println!("  (no particles released before the end)");
             return;
         }
         println!(
             "\nParticles: {} released at {:.1} h, {:.2} s tracking",
-            self.particles.len(),
+            self.released(),
             self.release_time / 3600.0,
             self.seconds
         );
+        if let Some(lice) = &self.lice {
+            let t = self.previous.as_ref().map_or(0.0, |(t, _)| *t);
+            println!(
+                "  Sun at the end: {:.1}° high, {:.0} µmol photons/m²/s at the surface; larvae swim up where the light exceeds {} (≈ {:.0} m deep)",
+                lice.light.solar_height(t),
+                lice.light.irradiance(t),
+                lice.light_threshold[0],
+                (lice.light.irradiance(t) / lice.light_threshold[0]).ln() / lice.attenuation
+            );
+        }
         let field = Solution3DVelocity::steady(state, sigma, bed, 0.05);
         // The vertical diffusivity the walk sees, 150 m up-current of the farm
         let locator = PointLocator2D::new(self.tracker_mesh);
@@ -502,12 +556,9 @@ impl<'a> FarmParticles<'a> {
             [dx, y - CAGES[c][1]]
         };
         for (kind, &(name, ..)) in KINDS.iter().enumerate() {
-            let of_kind: Vec<(&Particle3D, usize)> = self
-                .particles
+            let of_kind: Vec<(&Particle3D, usize)> = self.particles[kind]
                 .iter()
-                .zip(&self.origins)
-                .filter(|(_, (k, _))| *k == kind)
-                .map(|(p, &(_, c))| (p, c))
+                .zip(self.cages[kind].iter().copied())
                 .collect();
             let settled: Vec<[f64; 2]> = of_kind
                 .iter()
@@ -548,6 +599,24 @@ impl<'a> FarmParticles<'a> {
                     pct(0.9),
                     mean(0),
                     mean(1)
+                );
+            }
+            if kind == LARVAE && self.lice.is_some() && !water.is_empty() {
+                let swimming = |up: bool| {
+                    of_kind
+                        .iter()
+                        .filter(|(p, _)| p.status() == ParticleStatus::Active)
+                        .filter(|(p, _)| {
+                            let w = p.swimming_speed();
+                            if up { w > 0.0 } else { w < 0.0 }
+                        })
+                        .count() as f64
+                        / water.len() as f64
+                };
+                print!(
+                    "; swimming up {:.0} %, down {:.0} %",
+                    100.0 * swimming(true),
+                    100.0 * swimming(false)
                 );
             }
             if !settled.is_empty() {
