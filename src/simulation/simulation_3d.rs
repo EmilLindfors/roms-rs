@@ -2315,42 +2315,35 @@ mod tests {
         );
     }
 
-    /// TODO P4.6 gate: the lock exchange (Ilıcak et al. 2012, scaled). An
-    /// 8 km channel, 20 m deep, 5 °C colder left of the middle, at rest
-    /// (`g′ = gαΔT` = 8.3e-3 m/s², `√(g′H)` = 0.41 m/s). P1 on 250 m, ten
-    /// levels, 30 s steps, the horizontal Kuzmin tracer limiter, vertical
-    /// viscosity 1e-4 m²/s, `f = 0`.
+    /// The lock exchange (Ilıcak et al. 2012, scaled): an 8 km channel,
+    /// 20 m deep, 5 °C colder left of the middle, at rest (`g′ = gαΔT` =
+    /// 8.3e-3 m/s², `√(g′H)` = 0.41 m/s), with the horizontal Kuzmin tracer
+    /// limiter, vertical viscosity 1e-4 m²/s and `f = 0`. At `order` on `n_x`
+    /// elements along the channel and `levels` levels, with horizontal
+    /// viscosity `nu` (m²/s), the tracers' `vertical_advection` and steps of
+    /// `dt` (s).
     ///
-    /// The dense water runs right along the bed and the light water left
-    /// along the surface, each at the Froude number `U/√(g′H)` = 0.483
-    /// (0.475 at 125 m on 20 levels, 0.473 at 62 m), a little below
-    /// Benjamin's (1968) ½ for an energy-conserving current, as dissipative
-    /// currents in the laboratory and in hydrostatic models are. At the
-    /// middle the two layers move at ±0.20 m/s, Benjamin's ½√(g′H). The
-    /// interface between them thickens to ≈ 8 m (where the shear's Richardson
-    /// number reaches ≈ ¼), so the exchange transport is only 0.40 of
-    /// `(H/2)·½√(g′H)`. The limiter keeps T inside its initial range.
-    ///
-    /// Not at P2: without horizontal viscosity (P4.5) the interface's shear
-    /// instability grows at the grid scale, fastest in a hydrostatic model,
-    /// and P2 has too little numerical dissipation to stop it (NaN after
-    /// ≈ 1500 s, the same at 10 and 2 s steps; 1e-2 m²/s of vertical
-    /// viscosity holds it). The Kuzmin limiter also lets P2 overshoot by
-    /// 0.46 °C.
-    ///
-    /// The fronts are where the bed (surface) layer's dense (light) water
-    /// ends: the middle plus its length there, from its fraction integrated
-    /// along the channel. Their speed is taken over hours 1–3, after the
-    /// collapse of the lock.
-    #[test]
-    fn a_lock_exchange_runs_at_the_gravity_current_speed() {
+    /// Returns the Froude numbers `U/√(g′H)` of the dense and the light
+    /// front between the times `window` (s; after the collapse of the lock),
+    /// and how far T left its initial range at the end (°C). The fronts are where the bed (surface)
+    /// layer's dense (light) water ends: the middle plus its length there,
+    /// from its fraction integrated along the channel.
+    fn lock_exchange(
+        order: usize,
+        n_x: usize,
+        levels: usize,
+        nu: f64,
+        vertical_advection: crate::solver::rhs::VerticalAdvection,
+        dt: f64,
+        window: [f64; 2],
+    ) -> [f64; 3] {
         use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
         let (length, width, depth, delta_t) = (8e3, 500.0, 20.0, 5.0);
-        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, 32, 1));
-        let ops = Arc::new(DGOperators2D::new(1));
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, n_x, 1));
+        let ops = Arc::new(DGOperators2D::new(order));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
-        let sigma = SigmaGrid::new(10, UniformStretching);
+        let sigma = SigmaGrid::new(levels, UniformStretching);
         let swe = PhysicsBuilder::swe_2d(
             mesh.clone(),
             ops.clone(),
@@ -2374,6 +2367,8 @@ mod tests {
             G,
             RHO0,
         )
+        .with_horizontal_viscosity(nu)
+        .with_vertical_advection(vertical_advection)
         .with_tracer_limiter(TracerLimiter3DConfig {
             limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
             ..TracerLimiter3DConfig::default()
@@ -2411,29 +2406,51 @@ mod tests {
             ]
         };
 
-        let dt = 30.0;
         let mut integrator = ModeSplitIntegrator::new();
         let mut positions = Vec::new();
-        for n in 0..(3.0 * 3600.0 / dt) as usize {
+        let [first, last] = window.map(|t| (t / dt).round() as usize);
+        for n in 0..last {
             physics.update_density(&mut state);
             integrator.step(&mut state, &physics, dt, n as f64 * dt);
             physics.post_process(&mut state);
-            if (n + 1) % (3600.0 / dt) as usize == 0 {
+            if n + 1 == first || n + 1 == last {
                 positions.push(fronts(&state));
             }
         }
-        let t_range = max_or_nan(
+        let t_excess = max_or_nan(
             state
                 .temp
                 .iter()
                 .map(|&t| (t - cold).max(warm - t) - delta_t),
         );
+        let span = (last - first) as f64 * dt;
+        let [dense, light] =
+            [0, 1].map(|f| (positions[1][f] - positions[0][f]).abs() / span / speed_scale);
+        [dense, light, t_excess]
+    }
+
+    /// TODO P4.6 gate: the lock exchange ([`lock_exchange`]) at P1 on
+    /// 250 m, ten levels, 30 s steps, without horizontal viscosity, fronts
+    /// over hours 1–3.
+    ///
+    /// The dense water runs right along the bed and the light water left
+    /// along the surface, each at the Froude number 0.483 (0.475 at 125 m on
+    /// 20 levels, 0.473 at 62 m), a little below Benjamin's (1968) ½ for an
+    /// energy-conserving current, as dissipative currents in the laboratory
+    /// and in hydrostatic models are. At the middle the two layers move at
+    /// ±0.20 m/s, Benjamin's ½√(g′H). The interface between them thickens
+    /// to ≈ 8 m (where the shear's Richardson number reaches ≈ ¼), so the
+    /// exchange transport is only 0.40 of `(H/2)·½√(g′H)`. The limiter keeps
+    /// T inside its initial range.
+    #[test]
+    fn a_lock_exchange_runs_at_the_gravity_current_speed() {
+        use crate::solver::rhs::VerticalAdvection::Akima;
+        let [dense, light, t_excess] =
+            lock_exchange(1, 32, 10, 0.0, Akima, 30.0, [3600.0, 10800.0]);
         assert!(
-            t_range < 1e-9,
-            "T left its initial range by {t_range:.3e} °C"
+            t_excess < 1e-9,
+            "T left its initial range by {t_excess:.3e} °C"
         );
-        let [dense, light] = [0, 1]
-            .map(|f| (positions[2][f] - positions[0][f]).abs() / (2.0 * 3600.0) / speed_scale);
         // Measured 0.483 for both
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
@@ -2445,5 +2462,165 @@ mod tests {
             (dense - light).abs() < 0.01,
             "the fronts run at Fr = {dense:.4} and {light:.4}"
         );
+    }
+
+    /// TODO P4.5 gate: the lock exchange ([`lock_exchange`]) at P2 needs
+    /// horizontal viscosity, and runs with it. On 250 m, ten levels, 40 s
+    /// steps, ν = 10 m²/s and TVD vertical advection the fronts run at
+    /// Fr = 0.500 (dense) and 0.494 (light) over hours 1–2 (0.499 and 0.494
+    /// over hours 1–3, the same at 30 s steps; P1 without viscosity 0.483),
+    /// and T stays in its range to 2e-12 °C. Before hour 1 the fronts are
+    /// still accelerating (0.48 over 0.5–1.5 h).
+    ///
+    /// Without horizontal viscosity the interface's shear instability grows
+    /// at the grid scale, fastest in a hydrostatic model (its growth rate
+    /// rises with the wavenumber, `≈ kΔU/2`), and P2 has too little numerical
+    /// dissipation to stop it: NaN after ≈ 1500 s, at 10 and 2 s steps
+    /// alike; at ν = 5 the mid-depth interface at an element vertex grows
+    /// from 0.3 to 4.6 m/s within 450 s (≈ 6e-3 s⁻¹, as `kΔU/2` at the node
+    /// spacing) after an hour. The smallest ν that holds shrinks with the
+    /// spacing: between 5 and 10 m²/s at 500 m, 5 and 7 at 250 m, 2.5 and 5
+    /// at 125 m, at most 2.5 at 62 m (fronts 0.491 and 0.490). In grid
+    /// Reynolds numbers `ΔU·Δx/ν` (ΔU = 0.4 m/s, Δx = element size / N) the
+    /// bound is 7–10 at 250 m and below, 10–20 at 500 m.
+    ///
+    /// With Akima vertical advection (the default) the same runs pass, but
+    /// at 125 m and ν = 10 the bed layers undershoot by 0.23 °C next to the
+    /// sharp interface: the horizontal Kuzmin limiter bounds T only along the
+    /// layers. TVD keeps it to 4e-12 °C.
+    #[test]
+    fn a_p2_lock_exchange_runs_with_horizontal_viscosity() {
+        use crate::solver::rhs::VerticalAdvection::Tvd;
+        let [dense, light, t_excess] = lock_exchange(2, 32, 10, 10.0, Tvd, 40.0, [3600.0, 7200.0]);
+        assert!(
+            t_excess < 1e-9,
+            "T left its initial range by {t_excess:.3e} °C"
+        );
+        // Measured 0.500 and 0.494
+        for (front, froude) in [("dense", dense), ("light", light)] {
+            assert!(
+                (0.46..0.52).contains(&froude),
+                "the {front} front runs at Fr = {froude:.4}"
+            );
+        }
+        assert!(
+            (dense - light).abs() < 0.01,
+            "the fronts run at Fr = {dense:.4} and {light:.4}"
+        );
+    }
+
+    /// TODO P4.5 gate: the horizontal viscosity of the 3D shear in the mode
+    /// split. A shear `u = p(σ)·cos(ky)` along a doubly periodic box (P3,
+    /// flat, no vertical mixing, no rotation, uniform T/S) is divergence-free
+    /// in every layer, so nothing but the viscosity acts on it: it decays as
+    /// `e^(−νk²t)` with its profile, and the depth mean stays at rest (the
+    /// column sum of the viscosity is zero, so `G` is).
+    #[test]
+    fn a_shear_mode_decays_at_the_viscous_rate_and_leaves_the_depth_mean() {
+        let (length, depth, nu, levels) = (10e3, 20.0, 50.0, 6);
+        let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, length, 0.0, length, 2, 8));
+        let ops = Arc::new(DGOperators2D::new(3));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let sigma = SigmaGrid::new(levels, UniformStretching);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(sigma.clone()),
+            bathymetry,
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(0.0, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_horizontal_viscosity(nu);
+        let k = 2.0 * std::f64::consts::PI / length;
+        // A profile with zero depth mean
+        let profile: Vec<f64> = sigma
+            .sigma_rho()
+            .iter()
+            .map(|s| 0.1 * (2.0 * s + 1.0))
+            .collect();
+        let (nn, nl) = (ops.n_nodes, levels);
+        let eos = LinearEOS::default();
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        state.temp.fill(eos.t0);
+        state.salt.fill(eos.s0);
+        let shape: Vec<f64> = (0..mesh.n_elements * nn)
+            .map(|idx| {
+                let (e, i) = (idx / nn, idx % nn);
+                let [_, y] = mesh.reference_to_physical(
+                    ElementIndex::new(e),
+                    ops.nodes_r[i],
+                    ops.nodes_s[i],
+                );
+                (k * y).cos()
+            })
+            .collect();
+        for (idx, c) in shape.iter().enumerate() {
+            for (l, p) in profile.iter().enumerate() {
+                state.u[idx * nl + l] = p * c;
+            }
+        }
+        physics.update_density(&mut state);
+        let ops_mass = |idx: usize| physics.geom.node_mass(idx / nn, idx % nn);
+
+        // e-folding 5.1e4 s; the viscous step limit is ≈ 870 s
+        let (dt, n_steps) = (500.0, 40);
+        let mut integrator = ModeSplitIntegrator::new();
+        for n in 0..n_steps {
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+        }
+        let decay = (-nu * k * k * dt * n_steps as f64).exp();
+        // The mode's amplitude, by mass-weighted projection, and the rest
+        let (mut projected, mut norm, mut rest) = (0.0, 0.0, 0.0_f64);
+        for (idx, c) in shape.iter().enumerate() {
+            let mass = ops_mass(idx);
+            for (l, p) in profile.iter().enumerate() {
+                projected += mass * state.u[idx * nl + l] * p * c;
+                norm += mass * (p * c).powi(2);
+            }
+        }
+        let amplitude = projected / norm;
+        for (idx, c) in shape.iter().enumerate() {
+            for (l, p) in profile.iter().enumerate() {
+                rest = max_or_nan([rest, (state.u[idx * nl + l] - amplitude * p * c).abs()]);
+            }
+        }
+        let mean = max_or_nan(
+            state
+                .ubar
+                .data
+                .iter()
+                .chain(&state.vbar.data)
+                .chain(&state.eta.data)
+                .chain(&state.v)
+                .map(|x| x.abs()),
+        );
+        // Measured: the amplitude 1.1e-6 off, the rest 5.5e-5 m/s (the
+        // nodal cos(ky) is not exactly the discrete mode), the mean 1.7e-12
+        assert!(
+            (amplitude / decay - 1.0).abs() < 1e-5,
+            "the shear decayed to {amplitude:.6} of its amplitude, not {decay:.6}"
+        );
+        assert!(
+            rest < 1e-3 * decay,
+            "the shear left its profile by {rest:.3e} m/s"
+        );
+        assert!(mean < 1e-11, "the depth mean (or v, η) moved by {mean:.3e}");
     }
 }

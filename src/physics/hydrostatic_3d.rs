@@ -17,8 +17,11 @@
 //!     G = D·⟨R_PGF+Cor(u)⟩ + Σ_l A_l(u) − A(ū) − D·R_Cor(ū) + (τ_s − τ_b)/ρ₀ − r·(u_b − ū)
 //! ```
 //!
-//! `⟨R_PGF+Cor(u)⟩` is the depth mean of the pointwise 3D momentum tendency
-//! (baroclinic PGF, Coriolis). `A_l(u)` is the momentum advection of layer
+//! `⟨R_PGF+Cor(u)⟩` is the depth mean of the 3D momentum tendency that does
+//! not move with the layer fluxes (baroclinic PGF, Coriolis, and the
+//! horizontal viscosity of the shear, [`Hydrostatic3D::with_horizontal_viscosity`],
+//! whose column integral is zero for a constant ν: the depth mean's viscosity
+//! is the 2D module's). `A_l(u)` is the momentum advection of layer
 //! `l` in inventory form, `−∇·(Q_l u_l) − δ(Ω u)_l`
 //! ([`crate::solver::rhs::apply_momentum_transport_3d`]), with the state's own
 //! layer transports `Q_l = H_z u_l` (the barotropic transport of the step
@@ -58,8 +61,9 @@ use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::rhs::{
     BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, LayerTransport, Rhs3DConfig,
-    TracerBoundaryCondition3D, TransportScratch, VerticalAdvection, apply_coriolis_3d,
-    apply_momentum_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
+    TracerBoundaryCondition3D, TransportScratch, VerticalAdvection, ViscosityScratch3D,
+    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
+    compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -111,6 +115,9 @@ where
     /// Quadratic drag of the bottom-layer velocity, if any (see
     /// [`Self::with_bottom_drag`]).
     pub bottom_drag: Option<BottomDrag3D>,
+    /// Horizontal eddy viscosity of the vertical shear (m²/s; see
+    /// [`Self::with_horizontal_viscosity`]).
+    pub horizontal_viscosity: f64,
     /// A parent model's profiles at open boundaries and in a relaxation
     /// band, if nested (see [`Self::with_nesting`]).
     pub nesting: Option<Nesting3D>,
@@ -124,6 +131,8 @@ where
     /// `state` with the velocity of thin columns zeroed, for the momentum
     /// advection (allocated on the first step with a thin column).
     masked_scratch: Mutex<Option<Solution3D>>,
+    /// Buffers of the horizontal viscosity (allocated on first use).
+    viscosity_scratch: Mutex<Option<ViscosityScratch3D>>,
 }
 
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
@@ -175,11 +184,13 @@ where
             vertical_advection: VerticalAdvection::default(),
             momentum_vertical_advection: VerticalAdvection::Centred,
             bottom_drag: None,
+            horizontal_viscosity: 0.0,
             nesting: None,
             open_boundary_check: Once::new(),
             transport_scratch,
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
+            viscosity_scratch: Mutex::new(None),
         }
     }
 
@@ -236,6 +247,24 @@ where
     /// bottom friction of its own: it would count the drag twice.
     pub fn with_bottom_drag(mut self, drag: BottomDrag3D) -> Self {
         self.bottom_drag = Some(drag);
+        self
+    }
+
+    /// Horizontal eddy viscosity `nu` (m²/s, constant) of the 3D momentum,
+    /// along σ-surfaces, on the vertical shear `u − ū` only (BR1; see
+    /// [`crate::solver::rhs::viscosity_3d`]). The depth mean is the 2D
+    /// module's: give it its own `HorizontalViscosity2D` for a viscous mean
+    /// flow.
+    ///
+    /// Higher orders need it in sheared, stratified flow: without it the
+    /// shear instability of an interface grows at the grid scale (a P2 lock
+    /// exchange blows up).
+    pub fn with_horizontal_viscosity(mut self, nu: f64) -> Self {
+        assert!(
+            nu >= 0.0 && nu.is_finite(),
+            "horizontal viscosity must be finite and non-negative, got {nu}"
+        );
+        self.horizontal_viscosity = nu;
         self
     }
 
@@ -424,12 +453,35 @@ where
     }
 
     /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the
-    /// pointwise momentum terms of `state` at time `t` (baroclinic PGF,
-    /// Coriolis; see [`compute_momentum_rhs_3d`]; and the nesting's
-    /// relaxation of the shear, which has no depth mean), zero in thin
-    /// columns. `state.rho` must be current.
+    /// momentum terms of `state` at time `t` that do not move with the layer
+    /// fluxes (baroclinic PGF, Coriolis; see [`compute_momentum_rhs_3d`]; the
+    /// horizontal viscosity of the shear; and the nesting's relaxation of
+    /// the shear, which has no depth mean), zero in thin columns.
+    /// `state.rho` must be current.
     pub fn compute_momentum_rhs_into(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D) {
         compute_momentum_rhs_3d(rhs, state, &self.rhs_config());
+        if self.horizontal_viscosity > 0.0 {
+            let mut guard = self
+                .viscosity_scratch
+                .lock()
+                .expect("Failed to lock viscosity_scratch");
+            let scratch = guard
+                .get_or_insert_with(|| ViscosityScratch3D::new(self.mesh.n_elements, &self.ops));
+            apply_horizontal_viscosity_3d(
+                &mut rhs.u,
+                &mut rhs.v,
+                state,
+                self.horizontal_viscosity,
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                &self.bathymetry,
+                &self.sigma,
+                &self.boundaries,
+                self.min_column_depth,
+                scratch,
+            );
+        }
         if let Some(nesting) = &self.nesting {
             nesting
                 .columns(state, &self.bathymetry, &self.sigma, t)
@@ -617,6 +669,16 @@ where
                     min_dt = dt_loc;
                 }
             }
+            // The horizontal viscosity, explicit in the SSP-RK3 stages
+            min_dt = min_dt.min(element_dt_viscous_swe_2d(
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                self.horizontal_viscosity,
+                self.ops.order,
+                cfl,
+                k,
+            ));
         }
 
         if min_dt == f64::INFINITY { 1.0 } else { min_dt }
