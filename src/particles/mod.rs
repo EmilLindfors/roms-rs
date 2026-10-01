@@ -1,4 +1,5 @@
-//! Lagrangian particle tracking in the depth-averaged flow (TODO F.2).
+//! Lagrangian particle tracking in the depth-averaged flow (TODO F.2), and
+//! in the 3D flow with a σ-level per particle ([`tracker_3d`]).
 //!
 //! Particles (sea-lice larvae, feed, faeces, drifters) move with a velocity
 //! field sampled from the DG solution at the particle itself: the element
@@ -62,9 +63,13 @@
 //!   Shelf Sci.* 37, 99–110.
 
 mod tracker;
+pub mod tracker_3d;
 mod velocity;
+pub mod velocity_3d;
 pub mod walk;
 
 pub use tracker::{Particle2D, ParticleStatus, ParticleTracker2D};
+pub use tracker_3d::{Particle3D, ParticleTracker3D};
 pub use velocity::{NodalVelocity2D, ParticleVelocity2D, SWEVelocity2D};
+pub use velocity_3d::{ParticleVelocity3D, Solution3DVelocity};
 pub use walk::{WalkEnd, walk};

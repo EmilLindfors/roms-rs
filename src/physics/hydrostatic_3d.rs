@@ -241,6 +241,14 @@ where
         self
     }
 
+    /// Floor (m/s) of the internal-wave speed in [`Self::compute_dt`]: keeps
+    /// the step finite in unstratified water at rest, where nothing else
+    /// bounds it (a run starting from rest would otherwise take its first
+    /// step unbounded). 0.1 m/s is the first-mode speed of weak
+    /// stratification, `g′ ≈ 10⁻³ m/s²` over 10 m. A heuristic, not a
+    /// stability limit.
+    pub const MIN_INTERNAL_WAVE_SPEED: f64 = 0.1;
+
     /// Default of [`Self::with_min_column_depth`] (m), ROMS's usual `Dcrit`.
     pub const DEFAULT_MIN_COLUMN_DEPTH: f64 = 0.1;
 
@@ -749,75 +757,82 @@ where
         self.eos.update_density(state);
     }
 
-    /// Compute permissible time step based on 3D CFL condition.
+    /// The baroclinic time step at Courant number `cfl` (the barotropic pass
+    /// takes its own substeps).
     ///
-    /// Limited by horizontal advection speed + gravity wave speed (if explicit)
-    /// or just advection (if split).
-    /// Since we use mode splitting, the 3D step is limited by:
-    /// 1. Internal wave speed (baroclinic modes)
-    /// 2. 3D Advection velocity
+    /// The explicit 3D terms bound it:
+    /// - horizontal advection and internal waves, `cfl·h/(|u| + c₁)/(N+1)²`
+    ///   per element (`h = √J`), with `|u|` the largest layer speed and `c₁`
+    ///   the first-mode internal-wave speed of each column in the WKB
+    ///   estimate `c₁ = (1/π) ∫ N dz` (exact `NH/π` for a constant `N`),
+    ///   `N² = −(g/ρ₀) ∂ρ/∂z` between the layer centres, unstable parts
+    ///   counted as zero, and at least [`Self::MIN_INTERNAL_WAVE_SPEED`];
+    /// - vertical advection, `|Ω| Δt/H_z ≤ 1` on every layer (`Ω` from the
+    ///   last `post_process`; the limit of upwind, below Akima's ≈ 1.2,
+    ///   see [`VerticalAdvection`]);
+    /// - Coriolis, `|f| Δt ≤ 1` (SSP-RK3 is stable on the imaginary axis up
+    ///   to √3);
+    /// - the horizontal viscosity, by the BR1 spectral radius.
+    ///
+    /// Thin columns are left to the 2D module (a domain of thin columns
+    /// only gets 1 s).
     pub fn compute_dt(&self, state: &Solution3D, cfl: f64) -> f64 {
-        // Simplified estimate: use 2D CFL but scaled for internal waves?
-        // Or just use advection speed.
-        // For mode splitting, dt_3d can be much larger than dt_2d (barotropic).
-        // Typically dt_3d is limited by internal gravity waves c_n ~ sqrt(g' H).
-
-        // For now, let's delegate to SWEPhysics2D compute_dt and multiply by a factor?
-        // No, better to compute explicit advection limit.
-
-        // Placeholder: Return a conservative estimate
-        // Min(dx / (|u| + c_internal))
-
-        // Let's assume c_internal << c_external
-        // So we can take a larger step.
-        // For this prototype, return 0.1s or something safe.
-        // Or better: use the 2D dt computation but with a larger CFL factor.
-
-        // We really should iterate over elements and find max(|u| + c_bc) / dx.
-        // c_bc approx NH * N * H / pi?
-
-        // Let's use the 2D physics dt as a baseline.
-        // But 2D physics uses sqrt(gH), which is fast.
-        // We want to skip that.
-
-        // Let's iterate elements.
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        let (sigma_rho, d_sigma) = (self.sigma.sigma_rho(), self.sigma.d_sigma());
         let mut min_dt = reduce_blocks::<f64, _, _, 0>(
             self.mesh.n_elements,
             [],
             || (),
             |_, k, []| {
-                let j_inv = self.geom.affine_metric(k).det_j_inv;
-                // length scale h ~ 1/sqrt(J_inv) ?
-                // For parallelogram: Area = J. h ~ sqrt(Area).
-                let h_len = 1.0 / j_inv.sqrt(); // Approx element size
-
-                // Max velocity in column
-                let mut max_vel = 0.0;
-                let el = crate::types::ElementIndex::new(k);
-                for i in 0..state.n_nodes {
+                // √J: half the side of a square element
+                let h_len = 1.0 / self.geom.affine_metric(k).det_j_inv.sqrt();
+                let (mut wave_speed, mut vertical_rate) = (0.0_f64, 0.0_f64);
+                for i in 0..nn {
+                    let idx = k * nn + i;
                     // Thin films are the 2D module's (and its own CFL's) business
-                    if self.is_thin(state, k * state.n_nodes + i) {
+                    if self.is_thin(state, idx) {
                         continue;
                     }
-                    for l in 0..state.n_levels {
-                        let u = state.u_column(el, i)[l];
-                        let v = state.v_column(el, i)[l];
-                        let vel = (u * u + v * v).sqrt();
-                        if vel > max_vel {
-                            max_vel = vel;
-                        }
+                    let depth = state.eta.data[idx] - self.bathymetry.data[idx];
+                    let column = idx * nl..(idx + 1) * nl;
+                    let (u, v, w, rho) = (
+                        &state.u[column.clone()],
+                        &state.v[column.clone()],
+                        &state.w[column.clone()],
+                        &state.rho[column],
+                    );
+                    let mut speed = 0.0_f64;
+                    for l in 0..nl {
+                        speed = speed.max(u[l].hypot(v[l]));
+                        vertical_rate = vertical_rate.max(w[l].abs() / (d_sigma[l] * depth));
                     }
+                    // WKB: Σ N Δz = Σ √(−(g/ρ₀) Δρ Δz) over the interior w-points
+                    let mut integral = 0.0;
+                    for l in 1..nl {
+                        let dz = (sigma_rho[l] - sigma_rho[l - 1]) * depth;
+                        let n2_dz2 = -self.g / self.rho0 * (rho[l] - rho[l - 1]) * dz;
+                        integral += n2_dz2.max(0.0).sqrt();
+                    }
+                    let c1 = (integral / std::f64::consts::PI).max(Self::MIN_INTERNAL_WAVE_SPEED);
+                    wave_speed = wave_speed.max(speed + c1);
                 }
-
-                // Internal wave speed approximation: c ~ 2.0 m/s (typical)
-                let c_internal = 2.0;
-                let wave_speed = max_vel + c_internal;
-
-                if wave_speed > 1e-6 {
-                    cfl * h_len / wave_speed / (self.ops.order as f64 + 1.0).powi(2)
-                } else {
-                    f64::INFINITY
+                let mut dt = f64::INFINITY;
+                if wave_speed > 1e-12 {
+                    dt = dt.min(cfl * h_len / wave_speed / (self.ops.order as f64 + 1.0).powi(2));
                 }
+                if vertical_rate > 0.0 {
+                    dt = dt.min(1.0 / vertical_rate);
+                }
+                let f = self
+                    .mesh
+                    .element_vertices(ElementIndex::new(k))
+                    .iter()
+                    .map(|&[_, y]| self.coriolis.f_at(y).abs())
+                    .fold(0.0, f64::max);
+                if f > 0.0 {
+                    dt = dt.min(1.0 / f);
+                }
+                dt
             },
             || f64::INFINITY,
             f64::min,

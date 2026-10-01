@@ -62,7 +62,7 @@ pub fn layer_coefficient(entries: &[CageNode], sigma: &SigmaGrid, level: usize, 
 
 /// The cage entries of every node of element `k` (`n_nodes` nodes), in
 /// order: call `f(i, entries)` for each node `i` that has any.
-pub(crate) fn for_each_caged_node(
+pub fn for_each_caged_node(
     cages: &CageDrag2D,
     k: usize,
     n_nodes: usize,

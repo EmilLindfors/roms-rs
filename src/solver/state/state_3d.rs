@@ -55,9 +55,12 @@ pub struct Solution3D {
     pub salt: Vec<f64>,
     /// Density (kg/m³)
     pub rho: Vec<f64>,
-    /// Eddy viscosity (m²/s) for momentum
+    /// Eddy viscosity (m²/s) of the momentum at the w-points,
+    /// `[n_elements][n_nodes][n_levels + 1]`, bottom to surface (as
+    /// [`Self::tke`]); set by the vertical diffusion, zero before.
     pub eddy_viscosity: Vec<f64>,
-    /// Eddy diffusivity (m²/s) for tracers
+    /// Eddy diffusivity (m²/s) of the tracers at the w-points, like
+    /// [`Self::eddy_viscosity`].
     pub eddy_diffusivity: Vec<f64>,
 
     // --- Turbulence (prognostic closures only) ---
@@ -106,8 +109,8 @@ impl Solution3D {
             temp: vec![0.0; n_3d],
             salt: vec![0.0; n_3d],
             rho: vec![0.0; n_3d],
-            eddy_viscosity: vec![0.0; n_3d],
-            eddy_diffusivity: vec![0.0; n_3d],
+            eddy_viscosity: vec![0.0; n_elements * n_nodes * (n_levels + 1)],
+            eddy_diffusivity: vec![0.0; n_elements * n_nodes * (n_levels + 1)],
             tke: Vec::new(),
             gls: Vec::new(),
         }
@@ -220,22 +223,34 @@ impl Solution3D {
         Self::get_column_mut(&mut self.rho, self.n_nodes, self.n_levels, k, i)
     }
 
-    /// Get a reference to the eddy viscosity column at (k, i).
+    /// The eddy viscosity column at (k, i): `n_levels + 1` w-points.
     #[inline(always)]
     pub fn eddy_viscosity_column(&self, k: ElementIndex, i: usize) -> &[f64] {
-        Self::get_column(&self.eddy_viscosity, self.n_nodes, self.n_levels, k, i)
+        Self::get_column(&self.eddy_viscosity, self.n_nodes, self.n_levels + 1, k, i)
     }
 
     /// Get a mutable reference to the eddy viscosity column at (k, i).
     #[inline(always)]
     pub fn eddy_viscosity_column_mut(&mut self, k: ElementIndex, i: usize) -> &mut [f64] {
-        Self::get_column_mut(&mut self.eddy_viscosity, self.n_nodes, self.n_levels, k, i)
+        Self::get_column_mut(
+            &mut self.eddy_viscosity,
+            self.n_nodes,
+            self.n_levels + 1,
+            k,
+            i,
+        )
     }
 
-    /// Get a reference to the eddy diffusivity column at (k, i).
+    /// The eddy diffusivity column at (k, i): `n_levels + 1` w-points.
     #[inline(always)]
     pub fn eddy_diffusivity_column(&self, k: ElementIndex, i: usize) -> &[f64] {
-        Self::get_column(&self.eddy_diffusivity, self.n_nodes, self.n_levels, k, i)
+        Self::get_column(
+            &self.eddy_diffusivity,
+            self.n_nodes,
+            self.n_levels + 1,
+            k,
+            i,
+        )
     }
 
     /// Get a mutable reference to the eddy diffusivity column at (k, i).
@@ -244,7 +259,7 @@ impl Solution3D {
         Self::get_column_mut(
             &mut self.eddy_diffusivity,
             self.n_nodes,
-            self.n_levels,
+            self.n_levels + 1,
             k,
             i,
         )
