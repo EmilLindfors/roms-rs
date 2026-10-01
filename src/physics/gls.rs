@@ -50,8 +50,19 @@
 //! The boundaries are logarithmic layers with flux conditions at the
 //! boundary layers' centres: no flux of `k`, and the flux of `ψ` of a log
 //! layer, `−n (c_μ⁰)^(p+1) κ^(n+1)/σ_ψ k^(m+1/2) (z′ + z₀)^n`, at a height
-//! `z′` of half the end layer over roughness `z₀`. The boundary w-points
-//! themselves carry `k = u*²/(c_μ⁰)²`, `l = κ z₀` (diagnostic only).
+//! `z′` of half the end layer over roughness `z₀` (GOTM's Neumann
+//! "logarithmic" conditions). The boundary w-points themselves carry
+//! `k = u*²/(c_μ⁰)²`, `l = κ z₀`, and nothing reads them: not the `k` and `ψ`
+//! solves (the `ψ` flux takes the `k` of the first interior w-point), not
+//! the momentum and tracer solves (which take the surface and bottom fluxes
+//! directly). So the friction velocities in [`Column`] are diagnostic: the
+//! wind and the bed reach the turbulence through the shear production of the
+//! stresses' momentum fluxes. In a layer of constant stress the interior
+//! holds the log layer's `k = u*²/(c_μ⁰)²` exactly at equilibrium, so the
+//! boundary values agree with it; from rest the top interior w-point needs
+//! ≈ 36 h/u* to get there (h the top layer's thickness; ROMS's default
+//! Dirichlet surface value, or wave injection, would put `u*` into the
+//! interior).
 //!
 //! The model is local to each column: `k` and `ψ` are not advected
 //! horizontally or vertically (as in GOTM; ROMS advects them).
@@ -65,6 +76,8 @@
 //! - Open-channel flow: bottom stress `u*²` at steady state, `k` in local
 //!   equilibrium with the linear stress to 3 %, the wall length `κz` at the
 //!   first w-point (0.96 at 80 levels).
+//! - Wind against a log-layer drag: the constant-stress layer holds
+//!   `k = u*²/(c_μ⁰)²` and `ν ∂u/∂z = u*²` at every w-point to 1e-10.
 //! - Homogeneous shear turbulence is steady at `Ri_st` (growth rate
 //!   ≈ 10⁻⁵ S, against ±10⁻² S at Ri = 0.2 and 0.3).
 //! - Convection: an unstable column overturns from the minimum turbulence

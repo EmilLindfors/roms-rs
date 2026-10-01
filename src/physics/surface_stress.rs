@@ -10,11 +10,14 @@
 //!   splitter extrapolates `G` to the step average);
 //! - the surface momentum flux `τ/ρ₀` of the implicit vertical diffusion, at
 //!   the middle of the step, `tⁿ + Δt/2`;
-//! - the surface friction velocity `u* = √(|τ|/ρ₀)` of the turbulence
-//!   closure (the GLS surface boundary), at the same time.
+//! - the surface friction velocity `u* = √(|τ|/ρ₀)` handed to the turbulence
+//!   closure, at the same time. [`crate::physics::GlsMixing`] sets only its
+//!   diagnostic surface `k`, `ψ` from it: the wind reaches its turbulence
+//!   through the shear production of the column's momentum flux.
 //!
 //! The depth mean of the 3D velocity is the barotropic mode's, so only `G`
-//! moves it; the column's flux sets the vertical shear. Implementations:
+//! moves it; the column's flux sets the vertical shear, and with it the
+//! closure's shear production. Implementations:
 //! [`AnalyticSurfaceStress`] for a field given as a function, and
 //! [`crate::source::GriddedWindStress`] for a weather model's 10 m wind
 //! ([`crate::source::GriddedAtmosphere2D::split_for_3d`]).
