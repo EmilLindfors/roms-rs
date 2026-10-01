@@ -35,6 +35,11 @@ This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean 
 - **Conservation tests**: Total mass/momentum must be preserved (periodic BCs)
 - **Regression tests**: Any bug fix must include a test that would have caught it
 
+### Note Down Opportunities
+The crate is at an early stage, so experimenting is welcome. While working on any task, watch for opportunities: suboptimal code, better approaches, simplifications, in the numerics, performance (e.g. how parallel code is run), API shape or duplicated paths.
+- **Note them in `TODO.md`**: one checkbox each, under the matching priority section (not a separate list), with a measurement or a concrete pointer (file, function) where you have one.
+- **Report them**: list what you noted in the end-of-task summary.
+
 ## Architecture Overview
 
 See `OUTLINE.md` for the full annotated module tree and layer-by-layer status,

@@ -2906,4 +2906,130 @@ mod tests {
             "ū left the layers' depth mean by {consistency:.3e}"
         );
     }
+
+    /// TODO P4.5 gate: the parallel 3D kernels give the serial result bit for
+    /// bit. A stratified basin over a sloping bed with every 3D term on
+    /// (Coriolis, wind, log-layer bottom drag, Pacanowski–Philander mixing,
+    /// Smagorinsky viscosity of the shear, Akima momentum advection, the
+    /// horizontal Kuzmin limiter), stepped on one thread and on four: every
+    /// field of the state is identical. The kernels write disjoint element
+    /// blocks and reduce only with exact operations
+    /// (`solver::core::blocks`), so the thread count cannot change the
+    /// result.
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn the_3d_step_does_not_depend_on_the_thread_count() {
+        use crate::physics::PacanowskiPhilanderMixing;
+        use crate::solver::rhs::VerticalAdvection;
+        use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+        use crate::vertical::SongHaidvogelStretching;
+
+        let run = || {
+            let (length, width) = (6e3, 3e3);
+            let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, 6, 3));
+            let ops = Arc::new(DGOperators2D::new(2));
+            let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+            let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+                -(15.0 + 60.0 * x / length + 10.0 * y / width)
+            }));
+            let sigma = SigmaGrid::new(8, SongHaidvogelStretching::new(3.0, 0.4, 10.0));
+            let swe = PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(G),
+                Reflective2D::default(),
+            )
+            .with_bathymetry(bathymetry.clone())
+            .with_formulation(SWEFormulation2D::EntropyStable)
+            .with_source(CoriolisSource2D::f_plane(1.2e-4))
+            .build();
+            let forcing = Forcing {
+                surface_stress: [0.2, -0.1],
+                bottom_stress: [0.0, 0.0],
+                surface_buoyancy_flux: 0.0,
+            };
+            let physics = Hydrostatic3D::new(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                Arc::new(sigma.clone()),
+                bathymetry.clone(),
+                Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
+                LinearEOS::default(),
+                PacanowskiPhilanderMixing::new(1e-2, 1e-5, 1e-5, G, RHO0),
+                swe,
+                forcing,
+                G,
+                RHO0,
+            )
+            .with_bottom_drag(BottomDrag3D::log_layer(0.005))
+            .with_smagorinsky_viscosity(0.5)
+            .with_momentum_vertical_advection(VerticalAdvection::Akima)
+            .with_tracer_limiter(TracerLimiter3DConfig {
+                limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                ..TracerLimiter3DConfig::default()
+            });
+            let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+            let eos = LinearEOS::default();
+            let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+            for idx in 0..mesh.n_elements * nn {
+                let (k, i) = (idx / nn, idx % nn);
+                let [x, _] = mesh.reference_to_physical(
+                    ElementIndex::new(k),
+                    ops.nodes_r[i],
+                    ops.nodes_s[i],
+                );
+                let depth = -bathymetry.data[idx];
+                state.eta.data[idx] = 0.05 * (x / length - 0.5);
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    let z = s * depth;
+                    // A pycnocline that tilts along the basin: a front
+                    state.temp[idx * nl + l] =
+                        eos.t0 + 3.0 * ((z + 10.0 + 5.0 * x / length) / 4.0).tanh();
+                    state.salt[idx * nl + l] = eos.s0;
+                }
+            }
+            let mut integrator = ModeSplitIntegrator::new();
+            let dt = 30.0;
+            for n in 0..8 {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+            }
+            state
+        };
+        let on = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("a thread pool")
+                .install(run)
+        };
+        let (serial, parallel) = (on(1), on(4));
+        let speed = max_or_nan(serial.u.iter().zip(&serial.v).map(|(u, v)| u.hypot(*v)));
+        assert!(
+            speed > 1e-3,
+            "the flow is too weak to test: {speed:.3e} m/s"
+        );
+        for (name, a, b) in [
+            ("u", &serial.u, &parallel.u),
+            ("v", &serial.v, &parallel.v),
+            ("w", &serial.w, &parallel.w),
+            ("T", &serial.temp, &parallel.temp),
+            ("S", &serial.salt, &parallel.salt),
+            ("rho", &serial.rho, &parallel.rho),
+            ("Av", &serial.eddy_viscosity, &parallel.eddy_viscosity),
+            ("eta", &serial.eta.data, &parallel.eta.data),
+            ("ubar", &serial.ubar.data, &parallel.ubar.data),
+            ("vbar", &serial.vbar.data, &parallel.vbar.data),
+        ] {
+            let differing = a
+                .iter()
+                .zip(b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            assert_eq!(differing, 0, "{name} differs at {differing} values");
+        }
+    }
 }

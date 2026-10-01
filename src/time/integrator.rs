@@ -757,6 +757,7 @@ pub fn create_integrator_info(integrator: StandardIntegrator) -> BoxedIntegrator
 // Integrable Implementations for Existing Types
 // =============================================================================
 
+use crate::solver::core::blocks::{update_values, update_with};
 use crate::solver::{
     DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, TracerSolution2D, state::Solution3D,
 };
@@ -819,23 +820,15 @@ impl Integrable for Solution3D {
         self.vbar.scale(c);
 
         // Scale 3D baroclinic state
-        for x in &mut self.u {
-            *x *= c;
-        }
-        for x in &mut self.v {
-            *x *= c;
-        }
-        for x in &mut self.w {
-            *x *= c;
-        }
-        for x in &mut self.temp {
-            *x *= c;
-        }
-        for x in &mut self.salt {
-            *x *= c;
-        }
-        for x in &mut self.rho {
-            *x *= c;
+        for field in [
+            &mut self.u,
+            &mut self.v,
+            &mut self.w,
+            &mut self.temp,
+            &mut self.salt,
+            &mut self.rho,
+        ] {
+            update_values(field, |x| *x *= c);
         }
     }
 
@@ -846,24 +839,15 @@ impl Integrable for Solution3D {
         self.vbar.axpy(c, &other.vbar);
 
         // AXPY 3D baroclinic state
-        // Using iterators for now. Optimized SIMD/BLAS kernels should replace this later.
-        for (x, y) in self.u.iter_mut().zip(other.u.iter()) {
-            *x += c * y;
-        }
-        for (x, y) in self.v.iter_mut().zip(other.v.iter()) {
-            *x += c * y;
-        }
-        for (x, y) in self.w.iter_mut().zip(other.w.iter()) {
-            *x += c * y;
-        }
-        for (x, y) in self.temp.iter_mut().zip(other.temp.iter()) {
-            *x += c * y;
-        }
-        for (x, y) in self.salt.iter_mut().zip(other.salt.iter()) {
-            *x += c * y;
-        }
-        for (x, y) in self.rho.iter_mut().zip(other.rho.iter()) {
-            *x += c * y;
+        for (x, y) in [
+            (&mut self.u, &other.u),
+            (&mut self.v, &other.v),
+            (&mut self.w, &other.w),
+            (&mut self.temp, &other.temp),
+            (&mut self.salt, &other.salt),
+            (&mut self.rho, &other.rho),
+        ] {
+            update_with(x, y, |x, y| *x += c * y);
         }
     }
 
@@ -878,15 +862,18 @@ impl Integrable for Solution3D {
         self.eta.copy_from(&other.eta);
         self.ubar.copy_from(&other.ubar);
         self.vbar.copy_from(&other.vbar);
-        self.u.copy_from_slice(&other.u);
-        self.v.copy_from_slice(&other.v);
-        self.w.copy_from_slice(&other.w);
-        self.temp.copy_from_slice(&other.temp);
-        self.salt.copy_from_slice(&other.salt);
-        self.rho.copy_from_slice(&other.rho);
-        self.eddy_viscosity.copy_from_slice(&other.eddy_viscosity);
-        self.eddy_diffusivity
-            .copy_from_slice(&other.eddy_diffusivity);
+        for (x, y) in [
+            (&mut self.u, &other.u),
+            (&mut self.v, &other.v),
+            (&mut self.w, &other.w),
+            (&mut self.temp, &other.temp),
+            (&mut self.salt, &other.salt),
+            (&mut self.rho, &other.rho),
+            (&mut self.eddy_viscosity, &other.eddy_viscosity),
+            (&mut self.eddy_diffusivity, &other.eddy_diffusivity),
+        ] {
+            update_with(x, y, |x, y| *x = y);
+        }
     }
 }
 

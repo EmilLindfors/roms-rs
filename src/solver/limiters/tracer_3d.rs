@@ -8,6 +8,7 @@
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::DGSolution2D;
+use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -129,7 +130,9 @@ pub struct TracerLimiter3DStats {
     pub temperature_average_violations: usize,
     /// Number of salinity averages that were already outside bounds.
     pub salinity_average_violations: usize,
-    /// Domain-integrated temperature inventory correction from enforced averages.
+    /// Domain-integrated temperature inventory correction from enforced
+    /// averages. (Summed per element in an order that depends on the thread
+    /// count: its last bits may differ between runs.)
     pub temperature_inventory_correction: f64,
     /// Domain-integrated salinity inventory correction from enforced averages.
     pub salinity_inventory_correction: f64,
@@ -142,6 +145,23 @@ impl TracerLimiter3DStats {
             || self.limited_salinity_cells > 0
             || self.temperature_inventory_correction.abs() > 0.0
             || self.salinity_inventory_correction.abs() > 0.0
+    }
+
+    /// The sum of two diagnostics.
+    fn merged(self, other: Self) -> Self {
+        Self {
+            limited_temperature_cells: self.limited_temperature_cells
+                + other.limited_temperature_cells,
+            limited_salinity_cells: self.limited_salinity_cells + other.limited_salinity_cells,
+            temperature_average_violations: self.temperature_average_violations
+                + other.temperature_average_violations,
+            salinity_average_violations: self.salinity_average_violations
+                + other.salinity_average_violations,
+            temperature_inventory_correction: self.temperature_inventory_correction
+                + other.temperature_inventory_correction,
+            salinity_inventory_correction: self.salinity_inventory_correction
+                + other.salinity_inventory_correction,
+        }
     }
 
     fn record_average_violation(&mut self, component: TracerComponent) {
@@ -310,63 +330,74 @@ fn apply_horizontal_bounds_field(
     stats: &mut TracerLimiter3DStats,
 ) {
     let d_sigma = sigma.d_sigma();
+    let index = |i: usize, level: usize| i * n_levels + level;
 
-    for k in 0..n_elements {
-        let element = ElementIndex::new(k);
-        let jac = geom.affine_metric(k).det_j;
-        for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
-            let mut weight_sum = 0.0;
-            let mut inventory = 0.0;
-            let mut min_value = f64::INFINITY;
-            let mut max_value = f64::NEG_INFINITY;
+    let block_stats = reduce_blocks(
+        n_elements,
+        [&mut field[..n_elements * n_nodes * n_levels]],
+        || (),
+        |_, k, [field]| {
+            let mut stats = TracerLimiter3DStats::default();
+            let element = ElementIndex::new(k);
+            let jac = geom.affine_metric(k).det_j;
+            for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
+                let mut weight_sum = 0.0;
+                let mut inventory = 0.0;
+                let mut min_value = f64::INFINITY;
+                let mut max_value = f64::NEG_INFINITY;
 
-            for (i, &w) in ops.weights.iter().enumerate().take(n_nodes) {
-                let value = field[index(k, i, level, n_nodes, n_levels)];
-                let weight = w * jac * layer_thickness(eta, bathymetry, element, i, ds);
-                weight_sum += weight;
-                inventory += weight * value;
-                min_value = min_value.min(value);
-                max_value = max_value.max(value);
-            }
-
-            if weight_sum <= MIN_INTEGRAL_WEIGHT {
-                continue;
-            }
-
-            let avg = inventory / weight_sum;
-
-            if avg < bound_min - LIMITER_EPS || avg > bound_max + LIMITER_EPS {
-                stats.record_average_violation(component);
-                let replacement = match average_policy {
-                    TracerAveragePolicy3D::PreserveConservation => avg,
-                    TracerAveragePolicy3D::EnforceBounds => avg.clamp(bound_min, bound_max),
-                };
-
-                for i in 0..n_nodes {
-                    field[index(k, i, level, n_nodes, n_levels)] = replacement;
+                for (i, &w) in ops.weights.iter().enumerate().take(n_nodes) {
+                    let value = field[index(i, level)];
+                    let weight = w * jac * layer_thickness(eta, bathymetry, element, i, ds);
+                    weight_sum += weight;
+                    inventory += weight * value;
+                    min_value = min_value.min(value);
+                    max_value = max_value.max(value);
                 }
 
+                if weight_sum <= MIN_INTEGRAL_WEIGHT {
+                    continue;
+                }
+
+                let avg = inventory / weight_sum;
+
+                if avg < bound_min - LIMITER_EPS || avg > bound_max + LIMITER_EPS {
+                    stats.record_average_violation(component);
+                    let replacement = match average_policy {
+                        TracerAveragePolicy3D::PreserveConservation => avg,
+                        TracerAveragePolicy3D::EnforceBounds => avg.clamp(bound_min, bound_max),
+                    };
+
+                    for i in 0..n_nodes {
+                        field[index(i, level)] = replacement;
+                    }
+
+                    stats.record_limited(component);
+                    stats.add_inventory_correction(component, weight_sum * (replacement - avg));
+                    continue;
+                }
+
+                if min_value >= bound_min - LIMITER_EPS && max_value <= bound_max + LIMITER_EPS {
+                    continue;
+                }
+
+                let theta = compute_theta(avg, min_value, max_value, bound_min, bound_max);
+                if theta >= 1.0 - LIMITER_EPS {
+                    continue;
+                }
+
+                for i in 0..n_nodes {
+                    let idx = index(i, level);
+                    field[idx] = avg + theta * (field[idx] - avg);
+                }
                 stats.record_limited(component);
-                stats.add_inventory_correction(component, weight_sum * (replacement - avg));
-                continue;
             }
-
-            if min_value >= bound_min - LIMITER_EPS && max_value <= bound_max + LIMITER_EPS {
-                continue;
-            }
-
-            let theta = compute_theta(avg, min_value, max_value, bound_min, bound_max);
-            if theta >= 1.0 - LIMITER_EPS {
-                continue;
-            }
-
-            for i in 0..n_nodes {
-                let idx = index(k, i, level, n_nodes, n_levels);
-                field[idx] = avg + theta * (field[idx] - avg);
-            }
-            stats.record_limited(component);
-        }
-    }
+            stats
+        },
+        TracerLimiter3DStats::default,
+        TracerLimiter3DStats::merged,
+    );
+    *stats = stats.merged(block_stats);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -387,66 +418,76 @@ fn apply_vertical_column_bounds_field(
     stats: &mut TracerLimiter3DStats,
 ) {
     let d_sigma = sigma.d_sigma();
+    let index = |i: usize, level: usize| i * n_levels + level;
 
-    for k in 0..n_elements {
-        let element = ElementIndex::new(k);
-        for i in 0..n_nodes {
-            let horizontal_weight = ops.weights[i] * geom.affine_metric(k).det_j;
-            let mut weight_sum = 0.0;
-            let mut inventory = 0.0;
-            let mut min_value = f64::INFINITY;
-            let mut max_value = f64::NEG_INFINITY;
+    let block_stats = reduce_blocks(
+        n_elements,
+        [&mut field[..n_elements * n_nodes * n_levels]],
+        || (),
+        |_, k, [field]| {
+            let mut stats = TracerLimiter3DStats::default();
+            let element = ElementIndex::new(k);
+            for i in 0..n_nodes {
+                let horizontal_weight = ops.weights[i] * geom.affine_metric(k).det_j;
+                let mut weight_sum = 0.0;
+                let mut inventory = 0.0;
+                let mut min_value = f64::INFINITY;
+                let mut max_value = f64::NEG_INFINITY;
 
-            for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
-                let idx = index(k, i, level, n_nodes, n_levels);
-                let value = field[idx];
-                let weight = layer_thickness(eta, bathymetry, element, i, ds);
-                weight_sum += weight;
-                inventory += weight * value;
-                min_value = min_value.min(value);
-                max_value = max_value.max(value);
-            }
-
-            if weight_sum <= MIN_INTEGRAL_WEIGHT {
-                continue;
-            }
-
-            let avg = inventory / weight_sum;
-            if avg < bound_min - LIMITER_EPS || avg > bound_max + LIMITER_EPS {
-                stats.record_average_violation(component);
-                let replacement = match average_policy {
-                    TracerAveragePolicy3D::PreserveConservation => avg,
-                    TracerAveragePolicy3D::EnforceBounds => avg.clamp(bound_min, bound_max),
-                };
-
-                for level in 0..n_levels {
-                    field[index(k, i, level, n_nodes, n_levels)] = replacement;
+                for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
+                    let value = field[index(i, level)];
+                    let weight = layer_thickness(eta, bathymetry, element, i, ds);
+                    weight_sum += weight;
+                    inventory += weight * value;
+                    min_value = min_value.min(value);
+                    max_value = max_value.max(value);
                 }
 
+                if weight_sum <= MIN_INTEGRAL_WEIGHT {
+                    continue;
+                }
+
+                let avg = inventory / weight_sum;
+                if avg < bound_min - LIMITER_EPS || avg > bound_max + LIMITER_EPS {
+                    stats.record_average_violation(component);
+                    let replacement = match average_policy {
+                        TracerAveragePolicy3D::PreserveConservation => avg,
+                        TracerAveragePolicy3D::EnforceBounds => avg.clamp(bound_min, bound_max),
+                    };
+
+                    for level in 0..n_levels {
+                        field[index(i, level)] = replacement;
+                    }
+
+                    stats.record_limited(component);
+                    stats.add_inventory_correction(
+                        component,
+                        horizontal_weight * weight_sum * (replacement - avg),
+                    );
+                    continue;
+                }
+
+                if min_value >= bound_min - LIMITER_EPS && max_value <= bound_max + LIMITER_EPS {
+                    continue;
+                }
+
+                let theta = compute_theta(avg, min_value, max_value, bound_min, bound_max);
+                if theta >= 1.0 - LIMITER_EPS {
+                    continue;
+                }
+
+                for level in 0..n_levels {
+                    let idx = index(i, level);
+                    field[idx] = avg + theta * (field[idx] - avg);
+                }
                 stats.record_limited(component);
-                stats.add_inventory_correction(
-                    component,
-                    horizontal_weight * weight_sum * (replacement - avg),
-                );
-                continue;
             }
-
-            if min_value >= bound_min - LIMITER_EPS && max_value <= bound_max + LIMITER_EPS {
-                continue;
-            }
-
-            let theta = compute_theta(avg, min_value, max_value, bound_min, bound_max);
-            if theta >= 1.0 - LIMITER_EPS {
-                continue;
-            }
-
-            for level in 0..n_levels {
-                let idx = index(k, i, level, n_nodes, n_levels);
-                field[idx] = avg + theta * (field[idx] - avg);
-            }
-            stats.record_limited(component);
-        }
-    }
+            stats
+        },
+        TracerLimiter3DStats::default,
+        TracerLimiter3DStats::merged,
+    );
+    *stats = stats.merged(block_stats);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -465,59 +506,88 @@ fn apply_horizontal_kuzmin_field(
     component: TracerComponent,
     stats: &mut TracerLimiter3DStats,
 ) {
-    let averages = horizontal_layer_averages(
-        field, eta, n_elements, n_nodes, n_levels, ops, geom, bathymetry, sigma,
+    let mut averages = Pooled::take(
+        |a: &Vec<f64>| a.len() == n_elements * n_levels,
+        || vec![f64::NAN; n_elements * n_levels],
     );
+    horizontal_layer_averages(
+        &mut averages,
+        field,
+        eta,
+        n_elements,
+        n_nodes,
+        n_levels,
+        ops,
+        geom,
+        bathymetry,
+        sigma,
+    );
+    let averages: &[f64] = &averages;
+    let index = |i: usize, level: usize| i * n_levels + level;
 
-    for k in 0..n_elements {
-        let element = ElementIndex::new(k);
-        let vertices = mesh.element_vertex_indices(element);
+    let block_stats = reduce_blocks(
+        n_elements,
+        [&mut field[..n_elements * n_nodes * n_levels]],
+        || (),
+        |_, k, [field]| {
+            let mut stats = TracerLimiter3DStats::default();
+            let element = ElementIndex::new(k);
+            let vertices = mesh.element_vertex_indices(element);
 
-        for level in 0..n_levels {
-            let avg = averages[k * n_levels + level];
-            if !avg.is_finite() {
-                continue;
-            }
+            for level in 0..n_levels {
+                let avg = averages[k * n_levels + level];
+                if !avg.is_finite() {
+                    continue;
+                }
 
-            let mut alpha = 1.0_f64;
-            // Every vertex within its own patch's bounds; every other node
-            // (P2 and up) within the union of the element's vertex patches
-            let (mut union_min, mut union_max) = (f64::INFINITY, f64::NEG_INFINITY);
-            for (local_vertex, &global_vertex) in vertices.iter().enumerate() {
-                let (bound_min, bound_max) = vertex_patch_bounds(
-                    global_vertex,
-                    level,
-                    mesh,
-                    &averages,
-                    n_levels,
-                    relaxation,
-                );
-                union_min = union_min.min(bound_min);
-                union_max = union_max.max(bound_max);
-                let node_idx = vertex_to_node_index(local_vertex, ops.n_1d);
-                let value = field[index(k, node_idx, level, n_nodes, n_levels)];
-                alpha = alpha.min(compute_kuzmin_alpha(avg, value, bound_min, bound_max));
-            }
-            for i in 0..n_nodes {
-                let value = field[index(k, i, level, n_nodes, n_levels)];
-                alpha = alpha.min(compute_kuzmin_alpha(avg, value, union_min, union_max));
-            }
+                let mut alpha = 1.0_f64;
+                // Every vertex within its own patch's bounds; every other
+                // node (P2 and up) within the union of the element's vertex
+                // patches
+                let (mut union_min, mut union_max) = (f64::INFINITY, f64::NEG_INFINITY);
+                for (local_vertex, &global_vertex) in vertices.iter().enumerate() {
+                    let (bound_min, bound_max) = vertex_patch_bounds(
+                        global_vertex,
+                        level,
+                        mesh,
+                        averages,
+                        n_levels,
+                        relaxation,
+                    );
+                    union_min = union_min.min(bound_min);
+                    union_max = union_max.max(bound_max);
+                    let node_idx = vertex_to_node_index(local_vertex, ops.n_1d);
+                    let value = field[index(node_idx, level)];
+                    alpha = alpha.min(compute_kuzmin_alpha(avg, value, bound_min, bound_max));
+                }
+                for i in 0..n_nodes {
+                    let value = field[index(i, level)];
+                    alpha = alpha.min(compute_kuzmin_alpha(avg, value, union_min, union_max));
+                }
 
-            if alpha >= 1.0 - LIMITER_EPS {
-                continue;
-            }
+                if alpha >= 1.0 - LIMITER_EPS {
+                    continue;
+                }
 
-            for i in 0..n_nodes {
-                let idx = index(k, i, level, n_nodes, n_levels);
-                field[idx] = avg + alpha * (field[idx] - avg);
+                for i in 0..n_nodes {
+                    let idx = index(i, level);
+                    field[idx] = avg + alpha * (field[idx] - avg);
+                }
+                stats.record_limited(component);
             }
-            stats.record_limited(component);
-        }
-    }
+            stats
+        },
+        TracerLimiter3DStats::default,
+        TracerLimiter3DStats::merged,
+    );
+    *stats = stats.merged(block_stats);
 }
 
+/// The inventory-weighted mean of every element's layers into `averages`
+/// (`[element][level]`; NaN for a layer without water).
 #[allow(clippy::too_many_arguments)]
 fn horizontal_layer_averages(
+    averages: &mut [f64],
     field: &[f64],
     eta: &DGSolution2D,
     n_elements: usize,
@@ -527,30 +597,33 @@ fn horizontal_layer_averages(
     geom: &GeometricFactors2D,
     bathymetry: &Bathymetry2D,
     sigma: &SigmaGrid,
-) -> Vec<f64> {
+) {
     let d_sigma = sigma.d_sigma();
-    let mut averages = vec![f64::NAN; n_elements * n_levels];
+    for_each_block(
+        n_elements,
+        [averages],
+        || (),
+        |_, k, [averages]| {
+            let element = ElementIndex::new(k);
+            let jac = geom.affine_metric(k).det_j;
+            for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
+                let mut weight_sum = 0.0;
+                let mut inventory = 0.0;
 
-    for k in 0..n_elements {
-        let element = ElementIndex::new(k);
-        let jac = geom.affine_metric(k).det_j;
-        for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
-            let mut weight_sum = 0.0;
-            let mut inventory = 0.0;
+                for (i, &w) in ops.weights.iter().enumerate().take(n_nodes) {
+                    let weight = w * jac * layer_thickness(eta, bathymetry, element, i, ds);
+                    weight_sum += weight;
+                    inventory += weight * field[index(k, i, level, n_nodes, n_levels)];
+                }
 
-            for (i, &w) in ops.weights.iter().enumerate().take(n_nodes) {
-                let weight = w * jac * layer_thickness(eta, bathymetry, element, i, ds);
-                weight_sum += weight;
-                inventory += weight * field[index(k, i, level, n_nodes, n_levels)];
+                averages[level] = if weight_sum > MIN_INTEGRAL_WEIGHT {
+                    inventory / weight_sum
+                } else {
+                    f64::NAN
+                };
             }
-
-            if weight_sum > MIN_INTEGRAL_WEIGHT {
-                averages[k * n_levels + level] = inventory / weight_sum;
-            }
-        }
-    }
-
-    averages
+        },
+    );
 }
 
 fn vertex_patch_bounds(

@@ -12,6 +12,7 @@
 use crate::mesh::data::Bathymetry2D;
 use crate::physics::vertical_mixing::{Column, Forcing, VerticalMixing};
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
+use crate::solver::core::blocks::{Pooled, for_each_block};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -44,135 +45,159 @@ pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     min_column_depth: f64,
     bottom_drag: Option<&[f64]>,
 ) {
-    let n_levels = state.n_levels;
-    let mut a = vec![0.0; n_levels];
-    let mut b = vec![0.0; n_levels];
-    let mut c = vec![0.0; n_levels];
-    let mut d = vec![0.0; n_levels]; // RHS
-    let mut x = vec![0.0; n_levels]; // Solution
-    let mut c_prime = vec![0.0; n_levels];
-    let mut d_prime = vec![0.0; n_levels];
+    let (nn, nl) = (state.n_nodes, state.n_levels);
+    let Solution3D {
+        eta,
+        u,
+        v,
+        temp,
+        salt,
+        rho,
+        eddy_viscosity,
+        eddy_diffusivity,
+        ..
+    } = state;
+    let (eta, rho): (&[f64], &[f64]) = (&eta.data, rho);
+    let n = state.n_elements * nn * nl;
+    for_each_block(
+        state.n_elements,
+        [
+            &mut u[..n],
+            &mut v[..n],
+            &mut temp[..n],
+            &mut salt[..n],
+            &mut eddy_viscosity[..n],
+            &mut eddy_diffusivity[..n],
+        ],
+        || {
+            Pooled::take(
+                |s: &ColumnScratch| s.z_r.len() == nl,
+                || ColumnScratch::new(nl),
+            )
+        },
+        |scratch, k, [u, v, temp, salt, eddy_viscosity, eddy_diffusivity]| {
+            let ColumnScratch {
+                a,
+                b,
+                c,
+                d,
+                x,
+                c_prime,
+                d_prime,
+                z_r,
+                z_w,
+                dz,
+                av,
+                kt,
+            } = &mut **scratch;
+            for i in 0..nn {
+                let idx = k * nn + i;
+                // Still-water depth h = -B (bathymetry stores bed elevation B,
+                // negative under water). The sigma routines form the total
+                // column as eta + h, so eta + h = eta - B = water_depth,
+                // matching the PGF/advection paths.
+                let h = -bathymetry.get(ElementIndex::new(k), i);
+                if eta[idx] + h < min_column_depth {
+                    continue;
+                }
+                let (local, column) = (i * nl..(i + 1) * nl, idx * nl..(idx + 1) * nl);
 
-    let mut z_r = vec![0.0; n_levels];
-    let mut z_w = vec![0.0; n_levels + 1];
-    let mut dz = vec![0.0; n_levels];
+                // 1. Prepare Column data
+                sigma.z_at_levels_into(eta[idx], h, z_r);
+                sigma.z_at_faces_into(eta[idx], h, z_w);
+                sigma.layer_thicknesses_into(eta[idx], h, dz);
 
-    for k in 0..state.n_elements {
-        for i in 0..state.n_nodes {
-            let elem_idx = ElementIndex::new(k);
+                // 2. Compute mixing coefficients
+                mixing.compute_mixing_into(
+                    &Column {
+                        z_r,
+                        z_w,
+                        u: &u[local.clone()],
+                        v: &v[local.clone()],
+                        rho: &rho[column],
+                    },
+                    forcing,
+                    av,
+                    kt,
+                );
 
-            // 1. Prepare Column data
-            let u = state.u_column(elem_idx, i);
-            let v = state.v_column(elem_idx, i);
-            let rho = state.rho_column(elem_idx, i);
+                // Store diagnostics
+                eddy_viscosity[local.clone()].copy_from_slice(&av[0..nl]);
+                eddy_diffusivity[local.clone()].copy_from_slice(&kt[0..nl]);
 
-            let eta = state.eta.get(k, i);
-            // Still-water depth h = -B (bathymetry stores bed elevation B, negative
-            // under water). The sigma routines form the total column as eta + h, so
-            // eta + h = eta - B = water_depth, matching the PGF/advection paths.
-            let h = -bathymetry.get(elem_idx, i);
-            if eta + h < min_column_depth {
-                continue;
+                // 3. Solve diffusion: u, v with the stresses (kinematic) and
+                // the drag, T with the surface buoyancy flux, S without
+                let drag = bottom_drag.map_or(0.0, |rate| rate[idx]);
+                let [tau_sx, tau_sy] = forcing.surface_stress;
+                let [tau_bx, tau_by] = forcing.bottom_stress;
+                for (phi, nu, flux_top, flux_bot, drag) in [
+                    (
+                        &mut u[local.clone()],
+                        &*av,
+                        tau_sx / rho0,
+                        tau_bx / rho0,
+                        drag,
+                    ),
+                    (
+                        &mut v[local.clone()],
+                        &*av,
+                        tau_sy / rho0,
+                        tau_by / rho0,
+                        drag,
+                    ),
+                    (
+                        &mut temp[local.clone()],
+                        &*kt,
+                        forcing.surface_buoyancy_flux,
+                        0.0,
+                        0.0,
+                    ),
+                    (&mut salt[local], &*kt, 0.0, 0.0, 0.0),
+                ] {
+                    solve_diffusion_column(
+                        phi, nu, dz, dt, flux_top, flux_bot, drag, a, b, c, d, x, c_prime, d_prime,
+                    );
+                }
             }
+        },
+    );
+}
 
-            sigma.z_at_levels_into(eta, h, &mut z_r);
-            sigma.z_at_faces_into(eta, h, &mut z_w);
-            sigma.layer_thicknesses_into(eta, h, &mut dz);
+/// One column's buffers of [`apply_vertical_diffusion`].
+struct ColumnScratch {
+    a: Vec<f64>,
+    b: Vec<f64>,
+    c: Vec<f64>,
+    /// Right-hand side
+    d: Vec<f64>,
+    /// Solution
+    x: Vec<f64>,
+    c_prime: Vec<f64>,
+    d_prime: Vec<f64>,
+    z_r: Vec<f64>,
+    z_w: Vec<f64>,
+    dz: Vec<f64>,
+    /// Eddy viscosity and diffusivity at the w-points
+    av: Vec<f64>,
+    kt: Vec<f64>,
+}
 
-            let column = Column {
-                z_r: &z_r,
-                z_w: &z_w,
-                u,
-                v,
-                rho,
-            };
-
-            // 2. Compute mixing coefficients
-            let (av, kt) = mixing.compute_mixing(&column, forcing);
-            drop(column);
-
-            // Store diagnostics
-            state
-                .eddy_viscosity_column_mut(elem_idx, i)
-                .copy_from_slice(&av[0..n_levels]);
-            state
-                .eddy_diffusivity_column_mut(elem_idx, i)
-                .copy_from_slice(&kt[0..n_levels]);
-
-            // 3. Solve diffusion
-            let drag = bottom_drag.map_or(0.0, |rate| rate[k * state.n_nodes + i]);
-
-            // U-momentum
-            solve_diffusion_column(
-                state.u_column_mut(elem_idx, i),
-                &av,
-                &dz,
-                dt,
-                forcing.surface_stress[0] / rho0, // kinematic
-                forcing.bottom_stress[0] / rho0,
-                drag,
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut x,
-                &mut c_prime,
-                &mut d_prime,
-            );
-
-            // V-momentum
-            solve_diffusion_column(
-                state.v_column_mut(elem_idx, i),
-                &av,
-                &dz,
-                dt,
-                forcing.surface_stress[1] / rho0,
-                forcing.bottom_stress[1] / rho0,
-                drag,
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut x,
-                &mut c_prime,
-                &mut d_prime,
-            );
-
-            // Temp
-            solve_diffusion_column(
-                state.temp_column_mut(elem_idx, i),
-                &kt,
-                &dz,
-                dt,
-                forcing.surface_buoyancy_flux,
-                0.0,
-                0.0,
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut x,
-                &mut c_prime,
-                &mut d_prime,
-            );
-
-            // Salt
-            solve_diffusion_column(
-                state.salt_column_mut(elem_idx, i),
-                &kt,
-                &dz,
-                dt,
-                0.0,
-                0.0,
-                0.0,
-                &mut a,
-                &mut b,
-                &mut c,
-                &mut d,
-                &mut x,
-                &mut c_prime,
-                &mut d_prime,
-            );
+impl ColumnScratch {
+    fn new(n_levels: usize) -> Self {
+        let levels = || vec![0.0; n_levels];
+        Self {
+            a: levels(),
+            b: levels(),
+            c: levels(),
+            d: levels(),
+            x: levels(),
+            c_prime: levels(),
+            d_prime: levels(),
+            z_r: levels(),
+            z_w: vec![0.0; n_levels + 1],
+            dz: levels(),
+            av: vec![0.0; n_levels + 1],
+            kt: vec![0.0; n_levels + 1],
         }
     }
 }

@@ -9,6 +9,7 @@
 
 use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
+use crate::solver::core::blocks::for_each_block;
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
 use crate::types::ElementIndex;
@@ -30,36 +31,32 @@ pub fn apply_coriolis_3d(
     ops: &DGOperators2D,
     coriolis: &CoriolisSource2D,
 ) {
-    let n_nodes = ops.n_nodes;
-    let n_levels = state.n_levels;
-
-    // Iterate over elements
-    for k in ElementIndex::iter(mesh.n_elements) {
-        // Iterate over nodes
-        for i in 0..n_nodes {
-            // Get y-coordinate
-            let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
-            let [_x, y] = mesh.reference_to_physical(k, r, s);
-
-            let f = coriolis.f_at(y);
-
-            // Get columns (read-only from state)
-            let u_col = state.u_column(k, i);
-            let v_col = state.v_column(k, i);
-
-            // Get columns (mutable from rhs)
-            // We access fields directly to allow split mutable borrows
-            let idx = (k.as_usize() * n_nodes + i) * n_levels;
-            let rhs_u_col = &mut rhs.u[idx..idx + n_levels];
-            let rhs_v_col = &mut rhs.v[idx..idx + n_levels];
-
-            // Apply tendency: du = f*v, dv = -f*u
-            for l in 0..n_levels {
-                rhs_u_col[l] += f * v_col[l];
-                rhs_v_col[l] -= f * u_col[l];
+    let (n_nodes, n_levels) = (ops.n_nodes, state.n_levels);
+    let n = mesh.n_elements * n_nodes * n_levels;
+    for_each_block(
+        mesh.n_elements,
+        [&mut rhs.u[..n], &mut rhs.v[..n]],
+        || (),
+        |_, k, [rhs_u, rhs_v]| {
+            let k = ElementIndex::new(k);
+            for i in 0..n_nodes {
+                let (r, s) = (ops.nodes_r[i], ops.nodes_s[i]);
+                let [_x, y] = mesh.reference_to_physical(k, r, s);
+                let f = coriolis.f_at(y);
+                let (u_col, v_col) = (state.u_column(k, i), state.v_column(k, i));
+                let column = i * n_levels..(i + 1) * n_levels;
+                // du/dt = f v, dv/dt = −f u
+                for ((du, dv), (&u, &v)) in rhs_u[column.clone()]
+                    .iter_mut()
+                    .zip(&mut rhs_v[column])
+                    .zip(u_col.iter().zip(v_col))
+                {
+                    *du += f * v;
+                    *dv -= f * u;
+                }
             }
-        }
-    }
+        },
+    );
 }
 
 #[cfg(test)]

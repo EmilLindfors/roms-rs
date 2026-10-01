@@ -60,15 +60,16 @@ use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
 use crate::physics::vertical_diffusion::apply_vertical_diffusion;
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
+use crate::solver::core::blocks::{for_each_block, reduce_blocks};
 use crate::solver::rhs::{
     BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D, HorizontalViscosity3D,
-    LayerTransport, Rhs3DConfig, TracerBoundaryCondition3D, TransportScratch, VerticalAdvection,
-    ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
-    apply_momentum_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
-    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
+    LayerTransport, Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
+    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
+    compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
+    largest_horizontal_viscosity_3d,
 };
+use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
-use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
 use crate::source::CoriolisSource2D;
 use crate::time::{Integrable, ModeSplitPhysics};
@@ -126,9 +127,8 @@ where
     pub nesting: Option<Nesting3D>,
     /// Warns once about stratified open boundaries without nesting.
     open_boundary_check: Once,
-    /// Layer transports (and their Ω) of the last 3D stage, and the
-    /// transport kernels' buffers.
-    transport_scratch: Mutex<(LayerTransport, TransportScratch)>,
+    /// Layer transports (and their Ω) of the last 3D stage.
+    transport_scratch: Mutex<LayerTransport>,
     /// Buffers of the slow forcing (allocated on the first step).
     slow_forcing_scratch: Mutex<Option<SlowForcingScratch>>,
     /// `state` with the velocity of thin columns zeroed, for the momentum
@@ -160,10 +160,8 @@ where
         rho0: f64,
     ) -> Self {
         geom.assert_affine("Hydrostatic3D (the 3D horizontal kernels)");
-        let transport_scratch = Mutex::new((
-            LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels()),
-            TransportScratch::new(&ops, sigma.n_levels()),
-        ));
+        let transport_scratch =
+            Mutex::new(LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels()));
         // The 3D walls are the 2D boundary condition's
         let boundaries = Boundaries3D::matching(&mesh, &swe_physics.bc);
         Self {
@@ -528,7 +526,7 @@ where
             .transport_scratch
             .lock()
             .expect("Failed to lock transport_scratch");
-        let (transport, scratch) = &mut *guard;
+        let transport = &mut *guard;
         self.open_boundary_check
             .call_once(|| self.warn_if_stratified_open_boundaries(state));
         let columns = self
@@ -556,7 +554,7 @@ where
                 exterior,
                 ..self.rhs_config()
             };
-            compute_transport_rhs_3d(rhs, state, transport, &config, scratch);
+            compute_transport_rhs_3d(rhs, state, transport, &config);
         });
         if let Some(columns) = &columns {
             let thin = |idx| self.is_thin(state, idx);
@@ -613,7 +611,6 @@ where
         self.transport_scratch
             .lock()
             .expect("Failed to lock transport_scratch")
-            .0
             .surface_residual
     }
 
@@ -654,43 +651,47 @@ where
         // We want to skip that.
 
         // Let's iterate elements.
-        let mut min_dt = f64::INFINITY;
+        let mut min_dt = reduce_blocks::<f64, _, _, 0>(
+            self.mesh.n_elements,
+            [],
+            || (),
+            |_, k, []| {
+                let j_inv = self.geom.affine_metric(k).det_j_inv;
+                // length scale h ~ 1/sqrt(J_inv) ?
+                // For parallelogram: Area = J. h ~ sqrt(Area).
+                let h_len = 1.0 / j_inv.sqrt(); // Approx element size
 
-        for k in 0..self.mesh.n_elements {
-            let j_inv = self.geom.affine_metric(k).det_j_inv;
-            // length scale h ~ 1/sqrt(J_inv) ?
-            // For parallelogram: Area = J. h ~ sqrt(Area).
-            let h_len = 1.0 / j_inv.sqrt(); // Approx element size
-
-            // Max velocity in column
-            let mut max_vel = 0.0;
-            let el = crate::types::ElementIndex::new(k);
-            for i in 0..state.n_nodes {
-                // Thin films are the 2D module's (and its own CFL's) business
-                if self.is_thin(state, k * state.n_nodes + i) {
-                    continue;
-                }
-                for l in 0..state.n_levels {
-                    let u = state.u_column(el, i)[l];
-                    let v = state.v_column(el, i)[l];
-                    let vel = (u * u + v * v).sqrt();
-                    if vel > max_vel {
-                        max_vel = vel;
+                // Max velocity in column
+                let mut max_vel = 0.0;
+                let el = crate::types::ElementIndex::new(k);
+                for i in 0..state.n_nodes {
+                    // Thin films are the 2D module's (and its own CFL's) business
+                    if self.is_thin(state, k * state.n_nodes + i) {
+                        continue;
+                    }
+                    for l in 0..state.n_levels {
+                        let u = state.u_column(el, i)[l];
+                        let v = state.v_column(el, i)[l];
+                        let vel = (u * u + v * v).sqrt();
+                        if vel > max_vel {
+                            max_vel = vel;
+                        }
                     }
                 }
-            }
 
-            // Internal wave speed approximation: c ~ 2.0 m/s (typical)
-            let c_internal = 2.0;
-            let wave_speed = max_vel + c_internal;
+                // Internal wave speed approximation: c ~ 2.0 m/s (typical)
+                let c_internal = 2.0;
+                let wave_speed = max_vel + c_internal;
 
-            if wave_speed > 1e-6 {
-                let dt_loc = cfl * h_len / wave_speed / (self.ops.order as f64 + 1.0).powi(2);
-                if dt_loc < min_dt {
-                    min_dt = dt_loc;
+                if wave_speed > 1e-6 {
+                    cfl * h_len / wave_speed / (self.ops.order as f64 + 1.0).powi(2)
+                } else {
+                    f64::INFINITY
                 }
-            }
-        }
+            },
+            || f64::INFINITY,
+            f64::min,
+        );
 
         // The horizontal viscosity, explicit in the SSP-RK3 stages: BR1
         // couples an element to its face neighbours' gradients, so each
@@ -753,7 +754,7 @@ where
             .transport_scratch
             .lock()
             .expect("Failed to lock transport_scratch");
-        let (transport, _) = &mut *guard;
+        let transport = &mut *guard;
         self.with_thin_columns_at_rest(state, |state| {
             transport.compute(
                 state,
@@ -834,7 +835,7 @@ where
             .transport_scratch
             .lock()
             .expect("Failed to lock transport_scratch");
-        let (transport, transport_scratch) = &mut *transport_guard;
+        let transport = &mut *transport_guard;
         let SlowForcingScratch {
             advection_u,
             advection_v,
@@ -842,7 +843,6 @@ where
             bar_rhs,
             bar_transport,
             bar_sigma,
-            bar_scratch,
         } = scratch;
 
         self.with_thin_columns_at_rest(state, |state| {
@@ -872,7 +872,6 @@ where
                 &self.boundaries,
                 None,
                 self.momentum_vertical_advection,
-                transport_scratch,
             );
 
             // A(ū) + D·R_Cor(ū): the mean flow as one layer
@@ -914,7 +913,6 @@ where
                 &self.boundaries,
                 None,
                 self.momentum_vertical_advection,
-                bar_scratch,
             );
         });
 
@@ -924,39 +922,45 @@ where
         let stress_y = (tau_sy - tau_by) / self.rho0;
 
         g.data[SWE_VAR_H].fill(0.0);
-        for k in 0..ne {
-            let bed = self.bathymetry.element(ElementIndex::new(k));
-            for (i, &b) in bed.iter().enumerate() {
-                let idx = k * nn + i;
-                let depth = state.eta.data[idx] - b;
-                // Thin columns: their depth mean is the 2D module's alone
-                if depth < self.min_column_depth {
-                    g.data[SWE_VAR_HU][idx] = 0.0;
-                    g.data[SWE_VAR_HV][idx] = 0.0;
-                    continue;
-                }
-                let columns = idx * nl..(idx + 1) * nl;
-                let mean_u = self.sigma.depth_average(&rhs.u[columns.clone()]);
-                let mean_v = self.sigma.depth_average(&rhs.v[columns.clone()]);
-                let advection_x: f64 = advection_u[columns.clone()].iter().sum();
-                let advection_y: f64 = advection_v[columns].iter().sum();
-                // The shear part of the bottom drag; the pass applies −r·ū
-                let (drag_x, drag_y) = match &self.bottom_drag {
-                    Some(drag) => {
-                        let r = self.drag_rate(drag, state, idx);
-                        (
-                            r * (state.u[idx * nl] - state.ubar.data[idx]),
-                            r * (state.v[idx * nl] - state.vbar.data[idx]),
-                        )
+        let [_, g_hu, g_hv] = &mut g.data;
+        let (advection_u, advection_v, bar_rhs): (&[f64], &[f64], &Solution3D) =
+            (advection_u, advection_v, bar_rhs);
+        for_each_block(
+            ne,
+            [&mut g_hu[..ne * nn], &mut g_hv[..ne * nn]],
+            || (),
+            |_, k, [g_hu, g_hv]| {
+                let bed = self.bathymetry.element(ElementIndex::new(k));
+                for (i, &b) in bed.iter().enumerate() {
+                    let idx = k * nn + i;
+                    let depth = state.eta.data[idx] - b;
+                    // Thin columns: their depth mean is the 2D module's alone
+                    if depth < self.min_column_depth {
+                        g_hu[i] = 0.0;
+                        g_hv[i] = 0.0;
+                        continue;
                     }
-                    None => (0.0, 0.0),
-                };
-                g.data[SWE_VAR_HU][idx] =
-                    depth * mean_u + advection_x - bar_rhs.u[idx] + stress_x - drag_x;
-                g.data[SWE_VAR_HV][idx] =
-                    depth * mean_v + advection_y - bar_rhs.v[idx] + stress_y - drag_y;
-            }
-        }
+                    let columns = idx * nl..(idx + 1) * nl;
+                    let mean_u = self.sigma.depth_average(&rhs.u[columns.clone()]);
+                    let mean_v = self.sigma.depth_average(&rhs.v[columns.clone()]);
+                    let advection_x: f64 = advection_u[columns.clone()].iter().sum();
+                    let advection_y: f64 = advection_v[columns].iter().sum();
+                    // The shear part of the bottom drag; the pass applies −r·ū
+                    let (drag_x, drag_y) = match &self.bottom_drag {
+                        Some(drag) => {
+                            let r = self.drag_rate(drag, state, idx);
+                            (
+                                r * (state.u[idx * nl] - state.ubar.data[idx]),
+                                r * (state.v[idx * nl] - state.vbar.data[idx]),
+                            )
+                        }
+                        None => (0.0, 0.0),
+                    };
+                    g_hu[i] = depth * mean_u + advection_x - bar_rhs.u[idx] + stress_x - drag_x;
+                    g_hv[i] = depth * mean_v + advection_y - bar_rhs.v[idx] + stress_y - drag_y;
+                }
+            },
+        );
     }
 
     /// `r = C_d|u_b|` of every column from the bottom-layer velocity (the
@@ -1012,7 +1016,6 @@ struct SlowForcingScratch {
     bar_rhs: Solution3D,
     bar_transport: LayerTransport,
     bar_sigma: SigmaGrid,
-    bar_scratch: TransportScratch,
 }
 
 impl SlowForcingScratch {
@@ -1025,7 +1028,6 @@ impl SlowForcingScratch {
             bar_rhs: Solution3D::new(n_elements, nn, 1),
             bar_transport: LayerTransport::new(n_elements, ops, 1),
             bar_sigma: SigmaGrid::uniform(1),
-            bar_scratch: TransportScratch::new(ops, 1),
         }
     }
 }
