@@ -34,11 +34,19 @@
 //! Faeces and feed settle on the bed; the report gives the larvae's depths,
 //! spread and swimming, and where the rest landed.
 //!
+//! `wind` (Pa, default 0) blows along the channel: through the columns'
+//! surface stress in 3D, as a body force `τ/ρ₀` in 2D. `waves` (m, default
+//! off) adds breaking waves to GLS (`GlsMixing::with_wave_breaking`, Craig &
+//! Banner) with that surface roughness, a wave height's (Terray et al.:
+//! `z₀ ≈ 0.6 H_s`); `closure` picks the GLS model (`k-epsilon`, the
+//! default, `k-omega` or `generic`; with waves k-ω or the generic model,
+//! whose wave-affected layer metre layers resolve).
+//!
 //! ```bash
 //! cargo run --release --no-default-features --features parallel,simd \
 //!     --example farm_3d -- [hours=3] [order=2] [levels=16] [dx=60] [nu=1] [cs=0.2] \
 //!     [particles=0] [release=2] [particle_seconds=60] [kh=0.1] \
-//!     [lice=ladim] [start=2025-06-15T00:00:00Z]
+//!     [lice=ladim] [start=2025-06-15T00:00:00Z] [wind=0] [waves=0] [closure=k-epsilon]
 //! ```
 
 use std::collections::HashMap;
@@ -88,6 +96,20 @@ const RAMP: f64 = 3_600.0;
 /// Bed roughness of the log-layer drag (m) and its lower `C_d` bound
 const Z0: f64 = 0.005;
 const CD_MIN: f64 = 2.5e-3;
+
+/// A uniform wind stress along the channel as a body force in 2D,
+/// `∂(hu)/∂t = τ/ρ₀`.
+struct WindForce(f64);
+
+impl SourceTerm2D for WindForce {
+    fn evaluate(&self, _ctx: &SourceContext2D) -> SWEState2D {
+        SWEState2D::new(0.0, self.0 / RHO0, 0.0)
+    }
+
+    fn name(&self) -> &'static str {
+        "wind_force"
+    }
+}
 
 /// The tidal surface slope as a depth-uniform body force along the
 /// channel, `∂(hu)/∂t = h·a(t)`, `a = U ω r(t) cos ωt` with a smooth ramp
@@ -142,6 +164,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "passive" => None,
         other => return Err(format!("lice={other}: ladim, johnsen or passive").into()),
     };
+    let wind: f64 = get("wind", 0.0)?;
+    let waves: f64 = get("waves", 0.0)?;
+    let closure = match args.get("closure").map_or("k-epsilon", String::as_str) {
+        "k-epsilon" => GlsMixing::k_epsilon(),
+        "k-omega" => GlsMixing::k_omega(),
+        "generic" => GlsMixing::generic(),
+        other => return Err(format!("closure={other}: k-epsilon, k-omega or generic").into()),
+    };
+    let mixing = if waves > 0.0 {
+        closure
+            .with_roughness(waves, Z0)
+            .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING)
+    } else {
+        closure.with_roughness(GlsMixing::DEFAULT_ROUGHNESS, Z0)
+    };
     let t_end = hours * 3600.0;
 
     let (nx, ny) = ((LX / dx).round() as usize, (LY / dx).round() as usize);
@@ -157,6 +194,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "Channel {:.0} × {:.0} m, {} quads of {dx:.0} m (P{order}), {n_levels} σ-levels, {DEPTH} m deep",
         LX, LY, mesh.n_elements
+    );
+    println!(
+        "GLS {:?}, {}; wind {wind} Pa along the channel",
+        mixing.parameters(),
+        if waves > 0.0 {
+            format!("breaking waves, z₀ = {waves} m")
+        } else {
+            "log-layer surface".into()
+        }
     );
     println!(
         "Cages: {} × R {RADIUS} m, nets {NET_DEPTH} m deep, C_d·a = {:.4} /m",
@@ -178,6 +224,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_source(TidalForce)
         .with_source(CoriolisSource2D::f_plane(1.2e-4))
         .with_viscosity(HorizontalViscosity2D::constant(nu));
+        // The standalone 2D runs (with friction) take the wind as a body
+        // force; in 3D it reaches the depth mean through the columns
+        let builder = if with_friction && wind != 0.0 {
+            builder.with_source(WindForce(wind))
+        } else {
+            builder
+        };
         let builder = if with_friction {
             // The 3D log-layer drag of a well-mixed column: C_d at the
             // bottom-layer centre, bounded below as in BottomDrag3D
@@ -207,10 +260,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bathymetry.clone(),
             Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
             eos,
-            GlsMixing::k_epsilon().with_roughness(0.02, Z0),
+            mixing.clone(),
             swe(false, false),
             Forcing {
-                surface_stress: [0.0, 0.0],
+                surface_stress: [wind, 0.0],
                 bottom_stress: [0.0, 0.0],
                 surface_buoyancy_flux: 0.0,
             },

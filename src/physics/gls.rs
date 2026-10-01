@@ -64,6 +64,39 @@
 //! Dirichlet surface value, or wave injection, would put `u*` into the
 //! interior).
 //!
+//! The surface roughness is constant, or Charnock's `z₀ₛ = α u*²/g` above
+//! it ([`GlsMixing::with_charnock_roughness`]).
+//!
+//! ## Breaking waves
+//!
+//! [`GlsMixing::with_wave_breaking`] replaces the surface log layer by
+//! Craig & Banner's (1994) injection of `k`, the flux `c_w u*³`. Without
+//! shear, diffusion of the injected `k` balances dissipation in a layer
+//! `k = K s^(−a)`, `l = L s` (`s` the depth plus `z₀ₛ`), with `a`, `L` fixed
+//! by the model's constants ([`GlsMixing::shear_free_layer`]; Umlauf &
+//! Burchard 2003) and `K` by the flux. At the top layer's centre `s_c`
+//! (GOTM's injection condition, evaluated there as the log layer's is):
+//! - the flux of `k` is that layer's, `c_w u*³ (z₀ₛ/s_c)^(3a/2)`;
+//! - the flux of `ψ` is that layer's, `−(n − a m) (c_μ⁰)^(p+1) L^(n+1)/σ_ψ
+//!   k^(m+½) s_c^n` with `k` from the top interior w-point along the power
+//!   law, blended with the log layer's by how deep `s_c` lies in the
+//!   wave-affected layer: weight `1 − ln(s_c/z₀ₛ)/ln(s*/z₀ₛ)`, where `s*`
+//!   is the depth at which the shear-free `k` falls to the log layer's
+//!   `u*²/(c_μ⁰)²` (≈ 2–4 z₀ₛ). With a roughness well below half the top
+//!   layer (Charnock's at metre layers) the wave-affected layer is not
+//!   resolved and the column is the log layer's; with a wave height's
+//!   (Terray et al. 1996: `z₀ₛ ≈ 0.6 H_s`) the top layers hold the
+//!   injected `k`. Imposing the shear-free condition at any depth instead
+//!   shrank the length in the log layer below and cut the near-surface
+//!   mixing by 10–100× at metre layers; a weight from the local `P/ε`
+//!   (Burchard 2001's interpolation of `σ_ψ`) fed back on itself.
+//! - The surface w-point carries the layer's `k = K z₀ₛ^(−a)`, `l = L z₀ₛ`.
+//!
+//! k-ε's shear-free layer is thin (`a` ≈ 5, `L` ≈ 0.09 against κ ≈ 0.4):
+//! it needs centimetre layers, and at metre layers it lowers the
+//! near-surface diffusivity. Use k-ω (`a` 2.5, `L` 0.24) or the generic
+//! model (2.0, 0.19, designed for it) with waves.
+//!
 //! The model is local to each column: `k` and `ψ` are not advected
 //! horizontally or vertically (as in GOTM; ROMS advects them).
 //!
@@ -82,6 +115,12 @@
 //!   ≈ 10⁻⁵ S, against ±10⁻² S at Ri = 0.2 and 0.3).
 //! - Convection: an unstable column overturns from the minimum turbulence
 //!   within hours, with no convective adjustment.
+//! - Breaking waves over still water reach the shear-free layer (`k` to
+//!   10 / 7 % at 0.1 m layers with k-ω / generic, first order in the layer
+//!   thickness; k-ε to 3 % at 5 mm); under wind with `z₀ₛ` = 0.5 m they
+//!   raise `k` 4× and the diffusivity 2–3× at the top interior w-point,
+//!   leave mid-depth and the Kato–Phillips entrainment as they were, and
+//!   with Charnock's roughness change nothing at 0.5 m layers.
 
 use crate::physics::vertical_mixing::{Column, Forcing, Turbulence, VerticalMixing};
 use crate::solver::algorithms::tridiagonal::solve_tridiagonal;
@@ -274,6 +313,34 @@ impl Stability {
     }
 }
 
+/// Injection of TKE by breaking surface waves (Craig & Banner 1994), with
+/// the shear-free layer it makes in a GLS model
+/// ([`GlsMixing::with_wave_breaking`], [`GlsMixing::shear_free_layer`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaveBreaking {
+    /// `c_w` of the surface flux of `k`, `c_w u*³`.
+    pub c_w: f64,
+    /// Decay rate `a` of `k ∝ (d + z₀ₛ)^(−a)` below the surface.
+    pub decay: f64,
+    /// Slope `L` of the length `l = L (d + z₀ₛ)`.
+    pub slope: f64,
+    /// Depth of the wave-affected layer over the roughness, `s*/z₀ₛ`: where
+    /// the shear-free layer's `k` falls to the log layer's `u*²/(c_μ⁰)²`.
+    pub extent: f64,
+}
+
+impl WaveBreaking {
+    /// How far a point at `s/z₀ₛ` is inside the wave-affected layer, on a
+    /// log scale: 1 at the surface (`s = z₀ₛ`), 0 at its depth `s*` and below.
+    #[inline]
+    pub fn share_above(&self, s_over_z0: f64) -> f64 {
+        if self.extent <= 1.0 {
+            return 0.0;
+        }
+        (1.0 - s_over_z0.ln() / self.extent.ln()).clamp(0.0, 1.0)
+    }
+}
+
 /// GLS vertical mixing (see the module docs). The turbulence is stored in
 /// `Solution3D::tke`, `Solution3D::gls` and stepped by the vertical
 /// diffusion ([`crate::physics::apply_vertical_diffusion`]).
@@ -291,9 +358,14 @@ pub struct GlsMixing {
     /// Added to the turbulent viscosity and diffusivity (m²/s).
     background_viscosity: f64,
     background_diffusivity: f64,
-    /// Roughness lengths of the surface and of the bed (m).
+    /// Roughness lengths of the surface (the minimum under Charnock's) and
+    /// of the bed (m).
     z0_surface: f64,
     z0_bottom: f64,
+    /// Charnock's constant of the surface roughness `α u*²/g`, if any.
+    charnock: Option<f64>,
+    /// The surface's TKE injection; a log layer without.
+    wave_breaking: Option<WaveBreaking>,
 }
 
 impl GlsMixing {
@@ -311,6 +383,13 @@ impl GlsMixing {
     pub const DEFAULT_BACKGROUND_DIFFUSIVITY: f64 = 1e-6;
     /// Default roughness of the surface and the bed (ROMS's `Zos`, `Zob`).
     pub const DEFAULT_ROUGHNESS: f64 = 0.02;
+    /// Charnock's constant of the water side, `z₀ₛ = α u*²/g` with the
+    /// water's friction velocity (Stacey 1999; ROMS's `charnok_alpha`,
+    /// GOTM's `charnock_val`).
+    pub const DEFAULT_CHARNOCK: f64 = 1400.0;
+    /// Craig & Banner's (1994) `c_w` of the wave-breaking flux `c_w u*³`
+    /// (ROMS's `crgban_cw`, GOTM's `cw`).
+    pub const DEFAULT_WAVE_BREAKING: f64 = 100.0;
 
     /// A GLS model with `params` and `stability` functions; `c₃⁻` for
     /// [`Self::DEFAULT_RI_ST`] (see [`Self::with_steady_state_richardson`]).
@@ -341,6 +420,8 @@ impl GlsMixing {
             background_diffusivity: Self::DEFAULT_BACKGROUND_DIFFUSIVITY,
             z0_surface: Self::DEFAULT_ROUGHNESS,
             z0_bottom: Self::DEFAULT_ROUGHNESS,
+            charnock: None,
+            wave_breaking: None,
         }
     }
 
@@ -379,6 +460,106 @@ impl GlsMixing {
         self.z0_surface = z0_surface;
         self.z0_bottom = z0_bottom;
         self
+    }
+
+    /// Charnock's surface roughness `z₀ₛ = max(α u*²/g, z₀)` from the
+    /// surface stress, with `z₀` the surface roughness of
+    /// [`Self::with_roughness`] as the minimum (ROMS's `CHARNOK`). `alpha`
+    /// is for the water's friction velocity: [`Self::DEFAULT_CHARNOCK`].
+    pub fn with_charnock_roughness(mut self, alpha: f64) -> Self {
+        assert!(
+            alpha > 0.0,
+            "Charnock's constant must be positive, got {alpha}"
+        );
+        self.charnock = Some(alpha);
+        self
+    }
+
+    /// TKE injected at the surface by breaking waves, the flux `c_w u*³`
+    /// (Craig & Banner 1994; [`Self::DEFAULT_WAVE_BREAKING`]), in place of
+    /// the surface log layer. Below the surface the model then holds its
+    /// shear-free layer ([`Self::shear_free_layer`]); the flux conditions
+    /// of `k` and `ψ` are that layer's, at the top layer's centre (see the
+    /// module docs).
+    ///
+    /// # Panics
+    /// If `c_w` is negative, or the model has no shear-free layer.
+    pub fn with_wave_breaking(mut self, c_w: f64) -> Self {
+        assert!(
+            c_w >= 0.0,
+            "wave-breaking c_w must be non-negative, got {c_w}"
+        );
+        let (decay, slope) = self.shear_free_layer().unwrap_or_else(|| {
+            panic!(
+                "GLS model {:?} has no shear-free layer for wave breaking",
+                self.params
+            )
+        });
+        // k at the surface over the log layer's, (σ_k c_w/(a c_μ⁰ L))^(2/3) (c_μ⁰)²
+        let cm0 = self.stability.cm0;
+        let surface_ratio =
+            (self.params.sigma_k * c_w / (decay * cm0 * slope)).powf(2.0 / 3.0) * cm0 * cm0;
+        self.wave_breaking = Some(WaveBreaking {
+            c_w,
+            decay,
+            slope,
+            extent: surface_ratio.powf(1.0 / decay),
+        });
+        self
+    }
+
+    /// The surface's wave breaking, if configured.
+    pub fn wave_breaking(&self) -> Option<WaveBreaking> {
+        self.wave_breaking
+    }
+
+    /// The model's shear-free layer under a source of `k` at a wall,
+    /// `(a, L)`: `k = K s^(−a)`, `l = L s` at a distance `s` from the wall
+    /// (plus its roughness), where the diffusion of `k` and `ψ` balances
+    /// dissipation (no shear, no stratification). With `c_μ = c_μ⁰` (the
+    /// quasi-equilibrium stability functions without stratification), the
+    /// `k` and `ψ` equations give `(3/2) a² L² = σ_k (c_μ⁰)²` and
+    /// `b (b − a/2) L² = c₂ σ_ψ (c_μ⁰)²` with `b = n − a m`, so that
+    /// `a` is the positive root of
+    /// `(2σ_k m(m + ½) − 3c₂σ_ψ) a² − 2σ_k n(2m + ½) a + 2σ_k n² = 0`
+    /// (Umlauf & Burchard 2003, §4; GOTM's `gen_alpha`, `gen_l`). The
+    /// presets: k-ε `a` 4.97, `L` 0.087; k-ω 2.53, 0.24; generic 2.00, 0.19
+    /// (designed for 2, after Terray et al. 1996). `None` if no root is
+    /// positive.
+    pub fn shear_free_layer(&self) -> Option<(f64, f64)> {
+        let GlsParameters {
+            m,
+            n,
+            sigma_k,
+            sigma_psi,
+            c2,
+            ..
+        } = self.params;
+        let qa = 2.0 * sigma_k * m * (m + 0.5) - 3.0 * c2 * sigma_psi;
+        let qb = -2.0 * sigma_k * n * (2.0 * m + 0.5);
+        let qc = 2.0 * sigma_k * n * n;
+        // The smallest positive root (`qc > 0`: with `qa < 0` there is one)
+        let roots = if qa.abs() < 1e-12 {
+            [-qc / qb, f64::NAN]
+        } else {
+            let disc = (qb * qb - 4.0 * qa * qc).sqrt();
+            [(-qb + disc) / (2.0 * qa), (-qb - disc) / (2.0 * qa)]
+        };
+        let decay = roots
+            .into_iter()
+            .filter(|&a| a > 0.0)
+            .min_by(f64::total_cmp)?;
+        let slope = self.stability.cm0 * (2.0 * sigma_k / 3.0).sqrt() / decay;
+        Some((decay, slope))
+    }
+
+    /// Surface roughness at the surface friction velocity `u_star`.
+    #[inline]
+    fn surface_roughness(&self, u_star: f64, g: f64) -> f64 {
+        match self.charnock {
+            Some(alpha) => (alpha * u_star * u_star / g).max(self.z0_surface),
+            None => self.z0_surface,
+        }
     }
 
     /// Background viscosity and diffusivity (m²/s), added to the turbulent ones.
@@ -490,6 +671,37 @@ impl GlsMixing {
         -n * self.stability.cm0.powf(p + 1.0) * self.kappa.powf(n + 1.0) / sigma_psi
             * k.powf(m + 0.5)
             * height.powf(n)
+    }
+
+    /// Flux of `ψ` into the water at a distance `s` from the surface (plus
+    /// its roughness) in the shear-free layer of `wave`, with `k` there:
+    /// `−(n − a m) (c_μ⁰)^(p+1) L^(n+1)/σ_ψ k^(m+½) s^n`, the log layer's
+    /// flux for `a = 0`, `L = κ`.
+    #[inline]
+    fn shear_free_psi_flux(&self, wave: &WaveBreaking, k: f64, s: f64) -> f64 {
+        let GlsParameters {
+            p, m, n, sigma_psi, ..
+        } = self.params;
+        -(n - wave.decay * m) * self.stability.cm0.powf(p + 1.0) * wave.slope.powf(n + 1.0)
+            / sigma_psi
+            * k.powf(m + 0.5)
+            * s.powf(n)
+    }
+
+    /// `k` and `ψ` at the surface itself of the shear-free layer under the
+    /// flux `c_w u*³` at roughness `z0`: `K z₀^(−a) = (σ_k c_w/(a c_μ⁰ L))^(2/3) u*²`,
+    /// `l = L z₀`.
+    #[inline]
+    fn wave_surface(&self, wave: &WaveBreaking, u_star: f64, z0: f64) -> (f64, f64) {
+        let GlsParameters {
+            p, m, n, sigma_k, ..
+        } = self.params;
+        let cm0 = self.stability.cm0;
+        let k = ((sigma_k * wave.c_w / (wave.decay * cm0 * wave.slope)).powf(2.0 / 3.0)
+            * u_star
+            * u_star)
+            .max(self.k_min);
+        (k, cm0.powf(p) * k.powf(m) * (wave.slope * z0).powf(n))
     }
 }
 
@@ -673,6 +885,8 @@ impl VerticalMixing for GlsMixing {
             ..
         } = self.params;
         let cm0 = self.stability.cm0;
+        let u_surface = column.surface_friction_velocity;
+        let z0_surface = self.surface_roughness(u_surface, column.g);
 
         for l in 0..nl {
             f.h[l] = column.z_w[l + 1] - column.z_w[l];
@@ -717,14 +931,19 @@ impl VerticalMixing for GlsMixing {
                 ..
             } = &f;
 
-            // k, with no flux through the log layers
+            // k, with no flux through the log layers, and the shear-free
+            // layer's flux at the top layer's centre under breaking waves
+            let top_centre = 0.5 * h[nl - 1] + z0_surface;
+            let k_flux_top = self.wave_breaking.map_or(0.0, |wave| {
+                wave.c_w * u_surface.powi(3) * (z0_surface / top_centre).powf(1.5 * wave.decay)
+            });
             solve_interior(
                 tke,
                 h,
                 |j| num[j] / sigma_k,
                 |j| patankar(production[j], buoyancy[j], eps[j], k_old[j]),
                 0.0,
-                0.0,
+                k_flux_top,
                 dt,
                 &mut solver,
             );
@@ -732,9 +951,23 @@ impl VerticalMixing for GlsMixing {
                 *k = k.max(self.k_min);
             }
 
-            // ψ, with the log layers' fluxes at the end layers' centres
+            // ψ, with the boundary layers' fluxes at the end layers' centres.
+            // Under breaking waves the top one is the shear-free layer's
+            // where the top interior w-point has no shear production and the
+            // log layer's where it is in equilibrium (`P = ε`), linear in
+            // `P/ε` between
             let flux_bottom = self.wall_psi_flux(tke[1], 0.5 * h[0] + self.z0_bottom);
-            let flux_top = self.wall_psi_flux(tke[nl - 1], 0.5 * h[nl - 1] + self.z0_surface);
+            let log_flux_top = self.wall_psi_flux(tke[nl - 1], top_centre);
+            let flux_top = match &self.wave_breaking {
+                None => log_flux_top,
+                Some(wave) => {
+                    let w = wave.share_above(top_centre / z0_surface);
+                    let k_centre =
+                        tke[nl - 1] * ((h[nl - 1] + z0_surface) / top_centre).powf(wave.decay);
+                    w * self.shear_free_psi_flux(wave, k_centre, top_centre)
+                        + (1.0 - w) * log_flux_top
+                }
+            };
             solve_interior(
                 psi,
                 h,
@@ -766,11 +999,16 @@ impl VerticalMixing for GlsMixing {
             }
         }
 
-        // The log layers at the boundary w-points
+        // The boundary layers at the boundary w-points
         tke[0] = (column.bottom_friction_velocity.powi(2) / (cm0 * cm0)).max(self.k_min);
-        tke[nl] = (column.surface_friction_velocity.powi(2) / (cm0 * cm0)).max(self.k_min);
         psi[0] = self.wall_psi(tke[0], self.z0_bottom);
-        psi[nl] = self.wall_psi(tke[nl], self.z0_surface);
+        match &self.wave_breaking {
+            None => {
+                tke[nl] = (u_surface * u_surface / (cm0 * cm0)).max(self.k_min);
+                psi[nl] = self.wall_psi(tke[nl], z0_surface);
+            }
+            Some(wave) => (tke[nl], psi[nl]) = self.wave_surface(wave, u_surface, z0_surface),
+        }
 
         for j in 0..nw {
             let eps = self.bounded_dissipation(tke[j], self.dissipation(tke[j], psi[j]), f.n2[j]);
@@ -795,6 +1033,8 @@ mod tests {
         rho: Vec<f64>,
         tke: Vec<f64>,
         gls: Vec<f64>,
+        /// Surface friction velocity (m/s)
+        u_star: f64,
     }
 
     const G: f64 = 9.81;
@@ -820,6 +1060,7 @@ mod tests {
                 rho: z_r.iter().map(|z| RHO0 * (1.0 - n2 / G * z)).collect(),
                 tke: vec![k; nl + 1],
                 gls: vec![mixing.psi(k, eps); nl + 1],
+                u_star: 0.0,
                 z_r,
                 z_w,
             }
@@ -837,7 +1078,7 @@ mod tests {
                     rho: &self.rho,
                     g: G,
                     rho0: RHO0,
-                    surface_friction_velocity: 0.0,
+                    surface_friction_velocity: self.u_star,
                     bottom_friction_velocity: 0.0,
                 },
                 &Forcing {
@@ -974,5 +1215,153 @@ mod tests {
         let av = column.step(&gls, 10.0, &mut Vec::new());
         assert_eq!(column.tke, vec![GlsMixing::DEFAULT_K_MIN; 2]);
         assert!(av.iter().all(|x| x.is_finite() && *x > 0.0));
+    }
+
+    /// The shear-free layer's `(a, L)` satisfy both of its balances, the
+    /// `k` equation's `(3/2) a² L² = σ_k (c_μ⁰)²` and the `ψ` equation's
+    /// `b (b − a/2) L² = c₂ σ_ψ (c_μ⁰)²`, `b = n − a m`; the generic model
+    /// has GOTM's `gen_alpha` = −2 (Umlauf & Burchard 2003 designed it for
+    /// that) and a slope near its `gen_l` = 0.2.
+    #[test]
+    fn the_shear_free_layer_balances_both_equations() {
+        for gls in [
+            GlsMixing::k_epsilon(),
+            GlsMixing::k_omega(),
+            GlsMixing::generic(),
+        ] {
+            let GlsParameters {
+                m,
+                n,
+                sigma_k,
+                sigma_psi,
+                c2,
+                ..
+            } = gls.parameters();
+            let (a, l) = gls.shear_free_layer().expect("a shear-free layer");
+            let cm0_2 = gls.cm0().powi(2);
+            let b = n - a * m;
+            let name = format!("{:?}", gls.parameters());
+            assert!(
+                (1.5 * a * a * l * l / (sigma_k * cm0_2) - 1.0).abs() < 1e-12,
+                "{name}: k balance, a {a}, L {l}"
+            );
+            assert!(
+                (b * (b - 0.5 * a) * l * l / (c2 * sigma_psi * cm0_2) - 1.0).abs() < 1e-12,
+                "{name}: ψ balance, a {a}, L {l}"
+            );
+        }
+        let (a, l) = GlsMixing::generic().shear_free_layer().unwrap();
+        assert!(
+            (a - 2.0).abs() < 0.01 && (l - 0.2).abs() < 0.01,
+            "generic: a {a}, L {l}"
+        );
+    }
+
+    /// Charnock's roughness follows the stress above its minimum.
+    #[test]
+    fn charnock_roughness_has_the_constant_roughness_as_its_minimum() {
+        let gls = GlsMixing::k_epsilon().with_charnock_roughness(GlsMixing::DEFAULT_CHARNOCK);
+        let z0 = |u_star: f64| gls.surface_roughness(u_star, G);
+        assert!((z0(0.02) - 1400.0 * 4e-4 / G).abs() < 1e-15);
+        assert_eq!(z0(0.002), GlsMixing::DEFAULT_ROUGHNESS);
+        assert_eq!(
+            GlsMixing::k_epsilon().surface_roughness(0.02, G),
+            GlsMixing::DEFAULT_ROUGHNESS
+        );
+    }
+
+    /// The steady column under breaking waves over still, unstratified
+    /// water: `(max |k/k_a − 1|, max |l/l_a − 1|)` over 0.5–2.5 m deep
+    /// against the shear-free layer `k_a = K s^(−a)`, `l_a = L s`.
+    fn shear_free_errors(
+        gls: &GlsMixing,
+        nl: usize,
+        depth: f64,
+        u_star: f64,
+        z0: f64,
+    ) -> (f64, f64) {
+        let (a, slope) = gls.shear_free_layer().unwrap();
+        let k_surface = (gls.parameters().sigma_k * gls.wave_breaking().unwrap().c_w
+            / (a * gls.cm0() * slope))
+            .powf(2.0 / 3.0)
+            * u_star
+            * u_star;
+        let mut column = Homogeneous::new(gls, nl, depth, 0.0, 0.0, 1e-14, 1e-20);
+        column.u_star = u_star;
+        let (mut scratch, dt) = (Vec::new(), 60.0);
+        for _ in 0..(48.0 * 3600.0 / dt) as usize {
+            column.step(gls, dt, &mut scratch);
+        }
+        assert!(
+            (column.tke[nl] / k_surface - 1.0).abs() < 1e-12,
+            "surface k {} against {k_surface}",
+            column.tke[nl]
+        );
+        let (mut k_err, mut l_err) = (0.0_f64, 0.0_f64);
+        for j in 1..nl {
+            let s = -column.z_w[j] + z0;
+            if !(0.5..=2.5).contains(&(s - z0)) {
+                continue;
+            }
+            let k = column.tke[j];
+            let l = gls.cm0().powi(3) * k.powf(1.5) / gls.dissipation(k, column.gls[j]);
+            k_err = k_err.max((k / (k_surface * (z0 / s).powf(a)) - 1.0).abs());
+            l_err = l_err.max((l / (slope * s) - 1.0).abs());
+        }
+        (k_err, l_err)
+    }
+
+    /// Breaking waves over still, unstratified water (Craig & Banner 1994):
+    /// with the flux `c_w u*³` at the surface, the column settles into the
+    /// model's shear-free layer, `k = K s^(−a)` with
+    /// `K = (σ_k c_w/(a c_μ⁰ L))^(2/3) u*² z₀^a` and `l = L s`, `s` the depth
+    /// plus `z₀` (here 0.5 m, a wave height's). The surface condition blends
+    /// towards the log layer's by the top layer centre's depth inside the
+    /// wave-affected layer, so the error is first order in the layer
+    /// thickness. Measured over 0.5–2.5 m deep, at 0.4 / 0.2 / 0.1 m layers:
+    /// `k` 39 / 19 / 10 % (k-ω), 18 / 11 / 7.3 % (generic), the length
+    /// within 4 %. k-ε's layer (`a` ≈ 5, `l` ≈ 0.09 s) is too thin for
+    /// these layers (its turbulence collapses below ≈ 0.7 m even from the
+    /// exact profile): at 1 cm and 5 mm layers `k` holds to 4.3 / 2.7 %,
+    /// the length to 0.5 %.
+    #[test]
+    fn breaking_waves_make_the_shear_free_layer() {
+        let (u_star, z0) = (0.01, 0.5);
+        let waves = |gls: GlsMixing| {
+            gls.with_roughness(z0, 0.02)
+                .with_minimum(1e-14, 1e-20)
+                .with_wave_breaking(GlsMixing::DEFAULT_WAVE_BREAKING)
+        };
+        for gls in [GlsMixing::k_omega(), GlsMixing::generic()] {
+            let gls = waves(gls);
+            let name = format!("{:?}", gls.parameters());
+            let errors: Vec<(f64, f64)> = [50, 100, 200]
+                .into_iter()
+                .map(|nl| shear_free_errors(&gls, nl, 20.0, u_star, z0))
+                .collect();
+            for pair in errors.windows(2) {
+                assert!(
+                    pair[1].0 < pair[0].0 / 1.4,
+                    "{name}: k error {:.3} at half the layers against {:.3}",
+                    pair[1].0,
+                    pair[0].0
+                );
+            }
+            let finest = errors[2].0;
+            assert!(finest < 0.11, "{name}: k error {finest:.3} at 0.1 m layers");
+            assert!(
+                errors.iter().all(|&(_, l)| l < 0.04),
+                "{name}: length errors {errors:?}"
+            );
+        }
+        let gls = waves(GlsMixing::k_epsilon());
+        let errors: Vec<(f64, f64)> = [500, 1000]
+            .into_iter()
+            .map(|nl| shear_free_errors(&gls, nl, 5.0, u_star, z0))
+            .collect();
+        assert!(
+            errors[0].0 < 0.05 && errors[1].0 < 0.03 && errors.iter().all(|&(_, l)| l < 0.01),
+            "k-ε: errors {errors:?} at 1 cm and 5 mm layers"
+        );
     }
 }

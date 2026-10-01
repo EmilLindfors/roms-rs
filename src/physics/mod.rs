@@ -39,7 +39,7 @@ pub mod vertical_mixing;
 pub use bottom_drag::BottomDrag3D;
 pub use builder::{PhysicsBuilder, SWEPhysics2D, SWEPhysics2DBuilder};
 pub use eos::{EquationOfState, LinearEOS, UnescoEOS};
-pub use gls::{GlsMixing, GlsParameters, StabilityFunctions};
+pub use gls::{GlsMixing, GlsParameters, StabilityFunctions, WaveBreaking};
 pub use hydrostatic_3d::Hydrostatic3D;
 pub use surface_stress::{AnalyticSurfaceStress, SurfaceStress3D};
 pub use traits::{PhysicsConfig, PhysicsModule, PhysicsModuleInfo};
