@@ -23,6 +23,10 @@ pub enum ParticleStatus {
     /// [`super::ParticleTracker3D::with_bed_settling`]): deposited feed or
     /// faeces. It no longer moves.
     Settled,
+    /// Past the lifespan of its behaviour (3D tracking,
+    /// [`super::ParticleBehaviour3D::expired`]): a larva dead of senescence
+    /// or starvation. It no longer moves.
+    Dead,
 }
 
 /// A particle: its position, where that is in the mesh, and its own random
@@ -76,11 +80,14 @@ fn splitmix64(state: &mut u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Uniform in (0, 1): 53 random bits, offset by half a unit.
+pub(super) fn uniform(state: &mut u64) -> f64 {
+    ((splitmix64(state) >> 11) as f64 + 0.5) * (1.0 / (1u64 << 53) as f64)
+}
+
 /// Two independent standard normal numbers (Box–Muller).
 pub(super) fn standard_normal_pair(state: &mut u64) -> [f64; 2] {
-    // Uniform in (0, 1): 53 random bits, offset by half a unit
-    let mut uniform = || ((splitmix64(state) >> 11) as f64 + 0.5) * (1.0 / (1u64 << 53) as f64);
-    let (u1, u2) = (uniform(), uniform());
+    let (u1, u2) = (uniform(state), uniform(state));
     let radius = (-2.0 * u1.ln()).sqrt();
     let (sin, cos) = (std::f64::consts::TAU * u2).sin_cos();
     [radius * cos, radius * sin]
@@ -249,7 +256,7 @@ impl<'a> ParticleTracker2D<'a> {
     /// One step of one particle (see the module docs).
     fn advance(&self, p: &mut Particle2D, field: &impl ParticleVelocity2D, t: f64, dt: f64) {
         match p.status {
-            ParticleStatus::Exited(_) | ParticleStatus::Settled => return,
+            ParticleStatus::Exited(_) | ParticleStatus::Settled | ParticleStatus::Dead => return,
             ParticleStatus::Stranded => {
                 if !self.aground(field, p.point, t + dt) {
                     p.status = ParticleStatus::Active;

@@ -200,7 +200,7 @@ impl<'a> Cloud<'a> {
             out.eta.push(eta as f32);
             out.state.push(match p.status() {
                 ParticleStatus::Active => ACTIVE,
-                ParticleStatus::Stranded | ParticleStatus::Settled => STRANDED,
+                ParticleStatus::Stranded | ParticleStatus::Settled | ParticleStatus::Dead => STRANDED,
                 ParticleStatus::Exited(_) => EXITED,
             });
         }

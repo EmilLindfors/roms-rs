@@ -35,6 +35,15 @@
 //! takes the particle with [`ParticleTracker3D::with_bed_settling`]).
 //! Horizontal dispersion is the 2D tracker's constant-K walk.
 //!
+//! # Behaviour
+//!
+//! [`ParticleTracker3D::step_with`] takes a [`ParticleBehaviour3D`]: at the
+//! start of each step a particle senses its surroundings (depth, and
+//! temperature and salinity through [`ParticleVelocity3D::tracers`]),
+//! chooses a swimming speed held over the step, develops, and dies when the
+//! behaviour says so (swimming salmon-lice larvae: [`super::SalmonLice`]).
+//! [`ParticleTracker3D::step`] is the passive particle.
+//!
 //! # References
 //!
 //! - Visser, A. W. (1997). Using random walk models to simulate the vertical
@@ -43,8 +52,9 @@
 //! - Gräwe, U. (2011). Implementation of high-order particle-tracking
 //!   schemes in a water column model. *Ocean Modelling* 36, 80–89.
 
+use super::behaviour::{ParticleBehaviour3D, Passive, Surroundings};
 use super::tracker::{
-    MAX_NODES, Particle2D, ParticleStatus, ParticleTracker2D, standard_normal_pair,
+    MAX_NODES, Particle2D, ParticleStatus, ParticleTracker2D, standard_normal_pair, uniform,
 };
 use super::velocity_3d::ParticleVelocity3D;
 use super::walk::WalkEnd;
@@ -52,12 +62,16 @@ use crate::mesh::{BoundaryTag, Mesh2D, MeshPoint};
 use crate::operators::DGOperators2D;
 
 /// A particle in the 3D flow: a horizontal particle (position, element,
-/// status, random stream) with a σ-level and its own vertical speed.
+/// status, random stream) with a σ-level, its own vertical speed, and the
+/// state of its behaviour (age, development, current swimming speed).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Particle3D {
     horizontal: Particle2D,
     sigma: f64,
     vertical_speed: f64,
+    age: f64,
+    development: f64,
+    swimming_speed: f64,
 }
 
 impl Particle3D {
@@ -90,6 +104,23 @@ impl Particle3D {
     /// The particle's own vertical speed (m/s, positive up).
     pub fn vertical_speed(&self) -> f64 {
         self.vertical_speed
+    }
+
+    /// Time (s) since release, until it exits, settles or dies.
+    pub fn age(&self) -> f64 {
+        self.age
+    }
+
+    /// Development accrued by its behaviour (e.g. degree-days; see
+    /// [`ParticleBehaviour3D::development_rate`]).
+    pub fn development(&self) -> f64 {
+        self.development
+    }
+
+    /// Swimming speed (m/s, positive up) its behaviour chose for the last
+    /// step, on top of [`Self::vertical_speed`].
+    pub fn swimming_speed(&self) -> f64 {
+        self.swimming_speed
     }
 
     /// What the particle is doing.
@@ -195,10 +226,13 @@ impl<'a> ParticleTracker3D<'a> {
             horizontal: self.horizontal.release(id, position)?,
             sigma: sigma.clamp(-1.0, 0.0),
             vertical_speed,
+            age: 0.0,
+            development: 0.0,
+            swimming_speed: 0.0,
         })
     }
 
-    /// Advance `particles` from `t` to `t + dt` through `field` (in
+    /// Advance passive `particles` from `t` to `t + dt` through `field` (in
     /// parallel with the `parallel` feature; the result does not depend on
     /// the number of threads or the order of the particles).
     pub fn step(
@@ -208,18 +242,73 @@ impl<'a> ParticleTracker3D<'a> {
         t: f64,
         dt: f64,
     ) {
+        self.step_with(particles, field, &Passive, t, dt);
+    }
+
+    /// Advance `particles` from `t` to `t + dt` through `field`, swimming,
+    /// developing and dying by `behaviour` (see the module docs; parallel
+    /// and reproducible like [`Self::step`]).
+    pub fn step_with(
+        &self,
+        particles: &mut [Particle3D],
+        field: &impl ParticleVelocity3D,
+        behaviour: &impl ParticleBehaviour3D,
+        t: f64,
+        dt: f64,
+    ) {
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
             particles
                 .par_iter_mut()
                 .with_min_len(64)
-                .for_each(|p| self.advance(p, field, t, dt));
+                .for_each(|p| self.advance(p, field, behaviour, t, dt));
         }
         #[cfg(not(feature = "parallel"))]
         particles
             .iter_mut()
-            .for_each(|p| self.advance(p, field, t, dt));
+            .for_each(|p| self.advance(p, field, behaviour, t, dt));
+    }
+
+    /// The particle's behaviour over the step from `t`: it senses its
+    /// surroundings at the start, chooses its swimming speed, ages and
+    /// develops. Returns whether it is still alive.
+    fn live(
+        &self,
+        p: &mut Particle3D,
+        field: &impl ParticleVelocity3D,
+        behaviour: &impl ParticleBehaviour3D,
+        t: f64,
+        dt: f64,
+    ) -> bool {
+        p.age += dt;
+        if !behaviour.senses() {
+            return true;
+        }
+        let (point, sigma) = (p.horizontal.point, p.sigma);
+        let (column_depth, tracers) = self.with_weights(point, |w| {
+            (
+                field.depth(point.element, w, t),
+                field.tracers(point.element, w, sigma, t),
+            )
+        });
+        let surroundings = Surroundings {
+            time: t,
+            position: p.horizontal.position,
+            depth: -sigma * column_depth.max(0.0),
+            column_depth,
+            temperature: tracers.map(|[temp, _]| temp),
+            salinity: tracers.map(|[_, salt]| salt),
+        };
+        let draw = uniform(&mut p.horizontal.rng);
+        p.swimming_speed = behaviour.swimming_speed(p.development, &surroundings, draw);
+        p.development += behaviour.development_rate(&surroundings) * dt;
+        if behaviour.expired(p.development, p.age) {
+            p.swimming_speed = 0.0;
+            p.horizontal.status = ParticleStatus::Dead;
+            return false;
+        }
+        true
     }
 
     /// Call `f` with the nodal basis values at `point`.
@@ -249,24 +338,39 @@ impl<'a> ParticleTracker3D<'a> {
     }
 
     /// One step of one particle (see the module docs).
-    fn advance(&self, p: &mut Particle3D, field: &impl ParticleVelocity3D, t: f64, dt: f64) {
+    fn advance(
+        &self,
+        p: &mut Particle3D,
+        field: &impl ParticleVelocity3D,
+        behaviour: &impl ParticleBehaviour3D,
+        t: f64,
+        dt: f64,
+    ) {
         let depth_at = |point: MeshPoint, time: f64| {
             self.with_weights(point, |w| field.depth(point.element, w, time))
         };
-        let h = &mut p.horizontal;
-        match h.status {
-            ParticleStatus::Exited(_) | ParticleStatus::Settled => return,
+        match p.horizontal.status {
+            ParticleStatus::Exited(_) | ParticleStatus::Settled | ParticleStatus::Dead => return,
             ParticleStatus::Stranded => {
-                if !self.horizontal.too_shallow(Some(depth_at(h.point, t + dt))) {
-                    h.status = ParticleStatus::Active;
+                // Aground it still lives (on a drying flat), but does not swim
+                if self.live(p, field, behaviour, t, dt) {
+                    p.swimming_speed = 0.0;
+                    let h = &mut p.horizontal;
+                    if !self.horizontal.too_shallow(Some(depth_at(h.point, t + dt))) {
+                        h.status = ParticleStatus::Active;
+                    }
                 }
                 return;
             }
             ParticleStatus::Active => {}
         }
+        if !self.live(p, field, behaviour, t, dt) {
+            return;
+        }
+        let h = &mut p.horizontal;
         // RK4 on (x, y, σ); the stage points walk from the particle and
         // reflect off walls, the surface and the bed
-        let (half, w_p, sigma) = (0.5 * dt, p.vertical_speed, p.sigma);
+        let (half, w_p, sigma) = (0.5 * dt, p.vertical_speed + p.swimming_speed, p.sigma);
         let stage = |k: [f64; 3], step: f64| {
             let point = self
                 .horizontal
