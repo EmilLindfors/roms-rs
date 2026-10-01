@@ -59,6 +59,7 @@ src/
 │   │                 # split form), tracer, diffusion (BR1), 3D advection,
 │   │                 # 3D layer transports (Ω and inventory-form tracers,
 │   │                 # corrected to the barotropic DU_avg2), baroclinic PGF,
+│   │                 # 3D horizontal viscosity of the shear (BR1 per layer),
 │   │                 # 3D RHS assembly (momentum / transport parts)
 │   ├── limiters/     # Zhang-Shu positivity, Kuzmin/TVB slope limiters
 │   ├── algorithms/   # Wetting/drying, tridiagonal (Thomas) solve

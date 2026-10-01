@@ -4,6 +4,15 @@ All notable changes to this project should be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Horizontal viscosity of the 3D momentum (TODO P4.5).** New `Hydrostatic3D::with_horizontal_viscosity(ν)` (constant ν, m²/s) and kernel `solver::rhs::apply_horizontal_viscosity_3d` (module `viscosity_3d`, scratch `ViscosityScratch3D`).
+  - Formulation: `∂(H_z u_l)/∂t = ∇·(ν H_z ∇u′_l)` along σ-surfaces, on the shear `u′_l = u_l − ⟨u⟩` only, with BR1 per layer (the 2D module's `diffusion_2d` element kernels). With constant ν the column sum vanishes to round-off, so the depth mean stays the 2D module's (its own `HorizontalViscosity2D`) and nothing is counted twice in `G`. Walls mirror the shear, open faces extrapolate it, and thin columns carry none. It runs in `compute_momentum_rhs_into`. `Hydrostatic3D::compute_dt` now also bounds the step by the measured BR1 spectral radius (`element_dt_viscous_swe_2d`).
+  - Unit tests: the column sum is zero and layer momentum is conserved on a periodic mesh with a varying surface and stretched levels. A shear mode's decay rate converges at 2N (1.3e-2, 1.6e-5, 1.2e-8 at P1–P3 on 16²). An unsheared flow over a beach feels nothing.
+  - Gate `a_shear_mode_decays_at_the_viscous_rate_and_leaves_the_depth_mean`: a divergence-free shear `p(σ)·cos(ky)` (P3, periodic) decays under the full mode split to 1.1e-6 of `e^(−νk²t)`, and ū, v̄, η stay at rest (1.7e-12).
+  - Gate `a_p2_lock_exchange_runs_with_horizontal_viscosity`: the P2 lock exchange, which blew up without viscosity, runs on 250 m with ν = 10 m²/s and TVD vertical advection. The fronts are at Fr = 0.500 and 0.494, and T stays in range to 2e-12 °C. The smallest ν that holds shrinks with the spacing: 5–7 m²/s at 250 m, 2.5–5 at 125 m, ≤ 2.5 at 62 m (grid Reynolds numbers `ΔU·Δx/ν` of 7–10 at node spacing Δx). With Akima vertical advection, a 125 m run undershoots by 0.23 °C at the interface: the horizontal Kuzmin limiter bounds only along layers.
+  - The lock exchange's setup is now a helper (`lock_exchange`), shared by the P1 and P2 gates; the P1 numbers are unchanged.
+
 ### Changed
 
 - **Fourth-order Akima vertical tracer advection (TODO P4.5, P4.6).** The 3D tracers were advected through the σ-surfaces first-order upwind, which diffuses with `κ ≈ |w|Δz/2` (`REVIEW.md` §3.5).
@@ -19,7 +28,7 @@ All notable changes to this project should be documented in this file.
   - Akima and TVD reconstruct on the layers' σ-thicknesses (new `LayerTransport::d_sigma`), not in index space as ROMS does. They are exact for linear profiles on stretched levels. There, on θs 5, θb 0.4 levels, index-space Akima's divergence error stalls (9.2e-3 at 160 levels, against 3.2e-4).
   - `VerticalAdvection::Centred` (the momentum's second-order centred form) and `Hydrostatic3D::with_momentum_vertical_advection`. The momentum stays centred by default: Akima is 100× more accurate on a smooth profile, but a nonlinear internal seiche on 20 levels gains only 12–16 % of its period error. `apply_momentum_transport_3d` takes the scheme; `Rhs3DConfig.momentum_vertical_advection`.
 
-- **Lock exchange gate (TODO P4.6).** `a_lock_exchange_runs_at_the_gravity_current_speed`: an 8 km × 20 m channel with ΔT = 5 °C, run at P1. Both fronts move at Fr = 0.483 (0.473 at 62 m), a little below Benjamin's ½, and T stays in range. At P2 the run needs horizontal viscosity, which the 3D model does not have yet (TODO P4.5): the interface's hydrostatic shear instability blows it up after ≈ 1500 s.
+- **Lock exchange gate (TODO P4.6).** `a_lock_exchange_runs_at_the_gravity_current_speed`: an 8 km × 20 m channel with ΔT = 5 °C, run at P1. Both fronts move at Fr = 0.483 (0.473 at 62 m), a little below Benjamin's ½, and T stays in range. At P2 the run needs horizontal viscosity (TODO P4.5): the interface's hydrostatic shear instability blows it up after ≈ 1500 s. (Since added, see above.)
 
 ### Fixed
 

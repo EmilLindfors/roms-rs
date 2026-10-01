@@ -84,7 +84,7 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         &mut rhs.v,
     );
     apply_coriolis_3d(rhs, state, config.mesh, config.ops, config.coriolis);
-    // TODO: horizontal viscosity/diffusion (P4.5)
+    // The horizontal viscosity needs scratch: see `Hydrostatic3D`
 }
 
 /// Add the inventory tendency `∂(H_z u)/∂t` of the momentum advection by the
