@@ -68,8 +68,8 @@ use crate::solver::rhs::{
     compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
     largest_horizontal_viscosity_3d,
 };
-use crate::solver::state::Solution3D;
 use crate::solver::state::SWE_VAR_H;
+use crate::solver::state::Solution3D;
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
 use crate::source::CoriolisSource2D;
 use crate::time::{Integrable, ModeSplitPhysics};

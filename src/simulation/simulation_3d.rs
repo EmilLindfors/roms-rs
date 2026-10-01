@@ -3008,7 +3008,10 @@ mod tests {
         };
         let (serial, parallel) = (on(1), on(4));
         let speed = max_or_nan(serial.u.iter().zip(&serial.v).map(|(u, v)| u.hypot(*v)));
-        assert!(speed > 1e-3, "the flow is too weak to test: {speed:.3e} m/s");
+        assert!(
+            speed > 1e-3,
+            "the flow is too weak to test: {speed:.3e} m/s"
+        );
         for (name, a, b) in [
             ("u", &serial.u, &parallel.u),
             ("v", &serial.v, &parallel.v),

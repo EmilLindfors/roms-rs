@@ -78,6 +78,11 @@ struct ColumnView<'a> {
     slope: &'a [f64],
     /// `∫_z^η (ρ − ρ_ref) dz'` at the levels.
     pressure: &'a [f64],
+    /// The same as [`Self::pressure_at`] evaluates it at the levels: equal
+    /// to `pressure` but for rounding. The pressure differences take this,
+    /// so that their own and cross-column terms round alike (round-off at
+    /// rest stays ≤ 1.5e-14 m/s², not 3e-14).
+    at_level: &'a [f64],
     /// Bed elevation.
     bed: f64,
     /// At least the minimum column depth deep.
@@ -86,8 +91,12 @@ struct ColumnView<'a> {
 
 impl ColumnView<'_> {
     /// `∫_z^η (ρ − ρ_ref) dz'` at depth `z`, and whether `z` is in the water
-    /// column (above the bed).
-    fn pressure_at(&self, z: f64) -> (f64, bool) {
+    /// column (above the bed). `cursor` is a level at or below the interval
+    /// that holds `z` (`z[cursor] ≤ z`, or 0); it is moved up to that
+    /// interval, so that a caller evaluating at rising depths finds each
+    /// interval by stepping, not searching.
+    #[inline]
+    fn pressure_at(&self, z: f64, cursor: &mut usize) -> (f64, bool) {
         let n = self.z.len();
         let valid = z >= self.bed;
         let (top, bottom) = (n - 1, 0);
@@ -98,8 +107,11 @@ impl ColumnView<'_> {
             let dz = self.z[bottom] - z;
             self.pressure[bottom] + self.rho[bottom] * dz - 0.5 * self.slope[bottom] * dz * dz
         } else {
-            // z[m] ≤ z < z[m + 1]
-            let m = self.z.partition_point(|&zm| zm <= z) - 1;
+            // z[m] ≤ z < z[m + 1]; z < z[top] ends the walk
+            while self.z[*cursor + 1] <= z {
+                *cursor += 1;
+            }
+            let m = *cursor;
             let h = self.z[m + 1] - self.z[m];
             let t = (z - self.z[m]) / h;
             self.pressure[m + 1]
@@ -112,36 +124,48 @@ impl ColumnView<'_> {
 /// `(1/h) ∫_{z_m}^{z_m + t h}` of the Hermite cubic on level interval `m`.
 #[inline]
 fn hermite_integral(t: f64, column: &ColumnView, m: usize, h: f64) -> f64 {
+    hermite_integral_of(t, column.rho, column.slope, m, h)
+}
+
+/// [`hermite_integral`] of the profile `rho` with slopes `slope`.
+#[inline]
+fn hermite_integral_of(t: f64, rho: &[f64], slope: &[f64], m: usize, h: f64) -> f64 {
     let (t2, t3, t4) = (t * t, t * t * t, t * t * t * t);
     let h00 = 0.5 * t4 - t3 + t;
     let h10 = 0.25 * t4 - 2.0 / 3.0 * t3 + 0.5 * t2;
     let h01 = -0.5 * t4 + t3;
     let h11 = 0.25 * t4 - t3 / 3.0;
-    column.rho[m] * h00
-        + h * column.slope[m] * h10
-        + column.rho[m + 1] * h01
-        + h * column.slope[m + 1] * h11
+    rho[m] * h00 + h * slope[m] * h10 + rho[m + 1] * h01 + h * slope[m + 1] * h11
 }
 
-/// `½[(p_b(z_a) − p_a(z_a)) + (p_b(z_b) − p_a(z_b))]` (per `g`), using only
-/// the depths both columns reach; zero if either column is thin (a dry bank
-/// exerts no pressure on the water beside it).
-#[inline]
-fn pressure_difference(a: &ColumnView, za: f64, b: &ColumnView, zb: f64) -> f64 {
+/// `Δp_l = ½[(p_b(z_a) − p_a(z_a)) + (p_b(z_b) − p_a(z_b))]` (per `g`) at
+/// every level `l`, with `z_a`, `z_b` the two columns' own depths of that
+/// level, into `out`, using only the depths both columns reach; zero if
+/// either column is thin (a dry bank exerts no pressure on the water beside
+/// it).
+///
+/// A column's pressure at its own level is its table value, and the depths
+/// at which each column is evaluated in the other rise with the level, so
+/// one upward walk per column finds every interval.
+fn pressure_differences(a: &ColumnView, b: &ColumnView, out: &mut [f64]) {
     if !(a.wet && b.wet) {
-        return 0.0;
+        out.fill(0.0);
+        return;
     }
-    let (pb_at_a, b_reaches_a) = b.pressure_at(za);
-    let (pa_at_b, a_reaches_b) = a.pressure_at(zb);
-    let (pa, pb) = (a.pressure_at(za).0, b.pressure_at(zb).0);
-    match (b_reaches_a, a_reaches_b) {
-        (true, true) => 0.5 * ((pb_at_a - pa) + (pb - pa_at_b)),
-        (true, false) => pb_at_a - pa,
-        (false, true) => pb - pa_at_b,
-        // Impossible for columns with z ≥ bed at their own nodes (one of the
-        // two depths is the shallower one, which both reach); keep the
-        // symmetric form for degenerate input.
-        (false, false) => 0.5 * ((pb_at_a - pa) + (pb - pa_at_b)),
+    let (mut cursor_a, mut cursor_b) = (0, 0);
+    for (l, dp) in out.iter_mut().enumerate() {
+        let (pb_at_a, b_reaches_a) = b.pressure_at(a.z[l], &mut cursor_b);
+        let (pa_at_b, a_reaches_b) = a.pressure_at(b.z[l], &mut cursor_a);
+        let (pa, pb) = (a.at_level[l], b.at_level[l]);
+        *dp = match (b_reaches_a, a_reaches_b) {
+            (true, true) => 0.5 * ((pb_at_a - pa) + (pb - pa_at_b)),
+            (true, false) => pb_at_a - pa,
+            (false, true) => pb - pa_at_b,
+            // Impossible for columns with z ≥ bed at their own nodes (one of
+            // the two depths is the shallower one, which both reach); keep
+            // the symmetric form for degenerate input.
+            (false, false) => 0.5 * ((pb_at_a - pa) + (pb - pa_at_b)),
+        };
     }
 }
 
@@ -153,6 +177,7 @@ struct Columns {
     rho: Vec<f64>,
     slope: Vec<f64>,
     pressure: Vec<f64>,
+    at_level: Vec<f64>,
     bed: Vec<f64>,
     wet: Vec<bool>,
     min_column_depth: f64,
@@ -169,6 +194,7 @@ impl Columns {
             rho: vec![0.0; n],
             slope: vec![0.0; n],
             pressure: vec![0.0; n],
+            at_level: vec![0.0; n],
             bed: vec![0.0; n_columns],
         }
     }
@@ -179,7 +205,8 @@ impl Columns {
             z: &self.z[range.clone()],
             rho: &self.rho[range.clone()],
             slope: &self.slope[range.clone()],
-            pressure: &self.pressure[range],
+            pressure: &self.pressure[range.clone()],
+            at_level: &self.at_level[range],
             bed: self.bed[c],
             wet: self.wet[c],
         }
@@ -208,7 +235,8 @@ impl Columns {
         let z = &mut self.z[range.clone()];
         let rho = &mut self.rho[range.clone()];
         let slope = &mut self.slope[range.clone()];
-        let pressure = &mut self.pressure[range];
+        let pressure = &mut self.pressure[range.clone()];
+        let at_level = &mut self.at_level[range];
         for (l, (zl, &s)) in z.iter_mut().zip(sigma.sigma_rho()).enumerate() {
             *zl = eta + s * depth;
             rho[l] = state.rho_column(el, node)[l] - rho_ref;
@@ -247,6 +275,19 @@ impl Columns {
             let h = z[l + 1] - z[l];
             pressure[l] = pressure[l + 1]
                 + h * (0.5 * (rho[l] + rho[l + 1]) + h * (slope[l] - slope[l + 1]) / 12.0);
+        }
+
+        // `pressure_at(z[l])`: the end levels exactly, the others from the
+        // interval above them at t = 0
+        for (l, p) in at_level.iter_mut().enumerate() {
+            *p = if l == 0 || l == nl - 1 {
+                pressure[l]
+            } else {
+                let h = z[l + 1] - z[l];
+                pressure[l + 1]
+                    + h * (hermite_integral_of(1.0, rho, slope, l, h)
+                        - hermite_integral_of(0.0, rho, slope, l, h))
+            };
         }
     }
 }
@@ -320,9 +361,10 @@ pub fn compute_pressure_gradient(
                 across,
                 px,
                 py,
+                dp,
             } = &mut **scratch;
             pressure_gradient_element(
-                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, own, across, px, py,
+                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, own, across, px, py, dp,
             );
             for ((fx, fy), (&dx, &dy)) in out_x.iter_mut().zip(out_y).zip(px.iter().zip(&*py)) {
                 *fx = scale * dx;
@@ -339,6 +381,8 @@ struct PressureScratch {
     /// ∂p/∂x, ∂p/∂y per g, [node][level]
     px: Vec<f64>,
     py: Vec<f64>,
+    /// Δp of one pair of columns, [level]
+    dp: Vec<f64>,
 }
 
 impl PressureScratch {
@@ -348,6 +392,7 @@ impl PressureScratch {
             across: Columns::new(nfn, nl, 0.0),
             px: vec![0.0; nn * nl],
             py: vec![0.0; nn * nl],
+            dp: vec![0.0; nl],
         }
     }
 
@@ -358,7 +403,8 @@ impl PressureScratch {
 
 /// `∂p/∂x`, `∂p/∂y` per `g` of element `k` into `px`, `py` (`[node][level]`),
 /// with the columns of its nodes in `own` and of a face's neighbours in
-/// `across` (see [`compute_pressure_gradient`]).
+/// `across`, and one pair's pressure differences in `dp` (see
+/// [`compute_pressure_gradient`]).
 #[allow(clippy::too_many_arguments)]
 fn pressure_gradient_element(
     k: usize,
@@ -373,6 +419,7 @@ fn pressure_gradient_element(
     across: &mut Columns,
     px: &mut [f64],
     py: &mut [f64],
+    dp: &mut [f64],
 ) {
     let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
     let nl = sigma.n_levels();
@@ -395,8 +442,8 @@ fn pressure_gradient_element(
                 let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
                 let (dx_ij, dy_ij) = (rx * dr_ij + sx * ds_ij, ry * dr_ij + sy * ds_ij);
                 let (dx_ji, dy_ji) = (rx * dr_ji + sx * ds_ji, ry * dr_ji + sy * ds_ji);
-                for l in 0..nl {
-                    let dp = pressure_difference(&a, a.z[l], &b, b.z[l]);
+                pressure_differences(&a, &b, dp);
+                for (l, &dp) in dp.iter().enumerate() {
                     px[i * nl + l] += dx_ij * dp;
                     py[i * nl + l] += dy_ij * dp;
                     px[j * nl + l] -= dx_ji * dp;
@@ -418,9 +465,9 @@ fn pressure_gradient_element(
             let (normal, s_jac) = geom.affine_face(k, f);
             let lift_scale = s_jac * metric.det_j_inv;
             for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                let (a, b) = (own.view(node), across.view(fi));
-                for l in 0..nl {
-                    let jump = 0.5 * pressure_difference(&a, a.z[l], &b, b.z[l]);
+                pressure_differences(&own.view(node), &across.view(fi), dp);
+                for (l, &dp) in dp.iter().enumerate() {
+                    let jump = 0.5 * dp;
                     if jump == 0.0 {
                         continue;
                     }
