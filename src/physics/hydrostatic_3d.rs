@@ -18,7 +18,8 @@
 //! ([`ModeSplitPhysics::slow_forcing_into`]) is
 //!
 //! ```text
-//!     G = D·⟨R_PGF+Cor(u)⟩ + Σ_l A_l(u) − A(ū) − D·R_Cor(ū) + (τ_s − τ_b)/ρ₀ − r·(u_b − ū)
+//!     G = D·⟨R_PGF+Cor(u)⟩ + Σ_l A_l(u) − A(ū) − D·R_Cor(ū) + (τ_s − τ_b)/ρ₀
+//!         − r·(u_b − ū) − D Σ_l Δσ_l λ_l (u_l − ū)
 //! ```
 //!
 //! `⟨R_PGF+Cor(u)⟩` is the depth mean of the 3D momentum tendency that does
@@ -39,10 +40,12 @@
 //! pointwise and linear), and `G` reduces to the stresses. The vertical
 //! fluxes sum to zero over the column.
 
-//! The last term is the vertical-shear part of the quadratic bottom drag
-//! ([`Hydrostatic3D::with_bottom_drag`], rate `r = C_d|u_b|`); the splitter
-//! applies its depth-mean part `−r·ū` implicitly in the barotropic pass (see
-//! [`crate::physics::bottom_drag`]). `τ_s` is the stress of [`Forcing`]
+//! The last two terms are the vertical-shear parts of the quadratic bottom
+//! drag ([`Hydrostatic3D::with_bottom_drag`], rate `r = C_d|u_b|`) and of
+//! the net cages ([`Hydrostatic3D::with_cage_drag`], rate `λ_l` per layer);
+//! the splitter applies their depth-mean parts `−r·ū` and `−Λ̄ū` implicitly
+//! in the barotropic pass (see [`crate::physics::bottom_drag`] and
+//! [`crate::physics::cage_drag`]). `τ_s` is the stress of [`Forcing`]
 //! plus the column's of [`Hydrostatic3D::with_surface_stress`], if any (see
 //! [`crate::physics::surface_stress`] for when it is evaluated), `τ_b` the
 //! prescribed stress of [`Forcing`], if any. Thin columns
@@ -62,6 +65,7 @@ use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::SWEPhysics2D;
 use crate::physics::bottom_drag::BottomDrag3D;
+use crate::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use crate::physics::eos::EquationOfState;
 use crate::physics::surface_stress::SurfaceStress3D;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
@@ -79,8 +83,8 @@ use crate::solver::rhs::{
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
-use crate::source::{CoriolisSource2D, RiverSources};
-use crate::time::{Integrable, ModeSplitPhysics};
+use crate::source::{CageDrag2D, CageNode, CoriolisSource2D, RiverSources};
+use crate::time::{Integrable, ModeSplitPhysics, StepDrag};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -130,6 +134,9 @@ where
     /// Quadratic drag of the bottom-layer velocity, if any (see
     /// [`Self::with_bottom_drag`]).
     pub bottom_drag: Option<BottomDrag3D>,
+    /// Drag of fish-farm net cages on the layers they reach, if any (see
+    /// [`Self::with_cage_drag`]).
+    pub cage_drag: Option<CageDrag2D>,
     /// Horizontal eddy viscosity of the vertical shear (see
     /// [`Self::with_horizontal_viscosity`] and
     /// [`Self::with_smagorinsky_viscosity`]).
@@ -204,6 +211,7 @@ where
             vertical_advection: VerticalAdvection::default(),
             momentum_vertical_advection: VerticalAdvection::Centred,
             bottom_drag: None,
+            cage_drag: None,
             horizontal_viscosity: HorizontalViscosity3D::default(),
             nesting: None,
             rivers: None,
@@ -287,6 +295,26 @@ where
     /// bottom friction of its own: it would count the drag twice.
     pub fn with_bottom_drag(mut self, drag: BottomDrag3D) -> Self {
         self.bottom_drag = Some(drag);
+        self
+    }
+
+    /// The drag of fish-farm net cages, `−½ C_d a |u_l| u_l` on every layer
+    /// a net reaches, from the surface down to its net depth, weighted by
+    /// each node's share of the footprint (`CageDrag2D::new` on this model's
+    /// mesh and operators; see [`crate::physics::cage_drag`] for the time
+    /// discretisation). Without vertical shear it is the 2D cage drag. The
+    /// 2D module must not carry the cages as well: it would count the drag
+    /// twice.
+    ///
+    /// # Panics
+    /// If `cages` was built for another mesh or order.
+    pub fn with_cage_drag(mut self, cages: CageDrag2D) -> Self {
+        assert_eq!(
+            cages.n_total_nodes(),
+            self.mesh.n_elements * self.ops.n_nodes,
+            "CageDrag2D was built for a different mesh or order"
+        );
+        self.cage_drag = (!cages.is_empty()).then_some(cages);
         self
     }
 
@@ -397,6 +425,33 @@ where
         };
         let z_b = (1.0 + self.sigma.sigma_rho()[0]) * depth;
         drag.rate(z_b, (u * u + v * v).sqrt())
+    }
+
+    /// Cage-drag rate `λ_l = c_l·|u_l|` (1/s) of every layer of the column at
+    /// node `idx` (`[element][node]`) with cage entries `entries`, into
+    /// `rate`: with the depth mean's speed in thin columns, zero where dry.
+    fn cage_rates_into(
+        &self,
+        entries: &[CageNode],
+        state: &Solution3D,
+        idx: usize,
+        rate: &mut [f64],
+    ) {
+        let depth = state.eta.data[idx] - self.bathymetry.data[idx];
+        if depth <= 0.0 {
+            rate.fill(0.0);
+            return;
+        }
+        let nl = state.n_levels;
+        let thin = depth < self.min_column_depth;
+        for (l, r) in rate.iter_mut().enumerate() {
+            let (u, v) = if thin {
+                (state.ubar.data[idx], state.vbar.data[idx])
+            } else {
+                (state.u[idx * nl + l], state.v[idx * nl + l])
+            };
+            *r = layer_coefficient(entries, &self.sigma, l, depth) * u.hypot(v);
+        }
     }
 
     /// Whether the column at node `idx` (`[element][node]`) is thin.
@@ -1042,6 +1097,28 @@ where
                         g_hu[i] = depth * mean_u + advection_x - bar_rhs.u[idx] + stress_x - drag_x;
                         g_hv[i] = depth * mean_v + advection_y - bar_rhs.v[idx] + stress_y - drag_y;
                     }
+                    // The shear part of the cage drag, −D Σ_l Δσ_l λ_l (u_l − ū);
+                    // the pass applies −Λ̄ū
+                    if let Some(cages) = &self.cage_drag {
+                        for_each_caged_node(cages, k, nn, |i, entries| {
+                            let idx = k * nn + i;
+                            let depth = state.eta.data[idx] - bed[i];
+                            if depth < self.min_column_depth {
+                                return;
+                            }
+                            let (ubar, vbar) = (state.ubar.data[idx], state.vbar.data[idx]);
+                            let (mut drag_x, mut drag_y) = (0.0, 0.0);
+                            for (l, &ds) in self.sigma.d_sigma().iter().enumerate() {
+                                let (u, v) = (state.u[idx * nl + l], state.v[idx * nl + l]);
+                                let rate =
+                                    layer_coefficient(entries, &self.sigma, l, depth) * u.hypot(v);
+                                drag_x += ds * rate * (u - ubar);
+                                drag_y += ds * rate * (v - vbar);
+                            }
+                            g_hu[i] -= depth * drag_x;
+                            g_hv[i] -= depth * drag_y;
+                        });
+                    }
                 },
             )
         });
@@ -1059,15 +1136,25 @@ where
         true
     }
 
+    /// `λ_l` of every layer under a cage (zero elsewhere), if cages are set.
+    fn layer_drag_into(&self, state: &Solution3D, _t: f64, rate: &mut [f64]) -> bool {
+        let Some(cages) = &self.cage_drag else {
+            return false;
+        };
+        let (nn, nl) = (state.n_nodes, state.n_levels);
+        rate.fill(0.0);
+        for k in 0..state.n_elements {
+            for_each_caged_node(cages, k, nn, |i, entries| {
+                let idx = k * nn + i;
+                self.cage_rates_into(entries, state, idx, &mut rate[idx * nl..(idx + 1) * nl]);
+            });
+        }
+        true
+    }
+
     /// The vertical diffusion with the surface stress at the middle of the
     /// step, `t + dt/2`.
-    fn vertical_implicit(
-        &self,
-        state: &mut Solution3D,
-        t: f64,
-        dt: f64,
-        bottom_drag: Option<&[f64]>,
-    ) {
+    fn vertical_implicit(&self, state: &mut Solution3D, t: f64, dt: f64, drag: StepDrag<'_>) {
         self.surface_stress_at(t + 0.5 * dt, |field| {
             apply_vertical_diffusion(
                 state,
@@ -1080,7 +1167,7 @@ where
                 self.g,
                 self.rho0,
                 self.min_column_depth,
-                bottom_drag,
+                drag,
             )
         });
         // Thin columns carry the depth mean only

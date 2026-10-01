@@ -46,7 +46,10 @@
 //! applied point-implicitly in every barotropic RK stage, like the 2D
 //! friction, so no `r·Δt/D` destabilises it; `G` carries the part of the
 //! vertical shear, `−r·(u_b − ū)`, and the vertical diffusion takes
-//! `r·u_bⁿ⁺¹` as its bottom flux.
+//! `r·u_bⁿ⁺¹` as its bottom flux. A drag within the column (net cages,
+//! `−λ_l u_l` on layer `l`, [`ModeSplitPhysics::layer_drag_into`]) is
+//! treated the same way: `−Λ̄ ū` with `Λ̄ = Σ_l Δσ_l λ_l` in the pass,
+//! `−D Σ_l Δσ_l λ_l (u_l − ū)` in `G`, `−λ_l u_lⁿ⁺¹` in the vertical solve.
 //!
 //! The 2D positivity limiter and wet/dry treatment run after every barotropic
 //! RK stage (and on the filtered state, since the filter has small negative
@@ -283,21 +286,68 @@ pub trait ModeSplitPhysics {
         false
     }
 
+    /// Drag within the water column (net cages, see
+    /// [`crate::physics::cage_drag`]): overwrite `rate` (one entry per layer,
+    /// `[element][node][level]`) with the linear rates `λ_l` (1/s) of the
+    /// momentum sink `−λ_l u_l` from `state` at `t`, and return `true`;
+    /// `false` (the default) for none.
+    ///
+    /// The splitter freezes `λ` over the step. It applies `−Λ̄ ū`,
+    /// `Λ̄ = Σ_l Δσ_l λ_l`, to the depth mean in the barotropic pass,
+    /// point-implicitly, and hands the rates to [`Self::vertical_implicit`].
+    /// [`Self::slow_forcing_into`] must add the rest of the drag on the
+    /// depth mean, `−D Σ_l Δσ_l λ_l (u_l − ū)`.
+    fn layer_drag_into(&self, _state: &Solution3D, _t: f64, _rate: &mut [f64]) -> bool {
+        false
+    }
+
     /// Implicit vertical terms over `[t, t + dt]`: vertical diffusion, with
-    /// the surface and bottom stresses as its boundary fluxes, and the bottom
-    /// drag `r·u_b` at the new time if `bottom_drag` holds the rates `r` of
-    /// [`Self::bottom_drag_into`].
-    fn vertical_implicit(
-        &self,
-        state: &mut Solution3D,
-        t: f64,
-        dt: f64,
-        bottom_drag: Option<&[f64]>,
-    );
+    /// the surface and bottom stresses as its boundary fluxes, the bottom
+    /// drag `r·u_b` at the new time if `drag.bottom` holds the rates `r` of
+    /// [`Self::bottom_drag_into`], and the layer drag `λ_l u_l` at the new
+    /// time if `drag.layers` holds the rates of [`Self::layer_drag_into`].
+    fn vertical_implicit(&self, state: &mut Solution3D, t: f64, dt: f64, drag: StepDrag<'_>);
 
     /// Runs on every 3D stage value (with the tracers as concentrations),
     /// including the last: limiters, density.
     fn post_stage(&self, state: &mut Solution3D);
+}
+
+/// The linearised drags of one baroclinic step, frozen at `tⁿ`
+/// ([`ModeSplitPhysics::bottom_drag_into`],
+/// [`ModeSplitPhysics::layer_drag_into`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StepDrag<'a> {
+    /// Bottom-drag rate `r` (m/s) of every column, `[element][node]`:
+    /// `τ_b/ρ₀ = r·u_b`.
+    pub bottom: Option<&'a [f64]>,
+    /// Drag rate `λ_l` (1/s) of every layer, `[element][node][level]`:
+    /// `∂u_l/∂t = −λ_l u_l`.
+    pub layers: Option<&'a [f64]>,
+}
+
+impl<'a> StepDrag<'a> {
+    /// No drag.
+    pub const NONE: Self = Self {
+        bottom: None,
+        layers: None,
+    };
+
+    /// A bottom drag only.
+    pub fn bottom(rate: &'a [f64]) -> Self {
+        Self {
+            bottom: Some(rate),
+            layers: None,
+        }
+    }
+
+    /// A layer drag only.
+    pub fn layers(rate: &'a [f64]) -> Self {
+        Self {
+            bottom: None,
+            layers: Some(rate),
+        }
+    }
 }
 
 /// Weights `w_j` such that `Σ w_j G(t_j)` is the average over `[tⁿ, tⁿ + Δt]`
@@ -534,6 +584,11 @@ struct Buffers {
     rate_hv: DGSolution2D,
     /// Bottom-drag rate `r` of every column, frozen over the step.
     drag_rate: Vec<f64>,
+    /// Layer-drag rate `λ_l` of every layer, frozen over the step (sized on
+    /// the first step with a layer drag).
+    layer_drag_rate: Vec<f64>,
+    /// Its column mean `Λ̄ = Σ_l Δσ_l λ_l`.
+    column_drag_rate: Vec<f64>,
 }
 
 impl Buffers {
@@ -560,6 +615,8 @@ impl Buffers {
             rate_hu: DGSolution2D::new(ne, nn),
             rate_hv: DGSolution2D::new(ne, nn),
             drag_rate: vec![0.0; ne * nn],
+            layer_drag_rate: Vec::new(),
+            column_drag_rate: Vec::new(),
         }
     }
 }
@@ -665,6 +722,8 @@ impl ModeSplitIntegrator {
             rate_hu,
             rate_hv,
             drag_rate,
+            layer_drag_rate,
+            column_drag_rate,
         } = self.buffers.get_or_insert_with(|| {
             Buffers::new(state, barotropic.operators().n_face_nodes, n_rivers)
         });
@@ -676,9 +735,32 @@ impl ModeSplitIntegrator {
         let nn = state.n_nodes;
 
         // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3);
-        // the bottom-drag rates of the step
+        // the drag rates of the step
         let bottom_drag = physics.bottom_drag_into(state, t, drag_rate);
         let drag_rate: &[f64] = drag_rate;
+        let n_layer_values = state.u.len();
+        if layer_drag_rate.len() != n_layer_values {
+            layer_drag_rate.resize(n_layer_values, 0.0);
+        }
+        let layer_drag = physics.layer_drag_into(state, t, layer_drag_rate);
+        if layer_drag {
+            column_drag_rate.resize(state.eta.data.len(), 0.0);
+            for (mean, rates) in column_drag_rate
+                .iter_mut()
+                .zip(layer_drag_rate.chunks_exact(state.n_levels))
+            {
+                *mean = rates
+                    .iter()
+                    .zip(sigma.d_sigma())
+                    .map(|(r, ds)| r * ds)
+                    .sum();
+            }
+        }
+        let drag = StepDrag {
+            bottom: bottom_drag.then_some(drag_rate),
+            layers: layer_drag.then_some(&layer_drag_rate[..]),
+        };
+        let column_drag = layer_drag.then_some(&column_drag_rate[..]);
         physics.momentum_rhs_into(state, t, rhs_n);
         physics.slow_forcing_into(state, rhs_n, t, history.push(t, dt));
         history.step_average(dt, g_term);
@@ -732,8 +814,8 @@ impl ModeSplitIntegrator {
                 },
                 |stage, from, dt_stage| {
                     barotropic.implicit_damping(stage, from, dt_stage);
-                    if bottom_drag {
-                        damp_depth_mean(stage, drag_rate, dt_stage);
+                    if bottom_drag || layer_drag {
+                        damp_depth_mean(stage, drag.bottom, column_drag, dt_stage);
                     }
                 },
                 |s| barotropic.post_process(s),
@@ -883,7 +965,7 @@ impl ModeSplitIntegrator {
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the
         // barotropic mode: reset it to ū.
-        physics.vertical_implicit(state, t, dt, bottom_drag.then_some(drag_rate));
+        physics.vertical_implicit(state, t, dt, drag);
         depth_average(sigma, &state.u, mean_u);
         depth_average(sigma, &state.v, mean_v);
         shift_columns(&mut state.u, state.n_levels, mean_u, &state.ubar);
@@ -891,14 +973,25 @@ impl ModeSplitIntegrator {
     }
 }
 
-/// The depth-mean part of the bottom drag, `∂(hu, hv)/∂t = −r·(hu, hv)/h`,
-/// point-implicitly on a barotropic stage value: `(hu, hv) ← (hu, hv)/(1 +
-/// dt·r/h)` with the stage's own depth (only ever shrinks the transport).
-fn damp_depth_mean(stage: &mut SWESolution2D, rate: &[f64], dt: f64) {
+/// The depth-mean part of the bottom drag and the layer drag,
+/// `∂(hu, hv)/∂t = −(r/h + Λ̄)·(hu, hv)`, point-implicitly on a barotropic
+/// stage value: `(hu, hv) ← (hu, hv)/(1 + dt·(r/h + Λ̄))` with the stage's
+/// own depth (only ever shrinks the transport). `bottom` holds `r` (m/s),
+/// `column` holds `Λ̄` (1/s), per column.
+fn damp_depth_mean(
+    stage: &mut SWESolution2D,
+    bottom: Option<&[f64]>,
+    column: Option<&[f64]>,
+    dt: f64,
+) {
     let [h, hu, hv] = &mut stage.data;
-    for (((&h, hu), hv), &r) in h.iter().zip(hu.iter_mut()).zip(hv.iter_mut()).zip(rate) {
-        if h > 0.0 && r > 0.0 {
-            let factor = 1.0 / (1.0 + dt * r / h);
+    for (idx, ((&h, hu), hv)) in h.iter().zip(hu.iter_mut()).zip(hv.iter_mut()).enumerate() {
+        if h <= 0.0 {
+            continue;
+        }
+        let rate = bottom.map_or(0.0, |r| r[idx] / h) + column.map_or(0.0, |c| c[idx]);
+        if rate > 0.0 {
+            let factor = 1.0 / (1.0 + dt * rate);
             *hu *= factor;
             *hv *= factor;
         }
@@ -1326,7 +1419,7 @@ mod tests {
             _state: &mut Solution3D,
             _t: f64,
             _dt: f64,
-            _drag: Option<&[f64]>,
+            _drag: StepDrag<'_>,
         ) {
         }
 

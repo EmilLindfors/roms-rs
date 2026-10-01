@@ -30,7 +30,7 @@ use dg_rs::solver::rhs::BarotropicFlux;
 use dg_rs::solver::state::Solution3D;
 use dg_rs::solver::{SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D};
 use dg_rs::source::CoriolisSource2D;
-use dg_rs::time::{ModeSplitIntegrator, ModeSplitPhysics};
+use dg_rs::time::{ModeSplitIntegrator, ModeSplitPhysics, StepDrag};
 use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
 
 const G: f64 = 9.81;
@@ -117,15 +117,13 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         })
     }
 
-    fn vertical_implicit(
-        &self,
-        state: &mut Solution3D,
-        t: f64,
-        dt: f64,
-        bottom_drag: Option<&[f64]>,
-    ) {
+    fn layer_drag_into(&self, state: &Solution3D, t: f64, rate: &mut [f64]) -> bool {
+        self.time("layer_drag", || self.inner.layer_drag_into(state, t, rate))
+    }
+
+    fn vertical_implicit(&self, state: &mut Solution3D, t: f64, dt: f64, drag: StepDrag<'_>) {
         self.time("vertical_implicit", || {
-            self.inner.vertical_implicit(state, t, dt, bottom_drag)
+            self.inner.vertical_implicit(state, t, dt, drag)
         })
     }
 

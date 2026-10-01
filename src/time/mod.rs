@@ -38,7 +38,7 @@ pub use coupled_swe_tracer::{
 };
 pub use mode_split::{
     BarotropicFilter, BarotropicPhysics, BarotropicTransport, MIN_BAROTROPIC_SUBSTEPS,
-    ModeSplitIntegrator, ModeSplitPhysics, SplitMethod, step_average_weights,
+    ModeSplitIntegrator, ModeSplitPhysics, SplitMethod, StepDrag, step_average_weights,
 };
 pub use multirate::{
     LocalTimeStepping, Multirate, MultirateSSPRK3, MultirateSSPRK43, MultirateStats,
