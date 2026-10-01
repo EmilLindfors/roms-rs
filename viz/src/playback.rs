@@ -126,7 +126,7 @@ fn receive(channel: Res<SolverChannel>, mut playback: ResMut<Playback>) {
             Ok(SolverMessage::Snapshot(snapshot)) => {
                 // The budget counts snapshots of this size; all are the same size.
                 let fits = (playback.budget / snapshot.bytes().max(1)).max(2);
-                playback.frames.push_back(snapshot);
+                playback.frames.push_back(*snapshot);
                 while playback.frames.len() > fits {
                     playback.frames.pop_front();
                 }

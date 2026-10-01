@@ -4,8 +4,9 @@
 //! the node's place in the world, the bed, and the geometric factors and reference
 //! derivative matrices that give the exact gradient of a nodal field (for the surface
 //! normals). [`Field`] is η, u and v at [`crate::playback::Playback::t`], linear in
-//! time between the two snapshots around it. A [`Probe`] evaluates a nodal field at a
-//! point by the element's own polynomial (`dg_rs::solver::Probe2D`'s weights).
+//! time between the two snapshots around it; in a 3D run (u, v) is the depth mean or
+//! the σ-layer [`ShownLayer`] picks. A [`Probe`] evaluates a nodal field at a point by
+//! the element's own polynomial (`dg_rs::solver::Probe2D`'s weights).
 //!
 //! World frame: Bevy is +Y up, so mesh (x, y, z) goes to (x − x₀, z·vz, −(y − y₀)), the
 //! origin at the mesh's centre and heights exaggerated `vz` times.
@@ -127,6 +128,15 @@ impl Nodes {
     }
 }
 
+/// Which current a 3D run's water and arrows show.
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShownLayer {
+    #[default]
+    DepthMean,
+    /// A σ-layer, 0 at the bed
+    Level(usize),
+}
+
 /// η, u and v at the shown time.
 #[derive(Resource, Default)]
 pub struct Field {
@@ -138,8 +148,8 @@ pub struct Field {
 }
 
 /// Interpolates the snapshots around the shown time.
-pub fn interpolate(playback: Res<Playback>, mut field: ResMut<Field>) {
-    if !playback.changed {
+pub fn interpolate(playback: Res<Playback>, shown: Res<ShownLayer>, mut field: ResMut<Field>) {
+    if !(playback.changed || shown.is_changed()) {
         return;
     }
     let Some((a, b, w)) = playback.bracket() else {
@@ -150,8 +160,28 @@ pub fn interpolate(playback: Res<Playback>, mut field: ResMut<Field>) {
         out.extend(x.iter().zip(y).map(|(x, y)| x + w * (y - x)));
     };
     lerp(&mut field.eta, &a.eta, &b.eta);
-    lerp(&mut field.u, &a.u, &b.u);
-    lerp(&mut field.v, &a.v, &b.v);
+    match (*shown, &a.layers, &b.layers) {
+        (ShownLayer::Level(l), Some(la), Some(lb)) => {
+            let nl = la.n_levels;
+            let l = l.min(nl - 1);
+            let level = |out: &mut Vec<f32>, x: &[f32], y: &[f32]| {
+                out.clear();
+                out.extend(
+                    x.iter()
+                        .skip(l)
+                        .step_by(nl)
+                        .zip(y.iter().skip(l).step_by(nl))
+                        .map(|(x, y)| x + w * (y - x)),
+                );
+            };
+            level(&mut field.u, &la.u, &lb.u);
+            level(&mut field.v, &la.v, &lb.v);
+        }
+        _ => {
+            lerp(&mut field.u, &a.u, &b.u);
+            lerp(&mut field.v, &a.v, &b.v);
+        }
+    }
     field.t = Some(playback.t);
 }
 
@@ -176,5 +206,14 @@ impl Probe {
     pub fn eval(&self, field: &[f32]) -> f32 {
         let values = &field[self.start..self.start + self.weights.len()];
         self.weights.iter().zip(values).map(|(w, v)| w * v).sum()
+    }
+
+    /// Level `level` of a layered field `[node][level]` with `n_levels` levels.
+    pub fn eval_level(&self, field: &[f32], n_levels: usize, level: usize) -> f32 {
+        self.weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| w * field[(self.start + i) * n_levels + level])
+            .sum()
     }
 }

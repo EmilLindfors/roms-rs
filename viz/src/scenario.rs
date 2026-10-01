@@ -10,6 +10,11 @@
 //!   projected onto the nodes, and NorKyst-800 boundary tides from the tidal atlas
 //!   (`BoundaryTides`), on a clock starting 2025-06-15. The data files are those of the
 //!   example (untracked, in `data/`; see `TODO.md` P1.6 and P3.1 for how to fetch them).
+//! - [`Scenario::farm_channel`] is the stratified tidal channel of `examples/farm_3d.rs`,
+//!   run by the 3D model ([`ThreeD`]): 6 km long (periodic along it), 600 m wide and
+//!   40 m deep, 2 °C warmer over the top 10 m, an M2 current of ≈ 0.5 m/s driven by a
+//!   depth-uniform body force, two 50 m cages with 20 m nets across the flow, GLS k-ε
+//!   mixing and a log-layer bottom drag.
 
 use std::error::Error;
 use std::f64::consts::PI;
@@ -22,10 +27,12 @@ use dg_rs::io::{
 };
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
+use dg_rs::particles::ClearSkyLight;
 use dg_rs::solver::{SWESolution2D, SWEState2D};
 use dg_rs::source::NetCage;
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
+use dg_rs::vertical::{SigmaGrid, UniformStretching};
 
 pub const G: f64 = 9.81;
 
@@ -36,6 +43,9 @@ pub enum Tide {
     UniformM2(f64),
     /// Tides of a boundary atlas, varying along the boundary
     Atlas(BoundaryTides),
+    /// A depth-uniform M2 body force along mesh x that drives a current of this
+    /// amplitude (m/s) without friction: the tidal surface slope of a periodic channel
+    BodyForceM2(f64),
 }
 
 /// Tidal forcing and friction of a scenario.
@@ -52,16 +62,39 @@ pub struct Forcing {
     pub ramp: f64,
 }
 
-/// The close-up view (F): its camera distance and the fine grid of current arrows
-/// around the point of interest.
+/// The close-up view (F): its camera and the fine grid of current arrows around the
+/// point of interest.
 #[derive(Clone, Copy, Debug)]
 pub struct CloseUp {
     /// Camera distance (world units)
     pub distance: f32,
+    /// Camera direction: angle about the vertical from world +Z, and above the
+    /// horizontal (rad)
+    pub yaw: f32,
+    pub pitch: f32,
     /// Spacing of the fine arrows (m)
     pub arrow_spacing: f64,
     /// Radius of the fine arrow grid (m)
     pub arrow_radius: f64,
+}
+
+/// The 3D model of a scenario (`Hydrostatic3D` with mode splitting).
+#[derive(Clone, Debug)]
+pub struct ThreeD {
+    pub sigma: Arc<SigmaGrid>,
+    /// Temperature (°C) at rest at height z (m, negative below the surface)
+    pub temperature: fn(f64) -> f64,
+    /// Salinity at rest
+    pub salinity: f64,
+    /// Bed roughness z₀ of the log-layer drag (m)
+    pub roughness: f64,
+    /// Horizontal viscosity: constant background (m²/s) and Smagorinsky coefficient
+    pub viscosity: f64,
+    pub smagorinsky: f64,
+    /// The vertical section drawn through the water: its two ends (m, mesh coordinates)
+    pub section: [[f64; 2]; 2],
+    /// Surface light over the site, for the lice larvae
+    pub light: ClearSkyLight,
 }
 
 pub struct Scenario {
@@ -76,6 +109,10 @@ pub struct Scenario {
     pub farm: [f64; 2],
     pub close_up: CloseUp,
     pub forcing: Forcing,
+    /// The 3D model, for a scenario run in 3D
+    pub three_d: Option<ThreeD>,
+    /// The mesh's periods along x and y (m), for a periodic mesh
+    pub periodic: Option<[f64; 2]>,
 }
 
 impl Scenario {
@@ -98,6 +135,8 @@ impl Scenario {
             farm: FARM,
             close_up: CloseUp {
                 distance: 420.0,
+                yaw: 0.7,
+                pitch: 0.5,
                 arrow_spacing: 25.0,
                 arrow_radius: 500.0,
             },
@@ -107,11 +146,74 @@ impl Scenario {
                 coriolis: 1.2e-4,
                 ramp: 3600.0,
             },
+            three_d: None,
+            periodic: None,
             mesh,
             ops,
             geom,
             bathymetry,
         })
+    }
+
+    /// The stratified tidal channel of `examples/farm_3d.rs` (see the module docs) on
+    /// `levels` σ-levels, with the larvae's light at Mausund on `clock`.
+    pub fn farm_channel(order: usize, levels: usize, clock: ModelClock) -> Self {
+        const LX: f64 = 6_000.0;
+        const LY: f64 = 600.0;
+        const DX: f64 = 60.0;
+        const DEPTH: f64 = 40.0;
+        const FARM: [f64; 2] = [3_000.0, 300.0];
+        /// Mausund, off Frøya (longitude, latitude): where the sun is
+        const SITE: [f64; 2] = [8.67, 63.87];
+
+        let (nx, ny) = ((LX / DX).round() as usize, (LY / DX).round() as usize);
+        let mesh = Arc::new(Mesh2D::channel_periodic_x(0.0, LX, 0.0, LY, nx, ny));
+        let ops = Arc::new(DGOperators2D::new(order));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -DEPTH));
+        let cages = [-60.0, 60.0]
+            .map(|dy| NetCage::circular([FARM[0], FARM[1] + dy], 25.0, 20.0, 0.25))
+            .to_vec();
+        Self {
+            name: "Farm channel, 3D: M2 0.5 m/s, 2 C thermocline at 10 m, two 50 m cages".into(),
+            // The section runs along the flow through the first cage
+            three_d: Some(ThreeD {
+                sigma: Arc::new(SigmaGrid::new(levels, UniformStretching)),
+                // 10 °C below, 12 °C above, a smooth step at 10 m
+                temperature: |z| 11.0 + (0.5 * (z + 10.0)).tanh(),
+                salinity: 35.0,
+                roughness: 0.005,
+                viscosity: 1.0,
+                smagorinsky: 0.2,
+                section: [
+                    [FARM[0] - 600.0, FARM[1] - 60.0],
+                    [FARM[0] + 600.0, FARM[1] - 60.0],
+                ],
+                light: ClearSkyLight::new(clock, SITE[0], SITE[1]),
+            }),
+            cages,
+            // Periodic along the channel only
+            periodic: Some([LX, f64::INFINITY]),
+            farm: FARM,
+            // Low, from the second cage's side, so the section stands behind the cages
+            close_up: CloseUp {
+                distance: 800.0,
+                yaw: 2.6,
+                pitch: 0.28,
+                arrow_spacing: 25.0,
+                arrow_radius: 600.0,
+            },
+            forcing: Forcing {
+                tide: Tide::BodyForceM2(0.5),
+                manning: 0.0,
+                coriolis: 1.2e-4,
+                ramp: 3600.0,
+            },
+            mesh,
+            ops,
+            geom,
+            bathymetry,
+        }
     }
 
     /// Frøya–Smøla–Hitra on the coastline mesh `mesh_path`, with the elevation model
@@ -200,6 +302,8 @@ impl Scenario {
             farm: [x, y],
             close_up: CloseUp {
                 distance: 6_000.0,
+                yaw: 0.7,
+                pitch: 0.5,
                 arrow_spacing: 250.0,
                 arrow_radius: 5_000.0,
             },
@@ -210,6 +314,8 @@ impl Scenario {
                 // A spring tide squeezed into one hour overshoots (TODO P1.4)
                 ramp: 3.0 * 3600.0,
             },
+            three_d: None,
+            periodic: None,
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
             geom: Arc::new(geom),
