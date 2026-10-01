@@ -3,8 +3,8 @@
 //!
 //! A stratified fjord-like basin (bed 20 → 200 m across a sill, a tanh
 //! pycnocline, Coriolis, wind, quadratic bottom drag, Smagorinsky viscosity
-//! of the shear, Pacanowski–Philander mixing, the horizontal Kuzmin tracer
-//! limiter) stepped with [`ModeSplitIntegrator`]. Every [`ModeSplitPhysics`]
+//! of the shear, Pacanowski–Philander mixing or GLS k-ε (`mixing=gls`), the
+//! horizontal Kuzmin tracer limiter) stepped with [`ModeSplitIntegrator`]. Every [`ModeSplitPhysics`]
 //! call is timed through a wrapper; the barotropic pass and the splitter's
 //! own work are the rest of the step.
 //!
@@ -23,7 +23,8 @@ use dg_rs::mesh::Mesh2D;
 use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{
-    BottomDrag3D, Forcing, Hydrostatic3D, LinearEOS, PacanowskiPhilanderMixing, PhysicsBuilder,
+    BottomDrag3D, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, PacanowskiPhilanderMixing,
+    PhysicsBuilder, VerticalMixing,
 };
 use dg_rs::solver::rhs::BarotropicFlux;
 use dg_rs::solver::state::Solution3D;
@@ -146,6 +147,11 @@ fn main() {
     let steps: usize = arg("steps", 20);
     let dt: f64 = arg("dt", 60.0);
     let cs: f64 = arg("cs", 0.5);
+    let mixing: Box<dyn VerticalMixing> = match arg("mixing", "pp".to_string()).as_str() {
+        "pp" => Box::new(PacanowskiPhilanderMixing::new(1e-2, 1e-5, 1e-5, G, RHO0)),
+        "gls" => Box::new(GlsMixing::k_epsilon().with_roughness(0.02, 0.005)),
+        other => panic!("mixing={other}: expected pp or gls"),
+    };
 
     let (length, width) = (40e3, 10e3);
     let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, nx, ny));
@@ -182,7 +188,7 @@ fn main() {
         bathymetry.clone(),
         Arc::new(CoriolisSource2D::f_plane(f)),
         LinearEOS::default(),
-        PacanowskiPhilanderMixing::new(1e-2, 1e-5, 1e-5, G, RHO0),
+        mixing,
         swe,
         forcing,
         G,

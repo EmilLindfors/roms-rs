@@ -2909,7 +2909,7 @@ mod tests {
 
     /// TODO P4.5 gate: the parallel 3D kernels give the serial result bit for
     /// bit. A stratified basin over a sloping bed with every 3D term on
-    /// (Coriolis, wind, log-layer bottom drag, Pacanowski–Philander mixing,
+    /// (Coriolis, wind, log-layer bottom drag, GLS k-ε mixing,
     /// Smagorinsky viscosity of the shear, Akima momentum advection, the
     /// horizontal Kuzmin limiter), stepped on one thread and on four: every
     /// field of the state is identical. The kernels write disjoint element
@@ -2919,7 +2919,7 @@ mod tests {
     #[cfg(feature = "parallel")]
     #[test]
     fn the_3d_step_does_not_depend_on_the_thread_count() {
-        use crate::physics::PacanowskiPhilanderMixing;
+        use crate::physics::GlsMixing;
         use crate::solver::rhs::VerticalAdvection;
         use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
         use crate::vertical::SongHaidvogelStretching;
@@ -2957,7 +2957,7 @@ mod tests {
                 bathymetry.clone(),
                 Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
                 LinearEOS::default(),
-                PacanowskiPhilanderMixing::new(1e-2, 1e-5, 1e-5, G, RHO0),
+                GlsMixing::k_epsilon().with_roughness(0.02, 0.005),
                 swe,
                 forcing,
                 G,
@@ -3020,6 +3020,8 @@ mod tests {
             ("S", &serial.salt, &parallel.salt),
             ("rho", &serial.rho, &parallel.rho),
             ("Av", &serial.eddy_viscosity, &parallel.eddy_viscosity),
+            ("k", &serial.tke, &parallel.tke),
+            ("psi", &serial.gls, &parallel.gls),
             ("eta", &serial.eta.data, &parallel.eta.data),
             ("ubar", &serial.ubar.data, &parallel.ubar.data),
             ("vbar", &serial.vbar.data, &parallel.vbar.data),

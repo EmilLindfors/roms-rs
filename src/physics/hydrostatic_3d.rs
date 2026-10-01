@@ -983,6 +983,7 @@ where
             dt,
             &self.mixing,
             &self.forcing,
+            self.g,
             self.rho0,
             self.min_column_depth,
             bottom_drag,

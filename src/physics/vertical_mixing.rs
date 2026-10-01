@@ -13,6 +13,27 @@ pub struct Column<'a> {
     pub v: &'a [f64],
     /// Potential density at cell centers, length N
     pub rho: &'a [f64],
+    /// Gravitational acceleration (m/s²) and reference density (kg/m³) of
+    /// the model: `N² = −(g/ρ₀) ∂ρ/∂z`.
+    pub g: f64,
+    pub rho0: f64,
+    /// Friction velocities `u* = √(|τ|/ρ₀)` (m/s) of the surface stress and
+    /// of the bottom stress (prescribed plus drag) on this column.
+    pub surface_friction_velocity: f64,
+    pub bottom_friction_velocity: f64,
+}
+
+/// Prognostic turbulence of one column at its w-points (bottom to surface,
+/// length N+1 each), for closures that carry it
+/// ([`VerticalMixing::initial_turbulence`]); empty slices otherwise.
+pub struct Turbulence<'a> {
+    /// Turbulent kinetic energy `k` (m²/s²).
+    pub tke: &'a mut [f64],
+    /// The closure's length-scale variable (GLS `ψ`).
+    pub gls: &'a mut [f64],
+    /// Work space the closure may resize and use; the caller keeps it across
+    /// columns, so nothing is allocated after the first.
+    pub scratch: &'a mut Vec<f64>,
 }
 
 /// Surface and bottom forcing for mixing.
@@ -52,6 +73,57 @@ pub trait VerticalMixing: Send + Sync {
         av: &mut [f64],
         kt: &mut [f64],
     );
+
+    /// The initial `[k, ψ]` of a closure with prognostic turbulence (stored
+    /// in `Solution3D::tke`, `Solution3D::gls`), `None` for a diagnostic one.
+    fn initial_turbulence(&self) -> Option<[f64; 2]> {
+        None
+    }
+
+    /// Advance the column's turbulence over `dt`, then write `av` and `kt`
+    /// from it. The vertical diffusion calls this once per column and step,
+    /// before its implicit solve. Diagnostic closures ignore `dt` and
+    /// `turbulence`: [`Self::compute_mixing_into`].
+    fn step_mixing_into(
+        &self,
+        column: &Column,
+        forcing: &Forcing,
+        _dt: f64,
+        _turbulence: Turbulence<'_>,
+        av: &mut [f64],
+        kt: &mut [f64],
+    ) {
+        self.compute_mixing_into(column, forcing, av, kt);
+    }
+}
+
+/// A boxed closure, chosen at run time (`Box<dyn VerticalMixing>`).
+impl<M: VerticalMixing + ?Sized> VerticalMixing for Box<M> {
+    fn compute_mixing_into(
+        &self,
+        column: &Column,
+        forcing: &Forcing,
+        av: &mut [f64],
+        kt: &mut [f64],
+    ) {
+        (**self).compute_mixing_into(column, forcing, av, kt);
+    }
+
+    fn initial_turbulence(&self) -> Option<[f64; 2]> {
+        (**self).initial_turbulence()
+    }
+
+    fn step_mixing_into(
+        &self,
+        column: &Column,
+        forcing: &Forcing,
+        dt: f64,
+        turbulence: Turbulence<'_>,
+        av: &mut [f64],
+        kt: &mut [f64],
+    ) {
+        (**self).step_mixing_into(column, forcing, dt, turbulence, av, kt);
+    }
 }
 
 /// Constant vertical mixing.
@@ -213,6 +285,10 @@ mod tests {
             u: &u,
             v: &v,
             rho: &rho,
+            g: 9.81,
+            rho0: 1025.0,
+            surface_friction_velocity: 0.0,
+            bottom_friction_velocity: 0.0,
         };
 
         let forcing = Forcing {
@@ -258,6 +334,10 @@ mod tests {
             u: &u,
             v: &v,
             rho: &rho,
+            g: 9.81,
+            rho0: 1025.0,
+            surface_friction_velocity: 0.0,
+            bottom_friction_velocity: 0.0,
         };
 
         let forcing = Forcing {
@@ -297,6 +377,10 @@ mod tests {
             u: &u,
             v: &v,
             rho: &rho,
+            g: 9.81,
+            rho0: 1025.0,
+            surface_friction_velocity: 0.0,
+            bottom_friction_velocity: 0.0,
         };
 
         let forcing = Forcing {
@@ -347,6 +431,10 @@ mod tests {
             u: &u,
             v: &v,
             rho: &rho,
+            g: 9.81,
+            rho0: 1025.0,
+            surface_friction_velocity: 0.0,
+            bottom_friction_velocity: 0.0,
         };
 
         let forcing = Forcing {
