@@ -272,9 +272,9 @@ where
     /// A surface stress that varies from column to column, such as a
     /// weather model's wind ([`crate::source::GriddedAtmosphere2D::split_for_3d`]),
     /// added to the uniform `Forcing::surface_stress`. It reaches the depth
-    /// mean through `G`, the shear through the vertical diffusion's surface
-    /// flux, and the turbulence closure through the surface friction velocity
-    /// (see [`crate::physics::surface_stress`]). The 2D module must not carry
+    /// mean through `G`, and the shear, and with it the turbulence closure's
+    /// shear production, through the vertical diffusion's surface flux (see
+    /// [`crate::physics::surface_stress`]). The 2D module must not carry
     /// the same wind.
     pub fn with_surface_stress(mut self, stress: impl SurfaceStress3D + 'static) -> Self {
         self.surface_stress = Some(Arc::new(stress));

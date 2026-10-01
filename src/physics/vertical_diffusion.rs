@@ -806,6 +806,80 @@ mod gls_gates {
         assert!(wall_length > 0.95, "l/κz {wall_length} at 80 levels");
     }
 
+    /// Wind against a log-layer drag, unstratified, to steady state: a layer
+    /// of constant stress `u*²` from the surface to the bed. The surface's
+    /// friction velocity only sets the diagnostic `k` at the boundary
+    /// w-points; the wind reaches the turbulence through the shear
+    /// production of its momentum flux. At equilibrium the interior must
+    /// hold the log layer's `k = u*²/(c_μ⁰)²` and carry the stress as
+    /// `ν ∂u/∂z = u*²` at every w-point: measured to 2.9e-11 / 2.9e-11 (k-ε),
+    /// 1.4e-11 / 1.3e-11 (k-ω), 2.4e-10 / 2.3e-10 (generic) after 48 h
+    /// (7e-3 to 1.2e-2 after 12 h).
+    ///
+    /// From rest (`k = k_min`) the top interior w-point needs ≈ 36 h/u* to
+    /// reach 90 % of that `k`, for any Δt (h the top layer's thickness:
+    /// 3 h at 3 m layers and u* = 1 cm/s, 20 min at 0.3 m); a surface
+    /// condition with `u*` in it (wave injection, Charnock roughness) would
+    /// shorten that spin-up.
+    #[test]
+    fn a_constant_stress_layer_holds_the_log_layer_turbulence() {
+        let (depth, n_levels, u_star, z0, dt, rho0) = (10.0, 20, 0.01, 0.02, 60.0, 1025.0);
+        let sigma = SigmaGrid::uniform(n_levels);
+        let bathymetry = Bathymetry2D::constant(1, 1, -depth);
+        let dz = depth / n_levels as f64;
+        let z_b = (1.0 + sigma.sigma_rho()[0]) * depth;
+        let forcing = Forcing {
+            surface_stress: [rho0 * u_star * u_star, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        };
+        let drag = BottomDrag3D::log_layer(z0).with_bounds(0.0, 1.0);
+        for gls in [
+            GlsMixing::k_epsilon(),
+            GlsMixing::k_omega(),
+            GlsMixing::generic(),
+        ] {
+            let gls = gls.with_roughness(z0, z0).with_background(0.0, 0.0);
+            let k_log = u_star * u_star / gls.cm0().powi(2);
+            let mut state = Solution3D::new(1, 1, n_levels);
+            state.rho.fill(rho0);
+            for _ in 0..(48.0 * 3600.0 / dt) as usize {
+                let rate = drag.rate(z_b, state.u[0].abs());
+                apply_vertical_diffusion(
+                    &mut state,
+                    &sigma,
+                    &bathymetry,
+                    dt,
+                    &gls,
+                    &forcing,
+                    None,
+                    G,
+                    rho0,
+                    0.0,
+                    Some(&[rate]),
+                );
+            }
+            let name = format!("{:?}", gls.parameters());
+            let k_err = state
+                .tke
+                .iter()
+                .map(|k| (k / k_log - 1.0).abs())
+                .fold(0.0, f64::max);
+            // ν at w-point j (between layers j − 1 and j) is stored with layer j
+            let stress_err = (1..n_levels)
+                .map(|j| {
+                    let shear = (state.u[j] - state.u[j - 1]) / dz;
+                    (state.eddy_viscosity[j] * shear / (u_star * u_star) - 1.0).abs()
+                })
+                .fold(0.0, f64::max);
+            assert!(k_err < 1e-8, "{name}: k off u*²/(c_μ⁰)² by {k_err:.2e}");
+            assert!(
+                stress_err < 1e-8,
+                "{name}: ν ∂u/∂z off u*² by {stress_err:.2e}"
+            );
+        }
+    }
+
     /// Convection without wind or shear: cold water over warm (unstable,
     /// ΔT = 0.5 °C over the top 10 m of a 40 m column) mixes itself through
     /// buoyancy production (`c₃⁺`), from the minimum turbulence, with no
@@ -878,9 +952,10 @@ mod gls_gates {
     }
 
     /// A surface stress field reaches every column on its own: the momentum
-    /// flux and the friction velocity of the GLS surface boundary. Three
-    /// columns of a stratified layer under the uniform stress (0.05, 0) Pa
-    /// plus their entries of the field, (0.05, 0), (−0.05, 0) and (0, 0.08):
+    /// flux, and the friction velocity of the GLS surface boundary values
+    /// (diagnostic, see the constant-stress gate above). Three columns of a
+    /// stratified layer under the uniform stress (0.05, 0) Pa plus their
+    /// entries of the field, (0.05, 0), (−0.05, 0) and (0, 0.08):
     /// each ends bit for bit where a lone column under its total stress does,
     /// in velocity, temperature, `k` and `ψ`.
     #[test]
