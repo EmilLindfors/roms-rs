@@ -827,6 +827,8 @@ impl Integrable for Solution3D {
             &mut self.temp,
             &mut self.salt,
             &mut self.rho,
+            &mut self.tke,
+            &mut self.gls,
         ] {
             update_values(field, |x| *x *= c);
         }
@@ -848,6 +850,13 @@ impl Integrable for Solution3D {
             (&mut self.rho, &other.rho),
         ] {
             update_with(x, y, |x, y| *x += c * y);
+        }
+        // The turbulence of a prognostic closure (empty without one): an
+        // empty `other` adds nothing
+        for (x, y) in [(&mut self.tke, &other.tke), (&mut self.gls, &other.gls)] {
+            if !y.is_empty() {
+                update_with(x, y, |x, y| *x += c * y);
+            }
         }
     }
 

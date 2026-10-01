@@ -37,7 +37,10 @@
 //!    advection) get the pass's `DU_avg2` and `∂η/∂t`, so that the layers
 //!    carry exactly the water the free surface moved: constancy and
 //!    conservation of the tracers and of the layer momentum (see
-//!    [`crate::solver::rhs::transport_3d`]).
+//!    [`crate::solver::rhs::transport_3d`]). The turbulence of a prognostic
+//!    closure (`Solution3D::tke`, `gls`, at the w-points) is carried the
+//!    same way, as inventories over the w-cells
+//!    ([`crate::solver::rhs::w_cell_thicknesses`]).
 //! 4. **Implicit vertical terms** (diffusion with the surface and bottom
 //!    stresses), then the depth mean of `u` is reset to `ū`.
 //!
@@ -79,7 +82,7 @@ use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
 use crate::solver::rhs::{
-    BarotropicFlux, inventory_to_concentration, tracer_to_inventory, transport_divergence_element,
+    BarotropicFlux, from_inventory, to_inventory, transport_divergence_element, w_cell_thicknesses,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -246,8 +249,10 @@ pub trait ModeSplitPhysics {
     /// move with the layer volume fluxes (advection) to `out.u` and `out.v`,
     /// which the splitter has turned into inventory tendencies, and overwrite
     /// `out.temp` and `out.salt` with the tracers' inventory tendencies
-    /// `∂(H_z C)/∂t`. The layer fluxes are corrected to the barotropic
-    /// transport of the step, `barotropic` (see
+    /// `∂(H_z C)/∂t`, and `out.tke` and `out.gls` (sized like `state`'s, empty
+    /// without a prognostic closure) with the turbulence's over the w-cells,
+    /// `∂(H_w φ)/∂t` (zero to leave it to the columns). The layer fluxes are
+    /// corrected to the barotropic transport of the step, `barotropic` (see
     /// [`crate::solver::rhs::transport_3d`]). `state` holds velocities and
     /// concentrations.
     fn transport_rhs_into(
@@ -558,6 +563,8 @@ struct Buffers {
     /// Elements where the pass kept only the element balance: their
     /// inventory fields are element means per level for the step.
     element_means: Vec<bool>,
+    /// σ-thicknesses of the w-cells, for the turbulence's inventories.
+    d_sigma_w: Vec<f64>,
     /// `∇·DU_avg2` of the step.
     transport_divergence: DGSolution2D,
     /// Barotropic transport during the pass.
@@ -600,6 +607,7 @@ impl Buffers {
             concentrations: Solution3D::new(ne, nn, state.n_levels),
             last_values: InventoryFields::of(state),
             element_means: vec![false; ne],
+            d_sigma_w: vec![0.0; state.n_levels + 1],
             transport_divergence: DGSolution2D::new(ne, nn),
             q: SWESolution2D::new(ne, nn),
             q_avg: SWESolution2D::new(ne, nn),
@@ -707,6 +715,7 @@ impl ModeSplitIntegrator {
             concentrations,
             last_values: lent_values,
             element_means,
+            d_sigma_w,
             transport_divergence,
             q,
             q_avg,
@@ -878,18 +887,35 @@ impl ModeSplitIntegrator {
                 && residual * dt > DEPTH_ROUND_OFF * depth;
         }
         let means: &[bool] = element_means;
+        w_cell_thicknesses(sigma.d_sigma(), d_sigma_w);
+        // The σ-thicknesses of the cells of each inventory field
+        let cells = [sigma.d_sigma(), &d_sigma_w[..]];
+        let cells_of = |field: usize| cells[usize::from(field >= N_LAYER_FIELDS)];
         // Inventories of `s` → velocities and concentrations in `out` (which
         // holds the last values, kept where there is no water)
         let to_values = |s: &Solution3D, out: &mut InventoryFields| {
             let eta = &s.eta.data;
-            for (q, out) in inventory_fields(s).into_iter().zip(out.fields_mut()) {
-                inventory_to_concentration(q, eta, sigma, bathymetry, geom, means, out);
+            let fields = inventory_fields(s).into_iter().zip(out.fields_mut());
+            for (field, (q, out)) in fields.enumerate() {
+                if !q.is_empty() {
+                    from_inventory(q, eta, cells_of(field), bathymetry, geom, means, out);
+                }
             }
         };
         let to_inventories = |s: &mut Solution3D| {
             let eta = &s.eta.data;
-            for field in [&mut s.u, &mut s.v, &mut s.temp, &mut s.salt] {
-                tracer_to_inventory(field, eta, sigma, bathymetry);
+            let fields = [
+                &mut s.u,
+                &mut s.v,
+                &mut s.temp,
+                &mut s.salt,
+                &mut s.tke,
+                &mut s.gls,
+            ];
+            for (field, q) in fields.into_iter().enumerate() {
+                if !q.is_empty() {
+                    to_inventory(q, eta, cells_of(field), bathymetry);
+                }
             }
         };
         // Lent to both stage closures for the step
@@ -917,8 +943,10 @@ impl ModeSplitIntegrator {
                 }
                 // Velocity tendencies → inventory tendencies, then the
                 // advection's
-                tracer_to_inventory(&mut out.u, &s.eta.data, sigma, bathymetry);
-                tracer_to_inventory(&mut out.v, &s.eta.data, sigma, bathymetry);
+                to_inventory(&mut out.u, &s.eta.data, sigma.d_sigma(), bathymetry);
+                to_inventory(&mut out.v, &s.eta.data, sigma.d_sigma(), bathymetry);
+                out.tke.resize(s.tke.len(), 0.0);
+                out.gls.resize(s.gls.len(), 0.0);
                 physics.transport_rhs_into(concentrations, time, barotropic_flux, out);
                 // w and rho are diagnostics, refreshed after the stages
                 out.w.fill(0.0);
@@ -1051,38 +1079,54 @@ fn set_column_sums(sigma: &SigmaGrid, field: &mut [f64], rate: &DGSolution2D) {
     }
 }
 
-/// The fields a 3D step carries as inventories `H_z φ`: `u, v, temp, salt`.
-fn inventory_fields(state: &Solution3D) -> [&Vec<f64>; 4] {
-    [&state.u, &state.v, &state.temp, &state.salt]
+/// The fields a 3D step carries as inventories `H φ`: `u, v, temp, salt`
+/// over the layers, then the turbulence `tke, gls` over the w-cells (empty
+/// without a prognostic closure).
+fn inventory_fields(state: &Solution3D) -> [&Vec<f64>; 6] {
+    [
+        &state.u,
+        &state.v,
+        &state.temp,
+        &state.salt,
+        &state.tke,
+        &state.gls,
+    ]
 }
+
+/// How many of [`inventory_fields`] live on the layers.
+const N_LAYER_FIELDS: usize = 4;
 
 /// Their values, kept between the stages of a step.
 #[derive(Default)]
-struct InventoryFields([Vec<f64>; 4]);
+struct InventoryFields([Vec<f64>; 6]);
 
 impl InventoryFields {
     fn of(state: &Solution3D) -> Self {
-        let mut fields = Self(std::array::from_fn(|_| vec![0.0; state.u.len()]));
+        let mut fields = Self::default();
         fields.copy_from_state(state);
         fields
     }
 
-    fn fields_mut(&mut self) -> &mut [Vec<f64>; 4] {
+    fn fields_mut(&mut self) -> &mut [Vec<f64>; 6] {
         &mut self.0
     }
 
+    /// The turbulence is allocated by the closure's first step, so its
+    /// length can change between steps.
     fn copy_from_state(&mut self, state: &Solution3D) {
         for (a, b) in self.0.iter_mut().zip(inventory_fields(state)) {
-            a.copy_from_slice(b);
+            a.clone_from(b);
         }
     }
 
     fn copy_to_state(&self, state: &mut Solution3D) {
-        let [u, v, temp, salt] = &self.0;
+        let [u, v, temp, salt, tke, gls] = &self.0;
         state.u.copy_from_slice(u);
         state.v.copy_from_slice(v);
         state.temp.copy_from_slice(temp);
         state.salt.copy_from_slice(salt);
+        state.tke.copy_from_slice(tke);
+        state.gls.copy_from_slice(gls);
     }
 }
 

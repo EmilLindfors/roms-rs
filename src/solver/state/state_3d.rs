@@ -68,7 +68,9 @@ pub struct Solution3D {
     /// ([`crate::physics::GlsMixing`]) at the w-points,
     /// `[n_elements][n_nodes][n_levels + 1]`, bottom to surface; empty
     /// without one (the vertical diffusion allocates it on first use).
-    /// Stepped once per baroclinic step, not by the RK stages.
+    /// Advected by the 3D stages (as an inventory over the w-cells, see
+    /// `crate::physics::Hydrostatic3D::with_turbulence_advection`), then
+    /// stepped by the closure once per baroclinic step.
     pub tke: Vec<f64>,
     /// The closure's length-scale variable `ψ` (GLS), like [`Self::tke`].
     pub gls: Vec<f64>,

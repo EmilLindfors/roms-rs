@@ -4,7 +4,9 @@
 //! A stratified fjord-like basin (bed 20 → 200 m across a sill, a tanh
 //! pycnocline, Coriolis, wind, quadratic bottom drag, Smagorinsky viscosity
 //! of the shear, Pacanowski–Philander mixing or GLS k-ε (`mixing=gls`), the
-//! horizontal Kuzmin tracer limiter) stepped with [`ModeSplitIntegrator`]. Every [`ModeSplitPhysics`]
+//! horizontal Kuzmin tracer limiter) stepped with [`ModeSplitIntegrator`];
+//! with GLS, `turbulence=local` keeps `k` and `ψ` in their columns instead
+//! of advecting them. Every [`ModeSplitPhysics`]
 //! call is timed through a wrapper; the barotropic pass and the splitter's
 //! own work are the rest of the step.
 //!
@@ -26,7 +28,7 @@ use dg_rs::physics::{
     BottomDrag3D, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, PacanowskiPhilanderMixing,
     PhysicsBuilder, VerticalMixing,
 };
-use dg_rs::solver::rhs::BarotropicFlux;
+use dg_rs::solver::rhs::{BarotropicFlux, VerticalAdvection};
 use dg_rs::solver::state::Solution3D;
 use dg_rs::solver::{SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D};
 use dg_rs::source::CoriolisSource2D;
@@ -199,6 +201,11 @@ fn main() {
         RHO0,
     )
     .with_bottom_drag(BottomDrag3D::log_layer(0.005))
+    .with_turbulence_advection(match arg("turbulence", "advected".to_string()).as_str() {
+        "advected" => Some(VerticalAdvection::LimitedAkima),
+        "local" => None,
+        other => panic!("turbulence={other}: expected advected or local"),
+    })
     .with_smagorinsky_viscosity(cs)
     .with_tracer_limiter(TracerLimiter3DConfig {
         limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },

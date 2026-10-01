@@ -40,7 +40,7 @@
 //! column. It integrates to zero over the element (the element balance), so
 //! every layer's continuity still holds for the element as a whole, and the
 //! mode splitter carries the tracers of those elements as element means per
-//! level ([`inventory_to_concentration`]): constant and conservative there
+//! level ([`from_inventory`]): constant and conservative there
 //! too. This is what makes 3D wetting and drying work.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
@@ -379,6 +379,70 @@ impl LayerTransport {
         );
         self.surface_residual = residual.max(0.0);
     }
+
+    /// The transports of the control volumes around the w-points of `layers`
+    /// (the w-cells), for advecting a field that lives at the w-points (the
+    /// turbulence of [`crate::physics::GlsMixing`]; ROMS `gls_corstep`).
+    /// `self` must have one level more than `layers`.
+    ///
+    /// The w-cell of an interior w-point spans from the centre of the layer
+    /// below to the centre of the layer above; those of the bed and the
+    /// surface are the lower half of the bed layer and the upper half of the
+    /// top layer ([`w_cell_thicknesses`]). Each carries half of the
+    /// horizontal transport of the two layers it overlaps, nodally and on
+    /// the faces, and passes the mean of the layer's two `Ω` through a layer
+    /// centre (none through the bed and the surface). Averaging the
+    /// continuity of the two layers gives the w-cell's, so a field advected
+    /// with these fluxes keeps the constancy and conservation of
+    /// [`apply_tracer_transport_3d`].
+    pub fn stagger_from(&mut self, layers: &LayerTransport) {
+        let nl = layers.n_levels;
+        assert_eq!(self.n_levels, nl + 1, "w-cells of {nl} layers");
+        let nw = nl + 1;
+        for (w_cells, layer_values) in [
+            (&mut self.hu, &layers.hu),
+            (&mut self.hv, &layers.hv),
+            (&mut self.face, &layers.face),
+        ] {
+            for (w, l) in w_cells
+                .chunks_exact_mut(nw)
+                .zip(layer_values.chunks_exact(nl))
+            {
+                w[0] = 0.5 * l[0];
+                for j in 1..nl {
+                    w[j] = 0.5 * (l[j - 1] + l[j]);
+                }
+                w[nl] = 0.5 * l[nl - 1];
+            }
+        }
+        for (w, omega) in self
+            .omega
+            .chunks_exact_mut(nw + 1)
+            .zip(layers.omega.chunks_exact(nl + 1))
+        {
+            w[0] = 0.0;
+            for l in 0..nl {
+                w[l + 1] = 0.5 * (omega[l] + omega[l + 1]);
+            }
+            w[nw] = 0.0;
+        }
+        w_cell_thicknesses(&layers.d_sigma, &mut self.d_sigma);
+        self.surface_residual = layers.surface_residual;
+    }
+}
+
+/// σ-thicknesses of the w-cells of layers of σ-thickness `d_sigma` into
+/// `out` (one more): half the bed layer, the mean of each pair of adjacent
+/// layers, half the top layer (see [`LayerTransport::stagger_from`]). They
+/// sum to one, and a w-cell's thickness is `D` times its value.
+pub fn w_cell_thicknesses(d_sigma: &[f64], out: &mut [f64]) {
+    let nl = d_sigma.len();
+    assert_eq!(out.len(), nl + 1, "w-cells of {nl} layers");
+    out[0] = 0.5 * d_sigma[0];
+    for j in 1..nl {
+        out[j] = 0.5 * (d_sigma[j - 1] + d_sigma[j]);
+    }
+    out[nl] = 0.5 * d_sigma[nl - 1];
 }
 
 /// One element's layers of [`LayerTransport::compute`]: a layer's nodal
@@ -438,16 +502,12 @@ pub(crate) fn layer_thickness_of(depth: f64, d_sigma: f64) -> f64 {
 /// left as they were: it holds no water to define a concentration.
 const DRY_DEPTH: f64 = 1e-6;
 
-/// Multiply a tracer by the layer thickness of `η`: concentration `C` →
-/// inventory `H_z C`.
-pub fn tracer_to_inventory(
-    tracer: &mut [f64],
-    eta: &[f64],
-    sigma: &SigmaGrid,
-    bathymetry: &Bathymetry2D,
-) {
-    let (nn, nl) = (bathymetry.n_nodes, sigma.n_levels());
-    let d_sigma = sigma.d_sigma();
+/// Multiply a field by the thickness of its cells under `η`: concentration
+/// `C` → inventory `H_z C`, with `H_z = D·Δσ` for the σ-thicknesses
+/// `d_sigma` of the cells in a column (the layers' [`SigmaGrid::d_sigma`],
+/// or the w-cells' of [`w_cell_thicknesses`] for a field at the w-points).
+pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry: &Bathymetry2D) {
+    let (nn, nl) = (bathymetry.n_nodes, d_sigma.len());
     let n_elements = bathymetry.n_elements;
     for_each_block(
         n_elements,
@@ -468,7 +528,8 @@ pub fn tracer_to_inventory(
     );
 }
 
-/// Inventory `q = H_z C` → concentration, written to `out`.
+/// Inventory `q = H_z C` → concentration, written to `out`, for cells of
+/// σ-thickness `d_sigma` in a column (as [`to_inventory`]).
 ///
 /// - Elements not marked in `element_means`: `C = q / H_z` at every node.
 /// - Marked elements: per level, the element's inventory over its volume,
@@ -483,21 +544,20 @@ pub fn tracer_to_inventory(
 ///   already holds (the last concentration) instead of dividing by a
 ///   vanishing layer.
 ///
-/// Converting back with [`tracer_to_inventory`] keeps each element's
+/// Converting back with [`to_inventory`] keeps each element's
 /// inventory per level exactly.
 #[allow(clippy::too_many_arguments)]
-pub fn inventory_to_concentration(
+pub fn from_inventory(
     q: &[f64],
     eta: &[f64],
-    sigma: &SigmaGrid,
+    d_sigma: &[f64],
     bathymetry: &Bathymetry2D,
     geom: &GeometricFactors2D,
     element_means: &[bool],
     out: &mut [f64],
 ) {
-    let nl = sigma.n_levels();
+    let nl = d_sigma.len();
     let nn = bathymetry.n_nodes;
-    let d_sigma = sigma.d_sigma();
     let n_elements = bathymetry.n_elements;
     for_each_block(
         n_elements,
@@ -2285,13 +2345,13 @@ mod tests {
         marked[2] = true;
         let concentration = case.state.temp.clone();
         let mut inventory = concentration.clone();
-        tracer_to_inventory(&mut inventory, &eta, &case.sigma, &case.bathymetry);
+        to_inventory(&mut inventory, &eta, case.sigma.d_sigma(), &case.bathymetry);
         let last = vec![-1.0; concentration.len()];
         let mut out = last.clone();
-        inventory_to_concentration(
+        from_inventory(
             &inventory,
             &eta,
-            &case.sigma,
+            case.sigma.d_sigma(),
             &case.bathymetry,
             &case.geom,
             &marked,
@@ -2314,7 +2374,7 @@ mod tests {
         }
         // Element 2: one value per level, and its inventory per level kept
         let mut back = out.clone();
-        tracer_to_inventory(&mut back, &eta, &case.sigma, &case.bathymetry);
+        to_inventory(&mut back, &eta, case.sigma.d_sigma(), &case.bathymetry);
         for l in 0..nl {
             let level = |field: &[f64]| -> f64 {
                 (0..nn)
@@ -2329,6 +2389,107 @@ mod tests {
             assert!(
                 (before - after).abs() < 1e-13 * before.abs(),
                 "level {l}: {before} vs {after}"
+            );
+        }
+    }
+
+    /// The w-cells' σ-thicknesses: half the end layers, the means between,
+    /// summing to one on stretched levels.
+    #[test]
+    fn w_cells_span_the_column() {
+        let sigma = SigmaGrid::new(
+            6,
+            crate::vertical::SongHaidvogelStretching::new(5.0, 0.4, 10.0),
+        );
+        let d = sigma.d_sigma();
+        let mut w = vec![0.0; 7];
+        w_cell_thicknesses(d, &mut w);
+        assert!((w.iter().sum::<f64>() - 1.0).abs() < 1e-15);
+        assert_eq!(w[0], 0.5 * d[0]);
+        assert_eq!(w[3], 0.5 * (d[2] + d[3]));
+        assert_eq!(w[6], 0.5 * d[5]);
+    }
+
+    /// The w-cells of the layer transports ([`LayerTransport::stagger_from`])
+    /// carry the layers' water: their fluxes add up to the layers', `Ω`
+    /// vanishes at the bed and the surface, a uniform field at the w-points
+    /// changes its inventory exactly as its w-cell's thickness,
+    /// `C Δσ_w ∂η/∂t` (constancy), and a varying one keeps its inventory in
+    /// a closed basin and on a periodic mesh (conservation).
+    #[test]
+    fn w_cells_keep_constancy_and_conservation() {
+        for (case, closed) in [
+            (Case::closed(), true),
+            (Case::open(), false),
+            (Case::periodic(), true),
+        ] {
+            let layers = case.transport();
+            let (ne, nn, nl) = (
+                case.mesh.n_elements,
+                case.ops.n_nodes,
+                case.sigma.n_levels(),
+            );
+            let nw = nl + 1;
+            let mut w_cells = LayerTransport::new(ne, &case.ops, nw);
+            w_cells.stagger_from(&layers);
+            for (cells, layer) in [
+                (&w_cells.hu, &layers.hu),
+                (&w_cells.hv, &layers.hv),
+                (&w_cells.face, &layers.face),
+            ] {
+                for (w, l) in cells.chunks_exact(nw).zip(layer.chunks_exact(nl)) {
+                    let (sum_w, sum_l) = (w.iter().sum::<f64>(), l.iter().sum::<f64>());
+                    assert!((sum_w - sum_l).abs() <= 1e-14 * sum_l.abs().max(1.0));
+                }
+            }
+            for omega in w_cells.omega.chunks_exact(nw + 1) {
+                assert_eq!((omega[0], omega[nw]), (0.0, 0.0));
+            }
+
+            let c = 0.37;
+            let n = ne * nn * nw;
+            let rhs = case.tracer_rhs(&w_cells, &vec![c; n], &ExtrapolationTracerBC3D);
+            let scale = c * max_abs(case.eta_rate.iter().copied());
+            for idx in 0..ne * nn {
+                for j in 0..nw {
+                    let expected = c * w_cells.d_sigma[j] * case.eta_rate[idx];
+                    let got = rhs[idx * nw + j];
+                    assert!(
+                        (got - expected).abs() < 1e-12 * scale,
+                        "node {idx}, w-point {j}: {got:.6e} vs C·Δσ_w·∂η/∂t = {expected:.6e}"
+                    );
+                }
+            }
+
+            if !closed {
+                continue;
+            }
+            // A field that varies in x, y and z, upwind horizontally and
+            // limited-Akima vertically: the inventory tendency integrates to
+            // zero
+            let field: Vec<f64> = (0..n)
+                .map(|m| {
+                    let (idx, j) = (m / nw, m % nw);
+                    case.state.temp[idx * nl + j.min(nl - 1)] + 0.5 * j as f64
+                })
+                .collect();
+            let rhs = case.tracer_rhs(&w_cells, &field, &ExtrapolationTracerBC3D);
+            let integral = |values: &[f64]| -> f64 {
+                (0..ne)
+                    .map(|k| {
+                        let sums: Vec<f64> = (0..nn)
+                            .map(|i| values[(k * nn + i) * nw..][..nw].iter().sum())
+                            .collect();
+                        case.geom.integrate_element(k, &sums)
+                    })
+                    .sum()
+            };
+            let hu_scale = max_abs(w_cells.hu.iter().copied());
+            let scale = integral(&vec![hu_scale / 1000.0; n]) * max_abs(field.iter().copied());
+            let tendency = integral(&rhs);
+            assert!(
+                tendency.abs() < 1e-12 * scale,
+                "inventory tendency {tendency:.3e} (advective scale {scale:.3e})"
             );
         }
     }
