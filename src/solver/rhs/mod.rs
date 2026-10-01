@@ -54,7 +54,7 @@ pub use tracer_2d::{
 };
 
 // 3D Baroclinic
-pub use baroclinic::compute_pressure_gradient;
+pub use baroclinic::{BalancedReference, PressureGradientForm, compute_pressure_gradient};
 
 pub mod coriolis_3d;
 pub use coriolis_3d::apply_coriolis_3d;
@@ -70,9 +70,9 @@ pub use advection_3d::{
 
 pub mod transport_3d;
 pub use transport_3d::{
-    BarotropicFlux, LayerTransport, VerticalAdvection, apply_momentum_transport_3d,
-    apply_tracer_transport_3d, from_inventory, to_inventory, transport_divergence_element,
-    w_cell_thicknesses,
+    BarotropicFlux, LayerTransport, VerticalAdvection, advective_divergence_element,
+    apply_momentum_transport_3d, apply_tracer_transport_3d, from_inventory, to_inventory,
+    transport_divergence_element, w_cell_thicknesses,
 };
 
 pub mod viscosity_3d;
