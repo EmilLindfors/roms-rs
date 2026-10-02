@@ -850,18 +850,28 @@ pub enum VerticalAdvection {
     /// means: first order there would freeze the end layer's mean where the
     /// horizontal flow vanishes (at a wall), and a mode-1 internal seiche
     /// with a thick bed layer drifted by a third of its amplitude per period.
+    /// Its increment is bounded by the end layer's own gradient, extrapolated
+    /// from the gradients between the three end layers: kept for linear and
+    /// smoothly curved profiles, first order where the end layer sits on a
+    /// plateau over a front below it. Unbounded, the water leaving such a
+    /// layer was cooler than its mean (a warm one), and the warm water
+    /// flowing in along it carried its mean past the column's range: a light
+    /// gravity current's head in a P2 lock exchange 2.4e-2 °C above it.
     ///
     /// Monotone in the interior: no new extrema up to a vertical Courant
     /// number `|Ω|Δt/H_z` of ½ (SSP-RK3 inherits the forward-Euler bound).
-    /// The end layers' means can leave the column's range slightly, as the
-    /// water at the bed or the surface is carried into the layer above or
-    /// below. The limiter adds some diffusion at extrema and fronts.
+    /// The end layers' means can still leave the column's range where a
+    /// profile is linear to the end, as the water at the bed or the surface
+    /// beyond the end layer's mean is carried into the layer above or below
+    /// (that is the profile, not an overshoot). The limiter adds some
+    /// diffusion at extrema and fronts.
     Tvd,
     /// [`Self::Akima`]'s surface values under [`Self::Tvd`]'s limiter: the
     /// increment over the upwind layer's mean at most the upwind and
     /// downwind differences and zero at an extremum (out of an end layer,
-    /// the value between the two layers'), i.e. bounded by the layers below
-    /// and above. Where a profile is smooth and monotone Akima's value lies
+    /// the end layer's own extrapolated gradient takes the upwind
+    /// difference's place, as in [`Self::Tvd`]), i.e. bounded by the layers
+    /// below and above. Where a profile is smooth and monotone Akima's value lies
     /// within those bounds and is kept. At the foot of a front, where the
     /// upwind layer's harmonic-mean slope is small and the next one steep,
     /// Akima's centred value lies far towards the downwind layer's, more
@@ -916,9 +926,9 @@ impl VerticalAdvection {
                 for l in 1..nl {
                     let (up, far, down) = upwind_stencil(l, nl, omega[l]);
                     let Some(far) = far else {
-                        // Out of an end layer: between the two layers' means
-                        let (lo, hi) = (column[up].min(column[down]), column[up].max(column[down]));
-                        surface[l] = surface[l].max(lo).min(hi);
+                        // Out of an end layer: bounded by a ghost layer
+                        surface[l] = column[up]
+                            + end_layer_limited(surface[l] - column[up], column, d_sigma, up, down);
                         continue;
                     };
                     surface[l] = column[up]
@@ -935,9 +945,12 @@ impl VerticalAdvection {
                     let Some(far) = far else {
                         // Out of an end layer: linear through the two layers'
                         // means (first order would freeze the end layer's
-                        // mean against a wall, where u = 0)
+                        // mean against a wall, where u = 0), bounded by a
+                        // ghost layer
                         let (a, b) = (d_sigma[up], d_sigma[down]);
-                        surface[l] = column[up] + a / (a + b) * (column[down] - column[up]);
+                        let increment = a / (a + b) * (column[down] - column[up]);
+                        surface[l] =
+                            column[up] + end_layer_limited(increment, column, d_sigma, up, down);
                         continue;
                     };
                     let (a, b, c) = (d_sigma[up], d_sigma[down], d_sigma[far]);
@@ -973,6 +986,37 @@ fn tvd_limited(increment: f64, behind: f64, ahead: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+/// [`tvd_limited`] for the `increment` of the surface value out of the end
+/// layer `up` (the bed or the surface layer) towards its neighbour `down`,
+/// where there is no layer beyond to bound it. The difference behind is the
+/// end layer's own gradient times its thickness, the gradient at its centre
+/// extrapolated linearly from those between the three end layers' centres.
+/// A linear profile keeps its linear surface value, as does a curved one
+/// unless it flattens sharply towards the end (on uniform levels, the
+/// difference next to the end layer less than half the one beyond); where
+/// the end layer sits on a plateau over a front below it, its water leaves
+/// at its own mean. With two layers there is no curvature to see, and the
+/// increment is only kept between the two layers' means.
+fn end_layer_limited(
+    increment: f64,
+    column: &[f64],
+    d_sigma: &[f64],
+    up: usize,
+    down: usize,
+) -> f64 {
+    let ahead = column[down] - column[up];
+    let next = (2 * down).checked_sub(up).filter(|&n| n < column.len());
+    let Some(next) = next else {
+        return increment.max(ahead.min(0.0)).min(ahead.max(0.0));
+    };
+    let (a, b, c) = (d_sigma[up], d_sigma[down], d_sigma[next]);
+    // Gradients into the column between the centres, midway between them
+    let (h1, h2) = (0.5 * (a + b), 0.5 * (b + c));
+    let (g1, g2) = (ahead / h1, (column[next] - column[down]) / h2);
+    let gradient = g1 - (g2 - g1) * h1 / (h1 + h2);
+    tvd_limited(increment, gradient * a, ahead)
 }
 
 /// [`VerticalAdvection::Akima`]'s values at the interior σ-surfaces of
@@ -1835,6 +1879,40 @@ mod tests {
         // Upwind of the spike's peak (an extremum): first order
         let surface = surfaces(limited, &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0], &[1.0; 6], 1.0);
         assert_eq!(surface[3], 1.0);
+    }
+
+    /// Out of an end layer the surface value is bounded by the end layer's
+    /// own gradient (`end_layer_limited`). A surface layer at a plateau over
+    /// a front below it, the water sinking (a light gravity current's head):
+    /// its water leaves at its own mean. A value between the two layers'
+    /// means took cooler water out of the warmest layer, which was warmed
+    /// past the column's range by the warm water flowing in along it (P2
+    /// lock exchange on 125 m without viscosity: 6.0e-5 °C with limited
+    /// Akima, 2.4e-2 °C with TVD). The same at the bed, rising; a linear
+    /// profile (on stretched levels too) and a smooth curved one keep
+    /// their values.
+    #[test]
+    fn vertical_values_out_of_an_end_layer_at_a_plateau_are_its_mean() {
+        let plateau = [7.5, 8.0, 10.0, 12.4, 12.5];
+        let bed_plateau: Vec<f64> = plateau.iter().rev().copied().collect();
+        for scheme in [VerticalAdvection::LimitedAkima, VerticalAdvection::Tvd] {
+            let sinking = surfaces(scheme, &plateau, &[1.0; 5], -1.0);
+            assert_eq!(sinking[4], 12.5, "{scheme:?}: {sinking:?}");
+            let rising = surfaces(scheme, &bed_plateau, &[1.0; 5], 1.0);
+            assert_eq!(rising[1], 12.5, "{scheme:?}: {rising:?}");
+            // Flattening less sharply (the difference next to the end layer
+            // half the one beyond): kept, TVD's linear 13.0, Akima's 13.11
+            let curved = surfaces(scheme, &[0.0, 4.0, 8.0, 12.0, 14.0], &[1.0; 5], -1.0);
+            assert!((curved[4] - 13.0).abs() < 0.5, "{scheme:?}: {curved:?}");
+            let (column, d_sigma, faces) = stretched_linear();
+            for w in [1.0, -1.0] {
+                let surface = surfaces(scheme, &column, &d_sigma, w);
+                for l in [1, 4] {
+                    let want = 3.0 + 2.0 * faces[l];
+                    assert!((surface[l] - want).abs() < 1e-13, "{scheme:?}: {surface:?}");
+                }
+            }
+        }
     }
 
     /// `column` advected up a column of `d_sigma` layers by `Ω = w` for

@@ -40,13 +40,23 @@
 //! Banner) with that surface roughness, a wave height's (Terray et al.:
 //! `z₀ ≈ 0.6 H_s`); `closure` picks the GLS model (`k-epsilon`, the
 //! default, `k-omega` or `generic`; with waves k-ω or the generic model,
-//! whose wave-affected layer metre layers resolve).
+//! whose wave-affected layer metre layers resolve), or `none`: a constant
+//! viscosity (1e-2 m²/s) and no diffusivity of the tracers.
+//!
+//! Each 3D run reports its mixing, the growth of the reference potential
+//! energy (`PotentialEnergy3D`), every half hour with the range of T and
+//! the drift of the volume and heat inventories. With `closure=none` all of
+//! it is the advection's. For measuring that: `limiter` (`none`, the
+//! default, or `kuzmin`: the horizontal Kuzmin tracer limiter), `tvadv`
+//! (the tracers' vertical advection: `limited-akima`, the default, `akima`,
+//! `tvd` or `upwind`) and `runs=open` (only the 3D run without cages).
 //!
 //! ```bash
 //! cargo run --release --no-default-features --features parallel,simd \
 //!     --example farm_3d -- [hours=3] [order=2] [levels=16] [dx=60] [nu=1] [cs=0.2] \
 //!     [particles=0] [release=2] [particle_seconds=60] [kh=0.1] \
-//!     [lice=ladim] [start=2025-06-15T00:00:00Z] [wind=0] [waves=0] [closure=k-epsilon]
+//!     [lice=ladim] [start=2025-06-15T00:00:00Z] [wind=0] [waves=0] [closure=k-epsilon] \
+//!     [limiter=none] [tvadv=limited-akima] [runs=all]
 //! ```
 
 use std::collections::HashMap;
@@ -65,12 +75,15 @@ use dg_rs::particles::{
 };
 use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use dg_rs::physics::{
-    BottomDrag3D, EquationOfState, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, PhysicsBuilder,
-    SWEPhysics2D,
+    BottomDrag3D, ConstantMixing, EquationOfState, Forcing, GlsMixing, Hydrostatic3D, LinearEOS,
+    PhysicsBuilder, SWEPhysics2D, VerticalMixing,
 };
 use dg_rs::simulation::{Simulation, Simulation3D};
+use dg_rs::solver::rhs::VerticalAdvection;
 use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{PotentialEnergy3D, Probe2D, SWESolution2D, SWEState2D};
+use dg_rs::solver::{
+    PotentialEnergy3D, Probe2D, SWESolution2D, SWEState2D, TracerBounds, TracerLimiter3DConfig,
+};
 use dg_rs::source::{
     CageDrag2D, ChezyFriction2D, CoriolisSource2D, HorizontalViscosity2D, NetCage, SourceContext2D,
     SourceTerm2D,
@@ -165,13 +178,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "passive" => None,
         other => return Err(format!("lice={other}: ladim, johnsen or passive").into()),
     };
+    // The tracers' numerics, and which runs: for measuring their mixing
+    let tracer_limiter = match args.get("limiter").map_or("none", String::as_str) {
+        "none" => TracerLimiter3DConfig::none(),
+        "kuzmin" => TracerLimiter3DConfig::horizontal_kuzmin(TracerBounds::default(), 1.0),
+        other => return Err(format!("limiter={other}: none or kuzmin").into()),
+    };
+    let tracer_vertical = match args.get("tvadv").map_or("limited-akima", String::as_str) {
+        "limited-akima" => VerticalAdvection::LimitedAkima,
+        "akima" => VerticalAdvection::Akima,
+        "tvd" => VerticalAdvection::Tvd,
+        "upwind" => VerticalAdvection::Upwind,
+        other => return Err(format!("tvadv={other}: limited-akima, akima, tvd or upwind").into()),
+    };
+    let only_open = match args.get("runs").map_or("all", String::as_str) {
+        "all" => false,
+        "open" => true,
+        other => return Err(format!("runs={other}: all or open").into()),
+    };
     let wind: f64 = get("wind", 0.0)?;
     let waves: f64 = get("waves", 0.0)?;
-    let closure = match args.get("closure").map_or("k-epsilon", String::as_str) {
-        "k-epsilon" => GlsMixing::k_epsilon(),
+    // `none`: no diffusivity of the tracers (a constant viscosity), so that
+    // any change of RPE is the advection's
+    let closure_name = args.get("closure").map_or("k-epsilon", String::as_str);
+    let no_diffusion = closure_name == "none";
+    let closure = match closure_name {
+        "k-epsilon" | "none" => GlsMixing::k_epsilon(),
         "k-omega" => GlsMixing::k_omega(),
         "generic" => GlsMixing::generic(),
-        other => return Err(format!("closure={other}: k-epsilon, k-omega or generic").into()),
+        other => {
+            return Err(format!("closure={other}: k-epsilon, k-omega, generic or none").into());
+        }
     };
     let mixing = if waves > 0.0 {
         closure
@@ -253,6 +290,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let eos = LinearEOS::default();
     let physics_3d = |with_cages: bool| {
+        let closure: Box<dyn VerticalMixing + Send + Sync> = if no_diffusion {
+            Box::new(ConstantMixing::new(1e-2, 0.0))
+        } else {
+            Box::new(mixing.clone())
+        };
         let physics = Hydrostatic3D::new(
             mesh.clone(),
             ops.clone(),
@@ -261,7 +303,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bathymetry.clone(),
             Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
             eos,
-            mixing.clone(),
+            closure,
             swe(false, false),
             Forcing {
                 surface_stress: [wind, 0.0],
@@ -273,7 +315,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_bottom_drag(BottomDrag3D::log_layer(Z0))
         .with_horizontal_viscosity(nu)
-        .with_smagorinsky_viscosity(cs);
+        .with_smagorinsky_viscosity(cs)
+        .with_vertical_advection(tracer_vertical)
+        .with_tracer_limiter(tracer_limiter.clone());
         if with_cages {
             physics.with_cage_drag(CageDrag2D::new(&mesh, &ops, &cages))
         } else {
@@ -300,12 +344,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tracking = (with_cages && particles_per_kind > 0)
             .then(|| FarmParticles::new(&mesh, &ops, particles_per_kind, release_time, kh, lice));
         let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
-        if tracking.is_some() {
-            sim = sim.with_callback_interval(particle_seconds);
-        }
+        let interval = if tracking.is_some() {
+            particle_seconds
+        } else {
+            1800.0
+        };
+        sim = sim.with_callback_interval(interval);
+        // The mixing over each half hour, the range of T, and the volume and
+        // heat inventories
+        let inventory = |s: &Solution3D| {
+            let (mut volume, mut heat) = (0.0, 0.0);
+            for idx in 0..s.eta.data.len() {
+                let area = ops.weights[idx % ops.n_nodes]
+                    * geom.jacobian(idx / ops.n_nodes, idx % ops.n_nodes);
+                let depth = s.eta.data[idx] - bathymetry.data[idx];
+                volume += area * depth;
+                for (l, ds) in sigma.d_sigma().iter().enumerate() {
+                    heat += area * depth * ds * s.temp[idx * n_levels + l];
+                }
+            }
+            (volume, heat)
+        };
+        let (volume_0, heat_0) = inventory(&state);
+        let (mut density, mut last) = (state.clone(), (0.0, reference_0));
         let result = sim.run_with_callback(&mut state, 0.0, t_end, |s, t| {
             if let Some(tracking) = tracking.as_mut() {
                 tracking.advance(s, t, &sigma, &bathymetry);
+            }
+            if t - last.0 >= 1800.0 - 1e-6 {
+                density.clone_from(s);
+                eos.update_density(&mut density);
+                let reference = energy.compute(&density, &sigma).reference;
+                let mixing = (reference - last.1) / (t - last.0) / (LX * LY);
+                let (lo, hi) = s
+                    .temp
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &t| {
+                        (lo.min(t), hi.max(t))
+                    });
+                let (volume, heat) = inventory(s);
+                println!(
+                    "{label:>9}: {:4.1} h, mixing {mixing:+.3e} W/m², T in [{lo:.6}, {hi:.6}] °C, volume {:+.2e}, heat {:+.2e} (relative)",
+                    t / 3600.0,
+                    volume / volume_0 - 1.0,
+                    heat / heat_0 - 1.0
+                );
+                last = (t, reference);
             }
         });
         if let Some(tracking) = &tracking {
@@ -350,6 +434,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("\nM2 body force from rest, {hours} h:");
+    if only_open {
+        run_3d(false)?;
+        return Ok(());
+    }
     let caged_3d = run_3d(true)?;
     let open_3d = run_3d(false)?;
     let caged_2d = run_2d(true)?;

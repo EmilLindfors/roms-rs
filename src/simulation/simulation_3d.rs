@@ -3535,7 +3535,7 @@ mod tests {
     /// TODO P4.5 gate: the lock exchange ([`lock_exchange`]) at P2 with
     /// horizontal viscosity. On 250 m, ten levels, 40 s
     /// steps, ν = 10 m²/s and TVD vertical advection the fronts run at
-    /// Fr = 0.497 (dense) and 0.495 (light) over hours 1–2 (0.500 and 0.495
+    /// Fr = 0.496 (dense) and 0.494 (light) over hours 1–2 (0.500 and 0.495
     /// with the conservative momentum advection; P1 without viscosity 0.481),
     /// and T stays in its range to 5e-12 °C. Before hour 1 the fronts are
     /// still accelerating (0.48 over 0.5–1.5 h). The spurious mixing is
@@ -3581,7 +3581,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.497 and 0.495
+        // Measured 0.496 and 0.494
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.46..0.52).contains(&froude),
@@ -3609,7 +3609,7 @@ mod tests {
     /// `C_s` = 0.5 was the least that held it (0.4: NaN within 2 h; on
     /// 125 m 0.4 sufficed, the strain at the node spacing growing as the
     /// spacing shrinks). In the default split form any `C_s` holds, down to
-    /// none: 0.2 gives Fr 0.488 and 0.484, none 0.464
+    /// none: 0.2 gives Fr 0.487 and 0.484, none 0.463
     /// ([`a_p2_lock_exchange_runs_without_horizontal_viscosity`]).
     #[test]
     fn a_p2_lock_exchange_runs_with_smagorinsky_viscosity() {
@@ -3703,17 +3703,19 @@ mod tests {
     /// TODO P4.5 gate: in split form the momentum advection holds the P2
     /// lock exchange ([`lock_exchange`]) without any horizontal viscosity.
     /// On 250 m, ten levels, 40 s steps and the default vertical advection
-    /// the fronts run at Fr = 0.464 and 0.464 over hours 1–2, and T stays in
+    /// the fronts run at Fr = 0.463 and 0.462 over hours 1–2, and T stays in
     /// its range to 2e-12 °C. In the conservative form the same run is NaN
     /// within 2 h: the volume term's aliasing makes kinetic energy
     /// (`split_momentum_advection_only_dissipates_kinetic_energy`) and feeds
     /// the interface's grid-scale shear instability (Gassner, Winters &
     /// Kopriva 2016 for split forms in under-resolved DG flows).
     ///
-    /// Held, in split form, over hours 1–3: 125 m (Fr 0.473, 0.445) and
+    /// Held, in split form, over hours 1–3: 125 m (Fr 0.467, 0.434; 0.473,
+    /// 0.445 before the vertical advection's end-layer bound) and
     /// 62 m (0.483, 0.452, 20 s steps), 500 m (0.462, 0.461), P3 on 250 m
-    /// (0.453, 0.430, 20 s), 20 levels (0.467, 0.461), 10 s steps. The fronts
-    /// run slower than with viscosity (0.497 at ν = 10): an interface left to
+    /// (0.453, 0.430, 20 s), 20 levels (0.467, 0.461), 10 s steps (these
+    /// before the bound). The fronts
+    /// run slower than with viscosity (0.496 at ν = 10): an interface left to
     /// the grid mixes more. Its spurious mixing, the growth of the reference
     /// potential energy (there is no diffusivity of T), is 8.4e-4 W/m² here,
     /// 3.1× that at ν = 10 (2.7e-4,
@@ -3742,7 +3744,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.464 and 0.464
+        // Measured 0.463 and 0.462
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.42..0.5).contains(&froude),
