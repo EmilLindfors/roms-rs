@@ -8,7 +8,8 @@
 //! with GLS, `turbulence=local` keeps `k` and `ψ` in their columns instead
 //! of advecting them. Every [`ModeSplitPhysics`]
 //! call is timed through a wrapper; the barotropic pass and the splitter's
-//! own work are the rest of the step.
+//! own work are the rest of the step. `mform=conservative` advects the
+//! momentum in conservative instead of split form.
 //!
 //! ```text
 //! cargo run --release --no-default-features --features parallel,simd --example profile_3d -- \
@@ -28,7 +29,7 @@ use dg_rs::physics::{
     BottomDrag3D, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, PacanowskiPhilanderMixing,
     PhysicsBuilder, VerticalMixing,
 };
-use dg_rs::solver::rhs::{BarotropicFlux, VerticalAdvection};
+use dg_rs::solver::rhs::{BarotropicFlux, MomentumAdvectionForm, VerticalAdvection};
 use dg_rs::solver::state::Solution3D;
 use dg_rs::solver::{SWEFormulation2D, SWESolution2D, TracerLimiter3DConfig, TracerLimiterType3D};
 use dg_rs::source::CoriolisSource2D;
@@ -207,6 +208,11 @@ fn main() {
         other => panic!("turbulence={other}: expected advected or local"),
     })
     .with_smagorinsky_viscosity(cs)
+    .with_momentum_advection_form(match arg("mform", "split".to_string()).as_str() {
+        "split" => MomentumAdvectionForm::Split,
+        "conservative" => MomentumAdvectionForm::Conservative,
+        other => panic!("mform={other}: expected split or conservative"),
+    })
     .with_tracer_limiter(TracerLimiter3DConfig {
         limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
         ..TracerLimiter3DConfig::default()

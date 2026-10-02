@@ -75,11 +75,11 @@ use crate::solver::SWESolution2D;
 use crate::solver::core::blocks::{for_each_block, reduce_blocks};
 use crate::solver::rhs::{
     BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
-    HorizontalViscosity3D, LayerTransport, PressureGradientForm, Rhs3DConfig,
-    TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d,
-    apply_horizontal_viscosity_3d, apply_momentum_transport_3d, apply_tracer_transport_3d,
-    compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
-    largest_horizontal_viscosity_3d,
+    HorizontalViscosity3D, LayerTransport, MomentumAdvectionForm, PressureGradientForm,
+    Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
+    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
+    apply_tracer_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
+    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
@@ -129,6 +129,9 @@ where
     /// Reconstruction of the tracers at the σ-surfaces (see
     /// [`Self::with_vertical_advection`]).
     pub vertical_advection: VerticalAdvection,
+    /// Form of the horizontal momentum advection within the elements (see
+    /// [`Self::with_momentum_advection_form`]).
+    pub momentum_advection_form: MomentumAdvectionForm,
     /// Reconstruction of the velocity at the σ-surfaces (see
     /// [`Self::with_momentum_vertical_advection`]).
     pub momentum_vertical_advection: VerticalAdvection,
@@ -222,6 +225,7 @@ where
             tracer_limiter: TracerLimiter3DConfig::none(),
             min_column_depth: Self::DEFAULT_MIN_COLUMN_DEPTH,
             vertical_advection: VerticalAdvection::default(),
+            momentum_advection_form: MomentumAdvectionForm::default(),
             momentum_vertical_advection: VerticalAdvection::Centred,
             pressure_gradient: PressureGradientForm::default(),
             balanced_reference: None,
@@ -301,9 +305,21 @@ where
         self
     }
 
+    /// The form of the horizontal momentum advection within the elements, in
+    /// the 3D stages and in the slow forcing `G`: split (kinetic-energy
+    /// preserving) by default, which holds a sharp interface's grid-scale
+    /// shear instability without horizontal viscosity (see
+    /// [`MomentumAdvectionForm`]).
+    pub fn with_momentum_advection_form(mut self, form: MomentumAdvectionForm) -> Self {
+        self.momentum_advection_form = form;
+        self
+    }
+
     /// The vertical advection of the velocity, in the 3D stages and in the
     /// slow forcing `G`: second-order centred by default (see
-    /// [`VerticalAdvection`]).
+    /// [`VerticalAdvection`]). Centred is the one that keeps the kinetic
+    /// energy exactly with the split form
+    /// ([`Self::with_momentum_advection_form`]).
     pub fn with_momentum_vertical_advection(mut self, scheme: VerticalAdvection) -> Self {
         self.momentum_vertical_advection = scheme;
         self
@@ -677,6 +693,7 @@ where
             rho0: self.rho0,
             min_column_depth: self.min_column_depth,
             vertical_advection: self.vertical_advection,
+            momentum_advection_form: self.momentum_advection_form,
             momentum_vertical_advection: self.momentum_vertical_advection,
             pressure_gradient: self.pressure_gradient,
             balanced_reference: match self.pressure_gradient {
@@ -1175,6 +1192,7 @@ where
                 &self.geom,
                 &self.boundaries,
                 None,
+                self.momentum_advection_form,
                 self.momentum_vertical_advection,
             );
 
@@ -1216,6 +1234,7 @@ where
                 &self.geom,
                 &self.boundaries,
                 None,
+                self.momentum_advection_form,
                 self.momentum_vertical_advection,
             );
         });

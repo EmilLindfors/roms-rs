@@ -36,7 +36,8 @@
 //! (`Hydrostatic3D::with_balanced_reference`), `nu`/`kappa` vertical
 //! viscosity and diffusivity, `nuh` or `cs` horizontal viscosity (constant
 //! or Smagorinsky), `vadv`/`madv` the tracers' and the momentum's vertical
-//! advection, `kuzmin=1` the horizontal Kuzmin tracer limiter (`kuzmin=2`
+//! advection, `mform` the momentum's horizontal advection (`split`, the
+//! default, or `conservative`), `kuzmin=1` the horizontal Kuzmin tracer limiter (`kuzmin=2`
 //! with the initial stratification as its reference profile; `relax` its
 //! bounds' relaxation, default 1), `report` the interval of the printed
 //! lines (h).
@@ -50,7 +51,7 @@ use dg_rs::mesh::Mesh2DBuilder;
 use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
-use dg_rs::solver::rhs::{PressureGradientForm, VerticalAdvection};
+use dg_rs::solver::rhs::{MomentumAdvectionForm, PressureGradientForm, VerticalAdvection};
 use dg_rs::solver::state::Solution3D;
 use dg_rs::solver::{
     SWEFormulation2D, TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile,
@@ -109,6 +110,11 @@ fn main() {
         other => panic!("pgf={other}: expected sigma or depth"),
     };
     let balanced: usize = arg("balanced", 0);
+    let momentum_form = match arg("mform", "split".to_string()).as_str() {
+        "split" => MomentumAdvectionForm::Split,
+        "conservative" => MomentumAdvectionForm::Conservative,
+        other => panic!("mform={other}: expected split or conservative"),
+    };
 
     let mesh = Arc::new(
         Mesh2DBuilder::new(-domain / 2.0, domain / 2.0, -domain / 2.0, domain / 2.0)
@@ -159,6 +165,7 @@ fn main() {
     let physics = physics
         .with_vertical_advection(tracer_vadv)
         .with_momentum_vertical_advection(momentum_vadv)
+        .with_momentum_advection_form(momentum_form)
         .with_pressure_gradient(pgf);
     let mut physics = if cs > 0.0 {
         physics.with_smagorinsky_viscosity(cs)
@@ -246,7 +253,7 @@ fn main() {
     }
     println!(
         "seamount_3d: {nx}×{nx} P{order} ({:.2} km node spacing), {nl} {} levels, \
-         H₀ {depth} m, A {amp}, L {:.1} km, f {f:.1e}, profile {profile}, ν {viscosity:.0e},          {pgf:?}{}",
+         H₀ {depth} m, A {amp}, L {:.1} km, f {f:.1e}, profile {profile}, ν {viscosity:.0e},          {pgf:?}, {momentum_form:?} momentum{}",
         domain / nx as f64 / order as f64 / 1e3,
         if uniform != 0 { "uniform" } else { "stretched" },
         width / 1e3,

@@ -70,9 +70,9 @@ pub use advection_3d::{
 
 pub mod transport_3d;
 pub use transport_3d::{
-    BarotropicFlux, LayerTransport, VerticalAdvection, advective_divergence_element,
-    apply_momentum_transport_3d, apply_tracer_transport_3d, from_inventory, to_inventory,
-    transport_divergence_element, w_cell_thicknesses,
+    BarotropicFlux, LayerTransport, MomentumAdvectionForm, VerticalAdvection,
+    advective_divergence_element, apply_momentum_transport_3d, apply_tracer_transport_3d,
+    from_inventory, to_inventory, transport_divergence_element, w_cell_thicknesses,
 };
 
 pub mod viscosity_3d;
