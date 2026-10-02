@@ -97,6 +97,7 @@ pub use rhs::{
     element_dt_swe_2d,
     element_dt_viscous_swe_2d,
     face_mass_len,
+    largest_viscosity_swe_2d,
     linear_cfl_subcells_swe_2d,
     linear_cfl_swe_2d,
     min_element_dt_swe_2d,

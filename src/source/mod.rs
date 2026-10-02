@@ -43,7 +43,7 @@ pub use swe_2d::{
     CageNode, ChezyFriction2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
     GriddedWindStress, HorizontalViscosity2D, ManningFriction2D, NetCage, P_STANDARD, RHO_AIR,
     RHO_WATER, RHO_WATER_PRESSURE, SpatiallyVaryingManning2D, TidalPotential,
-    TidalPotentialConstituent, ViscosityModel, WindStress2D, loland_drag_coefficient,
+    TidalPotentialConstituent, WindStress2D, loland_drag_coefficient,
 };
 
 // Re-export tracer source terms

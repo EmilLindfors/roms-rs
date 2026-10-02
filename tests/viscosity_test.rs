@@ -507,3 +507,66 @@ fn test_viscous_dt_bounds_the_br1_spectral_radius() {
         }
     }
 }
+
+/// A Smagorinsky viscosity is in the time step: it is bounded from the
+/// current strain at every step. A grid-scale shear u = U·sin(4y) (two
+/// elements per wavelength) with an exaggerated `C_s` = 1 and a slow gravity
+/// wave makes the viscous limit the binding one (≈ 1/10 of the advective
+/// step). At CFL 1, `Simulation` stays stable and the shear decays
+/// monotonically; with the advective step alone it blows up in the first
+/// step. As the shear decays, ν falls with it and the step grows.
+#[test]
+fn smagorinsky_viscosity_bounds_the_time_step() {
+    use dg_rs::Simulation;
+    use dg_rs::physics::{PhysicsBuilder, PhysicsModule};
+    use dg_rs::time::SSPRK3;
+    use std::sync::Arc;
+
+    let mesh = Arc::new(Mesh2D::uniform_periodic(0.0, 2.0 * PI, 0.0, 2.0 * PI, 8, 8));
+    let ops = Arc::new(DGOperators2D::new(3));
+    let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+    let physics = |viscosity: Option<HorizontalViscosity2D>| {
+        let builder = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(1e-4),
+            Reflective2D::new(),
+        );
+        match viscosity {
+            Some(viscosity) => builder.with_viscosity(viscosity),
+            None => builder,
+        }
+        .build()
+    };
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    q.set_from_functions(&mesh, &ops, |_, _| 1.0, |_, y| (4.0 * y).sin(), |_, _| 0.0);
+
+    let dt_advective = physics(None).compute_dt(&q, 1.0);
+    let viscous = physics(Some(HorizontalViscosity2D::smagorinsky(1.0)));
+    let dt = viscous.compute_dt(&q, 1.0);
+    assert!(dt < 0.2 * dt_advective, "{dt} against {dt_advective}");
+
+    let amplitude = |q: &SWESolution2D| q.data[1].iter().map(|v| v.abs()).fold(0.0, f64::max);
+    let (mut previous, mut previous_dt) = (amplitude(&q), dt);
+    let sim = Simulation::new(viscous, SSPRK3).with_cfl(1.0);
+    for step in 1..=5 {
+        let result = sim.run(&mut q, 0.25 * (step - 1) as f64, 0.25 * step as f64);
+        assert!(result.success, "{:?}", result.error);
+        let now = amplitude(&q);
+        assert!(
+            now < previous,
+            "step {step}: amplitude {now} after {previous}"
+        );
+        assert!(
+            result.dt_max >= previous_dt,
+            "step {step}: dt {} after {previous_dt}",
+            result.dt_max
+        );
+        (previous, previous_dt) = (now, result.dt_max);
+    }
+    assert!(
+        previous_dt > 1.5 * dt,
+        "dt {previous_dt} after starting at {dt}"
+    );
+}

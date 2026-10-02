@@ -161,7 +161,7 @@ pub use source::{
     AtmosphericPressure2D, CombinedSource2D, CoriolisSource2D, DragCoefficient,
     GriddedAtmosphere2D, GriddedWindStress, HorizontalViscosity2D, HydrostaticReconstruction2D,
     P_STANDARD, RectangularBoundary, SourceContext2D, SourceTerm2D, SpongeLayer2D, SpongeProfile,
-    TidalPotential, TidalPotentialConstituent, ViscosityModel, WindStress2D,
+    TidalPotential, TidalPotentialConstituent, WindStress2D,
 };
 #[cfg(feature = "burn")]
 pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};

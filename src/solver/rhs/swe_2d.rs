@@ -2039,7 +2039,7 @@ mod tests {
 
         let mut coeff = vec![0.0; total_nodes];
         for k in ElementIndex::iter(mesh.n_elements) {
-            let delta = 0.5 * geom.element_size(k.as_usize());
+            let delta = HorizontalViscosity2D::filter_width(geom.area[k.as_usize()], ops.order);
             for i in 0..n_nodes {
                 let flat = k.as_usize() * n_nodes + i;
                 let state = q.get_state(k, i);
@@ -2100,6 +2100,7 @@ mod tests {
         for visc in [
             HorizontalViscosity2D::constant(0.7),
             HorizontalViscosity2D::smagorinsky(0.2),
+            HorizontalViscosity2D::smagorinsky(0.2).with_background(0.7),
         ] {
             let inviscid = || {
                 SWE2DRhsConfig::new(&equation, &bc)
@@ -2113,7 +2114,7 @@ mod tests {
             reference_viscosity(&mut expected, &q, &mesh, &ops, &geom, &config, t);
 
             let serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, t);
-            assert_eq!(serial.data, expected.data, "{:?}: serial", visc.model);
+            assert_eq!(serial.data, expected.data, "{:?}: serial", visc);
             assert_ne!(
                 serial.data[1], without.data[1],
                 "the viscous term must do something"
@@ -2121,7 +2122,7 @@ mod tests {
             #[cfg(feature = "parallel")]
             {
                 let parallel = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, t);
-                assert_eq!(parallel.data, expected.data, "{:?}: parallel", visc.model);
+                assert_eq!(parallel.data, expected.data, "{:?}: parallel", visc);
             }
 
             let mut subset = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
@@ -2141,7 +2142,7 @@ mod tests {
                         subset.element_var(k, var),
                         expected.element_var(k, var),
                         "{:?}: subset, element {k:?}, variable {var}",
-                        visc.model
+                        visc
                     );
                 }
             }
