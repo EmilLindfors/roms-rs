@@ -39,15 +39,15 @@ use super::swe_2d::{SWE2DRhsConfig, boundary_state};
 /// Per-element scratch of the viscous term (part of the RHS kernel's
 /// per-thread element workspace).
 pub(super) struct ViscousScratch {
-    own: Vec<f64>,
-    diffusion: DiffusionScratch,
+    own: Vec<[f64; 2]>,
+    diffusion: DiffusionScratch<2>,
     diff: [Vec<f64>; 2],
 }
 
 impl ViscousScratch {
     pub(super) fn new(n_nodes: usize) -> Self {
         Self {
-            own: vec![0.0; n_nodes],
+            own: vec![[0.0; 2]; n_nodes],
             diffusion: DiffusionScratch::new(n_nodes),
             diff: [vec![0.0; n_nodes], vec![0.0; n_nodes]],
         }
@@ -134,26 +134,17 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
         })
     }
 
-    /// Velocity at node `i` of element `k`; zero where the depth is at or
-    /// below the viscosity's `h_min`.
-    #[inline]
-    fn velocity(&self, k: ElementIndex, i: usize) -> (f64, f64) {
-        node_velocity(self.q, self.visc, k, i)
-    }
-
-    /// Velocity component of the boundary condition's exterior state at
-    /// boundary node `node` (face node `fi` of `face`) of element `k`, at
-    /// `time`.
-    #[allow(clippy::too_many_arguments)]
+    /// Velocity of the boundary condition's exterior state at boundary node
+    /// `node` (face node `fi` of `face`) of element `k`, at `time`; zero
+    /// where its depth is at or below the viscosity's `h_min`.
     fn boundary_velocity(
         &self,
-        component: usize,
         time: f64,
         k: ElementIndex,
         face: usize,
         fi: usize,
         node: usize,
-    ) -> f64 {
+    ) -> [f64; 2] {
         let normal = self.geom.normal(k.as_usize(), face, fi);
         let ghost = boundary_state(
             self.q,
@@ -169,14 +160,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
         .state();
         let h_min = self.visc.h_min;
         if ghost.h <= h_min {
-            return 0.0;
+            return [0.0; 2];
         }
         let h_safe = ghost.h.max(h_min);
-        match component {
-            0 => ghost.hu / h_safe,
-            1 => ghost.hv / h_safe,
-            _ => unreachable!("invalid velocity component"),
-        }
+        [ghost.hu / h_safe, ghost.hv / h_safe]
     }
 
     /// Pass 1: the BR1 gradients of u and v of element `k` into its rows
@@ -190,24 +177,16 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
         grad_u: &mut [ScalarGradient2D],
         grad_v: &mut [ScalarGradient2D],
     ) {
-        let k = ElementIndex::new(k);
-        for (component, out) in [grad_u, grad_v].into_iter().enumerate() {
-            br1_gradient_element(
-                k,
-                self.mesh,
-                self.ops,
-                self.geom,
-                |j, node| {
-                    let (u, v) = self.velocity(j, node);
-                    if component == 0 { u } else { v }
-                },
-                |k, face, fi, node, _interior| {
-                    self.boundary_velocity(component, time, k, face, fi, node)
-                },
-                &mut scratch.own,
-                out,
-            );
-        }
+        br1_gradient_element(
+            ElementIndex::new(k),
+            self.mesh,
+            self.ops,
+            self.geom,
+            |j, node| node_velocity(self.q, self.visc, j, node),
+            |k, face, fi, node, _interior| self.boundary_velocity(time, k, face, fi, node),
+            &mut scratch.own,
+            [grad_u, grad_v],
+        );
     }
 
     /// Pass 2: `∇·(νh∇u)`, `∇·(νh∇v)` of element `k` added to its rows `hu`,
@@ -236,26 +215,27 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
                 .compute_viscosity(gu.dx, gu.dy, gv.dx, gv.dy, delta)
                 * h
         };
-        let k = ElementIndex::new(k);
         let ViscousScratch {
             diffusion, diff, ..
         } = scratch;
-        for (component, diff) in diff.iter_mut().enumerate() {
-            let gradient = grad[component];
-            br1_diffusion_element(
-                k,
-                self.mesh,
-                self.ops,
-                self.geom,
-                |j, node| {
-                    let coeff = coefficient(j, node).max(0.0);
-                    let g = gradient[j.as_usize() * n_nodes + node];
-                    (coeff * g.dx, coeff * g.dy)
-                },
-                diffusion,
-                diff,
-            );
-        }
+        let [diff_u, diff_v] = diff;
+        br1_diffusion_element(
+            ElementIndex::new(k),
+            self.mesh,
+            self.ops,
+            self.geom,
+            |j, node| {
+                let coeff = coefficient(j, node).max(0.0);
+                let flat = j.as_usize() * n_nodes + node;
+                let (gu, gv) = (grad[0][flat], grad[1][flat]);
+                [
+                    (coeff * gu.dx, coeff * gu.dy),
+                    (coeff * gv.dx, coeff * gv.dy),
+                ]
+            },
+            diffusion,
+            [diff_u, diff_v],
+        );
         for (row, diff) in [hu, hv].into_iter().zip(diff.iter()) {
             for (r, d) in row.iter_mut().zip(diff) {
                 *r += d;
@@ -272,13 +252,13 @@ fn node_velocity(
     visc: &HorizontalViscosity2D,
     k: ElementIndex,
     i: usize,
-) -> (f64, f64) {
+) -> [f64; 2] {
     let state = q.get_state(k, i);
     if state.h > visc.h_min {
         let h_safe = state.h.max(visc.h_min);
-        (state.hu / h_safe, state.hv / h_safe)
+        [state.hu / h_safe, state.hv / h_safe]
     } else {
-        (0.0, 0.0)
+        [0.0; 2]
     }
 }
 
@@ -305,7 +285,7 @@ pub fn largest_viscosity_swe_2d(
         return;
     }
     struct Scratch {
-        own: Vec<f64>,
+        own: Vec<[f64; 2]>,
         gradient: [Vec<ScalarGradient2D>; 2],
     }
     let nn = ops.n_nodes;
@@ -316,7 +296,7 @@ pub fn largest_viscosity_swe_2d(
             Pooled::take(
                 |s: &Scratch| s.own.len() == nn,
                 || Scratch {
-                    own: vec![0.0; nn],
+                    own: vec![[0.0; 2]; nn],
                     gradient: std::array::from_fn(|_| vec![ScalarGradient2D::default(); nn]),
                 },
             )
@@ -324,21 +304,17 @@ pub fn largest_viscosity_swe_2d(
         |scratch, k, [out]| {
             let k = ElementIndex::new(k);
             let Scratch { own, gradient } = &mut **scratch;
-            for (component, out) in gradient.iter_mut().enumerate() {
-                br1_gradient_element(
-                    k,
-                    mesh,
-                    ops,
-                    geom,
-                    |j, node| {
-                        let (u, v) = node_velocity(q, visc, j, node);
-                        if component == 0 { u } else { v }
-                    },
-                    |_, _, _, _, interior| interior,
-                    own,
-                    out,
-                );
-            }
+            let [grad_u, grad_v] = gradient;
+            br1_gradient_element(
+                k,
+                mesh,
+                ops,
+                geom,
+                |j, node| node_velocity(q, visc, j, node),
+                |_, _, _, _, interior| interior,
+                own,
+                [grad_u, grad_v],
+            );
             let delta = HorizontalViscosity2D::filter_width(geom.area[k.as_usize()], ops.order);
             out[0] = (0..nn)
                 .filter(|&i| q.get_state(k, i).h > visc.h_min)

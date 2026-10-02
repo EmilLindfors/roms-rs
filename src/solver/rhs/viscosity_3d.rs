@@ -125,10 +125,10 @@ impl ViscosityScratch3D {
 
 /// One element's buffers of the BR1 passes.
 struct ElementScratch {
-    own: Vec<f64>,
+    own: Vec<[f64; 2]>,
     gradient: [Vec<ScalarGradient2D>; 2],
-    diffusion: DiffusionScratch,
-    out: Vec<f64>,
+    diffusion: DiffusionScratch<2>,
+    out: [Vec<f64>; 2],
 }
 
 impl ElementScratch {
@@ -136,10 +136,10 @@ impl ElementScratch {
         Pooled::take(
             |s: &Self| s.own.len() == nn,
             || Self {
-                own: vec![0.0; nn],
+                own: vec![[0.0; 2]; nn],
                 gradient: std::array::from_fn(|_| vec![ScalarGradient2D::default(); nn]),
                 diffusion: DiffusionScratch::new(nn),
-                out: vec![0.0; nn],
+                out: std::array::from_fn(|_| vec![0.0; nn]),
             },
         )
     }
@@ -167,27 +167,26 @@ impl Columns<'_> {
     ) {
         let (mesh, geom, nn) = (self.mesh, self.geom, self.ops.n_nodes);
         let ElementScratch { own, gradient, .. } = scratch;
-        for (component, grad) in gradient.iter_mut().enumerate() {
-            br1_gradient_element(
-                ElementIndex::new(k),
-                mesh,
-                self.ops,
-                geom,
-                |j, node| value(j.as_usize() * nn + node)[component],
-                |k, face, fi, node, interior| match self.boundaries.exterior(mesh, k, face) {
-                    // Mirrored: no normal velocity at the wall
-                    FaceExterior::Wall => {
-                        let (nx, ny) = geom.normal(k.as_usize(), face, fi);
-                        let [u, v] = value(k.as_usize() * nn + node);
-                        let normal = u * nx + v * ny;
-                        interior - 2.0 * normal * if component == 0 { nx } else { ny }
-                    }
-                    _ => interior,
-                },
-                own,
-                grad,
-            );
-        }
+        let [grad_u, grad_v] = gradient;
+        br1_gradient_element(
+            ElementIndex::new(k),
+            mesh,
+            self.ops,
+            geom,
+            |j, node| value(j.as_usize() * nn + node),
+            |k, face, fi, _node, interior| match self.boundaries.exterior(mesh, k, face) {
+                // Mirrored: no normal velocity at the wall
+                FaceExterior::Wall => {
+                    let (nx, ny) = geom.normal(k.as_usize(), face, fi);
+                    let [u, v] = interior;
+                    let normal = u * nx + v * ny;
+                    [u - 2.0 * normal * nx, v - 2.0 * normal * ny]
+                }
+                _ => interior,
+            },
+            own,
+            [grad_u, grad_v],
+        );
     }
 
     /// Depths, depth means, the Smagorinsky areas and (with Smagorinsky)
@@ -363,20 +362,21 @@ pub fn apply_horizontal_viscosity_3d(
             || ElementScratch::take(nn),
             |scratch, k, rhs| {
                 let ElementScratch { diffusion, out, .. } = &mut **scratch;
-                for (component, rhs_k) in rhs.into_iter().enumerate() {
-                    br1_diffusion_element(
-                        ElementIndex::new(k),
-                        mesh,
-                        ops,
-                        geom,
-                        |j, node| {
-                            let node = layer[j.as_usize() * nn + node];
-                            let g = node.gradient[component];
-                            (node.coefficient * g.dx, node.coefficient * g.dy)
-                        },
-                        diffusion,
-                        out,
-                    );
+                let [out_u, out_v] = out;
+                br1_diffusion_element(
+                    ElementIndex::new(k),
+                    mesh,
+                    ops,
+                    geom,
+                    |j, node| {
+                        let node = layer[j.as_usize() * nn + node];
+                        node.gradient
+                            .map(|g| (node.coefficient * g.dx, node.coefficient * g.dy))
+                    },
+                    diffusion,
+                    [out_u, out_v],
+                );
+                for (rhs_k, out) in rhs.into_iter().zip(out.iter()) {
                     for (i, &d) in out.iter().enumerate() {
                         let idx = k * nn + i;
                         if depth[idx] > 0.0 {
