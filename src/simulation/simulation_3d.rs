@@ -3384,7 +3384,6 @@ mod tests {
         );
         let span = (last - first) as f64 * dt;
         let froude = [0, 1].map(|f| (positions[1][f] - positions[0][f]).abs() / span / speed_scale);
-        eprintln!("DBGLOCK order {order} froude {froude:?} t_excess {t_excess:.3e}");
         LockExchange {
             froude,
             t_excess,
@@ -3397,7 +3396,8 @@ mod tests {
     /// over hours 1–3.
     ///
     /// The dense water runs right along the bed and the light water left
-    /// along the surface, each at the Froude number 0.488 (0.483 before the
+    /// along the surface, at the Froude numbers 0.481 and 0.480 (0.488 with
+    /// the conservative momentum advection; 0.483 before the
     /// limiter's bounds were taken at constant height; then 0.475 at 125 m
     /// on 20 levels, 0.473 at 62 m), a little below Benjamin's (1968) ½ for an
     /// energy-conserving current, as dissipative currents in the laboratory
@@ -3426,7 +3426,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.488 for both
+        // Measured 0.481 and 0.480
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.44..0.5).contains(&froude),
@@ -3439,25 +3439,27 @@ mod tests {
         );
     }
 
-    /// TODO P4.5 gate: the lock exchange ([`lock_exchange`]) at P2 needs
-    /// horizontal viscosity, and runs with it. On 250 m, ten levels, 40 s
+    /// TODO P4.5 gate: the lock exchange ([`lock_exchange`]) at P2 with
+    /// horizontal viscosity. On 250 m, ten levels, 40 s
     /// steps, ν = 10 m²/s and TVD vertical advection the fronts run at
-    /// Fr = 0.500 (dense) and 0.495 (light) over hours 1–2 (0.499 and 0.494
-    /// over hours 1–3, the same at 30 s steps; P1 without viscosity 0.488),
+    /// Fr = 0.497 (dense) and 0.495 (light) over hours 1–2 (0.500 and 0.495
+    /// with the conservative momentum advection; P1 without viscosity 0.481),
     /// and T stays in its range to 5e-12 °C. Before hour 1 the fronts are
     /// still accelerating (0.48 over 0.5–1.5 h).
     ///
-    /// Without horizontal viscosity the interface's shear instability grows
+    /// With the conservative momentum advection P2 needed it: the
+    /// interface's shear instability grows
     /// at the grid scale, fastest in a hydrostatic model (its growth rate
-    /// rises with the wavenumber, `≈ kΔU/2`), and P2 has too little numerical
-    /// dissipation to stop it: NaN after ≈ 1500 s, at 10 and 2 s steps
-    /// alike; at ν = 5 the mid-depth interface at an element vertex grows
+    /// rises with the wavenumber, `≈ kΔU/2`), and its aliasing fed it: NaN
+    /// after ≈ 1500 s without viscosity, at 10 and 2 s steps
+    /// alike; at ν = 5 the mid-depth interface at an element vertex grew
     /// from 0.3 to 4.6 m/s within 450 s (≈ 6e-3 s⁻¹, as `kΔU/2` at the node
-    /// spacing) after an hour. The smallest ν that holds shrinks with the
+    /// spacing) after an hour. The smallest ν that held shrank with the
     /// spacing: between 5 and 10 m²/s at 500 m, 5 and 7 at 250 m, 2.5 and 5
     /// at 125 m, at most 2.5 at 62 m (fronts 0.491 and 0.490). In grid
     /// Reynolds numbers `ΔU·Δx/ν` (ΔU = 0.4 m/s, Δx = element size / N) the
-    /// bound is 7–10 at 250 m and below, 10–20 at 500 m.
+    /// bound was 7–10 at 250 m and below, 10–20 at 500 m. The split form
+    /// needs none ([`a_p2_lock_exchange_runs_without_horizontal_viscosity`]).
     ///
     /// With unlimited Akima vertical advection the same runs pass, but at
     /// 125 m and ν = 10 the bed layers undershoot by 0.23 °C next to the
@@ -3483,7 +3485,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.500 and 0.495
+        // Measured 0.497 and 0.495
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.46..0.52).contains(&froude),
@@ -3500,17 +3502,17 @@ mod tests {
     /// ([`lock_exchange`]) without a constant one, and only where the flow
     /// needs it. On 250 m, ten levels, 40 s steps, `C_s` = 0.7 and the
     /// default (limited Akima) vertical advection the fronts run at
-    /// Fr = 0.504 (dense) and 0.501 (light) over hours 1–2, T stays in its
+    /// Fr = 0.501 (dense) and 0.499 (light) over hours 1–2, T stays in its
     /// range to 2e-12 °C, and after 2 h ν reaches 19 m²/s at the fronts' heads
-    /// and ≈ 5 m²/s along the interface between them (the constant ν that
-    /// holds it is 5–7 m²/s everywhere), while the water at rest beyond the
-    /// fronts gets ≤ 0.1 m²/s (the median element 0.13 m²/s).
+    /// and ≈ 5 m²/s along the interface between them, while the water at
+    /// rest beyond the fronts gets ≤ 0.1 m²/s (the median element 0.3 m²/s).
     ///
-    /// `C_s` = 0.5 also holds it (Fr 0.503 and 0.497; ν ≤ 13), 0.4 does not
-    /// (NaN within 2 h). On 125 m `C_s` = 0.4 suffices: the strain at the
-    /// node spacing grows as the spacing shrinks, so ν falls with the grid
-    /// as the constant ν had to by hand (0.5: ν ≈ 1–3 m²/s along the
-    /// interface, ≤ 10 at the heads; Fr 0.505 and 0.505).
+    /// With the conservative momentum advection (Fr 0.504 and 0.501 here)
+    /// `C_s` = 0.5 was the least that held it (0.4: NaN within 2 h; on
+    /// 125 m 0.4 sufficed, the strain at the node spacing growing as the
+    /// spacing shrinks). In the default split form any `C_s` holds, down to
+    /// none: 0.2 gives Fr 0.488 and 0.484, none 0.464
+    /// ([`a_p2_lock_exchange_runs_without_horizontal_viscosity`]).
     #[test]
     fn a_p2_lock_exchange_runs_with_smagorinsky_viscosity() {
         use crate::solver::rhs::{HorizontalViscosity3D, VerticalAdvection};
@@ -3531,7 +3533,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.504 and 0.501
+        // Measured 0.501 and 0.499
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.46..0.52).contains(&froude),
@@ -3542,7 +3544,7 @@ mod tests {
             (dense - light).abs() < 0.01,
             "the fronts run at Fr = {dense:.4} and {light:.4}"
         );
-        // Measured 18.9 at the heads, ≤ 0.1 within 2 km of the ends
+        // Measured 18.7 at the heads, ≤ 0.08 within 2 km of the ends
         let n = largest_viscosity.len();
         let largest = max_or_nan(largest_viscosity.iter().copied());
         let beyond = max_or_nan(
@@ -3597,6 +3599,57 @@ mod tests {
                 "the {front} front runs at Fr = {froude:.4}"
             );
         }
+    }
+
+    /// TODO P4.5 gate: in split form the momentum advection holds the P2
+    /// lock exchange ([`lock_exchange`]) without any horizontal viscosity.
+    /// On 250 m, ten levels, 40 s steps and the default vertical advection
+    /// the fronts run at Fr = 0.464 and 0.464 over hours 1–2, and T stays in
+    /// its range to 2e-12 °C. In the conservative form the same run is NaN
+    /// within 2 h: the volume term's aliasing makes kinetic energy
+    /// (`split_momentum_advection_only_dissipates_kinetic_energy`) and feeds
+    /// the interface's grid-scale shear instability (Gassner, Winters &
+    /// Kopriva 2016 for split forms in under-resolved DG flows).
+    ///
+    /// Held, in split form, over hours 1–3: 125 m (Fr 0.473, 0.445) and
+    /// 62 m (0.483, 0.452, 20 s steps), 500 m (0.462, 0.461), P3 on 250 m
+    /// (0.453, 0.430, 20 s), 20 levels (0.467, 0.461), 10 s steps. The fronts
+    /// run slower than with viscosity (0.497 at ν = 10): an interface left to
+    /// the grid mixes more, as the spurious mixing of the models in
+    /// Ilıcak et al. (2012) grows with the grid Reynolds number, and on the
+    /// finer meshes the two fronts drift apart. Viscosity is then a choice
+    /// of physics, not a condition of stability.
+    #[test]
+    fn a_p2_lock_exchange_runs_without_horizontal_viscosity() {
+        use crate::solver::rhs::VerticalAdvection;
+        let LockExchange {
+            froude: [dense, light],
+            t_excess,
+            ..
+        } = lock_exchange(
+            2,
+            32,
+            10,
+            Default::default(),
+            VerticalAdvection::default(),
+            40.0,
+            [3600.0, 7200.0],
+        );
+        assert!(
+            t_excess < 1e-9,
+            "T left its initial range by {t_excess:.3e} °C"
+        );
+        // Measured 0.464 and 0.464
+        for (front, froude) in [("dense", dense), ("light", light)] {
+            assert!(
+                (0.42..0.5).contains(&froude),
+                "the {front} front runs at Fr = {froude:.4}"
+            );
+        }
+        assert!(
+            (dense - light).abs() < 0.01,
+            "the fronts run at Fr = {dense:.4} and {light:.4}"
+        );
     }
 
     /// TODO P4.5 gate: the horizontal viscosity of the 3D shear in the mode
@@ -4163,21 +4216,27 @@ mod tests {
     /// ```
     ///
     /// hold at three sections over hours 12–24 (`V`, `M` the volume and salt
-    /// landward of the section). The section fluxes are the nodal `H_z u` and
-    /// `H_z u S` at the section, not the DG face fluxes the model moves its
-    /// water and salt with: the volume closes to 1e-5 of the river's, the
+    /// landward of the section). The section fluxes are `H_z u` and
+    /// `H_z u S` averaged over the nodes on both sides of the element face at
+    /// the section, not the DG face fluxes the model moves its
+    /// water and salt with: the volume closes to 3–6e-5 of the river's, the
     /// salt to 1–3 % of the outgoing salt flux, largest where the gradients
-    /// are sharpest (near the head).
+    /// are sharpest (near the head). One side's nodes alone see the face's
+    /// velocity jump: 1e-4 in the conservative momentum form, 5e-4 in the
+    /// split form.
     ///
     /// Run on to 48 h, the exchange at the sections grows to Q_in = 76, 127,
     /// 176 m³/s (2.5, 5, 7.5 km) against Knudsen's steady-state 86, 142, 198
     /// from the section salinities: the difference is the salt the fjord is
     /// still losing.
     ///
-    /// With ν_h = 5 m²/s the surface outflow at the face of the river's
-    /// element accelerates from 0.5 to 9 m/s within 20 min after 1.5 h, at
-    /// any step (40–240 s): the P2 momentum needs ν_h at a grid Reynolds
-    /// number of a few, as in the lock exchange.
+    /// With the conservative momentum advection and ν_h = 5 m²/s the surface
+    /// outflow at the face of the river's element accelerated from 0.5 to
+    /// 9 m/s within 20 min after 1.5 h, at any step (40–240 s), as in the
+    /// lock exchange. In the default split form it runs with ν_h = 5, 1 and
+    /// none, with the same exchange (Q_in at 2.5 km 70.8, 71.0, 71.1 m³/s
+    /// against 70.5 at 20 m²/s); only the volume budget at the sections, with
+    /// sharper face jumps, misses 2–3e-4.
     #[test]
     fn a_river_drives_an_estuarine_circulation_in_a_fjord() {
         use crate::boundary::{Nesting3D, NestingBand3D, StillWater};
@@ -4277,13 +4336,34 @@ mod tests {
                 })
                 .expect("a node at x")
         };
+        // The nodes at x on both sides of the element face there: the
+        // model's flux through the face is their central average (plus the
+        // 2D flux's jump term), not either side's
+        let sides_at = |x: f64| {
+            let mut found = (0..mesh.n_elements * nn).filter(|&idx| {
+                let [px, py] = position(idx);
+                (px - x).abs() < 1e-6 && (py - 0.5 * width).abs() < 1e-6
+            });
+            let a = found.next().expect("a node at x");
+            [a, found.next().expect("a face at x")]
+        };
         let exchange = |s: &Solution3D, x: f64| {
-            let idx = node_at(x);
-            let d = s.eta.data[idx] - bathymetry.data[idx];
+            let pair = sides_at(x);
             let mut e = Exchange::default();
             for (l, &ds) in sigma.d_sigma().iter().enumerate() {
-                let q = width * d * ds * s.u[idx * nl + l];
-                let salt = s.salt[idx * nl + l];
+                let q = pair
+                    .iter()
+                    .map(|&idx| {
+                        0.5 * width
+                            * (s.eta.data[idx] - bathymetry.data[idx])
+                            * ds
+                            * s.u[idx * nl + l]
+                    })
+                    .sum::<f64>();
+                let salt = pair
+                    .iter()
+                    .map(|&idx| 0.5 * s.salt[idx * nl + l])
+                    .sum::<f64>();
                 if q > 0.0 {
                     e.out += q;
                     e.salt_out += q * salt;
@@ -4388,14 +4468,15 @@ mod tests {
                 f.into / window
             );
             outflows.push(f.out);
-            // Measured 1.2e-5, 4.3e-5, 3.2e-5
+            // Measured 6.0e-5, 3.8e-5, 3.0e-5 (one side's nodes: 5.1e-4 in
+            // split form, 9.9e-5 in conservative form)
             let volume = ((v1 - v0) - (discharge * window - (f.out - f.into))).abs();
             assert!(
                 volume < 1e-4 * discharge * window,
                 "x = {x}: the volume budget misses {:.2e} of the river's",
                 volume / (discharge * window)
             );
-            // Measured 2.7e-2, 1.3e-2, 8.8e-3 (with storage dM of 0.90, 0.96,
+            // Measured 2.6e-2, 1.3e-2, 8.8e-3 (with storage dM of 0.90, 0.96,
             // 0.98 of the net salt flux)
             let salt = ((m1 - m0) + (f.salt_out - f.salt_in)).abs();
             assert!(

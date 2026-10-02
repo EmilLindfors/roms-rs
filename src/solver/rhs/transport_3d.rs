@@ -60,10 +60,16 @@
 //!     ∂(H_z u)_l/∂t = −∇·(Q_l u_l) − (Ω_{l+1/2} u_{l+1/2} − Ω_{l−1/2} u_{l−1/2}) + …
 //! ```
 //!
+//! in split form within the elements (by default, [`MomentumAdvectionForm`]),
 //! upwind in `u` on the face fluxes and (by default) centred on `Ω`. A velocity that is
 //! uniform in space changes its inventory exactly as the layer thickness
 //! changes, and the layer momentum `∫ H_z,l u_l` is changed by the advection
-//! only through open boundaries.
+//! only through open boundaries. In the split form with centred `Ω` fluxes
+//! the advection changes the kinetic energy only through open boundaries and
+//! by the upwind faces' dissipation: it cannot feed a grid-scale
+//! instability, as the conservative form's aliasing did (P2 lock exchange
+//! without horizontal viscosity: NaN within 2 h in conservative form; fronts
+//! at Fr 0.46 in split form).
 
 use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
@@ -143,7 +149,8 @@ pub fn transport_divergence_element(
 /// [`crate::solver::rhs::baroclinic`]), and under GLL summation by parts
 /// that holds for this form, not for the conservative one. Over a
 /// stratified seamount at rest the conservative form let round-off grow
-/// tenfold every 6 h (`examples/seamount_3d.rs`).
+/// tenfold every 6 h (`examples/seamount_3d.rs`). For the momentum it is
+/// what keeps the kinetic energy (see [`MomentumAdvectionForm::Split`]).
 ///
 /// `hu`, `hv` and `phi` are the element's nodal values, `face` the
 /// numerical flux `F*` of `qφ` out of every face node, `fr`, `fs` scratch
@@ -668,6 +675,26 @@ pub fn from_inventory(
     );
 }
 
+/// The form of the horizontal momentum advection `∇·(Q_l u_l)` within the
+/// elements ([`apply_momentum_transport_3d`]). Both are conservative and keep
+/// a uniform velocity uniform; they differ by aliasing only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MomentumAdvectionForm {
+    /// Split (flux-differencing) form, `½[∇·(Qu) + Q·∇u + u∇·Q]`
+    /// ([`advective_divergence_element`]): kinetic-energy preserving within
+    /// the elements (Gassner, Winters & Kopriva 2016), so the advection only
+    /// removes kinetic energy, at the upwind faces. The default: in the
+    /// conservative form the aliasing feeds the grid-scale shear instability
+    /// of a sharp interface, and the P2 lock exchange blew up without
+    /// horizontal viscosity (as did the P2 fjord estuary with ν = 5 m²/s);
+    /// in this form both run with none.
+    #[default]
+    Split,
+    /// Strong conservative form, the DG divergence of `Q_l u_l` at the nodes
+    /// ([`transport_divergence_element`]). For comparison.
+    Conservative,
+}
+
 /// Overwrite `rhs` with the inventory tendency `∂(H_z C)/∂t` of the tracer
 /// concentration `tracer`, advected by the layer transports `transport`:
 ///
@@ -983,7 +1010,9 @@ fn akima_surface_values(column: &[f64], d_sigma: &[f64], slope: &mut [f64], surf
 /// ```
 ///
 /// for the advected velocity `(u, v)`; `Q` and `Ω` come from `transport`.
-/// Horizontally the face flux is `F_l u↑`, with `u↑` upwind of the layer's
+/// Within the elements `∇·(Q_l u_l)` is in the `form` of
+/// [`MomentumAdvectionForm`] (`Hydrostatic3D` uses the split form by
+/// default). Horizontally the face flux is `F_l u↑`, with `u↑` upwind of the layer's
 /// face flux as for the tracers. Flowing in through an open boundary it is
 /// a nesting parent's velocity (`exterior`) where there is one, otherwise
 /// the interior's (zero gradient, ROMS's "gradient" condition for the 3D
@@ -993,7 +1022,10 @@ fn akima_surface_values(column: &[f64], d_sigma: &[f64], slope: &mut [f64], surf
 ///
 /// A velocity uniform in space gets `u·Δσ_l ∂η/∂t`: divided by the new layer
 /// thickness it stays uniform. The layer momentum `∫ H_z,l u_l` changes
-/// only through open faces.
+/// only through open faces. In the split form with
+/// [`VerticalAdvection::Centred`] the kinetic energy `½ Σ_l H_z,l |u_l|²`
+/// changes only through open faces and by the upwind faces' dissipation,
+/// `−½ Σ_faces |F_l| |u_l − u_l'|²`.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_momentum_transport_3d(
     rhs_u: &mut [f64],
@@ -1006,9 +1038,11 @@ pub fn apply_momentum_transport_3d(
     geom: &GeometricFactors2D,
     boundaries: &Boundaries3D,
     exterior: Option<[ExteriorField; 2]>,
+    form: MomentumAdvectionForm,
     vertical: VerticalAdvection,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
+    let split = form == MomentumAdvectionForm::Split;
     let context = LayerContext {
         transport,
         mesh,
@@ -1030,7 +1064,7 @@ pub fn apply_momentum_transport_3d(
                             .and_then(|e| e.at(tag, node, l))
                             .unwrap_or(interior)
                     };
-                    let div = context.flux_divergence(k, l, field, false, inflow, scratch);
+                    let div = context.flux_divergence(k, l, field, split, inflow, scratch);
                     for (i, &d) in div.iter().enumerate() {
                         rhs_k[i * nl + l] -= d;
                     }
@@ -1932,12 +1966,13 @@ mod tests {
 
     impl Case {
         /// Momentum inventory tendencies `(∂(H_z u)/∂t, ∂(H_z v)/∂t)` of the
-        /// advection of `(u, v)`.
+        /// advection of `(u, v)` in `form`.
         fn momentum_rhs(
             &self,
             transport: &LayerTransport,
             u: &[f64],
             v: &[f64],
+            form: MomentumAdvectionForm,
         ) -> (Vec<f64>, Vec<f64>) {
             let mut rhs_u = vec![0.0; u.len()];
             let mut rhs_v = vec![0.0; v.len()];
@@ -1952,6 +1987,7 @@ mod tests {
                 &self.geom,
                 &self.boundaries,
                 None,
+                form,
                 VerticalAdvection::Centred,
             );
             (rhs_u, rhs_v)
@@ -1960,7 +1996,8 @@ mod tests {
 
     /// Momentum constancy: a velocity uniform in space changes its inventory
     /// exactly as the layer thickness changes, `∂(H_z u)/∂t = u Δσ_l ∂η/∂t`,
-    /// so it stays uniform, through walls, open faces and periodic ones. (The
+    /// so it stays uniform, through walls, open faces and periodic ones, in
+    /// either form. (The
     /// old velocity-form advection, `∇·(u u)` with its own Rusanov flux and
     /// `Ω` only in the vertical term, was not built on the layer transports.)
     #[test]
@@ -1969,19 +2006,25 @@ mod tests {
         for case in [Case::closed(), Case::open(), Case::periodic()] {
             let transport = case.transport();
             let n = case.state.u.len();
-            let (rhs_u, rhs_v) = case.momentum_rhs(&transport, &vec![u0; n], &vec![v0; n]);
-            let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
-            let scale = max_abs(case.eta_rate.iter().copied());
-            for idx in 0..case.mesh.n_elements * nn {
-                for l in 0..nl {
-                    let thickness_rate = case.sigma.d_sigma()[l] * case.eta_rate[idx];
-                    for (c, rhs) in [(u0, &rhs_u), (v0, &rhs_v)] {
-                        let got = rhs[idx * nl + l];
-                        assert!(
-                            (got - c * thickness_rate).abs() < 1e-12 * scale,
-                            "node {idx}, layer {l}: {got:.6e} vs u·Δσ·∂η/∂t = {:.6e}",
-                            c * thickness_rate
-                        );
+            for form in [
+                MomentumAdvectionForm::Split,
+                MomentumAdvectionForm::Conservative,
+            ] {
+                let (rhs_u, rhs_v) =
+                    case.momentum_rhs(&transport, &vec![u0; n], &vec![v0; n], form);
+                let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
+                let scale = max_abs(case.eta_rate.iter().copied());
+                for idx in 0..case.mesh.n_elements * nn {
+                    for l in 0..nl {
+                        let thickness_rate = case.sigma.d_sigma()[l] * case.eta_rate[idx];
+                        for (c, rhs) in [(u0, &rhs_u), (v0, &rhs_v)] {
+                            let got = rhs[idx * nl + l];
+                            assert!(
+                                (got - c * thickness_rate).abs() < 1e-12 * scale,
+                                "{form:?}, node {idx}, layer {l}: {got:.6e} vs u·Δσ·∂η/∂t = {:.6e}",
+                                c * thickness_rate
+                            );
+                        }
                     }
                 }
             }
@@ -1990,26 +2033,116 @@ mod tests {
 
     /// Conservation: the momentum advection moves momentum between layers and
     /// elements but, summed over the layers, creates none in a closed basin
-    /// (walls carry no volume, so no momentum) or on a periodic mesh.
+    /// (walls carry no volume, so no momentum) or on a periodic mesh, in
+    /// either form.
     #[test]
     fn momentum_advection_conserves_the_column_momentum() {
         for case in [Case::closed(), Case::periodic()] {
             let transport = case.transport();
-            let (rhs_u, rhs_v) = case.momentum_rhs(&transport, &case.state.u, &case.state.v);
-            let hu_scale = max_abs(transport.hu.iter().copied());
-            let u_scale = max_abs(case.state.u.iter().chain(&case.state.v).copied());
-            let scale = case.integral(&vec![hu_scale * u_scale / 1000.0; rhs_u.len()]);
-            assert!(
-                max_abs(rhs_u.iter().copied()) > 1e-3 * hu_scale * u_scale / 1000.0,
-                "test regime: no advection"
-            );
-            for rhs in [rhs_u, rhs_v] {
-                let tendency = case.integral(&rhs);
+            for form in [
+                MomentumAdvectionForm::Split,
+                MomentumAdvectionForm::Conservative,
+            ] {
+                let (rhs_u, rhs_v) =
+                    case.momentum_rhs(&transport, &case.state.u, &case.state.v, form);
+                let hu_scale = max_abs(transport.hu.iter().copied());
+                let u_scale = max_abs(case.state.u.iter().chain(&case.state.v).copied());
+                let scale = case.integral(&vec![hu_scale * u_scale / 1000.0; rhs_u.len()]);
                 assert!(
-                    tendency.abs() < 1e-12 * scale,
-                    "momentum tendency {tendency:.3e} (advective scale {scale:.3e})"
+                    max_abs(rhs_u.iter().copied()) > 1e-3 * hu_scale * u_scale / 1000.0,
+                    "test regime: no advection"
                 );
+                for rhs in [rhs_u, rhs_v] {
+                    let tendency = case.integral(&rhs);
+                    assert!(
+                        tendency.abs() < 1e-12 * scale,
+                        "{form:?}: momentum tendency {tendency:.3e} (advective scale {scale:.3e})"
+                    );
+                }
             }
+        }
+    }
+
+    /// TODO P4.5 gate: the split form keeps the kinetic energy. In a closed
+    /// basin or on a periodic mesh, with a sheared, non-uniform flow and
+    /// barotropically corrected layer transports, the momentum advection in
+    /// split form with centred `Ω` fluxes changes the kinetic energy
+    /// `½ ∫ Σ_l H_z,l |u_l|²` only by the upwind faces' dissipation,
+    ///
+    /// ```text
+    ///     ∫ Σ_l [u·A_u + v·A_v − ½|u|² ∂H_z,l/∂t] = −½ ∮ Σ_l |F_l| |u_l − u_l′|²
+    /// ```
+    ///
+    /// (GLL summation by parts: the split volume term and the continuity's
+    /// strong form leave `F(φ − φ′)[½(φ + φ′) − φ↑]` at every face, the
+    /// centred σ-surface values nothing). The conservative form's volume
+    /// term leaves an aliasing remainder of either sign: the energy source
+    /// that fed the P2 lock exchange's grid-scale instability.
+    #[test]
+    fn split_momentum_advection_only_dissipates_kinetic_energy() {
+        for case in [Case::closed(), Case::periodic()] {
+            let transport = case.transport();
+            let (nn, nfn, nl) = (
+                case.ops.n_nodes,
+                case.ops.n_face_nodes,
+                case.sigma.n_levels(),
+            );
+            // Rough at the node scale, discontinuous across the faces
+            let offset = |idx: usize| 0.05 * (1.37 * idx as f64).sin();
+            let u: Vec<f64> = (case.state.u.iter().enumerate())
+                .map(|(idx, &u)| u + offset(idx))
+                .collect();
+            let v: Vec<f64> = (case.state.v.iter().enumerate())
+                .map(|(idx, &v)| v - 0.5 * offset(idx))
+                .collect();
+            let (u, v) = (&u[..], &v[..]);
+            // ½ ∮ Σ_l |F_l| |Δu|², each face once (from both sides, halved)
+            let mut dissipation = 0.0;
+            for k in 0..case.mesh.n_elements {
+                for f in 0..4 {
+                    let el = ElementIndex::new(k);
+                    let FaceExterior::Element(nb) = case.boundaries.exterior(&case.mesh, el, f)
+                    else {
+                        continue;
+                    };
+                    for (fi, &node) in case.ops.face_nodes[f].iter().enumerate() {
+                        let slot = (k * 4 + f) * nfn + fi;
+                        let weight = case.ops.weights_1d[fi] * case.geom.surface_jacobian(k, f, fi);
+                        let nb_node = case.ops.face_nodes[nb.face][nfn - 1 - fi];
+                        let (a, b) = ((k * nn + node) * nl, (nb.element * nn + nb_node) * nl);
+                        for l in 0..nl {
+                            let jump =
+                                (u[a + l] - u[b + l]).powi(2) + (v[a + l] - v[b + l]).powi(2);
+                            dissipation +=
+                                0.25 * weight * transport.face[slot * nl + l].abs() * jump;
+                        }
+                    }
+                }
+            }
+            let energy_rate = |form| {
+                let (rhs_u, rhs_v) = case.momentum_rhs(&transport, u, v, form);
+                let mut rate = vec![0.0; u.len()];
+                for (idx, r) in rate.iter_mut().enumerate() {
+                    let thickness_rate = case.sigma.d_sigma()[idx % nl] * case.eta_rate[idx / nl];
+                    *r = u[idx] * rhs_u[idx] + v[idx] * rhs_v[idx]
+                        - 0.5 * (u[idx].powi(2) + v[idx].powi(2)) * thickness_rate;
+                }
+                case.integral(&rate)
+            };
+            let split = energy_rate(MomentumAdvectionForm::Split);
+            let conservative = energy_rate(MomentumAdvectionForm::Conservative);
+            // Measured: split to 1e-15, conservative 5.5e-3 (closed) and
+            // 7.6e-4 (periodic) of the dissipation short, energy the
+            // aliasing made
+            assert!(dissipation > 0.0, "test regime: no face jumps");
+            assert!(
+                (split + dissipation).abs() < 1e-10 * dissipation,
+                "split form: kinetic energy rate {split:.6e} against the faces' −{dissipation:.6e}"
+            );
+            assert!(
+                (conservative + dissipation).abs() > 1e-4 * dissipation,
+                "test regime: the conservative form ({conservative:.6e}) has no aliasing"
+            );
         }
     }
 
@@ -2025,7 +2158,12 @@ mod tests {
             case.ops.n_face_nodes,
             case.sigma.n_levels(),
         );
-        let (rhs_u, rhs_v) = case.momentum_rhs(&transport, &case.state.u, &case.state.v);
+        let (rhs_u, rhs_v) = case.momentum_rhs(
+            &transport,
+            &case.state.u,
+            &case.state.v,
+            MomentumAdvectionForm::default(),
+        );
         for (rhs, field) in [(&rhs_u, &case.state.u), (&rhs_v, &case.state.v)] {
             let tendency = case.integral(rhs);
             let (mut outflow, mut scale) = (0.0, 0.0);
@@ -2089,6 +2227,7 @@ mod tests {
             &geom,
             &Boundaries3D::default(),
             None,
+            MomentumAdvectionForm::default(),
             VerticalAdvection::Centred,
         );
         let sw = sigma.sigma_w();
@@ -2340,6 +2479,7 @@ mod tests {
             &case.geom,
             &case.boundaries,
             exterior.velocity,
+            MomentumAdvectionForm::default(),
             VerticalAdvection::Centred,
         );
         let fields = [
