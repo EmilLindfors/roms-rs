@@ -65,7 +65,8 @@ src/
 │   │                 # split form), tracer, diffusion (BR1), 3D advection,
 │   │                 # 3D layer transports (Ω and inventory-form tracers,
 │   │                 # corrected to the barotropic DU_avg2; vertical
-│   │                 # advection upwind/centred/Akima/TVD/limited Akima),
+│   │                 # advection upwind/centred/Akima/TVD/limited Akima,
+│   │                 # end layers bounded by their extrapolated gradient),
 │   │                 # (split-form horizontal tracer and momentum
 │   │                 # advection, MomentumAdvectionForm), baroclinic
 │   │                 # PGF (σ-pairs or constant depth, balanced reference),
