@@ -22,7 +22,9 @@
 //!    `η` over the step, `η̄ − ηⁿ = −Δt·∇·DU_avg2` ([`BarotropicTransport`]).
 //!    Rivers ([`ModeSplitPhysics::rivers`]) add their discharge to every
 //!    stage and are averaged the same way, `+ Δt·Q̄/A_k` in their elements
-//!    (see [`crate::source::river`]).
+//!    (see [`crate::source::river`]). After the 2D RHS, each stage's work
+//!    (`+ G`, the combination, the drag, the sums) is one element-block
+//!    pass.
 //! 3. **3D stages.** SSP-RK3 on the 3D fields, with the velocity and the
 //!    tracers stepped as inventories `H_z u`, `H_z C` and divided by the new
 //!    `H_z` at the end of the step. `η, ū, v̄` get the constant rates of the
@@ -76,11 +78,11 @@
 //!   (≈ 0.03 % amplitude per period at 50 baroclinic steps per period; see
 //!   [`BarotropicFilter`]). Strictly this term is first order, with a
 //!   constant ≈ 1e-3 of the usual one.
-//! - `R₃D` is still evaluated into a freshly allocated state (TODO P4.5).
 
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
+use crate::solver::core::blocks::for_each_block;
 use crate::solver::rhs::{
     BarotropicFlux, from_inventory, to_inventory, transport_divergence_element, w_cell_thicknesses,
 };
@@ -181,19 +183,6 @@ impl BarotropicTransport {
         self.hv.fill(0.0);
         self.face.fill(0.0);
         self.discharge.fill(0.0);
-    }
-
-    /// Add `c ×` the nodal transport of `state` and the face fluxes `face`.
-    fn accumulate(&mut self, c: f64, state: &SWESolution2D, face: &[f64]) {
-        for (a, b) in self.hu.data.iter_mut().zip(&state.data[SWE_VAR_HU]) {
-            *a += c * b;
-        }
-        for (a, b) in self.hv.data.iter_mut().zip(&state.data[SWE_VAR_HV]) {
-            *a += c * b;
-        }
-        for (a, b) in self.face.iter_mut().zip(face) {
-            *a += c * b;
-        }
     }
 
     /// The DG divergence of the transport, in the strong (conservative) form
@@ -573,6 +562,10 @@ struct Buffers {
     transport_divergence: DGSolution2D,
     /// Barotropic transport during the pass.
     q: SWESolution2D,
+    /// Its first two SSP-RK3 stage values, and a stage's 2D RHS.
+    u1: SWESolution2D,
+    u2: SWESolution2D,
+    k_2d: SWESolution2D,
     /// Filtered transport.
     q_avg: SWESolution2D,
     /// Step-averaged slow forcing `G` of the transport (zero for `h`).
@@ -614,6 +607,9 @@ impl Buffers {
             d_sigma_w: vec![0.0; state.n_levels + 1],
             transport_divergence: DGSolution2D::new(ne, nn),
             q: SWESolution2D::new(ne, nn),
+            u1: SWESolution2D::new(ne, nn),
+            u2: SWESolution2D::new(ne, nn),
+            k_2d: SWESolution2D::new(ne, nn),
             q_avg: SWESolution2D::new(ne, nn),
             forcing: SWESolution2D::new(ne, nn),
             history: SlowForcingHistory::new(ne, nn),
@@ -643,7 +639,6 @@ pub struct ModeSplitIntegrator {
     filter: Option<BarotropicFilter>,
     buffers: Option<Buffers>,
     stages_3d: StageWorkspace<Solution3D>,
-    stages_2d: StageWorkspace<SWESolution2D>,
 }
 
 impl Default for ModeSplitIntegrator {
@@ -666,7 +661,6 @@ impl ModeSplitIntegrator {
             filter: None,
             buffers: None,
             stages_3d: StageWorkspace::new(),
-            stages_2d: StageWorkspace::new(),
         }
     }
 
@@ -722,6 +716,9 @@ impl ModeSplitIntegrator {
             d_sigma_w,
             transport_divergence,
             q,
+            u1,
+            u2,
+            k_2d,
             q_avg,
             forcing: g_term,
             history,
@@ -800,48 +797,58 @@ impl ModeSplitIntegrator {
         let filter = self.filter.as_ref().expect("filter was just set");
         let dt_bt = dt / n_bt as f64;
 
-        // SSP-RK3 in Butcher form: u + dt (k₁ + k₂ + 4k₃)/6
-        const STAGE_WEIGHTS: [f64; 3] = [1.0 / 6.0, 1.0 / 6.0, 2.0 / 3.0];
         q_avg.fill(0.0);
         transport.clear();
-        for (m, (&w, &w_secondary)) in filter
-            .weights()
-            .iter()
-            .zip(filter.secondary_weights())
-            .enumerate()
-        {
-            let mut stage = 0;
-            SSPRK3.step_with_relaxation(
-                q,
-                dt_bt,
-                t + m as f64 * dt_bt,
-                |s, time, out| {
-                    barotropic.compute_rhs_face_mass_into(s, time, out, face_mass);
-                    out.axpy(1.0, g_term);
-                    let c = w_secondary * STAGE_WEIGHTS[stage] / n_bt as f64;
-                    transport.accumulate(c, s, face_mass);
-                    if let Some(rivers) = rivers {
-                        for (i, mean) in transport.discharge.iter_mut().enumerate() {
-                            let discharge = rivers.discharge(i, time);
-                            let rate = discharge * rivers.inv_area(i);
-                            let k = rivers.element(i).as_usize();
-                            out.data[SWE_VAR_H][k * nn..(k + 1) * nn]
-                                .iter_mut()
-                                .for_each(|h| *h += rate);
-                            *mean += c * discharge;
-                        }
+        let stage_drag = StageDrag {
+            bottom: drag.bottom,
+            column: column_drag,
+        };
+        // The filter's weight of the state the next substep starts from
+        let mut pending_weight = None;
+        for (m, &w_secondary) in filter.secondary_weights().iter().enumerate() {
+            let t_m = t + m as f64 * dt_bt;
+            for stage in SSP_RK3_STAGES {
+                let time = t_m + stage.time * dt_bt;
+                // The stage's start value `x`, the value it writes, and `qⁿ`
+                // for the second stage's combination. The third stage writes
+                // `qⁿ⁺¹` in place, reading each node's `qⁿ` before
+                let (x, target, start) = match stage.input {
+                    StageInput::Start => (&*q, &mut *u1, None),
+                    StageInput::First => (&*u1, &mut *u2, Some(&*q)),
+                    StageInput::Second => (&*u2, &mut *q, None),
+                };
+                barotropic.compute_rhs_face_mass_into(x, time, k_2d, face_mass);
+                let c = w_secondary * stage.weight / n_bt as f64;
+                if let Some(rivers) = rivers {
+                    for (i, mean) in transport.discharge.iter_mut().enumerate() {
+                        let discharge = rivers.discharge(i, time);
+                        let rate = discharge * rivers.inv_area(i);
+                        let k = rivers.element(i).as_usize();
+                        k_2d.data[SWE_VAR_H][k * nn..(k + 1) * nn]
+                            .iter_mut()
+                            .for_each(|h| *h += rate);
+                        *mean += c * discharge;
                     }
-                    stage += 1;
-                },
-                |stage, from, dt_stage| {
-                    barotropic.implicit_damping(stage, from, dt_stage);
-                    if bottom_drag || layer_drag {
-                        damp_depth_mean(stage, drag.bottom, column_drag, dt_stage);
-                    }
-                },
-                |s| barotropic.post_process(s),
-                &mut self.stages_2d,
-            );
+                }
+                let rates = StageRates {
+                    rhs: k_2d,
+                    forcing: g_term,
+                    face_mass,
+                    drag: stage_drag,
+                };
+                let weights = PassWeights {
+                    transport: c,
+                    average: pending_weight.take(),
+                };
+                barotropic_stage(
+                    stage, x, start, rates, dt_bt, weights, target, transport, q_avg,
+                );
+                barotropic.implicit_damping(target, x, stage.dt_fraction * dt_bt);
+                barotropic.post_process(target);
+            }
+            pending_weight = Some(filter.weights()[m]);
+        }
+        if let Some(w) = pending_weight {
             q_avg.axpy(w, q);
         }
         // The early weights are negative: restore positivity of the average
@@ -1013,29 +1020,202 @@ impl ModeSplitIntegrator {
     }
 }
 
-/// The depth-mean part of the bottom drag and the layer drag,
-/// `∂(hu, hv)/∂t = −(r/h + Λ̄)·(hu, hv)`, point-implicitly on a barotropic
-/// stage value: `(hu, hv) ← (hu, hv)/(1 + dt·(r/h + Λ̄))` with the stage's
-/// own depth (only ever shrinks the transport). `bottom` holds `r` (m/s),
-/// `column` holds `Λ̄` (1/s), per column.
-fn damp_depth_mean(
-    stage: &mut SWESolution2D,
-    bottom: Option<&[f64]>,
-    column: Option<&[f64]>,
+/// The start value of an SSP-RK3 stage of a barotropic substep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageInput {
+    /// `qⁿ`, the substep's start.
+    Start,
+    /// The first stage value `u₁`.
+    First,
+    /// The second stage value `u₂`.
+    Second,
+}
+
+/// An SSP-RK3 stage of a barotropic substep (Shu–Osher form):
+///
+/// ```text
+/// u₁   = qⁿ + Δt·L(qⁿ)
+/// u₂   = ¾qⁿ + ¼u₁ + ¼Δt·L(u₁)
+/// qⁿ⁺¹ = ⅓qⁿ + ⅔u₂ + ⅔Δt·L(u₂)
+/// ```
+#[derive(Clone, Copy, Debug)]
+struct RkStage {
+    input: StageInput,
+    /// Stage time, as a fraction of the substep.
+    time: f64,
+    /// Weight of the stage's RHS in the substep (Butcher form,
+    /// `qⁿ⁺¹ = qⁿ + Δt(k₁ + k₂ + 4k₃)/6`): the weight of its fluxes in the
+    /// transport.
+    weight: f64,
+    /// Length of the stage's forward-Euler step, as a fraction of the
+    /// substep: the step of its point-implicit damping.
+    dt_fraction: f64,
+}
+
+/// The three stages of [`SSPRK3`], in order.
+const SSP_RK3_STAGES: [RkStage; 3] = [
+    RkStage {
+        input: StageInput::Start,
+        time: 0.0,
+        weight: 1.0 / 6.0,
+        dt_fraction: 1.0,
+    },
+    RkStage {
+        input: StageInput::First,
+        time: 1.0,
+        weight: 1.0 / 6.0,
+        dt_fraction: 0.25,
+    },
+    RkStage {
+        input: StageInput::Second,
+        time: 0.5,
+        weight: 2.0 / 3.0,
+        dt_fraction: 2.0 / 3.0,
+    },
+];
+
+/// The depth-mean part of the 3D model's drags, frozen over the step:
+/// `bottom` holds the bottom-drag rate `r` (m/s), `column` the column mean
+/// `Λ̄` (1/s) of the layer drag, per column.
+#[derive(Clone, Copy)]
+struct StageDrag<'a> {
+    bottom: Option<&'a [f64]>,
+    column: Option<&'a [f64]>,
+}
+
+/// The rates of a barotropic stage: the 2D module's RHS (with the rivers),
+/// the slow forcing `G` added to it, the face mass fluxes of the RHS, and
+/// the drag.
+#[derive(Clone, Copy)]
+struct StageRates<'a> {
+    rhs: &'a SWESolution2D,
+    forcing: &'a SWESolution2D,
+    face_mass: &'a [f64],
+    drag: StageDrag<'a>,
+}
+
+/// What a barotropic stage adds to the pass's sums: its start value's
+/// transport and its face fluxes with weight `transport` to DU_avg2, and,
+/// at the first stage of a substep, its start value (the state after the
+/// previous substep) with the filter's weight `average` to the average.
+#[derive(Clone, Copy)]
+struct PassWeights {
+    transport: f64,
+    average: Option<f64>,
+}
+
+/// One SSP-RK3 stage of a barotropic substep of `dt` from the stage's start
+/// value `x` (and `qⁿ`, `start`, for the second stage), in one element-block
+/// pass:
+/// - the stage combination with the rate `L(x) = RHS + G` into `target`, as
+///   [`SSPRK3`] evaluates it, bit for bit; the third stage writes `qⁿ⁺¹`
+///   over `qⁿ` (`target` holds `qⁿ`);
+/// - the depth-mean part of the drags, `∂(hu, hv)/∂t = −ρ·(hu, hv)` with
+///   `ρ = r/h + Λ̄`, point-implicitly with the new depth: `(hu, hv) ←
+///   (hu, hv)/(1 + dt_s·ρ)`, `dt_s` the stage's forward-Euler step (it only
+///   ever shrinks the transport);
+/// - the stage's contributions to DU_avg2 and to the filtered average
+///   ([`PassWeights`]).
+///
+/// One pass instead of a serial sweep per operation: the 2D state is
+/// streamed once per stage, on every thread.
+#[allow(clippy::too_many_arguments)]
+fn barotropic_stage(
+    stage: RkStage,
+    x: &SWESolution2D,
+    start: Option<&SWESolution2D>,
+    rates: StageRates<'_>,
     dt: f64,
+    weights: PassWeights,
+    target: &mut SWESolution2D,
+    transport: &mut BarotropicTransport,
+    average: &mut SWESolution2D,
 ) {
-    let [h, hu, hv] = &mut stage.data;
-    for (idx, ((&h, hu), hv)) in h.iter().zip(hu.iter_mut()).zip(hv.iter_mut()).enumerate() {
-        if h <= 0.0 {
-            continue;
-        }
-        let rate = bottom.map_or(0.0, |r| r[idx] / h) + column.map_or(0.0, |c| c[idx]);
-        if rate > 0.0 {
-            let factor = 1.0 / (1.0 + dt * rate);
-            *hu *= factor;
-            *hv *= factor;
-        }
-    }
+    let (ne, nn) = (x.n_elements, x.n_nodes);
+    let n_face = rates.face_mass.len() / ne.max(1);
+    let dt_stage = stage.dt_fraction * dt;
+    let [h, hu, hv] = &mut target.data;
+    let [avg_h, avg_hu, avg_hv] = &mut average.data;
+    let outputs = [
+        &mut h[..],
+        hu,
+        hv,
+        &mut transport.hu.data[..],
+        &mut transport.hv.data[..],
+        &mut transport.face[..],
+        avg_h,
+        avg_hu,
+        avg_hv,
+    ];
+    for_each_block(
+        ne,
+        outputs,
+        || (),
+        |_, k, [h, hu, hv, tr_hu, tr_hv, tr_face, avg_h, avg_hu, avg_hv]| {
+            let nodes = k * nn..(k + 1) * nn;
+            for (var, new) in [&mut *h, &mut *hu, &mut *hv].into_iter().enumerate() {
+                let x = &x.data[var][nodes.clone()];
+                let rhs = &rates.rhs.data[var][nodes.clone()];
+                let forcing = &rates.forcing.data[var][nodes.clone()];
+                let rate = |i: usize| rhs[i] + forcing[i];
+                match stage.input {
+                    StageInput::Start => {
+                        for (i, (new, &x)) in new.iter_mut().zip(x).enumerate() {
+                            *new = x + dt * rate(i);
+                        }
+                    }
+                    StageInput::First => {
+                        let start = start.expect("the second stage combines with qⁿ");
+                        let start = &start.data[var][nodes.clone()];
+                        for (i, (new, (&x, &q))) in
+                            new.iter_mut().zip(x.iter().zip(start)).enumerate()
+                        {
+                            *new = q * 0.75 + 0.25 * x + 0.25 * dt * rate(i);
+                        }
+                    }
+                    StageInput::Second => {
+                        for (i, (new, &x)) in new.iter_mut().zip(x).enumerate() {
+                            *new = *new * (1.0 / 3.0) + 2.0 / 3.0 * x + 2.0 / 3.0 * dt * rate(i);
+                        }
+                    }
+                }
+            }
+            let drag = rates.drag;
+            if drag.bottom.is_some() || drag.column.is_some() {
+                let columns = h.iter().zip(hu.iter_mut()).zip(hv.iter_mut());
+                for (i, ((&h, hu), hv)) in columns.enumerate() {
+                    if h <= 0.0 {
+                        continue;
+                    }
+                    let idx = k * nn + i;
+                    let rate = drag.bottom.map_or(0.0, |r| r[idx] / h)
+                        + drag.column.map_or(0.0, |c| c[idx]);
+                    if rate > 0.0 {
+                        let factor = 1.0 / (1.0 + dt_stage * rate);
+                        *hu *= factor;
+                        *hv *= factor;
+                    }
+                }
+            }
+            let c = weights.transport;
+            for (sum, var) in [(tr_hu, SWE_VAR_HU), (tr_hv, SWE_VAR_HV)] {
+                for (a, &b) in sum.iter_mut().zip(&x.data[var][nodes.clone()]) {
+                    *a += c * b;
+                }
+            }
+            let faces = &rates.face_mass[k * n_face..(k + 1) * n_face];
+            for (a, &b) in tr_face.iter_mut().zip(faces) {
+                *a += c * b;
+            }
+            if let Some(w) = weights.average {
+                for (var, sum) in [avg_h, avg_hu, avg_hv].into_iter().enumerate() {
+                    for (a, &b) in sum.iter_mut().zip(&x.data[var][nodes.clone()]) {
+                        *a += w * b;
+                    }
+                }
+            }
+        },
+    );
 }
 
 /// `(η, ū, v̄)` at node `idx` of the filtered transport, over bed `b`
@@ -1322,6 +1502,150 @@ mod tests {
         let exact = (2.0 * dt - 0.15 * dt * dt + 0.07 * dt.powi(3) / 3.0) / dt;
         let approx: f64 = tau.iter().zip(&w).map(|(t, w)| w * p(*t)).sum();
         assert!((approx - exact).abs() < 1e-12, "{approx} vs {exact}");
+    }
+
+    /// The fused barotropic stages ([`barotropic_stage`]) give, bit for bit,
+    /// what [`SSPRK3`] with the drag as relaxation and separate sweeps for
+    /// `+ G`, the transport and the filtered average give: over two substeps
+    /// of a nonlinear rate, with a bottom and a layer drag and a dry node.
+    #[test]
+    fn fused_barotropic_stages_match_ssp_rk3_bit_for_bit() {
+        let (ne, nn, n_face) = (3, 4, 8);
+        let value = |seed: usize| ((seed as f64 * 0.618_034).fract() - 0.3) * 2.0;
+        let mut q0 = SWESolution2D::new(ne, nn);
+        let mut g = SWESolution2D::new(ne, nn);
+        for var in 0..3 {
+            for i in 0..ne * nn {
+                q0.data[var][i] = value(7 * i + var) + if var == SWE_VAR_H { 1.0 } else { 0.0 };
+                if var != SWE_VAR_H {
+                    g.data[var][i] = 0.1 * value(11 * i + var);
+                }
+            }
+        }
+        q0.data[SWE_VAR_H][5] = 0.0;
+        let bottom: Vec<f64> = (0..ne * nn).map(|i| 0.01 * value(3 * i).abs()).collect();
+        let column: Vec<f64> = (0..ne * nn).map(|i| 1e-3 * value(5 * i).abs()).collect();
+        let drag = StageDrag {
+            bottom: Some(&bottom),
+            column: Some(&column),
+        };
+        // A nonlinear 2D "RHS" and face fluxes depending on the state
+        let rhs = |s: &SWESolution2D, time: f64, out: &mut SWESolution2D, face: &mut [f64]| {
+            for var in 0..3 {
+                for i in 0..ne * nn {
+                    let x = s.data[var][i];
+                    out.data[var][i] =
+                        -0.3 * x * s.data[SWE_VAR_H][i] + 0.05 * (time + i as f64).sin();
+                }
+            }
+            for (j, f) in face.iter_mut().enumerate() {
+                *f = s.data[SWE_VAR_HU][j % (ne * nn)] - 0.5 * s.data[SWE_VAR_H][j % (ne * nn)];
+            }
+        };
+        let (dt, w_avg, w_secondary) = (0.7, [0.4, 0.6], [1.0, 0.6]);
+
+        // Reference: SSPRK3 with each operation as its own sweep
+        let mut q = q0.clone();
+        let mut avg = SWESolution2D::new(ne, nn);
+        let mut transport = BarotropicTransport::new(ne, nn, ne * n_face, 0);
+        let mut face = vec![0.0; ne * n_face];
+        let mut workspace = StageWorkspace::new();
+        let damp = |s: &mut SWESolution2D, dt: f64| {
+            let [h, hu, hv] = &mut s.data;
+            for (idx, ((&h, hu), hv)) in h.iter().zip(hu.iter_mut()).zip(hv.iter_mut()).enumerate()
+            {
+                if h > 0.0 {
+                    let factor = 1.0 / (1.0 + dt * (bottom[idx] / h + column[idx]));
+                    *hu *= factor;
+                    *hv *= factor;
+                }
+            }
+        };
+        for m in 0..2 {
+            let mut stage = 0;
+            SSPRK3.step_with_relaxation(
+                &mut q,
+                dt,
+                m as f64 * dt,
+                |s, time, out| {
+                    rhs(s, time, out, &mut face);
+                    out.axpy(1.0, &g);
+                    let c = w_secondary[m] * SSP_RK3_STAGES[stage].weight;
+                    let sums = [
+                        (&mut transport.hu.data[..], &s.data[SWE_VAR_HU][..]),
+                        (&mut transport.hv.data[..], &s.data[SWE_VAR_HV][..]),
+                        (&mut transport.face[..], &face[..]),
+                    ];
+                    for (sum, values) in sums {
+                        for (a, b) in sum.iter_mut().zip(values) {
+                            *a += c * b;
+                        }
+                    }
+                    stage += 1;
+                },
+                |s, _, dt_stage| damp(s, dt_stage),
+                |_| {},
+                &mut workspace,
+            );
+            avg.axpy(w_avg[m], &q);
+        }
+
+        // Fused
+        let mut q_fused = q0.clone();
+        let (mut u1, mut u2, mut k) = (q0.clone(), q0.clone(), q0.clone());
+        let mut avg_fused = SWESolution2D::new(ne, nn);
+        let mut transport_fused = BarotropicTransport::new(ne, nn, ne * n_face, 0);
+        let mut pending = None;
+        for m in 0..2 {
+            for stage in SSP_RK3_STAGES {
+                let (x, target, start) = match stage.input {
+                    StageInput::Start => (&q_fused, &mut u1, None),
+                    StageInput::First => (&u1, &mut u2, Some(&q_fused)),
+                    StageInput::Second => (&u2, &mut q_fused, None),
+                };
+                rhs(x, m as f64 * dt + stage.time * dt, &mut k, &mut face);
+                let rates = StageRates {
+                    rhs: &k,
+                    forcing: &g,
+                    face_mass: &face,
+                    drag,
+                };
+                let weights = PassWeights {
+                    transport: w_secondary[m] * stage.weight,
+                    average: pending.take(),
+                };
+                barotropic_stage(
+                    stage,
+                    x,
+                    start,
+                    rates,
+                    dt,
+                    weights,
+                    target,
+                    &mut transport_fused,
+                    &mut avg_fused,
+                );
+            }
+            pending = Some(w_avg[m]);
+        }
+        avg_fused.axpy(pending.unwrap(), &q_fused);
+
+        let bits = |s: &[f64]| s.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for var in 0..3 {
+            assert_eq!(
+                bits(&q.data[var]),
+                bits(&q_fused.data[var]),
+                "state, var {var}"
+            );
+            assert_eq!(
+                bits(&avg.data[var]),
+                bits(&avg_fused.data[var]),
+                "average, var {var}"
+            );
+        }
+        assert_eq!(bits(&transport.hu.data), bits(&transport_fused.hu.data));
+        assert_eq!(bits(&transport.hv.data), bits(&transport_fused.hv.data));
+        assert_eq!(bits(&transport.face), bits(&transport_fused.face));
     }
 
     /// Phase of the prescribed forcing, so that `G′(0) ≠ 0` and the
