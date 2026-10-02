@@ -178,6 +178,51 @@ pub(crate) fn update_values(out: &mut [f64], f: impl Fn(&mut f64) + Sync + Send)
     out.iter_mut().for_each(f);
 }
 
+/// `out ← a·base + Σᵢ cᵢ·xᵢ` (`base` is `out` itself when `None`), in one
+/// streaming pass (as [`update_values`]), every value evaluated as
+/// `((base·a) + c₁x₁) + c₂x₂ …` with `·a` left out for `a = 1`: the bits of
+/// a `copy`, `scale`, `axpy` sequence ([`crate::time::Integrable::combine`]).
+pub(crate) fn combine_values(
+    out: &mut [f64],
+    base: Option<&[f64]>,
+    a: f64,
+    terms: &[(f64, &[f64])],
+) {
+    if let Some(base) = base {
+        assert_eq!(out.len(), base.len(), "lengths of the combined fields");
+    }
+    for (_, x) in terms {
+        assert_eq!(out.len(), x.len(), "lengths of the combined fields");
+    }
+    let chunk = |offset: usize, out: &mut [f64]| {
+        let range = offset..offset + out.len();
+        if let Some(base) = base {
+            out.copy_from_slice(&base[range.clone()]);
+        }
+        if a != 1.0 {
+            out.iter_mut().for_each(|v| *v *= a);
+        }
+        // One sweep per term over a cache-sized chunk: the chunk stays in
+        // cache, so the memory traffic is that of a single pass
+        for &(c, x) in terms {
+            for (v, &x) in out.iter_mut().zip(&x[range.clone()]) {
+                *v += c * x;
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(STREAM_CHUNK)
+            .enumerate()
+            .for_each(|(i, out)| chunk(i * STREAM_CHUNK, out));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (i, out) in out.chunks_mut(STREAM_CHUNK).enumerate() {
+        chunk(i * STREAM_CHUNK, out);
+    }
+}
+
 /// `f(x, y)` for every value `x` of `out` and `y` of `input` at the same
 /// index (as [`update_values`]).
 pub(crate) fn update_with(out: &mut [f64], input: &[f64], f: impl Fn(&mut f64, f64) + Sync + Send) {
