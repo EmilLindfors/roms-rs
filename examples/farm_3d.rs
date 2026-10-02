@@ -65,11 +65,12 @@ use dg_rs::particles::{
 };
 use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use dg_rs::physics::{
-    BottomDrag3D, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D,
+    BottomDrag3D, EquationOfState, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, PhysicsBuilder,
+    SWEPhysics2D,
 };
 use dg_rs::simulation::{Simulation, Simulation3D};
 use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{Probe2D, SWESolution2D, SWEState2D};
+use dg_rs::solver::{PotentialEnergy3D, Probe2D, SWESolution2D, SWEState2D};
 use dg_rs::source::{
     CageDrag2D, ChezyFriction2D, CoriolisSource2D, HorizontalViscosity2D, NetCage, SourceContext2D,
     SourceTerm2D,
@@ -292,6 +293,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         physics.update_density(&mut state);
+        let mut energy = PotentialEnergy3D::new(&ops, &geom, &bathymetry, G, RHO0);
+        let reference_0 = energy.compute(&state, &sigma).reference;
         let label = if with_cages { "3D cages" } else { "3D open" };
         let start = Instant::now();
         let mut tracking = (with_cages && particles_per_kind > 0)
@@ -308,8 +311,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(tracking) = &tracking {
             tracking.report(&state, &sigma, &bathymetry);
         }
+        // Mixing: the growth of the reference potential energy, GLS's and
+        // the advection's spurious mixing together
+        eos.update_density(&mut state);
+        let mixing = (energy.compute(&state, &sigma).reference - reference_0) / t_end / (LX * LY);
         println!(
-            "{label:>9}: {:5} steps, dt {:.1}–{:.1} s, {:6.1} s wall",
+            "{label:>9}: {:5} steps, dt {:.1}–{:.1} s, {:6.1} s wall, mixing {mixing:.3e} W/m²",
             result.n_steps,
             result.dt_min,
             result.dt_max,

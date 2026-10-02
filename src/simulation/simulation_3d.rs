@@ -3246,6 +3246,90 @@ mod tests {
         );
     }
 
+    /// TODO P4.5 gate: the reference potential energy measures mixing
+    /// exactly. A stratified basin at rest with only a constant vertical
+    /// diffusivity κ has no motion and stays sorted, so RPE = PE, and with
+    /// no flux through the bed or the surface the implicit diffusion step
+    /// changes it by
+    ///
+    /// ```text
+    /// ΔRPE = g κ A Δt (ρ_bed − ρ_surface)ⁿ⁺¹,
+    /// ```
+    ///
+    /// the conversion of internal energy into potential energy of
+    /// Winters et al. (1995) for the discrete column: the layer fluxes
+    /// `κ(ρ_{l+1} − ρ_l)/(z_{l+1} − z_l)` times the heights they cross sum
+    /// to the end layers' difference. Holds to 4.2e-11 of each step's change
+    /// over 30 steps.
+    #[test]
+    fn vertical_diffusion_raises_the_reference_potential_energy_at_its_exact_rate() {
+        use crate::solver::PotentialEnergy3D;
+        let (length, width, depth, levels) = (2e3, 1e3, 20.0, 10);
+        let (kappa, dt) = (1e-2, 60.0);
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, width, 2, 1));
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -depth));
+        let sigma = SigmaGrid::new(levels, UniformStretching);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .build();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(0.0, kappa),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        let eos = LinearEOS::default();
+        let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, levels);
+        state.salt.fill(eos.s0);
+        // Warm at the surface: a tanh thermocline, so the profile diffuses
+        for column in state.temp.chunks_mut(levels) {
+            for (l, t) in column.iter_mut().enumerate() {
+                let z = depth * (sigma.sigma_rho()[l] + 0.5);
+                *t = eos.t0 + 3.0 * (z / 3.0).tanh();
+            }
+        }
+        physics.update_density(&mut state);
+        let mut energy = PotentialEnergy3D::new(&ops, &geom, &bathymetry, G, RHO0);
+        let mut before = energy.compute(&state, &sigma);
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut worst: f64 = 0.0;
+        for n in 0..30 {
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.update_density(&mut state);
+            let after = energy.compute(&state, &sigma);
+            let (bed, surface) = (state.rho[0], state.rho[levels - 1]);
+            let expected = G * kappa * length * width * dt * (bed - surface);
+            let change = after.reference - before.reference;
+            worst = worst.max((change - expected).abs() / expected);
+            assert!(
+                after.available().abs() < 1e-9 * expected,
+                "the column at rest left its sorted state: APE {:.3e} J",
+                after.available()
+            );
+            before = after;
+        }
+        assert!(
+            worst < 1e-9,
+            "the reference potential energy changed by {worst:.3e} of the diffusion's rate"
+        );
+    }
+
     /// What [`lock_exchange`] measures.
     struct LockExchange {
         /// The Froude numbers `U/√(g′H)` of the dense and the light front
@@ -3253,6 +3337,9 @@ mod tests {
         froude: [f64; 2],
         /// How far T left its initial range at the end (°C).
         t_excess: f64,
+        /// The spurious mixing: the growth of the reference potential energy
+        /// per area over the window (W/m²; there is no diffusivity of T).
+        mixing: f64,
         /// The largest horizontal viscosity of each element at the end
         /// (m²/s).
         largest_viscosity: Vec<f64>,
@@ -3350,8 +3437,10 @@ mod tests {
             ]
         };
 
+        let mut energy =
+            crate::solver::PotentialEnergy3D::new(&ops, &geom, &physics.bathymetry, G, RHO0);
         let mut integrator = ModeSplitIntegrator::new();
-        let mut positions = Vec::new();
+        let (mut positions, mut references) = (Vec::new(), Vec::new());
         let [first, last] = window.map(|t| (t / dt).round() as usize);
         for n in 0..last {
             physics.update_density(&mut state);
@@ -3359,6 +3448,8 @@ mod tests {
             physics.post_process(&mut state);
             if n + 1 == first || n + 1 == last {
                 positions.push(fronts(&state));
+                physics.update_density(&mut state);
+                references.push(energy.compute(&state, &sigma).reference);
             }
         }
         let t_excess = max_or_nan(
@@ -3384,9 +3475,11 @@ mod tests {
         );
         let span = (last - first) as f64 * dt;
         let froude = [0, 1].map(|f| (positions[1][f] - positions[0][f]).abs() / span / speed_scale);
+        let mixing = (references[1] - references[0]) / span / (length * width);
         LockExchange {
             froude,
             t_excess,
+            mixing,
             largest_viscosity,
         }
     }
@@ -3445,7 +3538,9 @@ mod tests {
     /// Fr = 0.497 (dense) and 0.495 (light) over hours 1–2 (0.500 and 0.495
     /// with the conservative momentum advection; P1 without viscosity 0.481),
     /// and T stays in its range to 5e-12 °C. Before hour 1 the fronts are
-    /// still accelerating (0.48 over 0.5–1.5 h).
+    /// still accelerating (0.48 over 0.5–1.5 h). The spurious mixing is
+    /// 2.7e-4 W/m², a third of the inviscid run's
+    /// ([`spurious_mixing_is_set_by_the_grid_reynolds_number`]).
     ///
     /// With the conservative momentum advection P2 needed it: the
     /// interface's shear instability grows
@@ -3471,6 +3566,7 @@ mod tests {
         let LockExchange {
             froude: [dense, light],
             t_excess,
+            mixing,
             ..
         } = lock_exchange(
             2,
@@ -3496,6 +3592,8 @@ mod tests {
             (dense - light).abs() < 0.01,
             "the fronts run at Fr = {dense:.4} and {light:.4}"
         );
+        // Measured 2.7e-4 W/m² (no viscosity: 8.4e-4)
+        assert!(mixing < 4e-4, "the spurious mixing is {mixing:.3e} W/m²");
     }
 
     /// TODO P4.5 gate: Smagorinsky's viscosity holds the P2 lock exchange
@@ -3520,6 +3618,7 @@ mod tests {
             froude: [dense, light],
             t_excess,
             largest_viscosity,
+            ..
         } = lock_exchange(
             2,
             32,
@@ -3615,16 +3714,20 @@ mod tests {
     /// 62 m (0.483, 0.452, 20 s steps), 500 m (0.462, 0.461), P3 on 250 m
     /// (0.453, 0.430, 20 s), 20 levels (0.467, 0.461), 10 s steps. The fronts
     /// run slower than with viscosity (0.497 at ν = 10): an interface left to
-    /// the grid mixes more, as the spurious mixing of the models in
-    /// Ilıcak et al. (2012) grows with the grid Reynolds number, and on the
-    /// finer meshes the two fronts drift apart. Viscosity is then a choice
-    /// of physics, not a condition of stability.
+    /// the grid mixes more. Its spurious mixing, the growth of the reference
+    /// potential energy (there is no diffusivity of T), is 8.4e-4 W/m² here,
+    /// 3.1× that at ν = 10 (2.7e-4,
+    /// [`a_p2_lock_exchange_runs_with_horizontal_viscosity`]), and grows
+    /// as the mesh is refined ([`spurious_mixing_is_set_by_the_grid_reynolds_number`]),
+    /// and on the finer meshes the two fronts drift apart. Viscosity is then
+    /// a choice of physics, not a condition of stability.
     #[test]
     fn a_p2_lock_exchange_runs_without_horizontal_viscosity() {
         use crate::solver::rhs::VerticalAdvection;
         let LockExchange {
             froude: [dense, light],
             t_excess,
+            mixing,
             ..
         } = lock_exchange(
             2,
@@ -3649,6 +3752,64 @@ mod tests {
         assert!(
             (dense - light).abs() < 0.01,
             "the fronts run at Fr = {dense:.4} and {light:.4}"
+        );
+        // Measured 8.4e-4 W/m²
+        assert!(
+            (6e-4..1.2e-3).contains(&mixing),
+            "the spurious mixing is {mixing:.3e} W/m²"
+        );
+    }
+
+    /// TODO P4.5 gate: the spurious mixing of the lock exchange
+    /// ([`lock_exchange`]) is set by the grid Reynolds number
+    /// `Re_Δ = ΔU·Δx/ν` (ΔU = 0.4 m/s, Δx the node spacing), as Ilıcak et al.
+    /// (2012) found for z-, σ- and isopycnal models. P2 on 250 m with
+    /// ν = 5 m²/s and on 125 m with ν = 2.5 (both `Re_Δ` = 10), ten levels,
+    /// 40 s steps: the reference potential energy grows by 3.818e-4 and
+    /// 3.812e-4 W/m² over hours 1–2 (0.2 % apart). There is no diffusivity
+    /// of T, so all of it is the advection's.
+    ///
+    /// Measured over hours 1–3 (W/m²; 10 levels unless noted):
+    ///
+    /// | P2 elements | ν = 0 | `Re_Δ` = 10 | ν = 10 | ν = 10, 20 levels | `C_s` 0.2 | `C_s` 0.5 |
+    /// |---|---|---|---|---|---|---|
+    /// | 500 m | 1.07e-3 | 5.7e-4 | 5.7e-4 | | 8.9e-4 | 6.1e-4 |
+    /// | 250 m | 1.35e-3 | 5.1e-4 | 3.3e-4 | | 7.9e-4 | 4.0e-4 |
+    /// | 125 m | 1.64e-3 | 5.1e-4 | 2.3e-4 | 1.45e-4 | 6.6e-4 | 3.2e-4 |
+    /// | 62 m | 1.72e-3 | 5.4e-4 | 2.0e-4 | 7.9e-5 | 5.8e-4 | 2.8e-4 |
+    ///
+    /// Without viscosity the mixing grows as the mesh is refined (the
+    /// interface is left to the grid at any resolution; 20 levels change
+    /// nothing, 1.64e-3 at 125 m); at a fixed `Re_Δ` it stays; at a fixed ν
+    /// it converges, towards zero once the levels are refined too (the
+    /// 10-level runs level off at 2e-4). On 250 m it falls monotonically with
+    /// ν: 9.4e-4, 7.0e-4, 5.1e-4, 3.3e-4, 2.2e-4 at ν = 1, 2.5, 5, 10, 20.
+    /// Smagorinsky's ν follows the strain, so its mixing falls with the
+    /// spacing at a fixed `C_s`; at 0.5 it is within 1.2–1.4× of ν = 10. P1
+    /// without viscosity mixes 6.0e-4 (its own dissipation).
+    #[test]
+    fn spurious_mixing_is_set_by_the_grid_reynolds_number() {
+        use crate::solver::rhs::{HorizontalViscosity3D, VerticalAdvection};
+        let [coarse, fine] = [(32, 5.0), (64, 2.5)].map(|(n_x, nu)| {
+            lock_exchange(
+                2,
+                n_x,
+                10,
+                HorizontalViscosity3D::constant(nu),
+                VerticalAdvection::default(),
+                40.0,
+                [3600.0, 7200.0],
+            )
+            .mixing
+        });
+        assert!(
+            (fine / coarse - 1.0).abs() < 0.05,
+            "at Re_Δ = 10 the spurious mixing is {coarse:.4e} W/m² on 250 m and {fine:.4e} on 125 m"
+        );
+        // Measured 3.82e-4: less than half the inviscid run's (8.4e-4)
+        assert!(
+            coarse < 4.5e-4,
+            "the spurious mixing at Re_Δ = 10 is {coarse:.4e} W/m²"
         );
     }
 
