@@ -82,7 +82,7 @@
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
-use crate::solver::core::blocks::for_each_block;
+use crate::solver::core::blocks::{for_each_block, update_values, update_with};
 use crate::solver::rhs::{
     BarotropicFlux, from_inventory, to_inventory, transport_divergence_element, w_cell_thicknesses,
 };
@@ -90,7 +90,7 @@ use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::source::{RiverInflow, RiverSources};
-use crate::time::{Integrable, IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
+use crate::time::{IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 use std::cell::RefCell;
@@ -948,14 +948,17 @@ impl ModeSplitIntegrator {
             dt,
             t,
             |s, time, out| {
-                concentrations.copy_from(s);
+                // The inventory fields are converted from `s` next
+                copy_non_inventory_fields(s, concentrations);
                 {
                     let mut last = last_values.borrow_mut();
                     to_values(s, &mut last);
                     last.copy_to_state(concentrations);
                 }
                 if first_stage {
-                    out.copy_from(rhs_n);
+                    // R₃D is u, v; the other fields of `out` are written below
+                    update_with(&mut out.u, &rhs_n.u, |x, y| *x = y);
+                    update_with(&mut out.v, &rhs_n.v, |x, y| *x = y);
                     first_stage = false;
                 } else {
                     physics.momentum_rhs_into(concentrations, time, out);
@@ -968,8 +971,8 @@ impl ModeSplitIntegrator {
                 out.gls.resize(s.gls.len(), 0.0);
                 physics.transport_rhs_into(concentrations, time, barotropic_flux, out);
                 // w and rho are diagnostics, refreshed after the stages
-                out.w.fill(0.0);
-                out.rho.fill(0.0);
+                update_values(&mut out.w, |x| *x = 0.0);
+                update_values(&mut out.rho, |x| *x = 0.0);
                 set_column_sums(sigma, &mut out.u, rate_hu);
                 set_column_sums(sigma, &mut out.v, rate_hv);
                 out.eta.copy_from(rate_eta);
@@ -1250,24 +1253,66 @@ fn to_transport(state: &Solution3D, bathymetry: &Bathymetry2D, q: &mut SWESoluti
 
 /// Depth average of every column of a 3D field.
 fn depth_average(sigma: &SigmaGrid, field: &[f64], out: &mut DGSolution2D) {
-    for (mean, column) in out
-        .data
-        .iter_mut()
-        .zip(field.chunks_exact(sigma.n_levels()))
-    {
-        *mean = sigma.depth_average(column);
-    }
+    let (nl, nn) = (sigma.n_levels(), out.n_nodes);
+    for_each_block(
+        out.n_elements,
+        [&mut out.data[..]],
+        || (),
+        |_, k, [means]| {
+            let columns = &field[k * nn * nl..(k + 1) * nn * nl];
+            for (mean, column) in means.iter_mut().zip(columns.chunks_exact(nl)) {
+                *mean = sigma.depth_average(column);
+            }
+        },
+    );
 }
 
 /// Replace the sum of every column of an inventory tendency by `rate`,
 /// sharing the difference out by the layer fractions `Δσ_l`.
 fn set_column_sums(sigma: &SigmaGrid, field: &mut [f64], rate: &DGSolution2D) {
-    let d_sigma = sigma.d_sigma();
-    for (column, &r) in field.chunks_exact_mut(sigma.n_levels()).zip(&rate.data) {
-        let difference = r - column.iter().sum::<f64>();
-        for (x, &ds) in column.iter_mut().zip(d_sigma) {
-            *x += ds * difference;
-        }
+    let (d_sigma, nn) = (sigma.d_sigma(), rate.n_nodes);
+    for_each_block(
+        rate.n_elements,
+        [field],
+        || (),
+        |_, k, [columns]| {
+            let rates = &rate.data[k * nn..(k + 1) * nn];
+            for (column, &r) in columns.chunks_exact_mut(d_sigma.len()).zip(rates) {
+                let difference = r - column.iter().sum::<f64>();
+                for (x, &ds) in column.iter_mut().zip(d_sigma) {
+                    *x += ds * difference;
+                }
+            }
+        },
+    );
+}
+
+/// Copy the fields of `from` that the 3D stages do not carry as inventories
+/// (the barotropic state, the diagnostics) into `to`, and size `to`'s
+/// turbulence like `from`'s; `to`'s inventory fields are left as they are.
+fn copy_non_inventory_fields(from: &Solution3D, to: &mut Solution3D) {
+    to.eta.copy_from(&from.eta);
+    to.ubar.copy_from(&from.ubar);
+    to.vbar.copy_from(&from.vbar);
+    for (x, y) in [
+        (&mut to.w, &from.w),
+        (&mut to.rho, &from.rho),
+        (&mut to.eddy_viscosity, &from.eddy_viscosity),
+        (&mut to.eddy_diffusivity, &from.eddy_diffusivity),
+    ] {
+        copy_field(x, y);
+    }
+    to.tke.resize(from.tke.len(), 0.0);
+    to.gls.resize(from.gls.len(), 0.0);
+}
+
+/// `to = from`, in parallel when the lengths agree.
+fn copy_field(to: &mut Vec<f64>, from: &[f64]) {
+    if to.len() == from.len() {
+        update_with(to, from, |x, y| *x = y);
+    } else {
+        to.clear();
+        to.extend_from_slice(from);
     }
 }
 
@@ -1307,18 +1352,24 @@ impl InventoryFields {
     /// length can change between steps.
     fn copy_from_state(&mut self, state: &Solution3D) {
         for (a, b) in self.0.iter_mut().zip(inventory_fields(state)) {
-            a.clone_from(b);
+            copy_field(a, b);
         }
     }
 
     fn copy_to_state(&self, state: &mut Solution3D) {
         let [u, v, temp, salt, tke, gls] = &self.0;
-        state.u.copy_from_slice(u);
-        state.v.copy_from_slice(v);
-        state.temp.copy_from_slice(temp);
-        state.salt.copy_from_slice(salt);
-        state.tke.copy_from_slice(tke);
-        state.gls.copy_from_slice(gls);
+        let fields = [
+            (&mut state.u, u),
+            (&mut state.v, v),
+            (&mut state.temp, temp),
+            (&mut state.salt, salt),
+            (&mut state.tke, tke),
+            (&mut state.gls, gls),
+        ];
+        for (to, from) in fields {
+            assert_eq!(to.len(), from.len(), "inventory field lengths");
+            update_with(to, from, |x, y| *x = y);
+        }
     }
 }
 
@@ -1326,14 +1377,20 @@ impl InventoryFields {
 /// The σ-layer fractions sum to one, so a uniform shift changes the depth mean
 /// by exactly the shift.
 fn shift_columns(field: &mut [f64], n_levels: usize, from: &DGSolution2D, to: &DGSolution2D) {
-    for ((column, &a), &b) in field
-        .chunks_exact_mut(n_levels)
-        .zip(&from.data)
-        .zip(&to.data)
-    {
-        let shift = b - a;
-        column.iter_mut().for_each(|x| *x += shift);
-    }
+    let nn = from.n_nodes;
+    for_each_block(
+        from.n_elements,
+        [field],
+        || (),
+        |_, k, [columns]| {
+            let nodes = k * nn..(k + 1) * nn;
+            let shifts = from.data[nodes.clone()].iter().zip(&to.data[nodes]);
+            for (column, (&a, &b)) in columns.chunks_exact_mut(n_levels).zip(shifts) {
+                let shift = b - a;
+                column.iter_mut().for_each(|x| *x += shift);
+            }
+        },
+    );
 }
 
 impl IntegratorInfo for ModeSplitIntegrator {
@@ -1365,6 +1422,7 @@ impl IntegratorInfo for ModeSplitIntegrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::Integrable;
 
     /// Moments of the filter about `tⁿ⁺¹`, in units of the baroclinic step.
     fn central_moment(filter: &BarotropicFilter, k: i32) -> f64 {
