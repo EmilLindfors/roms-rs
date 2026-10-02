@@ -125,6 +125,7 @@ pub use limiters::{
     TracerLimiter3DConfig,
     TracerLimiter3DStats,
     TracerLimiterType3D,
+    TracerReferenceProfile,
     apply_swe_limiters,
     apply_swe_limiters_kuzmin_2d,
     apply_tracer_limiters_2d,

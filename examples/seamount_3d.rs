@@ -36,8 +36,10 @@
 //! (`Hydrostatic3D::with_balanced_reference`), `nu`/`kappa` vertical
 //! viscosity and diffusivity, `nuh` or `cs` horizontal viscosity (constant
 //! or Smagorinsky), `vadv`/`madv` the tracers' and the momentum's vertical
-//! advection, `kuzmin=1` the horizontal Kuzmin tracer limiter, `report`
-//! the interval of the printed lines (h).
+//! advection, `kuzmin=1` the horizontal Kuzmin tracer limiter (`kuzmin=2`
+//! with the initial stratification as its reference profile; `relax` its
+//! bounds' relaxation, default 1), `report` the interval of the printed
+//! lines (h).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,7 +52,9 @@ use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{ConstantMixing, Forcing, Hydrostatic3D, LinearEOS, PhysicsBuilder};
 use dg_rs::solver::rhs::{PressureGradientForm, VerticalAdvection};
 use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{SWEFormulation2D, TracerLimiter3DConfig, TracerLimiterType3D};
+use dg_rs::solver::{
+    SWEFormulation2D, TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile,
+};
 use dg_rs::source::CoriolisSource2D;
 use dg_rs::time::ModeSplitIntegrator;
 use dg_rs::types::ElementIndex;
@@ -156,14 +160,6 @@ fn main() {
         .with_vertical_advection(tracer_vadv)
         .with_momentum_vertical_advection(momentum_vadv)
         .with_pressure_gradient(pgf);
-    let physics = if kuzmin != 0 {
-        physics.with_tracer_limiter(TracerLimiter3DConfig {
-            limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
-            ..TracerLimiter3DConfig::default()
-        })
-    } else {
-        physics
-    };
     let mut physics = if cs > 0.0 {
         physics.with_smagorinsky_viscosity(cs)
     } else if nu_h > 0.0 {
@@ -184,6 +180,27 @@ fn main() {
         other => panic!("profile={other}: expected tanh, exp or linear"),
     };
     let temperature = |z: f64| eos.t0 + (1.0 - rho_of_z(z) / eos.rho0) / eos.alpha;
+    if kuzmin != 0 {
+        let limiter = TracerLimiter3DConfig {
+            limiter_type: TracerLimiterType3D::HorizontalKuzmin {
+                relaxation: arg("relax", 1.0),
+            },
+            ..TracerLimiter3DConfig::default()
+        };
+        physics.set_tracer_limiter(if kuzmin == 2 {
+            // The initial stratification, every 5 cm (linear between samples:
+            // ≈ 2e-5 °C off a 10 m pycnocline; every 0.5 m, 2e-3)
+            let samples = (20.0 * depth) as usize + 1;
+            limiter.with_reference_profile(TracerReferenceProfile::from_fn(
+                -depth,
+                0.0,
+                samples,
+                |z| (temperature(z), eos.s0),
+            ))
+        } else {
+            limiter
+        });
+    }
 
     let (nn, nl) = (ops.n_nodes, sigma.n_levels());
     let mut state = Solution3D::new(mesh.n_elements, nn, nl);

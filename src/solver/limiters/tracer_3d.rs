@@ -5,6 +5,8 @@
 //! limiters therefore compute `Hz`-weighted averages before applying
 //! Zhang-Shu/Kuzmin scaling.
 
+use std::sync::Arc;
+
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::DGSolution2D;
@@ -18,6 +20,8 @@ use super::tracer_2d::TracerBounds;
 const MIN_LAYER_THICKNESS: f64 = 1.0e-12;
 const MIN_INTEGRAL_WEIGHT: f64 = 1.0e-14;
 const LIMITER_EPS: f64 = 1.0e-12;
+/// The relative round-off margin of the Kuzmin bounds.
+const ROUND_OFF: f64 = 256.0 * f64::EPSILON;
 
 /// Policy used when an element/layer average is already outside tracer bounds.
 ///
@@ -57,7 +61,7 @@ impl Default for TracerLimiterType3D {
 }
 
 /// Configuration for 3D tracer limiting.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct TracerLimiter3DConfig {
     /// Selected limiter.
     pub limiter_type: TracerLimiterType3D,
@@ -67,6 +71,9 @@ pub struct TracerLimiter3DConfig {
     pub average_policy: TracerAveragePolicy3D,
     /// Also apply a vertical column bounds projection after horizontal limiting.
     pub vertical_column_bounds: bool,
+    /// A horizontally uniform stratification whose departure the horizontal
+    /// Kuzmin limiter bounds, if any (see [`Self::with_reference_profile`]).
+    pub reference: Option<Arc<TracerReferenceProfile>>,
 }
 
 impl Default for TracerLimiter3DConfig {
@@ -76,6 +83,7 @@ impl Default for TracerLimiter3DConfig {
             bounds: TracerBounds::default(),
             average_policy: TracerAveragePolicy3D::default(),
             vertical_column_bounds: false,
+            reference: None,
         }
     }
 }
@@ -116,6 +124,94 @@ impl TracerLimiter3DConfig {
     pub fn with_vertical_column_bounds(mut self, enabled: bool) -> Self {
         self.vertical_column_bounds = enabled;
         self
+    }
+
+    /// Limit horizontally the departure from `reference`, not the tracers
+    /// themselves.
+    ///
+    /// The horizontal Kuzmin limiter bounds each node by its neighbours'
+    /// layer means at the node's height, which is exact for a stratification
+    /// linear in `z` but not for a curved one: where the σ-layers are thick
+    /// against a pycnocline and cross it steeply within an element (over a
+    /// seamount's flank), the layer means are not its values at their mean
+    /// heights, and the limiter changes the pycnocline at rest (up to 1.8 °C of
+    /// 17 °C over a 6 × 6 seamount). With the reference stratification taken
+    /// out, a fluid at rest in it has nothing to limit; with a
+    /// stratification that varies horizontally, the limiter sees only the
+    /// variation. Use the domain's typical (or initial) profile.
+    pub fn with_reference_profile(mut self, reference: TracerReferenceProfile) -> Self {
+        self.reference = Some(Arc::new(reference));
+        self
+    }
+}
+
+/// A horizontally uniform stratification `T(z)`, `S(z)`, linear between
+/// samples and constant beyond them: the reference of the horizontal Kuzmin
+/// limiter ([`TracerLimiter3DConfig::with_reference_profile`]).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TracerReferenceProfile {
+    heights: Vec<f64>,
+    temp: Vec<f64>,
+    salt: Vec<f64>,
+}
+
+impl TracerReferenceProfile {
+    /// Temperature and salinity at `heights` (m, increasing upward).
+    ///
+    /// # Panics
+    ///
+    /// If the lengths differ, there are no samples, or the heights do not
+    /// increase.
+    pub fn new(heights: Vec<f64>, temp: Vec<f64>, salt: Vec<f64>) -> Self {
+        assert!(
+            !heights.is_empty() && temp.len() == heights.len() && salt.len() == heights.len(),
+            "a reference profile needs as many temperatures and salinities as heights"
+        );
+        assert!(
+            heights.windows(2).all(|pair| pair[0] < pair[1]),
+            "the heights of a reference profile must increase"
+        );
+        Self {
+            heights,
+            temp,
+            salt,
+        }
+    }
+
+    /// `profile(z) = (T, S)` sampled at `n` (≥ 2) heights evenly from
+    /// `z_bottom` to `z_top`.
+    pub fn from_fn(
+        z_bottom: f64,
+        z_top: f64,
+        n: usize,
+        profile: impl Fn(f64) -> (f64, f64),
+    ) -> Self {
+        assert!(
+            n >= 2 && z_bottom < z_top,
+            "a sampled profile needs n ≥ 2 and z_bottom < z_top"
+        );
+        let heights: Vec<f64> = (0..n)
+            .map(|j| z_bottom + (z_top - z_bottom) * j as f64 / (n - 1) as f64)
+            .collect();
+        let (temp, salt) = heights.iter().map(|&z| profile(z)).unzip();
+        Self::new(heights, temp, salt)
+    }
+
+    /// The temperature at height `z`.
+    pub fn temperature(&self, z: f64) -> f64 {
+        interpolate_profile(&self.heights, &self.temp, z)
+    }
+
+    /// The salinity at height `z`.
+    pub fn salinity(&self, z: f64) -> f64 {
+        interpolate_profile(&self.heights, &self.salt, z)
+    }
+
+    fn values(&self, component: TracerComponent) -> &[f64] {
+        match component {
+            TracerComponent::Temperature => &self.temp,
+            TracerComponent::Salinity => &self.salt,
+        }
     }
 }
 
@@ -208,32 +304,45 @@ pub fn apply_tracer_limiters_3d(
         TracerLimiterType3D::None => return stats,
         TracerLimiterType3D::Bounds => {}
         TracerLimiterType3D::HorizontalKuzmin { relaxation } => {
-            apply_horizontal_kuzmin_field(
-                &mut state.temp,
-                &state.eta,
-                state.n_elements,
-                state.n_nodes,
-                state.n_levels,
-                mesh,
+            let columns = LayerColumns {
+                eta: &state.eta,
+                n_elements: state.n_elements,
+                n_nodes: state.n_nodes,
+                n_levels: state.n_levels,
                 ops,
                 geom,
                 bathymetry,
                 sigma,
+            };
+            let mut mean_heights = Pooled::take(
+                |a: &Vec<f64>| a.len() == state.n_elements * state.n_levels,
+                || vec![f64::NAN; state.n_elements * state.n_levels],
+            );
+            columns.layer_mean_heights(&mut mean_heights);
+            let reference = |component| {
+                config
+                    .reference
+                    .as_deref()
+                    .map(|profile: &TracerReferenceProfile| {
+                        (&profile.heights[..], profile.values(component))
+                    })
+            };
+            apply_horizontal_kuzmin_field(
+                &mut state.temp,
+                reference(TracerComponent::Temperature),
+                &columns,
+                &mean_heights,
+                mesh,
                 relaxation,
                 TracerComponent::Temperature,
                 &mut stats,
             );
             apply_horizontal_kuzmin_field(
                 &mut state.salt,
-                &state.eta,
-                state.n_elements,
-                state.n_nodes,
-                state.n_levels,
+                reference(TracerComponent::Salinity),
+                &columns,
+                &mean_heights,
                 mesh,
-                ops,
-                geom,
-                bathymetry,
-                sigma,
                 relaxation,
                 TracerComponent::Salinity,
                 &mut stats,
@@ -490,88 +599,327 @@ fn apply_vertical_column_bounds_field(
     *stats = stats.merged(block_stats);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_horizontal_kuzmin_field(
-    field: &mut [f64],
-    eta: &DGSolution2D,
+/// The layers' geometry and inventory weights, for the means and heights
+/// the horizontal Kuzmin bounds compare.
+struct LayerColumns<'a> {
+    eta: &'a DGSolution2D,
     n_elements: usize,
     n_nodes: usize,
     n_levels: usize,
+    ops: &'a DGOperators2D,
+    geom: &'a GeometricFactors2D,
+    bathymetry: &'a Bathymetry2D,
+    sigma: &'a SigmaGrid,
+}
+
+impl LayerColumns<'_> {
+    /// The height `z = η + D σ` of a node's layer centre.
+    fn centre_height(&self, element: ElementIndex, node: usize, level: usize) -> f64 {
+        let eta = self.eta.get(element.as_usize(), node);
+        let depth = self.bathymetry.water_depth(element, node, eta).max(0.0);
+        eta + depth * self.sigma.sigma_rho()[level]
+    }
+
+    /// The inventory-weighted mean of `value(k, node, level)` over every
+    /// element's layers into `means` (`[element][level]`; NaN for a layer
+    /// without water).
+    fn layer_means(&self, means: &mut [f64], value: impl Fn(usize, usize, usize) -> f64 + Sync) {
+        let d_sigma = self.sigma.d_sigma();
+        for_each_block(
+            self.n_elements,
+            [means],
+            || (),
+            |_, k, [means]| {
+                let element = ElementIndex::new(k);
+                let jac = self.geom.affine_metric(k).det_j;
+                for (level, &ds) in d_sigma.iter().enumerate().take(self.n_levels) {
+                    let mut weight_sum = 0.0;
+                    let mut inventory = 0.0;
+                    for (i, &w) in self.ops.weights.iter().enumerate().take(self.n_nodes) {
+                        let weight =
+                            w * jac * layer_thickness(self.eta, self.bathymetry, element, i, ds);
+                        weight_sum += weight;
+                        inventory += weight * value(k, i, level);
+                    }
+                    means[level] = if weight_sum > MIN_INTEGRAL_WEIGHT {
+                        inventory / weight_sum
+                    } else {
+                        f64::NAN
+                    };
+                }
+            },
+        );
+    }
+
+    /// The inventory-weighted mean height of every element layer's centres:
+    /// for a tracer linear in `z`, its layer mean is its value there.
+    fn layer_mean_heights(&self, heights: &mut [f64]) {
+        self.layer_means(heights, |k, i, level| {
+            self.centre_height(ElementIndex::new(k), i, level)
+        });
+    }
+}
+
+/// A Kuzmin worker's scratch, per node of the element's current layer.
+#[derive(Default)]
+struct KuzminScratch {
+    /// The union of the element's vertex patches.
+    patches: Vec<usize>,
+    /// The reference stratification at the node's height (zero without one).
+    reference: Vec<f64>,
+    /// The departure from it, `T_i − T_ref(z_i)`.
+    value: Vec<f64>,
+    /// The limited state at `α = 0`.
+    base: Vec<f64>,
+    /// The inventory weight.
+    weight: Vec<f64>,
+    /// The bounds.
+    bounds: Vec<(f64, f64)>,
+}
+
+/// Horizontal Kuzmin limiting of `field`, layer by layer, against bounds
+/// taken at constant height, of its departure from a `reference`
+/// stratification (`(heights, values)`; none is zero).
+///
+/// On a sloping bed a σ-layer crosses the stratification, so a smooth `T(z)`
+/// varies along it, extremal where the bed is (the top of a seamount). The
+/// classic limiter took that for a front twice over: it bounded the nodes by
+/// the neighbours' means on the same layer, which a smooth stratification
+/// exceeds at every bed extremum, and it scaled the whole deviation from the
+/// layer's mean, so that a round-off clip at a node near the mean's height
+/// flattened the layer's stratification; a stratified seamount at rest
+/// reached 0.15 m/s in 15 min. Here:
+///
+/// - each node is bounded by its patch's columns (a vertex by its own patch,
+///   every node by the union of the element's vertex patches) *at the
+///   node's height*: each column's layer means interpolated linearly in `z`
+///   ([`column_value_at`]), and the means of its two layers bracketing that
+///   height ([`bracketing_means`], the cells above and below of a 3D vertex
+///   patch). A `T(z)` linear over the patch is within its bounds, and so is a
+///   smooth vertical extremum between thick layers;
+/// - what is scaled is the departure `d_i = T_i − T̂_i` from the element's
+///   own column at the node's height, about its inventory-weighted mean `m`:
+///   `T_i ← T̂_i + m + α (d_i − m)`, which keeps the layer's inventory (the
+///   change `−(1 − α)(d_i − m)` has zero weighted mean). At `α = 0` the layer
+///   is its own column's stratification, not a flat mean (`m` is spread
+///   within the bounds as far as they allow, see below).
+///
+/// Layer means cannot represent a *curved* `T(z)` at the nodes' heights where
+/// the layers are thick against the curvature and steep across an element
+/// (a pycnocline over a seamount's flank: up to 1.8 °C of 17 changed at rest). A
+/// `reference` stratification takes the curvature out: the limiter works on
+/// `T − T_ref(z)`, zero at rest for any horizontally uniform `T_ref`.
+///
+/// On a flat bed with `η` flat and no reference every node sits at its
+/// layer's mean height, `T̂_i` is the layer's mean and `m = 0`: the classic
+/// limiter.
+#[allow(clippy::too_many_arguments)]
+fn apply_horizontal_kuzmin_field(
+    field: &mut [f64],
+    reference: Option<(&[f64], &[f64])>,
+    columns: &LayerColumns,
+    heights: &[f64],
     mesh: &Mesh2D,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-    bathymetry: &Bathymetry2D,
-    sigma: &SigmaGrid,
     relaxation: f64,
     component: TracerComponent,
     stats: &mut TracerLimiter3DStats,
 ) {
+    let (n_elements, n_nodes, n_levels) = (columns.n_elements, columns.n_nodes, columns.n_levels);
+    // The reference at a node's layer centre
+    let reference_at = |k: usize, i: usize, level: usize| {
+        reference.map_or(0.0, |(heights, values)| {
+            interpolate_profile(
+                heights,
+                values,
+                columns.centre_height(ElementIndex::new(k), i, level),
+            )
+        })
+    };
     let mut averages = Pooled::take(
         |a: &Vec<f64>| a.len() == n_elements * n_levels,
         || vec![f64::NAN; n_elements * n_levels],
     );
-    horizontal_layer_averages(
-        &mut averages,
-        field,
-        eta,
-        n_elements,
-        n_nodes,
-        n_levels,
-        ops,
-        geom,
-        bathymetry,
-        sigma,
+    // The range of every column's nodal departures in its bottom and top
+    // layers
+    let mut end_ranges = Pooled::take(
+        |a: &Vec<[f64; 4]>| a.len() == n_elements,
+        || vec![[f64::NAN; 4]; n_elements],
     );
+    {
+        let field: &[f64] = field;
+        let departure =
+            |k, i, level| field[index(k, i, level, n_nodes, n_levels)] - reference_at(k, i, level);
+        columns.layer_means(&mut averages, departure);
+        for_each_block(
+            n_elements,
+            [&mut end_ranges[..]],
+            || (),
+            |_, k, [range]| {
+                let (bottom, top) = (0..n_nodes).fold(
+                    (
+                        [f64::INFINITY, f64::NEG_INFINITY],
+                        [f64::INFINITY, f64::NEG_INFINITY],
+                    ),
+                    |([b0, b1], [t0, t1]), i| {
+                        let (b, t) = (departure(k, i, 0), departure(k, i, n_levels - 1));
+                        ([b0.min(b), b1.max(b)], [t0.min(t), t1.max(t)])
+                    },
+                );
+                range[0] = [bottom[0], bottom[1], top[0], top[1]];
+            },
+        );
+    }
     let averages: &[f64] = &averages;
+    let end_ranges: &[[f64; 4]] = &end_ranges;
     let index = |i: usize, level: usize| i * n_levels + level;
+    // Element `e`'s column at height `z` (near `level`), if it has water there
+    let column_at = |e: usize, z: f64, level: usize| {
+        let column = e * n_levels..(e + 1) * n_levels;
+        averages[column.start + level].is_finite().then(|| {
+            column_value_at(
+                &averages[column.clone()],
+                &heights[column],
+                end_ranges[e],
+                z,
+                level,
+            )
+        })
+    };
+    // The range over `elements`' columns at height `z`: each column's value
+    // there and the means of its two layers bracketing `z`, widened by
+    // `relaxation` and by round-off relative to the tracer's `scale`
+    let bounds_at = |elements: &[usize], z: f64, level: usize, scale: f64| {
+        let (bound_min, bound_max) = elements
+            .iter()
+            .filter_map(|&e| {
+                let column = e * n_levels..(e + 1) * n_levels;
+                column_at(e, z, level).map(|value| {
+                    let (a, b) =
+                        bracketing_means(&averages[column.clone()], &heights[column], z, level);
+                    (value.min(a).min(b), value.max(a).max(b))
+                })
+            })
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (a, b)| {
+                (lo.min(a), hi.max(b))
+            });
+        relaxed_bounds(bound_min, bound_max, relaxation, scale)
+    };
 
     let block_stats = reduce_blocks(
         n_elements,
         [&mut field[..n_elements * n_nodes * n_levels]],
-        || (),
-        |_, k, [field]| {
+        || Pooled::take(|_: &KuzminScratch| true, KuzminScratch::default),
+        |scratch, k, [field]| {
+            let KuzminScratch {
+                patches,
+                reference,
+                value,
+                base,
+                weight,
+                bounds,
+            } = &mut **scratch;
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
             let vertices = mesh.element_vertex_indices(element);
+            let jac = columns.geom.affine_metric(k).det_j;
+            // The union of the element's vertex patches
+            patches.clear();
+            for &vertex in &vertices {
+                for &e in mesh.elements_at_vertex(vertex) {
+                    if !patches.contains(&e) {
+                        patches.push(e);
+                    }
+                }
+            }
 
-            for level in 0..n_levels {
-                let avg = averages[k * n_levels + level];
-                if !avg.is_finite() {
+            for (level, &ds) in columns.sigma.d_sigma().iter().enumerate().take(n_levels) {
+                if !averages[k * n_levels + level].is_finite() {
+                    continue;
+                }
+                // The element's own column at each node's height, `T̂_i`, and
+                // the bounds: every vertex within its own patch's, every
+                // other node (P2 and up) within the union's
+                for buffer in [&mut *reference, &mut *value, &mut *base, &mut *weight] {
+                    buffer.clear();
+                }
+                bounds.clear();
+                let (mut weight_sum, mut departure) = (0.0, 0.0);
+                for (i, &w) in columns.ops.weights.iter().enumerate().take(n_nodes) {
+                    let z = columns.centre_height(element, i, level);
+                    let Some(own) = column_at(k, z, level) else {
+                        break;
+                    };
+                    let node_reference = reference_at(k, i, level);
+                    let node_value = field[index(i, level)] - node_reference;
+                    let node_weight =
+                        w * jac * layer_thickness(columns.eta, columns.bathymetry, element, i, ds);
+                    let patch = match node_to_vertex(i, columns.ops.n_1d) {
+                        Some(local_vertex) => mesh.elements_at_vertex(vertices[local_vertex]),
+                        None => &patches[..],
+                    };
+                    let scale = field[index(i, level)].abs().max(node_reference.abs());
+                    weight_sum += node_weight;
+                    departure += node_weight * (node_value - own);
+                    reference.push(node_reference);
+                    value.push(node_value);
+                    base.push(own);
+                    weight.push(node_weight);
+                    bounds.push(bounds_at(patch, z, level, scale));
+                }
+                if base.len() < n_nodes {
                     continue;
                 }
 
-                let mut alpha = 1.0_f64;
-                // Every vertex within its own patch's bounds; every other
-                // node (P2 and up) within the union of the element's vertex
-                // patches
-                let (mut union_min, mut union_max) = (f64::INFINITY, f64::NEG_INFINITY);
-                for (local_vertex, &global_vertex) in vertices.iter().enumerate() {
-                    let (bound_min, bound_max) = vertex_patch_bounds(
-                        global_vertex,
-                        level,
-                        mesh,
-                        averages,
-                        n_levels,
-                        relaxation,
-                    );
-                    union_min = union_min.min(bound_min);
-                    union_max = union_max.max(bound_max);
-                    let node_idx = vertex_to_node_index(local_vertex, ops.n_1d);
-                    let value = field[index(node_idx, level)];
-                    alpha = alpha.min(compute_kuzmin_alpha(avg, value, bound_min, bound_max));
+                // The limited state at `α = 0`: `T̂` shifted by the departure's
+                // mean `m` to keep the inventory. The shift goes into each
+                // node's room within its bounds (`T̂_i` is one of its
+                // candidates) in proportion to it, then into the room within
+                // the element's widest bounds, then (if not even those hold
+                // the layer's mean) uniformly. A shift as a factor on the
+                // column's structure, or a fallback to the layer's mean, would
+                // be ill-conditioned: that structure vanishes at nodes near the
+                // layer's mean height, where a round-off violation would set
+                // the factor, and flattening it over a slope drives a flow.
+                let m = departure / weight_sum;
+                let mut need = m.abs() * weight_sum;
+                let widest = bounds
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &(lo, hi)| {
+                        (a.min(lo), b.max(hi))
+                    });
+                let room_of = |own: f64, (lo, hi): (f64, f64)| {
+                    if m > 0.0 { hi - own } else { own - lo }.max(0.0)
+                };
+                for tier in 0..2 {
+                    let node_bounds = |i: usize| if tier == 0 { bounds[i] } else { widest };
+                    let room: f64 = (0..n_nodes)
+                        .map(|i| weight[i] * room_of(base[i], node_bounds(i)))
+                        .sum();
+                    if need <= 0.0 || !room.is_finite() || room <= 0.0 {
+                        continue;
+                    }
+                    let fraction = (need / room).min(1.0);
+                    for (i, own) in base.iter_mut().enumerate() {
+                        *own += m.signum() * fraction * room_of(*own, node_bounds(i));
+                    }
+                    need -= need.min(room);
                 }
-                for i in 0..n_nodes {
-                    let value = field[index(i, level)];
-                    alpha = alpha.min(compute_kuzmin_alpha(avg, value, union_min, union_max));
+                for own in base.iter_mut() {
+                    *own += m.signum() * need / weight_sum;
                 }
 
+                let alpha = (0..n_nodes)
+                    .map(|i| {
+                        let (lo, hi) = bounds[i];
+                        compute_kuzmin_alpha(base[i], value[i], lo, hi)
+                    })
+                    .fold(1.0_f64, f64::min);
                 if alpha >= 1.0 - LIMITER_EPS {
                     continue;
                 }
 
                 for i in 0..n_nodes {
-                    let idx = index(i, level);
-                    field[idx] = avg + alpha * (field[idx] - avg);
+                    field[index(i, level)] = reference[i] + base[i] + alpha * (value[i] - base[i]);
                 }
                 stats.record_limited(component);
             }
@@ -583,80 +931,107 @@ fn apply_horizontal_kuzmin_field(
     *stats = stats.merged(block_stats);
 }
 
-/// The inventory-weighted mean of every element's layers into `averages`
-/// (`[element][level]`; NaN for a layer without water).
-#[allow(clippy::too_many_arguments)]
-fn horizontal_layer_averages(
-    averages: &mut [f64],
-    field: &[f64],
-    eta: &DGSolution2D,
-    n_elements: usize,
-    n_nodes: usize,
-    n_levels: usize,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-    bathymetry: &Bathymetry2D,
-    sigma: &SigmaGrid,
-) {
-    let d_sigma = sigma.d_sigma();
-    for_each_block(
-        n_elements,
-        [averages],
-        || (),
-        |_, k, [averages]| {
-            let element = ElementIndex::new(k);
-            let jac = geom.affine_metric(k).det_j;
-            for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
-                let mut weight_sum = 0.0;
-                let mut inventory = 0.0;
-
-                for (i, &w) in ops.weights.iter().enumerate().take(n_nodes) {
-                    let weight = w * jac * layer_thickness(eta, bathymetry, element, i, ds);
-                    weight_sum += weight;
-                    inventory += weight * field[index(k, i, level, n_nodes, n_levels)];
-                }
-
-                averages[level] = if weight_sum > MIN_INTEGRAL_WEIGHT {
-                    inventory / weight_sum
-                } else {
-                    f64::NAN
-                };
-            }
-        },
-    );
+/// A column's layer `means` (at `heights`, bottom first) interpolated
+/// linearly to height `z`, searching from `level`: exact for a tracer linear
+/// in `z`.
+///
+/// Beyond its end layers' means it extrapolates the end pair, clamped to
+/// the range of the column's nodal values in that end layer
+/// (`[bottom min, bottom max, top min, top max]`). A node of the column
+/// itself is never beyond them, so at the deepest node of a pit the
+/// extrapolation is still exact for a linear `T(z)`; and a thin column (a
+/// shoreline film, its layers mm apart) does not extend its last step over
+/// metres.
+fn column_value_at(
+    means: &[f64],
+    heights: &[f64],
+    end_ranges: [f64; 4],
+    z: f64,
+    level: usize,
+) -> f64 {
+    let n = means.len();
+    if n == 1 {
+        return means[0];
+    }
+    let mut lo = level.min(n - 2);
+    while lo > 0 && z < heights[lo] {
+        lo -= 1;
+    }
+    while lo + 2 < n && z > heights[lo + 1] {
+        lo += 1;
+    }
+    let spacing = heights[lo + 1] - heights[lo];
+    if spacing <= 0.0 {
+        return 0.5 * (means[lo] + means[lo + 1]);
+    }
+    let value = means[lo] + (z - heights[lo]) / spacing * (means[lo + 1] - means[lo]);
+    if z < heights[0] {
+        value.clamp(end_ranges[0], end_ranges[1])
+    } else if z > heights[n - 1] {
+        value.clamp(end_ranges[2], end_ranges[3])
+    } else {
+        value
+    }
 }
 
-fn vertex_patch_bounds(
-    vertex: usize,
-    level: usize,
-    mesh: &Mesh2D,
-    averages: &[f64],
-    n_levels: usize,
-    relaxation: f64,
-) -> (f64, f64) {
-    let mut bound_min = f64::INFINITY;
-    let mut bound_max = f64::NEG_INFINITY;
-
-    for &elem in mesh.elements_at_vertex(vertex) {
-        let value = averages[elem * n_levels + level];
-        if value.is_finite() {
-            bound_min = bound_min.min(value);
-            bound_max = bound_max.max(value);
-        }
+/// The means of the two layers of a column (`means` at `heights`, bottom
+/// first) whose heights bracket `z` (the end pair beyond them), searching
+/// from `level`.
+///
+/// Kuzmin's bounds take, from each neighbour column, these two means as well
+/// as the column's value interpolated to `z`, as Thetis's vertex patches on
+/// prisms take the cells above and below (Kärnä et al. 2018): a node may
+/// hold what its 3D neighbourhood holds. Bounded by the interpolated values
+/// alone, the limiter cut every smooth vertical extremum between thick
+/// layers (the departure of a displaced pycnocline peaks where `∂T/∂z`
+/// does): on the seamount at `r_x0` 0.32 it changed 55–75 % of the element
+/// layers every stage, by up to 0.2 °C at depth, and every such change over
+/// a slope is a pressure gradient the advection did not make. With the
+/// bracketing means it limits about half as many. On a flat bed a node's own
+/// layer is one of the pair: a sharp interface between layers is bounded by
+/// both water masses' means (the lock exchanges stay in range to 5e-12 °C).
+fn bracketing_means(means: &[f64], heights: &[f64], z: f64, level: usize) -> (f64, f64) {
+    let n = means.len();
+    if n == 1 {
+        return (means[0], means[0]);
     }
+    let mut lo = level.min(n - 2);
+    while lo > 0 && z < heights[lo] {
+        lo -= 1;
+    }
+    while lo + 2 < n && z > heights[lo + 1] {
+        lo += 1;
+    }
+    (means[lo], means[lo + 1])
+}
 
+/// `[bound_min, bound_max]` widened by `relaxation` (≥ 1) times its range,
+/// and by a round-off margin relative to its values and the tracer's
+/// `scale` (bounds interpolated at a node's height close on its value in a
+/// smooth stratification); unbounded for no data.
+fn relaxed_bounds(bound_min: f64, bound_max: f64, relaxation: f64, scale: f64) -> (f64, f64) {
     if !bound_min.is_finite() || !bound_max.is_finite() {
         return (f64::NEG_INFINITY, f64::INFINITY);
     }
 
-    if relaxation > 1.0 {
-        let range = bound_max - bound_min;
-        let expand = 0.5 * range * (relaxation - 1.0);
-        bound_min -= expand;
-        bound_max += expand;
-    }
+    let range = bound_max - bound_min;
+    let expand = 0.5 * range * (relaxation - 1.0).max(0.0)
+        + ROUND_OFF * bound_min.abs().max(bound_max.abs()).max(scale);
+    (bound_min - expand, bound_max + expand)
+}
 
-    (bound_min, bound_max)
+/// `values` at `heights` (increasing) interpolated linearly to `z`, constant
+/// beyond the ends.
+fn interpolate_profile(heights: &[f64], values: &[f64], z: f64) -> f64 {
+    let j = heights.partition_point(|&h| h < z);
+    if j == 0 {
+        values[0]
+    } else if j == heights.len() {
+        values[j - 1]
+    } else {
+        let t = (z - heights[j - 1]) / (heights[j] - heights[j - 1]);
+        values[j - 1] + t * (values[j] - values[j - 1])
+    }
 }
 
 fn compute_theta(avg: f64, min_value: f64, max_value: f64, bound_min: f64, bound_max: f64) -> f64 {
@@ -690,6 +1065,11 @@ fn compute_kuzmin_alpha(avg: f64, value: f64, bound_min: f64, bound_max: f64) ->
     }
 
     alpha.clamp(0.0, 1.0)
+}
+
+/// The local vertex at `node`, if it is one.
+fn node_to_vertex(node: usize, n_1d: usize) -> Option<usize> {
+    (0..4).find(|&local_vertex| vertex_to_node_index(local_vertex, n_1d) == node)
 }
 
 fn vertex_to_node_index(local_vertex: usize, n_1d: usize) -> usize {
@@ -869,6 +1249,50 @@ mod tests {
         assert!(
             (before - after).abs() < 1e-10,
             "inventory changed: before={before}, after={after}"
+        );
+    }
+
+    /// TODO P4.6 (regression): on a sloping bed a σ-layer crosses the
+    /// stratification, so a `T(z)` varies along it, extremal at the top of a
+    /// bump. Bounded by the neighbours' means on the same layer, the limiter
+    /// clipped it as a front (a stratified seamount at rest reached 0.15 m/s
+    /// in 15 min); bounded at constant height, it leaves it.
+    #[test]
+    fn horizontal_kuzmin_leaves_a_linear_stratification_over_a_bump() {
+        use crate::vertical::SongHaidvogelStretching;
+        let (mesh, ops, geom, _, _, mut state) = setup(5, 4, 2, 8);
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -100.0 + 70.0 * (-((x - 0.5).powi(2) + (y - 0.45).powi(2)) / 0.08).exp()
+        });
+        let sigma = SigmaGrid::new(8, SongHaidvogelStretching::new(5.0, 0.4, 20.0));
+        let n_levels = sigma.n_levels();
+        for k in 0..mesh.n_elements {
+            for i in 0..ops.n_nodes {
+                let bed = bathymetry.get(ElementIndex::new(k), i);
+                let eta = 0.3 + 2e-3 * bed;
+                state.eta.set(k, i, eta);
+                for (level, &s) in sigma.sigma_rho().iter().enumerate() {
+                    let z = eta + (eta - bed) * s;
+                    state.temp[index(k, i, level, ops.n_nodes, n_levels)] = 10.0 + 0.05 * z;
+                }
+            }
+        }
+        let before = state.temp.clone();
+        let config = TracerLimiter3DConfig::horizontal_kuzmin(
+            TracerBounds::new(-100.0, 100.0, 0.0, 40.0),
+            1.0,
+        );
+        let stats =
+            apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
+        let change = before
+            .iter()
+            .zip(&state.temp)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            stats.limited_temperature_cells == 0 && change == 0.0,
+            "limited {} layers, by up to {change:.3e} °C",
+            stats.limited_temperature_cells
         );
     }
 
