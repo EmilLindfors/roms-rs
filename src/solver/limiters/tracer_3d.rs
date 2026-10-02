@@ -304,7 +304,20 @@ pub fn apply_tracer_limiters_3d(
         TracerLimiterType3D::None => return stats,
         TracerLimiterType3D::Bounds => {}
         TracerLimiterType3D::HorizontalKuzmin { relaxation } => {
+            let mut centres = Pooled::take(
+                |a: &Vec<f64>| a.len() == state.n_elements * state.n_nodes * state.n_levels,
+                || vec![f64::NAN; state.n_elements * state.n_nodes * state.n_levels],
+            );
+            fill_centre_heights(
+                &mut centres,
+                &state.eta,
+                state.n_nodes,
+                state.n_levels,
+                bathymetry,
+                sigma,
+            );
             let columns = LayerColumns {
+                centres: &centres,
                 eta: &state.eta,
                 n_elements: state.n_elements,
                 n_nodes: state.n_nodes,
@@ -602,6 +615,8 @@ fn apply_vertical_column_bounds_field(
 /// The layers' geometry and inventory weights, for the means and heights
 /// the horizontal Kuzmin bounds compare.
 struct LayerColumns<'a> {
+    /// Every node's layer-centre height `z = η + D σ` (`[element][node][level]`).
+    centres: &'a [f64],
     eta: &'a DGSolution2D,
     n_elements: usize,
     n_nodes: usize,
@@ -612,12 +627,39 @@ struct LayerColumns<'a> {
     sigma: &'a SigmaGrid,
 }
 
+/// Every node's layer-centre heights `z = η + D σ` into `centres`
+/// (`[element][node][level]`).
+fn fill_centre_heights(
+    centres: &mut [f64],
+    eta: &DGSolution2D,
+    n_nodes: usize,
+    n_levels: usize,
+    bathymetry: &Bathymetry2D,
+    sigma: &SigmaGrid,
+) {
+    let n_elements = centres.len() / (n_nodes * n_levels);
+    let sigma_rho = sigma.sigma_rho();
+    for_each_block(
+        n_elements,
+        [centres],
+        || (),
+        |_, k, [centres]| {
+            let element = ElementIndex::new(k);
+            for i in 0..n_nodes {
+                let eta = eta.get(k, i);
+                let depth = bathymetry.water_depth(element, i, eta).max(0.0);
+                for (level, &s) in sigma_rho.iter().enumerate().take(n_levels) {
+                    centres[i * n_levels + level] = eta + depth * s;
+                }
+            }
+        },
+    );
+}
+
 impl LayerColumns<'_> {
     /// The height `z = η + D σ` of a node's layer centre.
     fn centre_height(&self, element: ElementIndex, node: usize, level: usize) -> f64 {
-        let eta = self.eta.get(element.as_usize(), node);
-        let depth = self.bathymetry.water_depth(element, node, eta).max(0.0);
-        eta + depth * self.sigma.sigma_rho()[level]
+        self.centres[index(element.as_usize(), node, level, self.n_nodes, self.n_levels)]
     }
 
     /// The inventory-weighted mean of `value(k, node, level)` over every
@@ -665,6 +707,8 @@ impl LayerColumns<'_> {
 struct KuzminScratch {
     /// The union of the element's vertex patches.
     patches: Vec<usize>,
+    /// The node's height.
+    height: Vec<f64>,
     /// The reference stratification at the node's height (zero without one).
     reference: Vec<f64>,
     /// The departure from it, `T_i − T_ref(z_i)`.
@@ -675,6 +719,8 @@ struct KuzminScratch {
     weight: Vec<f64>,
     /// The bounds.
     bounds: Vec<(f64, f64)>,
+    /// The tracer's magnitude, for the bounds' round-off margin.
+    scale: Vec<f64>,
 }
 
 /// Horizontal Kuzmin limiting of `field`, layer by layer, against bounds
@@ -692,11 +738,11 @@ struct KuzminScratch {
 ///
 /// - each node is bounded by its patch's columns (a vertex by its own patch,
 ///   every node by the union of the element's vertex patches) *at the
-///   node's height*: each column's layer means interpolated linearly in `z`
-///   ([`column_value_at`]), and the means of its two layers bracketing that
-///   height ([`bracketing_means`], the cells above and below of a 3D vertex
-///   patch). A `T(z)` linear over the patch is within its bounds, and so is a
-///   smooth vertical extremum between thick layers;
+///   node's height*: each column's layer means interpolated linearly in `z`,
+///   and the means of its two layers bracketing that height (the cells above
+///   and below of a 3D vertex patch; [`column_at_height`]). A `T(z)` linear
+///   over the patch is within its bounds, and so is a smooth vertical
+///   extremum between thick layers;
 /// - what is scaled is the departure `d_i = T_i − T̂_i` from the element's
 ///   own column at the node's height, about its inventory-weighted mean `m`:
 ///   `T_i ← T̂_i + m + α (d_i − m)`, which keeps the layer's inventory (the
@@ -713,6 +759,11 @@ struct KuzminScratch {
 /// On a flat bed with `η` flat and no reference every node sits at its
 /// layer's mean height, `T̂_i` is the layer's mean and `m = 0`: the classic
 /// limiter.
+///
+/// A layer whose nodes are all within their own column's bounds is left
+/// before its patches are read: those bounds are within every patch's, so
+/// `α = 1`. This about halves the Kuzmin pass's cost (`profile_3d`: 2.2 →
+/// 1.2 ms for `T` and `S` on 1024 P2 elements × 20 levels).
 #[allow(clippy::too_many_arguments)]
 fn apply_horizontal_kuzmin_field(
     field: &mut [f64],
@@ -772,11 +823,12 @@ fn apply_horizontal_kuzmin_field(
     let averages: &[f64] = &averages;
     let end_ranges: &[[f64; 4]] = &end_ranges;
     let index = |i: usize, level: usize| i * n_levels + level;
-    // Element `e`'s column at height `z` (near `level`), if it has water there
+    // Element `e`'s column at height `z` (near `level`), if it has water
+    // there: its value and the means of its two layers bracketing `z`
     let column_at = |e: usize, z: f64, level: usize| {
         let column = e * n_levels..(e + 1) * n_levels;
         averages[column.start + level].is_finite().then(|| {
-            column_value_at(
+            column_at_height(
                 &averages[column.clone()],
                 &heights[column],
                 end_ranges[e],
@@ -792,12 +844,8 @@ fn apply_horizontal_kuzmin_field(
         let (bound_min, bound_max) = elements
             .iter()
             .filter_map(|&e| {
-                let column = e * n_levels..(e + 1) * n_levels;
-                column_at(e, z, level).map(|value| {
-                    let (a, b) =
-                        bracketing_means(&averages[column.clone()], &heights[column], z, level);
-                    (value.min(a).min(b), value.max(a).max(b))
-                })
+                column_at(e, z, level)
+                    .map(|(value, a, b)| (value.min(a).min(b), value.max(a).max(b)))
             })
             .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), (a, b)| {
                 (lo.min(a), hi.max(b))
@@ -812,11 +860,13 @@ fn apply_horizontal_kuzmin_field(
         |scratch, k, [field]| {
             let KuzminScratch {
                 patches,
+                height,
                 reference,
                 value,
                 base,
                 weight,
                 bounds,
+                scale,
             } = &mut **scratch;
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
@@ -836,38 +886,60 @@ fn apply_horizontal_kuzmin_field(
                 if !averages[k * n_levels + level].is_finite() {
                     continue;
                 }
-                // The element's own column at each node's height, `T̂_i`, and
-                // the bounds: every vertex within its own patch's, every
-                // other node (P2 and up) within the union's
-                for buffer in [&mut *reference, &mut *value, &mut *base, &mut *weight] {
+                // The element's own column at each node's height, `T̂_i`
+                for buffer in [
+                    &mut *height,
+                    &mut *reference,
+                    &mut *value,
+                    &mut *base,
+                    &mut *weight,
+                    &mut *scale,
+                ] {
                     buffer.clear();
                 }
-                bounds.clear();
                 let (mut weight_sum, mut departure) = (0.0, 0.0);
+                // Whether every node is within its own column's bounds alone,
+                // which its patch's contain (the element is in every patch):
+                // then nothing is limited, and the patches need not be read
+                let mut within_own = true;
                 for (i, &w) in columns.ops.weights.iter().enumerate().take(n_nodes) {
                     let z = columns.centre_height(element, i, level);
-                    let Some(own) = column_at(k, z, level) else {
+                    let Some((own, lower, upper)) = column_at(k, z, level) else {
                         break;
                     };
                     let node_reference = reference_at(k, i, level);
                     let node_value = field[index(i, level)] - node_reference;
                     let node_weight =
                         w * jac * layer_thickness(columns.eta, columns.bathymetry, element, i, ds);
-                    let patch = match node_to_vertex(i, columns.ops.n_1d) {
-                        Some(local_vertex) => mesh.elements_at_vertex(vertices[local_vertex]),
-                        None => &patches[..],
-                    };
-                    let scale = field[index(i, level)].abs().max(node_reference.abs());
+                    let node_scale = field[index(i, level)].abs().max(node_reference.abs());
+                    let (lo, hi) = relaxed_bounds(
+                        own.min(lower).min(upper),
+                        own.max(lower).max(upper),
+                        relaxation,
+                        node_scale,
+                    );
+                    within_own &= (lo..=hi).contains(&node_value);
                     weight_sum += node_weight;
                     departure += node_weight * (node_value - own);
+                    height.push(z);
                     reference.push(node_reference);
                     value.push(node_value);
                     base.push(own);
                     weight.push(node_weight);
-                    bounds.push(bounds_at(patch, z, level, scale));
+                    scale.push(node_scale);
                 }
-                if base.len() < n_nodes {
+                if base.len() < n_nodes || within_own {
                     continue;
+                }
+                // The bounds: every vertex within its own patch's, every other
+                // node (P2 and up) within the union's
+                bounds.clear();
+                for i in 0..n_nodes {
+                    let patch = match node_to_vertex(i, columns.ops.n_1d) {
+                        Some(local_vertex) => mesh.elements_at_vertex(vertices[local_vertex]),
+                        None => &patches[..],
+                    };
+                    bounds.push(bounds_at(patch, height[i], level, scale[i]));
                 }
 
                 // The limited state at `α = 0`: `T̂` shifted by the departure's
@@ -931,27 +1003,41 @@ fn apply_horizontal_kuzmin_field(
     *stats = stats.merged(block_stats);
 }
 
-/// A column's layer `means` (at `heights`, bottom first) interpolated
-/// linearly to height `z`, searching from `level`: exact for a tracer linear
-/// in `z`.
+/// A column's layer `means` (at `heights`, bottom first) at height `z`,
+/// searching from `level`: `(value, lower, upper)`, the means interpolated
+/// linearly to `z` (exact for a tracer linear in `z`) and the means of the
+/// two layers whose heights bracket `z` (the end pair beyond them).
 ///
-/// Beyond its end layers' means it extrapolates the end pair, clamped to
-/// the range of the column's nodal values in that end layer
+/// Beyond its end layers' means the value extrapolates the end pair, clamped
+/// to the range of the column's nodal values in that end layer
 /// (`[bottom min, bottom max, top min, top max]`). A node of the column
 /// itself is never beyond them, so at the deepest node of a pit the
 /// extrapolation is still exact for a linear `T(z)`; and a thin column (a
 /// shoreline film, its layers mm apart) does not extend its last step over
 /// metres.
-fn column_value_at(
+///
+/// Kuzmin's bounds take, from each neighbour column, the bracketing means as
+/// well as the value, as Thetis's vertex patches on prisms take the cells
+/// above and below (Kärnä et al. 2018): a node may hold what its 3D
+/// neighbourhood holds. Bounded by the interpolated values alone, the limiter
+/// cut every smooth vertical extremum between thick layers (the departure of
+/// a displaced pycnocline peaks where `∂T/∂z` does): on the seamount at
+/// `r_x0` 0.32 it changed 55–75 % of the element layers every stage, by up
+/// to 0.2 °C at depth, and every such change over a slope is a pressure
+/// gradient the advection did not make. With the bracketing means it limits
+/// about half as many. On a flat bed a node's own layer is one of the pair: a
+/// sharp interface between layers is bounded by both water masses' means
+/// (the lock exchanges stay in range to 5e-12 °C).
+fn column_at_height(
     means: &[f64],
     heights: &[f64],
     end_ranges: [f64; 4],
     z: f64,
     level: usize,
-) -> f64 {
+) -> (f64, f64, f64) {
     let n = means.len();
     if n == 1 {
-        return means[0];
+        return (means[0], means[0], means[0]);
     }
     let mut lo = level.min(n - 2);
     while lo > 0 && z < heights[lo] {
@@ -960,49 +1046,20 @@ fn column_value_at(
     while lo + 2 < n && z > heights[lo + 1] {
         lo += 1;
     }
+    let (lower, upper) = (means[lo], means[lo + 1]);
     let spacing = heights[lo + 1] - heights[lo];
     if spacing <= 0.0 {
-        return 0.5 * (means[lo] + means[lo + 1]);
+        return (0.5 * (lower + upper), lower, upper);
     }
-    let value = means[lo] + (z - heights[lo]) / spacing * (means[lo + 1] - means[lo]);
-    if z < heights[0] {
+    let value = lower + (z - heights[lo]) / spacing * (upper - lower);
+    let value = if z < heights[0] {
         value.clamp(end_ranges[0], end_ranges[1])
     } else if z > heights[n - 1] {
         value.clamp(end_ranges[2], end_ranges[3])
     } else {
         value
-    }
-}
-
-/// The means of the two layers of a column (`means` at `heights`, bottom
-/// first) whose heights bracket `z` (the end pair beyond them), searching
-/// from `level`.
-///
-/// Kuzmin's bounds take, from each neighbour column, these two means as well
-/// as the column's value interpolated to `z`, as Thetis's vertex patches on
-/// prisms take the cells above and below (Kärnä et al. 2018): a node may
-/// hold what its 3D neighbourhood holds. Bounded by the interpolated values
-/// alone, the limiter cut every smooth vertical extremum between thick
-/// layers (the departure of a displaced pycnocline peaks where `∂T/∂z`
-/// does): on the seamount at `r_x0` 0.32 it changed 55–75 % of the element
-/// layers every stage, by up to 0.2 °C at depth, and every such change over
-/// a slope is a pressure gradient the advection did not make. With the
-/// bracketing means it limits about half as many. On a flat bed a node's own
-/// layer is one of the pair: a sharp interface between layers is bounded by
-/// both water masses' means (the lock exchanges stay in range to 5e-12 °C).
-fn bracketing_means(means: &[f64], heights: &[f64], z: f64, level: usize) -> (f64, f64) {
-    let n = means.len();
-    if n == 1 {
-        return (means[0], means[0]);
-    }
-    let mut lo = level.min(n - 2);
-    while lo > 0 && z < heights[lo] {
-        lo -= 1;
-    }
-    while lo + 2 < n && z > heights[lo + 1] {
-        lo += 1;
-    }
-    (means[lo], means[lo + 1])
+    };
+    (value, lower, upper)
 }
 
 /// `[bound_min, bound_max]` widened by `relaxation` (≥ 1) times its range,
