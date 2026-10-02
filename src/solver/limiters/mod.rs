@@ -52,5 +52,5 @@ pub use tracer_2d::{
 // 3D Tracer limiters
 pub use tracer_3d::{
     TracerAveragePolicy3D, TracerLimiter3DConfig, TracerLimiter3DStats, TracerLimiterType3D,
-    apply_tracer_limiters_3d,
+    TracerReferenceProfile, apply_tracer_limiters_3d,
 };

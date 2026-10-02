@@ -1607,10 +1607,15 @@ mod tests {
         (physics, state)
     }
 
-    /// Largest layer speed of `seamount(form, linear N²)` after 36 h.
-    fn seamount_spin_up(form: crate::solver::rhs::PressureGradientForm) -> f64 {
+    /// Largest layer speed of `seamount(form, linear N²)` after 36 h, with
+    /// `limiter` on the tracers.
+    fn seamount_spin_up(
+        form: crate::solver::rhs::PressureGradientForm,
+        limiter: TracerLimiter3DConfig,
+    ) -> f64 {
         // 3 kg/m³ from the surface to 400 m: N² ≈ 7e-5 s⁻²
         let (physics, mut state) = seamount(form, |z| RHO0 - 3.0 * (1.0 + z / 400.0));
+        let physics = physics.with_tracer_limiter(limiter);
         let mut integrator = ModeSplitIntegrator::new();
         let dt = 300.0;
         for n in 0..432 {
@@ -1633,13 +1638,84 @@ mod tests {
     fn a_stratified_seamount_at_rest_stays_at_rest() {
         use crate::solver::rhs::PressureGradientForm;
         // Measured 7.4e-11 m/s
-        let speed = seamount_spin_up(PressureGradientForm::SigmaPairs);
+        let speed = seamount_spin_up(
+            PressureGradientForm::SigmaPairs,
+            TracerLimiter3DConfig::none(),
+        );
         assert!(speed < 1e-9, "the seamount spun up {speed:.3e} m/s in 36 h");
         // Measured 8.6e-8 m/s, 40-fold in the last 12 h
-        let unstable = seamount_spin_up(PressureGradientForm::ConstantDepth);
+        let unstable = seamount_spin_up(
+            PressureGradientForm::ConstantDepth,
+            TracerLimiter3DConfig::none(),
+        );
         assert!(
             unstable > 1e-8,
             "test regime: the constant-depth form did not grow ({unstable:.3e} m/s)"
+        );
+    }
+
+    /// TODO P4.6 gate (regression): the horizontal Kuzmin tracer limiter
+    /// keeps the stratified seamount at rest. It bounded each node by the
+    /// neighbours' means on its σ-layer and scaled the layer's whole
+    /// deviation from its mean: a smooth stratification along a sloping
+    /// layer looked like a front (extremal over the seamount's top), and a
+    /// round-off clip flattened the layer's stratification. The seamount at
+    /// rest reached 0.15 m/s within 15 min and NaN at 2 h. Now the bounds are
+    /// taken at each node's height and only the departure from the element's
+    /// own column is scaled ([`crate::solver::apply_tracer_limiters_3d`]).
+    #[test]
+    fn a_stratified_seamount_at_rest_stays_at_rest_under_the_kuzmin_limiter() {
+        use crate::solver::rhs::PressureGradientForm;
+        let limiter = TracerLimiter3DConfig {
+            limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+            ..TracerLimiter3DConfig::default()
+        };
+        // Measured 7.9e-11 m/s (7.2e-11 without the limiter)
+        let speed = seamount_spin_up(PressureGradientForm::SigmaPairs, limiter);
+        assert!(
+            speed < 1e-9,
+            "the seamount spun up {speed:.3e} m/s in 36 h under the limiter"
+        );
+    }
+
+    /// TODO P4.6 gate: a pycnocline at rest over the seamount is left alone by
+    /// the horizontal Kuzmin limiter with the pycnocline as its reference
+    /// profile. Without it the limiter clips the pycnocline where the σ-layers
+    /// cross it steeply (the layer means of a curved `T(z)` are not its values
+    /// at their mean heights).
+    #[test]
+    fn the_kuzmin_limiter_leaves_a_pycnocline_at_rest_with_its_reference_profile() {
+        use crate::solver::TracerReferenceProfile;
+        use crate::solver::rhs::PressureGradientForm;
+        let pycnocline = |z: f64| RHO0 - 1.5 + 1.5 * (-(z + 30.0) / 10.0).tanh();
+        let eos = LinearEOS::default();
+        let temperature = |z: f64| eos.t0 + (1.0 - pycnocline(z) / eos.rho0) / eos.alpha;
+        let limiter = TracerLimiter3DConfig {
+            limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+            ..TracerLimiter3DConfig::default()
+        };
+        let largest_change = |limiter: TracerLimiter3DConfig| {
+            let (physics, mut state) = seamount(PressureGradientForm::SigmaPairs, pycnocline);
+            let before = state.temp.clone();
+            physics
+                .with_tracer_limiter(limiter)
+                .apply_tracer_limiters(&mut state);
+            max_or_nan(before.iter().zip(&state.temp).map(|(a, b)| (a - b).abs()))
+        };
+        // Every 5 cm: the profile's interpolation error is ≈ 2e-5 °C
+        let reference =
+            TracerReferenceProfile::from_fn(-400.0, 0.0, 8001, |z| (temperature(z), eos.s0));
+        let with_reference = largest_change(limiter.clone().with_reference_profile(reference));
+        let without = largest_change(limiter);
+        // Measured: 1.8 °C without the reference, 1.5e-5 °C with it (T spans 17 °C)
+        println!("clipped {without:.3e} °C without the reference, {with_reference:.3e} with it");
+        assert!(
+            with_reference < 1e-4,
+            "the limiter changed the pycnocline at rest by {with_reference:.3e} °C"
+        );
+        assert!(
+            without > 0.1,
+            "test regime: without the reference the limiter clipped only {without:.3e} °C"
         );
     }
 
@@ -3308,6 +3384,7 @@ mod tests {
         );
         let span = (last - first) as f64 * dt;
         let froude = [0, 1].map(|f| (positions[1][f] - positions[0][f]).abs() / span / speed_scale);
+        eprintln!("DBGLOCK order {order} froude {froude:?} t_excess {t_excess:.3e}");
         LockExchange {
             froude,
             t_excess,
@@ -3320,8 +3397,9 @@ mod tests {
     /// over hours 1–3.
     ///
     /// The dense water runs right along the bed and the light water left
-    /// along the surface, each at the Froude number 0.483 (0.475 at 125 m on
-    /// 20 levels, 0.473 at 62 m), a little below Benjamin's (1968) ½ for an
+    /// along the surface, each at the Froude number 0.488 (0.483 before the
+    /// limiter's bounds were taken at constant height; then 0.475 at 125 m
+    /// on 20 levels, 0.473 at 62 m), a little below Benjamin's (1968) ½ for an
     /// energy-conserving current, as dissipative currents in the laboratory
     /// and in hydrostatic models are. At the middle the two layers move at
     /// ±0.20 m/s, Benjamin's ½√(g′H). The interface between them thickens
@@ -3348,7 +3426,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.483 for both
+        // Measured 0.488 for both
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.44..0.5).contains(&froude),
@@ -3364,9 +3442,9 @@ mod tests {
     /// TODO P4.5 gate: the lock exchange ([`lock_exchange`]) at P2 needs
     /// horizontal viscosity, and runs with it. On 250 m, ten levels, 40 s
     /// steps, ν = 10 m²/s and TVD vertical advection the fronts run at
-    /// Fr = 0.500 (dense) and 0.494 (light) over hours 1–2 (0.499 and 0.494
-    /// over hours 1–3, the same at 30 s steps; P1 without viscosity 0.483),
-    /// and T stays in its range to 2e-12 °C. Before hour 1 the fronts are
+    /// Fr = 0.500 (dense) and 0.495 (light) over hours 1–2 (0.499 and 0.494
+    /// over hours 1–3, the same at 30 s steps; P1 without viscosity 0.488),
+    /// and T stays in its range to 5e-12 °C. Before hour 1 the fronts are
     /// still accelerating (0.48 over 0.5–1.5 h).
     ///
     /// Without horizontal viscosity the interface's shear instability grows
@@ -3405,7 +3483,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.500 and 0.494
+        // Measured 0.500 and 0.495
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.46..0.52).contains(&froude),
@@ -3422,7 +3500,7 @@ mod tests {
     /// ([`lock_exchange`]) without a constant one, and only where the flow
     /// needs it. On 250 m, ten levels, 40 s steps, `C_s` = 0.7 and the
     /// default (limited Akima) vertical advection the fronts run at
-    /// Fr = 0.504 (dense) and 0.499 (light) over hours 1–2, T stays in its
+    /// Fr = 0.504 (dense) and 0.501 (light) over hours 1–2, T stays in its
     /// range to 2e-12 °C, and after 2 h ν reaches 19 m²/s at the fronts' heads
     /// and ≈ 5 m²/s along the interface between them (the constant ν that
     /// holds it is 5–7 m²/s everywhere), while the water at rest beyond the
@@ -3453,7 +3531,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.504 and 0.499
+        // Measured 0.504 and 0.501
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.46..0.52).contains(&froude),
@@ -3487,8 +3565,8 @@ mod tests {
     /// element means (one layer of an element at 7.27 °C in a 7.5–12.5 °C
     /// range), which the horizontal Kuzmin limiter cannot change: it bounds
     /// the nodes around those means. Akima under a TVD limiter (the default,
-    /// `LimitedAkima`) keeps T in range to 4e-12 °C (TVD: the same), with the
-    /// fronts at Fr 0.502 and 0.501 (Akima: 0.502 and 0.500).
+    /// `LimitedAkima`) keeps T in range to 5e-12 °C (TVD: the same), with the
+    /// fronts at Fr 0.501 and 0.501 (Akima: 0.502 and 0.500).
     ///
     /// Akima's undershoot comes and goes with the interface: with ν = 15 it
     /// is 0.016 °C after 2 h, with ν = 5–10 on 125–250 m ≤ 2e-8 °C at 2 h.
@@ -3512,7 +3590,7 @@ mod tests {
             t_excess < 1e-9,
             "T left its initial range by {t_excess:.3e} °C"
         );
-        // Measured 0.502 and 0.501
+        // Measured 0.501 and 0.501
         for (front, froude) in [("dense", dense), ("light", light)] {
             assert!(
                 (0.46..0.52).contains(&froude),
