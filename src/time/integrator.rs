@@ -75,6 +75,26 @@ pub trait Integrable: Clone + Send + Sized {
     fn copy_from(&mut self, other: &Self) {
         self.clone_from(other);
     }
+
+    /// A stage combination `self ← a·base + Σᵢ cᵢ·xᵢ`, with `base` the
+    /// current `self` when `None`.
+    ///
+    /// Defined as [`Self::copy_from`]`(base)`, [`Self::scale`]`(a)` (left out
+    /// for `a = 1`), then one [`Self::axpy`] per term in order. An override
+    /// that fuses them into one pass must evaluate every value in that same
+    /// order (`((base·a) + c₁x₁) + c₂x₂`), so the integrators give the same
+    /// bits either way.
+    fn combine(&mut self, base: Option<&Self>, a: f64, terms: &[(f64, &Self)]) {
+        if let Some(base) = base {
+            self.copy_from(base);
+        }
+        if a != 1.0 {
+            self.scale(a);
+        }
+        for &(c, x) in terms {
+            self.axpy(c, x);
+        }
+    }
 }
 
 /// Reusable stage storage for [`TimeIntegrator::step_with_workspace`].
@@ -446,25 +466,19 @@ impl<S: Integrable> TimeIntegrator<S> for SSPRK3 {
 
         // Stage 1: u1 = u + dt * L(u, t)
         rhs(state, t, k);
-        u1.copy_from(state);
-        u1.axpy(dt, k);
+        u1.combine(Some(state), 1.0, &[(dt, k)]);
         relax(u1, state, dt);
         stage_hook(u1);
 
         // Stage 2: u2 = 3/4 * u + 1/4 * u1 + 1/4 * dt * L(u1, t + dt)
         rhs(u1, t + dt, k);
-        u2.copy_from(state);
-        u2.scale(0.75);
-        u2.axpy(0.25, u1);
-        u2.axpy(0.25 * dt, k);
+        u2.combine(Some(state), 0.75, &[(0.25, u1), (0.25 * dt, k)]);
         relax(u2, u1, 0.25 * dt);
         stage_hook(u2);
 
         // Stage 3: u_new = 1/3 * u + 2/3 * u2 + 2/3 * dt * L(u2, t + dt/2)
         rhs(u2, t + 0.5 * dt, k);
-        state.scale(1.0 / 3.0);
-        state.axpy(2.0 / 3.0, u2);
-        state.axpy(2.0 / 3.0 * dt, k);
+        state.combine(None, 1.0 / 3.0, &[(2.0 / 3.0, u2), (2.0 / 3.0 * dt, k)]);
         relax(state, u2, 2.0 / 3.0 * dt);
         stage_hook(state);
     }
@@ -550,31 +564,25 @@ impl<S: Integrable> TimeIntegrator<S> for SSPRK43 {
 
         // Stage 1: u1 = u + dt/2 · L(u, t)
         rhs(state, t + s1.c * dt, k);
-        u1.copy_from(state);
-        u1.axpy(s1.beta * dt, k);
+        u1.combine(Some(state), 1.0, &[(s1.beta * dt, k)]);
         relax(u1, state, s1.beta * dt);
         stage_hook(u1);
 
         // Stage 2: u2 = u1 + dt/2 · L(u1, t + dt/2)
         rhs(u1, t + s2.c * dt, k);
-        u2.copy_from(u1);
-        u2.axpy(s2.beta * dt, k);
+        u2.combine(Some(u1), 1.0, &[(s2.beta * dt, k)]);
         relax(u2, u1, s2.beta * dt);
         stage_hook(u2);
 
         // Stage 3: u3 = 2/3 · u + 1/3 · u2 + dt/6 · L(u2, t + dt), into u1
         rhs(u2, t + s3.c * dt, k);
-        u1.copy_from(state);
-        u1.scale(s3.start);
-        u1.axpy(s3.input, u2);
-        u1.axpy(s3.beta * dt, k);
+        u1.combine(Some(state), s3.start, &[(s3.input, u2), (s3.beta * dt, k)]);
         relax(u1, u2, s3.beta * dt);
         stage_hook(u1);
 
         // Stage 4: u_new = u3 + dt/2 · L(u3, t + dt/2)
         rhs(u1, t + s4.c * dt, k);
-        state.copy_from(u1);
-        state.axpy(s4.beta * dt, k);
+        state.combine(Some(u1), 1.0, &[(s4.beta * dt, k)]);
         relax(state, u1, s4.beta * dt);
         stage_hook(state);
     }
@@ -757,7 +765,7 @@ pub fn create_integrator_info(integrator: StandardIntegrator) -> BoxedIntegrator
 // Integrable Implementations for Existing Types
 // =============================================================================
 
-use crate::solver::core::blocks::{update_values, update_with};
+use crate::solver::core::blocks::{combine_values, update_values, update_with};
 use crate::solver::{
     DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, TracerSolution2D, state::Solution3D,
 };
@@ -892,11 +900,160 @@ impl Integrable for Solution3D {
             }
         }
     }
+
+    /// One pass per field instead of one per operation (bit for bit the
+    /// `copy_from`, `scale`, `axpy` sequence): the fields `scale` and `axpy`
+    /// change are combined, the eddy coefficients are copied from `base`.
+    fn combine(&mut self, base: Option<&Self>, a: f64, terms: &[(f64, &Self)]) {
+        const MAX_TERMS: usize = 4;
+        let shape = |s: &Self| {
+            (
+                s.n_elements,
+                s.n_nodes,
+                s.n_levels,
+                s.tke.len(),
+                s.gls.len(),
+            )
+        };
+        if terms.len() > MAX_TERMS || base.is_some_and(|b| shape(b) != shape(self)) {
+            // A reshaping copy (or many terms): the plain sequence
+            if let Some(base) = base {
+                Integrable::copy_from(self, base);
+            }
+            if a != 1.0 {
+                Integrable::scale(self, a);
+            }
+            for &(c, x) in terms {
+                Integrable::axpy(self, c, x);
+            }
+            return;
+        }
+        // `field` of `base` and of every term whose `field` is not empty
+        // (an empty turbulence field adds nothing, as in `axpy`)
+        let combine = |out: &mut [f64], field: fn(&Self) -> &[f64]| {
+            let mut buffer: [(f64, &[f64]); MAX_TERMS] = [(0.0, &[]); MAX_TERMS];
+            let mut n = 0;
+            for &(c, x) in terms {
+                if !field(x).is_empty() {
+                    buffer[n] = (c, field(x));
+                    n += 1;
+                }
+            }
+            combine_values(out, base.map(field), a, &buffer[..n]);
+        };
+        combine(&mut self.eta.data, |s| &s.eta.data);
+        combine(&mut self.ubar.data, |s| &s.ubar.data);
+        combine(&mut self.vbar.data, |s| &s.vbar.data);
+        combine(&mut self.u, |s| &s.u);
+        combine(&mut self.v, |s| &s.v);
+        combine(&mut self.w, |s| &s.w);
+        combine(&mut self.temp, |s| &s.temp);
+        combine(&mut self.salt, |s| &s.salt);
+        combine(&mut self.rho, |s| &s.rho);
+        combine(&mut self.tke, |s| &s.tke);
+        combine(&mut self.gls, |s| &s.gls);
+        if let Some(base) = base {
+            update_with(&mut self.eddy_viscosity, &base.eddy_viscosity, |x, y| {
+                *x = y
+            });
+            update_with(
+                &mut self.eddy_diffusivity,
+                &base.eddy_diffusivity,
+                |x, y| *x = y,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Solution3D`'s fused `combine` gives the bits of the `copy_from`,
+    /// `scale`, `axpy` sequence it replaces: with and without a base, with a
+    /// prognostic turbulence and with an empty one in a term, and over more
+    /// values than one streaming chunk.
+    #[test]
+    fn solution_3d_combine_matches_the_operation_sequence_bit_for_bit() {
+        let (ne, nn, nl) = (40, 9, 50);
+        let fill = |seed: u64, turbulence: bool| {
+            let mut s = Solution3D::new(ne, nn, nl);
+            let mut x = seed;
+            let mut next = || {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (x >> 11) as f64 / (1u64 << 53) as f64 - 0.3
+            };
+            for field in [&mut s.eta.data, &mut s.ubar.data, &mut s.vbar.data] {
+                field.iter_mut().for_each(|v| *v = next());
+            }
+            for field in [
+                &mut s.u,
+                &mut s.v,
+                &mut s.w,
+                &mut s.temp,
+                &mut s.salt,
+                &mut s.rho,
+                &mut s.eddy_viscosity,
+                &mut s.eddy_diffusivity,
+            ] {
+                field.iter_mut().for_each(|v| *v = next());
+            }
+            if turbulence {
+                s.tke = (0..ne * nn * (nl + 1)).map(|_| next()).collect();
+                s.gls = (0..ne * nn * (nl + 1)).map(|_| next()).collect();
+            }
+            s
+        };
+        assert!(ne * nn * nl > 16384, "more than one streaming chunk");
+        let (state, x1, x2, x2_laminar) =
+            (fill(1, true), fill(2, true), fill(3, true), fill(4, false));
+        let bits = |s: &Solution3D| {
+            [
+                &s.eta.data,
+                &s.ubar.data,
+                &s.vbar.data,
+                &s.u,
+                &s.v,
+                &s.w,
+                &s.temp,
+                &s.salt,
+                &s.rho,
+                &s.eddy_viscosity,
+                &s.eddy_diffusivity,
+                &s.tke,
+                &s.gls,
+            ]
+            .map(|f| f.iter().map(|v| v.to_bits()).collect::<Vec<_>>())
+        };
+        type Case<'a> = (Option<&'a Solution3D>, f64, Vec<(f64, &'a Solution3D)>);
+        let cases: [Case; 4] = [
+            (Some(&state), 1.0, vec![(0.7, &x1)]),
+            (Some(&state), 0.75, vec![(0.25, &x1), (0.25 * 0.7, &x2)]),
+            (
+                None,
+                1.0 / 3.0,
+                vec![(2.0 / 3.0, &x1), (2.0 / 3.0 * 0.7, &x2)],
+            ),
+            (None, 1.0, vec![(0.3, &x2_laminar), (0.1, &x1)]),
+        ];
+        for (case, (base, a, terms)) in cases.iter().enumerate() {
+            let mut fused = fill(5, true);
+            let mut sequence = fused.clone();
+            fused.combine(*base, *a, terms);
+            if let Some(base) = base {
+                Integrable::copy_from(&mut sequence, base);
+            }
+            if *a != 1.0 {
+                Integrable::scale(&mut sequence, *a);
+            }
+            for &(c, x) in terms {
+                Integrable::axpy(&mut sequence, c, x);
+            }
+            assert!(bits(&fused) == bits(&sequence), "case {case}");
+        }
+    }
 
     #[test]
     fn test_ssprk3_order() {
