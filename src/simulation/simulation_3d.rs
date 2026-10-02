@@ -3710,11 +3710,10 @@ mod tests {
     /// the interface's grid-scale shear instability (Gassner, Winters &
     /// Kopriva 2016 for split forms in under-resolved DG flows).
     ///
-    /// Held, in split form, over hours 1–3: 125 m (Fr 0.467, 0.434; 0.473,
-    /// 0.445 before the vertical advection's end-layer bound) and
-    /// 62 m (0.483, 0.452, 20 s steps), 500 m (0.462, 0.461), P3 on 250 m
-    /// (0.453, 0.430, 20 s), 20 levels (0.467, 0.461), 10 s steps (these
-    /// before the bound). The fronts
+    /// Held, in split form, over hours 1–3: 125 m (Fr 0.467, 0.434) and
+    /// 62 m (0.479, 0.447, 20 s steps), 500 m (0.462, 0.460), P3 on 250 m
+    /// (0.447, 0.429, 20 s), 20 levels (0.467, 0.460), 10 s steps (0.459,
+    /// 0.454). The fronts
     /// run slower than with viscosity (0.496 at ν = 10): an interface left to
     /// the grid mixes more. Its spurious mixing, the growth of the reference
     /// potential energy (there is no diffusivity of T), is 8.4e-4 W/m² here,
@@ -3776,16 +3775,20 @@ mod tests {
     /// | P2 elements | ν = 0 | `Re_Δ` = 10 | ν = 10 | ν = 10, 20 levels | `C_s` 0.2 | `C_s` 0.5 |
     /// |---|---|---|---|---|---|---|
     /// | 500 m | 1.07e-3 | 5.7e-4 | 5.7e-4 | | 8.9e-4 | 6.1e-4 |
-    /// | 250 m | 1.35e-3 | 5.1e-4 | 3.3e-4 | | 7.9e-4 | 4.0e-4 |
-    /// | 125 m | 1.64e-3 | 5.1e-4 | 2.3e-4 | 1.45e-4 | 6.6e-4 | 3.2e-4 |
-    /// | 62 m | 1.72e-3 | 5.4e-4 | 2.0e-4 | 7.9e-5 | 5.8e-4 | 2.8e-4 |
+    /// | 250 m | 1.38e-3 | 5.1e-4 | 3.3e-4 | | 7.9e-4 | 4.0e-4 |
+    /// | 125 m | 1.68e-3 | 5.1e-4 | 2.3e-4 | 1.45e-4 | 6.6e-4 | 3.2e-4 |
+    /// | 62 m | 1.69e-3 | 5.4e-4 | 2.0e-4 | 7.9e-5 | 5.9e-4 | 2.8e-4 |
     ///
-    /// Without viscosity the mixing grows as the mesh is refined (the
-    /// interface is left to the grid at any resolution; 20 levels change
-    /// nothing, 1.64e-3 at 125 m); at a fixed `Re_Δ` it stays; at a fixed ν
+    /// (62 m at 20 s steps; with explicit viscosity 40 s is past its
+    /// stability limit there.)
+    ///
+    /// Without viscosity the mixing grows as the mesh is refined, levelling
+    /// off at 125–62 m (the interface is left to the grid at any
+    /// resolution; 20 levels change nothing, 1.67e-3 at 125 m); at a fixed
+    /// `Re_Δ` it stays; at a fixed ν
     /// it converges, towards zero once the levels are refined too (the
     /// 10-level runs level off at 2e-4). On 250 m it falls monotonically with
-    /// ν: 9.4e-4, 7.0e-4, 5.1e-4, 3.3e-4, 2.2e-4 at ν = 1, 2.5, 5, 10, 20.
+    /// ν: 9.7e-4, 7.0e-4, 5.1e-4, 3.3e-4, 2.2e-4 at ν = 1, 2.5, 5, 10, 20.
     /// Smagorinsky's ν follows the strain, so its mixing falls with the
     /// spacing at a fixed `C_s`; at 0.5 it is within 1.2–1.4× of ν = 10. P1
     /// without viscosity mixes 6.0e-4 (its own dissipation).
