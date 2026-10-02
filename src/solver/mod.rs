@@ -154,8 +154,8 @@ pub use algorithms::{apply_implicit_damping_2d_parallel, apply_wet_dry_correctio
 
 // Re-export diagnostics
 pub use diagnostics::{
-    DiagnosticsTracker, ProgressReporter, SWEDiagnostics2D, current_cfl_2d, total_energy_2d,
-    total_mass_2d, total_momentum_2d,
+    DiagnosticsTracker, PotentialEnergy, PotentialEnergy3D, ProgressReporter, SWEDiagnostics2D,
+    current_cfl_2d, total_energy_2d, total_mass_2d, total_momentum_2d,
 };
 
 // Re-export SIMD types
