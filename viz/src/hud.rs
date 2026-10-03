@@ -6,6 +6,7 @@
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use bevy::ui::{BackgroundGradient, ColorStop, LinearGradient};
+use dg_rs::time::ModelClock;
 
 use crate::cloud_3d::KINDS;
 use crate::colormap::{SEABED, srgb_at};
@@ -13,7 +14,7 @@ use crate::contours::Contours;
 use crate::field::ShownLayer;
 use crate::layers::{Levels, Section, SectionShows};
 use crate::particles::{ACTIVE, DEAD, EXITED, Particles, SETTLED, STRANDED};
-use crate::playback::{Playback, SolverState};
+use crate::playback::{Playback, SolverState, Source};
 use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 
 // ASCII only: Bevy's default font has no arrows or middle dots.
@@ -27,6 +28,11 @@ const KEYS_3D: &str = ", . layer (depth mean, surface ... bed)   V section";
 /// The scenario's one-line description, heading the status.
 #[derive(Resource)]
 pub struct Title(pub String);
+
+/// The UTC of model time 0, when the run has a date: the status then shows the date
+/// next to the model time.
+#[derive(Resource)]
+pub struct RunClock(pub ModelClock);
 
 #[derive(Component)]
 struct Status;
@@ -176,6 +182,8 @@ fn clock(t: f64) -> String {
 fn status(
     playback: Res<Playback>,
     title: Res<Title>,
+    source: Res<Source>,
+    run_clock: Option<Res<RunClock>>,
     style: Res<SurfaceStyle>,
     opacity: Res<WaterOpacity>,
     particles: Res<Particles>,
@@ -187,31 +195,54 @@ fn status(
         return;
     };
     let mut s = format!("{}\n", title.0);
+    let replay = matches!(*source, Source::Replay { .. });
     match playback.newest() {
+        None if replay => s += "reading the frames...\n",
         None => s += "starting the solver...\n",
         Some(_) => {
             let state = if playback.paused {
                 "  paused"
+            } else if playback.waiting() && replay {
+                "  waiting for the frames"
             } else if playback.waiting() {
                 "  waiting for the solver"
             } else {
                 ""
             };
-            s += &format!("t = {}   x{:.0}{state}\n", clock(playback.t), playback.rate);
+            // The date to the minute, `YYYY-MM-DD HH:MM`
+            let date = run_clock.map_or(String::new(), |c| {
+                format!(" ({} UTC)", &c.0.format(playback.t)[..16])
+            });
+            s += &format!(
+                "t = {}{date}   x{:.0}{state}\n",
+                clock(playback.t),
+                playback.rate
+            );
         }
     }
     let newest = playback.newest().unwrap_or(0.0);
-    s += &match &playback.solver {
-        SolverState::Running => format!(
+    s += &match (&*source, &playback.solver) {
+        (Source::Solver, SolverState::Running) => format!(
             "solver at {}, {:.0}x real time\n",
             clock(newest),
             playback.solver_speed()
         ),
-        SolverState::Finished { steps, wall } => format!(
+        (Source::Solver, SolverState::Finished { steps, wall }) => format!(
             "solver done: {} in {steps} steps, {wall:.0} s\n",
             clock(newest)
         ),
-        SolverState::Failed(e) => format!("solver failed: {e}\n"),
+        (Source::Solver, SolverState::Failed(e)) => format!("solver failed: {e}\n"),
+        (Source::Replay { name, t_last, .. }, SolverState::Running) => format!(
+            "replay of {name}: read to {} of {}\n",
+            clock(newest),
+            clock(*t_last)
+        ),
+        (Source::Replay { name, frames, .. }, SolverState::Finished { wall, .. }) => format!(
+            "replay of {name}: {frames} frames {} apart (read in {wall:.0} s),\n\
+             linear in time between them\n",
+            clock(playback.interval)
+        ),
+        (Source::Replay { .. }, SolverState::Failed(e)) => format!("replay failed: {e}\n"),
     };
     if let (Some(lo), Some(hi)) = (playback.oldest(), playback.newest()) {
         s += &format!(
