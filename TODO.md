@@ -24,6 +24,24 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `REVIEW.md`
 
 ## ▶ Next session — start here
 
+**State on 2026-10-03.**
+
+Open PRs, to merge in this order. Retarget each stacked PR to `main` before deleting its base branch.
+1. [#89](https://github.com/EmilLindfors/roms-rs/pull/89): the viewer replays VTU runs.
+2. [#90](https://github.com/EmilLindfors/roms-rs/pull/90): snapshot files (`io::SnapshotWriter`/`Reader`, `.dgsnap`).
+3. [#91](https://github.com/EmilLindfors/roms-rs/pull/91): the tide-gauge trace.
+4. [#92](https://github.com/EmilLindfors/roms-rs/pull/92): 3D snapshot files and live `--save-snapshot`.
+5. [#93](https://github.com/EmilLindfors/roms-rs/pull/93): particle files (`.dgpart`).
+6. [#94](https://github.com/EmilLindfors/roms-rs/pull/94): the spectral wave model (stage 1, `src/waves/`). It is based on `main`, so expect small conflicts with the chain in `CHANGELOG.md` and `TODO.md`.
+
+Details in F.3 and F.4. Next, in this order:
+1. **F.4 stage 2: quadruplet interactions (DIA) and a diagnostic tail.** Gate them by fetch-limited growth against Kahma & Calkoen (1992). Until then the wave model propagates swell and dissipates, but does not grow a realistic wind sea.
+2. **Stokes drift into the particle trackers (F.4 coupling).** The lice larvae in the top metres are what the farm goal needs from the waves. `WaveModel2D::stokes_drift` gives the profile.
+3. **Second-order θ/σ advection (F.4).** The first-order refraction bias is ≈ 1° at 5° bins.
+4. **The rest of the coupling.** Radiation stress or the vortex force on the currents; H_s into GLS wave breaking and surface roughness; wave-enhanced bed stress. Then MET Norway boundary spectra and a cost measurement at Frøya.
+
+The circulation items below (P3.1 and the error budget) stand as they were.
+
 Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the deferred P0.11 GPU), P1.1 for the `Simulation` path, and the P1.2 core (split form; `WetDry` with second-order shoreline subcells as the wet/dry default). Frøya now runs on `Simulation` + `WetDry` on a water-only mesh, with correctly georeferenced bathymetry: the GeoTIFF reader had ignored its georeferencing. Lake at rest over the real bathymetry holds to 1.5e-10 m/s for 1 h. P1.4 is done: one characteristic OBC (`CharacteristicOBC` + external-state providers), NorKyst-800 boundary tides from a harmonic atlas, and a `ModelClock`. A full M2 cycle with NorKyst boundary tides at 9,653 P2 elements is stable, with 0 clips, in 6 min. Pick up in this order:
 
 1. **P3.1 validation: the tooling is done; the month-long run is still to do.** Heimsjø and Kristiansund lie outside the Frøya domain. Mausund (Kartverket MSU) is the gauge inside it, with a year of observations in `data/tide_gauges/mausund_obs.txt` and NorKyst at the gauge in `data/froya_station_tides.txt`. Both are untracked, like all of `data/`. Regenerate them with `./scripts/kartverket_gauge.sh Mausund 63.869331 8.665231 2024-07-01 2025-07-01` and `norkyst_boundary_tides -- spacing_km=0 points=8.665231,63.869331 out=/dev/null` (≈ 20 min). The run takes ≈ 9 h at 8.2 ms/step, so it waits until P2 makes it cheaper, or is started overnight:
