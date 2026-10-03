@@ -6,6 +6,20 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A spectral wave model (`waves`, TODO F.4 stage 1).** The wave action balance on the DG mesh, one nodal field per (frequency, direction) component.
+  - `waves::dispersion`: the wavenumber (Guo's start, Newton), group velocity and ∂σ/∂d.
+  - `waves::spectrum::SpectralGrid`: log-spaced frequencies and uniform directions; JONSWAP with cos^m spreading, normalised on the grid; H_s, T_m01, T_m02, T_p, mean direction and spread; the Stokes drift profile, radiation stress and bed orbital velocity.
+  - `waves::sources::SourceTerms`: Komen wind input with linear growth, Komen whitecapping, JONSWAP bottom friction, Battjes–Janssen breaking, integrated with frozen rates (an exponential integrator).
+  - `waves::WaveModel2D`: strong-form DG propagation per component at c_g e_θ + U, with upwind faces, open boundaries bringing in a spectrum, and absorbing coasts. Refraction by depth and current shear and frequency shifting by currents (first-order upwind in θ and σ). SSP-RK3 with a Zhang–Shu positivity scaling, then the sources; in parallel over components.
+  - Gates:
+    - DG propagation converges at rate 3.0 at P2;
+    - total action kept to 3.9e-15 under refraction;
+    - shoaling keeps c_g N to 2e-14;
+    - Snell's law met to first order in the direction bins (1.03° at 5°);
+    - a following current keeps σ + kU to 0.34 %;
+    - per-node gates for each source term and the integrated quantities.
+  - Not yet: quadruplet interactions (so no realistic wind-sea growth), coupling to the circulation, mixing and particles, and real boundary spectra. See TODO F.4.
+
 - **Reference potential energy: a measure of spurious mixing in 3D (TODO P4.5).** New `solver::PotentialEnergy3D` (re-exported from `solver`): the potential energy `g ∫ (ρ − ρ_r) z dV` of a `Solution3D` and its reference (background) potential energy, the same water sorted by density into level layers over the basin's own hypsometry (Winters et al. 1995). Each GLL node is a column of its quadrature area over its bed; each wet layer a parcel, stacked exactly over the piecewise-constant area. RPE is raised only by diapycnal mixing, so with no explicit diffusivity its growth is the advection's spurious mixing (Ilıcak et al. 2012). `PotentialEnergy::available()` is `total − reference`. Energies are of the anomaly from a reference density `ρ_r` (the model's ρ₀); changes of RPE do not depend on it, and full-density energies lose ≈ 1e-10 of a diffusion step's change to round-off.
   - Gates: a level stable stratification is its own sorted state (APE 1e-14 of PE); the lock's APE is `g A H² Δρ/8`; the reference basin follows a stepped bed; dry columns hold no water; under a constant vertical κ a stratified basin at rest gains exactly `g κ A Δt (ρ_bed − ρ_surface)` per implicit diffusion step, to 4.2e-11 (`vertical_diffusion_raises_the_reference_potential_energy_at_its_exact_rate`).
   - **The lock exchange's spurious mixing is set by the grid Reynolds number `ΔU·Δx/ν`**, as Ilıcak et al. found: at `Re_Δ` = 10 it is 5.1–5.7e-4 W/m² from 500 m to 62 m P2 elements (hours 1–3), and 3.818e-4 against 3.812e-4 on 250 and 125 m over hours 1–2 (gate `spurious_mixing_is_set_by_the_grid_reynolds_number`). Without viscosity it grows as the mesh is refined (1.07e-3 at 500 m to 1.69e-3 at 62 m); at a fixed ν = 10 m²/s it converges (5.7e-4 to 2.0e-4 on 10 levels, 7.9e-5 at 62 m on 20 levels). Smagorinsky `C_s` 0.5 is within 1.2–1.4× of ν = 10, `C_s` 0.2 twice that. The existing lock-exchange gates assert their mixing too (inviscid P2 8.4e-4, ν = 10 2.7e-4 W/m²).
