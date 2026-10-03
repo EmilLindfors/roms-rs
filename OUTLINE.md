@@ -111,7 +111,10 @@ src/
 │                     # walk, face-by-face walk with wall reflection, exits;
 │                     # 3D: σ-levels, Visser's vertical walk, sinking/settling;
 │                     # behaviour (swimming salmon-lice larvae, clear-sky light);
-│                     # the waves' Stokes drift added to any flow (stokes.rs)
+│                     # the waves' Stokes drift added to any flow (stokes.rs);
+│                     # site-to-site connectivity: exposure in contact zones,
+│                     # matrix per release group, spread across seeds
+│                     # (connectivity.rs)
 ├── io/               # NetCDF output; parent-ocean and weather-model readers
 │                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
 │                     # bathymetry, GSHHS coastline, projections, observations

@@ -46,6 +46,14 @@
 //! ([`crate::waves::StokesDriftField`]) to any flow, at a fixed depth in 2D and
 //! at each particle's depth in 3D ([`stokes`]).
 //!
+//! # Connectivity
+//!
+//! [`ConnectivityRecorder`] adds up the time each particle spends in contact
+//! with a set of sites ([`ContactZone`]: net cages, farms). From it,
+//! [`ConnectivityMatrix`] gives the share of each site's particles that
+//! reach each other site, and [`ConnectivityEnsemble`] gives its spread
+//! across random seeds ([`connectivity`]).
+//!
 //! # Locating particles and boundaries
 //!
 //! A particle keeps its element and reference coordinates. Each move (the
@@ -70,6 +78,7 @@
 //!   Shelf Sci.* 37, 99–110.
 
 pub mod behaviour;
+pub mod connectivity;
 pub mod stokes;
 mod tracker;
 pub mod tracker_3d;
@@ -80,6 +89,10 @@ pub mod walk;
 pub use behaviour::{
     ClearSkyLight, ConstantLight, LiceStage, ParticleBehaviour3D, Passive, SalmonLice,
     SurfaceLight, Surroundings,
+};
+pub use connectivity::{
+    ConnectivityEnsemble, ConnectivityMatrix, ConnectivityRecorder, Contact, ContactZone,
+    Difference,
 };
 pub use stokes::{StokesDrift, WithStokesDrift2D, WithStokesDrift3D};
 pub use tracker::{Particle2D, ParticleStatus, ParticleTracker2D};
