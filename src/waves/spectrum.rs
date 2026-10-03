@@ -205,10 +205,7 @@ impl SpectralGrid {
         let (mut ux, mut uy) = (0.0, 0.0);
         for i in 0..self.n_freq() {
             let (ki, s) = (k[i], self.sigma[i]);
-            // cosh(2k(z+d)) / sinh²(kd), written to stay finite for large kd
-            let decay = 2.0 * (2.0 * ki * z).exp() * (1.0 + (-4.0 * ki * (z + depth)).exp())
-                / (1.0 - (-2.0 * ki * depth).exp()).powi(2);
-            let w = s * ki * decay * self.d_sigma[i] * self.d_theta;
+            let w = s * ki * stokes_decay(ki, depth, z) * self.d_sigma[i] * self.d_theta;
             for j in 0..nd {
                 let ej = e[i * nd + j] * w;
                 ux += ej * self.cos_theta[j];
@@ -253,6 +250,15 @@ impl SpectralGrid {
         }
         (u2 * self.d_theta).sqrt()
     }
+}
+
+/// `cosh(2k(z + d))/sinh²(kd)` (`2 e^{2kz}` in deep water), the depth profile of
+/// the Stokes drift of wavenumber `k` at height `z` (≤ 0) in depth `d`, written to
+/// stay finite for large kd.
+#[inline]
+pub(crate) fn stokes_decay(k: f64, depth: f64, z: f64) -> f64 {
+    2.0 * (2.0 * k * z).exp() * (1.0 + (-4.0 * k * (z + depth)).exp())
+        / (1.0 - (-2.0 * k * depth).exp()).powi(2)
 }
 
 /// Angle `a` (rad) folded into (−π, π].

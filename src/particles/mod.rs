@@ -40,6 +40,12 @@
 //! seeded by the tracker's seed and the particle's id, so a run is
 //! reproducible whatever the thread count or particle order.
 //!
+//! # Stokes drift
+//!
+//! [`WithStokesDrift2D`] and [`WithStokesDrift3D`] add the waves' Stokes drift
+//! ([`crate::waves::StokesDriftField`]) to any flow, at a fixed depth in 2D and
+//! at each particle's depth in 3D ([`stokes`]).
+//!
 //! # Locating particles and boundaries
 //!
 //! A particle keeps its element and reference coordinates. Each move (the
@@ -64,6 +70,7 @@
 //!   Shelf Sci.* 37, 99–110.
 
 pub mod behaviour;
+pub mod stokes;
 mod tracker;
 pub mod tracker_3d;
 mod velocity;
@@ -74,6 +81,7 @@ pub use behaviour::{
     ClearSkyLight, ConstantLight, LiceStage, ParticleBehaviour3D, Passive, SalmonLice,
     SurfaceLight, Surroundings,
 };
+pub use stokes::{StokesDrift, WithStokesDrift2D, WithStokesDrift3D};
 pub use tracker::{Particle2D, ParticleStatus, ParticleTracker2D};
 pub use tracker_3d::{Particle3D, ParticleTracker3D};
 pub use velocity::{NodalVelocity2D, ParticleVelocity2D, SWEVelocity2D};

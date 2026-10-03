@@ -6,6 +6,13 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Particles carried by the waves' Stokes drift (`particles::stokes`, `waves::StokesDriftField`; TODO F.4 coupling).**
+  - `StokesDriftField::new(&wave_model, &state)` compresses each node's spectrum, with no approximation, to one vector per frequency. At any point and depth it sums the exact finite-depth profile, `n_freq` exponentials per sample.
+  - `WithStokesDrift2D` adds the drift at a fixed depth (0 for surface drifters) to any `ParticleVelocity2D`. `WithStokesDrift3D` adds it at each particle's own depth `−σD` to any `ParticleVelocity3D`. Either is steady or linear in time between two wave states (`StokesDrift`).
+  - Gates: the field equals the wave model's spectral sum at every node and depth (to 1e-12, shallow and deep). Over still water, 2D and 3D particles move by exactly their depth's drift (σ unchanged), and a current adds.
+  - `examples/farm_3d.rs stokes=H_s,T_p,direction`: the drift of a uniform sea for the farm's particles. A 1.5 m, 6 s sea along the channel (7.9 cm/s at the surface, 1.6 cm/s at 3 m) carries the larvae 147 m further in the hour after release and doubles their spread (94 m against 44 m); across the channel it moves them 125 m sideways. The sinking faeces and feed land within 2 m of where they did.
+  - `SpectralGrid::stokes_drift` and the field share the profile (`stokes_decay`).
+
 - **Wind-sea growth in the wave model (`waves`, TODO F.4 stage 2).**
   - `waves::nonlinear::Quadruplets`: the four-wave interactions by the DIA (Hasselmann et al. 1985; `C_nl4 = 3·10⁷`, λ = 0.25, angles from the deep-water resonance), scaled for finite depth by `shallow_water_factor` (SWAN's `R(k_p d)`). Off-grid frequencies use weights linear in 1/σ, so the discrete transfer keeps energy and action to round-off.
   - `SourceTerms`: the DIA (gains as linear input, losses as a rate), a diagnostic `σ^(−p)` tail above `max(2.5 σ̃, 4 σ_PM)` (p = 4), and Ris's growth limiter (γ = 0.1 of the Phillips level). Without the limiter a 2 Hz grid blows up within hours. All three are in `swan_defaults`. New `with_quadruplets`, `with_tail`, `with_limiter`.

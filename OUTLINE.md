@@ -105,11 +105,13 @@ src/
 │                     # refraction, current frequency shift), dispersion,
 │                     # SpectralGrid (JONSWAP, H_s/T_p/direction, Stokes drift,
 │                     # radiation stress), sources (Komen wind/whitecapping,
-│                     # DIA quadruplets, bed friction, breaking, tail, limiter)
+│                     # DIA quadruplets, bed friction, breaking, tail, limiter),
+│                     # StokesDriftField for the particles
 ├── particles/        # Lagrangian tracking: RK4 on the DG velocity, random
 │                     # walk, face-by-face walk with wall reflection, exits;
 │                     # 3D: σ-levels, Visser's vertical walk, sinking/settling;
-│                     # behaviour (swimming salmon-lice larvae, clear-sky light)
+│                     # behaviour (swimming salmon-lice larvae, clear-sky light);
+│                     # the waves' Stokes drift added to any flow (stokes.rs)
 ├── io/               # NetCDF output; parent-ocean and weather-model readers
 │                     # on lon/lat grids (GeoGrid, FieldSeries); VTK, GeoTIFF
 │                     # bathymetry, GSHHS coastline, projections, observations

@@ -32,7 +32,7 @@ Merged 2026-10-03:
 
 Details in F.3 and F.4. Next, in this order:
 1. ~~**F.4 stage 2: quadruplet interactions (DIA) and a diagnostic tail.**~~ Done 2026-10-03 (branch `feat/waves-dia`): wind seas grow with fetch (f_p to KC92 within 10 %, E* 1.3–0.60×). See F.4.
-2. **Stokes drift into the particle trackers (F.4 coupling).** The lice larvae in the top metres are what the farm goal needs from the waves. `WaveModel2D::stokes_drift` gives the profile.
+2. ~~**Stokes drift into the particle trackers (F.4 coupling).**~~ Done 2026-10-03 (`WithStokesDrift2D`/`3D`, `farm_3d stokes=`). See F.4.
 3. **Second-order θ/σ advection (F.4).** The first-order refraction bias is ≈ 1° at 5° bins.
 4. **The rest of the coupling.** Radiation stress or the vortex force on the currents; H_s into GLS wave breaking and surface roughness; wave-enhanced bed stress. Then MET Norway boundary spectra and a cost measurement at Frøya.
 
@@ -262,7 +262,12 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
   - circulation → waves: `set_water_level`, `set_currents` (P2 nodes to the wave mesh's).
   - waves → 2D/3D circulation: the radiation-stress gradient as a momentum source (or the vortex force with Stokes drift, McWilliams et al. 2004, as COAWST); a wave-enhanced bottom stress from the orbital velocity (Soulsby 1997 or Grant–Madsen).
   - waves → GLS: `H_s` for `with_wave_breaking` and the surface roughness (z₀ₛ ≈ 0.6 H_s, replacing `farm_3d waves=`).
-  - waves → particles: the Stokes drift profile added to the 2D and 3D trackers' velocity (lice larvae in the top metres; LADiM has this option).
+  - [x] waves → particles (2026-10-03): `particles::WithStokesDrift2D` (a fixed depth) and `WithStokesDrift3D` (each particle's depth) add the drift of `waves::StokesDriftField` to any flow, steady or linear in time between wave states. The field compresses each node's spectrum to one vector per frequency (exact) and samples the exact finite-depth profile at the particle.
+    - Gates: the field equals `WaveModel2D::stokes_drift` at every node and depth to 1e-12; 2D and 3D particles over still water move by exactly their depth's drift.
+    - `farm_3d stokes=1.5,6,0` (a uniform 1.5 m, 6 s sea along the channel; 7.9 / 3.6 / 1.6 / 0.9 cm/s at 0 / 1 / 3 / 5 m): the larvae drift +1268 m instead of +1121 m in the hour after release, and spread 94 m instead of 44 m, from the drift's shear over their 0–2.5 m depths; the same sea across the channel (`stokes=1.5,6,90`) moves them 125 m sideways. Faeces and feed (sinking 3 and 10 cm/s) land within 2 m of where they did.
+    - [ ] The vertical Stokes velocity (`−∫∇·u_s dz`) is left out, as in OpenDrift and LADiM; it matters only where the sea state changes over short distances (a lee, a shoal).
+    - [ ] `farm_3d` uses a uniform parametric sea. With wind (`wind=`) it should run the wave model on the farm mesh (fetch-limited across the channel) and couple at each output interval (`StokesDrift::between`).
+    - [ ] Cost: each sample sums `n_freq` exponentials over interpolated `k` and `b` (≈ 3 n_freq · n_nodes multiply–adds). It added 0.15 s to 0.55 s of tracking for 300 particles over an hour of 10 s steps (`farm_3d`). For 10⁵ particles, tabulate the profile per node on a few depths, or a Breivik et al. (2016) two-parameter profile.
   - waves → cages: drag from the orbital velocity, later.
 - [ ] Wet/dry: depth is floored at 0.1 m and breaking takes the energy, but dry elements are not walls. Make fully dry elements absorbing like the coast, and use the shoreline subcells (`WetDry`) for the partly dry ones.
 - [ ] Forcing:
