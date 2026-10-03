@@ -202,9 +202,36 @@ impl<'a> ParticleTracker2D<'a> {
             .for_each(|p| self.advance(p, field, t, dt));
     }
 
-    /// Horizontal diffusivity of the random walk (m²/s).
-    pub(super) fn diffusivity(&self) -> f64 {
-        self.diffusivity
+    /// Add the random walk over `dt` to `displacement`: the tracker's
+    /// constant diffusivity plus the field's `K` with its drift `∇K Δt`
+    /// (Euler–Maruyama at the start of the step; see
+    /// [`super::diffusivity`]).
+    pub(super) fn add_walk(
+        &self,
+        displacement: &mut [f64],
+        rng: &mut u64,
+        field: Option<(f64, [f64; 2])>,
+        dt: f64,
+    ) {
+        let (k_field, drift) = field.unwrap_or((0.0, [0.0; 2]));
+        let k = self.diffusivity + k_field.max(0.0);
+        displacement[0] += drift[0] * dt;
+        displacement[1] += drift[1] * dt;
+        if k > 0.0 {
+            let scale = (2.0 * k * dt).sqrt();
+            let xi = standard_normal_pair(rng);
+            displacement[0] += scale * xi[0];
+            displacement[1] += scale * xi[1];
+        }
+    }
+
+    /// Call `f` with the nodal basis values at `point`.
+    pub(super) fn with_weights<R>(&self, point: MeshPoint, f: impl FnOnce(&[f64]) -> R) -> R {
+        let mut weights = [0.0; MAX_NODES];
+        let weights = &mut weights[..self.ops.n_nodes];
+        self.ops
+            .interpolation_weights_into(point.r, point.s, weights);
+        f(weights)
     }
 
     /// Basis of the tracked field.
@@ -275,12 +302,10 @@ impl<'a> ParticleTracker2D<'a> {
         let k4 = self.velocity(field, stage(k3, dt), t + dt);
         let mut displacement =
             [0, 1].map(|d| dt / 6.0 * (k1[d] + 2.0 * k2[d] + 2.0 * k3[d] + k4[d]));
-        if self.diffusivity > 0.0 {
-            let scale = (2.0 * self.diffusivity * dt).sqrt();
-            let xi = standard_normal_pair(&mut p.rng);
-            displacement[0] += scale * xi[0];
-            displacement[1] += scale * xi[1];
-        }
+        let field_k = self.with_weights(p.point, |w| {
+            field.horizontal_diffusivity(p.point.element, w, t)
+        });
+        self.add_walk(&mut displacement, &mut p.rng, field_k, dt);
         match self.walk_by(p, displacement) {
             WalkEnd::Inside { position, point } => {
                 p.position = position;

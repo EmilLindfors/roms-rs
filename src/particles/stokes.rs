@@ -107,6 +107,15 @@ impl<V: ParticleVelocity2D> ParticleVelocity2D for WithStokesDrift2D<'_, V> {
     fn depth(&self, element: ElementIndex, weights: &[f64], t: f64) -> Option<f64> {
         self.flow.depth(element, weights, t)
     }
+
+    fn horizontal_diffusivity(
+        &self,
+        element: ElementIndex,
+        weights: &[f64],
+        t: f64,
+    ) -> Option<(f64, [f64; 2])> {
+        self.flow.horizontal_diffusivity(element, weights, t)
+    }
 }
 
 /// A 3D flow plus the Stokes drift at each particle's depth (see the module
@@ -153,6 +162,16 @@ impl<V: ParticleVelocity3D> ParticleVelocity3D for WithStokesDrift3D<'_, V> {
         t: f64,
     ) -> Option<[f64; 2]> {
         self.flow.tracers(element, weights, sigma, t)
+    }
+
+    fn horizontal_diffusivity(
+        &self,
+        element: ElementIndex,
+        weights: &[f64],
+        sigma: f64,
+        t: f64,
+    ) -> Option<(f64, [f64; 2])> {
+        self.flow.horizontal_diffusivity(element, weights, sigma, t)
     }
 }
 

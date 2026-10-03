@@ -387,13 +387,11 @@ impl<'a> ParticleTracker3D<'a> {
         let k4 = self.velocity(field, point, s, w_p, t + dt);
         let mut displacement =
             [0, 1, 2].map(|d| dt / 6.0 * (k1[d] + 2.0 * k2[d] + 2.0 * k3[d] + k4[d]));
-        let k_h = self.horizontal.diffusivity();
-        if k_h > 0.0 {
-            let scale = (2.0 * k_h * dt).sqrt();
-            let xi = standard_normal_pair(&mut h.rng);
-            displacement[0] += scale * xi[0];
-            displacement[1] += scale * xi[1];
-        }
+        let field_k = self.with_weights(h.point, |w| {
+            field.horizontal_diffusivity(h.point.element, w, sigma, t)
+        });
+        self.horizontal
+            .add_walk(&mut displacement[..2], &mut h.rng, field_k, dt);
         match self
             .horizontal
             .walk_by(h, [displacement[0], displacement[1]])

@@ -43,6 +43,20 @@ pub trait ParticleVelocity3D: Sync {
         None
     }
 
+    /// Horizontal diffusivity `K` (m²/s) of the walk and its gradient along
+    /// the σ-surface `∇K` (m/s) at the point and σ-level; `None` (the
+    /// default) for the tracker's constant alone (see
+    /// [`super::diffusivity`]).
+    fn horizontal_diffusivity(
+        &self,
+        _element: ElementIndex,
+        _weights: &[f64],
+        _sigma: f64,
+        _t: f64,
+    ) -> Option<(f64, [f64; 2])> {
+        None
+    }
+
     /// Temperature (°C) and salinity at the point and σ-level, for the
     /// particles' behaviour ([`super::ParticleBehaviour3D`]); `None` (the
     /// default) for a field without them.
@@ -78,7 +92,7 @@ fn evaluate_level(weights: &[f64], field: &[f64], k: usize, stride: usize, level
 /// Bracketing index and weight of `x` in the increasing `grid`: `x` lies
 /// at `(1 − a)·grid[j] + a·grid[j + 1]`, held at the ends.
 #[inline]
-fn bracket(grid: &[f64], x: f64) -> (usize, f64) {
+pub(super) fn bracket(grid: &[f64], x: f64) -> (usize, f64) {
     let last = grid.len() - 1;
     if x <= grid[0] {
         return (0, 0.0);

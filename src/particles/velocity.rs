@@ -24,6 +24,18 @@ pub trait ParticleVelocity2D: Sync {
     fn depth(&self, _element: ElementIndex, _weights: &[f64], _t: f64) -> Option<f64> {
         None
     }
+
+    /// Horizontal diffusivity `K` (m²/s) of the walk and its gradient `∇K`
+    /// (m/s) at the point; `None` (the default) for the tracker's constant
+    /// alone (see [`super::diffusivity`]).
+    fn horizontal_diffusivity(
+        &self,
+        _element: ElementIndex,
+        _weights: &[f64],
+        _t: f64,
+    ) -> Option<(f64, [f64; 2])> {
+        None
+    }
 }
 
 /// Dot product of the basis values with an element's nodal values.
