@@ -262,7 +262,7 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
     - `a_spread_sea_on_a_current_has_the_exact_doppler_shift` (Gaussian in σ, cos⁸ in θ, a following current 0 → 0.6 m/s over 500 m): mean σ off by 9.2e-3 / 2.0e-3 / 3.3e-4 (rates 2.2, 2.6) against upwind's 1.8e-2 / 9.0e-3 / 4.5e-3 (rates 1.00), refining σ and θ together.
     - The single-bin gates (Snell, the Doppler spike) stay first order with either scheme: a spike is an extremum, where the limiter falls back to first order, and it leaves its bin through faces whose speed is O(Δθ) off the bin's. MUSCL: 2.13 / 1.04 / 0.52° and 0.53 %; upwind 2.06 / 1.03 / 0.51° and 0.34 %. Swell from a parent model that is one or two bins wide behaves like this; finer bins are the cure there, not the scheme.
   - Cost: within the noise of the fetch gate (3.0–3.4 s against 2.9 s; the stencil adds two bins per face).
-- [ ] On steep fjord walls refraction sets the step: `with_turning_limit` caps |c_θ| (Dietrich et al. 2013), or θ could be implicit (a cyclic tridiagonal per node and frequency). MUSCL halves the spectral Courant limit, which makes this more pressing.
+- [ ] **Next for the waves: implicit refraction.** Measured at Frøya (2026-10-03, see Cost): refraction sets the step everywhere, 0.003 s on the coastline mesh against the geographic 0.30 s (100×), and on the 1 km grid 0.31 s against 4.2 s with a 0.14 rad/s cap. A cap matched to the geographic step (≈ 0.01 rad/s on the 1 km grid, `with_turning_limit`, Dietrich et al. 2013) bends the rays too little exactly where the skerries and slopes matter. Make θ implicit: per node and frequency the direction fluxes are a cyclic tridiagonal (first-order upwind in θ; or a θ-scheme / Crank–Nicolson with a limiter), solved after the explicit geographic RK step (Strang or Lie split, as SWAN's implicit spectral propagation). Gate: the Snell and spread-sea refraction tests at steps 10–100× the explicit limit, against their exact steady states, and conservation of the action to round-off. MUSCL halves the explicit spectral Courant limit, which makes this more pressing.
 - [ ] `c_σ` from a changing depth (`∂σ/∂d ∂d/∂t`): tides shift frequencies over flats. It needs the rate of η from the circulation, or the difference of two water levels.
 - [ ] Coupling (two-way, every coupling interval):
   - circulation → waves: `set_water_level`, `set_currents` (P2 nodes to the wave mesh's).
@@ -298,7 +298,21 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
   - boundary spectra from MET Norway's wave model (MyWave WAM 800 m / 4 km on THREDDS, or NORA3 hindcasts) along the open faces, converting from the nautical "coming from" directions;
   - a reflection coefficient for walls (cliffs, quays).
 - [ ] Cost.
-  - Each component is a scalar DG advection, so a step costs ≈ n_components/3 SWE right-hand sides (≈ 300 for 36 × 24). The group velocity is ≈ 20 m/s at 0.04 Hz, against √(gh) ≈ 64 m/s at 420 m, so the wave step is ≈ 3× the SWE's. Frøya at P2 would cost ≈ 70× its tidal run (unmeasured: estimate from the kernel shape).
+  - **Measured at Frøya (2026-10-03,** `froya_real_data waves=N [wave_grid=] [turning=] [order=] [mesh=|nx= ny=]`, 24 threads; SWAN-default sources, 10 m/s wind, JONSWAP H_s 2.5 m, T_p 10 s; 0.04–0.5 Hz). Wall time per model hour, against ≈ 38 s for the tidal circulation on the coastline mesh (LTS, SSP-RK(4,3)):
+
+    | Mesh, order, components | Δt (sets it) | Per step | Per model hour |
+    |---|---|---|---|
+    | coastline (12.1k el., 19–2700 m), P2, 25 × 36 | 0.003 s (refraction) | 2.98 s | ≈ 1,170 h |
+    | the same, `turning=0.14` | 0.30 s (geographic) | 2.89 s | 9.6 h |
+    | the same, P1 | 0.31 s | 1.19 s | 3.8 h |
+    | the same, P2, 24 × 24 | 0.30 s | 1.78 s | 5.9 h |
+    | 1 km grid (2.5k el.), P2, `turning=0.14` | 0.31 s (refraction) | 0.46 s | 1.5 h |
+    | 1 km grid, P2, `turning=0.0104` | 4.2 s (geographic) | 0.47 s | 404 s (8.9× real time) |
+    | 1 km grid, P1, `turning=0.0062` | 7.0 s | 0.19 s | 99 s (36× real time) |
+
+  - Per component and node and step: 14–22 ns of propagation (three RK stages; ≈ 5–7 ns a stage) and 7–10 ns of sources (26–34 % of the step, the DIA and the transposes).
+  - So: (1) refraction is the gate (implicit θ, above); (2) the coastline mesh is 10× the 1 km grid per step and 14× smaller in Δt, and local time stepping would save at most 4.5× there (steps 0.30–18 s), 1.1× on the 1 km grid; (3) the waves want their own coarser mesh, which needs interpolation between meshes in the coupling (today the force, the bed stress and the roughness assume the circulation's mesh and order). With implicit refraction a 1 km P1 wave grid would cost ≈ 2.6× the circulation per model hour.
+  - The old estimate (≈ 70× the tidal run at P2) was optimistic by ≈ 10× on the coastline mesh because of the step, not the kernel.
   - Options:
     - P1 or a coarser mesh for the waves, with interpolation between orders in the coupling;
     - local time stepping per component group (low frequencies are fastest);
