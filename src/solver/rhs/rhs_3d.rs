@@ -24,8 +24,9 @@ use crate::solver::rhs::baroclinic::{
 };
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
+use crate::solver::rhs::stratification::ReferenceStratification;
 use crate::solver::rhs::transport_3d::{
-    LayerTransport, MetricForm, MomentumAdvectionForm, VerticalAdvection,
+    LayerTransport, MetricForm, MomentumAdvectionForm, PairDensity, VerticalAdvection,
     apply_momentum_transport_3d, apply_tracer_transport_3d,
 };
 use crate::solver::state::Solution3D;
@@ -62,6 +63,10 @@ pub struct Rhs3DConfig<'a> {
     /// A reference state balanced by the constant-depth form, if any (with
     /// [`PressureGradientForm::SigmaPairs`]).
     pub balanced_reference: Option<&'a BalancedReference>,
+    /// The reference stratification whose pair density the σ-pairs force
+    /// and the advection of T and S share, if any (see
+    /// [`crate::solver::rhs::stratification`]).
+    pub pair_density: Option<&'a ReferenceStratification>,
     /// The volume form of the horizontal divergences, the 2D module's (the
     /// pressure gradient takes its adjoint).
     pub metric: MetricForm,
@@ -94,6 +99,7 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.min_column_depth,
         config.pressure_gradient,
         config.metric,
+        config.pair_density,
         &mut rhs.u,
         &mut rhs.v,
     );
@@ -155,6 +161,10 @@ pub fn compute_transport_rhs_3d(
             exterior,
             config.boundaries,
             config.vertical_advection,
+            config.pair_density.map(|reference| PairDensity {
+                reference,
+                rho: &state.rho,
+            }),
         );
     }
 }

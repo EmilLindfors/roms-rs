@@ -1897,6 +1897,17 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             .unwrap_or(0.1),
     )
     .with_smagorinsky_viscosity(0.1)
+    .with_horizontal_viscosity(
+        opts.debug_3d
+            .split(',')
+            .find_map(|f| f.strip_prefix("nu=").and_then(|v| v.parse().ok()))
+            .unwrap_or(0.0),
+    )
+    .with_vertical_advection(if dbg("vcentred") {
+        dg_rs::solver::rhs::VerticalAdvection::Centred
+    } else {
+        dg_rs::solver::rhs::VerticalAdvection::default()
+    })
     .with_tracer_limiter(if dbg("nolimiter") {
         TracerLimiter3DConfig::none()
     } else {

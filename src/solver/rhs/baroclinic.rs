@@ -164,6 +164,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::blocks::{Pooled, for_each_block};
+use crate::solver::rhs::stratification::{ReferencePoint, ReferenceStratification};
 use crate::solver::rhs::transport_3d::MetricForm;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
@@ -218,6 +219,7 @@ impl BalancedReference {
         rho_ref: f64,
         min_column_depth: f64,
         metric: MetricForm,
+        pair_density: Option<&ReferenceStratification>,
     ) -> Self {
         let n = state.n_elements * ops.n_nodes * sigma.n_levels();
         let force = |form| {
@@ -235,6 +237,7 @@ impl BalancedReference {
                 min_column_depth,
                 form,
                 metric,
+                pair_density,
                 &mut fx,
                 &mut fy,
             );
@@ -273,6 +276,7 @@ impl BalancedReference {
         rho_ref: f64,
         min_column_depth: f64,
         metric: MetricForm,
+        pair_density: Option<&ReferenceStratification>,
         profile: impl Fn(f64) -> f64,
     ) -> Self {
         let nl = sigma.n_levels();
@@ -299,6 +303,7 @@ impl BalancedReference {
             min_column_depth,
             PressureGradientForm::SigmaPairs,
             metric,
+            pair_density,
             &mut fx,
             &mut fy,
         );
@@ -340,6 +345,8 @@ struct ColumnView<'a> {
     /// so that their own and cross-column terms round alike (round-off at
     /// rest stays ≤ 1.5e-14 m/s², not 3e-14).
     at_level: &'a [f64],
+    /// The reference points of the full densities (with a pair density).
+    points: &'a [ReferencePoint],
     /// Bed elevation.
     bed: f64,
     /// At least the minimum column depth deep.
@@ -411,6 +418,7 @@ fn pressure_differences(
     a: &ColumnView,
     b: &ColumnView,
     form: PressureGradientForm,
+    reference: Option<&ReferenceStratification>,
     out: &mut [f64],
 ) {
     if !(a.wet && b.wet) {
@@ -419,7 +427,11 @@ fn pressure_differences(
     }
     if form == PressureGradientForm::SigmaPairs {
         for (l, dp) in out.iter_mut().enumerate() {
-            *dp = (b.at_level[l] - a.at_level[l]) + 0.5 * (a.rho[l] + b.rho[l]) * (b.z[l] - a.z[l]);
+            // The pair density: {{ρ}}, or the reference's mean between the
+            // two densities' heights
+            let rho = 0.5 * (a.rho[l] + b.rho[l])
+                + reference.map_or(0.0, |r| r.pair_deviation(&a.points[l], &b.points[l]));
+            *dp = (b.at_level[l] - a.at_level[l]) + rho * (b.z[l] - a.z[l]);
         }
         return;
     }
@@ -449,6 +461,7 @@ struct Columns {
     slope: Vec<f64>,
     pressure: Vec<f64>,
     at_level: Vec<f64>,
+    points: Vec<ReferencePoint>,
     bed: Vec<f64>,
     wet: Vec<bool>,
     min_column_depth: f64,
@@ -466,6 +479,7 @@ impl Columns {
             slope: vec![0.0; n],
             pressure: vec![0.0; n],
             at_level: vec![0.0; n],
+            points: vec![ReferencePoint::default(); n],
             bed: vec![0.0; n_columns],
         }
     }
@@ -477,7 +491,8 @@ impl Columns {
             rho: &self.rho[range.clone()],
             slope: &self.slope[range.clone()],
             pressure: &self.pressure[range.clone()],
-            at_level: &self.at_level[range],
+            at_level: &self.at_level[range.clone()],
+            points: &self.points[range],
             bed: self.bed[c],
             wet: self.wet[c],
         }
@@ -495,6 +510,7 @@ impl Columns {
         el: ElementIndex,
         node: usize,
         rho_ref: f64,
+        reference: Option<&ReferenceStratification>,
     ) {
         let nl = self.n_levels;
         let range = c * nl..(c + 1) * nl;
@@ -503,6 +519,14 @@ impl Columns {
         let depth = eta - bed;
         self.bed[c] = bed;
         self.wet[c] = depth >= self.min_column_depth;
+        if let Some(reference) = reference {
+            for (p, &r) in self.points[range.clone()]
+                .iter_mut()
+                .zip(state.rho_column(el, node))
+            {
+                *p = reference.point(r);
+            }
+        }
         let z = &mut self.z[range.clone()];
         let rho = &mut self.rho[range.clone()];
         let slope = &mut self.slope[range.clone()];
@@ -611,6 +635,7 @@ pub fn compute_pressure_gradient(
     min_column_depth: f64,
     form: PressureGradientForm,
     metric: MetricForm,
+    pair_density: Option<&ReferenceStratification>,
     grad_px: &mut [f64],
     grad_py: &mut [f64],
 ) {
@@ -640,8 +665,22 @@ pub fn compute_pressure_gradient(
                 dp,
             } = &mut **scratch;
             pressure_gradient_element(
-                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, form, metric, own, across,
-                px, py, dp,
+                k,
+                state,
+                mesh,
+                bathymetry,
+                sigma,
+                ops,
+                geom,
+                rho_ref,
+                form,
+                metric,
+                pair_density,
+                own,
+                across,
+                px,
+                py,
+                dp,
             );
             for ((fx, fy), (&dx, &dy)) in out_x.iter_mut().zip(out_y).zip(px.iter().zip(&*py)) {
                 *fx = scale * dx;
@@ -694,6 +733,7 @@ fn pressure_gradient_element(
     rho_ref: f64,
     form: PressureGradientForm,
     metric: MetricForm,
+    reference: Option<&ReferenceStratification>,
     own: &mut Columns,
     across: &mut Columns,
     px: &mut [f64],
@@ -705,7 +745,7 @@ fn pressure_gradient_element(
     {
         let el = ElementIndex::new(k);
         for i in 0..nn {
-            own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
+            own.fill(i, state, bathymetry, sigma, el, i, rho_ref, reference);
         }
         px.fill(0.0);
         py.fill(0.0);
@@ -741,7 +781,7 @@ fn pressure_gradient_element(
                     j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
                     j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
                 );
-                pressure_differences(&a, &b, form, dp);
+                pressure_differences(&a, &b, form, reference, dp);
                 for (l, &dp) in dp.iter().enumerate() {
                     px[i * nl + l] += dx_ij * dp;
                     py[i * nl + l] += dy_ij * dp;
@@ -759,10 +799,12 @@ fn pressure_gradient_element(
             let nb_el = ElementIndex::new(nb.element);
             for fi in 0..nfn {
                 let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
-                across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
+                across.fill(
+                    fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref, reference,
+                );
             }
             for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                pressure_differences(&own.view(node), &across.view(fi), form, dp);
+                pressure_differences(&own.view(node), &across.view(fi), form, reference, dp);
                 let normal = geom.normal(k, f, fi);
                 let lift_scale = geom.lift_scale(k, f, fi, node);
                 for (l, &dp) in dp.iter().enumerate() {
@@ -858,6 +900,7 @@ mod tests {
                 0.0,
                 form,
                 MetricForm::Conservative,
+                None,
                 &mut fx,
                 &mut fy,
             );
@@ -884,6 +927,7 @@ mod tests {
                 RHO0,
                 0.0,
                 MetricForm::Conservative,
+                None,
             );
             let (mut fx, mut fy) = self.pgf(RHO0, PressureGradientForm::SigmaPairs);
             reference.add_to(&mut fx, &mut fy);
@@ -1042,6 +1086,7 @@ mod tests {
                     RHO0,
                     0.0,
                     MetricForm::Conservative,
+                    None,
                     pycnocline,
                 );
                 let (mut fx, mut fy) = stratified.pgf(RHO0, PressureGradientForm::SigmaPairs);
