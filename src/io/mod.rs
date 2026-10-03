@@ -4,6 +4,7 @@
 //! - **Tidal constituents**: Harmonic data (amplitude, phase) for open boundary forcing
 //! - **Boundary time series**: Time-varying state data for nesting from parent models
 //! - **VTK output**: Solution visualization in ParaView (VTU format)
+//! - **Snapshot files**: compact f32 frames of a 2D run with its mesh and bed, for replay
 //! - **NetCDF I/O**: CF-conventions output (requires `netcdf` feature)
 //! - **Gridded external models**: parent ocean models (`OceanModelReader`) and
 //!   weather models (`AtmosphereReader`) on structured lon/lat grids
@@ -93,6 +94,7 @@ mod norkyst_reader;
 mod ocean_model;
 mod profile_series;
 mod projection;
+mod snapshot;
 mod tide_gauge_reader;
 mod timeseries_reader;
 mod vtk;
@@ -129,6 +131,7 @@ pub use norkyst_reader::{
 pub use ocean_model::{OceanModelReader, OceanState};
 pub use profile_series::{ProfileLevels, ProfileSeries};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
+pub use snapshot::{SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotReader, SnapshotWriter};
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,
     read_tide_gauge_file, write_tide_gauge_file,

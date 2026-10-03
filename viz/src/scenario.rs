@@ -24,6 +24,7 @@ use std::sync::Arc;
 use dg_rs::boundary::{BoundaryTides, TidalAtlas};
 use dg_rs::io::{
     BedRaster, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry, LocalProjection,
+    SnapshotHeader,
 };
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
@@ -323,6 +324,66 @@ impl Scenario {
         })
     }
 
+    /// The domain of a snapshot file's header, for a replay: its mesh and bed, a
+    /// close-up at its point of interest (`point_of_interest=x,y`, else its first
+    /// `station=name,x,y`, else the domain's centre) framed for the domain's size. It
+    /// runs nothing, so its forcing is none.
+    pub fn from_snapshot(header: SnapshotHeader) -> Self {
+        let (lo, hi) = header.mesh.vertices.iter().fold(
+            ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
+            |(lo, hi), v| {
+                (
+                    [lo[0].min(v[0]), lo[1].min(v[1])],
+                    [hi[0].max(v[0]), hi[1].max(v[1])],
+                )
+            },
+        );
+        let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]);
+        let point = |s: &str| -> Option<[f64; 2]> {
+            let mut c = s.rsplitn(3, ',').map(|c| c.trim().parse::<f64>());
+            let (y, x) = (c.next()?.ok()?, c.next()?.ok()?);
+            Some([x, y])
+        };
+        let farm = header
+            .metadata("point_of_interest")
+            .and_then(|p| point(&format!("_,{p}")))
+            .or_else(|| header.metadata("station").and_then(point))
+            .unwrap_or([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])]);
+        let name = ascii(header.metadata("title").unwrap_or("Snapshot file"));
+
+        let ops = DGOperators2D::new(header.order);
+        let mesh = header.mesh;
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let mut bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, 0.0);
+        bathymetry.data.copy_from_slice(&header.bathymetry);
+        bathymetry.compute_gradients(&ops, &geom);
+        Self {
+            name,
+            cages: Vec::new(),
+            farm,
+            // As Frøya's for its ≈ 60 km
+            close_up: CloseUp {
+                distance: (extent / 10.0) as f32,
+                yaw: 0.7,
+                pitch: 0.5,
+                arrow_spacing: extent / 240.0,
+                arrow_radius: extent / 12.0,
+            },
+            forcing: Forcing {
+                tide: Tide::UniformM2(0.0),
+                manning: 0.0,
+                coriolis: 0.0,
+                ramp: 0.0,
+            },
+            three_d: None,
+            periodic: None,
+            mesh: Arc::new(mesh),
+            ops: Arc::new(ops),
+            geom: Arc::new(geom),
+            bathymetry: Arc::new(bathymetry),
+        }
+    }
+
     /// Still water at z = 0 over the bed.
     pub fn at_rest(&self) -> SWESolution2D {
         let mut q = SWESolution2D::new(self.mesh.n_elements, self.ops.n_nodes);
@@ -334,4 +395,24 @@ impl Scenario {
         }
         q
     }
+}
+
+/// `text` in ASCII, for Bevy's default font: Norwegian letters spelt out, dashes
+/// plain, anything else dropped.
+pub fn ascii(text: &str) -> String {
+    text.chars()
+        .flat_map(|c| -> Vec<char> {
+            match c {
+                'ø' => vec!['o'],
+                'Ø' => vec!['O'],
+                'å' => vec!['a'],
+                'Å' => vec!['A'],
+                'æ' => vec!['a', 'e'],
+                'Æ' => vec!['A', 'e'],
+                '–' | '—' => vec!['-'],
+                c if c.is_ascii() => vec![c],
+                _ => vec![],
+            }
+        })
+        .collect()
 }
