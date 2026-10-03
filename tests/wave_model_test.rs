@@ -1,8 +1,10 @@
-//! Gates of the spectral wave model (`dg_rs::waves`, TODO "Waves" stage 1): the
-//! DG propagation converges at its order, the propagation with refraction keeps
-//! the total action, and the steady states of shoaling, refraction on a sloping
-//! shelf (Snell's law) and a following current (conservation of the absolute
-//! frequency) are the analytic ones.
+//! Gates of the spectral wave model (`dg_rs::waves`, TODO F.4): the DG
+//! propagation converges at its order, the propagation with refraction keeps the
+//! total action, and the steady states of shoaling, refraction on a sloping shelf
+//! (Snell's law) and a following current (conservation of the absolute frequency)
+//! are the analytic ones (stage 1). With the full source terms (stage 2: the DIA,
+//! the diagnostic tail and the limiter), a wind sea grows with fetch as Kahma &
+//! Calkoen (1992) observed, and with duration towards Pierson–Moskowitz.
 
 use std::f64::consts::{PI, TAU};
 use std::sync::Arc;
@@ -11,7 +13,8 @@ use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{
-    SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, group_velocity, wavenumber,
+    SourceTerms, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind, group_velocity,
+    wavenumber,
 };
 
 const G: f64 = 9.81;
@@ -295,4 +298,132 @@ fn a_following_current_shifts_the_frequency_doppler() {
     }
     println!("largest relative departure of the mean σ from σ + kU = σ₀: {worst:.2e}");
     assert!(worst < 0.01, "mean frequency off by {worst:e}");
+}
+
+/// `(E*, f_p*) = (g² m_0/U₁₀⁴, f_p U₁₀/g)` of the variance density `e`.
+fn dimensionless(grid: &SpectralGrid, e: &[f64], u10: f64) -> (f64, f64) {
+    let p = grid.parameters(e);
+    (G * G * p.m0 / u10.powi(4), u10 / (p.tp * G))
+}
+
+/// The deep-water sources of SWAN's GEN3 KOMEN set (wind, whitecapping, the DIA,
+/// the f⁻⁴ tail and the limiter; no bed or breaking in 1000 m).
+fn deep_water_sources() -> SourceTerms {
+    SourceTerms::swan_defaults(G)
+        .with_bottom_friction(None)
+        .with_breaking(None)
+}
+
+/// Fetch-limited growth: a steady 10 m/s wind blowing off a straight coast over
+/// deep water (a strip periodic along the coast, 120 km offshore, P1). In the
+/// steady state the peak frequency follows Kahma & Calkoen's (1992) composite
+/// `f_p* = 2.18 X*^−0.27` to a few per cent from X* = 10³ to 1.2·10⁴, and the
+/// energy `E* = 5.2e-7 X*^0.9` within the known deficit of Komen whitecapping at
+/// long fetch: measured 1.3× at X* = 1200 falling to 0.60× at 1.2·10⁴ (E* ∝
+/// X*^0.56; f_p within 0.90–1.05×). The curve is converged: P2, twice the
+/// elements, 36 directions, a 2 Hz grid or no tail move it by ≤ 4.5 %.
+#[test]
+fn fetch_limited_growth_follows_kahma_and_calkoen() {
+    const LENGTH: f64 = 120e3;
+    let u10 = 10.0;
+    let mut mesh = Mesh2D::channel_periodic_x(0.0, 1000.0, 0.0, LENGTH, 1, 30);
+    // The coast at y = 0 lets nothing in; the open sea at y = L lets waves out
+    for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
+        if mesh.vertices[edge.vertices.0][1] > 0.5 * LENGTH {
+            edge.boundary_tag = Some(BoundaryTag::Open);
+        }
+    }
+    let wind = Wind {
+        u10,
+        direction: PI / 2.0,
+    };
+    let m = model(
+        mesh,
+        1,
+        |_, _| -1000.0,
+        SpectralGrid::new(0.06, 1.0, 25, 24),
+    )
+    .with_sources(deep_water_sources())
+    .with_wind(wind);
+    let mut n = m.zero_state();
+    run(&m, &mut n, 10.0 * 3600.0, 0.5);
+    let xy = nodes(&m);
+    let mut e = vec![0.0; m.grid.n_components()];
+    let mut curve: Vec<(f64, f64, f64)> = Vec::new();
+    for (p, [_, y]) in xy.into_iter().enumerate() {
+        let x = G * y / (u10 * u10);
+        if !(1000.0..12500.0).contains(&x) || curve.iter().any(|c| (c.0 - x).abs() < 1.0) {
+            continue;
+        }
+        m.energy_spectrum_into(&n, p, &mut e);
+        let (es, fs) = dimensionless(&m.grid, &e, u10);
+        curve.push((x, es, fs));
+    }
+    curve.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for &(x, es, fs) in &curve {
+        let (e_kc, f_kc) = (5.2e-7 * x.powf(0.9), 2.18 * x.powf(-0.27));
+        println!(
+            "X* {x:7.0}: E* {es:.3e} ({:.2}× KC92), f_p* {fs:.4} ({:.2}× KC92)",
+            es / e_kc,
+            fs / f_kc
+        );
+        assert!(
+            (0.85..1.12).contains(&(fs / f_kc)),
+            "X* {x:.0}: f_p* {fs:.4} against {f_kc:.4}"
+        );
+        assert!(
+            (0.55..1.4).contains(&(es / e_kc)),
+            "X* {x:.0}: E* {es:.3e} against {e_kc:.3e}"
+        );
+    }
+    // Growing with fetch, slower than KC92's 0.9 but not stalled
+    let (first, last) = (curve[0], curve[curve.len() - 1]);
+    let exponent = (last.1 / first.1).ln() / (last.0 / first.0).ln();
+    println!("E* ∝ X*^{exponent:.2}");
+    assert!(curve.windows(2).all(|w| w[1].1 > w[0].1));
+    assert!((0.5..1.0).contains(&exponent), "E* ∝ X*^{exponent}");
+}
+
+/// Duration-limited growth at one node: a 10 m/s wind over a calm deep sea, the
+/// sources alone. The energy grows and the peak moves to lower frequencies
+/// monotonically, towards Pierson–Moskowitz (E* = 3.64e-3, f_p* = 0.13): 0.85×
+/// and 0.95× of it after 96 h (t* = 3.4·10⁵). The step does not matter: 10, 60
+/// and 300 s agree to 0.3 % at 96 h. (Run on, the sea passes Pierson–Moskowitz
+/// after ≈ 180 h and reaches 1.5× at 1000 h: Komen whitecapping with δ = 1 and
+/// the δ = 0 constant C_ds, as SWAN warns.)
+#[test]
+fn duration_limited_growth_approaches_pierson_moskowitz() {
+    let grid = SpectralGrid::new(0.06, 1.0, 30, 24);
+    let (u10, depth, dt) = (10.0, 1000.0, 300.0);
+    let wind = Wind {
+        u10,
+        direction: 0.0,
+    };
+    let sources = deep_water_sources();
+    let k: Vec<f64> = grid
+        .sigma
+        .iter()
+        .map(|&s| wavenumber(s, depth, G))
+        .collect();
+    let (nc, nd) = (grid.n_components(), grid.n_dir());
+    let mut n = vec![0.0; nc];
+    let (mut e, mut a, mut b) = (vec![0.0; nc], vec![0.0; nc], vec![0.0; nc]);
+    let mut history = Vec::new();
+    for step in 1..=(96 * 3600) / 300 {
+        sources.integrate(&grid, &mut n, &k, depth, wind, dt, &mut e, &mut a, &mut b);
+        if step % 12 == 0 {
+            let e: Vec<f64> = (0..nc).map(|c| n[c] * grid.sigma[c / nd]).collect();
+            history.push(dimensionless(&grid, &e, u10));
+        }
+    }
+    let (es, fs) = *history.last().unwrap();
+    println!(
+        "after 96 h: E* {es:.3e} ({:.2}× PM), f_p* {fs:.4}",
+        es / 3.64e-3
+    );
+    assert!(history.windows(2).all(|w| w[1].0 > w[0].0));
+    // The parabolic peak may sit still between hourly samples
+    assert!(history.windows(2).all(|w| w[1].1 <= w[0].1 * (1.0 + 1e-9)));
+    assert!((0.75..1.0).contains(&(es / 3.64e-3)), "E* {es:e}");
+    assert!((fs / 0.13 - 1.0).abs() < 0.1, "f_p* {fs}");
 }

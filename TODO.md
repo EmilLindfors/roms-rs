@@ -31,7 +31,7 @@ Merged 2026-10-03:
 - [#94](https://github.com/EmilLindfors/roms-rs/pull/94): the spectral wave model, stage 1.
 
 Details in F.3 and F.4. Next, in this order:
-1. **F.4 stage 2: quadruplet interactions (DIA) and a diagnostic tail.** Gate them by fetch-limited growth against Kahma & Calkoen (1992). Until then the wave model propagates swell and dissipates, but does not grow a realistic wind sea.
+1. ~~**F.4 stage 2: quadruplet interactions (DIA) and a diagnostic tail.**~~ Done 2026-10-03 (branch `feat/waves-dia`): wind seas grow with fetch (f_p to KC92 within 10 %, E* 1.3–0.60×). See F.4.
 2. **Stokes drift into the particle trackers (F.4 coupling).** The lice larvae in the top metres are what the farm goal needs from the waves. `WaveModel2D::stokes_drift` gives the profile.
 3. **Second-order θ/σ advection (F.4).** The first-order refraction bias is ≈ 1° at 5° bins.
 4. **The rest of the coupling.** Radiation stress or the vortex force on the currents; H_s into GLS wave breaking and surface roughness; wave-enhanced bed stress. Then MET Norway boundary spectra and a cost measurement at Frøya.
@@ -243,10 +243,19 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
     - a following current 0 → 0.6 m/s keeps σ + kU = σ₀ to 0.34 %;
     - per node: bottom friction decays at its rate, wind grows a sea from calm downwind only, breaking bounds H_s in shallow water;
     - Stokes drift, radiation stress and orbital velocity match the single-component and shallow limits exactly.
-- [ ] Stage 2: four-wave (quadruplet) interactions, without which wind seas do not grow or shape realistically. Then validate growth.
-  - The DIA (Hasselmann et al. 1985), as in SWAN and WAM; a high-frequency diagnostic tail (f⁻⁴ or f⁻⁵ beyond a cut-off at a few times the mean frequency); a growth limiter (Hersbach & Janssen 1999) if needed.
-  - Gate: fetch-limited growth of H_s and T_p against Kahma & Calkoen (1992), and duration-limited growth.
-  - Triads (LTA, Eldeberky 1996) for the surf zone later.
+- [x] Stage 2 (2026-10-03): four-wave interactions, the diagnostic tail and a growth limiter; wind seas grow.
+  - `waves::nonlinear::Quadruplets`: the DIA (Hasselmann et al. 1985; C_nl4 = 3e7, λ = 0.25, the angles from the deep-water resonance), scaled for depth by SWAN's `R(0.75 k̃ d)` (`shallow_water_factor`). Off-grid frequencies are read and scattered with weights linear in 1/σ, the only linear weights that keep energy and action both exact on the grid. In `SourceTerms::rates` the gains go to the linear input A and the losses to the rate B.
+  - Diagnostic tail: `σ^(−4)` (SWAN's power for the Komen terms) above `max(2.5 σ̃, 4 σ_PM)` after every step, and above the grid for the DIA.
+  - Ris's limiter (SWAN's; γ = 0.1 of the Phillips level, growth only): without it a grid to 2 Hz blew up (E* ≈ 1e96 within 14 h at 18 s steps); with it the growth curves do not depend on f_max.
+  - Gates:
+    - unit: the DIA keeps energy and action to 1e-13 (36×36 and 30×24); a JONSWAP's transfer has the three lobes (gain below the peak, loss at 1.3–1.5 f_p, gain at high frequencies); `R(0.5) = 4.43`.
+    - `fetch_limited_growth_follows_kahma_and_calkoen` (10 m/s, 120 km of deep water, P1, 25×24, 5 s in the ci profile): f_p* 0.90–1.05× KC92's `2.18 X*^−0.27` over X* = 1.2e3–1.2e4. E* is 1.31× KC92's `5.2e-7 X*^0.9` at 1.2e3, crossing 1.0 at 3e3 and falling to 0.60× at 1.2e4 (E* ∝ X*^0.56). Converged: P2, 120 elements, 36 directions, f_max = 2 Hz or no tail move it ≤ 4.5 % (most at the shortest fetch, X* ≈ 2e3; ≤ 0.6 % beyond 1e4).
+    - `duration_limited_growth_approaches_pierson_moskowitz`: from calm under 10 m/s, 0.84× PM energy and f_p* 0.123 at 96 h; dt 10/60/300 s agree to 0.3 %.
+  - `examples/wave_growth.rs` prints both curves (`mode=fetch|duration`, `dia=0`, `tail=0`, resolutions).
+  - Cost: the DIA is ≈ 10 % of a step in the fetch gate's configuration (2.9 s against 2.6 s without, 120 points × 600 components, release).
+- [ ] Wind-sea energy at long fetch and full development: Komen whitecapping (δ = 1, C_ds = 2.36e-5) leaves E* 0.60× KC92 at X* = 1.2e4 (growth ∝ X*^0.56 against 0.9), and under a steady wind it passes Pierson–Moskowitz after ≈ 180 h, reaching 1.5× at 1000 h (`wave_growth mode=duration hours=1000 dt=300`; SWAN warns of this for δ = 1 without retuning C_ds). The f_p curve is right, so the spectrum is too low for its peak. Try van der Westhuysen et al.'s (2007) saturation-based whitecapping with the Yan (1987) input (SWAN `GEN3 WESTH`), or ST6 (Rogers et al. 2012). Gate on the same two tests, then tighten their bounds.
+- [ ] The whitecapping means (`Means::of` in `src/waves/sources.rs`) integrate over the grid only; SWAN adds the diagnostic tail beyond `σ_max`. Negligible at f_max = 1 Hz for these seas (no tail and an f⁻⁵ tail agree to 1 %), but it matters for young seas near the grid top.
+- [ ] Triads (LTA, Eldeberky 1996) for the surf zone.
 - [ ] Second-order advection in θ and σ (MUSCL with a limiter, or SWAN's hybrid central/upwind). The first-order refraction bias is ≈ 1° at 5° bins (the Snell gate), and its numerical diffusion widens spectra. On steep fjord walls refraction sets the step: `with_turning_limit` caps |c_θ| (Dietrich et al. 2013), or θ could be implicit (a cyclic tridiagonal per node and frequency).
 - [ ] `c_σ` from a changing depth (`∂σ/∂d ∂d/∂t`): tides shift frequencies over flats. It needs the rate of η from the circulation, or the difference of two water levels.
 - [ ] Coupling (two-way, every coupling interval):

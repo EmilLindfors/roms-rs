@@ -6,6 +6,15 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Wind-sea growth in the wave model (`waves`, TODO F.4 stage 2).**
+  - `waves::nonlinear::Quadruplets`: the four-wave interactions by the DIA (Hasselmann et al. 1985; `C_nl4 = 3·10⁷`, λ = 0.25, angles from the deep-water resonance), scaled for finite depth by `shallow_water_factor` (SWAN's `R(k_p d)`). Off-grid frequencies use weights linear in 1/σ, so the discrete transfer keeps energy and action to round-off.
+  - `SourceTerms`: the DIA (gains as linear input, losses as a rate), a diagnostic `σ^(−p)` tail above `max(2.5 σ̃, 4 σ_PM)` (p = 4), and Ris's growth limiter (γ = 0.1 of the Phillips level). Without the limiter a 2 Hz grid blows up within hours. All three are in `swan_defaults`. New `with_quadruplets`, `with_tail`, `with_limiter`.
+  - Gates:
+    - the DIA keeps energy and action to 1e-13, and its transfer has the classic three lobes;
+    - fetch-limited growth: f_p* follows Kahma & Calkoen (1992) to 0.90–1.05× over X* = 1.2·10³–1.2·10⁴. E* runs from 1.3× to 0.60× (E* ∝ X*^0.56 against 0.9), the known long-fetch deficit of Komen whitecapping. Converged in mesh, order, directions, tail and f_max;
+    - duration-limited growth reaches 0.84× Pierson–Moskowitz energy at 96 h, independent of the step from 10 to 300 s.
+  - `examples/wave_growth.rs` prints both growth curves.
+
 - **A spectral wave model (`waves`, TODO F.4 stage 1).** The wave action balance on the DG mesh, one nodal field per (frequency, direction) component.
   - `waves::dispersion`: the wavenumber (Guo's start, Newton), group velocity and ∂σ/∂d.
   - `waves::spectrum::SpectralGrid`: log-spaced frequencies and uniform directions; JONSWAP with cos^m spreading, normalised on the grid; H_s, T_m01, T_m02, T_p, mean direction and spread; the Stokes drift profile, radiation stress and bed orbital velocity.
@@ -18,7 +27,7 @@ All notable changes to this project should be documented in this file.
     - Snell's law met to first order in the direction bins (1.03° at 5°);
     - a following current keeps σ + kU to 0.34 %;
     - per-node gates for each source term and the integrated quantities.
-  - Not yet: quadruplet interactions (so no realistic wind-sea growth), coupling to the circulation, mixing and particles, and real boundary spectra. See TODO F.4.
+  - Not yet: quadruplet interactions (stage 2, above), coupling to the circulation, mixing and particles, and real boundary spectra. See TODO F.4.
 
 - **Particle files (`io::ParticleFileWriter`, `ParticleFileReader`, `ParticleFrame`, `status_code`; TODO F.2/F.3).** The particles of a run frame by frame, beside its snapshot file (`.dgpart`): position, height, status, kind and release time per particle, in release order. Frames grow, so each carries its length; the reader indexes them on opening and ignores a partial last one. The header names the kinds. Gate: frames of 0, 4 and 9 particles read back exactly, a partial frame is ignored, and unknown kinds or fields of different lengths are refused.
   - `examples/farm_3d.rs snapshot=FILE particles=N` writes the larvae, faeces and feed at every snapshot frame, the last one moved on to the end of the run.
