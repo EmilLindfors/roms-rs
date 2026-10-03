@@ -385,10 +385,15 @@ fn main() -> AppExit {
     }
     // A live run saved as it runs
     let live_save = match (&replay, &args.save_snapshot) {
-        (None, Some(path)) => match replay::writer(path, &scenario, scenario.clock.as_ref()) {
-            Ok(writer) => {
+        (None, Some(path)) => match replay::SnapshotSink::create(
+            path,
+            &scenario,
+            scenario.clock.as_ref(),
+            args.particles.per_release > 0,
+        ) {
+            Ok(sink) => {
                 println!("Saving the run to {}", path.display());
-                Some(writer)
+                Some(sink)
             }
             Err(e) => {
                 eprintln!("cannot write {}: {e}", path.display());

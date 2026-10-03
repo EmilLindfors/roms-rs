@@ -63,8 +63,9 @@
 //! `snapshot=` writes the 3D run with cages to a snapshot file
 //! (`io::SnapshotWriter::create_3d`: η, ū, v̄ and u, v, T, S on every level
 //! every `snapshot_minutes`, with the mesh, σ-grid, clock, cages and a
-//! section through the first cage), which the viewer replays:
-//! `cd viz && cargo run --release -- --replay <file.dgsnap>`.
+//! section through the first cage), and with `particles=` the particles
+//! beside it (`<file>.dgpart`, `io::ParticleFileWriter`), which the viewer
+//! replays: `cd viz && cargo run --release -- --replay <file.dgsnap>`.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -73,7 +74,7 @@ use std::time::Instant;
 
 use dg_rs::boundary::Reflective2D;
 use dg_rs::equations::ShallowWater2D;
-use dg_rs::io::SnapshotWriter;
+use dg_rs::io::{ParticleFileWriter, ParticleFrame, SnapshotWriter, status_code};
 use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::mesh::{Mesh2D, PointLocator2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
@@ -384,7 +385,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ("periodic", periodic.as_str()),
                 ];
                 metadata.extend(cage_lines.iter().map(|c| ("cage", c.as_str())));
-                let mut writer = SnapshotWriter::create_3d(
+                let writer = SnapshotWriter::create_3d(
                     path,
                     &mesh,
                     &ops,
@@ -394,11 +395,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &metadata,
                 )
                 .map_err(|e| format!("{path}: {e}"))?;
-                writer
-                    .write_solution_3d(0.0, &state)
-                    .map_err(|e| e.to_string())?;
+                // The particles beside it, at the same times
+                let particles = match &tracking {
+                    Some(_) => {
+                        let path = std::path::Path::new(path).with_extension("dgpart");
+                        let kinds: Vec<&str> = KINDS.iter().map(|k| k.0).collect();
+                        Some(
+                            ParticleFileWriter::create(&path, &kinds, &[("source", "farm_3d")])
+                                .map_err(|e| format!("{}: {e}", path.display()))?,
+                        )
+                    }
+                    None => None,
+                };
+                let mut writers = (writer, particles);
+                write_frame(&mut writers, &state, 0.0, tracking.as_ref(), &bathymetry)?;
                 println!("{label:>9}: snapshots every {snapshot_seconds} s to {path}");
-                Some(writer)
+                Some(writers)
             }
             None => None,
         };
@@ -438,11 +450,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             // Callbacks land at the first step past each interval: a frame at
             // the first callback past each snapshot time
-            if let Some(writer) = snapshot.as_mut()
+            if let Some(writers) = snapshot.as_mut()
                 && t >= next_snapshot - 1e-6
             {
-                if let Err(e) = writer.write_solution_3d(t, s) {
-                    snapshot_error.get_or_insert(e.to_string());
+                if let Err(e) = write_frame(writers, s, t, tracking.as_ref(), &bathymetry) {
+                    snapshot_error.get_or_insert(e);
                 }
                 last_snapshot = t;
                 while next_snapshot <= t + 1e-6 {
@@ -470,12 +482,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last = (t, reference);
             }
         });
-        // The end of the run, unless a frame already holds it
-        if let Some(writer) = snapshot.as_mut()
+        // The end of the run, unless a frame already holds it (the particles
+        // moved on to it first)
+        if let Some(writers) = snapshot.as_mut()
             && result.final_time > last_snapshot + 1e-6
-            && let Err(e) = writer.write_solution_3d(result.final_time, &state)
         {
-            snapshot_error.get_or_insert(e.to_string());
+            if let Some(tracking) = tracking.as_mut() {
+                tracking.advance(&state, result.final_time, &sigma, &bathymetry);
+            }
+            if let Err(e) = write_frame(
+                writers,
+                &state,
+                result.final_time,
+                tracking.as_ref(),
+                &bathymetry,
+            ) {
+                snapshot_error.get_or_insert(e);
+            }
         }
         if let Some(e) = snapshot_error {
             return Err(format!("{label}: the snapshot file: {e}"));
@@ -638,6 +661,25 @@ const KINDS: [(&str, f64, [f64; 2]); 3] = [
 /// Index of the larvae in [`KINDS`].
 const LARVAE: usize = 0;
 
+/// A snapshot frame of `state` at `t`, and the particles' frame beside it.
+fn write_frame(
+    (fields, particles): &mut (SnapshotWriter, Option<ParticleFileWriter>),
+    state: &Solution3D,
+    t: f64,
+    tracking: Option<&FarmParticles>,
+    bed: &Bathymetry2D,
+) -> Result<(), String> {
+    fields
+        .write_solution_3d(t, state)
+        .map_err(|e| e.to_string())?;
+    if let (Some(writer), Some(tracking)) = (particles.as_mut(), tracking) {
+        writer
+            .write(&tracking.frame(state, t, bed))
+            .map_err(|e| format!("particles: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Particles released from the cages and tracked online in the 3D flow.
 struct FarmParticles<'a> {
     tracker: ParticleTracker3D<'a>,
@@ -682,6 +724,36 @@ impl<'a> FarmParticles<'a> {
 
     fn released(&self) -> usize {
         self.particles.iter().map(Vec::len).sum()
+    }
+
+    /// Every particle released by `t`, kind by kind, at its height in `state`.
+    fn frame(&self, state: &Solution3D, t: f64, bed: &Bathymetry2D) -> ParticleFrame {
+        let mut frame = ParticleFrame {
+            t,
+            ..Default::default()
+        };
+        let mut weights = vec![0.0; self.ops.n_nodes];
+        for (kind, particles) in self.particles.iter().enumerate() {
+            for p in particles {
+                let point = p.point();
+                self.ops
+                    .interpolation_weights_into(point.r, point.s, &mut weights);
+                let (k, n) = (point.element.as_usize(), self.ops.n_nodes);
+                let eta = &state.eta.data[k * n..(k + 1) * n];
+                let (mut e, mut b) = (0.0, 0.0);
+                for (i, (w, z)) in weights.iter().zip(bed.element(point.element)).enumerate() {
+                    e += w * eta[i];
+                    b += w * z;
+                }
+                let [x, y] = p.position();
+                frame.xy.push([x as f32, y as f32]);
+                frame.z.push((e + p.sigma() * (e - b).max(0.0)) as f32);
+                frame.status.push(status_code(p.status()));
+                frame.kind.push(kind as u8);
+                frame.born.push(self.release_time as f32);
+            }
+        }
+        frame
     }
 
     /// `n` particles of each kind in each cage: a sunflower pattern over
