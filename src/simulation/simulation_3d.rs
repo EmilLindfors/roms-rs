@@ -1548,6 +1548,101 @@ mod tests {
         assert!(max_speed < 1e-10, "the lake spun up {max_speed:.3e} m/s");
     }
 
+    /// Regression (Frøya, 2026-10-03): a stratified basin with a steep shore
+    /// (the bed from −100 m to +2 m over 1 km, five P2 elements, so the
+    /// shoreline element spans tens of metres of water), `WetDry`, linear in
+    /// z (0.02 °C/m, no diffusion), stirred only by a 1 cm seiche that wets
+    /// and dries the shore. The shoreline elements are carried as element
+    /// balances (the 2D pass keeps only those there), and their tracers
+    /// were the element's mean per level at every node: across the shoreline
+    /// element a σ-level spans tens of metres of depth, and the flattened
+    /// stratification drove a baroclinic flow (on the Frøya bed, 0.1–1 m/s
+    /// at rest). Now each node keeps its departure from the mean, and the
+    /// temperature at every node stays its initial profile's at the node's
+    /// height to within the seiche's heave of the σ-levels.
+    #[test]
+    fn a_steep_stratified_shore_keeps_its_stratification() {
+        let length = 1000.0;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 200.0, 5, 1));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            -100.0 + 102.0 * x / length
+        }));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(true)
+        .build();
+        let sigma = SigmaGrid::new(10, UniformStretching);
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-3, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let eos = LinearEOS::default();
+        let profile = |z: f64| eos.t0 + 0.02 * (z + 50.0);
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        for k in 0..mesh.n_elements {
+            for i in 0..nn {
+                let el = ElementIndex::new(k);
+                let [x, _] = mesh.reference_to_physical(el, ops.nodes_r[i], ops.nodes_s[i]);
+                let idx = k * nn + i;
+                let b = bathymetry.data[idx];
+                let eta = (0.01 * (std::f64::consts::PI * x / length).cos()).max(b);
+                state.eta.data[idx] = eta;
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    state.temp[idx * nl + l] = profile(eta + s * (eta - b));
+                    state.salt[idx * nl + l] = eos.s0;
+                }
+            }
+        }
+        physics.update_density(&mut state);
+        let (mut deviation, mut shoreline) = (0.0_f64, 0_usize);
+        run_beach(&physics, &mut state, 100, |s| {
+            for idx in 0..s.eta.data.len() {
+                let depth = s.eta.data[idx] - bathymetry.data[idx];
+                if depth < physics.min_column_depth {
+                    continue;
+                }
+                if depth < 10.0 {
+                    shoreline += 1;
+                }
+                for (l, &sig) in sigma.sigma_rho().iter().enumerate() {
+                    let z = s.eta.data[idx] + sig * depth;
+                    deviation = max_or_nan([deviation, (s.temp[idx * nl + l] - profile(z)).abs()]);
+                }
+            }
+        });
+        let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+        println!(
+            "steep shore: T off its profile by {deviation:.2e} °C, largest speed {speed:.2e} m/s"
+        );
+        assert!(shoreline > 0, "test regime: no shallow water at the shore");
+        // Measured 4.8e-4 °C (largest speed 2.9e-3 m/s); with the element
+        // means alone 0.12 °C (1.8e-2 m/s)
+        assert!(
+            deviation < 1e-3,
+            "the stratification moved by {deviation:.3e} °C at a node's height"
+        );
+    }
+
     /// A stratified seamount at rest (Beckmann & Haidvogel 1993; TODO P4.6):
     /// `H = 400 m · (1 − 0.9 e^{−r²/L²})`, `L` = 4 km, in a doubly periodic
     /// 24 km square (6 × 6 P2), 10 stretched levels, f-plane, density

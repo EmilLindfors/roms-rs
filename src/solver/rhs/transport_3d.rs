@@ -711,12 +711,22 @@ pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry
 ///
 /// - Elements not marked in `element_means`: `C = q / H_z` at every node.
 /// - Marked elements: per level, the element's inventory over its volume,
-///   `Σ w_i J_i q_il / Σ w_i J_i H_z,il`, at every node. The mode splitter
-///   marks the elements where the barotropic pass kept only the element
-///   balance, not the nodal identity `η̄ − ηⁿ = −Δt∇·DU_avg2` (`WetDry`
-///   subcell and positivity-limited elements, see `BarotropicTransport`):
-///   there the nodal quotient is not constant for a constant tracer, but the
-///   element means are (and are conservative, see the module docs).
+///   `M = Σ w_i J_i q_il / Σ w_i J_i H_z,il`, plus each node's departure from
+///   the same mean of the values `out` holds (the last ones):
+///   `C_il = out_il + (M − Σ w_i J_i H_z,il out_il / Σ w_i J_i H_z,il)`. The
+///   mode splitter marks the elements where the barotropic pass kept only
+///   the element balance, not the nodal identity `η̄ − ηⁿ = −Δt∇·DU_avg2`
+///   (`WetDry` subcell and positivity-limited elements, see
+///   `BarotropicTransport`): there the nodal quotient is not constant for a
+///   constant tracer, but the element means are (and are conservative, see
+///   the module docs). The departures are zero for a constant tracer and
+///   have zero weighted mean, so the conversion keeps both properties; and
+///   they keep the element's vertical structure, where the mean alone
+///   flattened the stratification along the σ-levels: across a shoreline
+///   element spanning 0.6 to 105 m of water a σ-level crosses 100 m of
+///   depth, and the flattened density drove 0.1–1 m/s at rest over the
+///   Frøya bed (2026-10-03). The structure within a marked element is held
+///   while it is marked; only its means move with the fluxes.
 /// - A node with (almost) no water, shallower than `DRY_DEPTH`, and a level
 ///   of a marked element with a mean depth below it, keep the value `out`
 ///   already holds (the last concentration) instead of dividing by a
@@ -758,16 +768,19 @@ pub fn from_inventory(
             }
             let area: f64 = (0..nn).map(|i| geom.node_mass(k, i)).sum();
             for (l, &ds) in d_sigma.iter().enumerate() {
-                let (mut inventory, mut volume) = (0.0, 0.0);
+                // The new mean, and the last values' mean with the same
+                // weights: each node keeps its departure from it
+                let (mut inventory, mut last, mut volume) = (0.0, 0.0, 0.0);
                 for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
-                    let mass = geom.node_mass(k, i);
-                    inventory += mass * q_k[i * nl + l];
-                    volume += mass * layer_thickness_of(e - b, ds);
+                    let weight = geom.node_mass(k, i) * layer_thickness_of(e - b, ds);
+                    inventory += geom.node_mass(k, i) * q_k[i * nl + l];
+                    last += weight * out_k[i * nl + l];
+                    volume += weight;
                 }
                 if volume > area * ds * DRY_DEPTH {
-                    let mean = inventory / volume;
+                    let shift = (inventory - last) / volume;
                     for i in 0..nn {
-                        out_k[i * nl + l] = mean;
+                        out_k[i * nl + l] += shift;
                     }
                 }
             }
@@ -2744,9 +2757,10 @@ mod tests {
     }
 
     /// Inventory ↔ concentration: nodal in unmarked elements; in marked
-    /// elements the element's inventory over its volume per level, which
-    /// converts back to the same element inventory; a dry node, or a dry
-    /// marked element, keeps its last concentration.
+    /// elements the element's inventory over its volume per level plus each
+    /// node's departure from the mean of its last value, which converts back
+    /// to the same element inventory and keeps the element's structure; a
+    /// dry node, or a dry marked element, keeps its last concentration.
     #[test]
     fn inventory_conversion_keeps_element_inventories() {
         let case = Case::closed();
@@ -2806,6 +2820,37 @@ mod tests {
                 (before - after).abs() < 1e-13 * before.abs(),
                 "level {l}: {before} vs {after}"
             );
+        }
+
+        // Regression (Frøya, 2026-10-03): a marked element keeps each node's
+        // departure from the level's mean, so a stratified element converts
+        // back to itself. With its last values the stratification that made
+        // its inventory, it is unchanged; the mean alone flattened it, and
+        // over a steep shoreline that drove 0.1–1 m/s at rest
+        let mut kept = vec![-1.0; concentration.len()];
+        let element_2 = 2 * nn * nl..3 * nn * nl;
+        kept[element_2.clone()].copy_from_slice(&concentration[element_2.clone()]);
+        from_inventory(
+            &inventory,
+            &eta,
+            case.sigma.d_sigma(),
+            &case.bathymetry,
+            &case.geom,
+            &marked,
+            &mut kept,
+        );
+        let spread = concentration[element_2.clone()]
+            .iter()
+            .fold((f64::MAX, f64::MIN), |(a, b), &c| (a.min(c), b.max(c)));
+        assert!(
+            spread.1 - spread.0 > 1e-3,
+            "test regime: element 2 is stratified"
+        );
+        for (got, c) in kept[element_2.clone()]
+            .iter()
+            .zip(&concentration[element_2])
+        {
+            assert!((got - c).abs() < 1e-12 * c.abs(), "{got} vs {c}");
         }
     }
 
