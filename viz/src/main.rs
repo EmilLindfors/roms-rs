@@ -41,6 +41,10 @@
 //! - `--save-snapshot FILE` with `--replay`: also write the frames read to a snapshot
 //!   file, a tenth of the VTU frames' size, which later replays read without the
 //!   scenario's data.
+//! - `--gauge FILE` a tide-gauge record (`scripts/kartverket_gauge.sh` format, e.g.
+//!   `../data/tide_gauges/mausund_obs.txt`) drawn against the model's surface at the
+//!   close-up point in the trace (top right, G; [`trace`]); it needs the run's clock,
+//!   so a replay's or a `--start`-dated run's
 //! - `--sigma N` σ-levels of a 3D run [16]; `--start TIME` the UTC instant of model
 //!   time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
 //!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
@@ -88,6 +92,7 @@ mod replay;
 mod scenario;
 mod solver;
 mod surface;
+mod trace;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -110,11 +115,13 @@ use replay::Replay;
 use scenario::Scenario;
 use solver::SolverConfig;
 use surface::{Colouring, SurfacePlugin, WaterOpacity};
+use trace::{Trace, TracePlugin};
 
 struct Args {
     scenario: Option<String>,
     replay: Option<PathBuf>,
     save_snapshot: Option<PathBuf>,
+    gauge: Option<PathBuf>,
     mesh: Option<PathBuf>,
     order: usize,
     levels: usize,
@@ -144,6 +151,7 @@ impl Args {
             scenario: None,
             replay: None,
             save_snapshot: None,
+            gauge: None,
             mesh: None,
             order: 2,
             levels: 8,
@@ -178,6 +186,7 @@ impl Args {
             match flag.as_str() {
                 "--scenario" => args.scenario = Some(value),
                 "--replay" => args.replay = Some(value.into()),
+                "--gauge" => args.gauge = Some(value.into()),
                 "--save-snapshot" => args.save_snapshot = Some(value.into()),
                 "--mesh" => args.mesh = Some(value.into()),
                 "--order" => args.order = num(&flag, &value)?,
@@ -481,6 +490,8 @@ fn main() -> AppExit {
     };
     let periodic = Periodic(scenario.periodic.map(|p| p.map(|x| x as f32)));
 
+    // The model times the gauge trace covers
+    let mut span = [0.0, args.hours * 3600.0];
     let (channel, source, t_end, interval, rate, run_clock) = match replay {
         Some(replay) => {
             let source = Source::Replay {
@@ -493,6 +504,7 @@ fn main() -> AppExit {
                 t_last: replay.t_last,
             };
             let (t_end, interval, clock) = (replay.t_last, replay.interval, replay.clock);
+            span = [replay.t_first, replay.t_last];
             (
                 replay::spawn(replay, args.threads),
                 source,
@@ -520,6 +532,38 @@ fn main() -> AppExit {
         }
     };
 
+    let gauge = match &args.gauge {
+        None => None,
+        Some(path) => match dg_rs::io::read_tide_gauge_file(path) {
+            Ok(file) => {
+                let name = file.station.as_ref().map_or_else(
+                    || {
+                        path.file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    },
+                    |s| s.name.clone(),
+                );
+                let record = file
+                    .time_series
+                    .data
+                    .iter()
+                    .map(|p| (p.time, p.value))
+                    .collect();
+                Some((name, record))
+            }
+            Err(e) => {
+                eprintln!("cannot read the gauge {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
+        },
+    };
+    if gauge.is_some() && run_clock.is_none() {
+        eprintln!("--gauge needs the run's clock: the gauge is not drawn");
+    }
+    let trace = Trace::new(&scenario, &locator, span, gauge, run_clock);
+
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
         primary_window: Some(Window {
@@ -546,6 +590,7 @@ fn main() -> AppExit {
     .insert_resource(Colouring::new(args.speed_max))
     .insert_resource(WaterOpacity(args.water_alpha))
     .insert_resource(Title(scenario.name.clone()))
+    .insert_resource(trace)
     .insert_resource(Playback::new(rate, interval, args.memory_mb << 20))
     .insert_resource(SolverChannel(Mutex::new(channel)))
     .insert_resource(source)
@@ -563,6 +608,7 @@ fn main() -> AppExit {
         ParticlesPlugin,
         CameraPlugin,
         HudPlugin,
+        TracePlugin,
     ))
     .add_systems(Startup, move |mut commands: Commands| {
         commands.spawn((

@@ -20,7 +20,7 @@ use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 // ASCII only: Bevy's default font has no arrows or middle dots.
 const KEYS: &str = "Space pause   [ ] rate   Left/Right seek   Home/End\n\
 C colour   T water   - = water opacity   B contours   A arrows\n\
-P particles   F close-up   O overview   H keys\n\
+P particles   F close-up   O overview   G gauge trace   H keys\n\
 drag orbit   right-drag pan   wheel zoom";
 /// The keys of a 3D run, added to [`KEYS`].
 const KEYS_3D: &str = ", . layer (depth mean, surface ... bed)   V section";
