@@ -6,6 +6,9 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The waves' force on the circulation in flux form (`source::WaveForce2D`; TODO F.4 coupling).** The radiation-stress divergence now includes the jumps of `S` between elements: the strong-form DG divergence with the central flux `½(S⁻ + S⁺)` lifted on interior faces. On GLL nodes, summation by parts makes the force's total exactly `−g ∮ S·n` over the boundary (new gate, to round-off, for a stress discontinuous at every face). The surf-zone longshore force is now within 6.8 % of Longuet-Higgins's dissipation force, against 9.5 % before; the spikes at element ends are gone.
+  - API: `WaveForce2D::from_radiation_stress` takes the mesh as its first argument.
+
 - **A 3D view of swell breaking on a beach (`viz/src/bin/surf_zone.rs`).** `cd viz && cargo run --release --bin surf_zone` runs the two surf-zone cases of `tests/wave_coupling_test.rs` to steady state (≈ 8 s) and animates them in Bevy. The crests come from the model's H_rms, mean direction and wavenumber across the beach; they steepen as they shoal, then turn into bores with white water where Battjes–Janssen breaking takes energy. The mean level carries the setup, and in the oblique case floats drift with the longshore current. `viz/Cargo.toml` gets `default-run = "dg-viz"`.
 
 - **Surf-zone gates for the wave-driven circulation (TODO F.4 coupling).** Two coupled runs on a plane beach (1:100, 4 m to a wall at 0.5 m, alongshore periodic), with 8 s swell of H_rms = 0.6 m breaking by Battjes–Janssen (`tests/wave_coupling_test.rs`). New `Mesh2D::channel_periodic_x_with_sides` (a mesh periodic in x with its own south and north tags).

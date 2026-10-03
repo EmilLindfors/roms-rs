@@ -43,8 +43,9 @@ impl SourceTerm2D for LinearDamping {
 /// gradient, `g h ∂η/∂x = −g ∂S_xx/∂x`. The wave model shoals the swell, its
 /// force drives the basin to rest, and the set-down follows the formula to
 /// 0.27 % of its 3.3 cm range across the basin. A current of 2e-5 m/s remains,
-/// held by the damping against the part of the element-local force that no
-/// level can balance (the jumps of S between elements are left out).
+/// held by the damping against the part of the force the discrete pressure
+/// gradient does not balance: discretisation error, 3e-6 m/s at half the
+/// element size.
 #[test]
 fn shoaling_waves_set_the_water_down() {
     const L: f64 = 2000.0;
@@ -584,18 +585,18 @@ fn longuet_higgins_force(waves: &WaveModel2D, n: &WaveSolution) -> Vec<f64> {
 /// drives a current along the beach. With no lateral mixing each line across
 /// the beach is its own balance, `C_d |u| u = F_x`, and Longuet-Higgins's
 /// (1970) force from the dissipation (`longuet_higgins_force`) gives
-/// `u = √(F_x/C_d)`: 0.60 m/s at most (the model's 0.615), two thirds of the way across the surf
-/// zone. Where that force is over a tenth of its largest the model's current
-/// follows it to 3.8 % (2.2 % at twice the resolution). The radiation-stress
-/// force of the wave model is above the dissipation's, by up to 9.5 % of the
-/// largest force at the ends of elements (where the derivative within each
-/// element is one-sided; the jumps of S between elements are left out) and
-/// ≈ 5 % inside them, converging with the mesh: 3 % at 12.5 m elements.
+/// `u = √(F_x/C_d)`: 0.60 m/s at most (the model's 0.61), two thirds of the
+/// way across the surf zone. Where that force is over a tenth of its largest
+/// the model's current follows it to 3.8 % (2.2 % at twice the resolution).
+/// The radiation-stress force (in flux form) is 4–5 % of the largest force
+/// above the dissipation's across the inner surf zone, 6.8 % at most: the
+/// resolution of the wave field, which halves at 12.5 m elements. (The
+/// element-local force without the face terms reached 9.5 % at element ends.)
 ///
 /// Seaward of the breakers there is no dissipation and the force should
 /// vanish: what remains is the discrete refraction (the direction bins), which
-/// leaves the flux of alongshore momentum not quite constant, and a current
-/// of −0.8 cm/s (−3.8 cm/s at 36 directions, −0.15 cm/s at 144).
+/// leaves the flux of alongshore momentum not quite constant, and a current of
+/// −0.5 cm/s; it falls about fivefold for each halving of the bins.
 #[test]
 fn oblique_breaking_waves_drive_a_longshore_current() {
     let beach = Beach::new();
@@ -642,7 +643,7 @@ fn oblique_breaking_waves_drive_a_longshore_current() {
         100.0 * excess
     );
     assert!(surf < 0.05, "the current is {surf} off Longuet-Higgins's");
-    assert!(excess < 0.1, "the force is {excess} off the dissipation's");
+    assert!(excess < 0.08, "the force is {excess} off the dissipation's");
     assert!(
         offshore < 0.02 * fastest,
         "an offshore current of {offshore} m/s"
