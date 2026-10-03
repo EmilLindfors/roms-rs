@@ -198,6 +198,11 @@ impl WaveModel2D {
         self
     }
 
+    /// Gravitational acceleration (m/s²).
+    pub fn g(&self) -> f64 {
+        self.g
+    }
+
     pub fn n_points(&self) -> usize {
         self.depth.len()
     }
@@ -716,7 +721,12 @@ fn face_flux(
 }
 
 /// Physical gradient of the nodal field `f` by each element's derivative matrices.
-fn nodal_gradient(ops: &DGOperators2D, geom: &GeometricFactors2D, f: &[f64], out: &mut [[f64; 2]]) {
+pub(crate) fn nodal_gradient(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    f: &[f64],
+    out: &mut [[f64; 2]],
+) {
     let nn = ops.n_nodes;
     for k in 0..f.len() / nn {
         let fk = &f[k * nn..(k + 1) * nn];

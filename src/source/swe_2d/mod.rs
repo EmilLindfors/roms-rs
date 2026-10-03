@@ -8,6 +8,7 @@
 //! - Atmospheric pressure gradients
 //! - Wind and pressure from a weather model's grid
 //! - Tidal potential forcing
+//! - The waves' radiation stress
 //! - Bathymetry gradients
 
 mod atmospheric;
@@ -18,6 +19,7 @@ mod friction;
 mod gridded_atmosphere;
 mod tidal;
 pub mod viscosity;
+mod waves;
 mod wind;
 
 pub use atmospheric::{AtmosphericPressure2D, P_STANDARD, RHO_WATER_PRESSURE};
@@ -30,4 +32,5 @@ pub use friction::{
 pub use gridded_atmosphere::{GriddedAtmosphere2D, GriddedWindStress};
 pub use tidal::{TidalPotential, TidalPotentialConstituent};
 pub use viscosity::HorizontalViscosity2D;
+pub use waves::WaveForce2D;
 pub use wind::{DragCoefficient, RHO_AIR, RHO_WATER, WindStress2D};

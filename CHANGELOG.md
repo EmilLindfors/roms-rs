@@ -6,6 +6,9 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The waves' force on the 2D circulation (`source::WaveForce2D`; TODO F.4 coupling).** The radiation-stress divergence `−g ∇·(S/ρg)` as a momentum source for `SWEPhysics2D`. It is built from a `WaveModel2D` state on the same mesh (`WaveForce2D::new`) or from any nodal stress field (`from_radiation_stress`), with an optional ramp. Dry nodes get no force. New `WaveModel2D::g`.
+  - Gates: polynomial exactness of the divergence on a sheared P2 mesh (1e-14). Shoaling swell sets a closed basin down by Longuet-Higgins & Stewart's `η = −E k/sinh 2kh`, to 0.27 % of the 3.3 cm range (`tests/wave_coupling_test.rs`).
+
 - **Second-order refraction and frequency shifting in the wave model (`waves::SpectralAdvection`; TODO F.4).** The direction and frequency fluxes now use MUSCL by default: the upwind bin linearly reconstructed with van Leer's limiter. First-order `Upwind` remains (`WaveModel2D::with_spectral_advection`). `compute_dt` halves the spectral Courant limits for MUSCL, which is TVD for ≤ ½.
   - Gates against exact steady states (action density in wavenumber space constant along rays). A spread sea refracting on a shelf: the mean direction is off by 0.072° at 5° bins against upwind's 0.70°, at rates 2.4–2.5. A spread sea on an accelerating current: the mean frequency is off by 2.0e-3 against 9.0e-3, at rates 2.2–2.6.
   - A single-bin spike (the older Snell and Doppler gates) stays first order with either scheme.

@@ -34,7 +34,7 @@ Details in F.3 and F.4. Next, in this order:
 1. ~~**F.4 stage 2: quadruplet interactions (DIA) and a diagnostic tail.**~~ Done 2026-10-03 (branch `feat/waves-dia`): wind seas grow with fetch (f_p to KC92 within 10 %, E* 1.3–0.60×). See F.4.
 2. ~~**Stokes drift into the particle trackers (F.4 coupling).**~~ Done 2026-10-03 (`WithStokesDrift2D`/`3D`, `farm_3d stokes=`). See F.4.
 3. ~~**Second-order θ/σ advection (F.4).**~~ Done 2026-10-03: MUSCL with van Leer's limiter, second order on resolved spectra. See F.4.
-4. **The rest of the coupling.** Radiation stress or the vortex force on the currents; H_s into GLS wave breaking and surface roughness; wave-enhanced bed stress. Then MET Norway boundary spectra and a cost measurement at Frøya.
+4. **The rest of the coupling.** ~~Radiation stress on the 2D currents~~ (done 2026-10-03, `WaveForce2D`); the surf-zone setup and longshore-current gates; H_s into GLS wave breaking and surface roughness; wave-enhanced bed stress; the force in 3D. Then MET Norway boundary spectra and a cost measurement at Frøya.
 
 The circulation items below (P3.1 and the error budget) stand as they were.
 
@@ -266,7 +266,12 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
 - [ ] `c_σ` from a changing depth (`∂σ/∂d ∂d/∂t`): tides shift frequencies over flats. It needs the rate of η from the circulation, or the difference of two water levels.
 - [ ] Coupling (two-way, every coupling interval):
   - circulation → waves: `set_water_level`, `set_currents` (P2 nodes to the wave mesh's).
-  - waves → 2D/3D circulation: the radiation-stress gradient as a momentum source (or the vortex force with Stokes drift, McWilliams et al. 2004, as COAWST); a wave-enhanced bottom stress from the orbital velocity (Soulsby 1997 or Grant–Madsen).
+  - [x] waves → 2D circulation (2026-10-03): `source::WaveForce2D`, `−g ∇·(S/ρg)` per node from `WaveModel2D::radiation_stress` on the same mesh, differentiated within each element; ramped (`with_ramp`), zero on dry nodes.
+    - Gates: a quadratic stress gives its exact divergence on a sheared P2 mesh (1e-14). `shoaling_waves_set_the_water_down` (`tests/wave_coupling_test.rs`): 10 s, 1 m swell shoaling over a closed basin from 20 to 3 m. The steady level follows Longuet-Higgins & Stewart's `η = −E k/sinh 2kh` to 0.27 % of its 3.3 cm range.
+    - [ ] The jumps of S between elements are left out, so the force is not in flux form, and a 2e-5 m/s current remains in the set-down basin, held by the damping against the unbalanced part. A weak form with central face fluxes of S would conserve momentum exactly; measure whether it matters once the wave field has real breaking.
+    - [ ] Surf zone: the setup shoreward of the breakers (Bowen et al. 1968; the slope `3γ²/8/(1 + 3γ²/8)` of the bed's for saturated breaking) and the longshore current under oblique waves (Longuet-Higgins 1970) on a plane beach. Both need wetting and drying at the shoreline, or a wall a little offshore.
+    - [ ] 3D: the radiation stress is depth-uniform here; in 3D the vortex force with the Stokes drift (McWilliams et al. 2004; COAWST, ROMS `WEC_VF`) gives the vertical structure.
+  - [ ] waves → bed: a wave-enhanced bottom stress from the orbital velocity (Soulsby 1997 or Grant–Madsen), from `bed_orbital_velocity`.
   - waves → GLS: `H_s` for `with_wave_breaking` and the surface roughness (z₀ₛ ≈ 0.6 H_s, replacing `farm_3d waves=`).
   - [x] waves → particles (2026-10-03): `particles::WithStokesDrift2D` (a fixed depth) and `WithStokesDrift3D` (each particle's depth) add the drift of `waves::StokesDriftField` to any flow, steady or linear in time between wave states. The field compresses each node's spectrum to one vector per frequency (exact) and samples the exact finite-depth profile at the particle.
     - Gates: the field equals `WaveModel2D::stokes_drift` at every node and depth to 1e-12; 2D and 3D particles over still water move by exactly their depth's drift.
