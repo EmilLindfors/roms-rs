@@ -257,10 +257,36 @@ impl Mesh2D {
     /// Create a mesh that is periodic in the x-direction (channel flow), with
     /// walls at y0 and y1.
     pub fn channel_periodic_x(x0: f64, x1: f64, y0: f64, y1: f64, nx: usize, ny: usize) -> Self {
+        Self::channel_periodic_x_with_sides(
+            x0,
+            x1,
+            y0,
+            y1,
+            nx,
+            ny,
+            [BoundaryTag::Wall, BoundaryTag::Wall],
+        )
+    }
+
+    /// A mesh periodic in x with the boundary tags `[south, north]` at y0 and
+    /// y1: e.g. an alongshore-uniform beach, open to the sea at y0.
+    pub fn channel_periodic_x_with_sides(
+        x0: f64,
+        x1: f64,
+        y0: f64,
+        y1: f64,
+        nx: usize,
+        ny: usize,
+        [south, north]: [BoundaryTag; 2],
+    ) -> Self {
         let (vertices, elements) = structured_quads(x0, x1, y0, y1, nx, ny);
         let periodic: Vec<_> = (0..ny).map(|j| periodic_x_pair(nx, j)).collect();
-        Self::from_quads(vertices, elements, &periodic, |_| BoundaryTag::Wall)
-            .expect("a structured grid is a valid quad mesh")
+        // Only the bottom faces (0) of the first row and the top faces (2) of
+        // the last are boundaries
+        Self::from_quads(vertices, elements, &periodic, |face| {
+            if face.face == 0 { south } else { north }
+        })
+        .expect("a structured grid is a valid quad mesh")
     }
 
     /// Create a fully periodic mesh (periodic in both x and y).
@@ -1182,6 +1208,26 @@ mod tests {
         // Element 2's right face should connect to element 0
         let right_neighbor = mesh.neighbor(k(2), 1).unwrap();
         assert_eq!(right_neighbor.element, 0);
+    }
+
+    #[test]
+    fn a_channel_takes_its_south_and_north_tags() {
+        let mesh = Mesh2D::channel_periodic_x_with_sides(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            3,
+            2,
+            [BoundaryTag::Open, BoundaryTag::Wall],
+        );
+        assert_eq!(mesh.n_boundary_edges, 6);
+        for i in 0..3 {
+            assert_eq!(mesh.boundary_tag(k(i), 0), Some(BoundaryTag::Open));
+            assert_eq!(mesh.boundary_tag(k(3 + i), 2), Some(BoundaryTag::Wall));
+            assert_eq!(mesh.boundary_tag(k(i), 2), None);
+        }
+        assert_eq!(mesh.neighbor(k(3), 3).unwrap().element, 5);
     }
 
     #[test]
