@@ -27,13 +27,20 @@
 //!   threads, so play it back at `--rate 30` or below to keep up with the solver.
 //!   The channel runs in 3D, from rest with the tide ramped up over an hour; its
 //!   particles start at once, three kinds per cage.
-//! - `--replay DIR` play back a finished run's VTU frames instead of running the
-//!   solver ([`replay`]): the hourly `froya_NNNN.vtu` of `examples/froya_real_data.rs`
-//!   with `mesh=data/froya_coast.msh`, e.g. `--replay ../output/froya_15d_k1o1`. The
-//!   scenario (Frøya unless `--scenario` says otherwise) must be built as the run was:
-//!   the frames' nodes and bed are checked against it. Frames are read in parallel on
-//!   `--threads`, and shown linear in time between them; the rate defaults to an hour
-//!   per second, the status shows the run's UTC date when its `run.log` has the clock.
+//! - `--replay FILE|DIR` play back a run instead of running the solver ([`replay`]),
+//!   shown linear in time between its frames; the rate defaults to an hour per
+//!   second, and the status shows the run's UTC date when the run has a clock.
+//!   - A snapshot file (`froya_real_data snapshot_minutes=N` writes
+//!     `<output>/froya.dgsnap`) carries its mesh and bed: no scenario is built, and
+//!     the close-up is its first station.
+//!   - A directory of VTU frames, the `froya_NNNN.vtu` of `examples/froya_real_data.rs`
+//!     with `mesh=data/froya_coast.msh`, e.g. `--replay ../output/froya_15d_k1o1`. The
+//!     scenario (Frøya unless `--scenario` says otherwise) must be built as the run
+//!     was: the frames' nodes and bed are checked against it. Frames are read in
+//!     parallel on `--threads`; the clock comes from the run's `run.log`.
+//! - `--save-snapshot FILE` with `--replay`: also write the frames read to a snapshot
+//!   file, a tenth of the VTU frames' size, which later replays read without the
+//!   scenario's data.
 //! - `--sigma N` σ-levels of a 3D run [16]; `--start TIME` the UTC instant of model
 //!   time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
 //!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
@@ -107,6 +114,7 @@ use surface::{Colouring, SurfacePlugin, WaterOpacity};
 struct Args {
     scenario: Option<String>,
     replay: Option<PathBuf>,
+    save_snapshot: Option<PathBuf>,
     mesh: Option<PathBuf>,
     order: usize,
     levels: usize,
@@ -135,6 +143,7 @@ impl Args {
         let mut args = Self {
             scenario: None,
             replay: None,
+            save_snapshot: None,
             mesh: None,
             order: 2,
             levels: 8,
@@ -169,6 +178,7 @@ impl Args {
             match flag.as_str() {
                 "--scenario" => args.scenario = Some(value),
                 "--replay" => args.replay = Some(value.into()),
+                "--save-snapshot" => args.save_snapshot = Some(value.into()),
                 "--mesh" => args.mesh = Some(value.into()),
                 "--order" => args.order = num(&flag, &value)?,
                 "--levels" => args.levels = num(&flag, &value)?,
@@ -260,92 +270,111 @@ fn main() -> AppExit {
         }
     };
     let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-    // A replay is of a Frøya run unless told otherwise
-    let scenario_name = args.scenario.clone().unwrap_or_else(|| {
-        if args.replay.is_some() {
-            "froya"
-        } else {
-            "fjord"
+    // A snapshot file holds its own domain; VTU frames are of a Frøya run unless
+    // told otherwise
+    let snapshot_file = args.replay.as_deref().filter(|p| p.is_file());
+    let (mut scenario, replay) = if let Some(path) = snapshot_file {
+        match Replay::snapshot(path) {
+            Ok((replay, scenario)) => (scenario, Some(replay)),
+            Err(e) => {
+                eprintln!("cannot replay {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
         }
-        .into()
-    });
-    let built = match scenario_name.as_str() {
-        "fjord" => {
-            let mesh = args
-                .mesh
-                .clone()
-                .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm.msh"));
-            Scenario::fjord_farm(&mesh, args.order)
-        }
-        "froya" => {
-            let data = repo.join("data");
-            let mesh = args
-                .mesh
-                .clone()
-                .unwrap_or_else(|| data.join("froya_coast.msh"));
-            println!(
-                "Building Frøya from {} (the bed projection takes a while)...",
-                data.display()
-            );
-            Scenario::froya(
-                &mesh,
-                &data.join("froya_topobathy.tif"),
-                &data.join("froya_boundary_tides.txt"),
-                args.order,
-                args.hours * 3600.0,
-            )
-        }
-        "channel" => match ModelClock::parse(&args.start) {
-            Ok(clock) => Ok(Scenario::farm_channel(args.order, args.sigma, clock)),
-            Err(e) => Err(format!("--start {}: {e}", args.start).into()),
-        },
-        other => {
-            eprintln!("unknown scenario {other}: fjord, froya or channel");
-            return AppExit::from_code(2);
-        }
+    } else {
+        let scenario_name = args.scenario.clone().unwrap_or_else(|| {
+            if args.replay.is_some() {
+                "froya"
+            } else {
+                "fjord"
+            }
+            .into()
+        });
+        let built = match scenario_name.as_str() {
+            "fjord" => {
+                let mesh = args
+                    .mesh
+                    .clone()
+                    .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm.msh"));
+                Scenario::fjord_farm(&mesh, args.order)
+            }
+            "froya" => {
+                let data = repo.join("data");
+                let mesh = args
+                    .mesh
+                    .clone()
+                    .unwrap_or_else(|| data.join("froya_coast.msh"));
+                println!(
+                    "Building Frøya from {} (the bed projection takes a while)...",
+                    data.display()
+                );
+                Scenario::froya(
+                    &mesh,
+                    &data.join("froya_topobathy.tif"),
+                    &data.join("froya_boundary_tides.txt"),
+                    args.order,
+                    args.hours * 3600.0,
+                )
+            }
+            "channel" => match ModelClock::parse(&args.start) {
+                Ok(clock) => Ok(Scenario::farm_channel(args.order, args.sigma, clock)),
+                Err(e) => Err(format!("--start {}: {e}", args.start).into()),
+            },
+            other => {
+                eprintln!("unknown scenario {other}: fjord, froya or channel");
+                return AppExit::from_code(2);
+            }
+        };
+        let scenario = match built {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot build the {scenario_name} scenario: {e}");
+                return AppExit::from_code(1);
+            }
+        };
+        let replay = match args.replay.as_deref().map(|d| Replay::vtu(d, &scenario)) {
+            None => None,
+            Some(Ok(replay)) => Some(replay),
+            Some(Err(e)) => {
+                eprintln!(
+                    "cannot replay {}: {e}",
+                    args.replay.as_ref().unwrap().display()
+                );
+                return AppExit::from_code(1);
+            }
+        };
+        (scenario, replay)
     };
-    let mut scenario = match built {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot build the {scenario_name} scenario: {e}");
-            return AppExit::from_code(1);
-        }
-    };
-    let replay = match args
-        .replay
-        .as_deref()
-        .map(|dir| Replay::open(dir, &scenario))
-    {
-        None => None,
-        Some(Ok(replay)) => Some(replay),
-        Some(Err(e)) => {
-            eprintln!(
-                "cannot replay {}: {e}",
-                args.replay.as_ref().unwrap().display()
-            );
-            return AppExit::from_code(1);
-        }
-    };
-    if let Some(replay) = &replay {
+    let mut replay = replay;
+    if let Some(replay) = &mut replay {
         println!(
             "Replaying {} frames of {}, {} s apart, t = {} to {} s",
             replay.frames(),
-            replay.dir.display(),
+            args.replay.as_ref().unwrap().display(),
             replay.interval,
             replay.t_first,
             replay.t_last
         );
+        let title = scenario
+            .name
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if let Some(path) = &args.save_snapshot {
+            if let Err(e) = replay.save_to(path, &scenario) {
+                eprintln!("cannot write {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
+            println!("Saving the frames to {}", path.display());
+        }
         scenario.name = match replay.clock {
-            Some(clock) => format!(
-                "{}: replay from {} UTC",
-                scenario.name.split(':').next().unwrap_or_default(),
-                &clock.format(0.0)[..16]
-            ),
-            None => format!(
-                "{}: replay",
-                scenario.name.split(':').next().unwrap_or_default()
-            ),
+            Some(clock) => format!("{title}: replay from {} UTC", &clock.format(0.0)[..16]),
+            None => format!("{title}: replay"),
         };
+    } else if args.save_snapshot.is_some() {
+        eprintln!("--save-snapshot needs --replay");
+        return AppExit::from_code(2);
     }
     if let Some(ramp) = args.ramp {
         scenario.forcing.ramp = ramp;

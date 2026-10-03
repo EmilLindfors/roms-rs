@@ -1,17 +1,23 @@
-//! A finished run played back from its VTU output instead of the solver.
+//! A finished run played back from its output instead of the solver.
 //!
-//! `examples/froya_real_data.rs` writes a `froya_NNNN.vtu` frame every `output_minutes`
-//! (`dg_rs::io::write_vtk_swe`): every element's nodes in the solver's order, so the
-//! scenario's own node numbering applies, with `eta`, `u`, `v`, `bathymetry` and the
-//! model time (`TimeValue`), in ASCII. [`Replay::open`] lists the frames of a directory
-//! and checks the first one's nodes and bed against the scenario, which must be built
-//! as the run was (the same mesh, order and bed). [`spawn`] then reads the frames on a
-//! thread of its own, a batch at a time in parallel, and sends them down the solver's
-//! channel ([`SolverMessage`]), so the playback treats a replay as a solver that runs
-//! ahead of the view: the first frame shows at once, and the 15-day Frøya run (385
-//! frames of 18 MB) is read in well under a minute, faster than it is played back.
-//! Between frames the field is linear in time ([`crate::field::Field`]), as between
-//! the solver's snapshots.
+//! Two kinds of output replay:
+//! - A snapshot file (`dg_rs::io::SnapshotWriter`, `.dgsnap`), as
+//!   `examples/froya_real_data.rs snapshot_minutes=N` writes it: f32 η, u, v per node,
+//!   with the mesh, the bed, the clock and the stations in its header. The scenario is
+//!   built from the file alone ([`Scenario::from_snapshot`]), so the run's domain data
+//!   and builder are not needed.
+//! - A directory of VTU frames (`froya_NNNN.vtu`, `dg_rs::io::write_vtk_swe`): every
+//!   element's nodes in the solver's order, with `eta`, `u`, `v`, `bathymetry` and the
+//!   model time (`TimeValue`), in ASCII. These carry no mesh connectivity, so the
+//!   scenario is built as the run was (Frøya), and [`Replay::vtu`] checks the first
+//!   frame's nodes and bed against it. `--save-snapshot` writes the frames to a
+//!   snapshot file while they are read, a tenth of their size.
+//!
+//! [`spawn`] reads the frames on a thread of its own (VTU a batch at a time in
+//! parallel) and sends them down the solver's channel ([`SolverMessage`]), so the
+//! playback treats a replay as a solver that runs ahead of the view: the first frame
+//! shows at once. Between frames the field is linear in time
+//! ([`crate::field::Field`]), as between the solver's snapshots.
 
 use std::error::Error;
 use std::fs::File;
@@ -20,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
+use dg_rs::io::{SnapshotFrame, SnapshotReader, SnapshotWriter};
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
 use rayon::prelude::*;
@@ -32,26 +39,35 @@ use crate::solver::{H_DRY, Snapshot, SolverMessage};
 /// files carry ten significant digits, ≈ 1e-6 m over a domain tens of km wide.
 const TOLERANCE: f64 = 1e-3;
 
+/// Where the frames are.
+enum Frames {
+    /// VTU files, in time order
+    Vtu(Vec<PathBuf>),
+    /// A snapshot file, and its number of frames when opened
+    Snapshot(Box<SnapshotReader>, usize),
+}
+
 /// The frames of a finished run.
 pub struct Replay {
-    pub dir: PathBuf,
-    /// The frame files, in time order
-    files: Vec<PathBuf>,
+    frames: Frames,
     /// Model time of the first and the last frame (s)
     pub t_first: f64,
     pub t_last: f64,
     /// Model time between frames (s)
     pub interval: f64,
-    /// The run's clock (UTC of model time 0), from the `Clock:` line of its `run.log`
+    /// The run's clock (UTC of model time 0)
     pub clock: Option<ModelClock>,
     /// The scenario's bed at the nodes, for the dry nodes
     bed: Vec<f64>,
+    /// Where the frames are also written as they are read
+    save: Option<SnapshotWriter>,
 }
 
 impl Replay {
     /// The `*.vtu` frames in `dir` (in file-name order, which is time order for
-    /// zero-padded numbers), checked against `scenario`.
-    pub fn open(dir: &Path, scenario: &Scenario) -> Result<Self, Box<dyn Error>> {
+    /// zero-padded numbers), checked against `scenario`. The clock is that of the
+    /// run's `run.log` (its `Clock:` line), if it has one.
+    pub fn vtu(dir: &Path, scenario: &Scenario) -> Result<Self, Box<dyn Error>> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|e| e == "vtu"))
@@ -113,75 +129,174 @@ impl Replay {
             None => 0.0,
         };
         Ok(Self {
-            dir: dir.to_path_buf(),
+            frames: Frames::Vtu(files),
             t_first,
             t_last,
             interval,
             clock: run_clock(&dir.join("run.log")),
             bed: scenario.bathymetry.data.clone(),
-            files,
+            save: None,
         })
     }
 
+    /// The snapshot file at `path`, and the scenario of its header.
+    pub fn snapshot(path: &Path) -> Result<(Self, Scenario), Box<dyn Error>> {
+        let mut reader = SnapshotReader::open(path)?;
+        let n = reader.n_frames()?;
+        if n == 0 {
+            return Err("the file has no frames yet".into());
+        }
+        let t_first = reader.time(0)?;
+        let t_last = reader.time(n - 1)?;
+        let interval = if n > 1 {
+            reader.time(1)? - t_first
+        } else {
+            0.0
+        };
+        let header = reader.header().clone();
+        let clock = header.clock;
+        let scenario = Scenario::from_snapshot(header);
+        let replay = Self {
+            frames: Frames::Snapshot(Box::new(reader), n),
+            t_first,
+            t_last,
+            interval,
+            clock,
+            bed: scenario.bathymetry.data.clone(),
+            save: None,
+        };
+        Ok((replay, scenario))
+    }
+
+    /// Also write the frames to the snapshot file `path` as they are read, with the
+    /// scenario's mesh and bed, the clock, the title and the point of interest.
+    pub fn save_to(&mut self, path: &Path, scenario: &Scenario) -> Result<(), Box<dyn Error>> {
+        let poi = format!("{:.1},{:.1}", scenario.farm[0], scenario.farm[1]);
+        let title = scenario.name.split(':').next().unwrap_or_default();
+        self.save = Some(SnapshotWriter::create(
+            path,
+            &scenario.mesh,
+            &scenario.ops,
+            &scenario.bathymetry.data,
+            self.clock.as_ref(),
+            &[
+                ("title", title),
+                ("source", "dg-viz --save-snapshot"),
+                ("point_of_interest", &poi),
+            ],
+            H_DRY as f64,
+        )?);
+        Ok(())
+    }
+
     pub fn frames(&self) -> usize {
-        self.files.len()
+        match &self.frames {
+            Frames::Vtu(files) => files.len(),
+            Frames::Snapshot(_, n) => *n,
+        }
     }
 }
 
-/// Read the frames on a thread of its own, `threads` files at a time; they arrive on
-/// the returned channel in time order, then [`SolverMessage::Finished`] with the
-/// number of frames as its steps.
+/// Read the frames on a thread of its own (VTU files `threads` at a time); they
+/// arrive on the returned channel in time order, then [`SolverMessage::Finished`]
+/// with the number of frames as its steps.
 pub fn spawn(replay: Replay, threads: usize) -> Receiver<SolverMessage> {
     let (tx, rx) = channel();
     std::thread::Builder::new()
         .name("dg-viz replay".into())
         .spawn(move || {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .thread_name(|i| format!("dg-viz replay {i}"))
-                .build()
-                .expect("replay thread pool");
             let started = Instant::now();
-            for batch in replay.files.chunks(threads.max(1)) {
-                let frames: Vec<_> = pool.install(|| {
-                    batch
-                        .par_iter()
-                        .map(|path| {
-                            frame(path, &replay.bed).map_err(|e| format!("{}: {e}", path.display()))
-                        })
-                        .collect()
-                });
-                for frame in frames {
-                    let message = match frame {
-                        Ok(snapshot) => SolverMessage::Snapshot(Box::new(snapshot)),
-                        Err(e) => {
-                            let _ = tx.send(SolverMessage::Finished {
-                                steps: 0,
-                                wall: started.elapsed().as_secs_f64(),
-                                error: Some(e),
-                            });
-                            return;
-                        }
-                    };
-                    // Fails only once the viewer has closed
-                    if tx.send(message).is_err() {
-                        return;
-                    }
-                }
-            }
+            let n = replay.frames();
+            let error = read_all(replay, threads, |snapshot| {
+                tx.send(SolverMessage::Snapshot(Box::new(snapshot))).is_ok()
+            })
+            .err();
             let _ = tx.send(SolverMessage::Finished {
-                steps: replay.files.len(),
+                steps: n,
                 wall: started.elapsed().as_secs_f64(),
-                error: None,
+                error,
             });
         })
         .expect("spawn the replay thread");
     rx
 }
 
-/// One frame as a snapshot: η, and (u, v) where the water is deeper than [`H_DRY`]
-/// over the bed, as the solver's snapshots have them.
-fn frame(path: &Path, bed: &[f64]) -> Result<Snapshot, Box<dyn Error>> {
+/// Hand every frame to `send` in time order (saving it too if asked), until `send`
+/// returns false (the viewer has closed).
+fn read_all(
+    mut replay: Replay,
+    threads: usize,
+    mut send: impl FnMut(Snapshot) -> bool,
+) -> Result<(), String> {
+    let mut deliver = |snapshot: Snapshot, save: &mut Option<SnapshotWriter>| {
+        if let Some(writer) = save {
+            writer
+                .write_fields(snapshot.t, &snapshot.eta, &snapshot.u, &snapshot.v)
+                .map_err(|e| format!("saving the snapshot file: {e}"))?;
+        }
+        Ok::<bool, String>(send(snapshot))
+    };
+    match replay.frames {
+        Frames::Vtu(files) => {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .thread_name(|i| format!("dg-viz replay {i}"))
+                .build()
+                .map_err(|e| e.to_string())?;
+            for batch in files.chunks(threads.max(1)) {
+                let frames: Vec<_> = pool.install(|| {
+                    batch
+                        .par_iter()
+                        .map(|path| {
+                            vtu_frame(path, &replay.bed)
+                                .map_err(|e| format!("{}: {e}", path.display()))
+                        })
+                        .collect()
+                });
+                for frame in frames {
+                    if !deliver(frame?, &mut replay.save)? {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        Frames::Snapshot(mut reader, n) => {
+            let mut frame = SnapshotFrame::default();
+            for i in 0..n {
+                reader
+                    .read_frame_into(i, &mut frame)
+                    .map_err(|e| format!("frame {i}: {e}"))?;
+                let snapshot = snapshot(frame.t, &frame.eta, &frame.u, &frame.v, &replay.bed);
+                if !deliver(snapshot, &mut replay.save)? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The viewer's snapshot of η and (u, v), the velocity zeroed where the water is no
+/// deeper than [`H_DRY`] over the bed, as the solver's snapshots have it.
+fn snapshot<T: Copy + Into<f64>>(t: f64, eta: &[T], u: &[T], v: &[T], bed: &[f64]) -> Snapshot {
+    let wet = |i: usize| eta[i].into() - bed[i] > H_DRY as f64;
+    let velocity = |c: &[T]| {
+        (0..bed.len())
+            .map(|i| if wet(i) { c[i].into() as f32 } else { 0.0 })
+            .collect()
+    };
+    Snapshot {
+        t,
+        eta: eta.iter().map(|&x| x.into() as f32).collect(),
+        u: velocity(u),
+        v: velocity(v),
+        particles: ParticleSnapshot::default(),
+        layers: None,
+    }
+}
+
+/// One VTU frame as a snapshot.
+fn vtu_frame(path: &Path, bed: &[f64]) -> Result<Snapshot, Box<dyn Error>> {
     let text = std::fs::read_to_string(path)?;
     let n = bed.len();
     let field = |name: &str| -> Result<Vec<f64>, Box<dyn Error>> {
@@ -192,20 +307,7 @@ fn frame(path: &Path, bed: &[f64]) -> Result<Snapshot, Box<dyn Error>> {
         Ok(values)
     };
     let (eta, u, v) = (field("eta")?, field("u")?, field("v")?);
-    let wet = |i: usize| eta[i] - bed[i] > H_DRY as f64;
-    let velocity = |c: &[f64]| {
-        (0..n)
-            .map(|i| if wet(i) { c[i] as f32 } else { 0.0 })
-            .collect()
-    };
-    Ok(Snapshot {
-        t: time_value(&text)?,
-        eta: eta.iter().map(|&x| x as f32).collect(),
-        u: velocity(&u),
-        v: velocity(&v),
-        particles: ParticleSnapshot::default(),
-        layers: None,
-    })
+    Ok(snapshot(time_value(&text)?, &eta, &u, &v, bed))
 }
 
 /// The body of a data array: the text from the first `>` after `key` (an attribute of
