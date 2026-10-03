@@ -1707,11 +1707,8 @@ fn wave_cost(domain: &Domain, opts: &Options) {
     let dt_geographic = element_dt.iter().cloned().fold(f64::INFINITY, f64::min);
     // Every element at its own step against all at the smallest: the most
     // local time stepping could save (power-of-two levels save a little less)
-    let multirate = element_dt.len() as f64
-        / element_dt
-            .iter()
-            .map(|dt| dt_geographic / dt)
-            .sum::<f64>();
+    let multirate =
+        element_dt.len() as f64 / element_dt.iter().map(|dt| dt_geographic / dt).sum::<f64>();
     println!(
         "  elements' own geographic steps {dt_geographic:.3}–{:.1} s: local time stepping could \
          save up to {multirate:.1}×",
