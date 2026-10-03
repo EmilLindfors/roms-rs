@@ -27,6 +27,25 @@
 //!   threads, so play it back at `--rate 30` or below to keep up with the solver.
 //!   The channel runs in 3D, from rest with the tide ramped up over an hour; its
 //!   particles start at once, three kinds per cage.
+//! - `--replay FILE|DIR` play back a run instead of running the solver ([`replay`]),
+//!   shown linear in time between its frames; the rate defaults to an hour per
+//!   second, and the status shows the run's UTC date when the run has a clock.
+//!   - A snapshot file (`froya_real_data snapshot_minutes=N` writes
+//!     `<output>/froya.dgsnap`) carries its mesh and bed: no scenario is built, and
+//!     the close-up is its first station.
+//!   - A directory of VTU frames, the `froya_NNNN.vtu` of `examples/froya_real_data.rs`
+//!     with `mesh=data/froya_coast.msh`, e.g. `--replay ../output/froya_15d_k1o1`. The
+//!     scenario (Frøya unless `--scenario` says otherwise) must be built as the run
+//!     was: the frames' nodes and bed are checked against it. Frames are read in
+//!     parallel on `--threads`; the clock comes from the run's `run.log`.
+//! - `--save-snapshot FILE` write the snapshots shown to a snapshot file (with the
+//!   mesh, bed, cages and, in 3D, the σ-grid and u, v, T on every level): a live run as
+//!   it runs, or the frames of a `--replay` as they are read (a tenth of VTU frames'
+//!   size). `--replay FILE` replays it later without the scenario's data.
+//! - `--gauge FILE` a tide-gauge record (`scripts/kartverket_gauge.sh` format, e.g.
+//!   `../data/tide_gauges/mausund_obs.txt`) drawn against the model's surface at the
+//!   close-up point in the trace (top right, G; [`trace`]); it needs the run's clock,
+//!   so a replay's or a `--start`-dated run's
 //! - `--sigma N` σ-levels of a 3D run [16]; `--start TIME` the UTC instant of model
 //!   time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
 //!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
@@ -39,7 +58,7 @@
 //! - `--hours H` model hours to run [25]; `--interval S` model seconds between
 //!   snapshots [60]; `--threads N` solver threads [all but two cores]
 //! - `--memory MB` snapshots kept, oldest dropped first [2048]
-//! - `--rate R` model seconds shown per second [60]
+//! - `--rate R` model seconds shown per second [60; 3600 in a replay]
 //! - `--vz Z` vertical exaggeration [3]; `--speed-max V` fix the speed scale (m/s)
 //!   instead of letting it follow the flow in round steps
 //! - `--water-alpha A` opacity of the translucent water, 0.05–0.95 [0.4]; lower shows
@@ -70,9 +89,11 @@ mod hud;
 mod layers;
 mod particles;
 mod playback;
+mod replay;
 mod scenario;
 mod solver;
 mod surface;
+mod trace;
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -87,16 +108,21 @@ use cages::{CageLayout, CagesPlugin};
 use camera::{CameraPlugin, OrbitCamera, Views};
 use contours::ContoursPlugin;
 use field::{Field, Frame, Nodes, Probe, ShownLayer};
-use hud::{HudPlugin, Title};
+use hud::{HudPlugin, RunClock, Title};
 use layers::{LayersPlugin, Levels, Section, SectionShows};
 use particles::{Lice, ParticleConfig, ParticlesPlugin, Periodic};
-use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState};
+use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState, Source};
+use replay::Replay;
 use scenario::Scenario;
 use solver::SolverConfig;
 use surface::{Colouring, SurfacePlugin, WaterOpacity};
+use trace::{Trace, TracePlugin};
 
 struct Args {
-    scenario: String,
+    scenario: Option<String>,
+    replay: Option<PathBuf>,
+    save_snapshot: Option<PathBuf>,
+    gauge: Option<PathBuf>,
     mesh: Option<PathBuf>,
     order: usize,
     levels: usize,
@@ -104,7 +130,7 @@ struct Args {
     interval: f64,
     threads: usize,
     memory_mb: usize,
-    rate: f64,
+    rate: Option<f64>,
     vz: f32,
     speed_max: Option<f32>,
     water_alpha: f32,
@@ -123,7 +149,10 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut args = Self {
-            scenario: "fjord".into(),
+            scenario: None,
+            replay: None,
+            save_snapshot: None,
+            gauge: None,
             mesh: None,
             order: 2,
             levels: 8,
@@ -132,7 +161,7 @@ impl Args {
             threads: std::thread::available_parallelism()
                 .map_or(1, |n| n.get().saturating_sub(2).max(1)),
             memory_mb: 2048,
-            rate: 60.0,
+            rate: None,
             vz: 3.0,
             speed_max: None,
             water_alpha: WaterOpacity::default().0,
@@ -156,7 +185,10 @@ impl Args {
         while let Some(flag) = it.next() {
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
-                "--scenario" => args.scenario = value,
+                "--scenario" => args.scenario = Some(value),
+                "--replay" => args.replay = Some(value.into()),
+                "--gauge" => args.gauge = Some(value.into()),
+                "--save-snapshot" => args.save_snapshot = Some(value.into()),
                 "--mesh" => args.mesh = Some(value.into()),
                 "--order" => args.order = num(&flag, &value)?,
                 "--levels" => args.levels = num(&flag, &value)?,
@@ -164,7 +196,7 @@ impl Args {
                 "--interval" => args.interval = num(&flag, &value)?,
                 "--threads" => args.threads = num(&flag, &value)?,
                 "--memory" => args.memory_mb = num(&flag, &value)?,
-                "--rate" => args.rate = num(&flag, &value)?,
+                "--rate" => args.rate = Some(num(&flag, &value)?),
                 "--vz" => args.vz = num(&flag, &value)?,
                 "--speed-max" => args.speed_max = Some(num(&flag, &value)?),
                 "--water-alpha" => {
@@ -248,47 +280,127 @@ fn main() -> AppExit {
         }
     };
     let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-    let built = match args.scenario.as_str() {
-        "fjord" => {
-            let mesh = args
-                .mesh
-                .clone()
-                .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm.msh"));
-            Scenario::fjord_farm(&mesh, args.order)
+    // A snapshot file holds its own domain; VTU frames are of a Frøya run unless
+    // told otherwise
+    let snapshot_file = args.replay.as_deref().filter(|p| p.is_file());
+    let (mut scenario, replay) = if let Some(path) = snapshot_file {
+        match Replay::snapshot(path) {
+            Ok((replay, scenario)) => (scenario, Some(replay)),
+            Err(e) => {
+                eprintln!("cannot replay {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
         }
-        "froya" => {
-            let data = repo.join("data");
-            let mesh = args
-                .mesh
-                .clone()
-                .unwrap_or_else(|| data.join("froya_coast.msh"));
-            println!(
-                "Building Frøya from {} (the bed projection takes a while)...",
-                data.display()
-            );
-            Scenario::froya(
-                &mesh,
-                &data.join("froya_topobathy.tif"),
-                &data.join("froya_boundary_tides.txt"),
-                args.order,
-                args.hours * 3600.0,
-            )
-        }
-        "channel" => match ModelClock::parse(&args.start) {
-            Ok(clock) => Ok(Scenario::farm_channel(args.order, args.sigma, clock)),
-            Err(e) => Err(format!("--start {}: {e}", args.start).into()),
-        },
-        other => {
-            eprintln!("unknown scenario {other}: fjord, froya or channel");
-            return AppExit::from_code(2);
-        }
+    } else {
+        let scenario_name = args.scenario.clone().unwrap_or_else(|| {
+            if args.replay.is_some() {
+                "froya"
+            } else {
+                "fjord"
+            }
+            .into()
+        });
+        let built = match scenario_name.as_str() {
+            "fjord" => {
+                let mesh = args
+                    .mesh
+                    .clone()
+                    .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm.msh"));
+                Scenario::fjord_farm(&mesh, args.order)
+            }
+            "froya" => {
+                let data = repo.join("data");
+                let mesh = args
+                    .mesh
+                    .clone()
+                    .unwrap_or_else(|| data.join("froya_coast.msh"));
+                println!(
+                    "Building Frøya from {} (the bed projection takes a while)...",
+                    data.display()
+                );
+                Scenario::froya(
+                    &mesh,
+                    &data.join("froya_topobathy.tif"),
+                    &data.join("froya_boundary_tides.txt"),
+                    args.order,
+                    args.hours * 3600.0,
+                )
+            }
+            "channel" => match ModelClock::parse(&args.start) {
+                Ok(clock) => Ok(Scenario::farm_channel(args.order, args.sigma, clock)),
+                Err(e) => Err(format!("--start {}: {e}", args.start).into()),
+            },
+            other => {
+                eprintln!("unknown scenario {other}: fjord, froya or channel");
+                return AppExit::from_code(2);
+            }
+        };
+        let scenario = match built {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("cannot build the {scenario_name} scenario: {e}");
+                return AppExit::from_code(1);
+            }
+        };
+        let replay = match args.replay.as_deref().map(|d| Replay::vtu(d, &scenario)) {
+            None => None,
+            Some(Ok(replay)) => Some(replay),
+            Some(Err(e)) => {
+                eprintln!(
+                    "cannot replay {}: {e}",
+                    args.replay.as_ref().unwrap().display()
+                );
+                return AppExit::from_code(1);
+            }
+        };
+        (scenario, replay)
     };
-    let mut scenario = match built {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot build the {} scenario: {e}", args.scenario);
-            return AppExit::from_code(1);
+    let mut replay = replay;
+    if let Some(replay) = &mut replay {
+        println!(
+            "Replaying {} frames of {}, {} s apart, t = {} to {} s",
+            replay.frames(),
+            args.replay.as_ref().unwrap().display(),
+            replay.interval,
+            replay.t_first,
+            replay.t_last
+        );
+        let title = scenario
+            .name
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        if let Some(path) = &args.save_snapshot {
+            if let Err(e) = replay.save_to(path, &scenario) {
+                eprintln!("cannot write {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
+            println!("Saving the frames to {}", path.display());
         }
+        scenario.name = match replay.clock {
+            Some(clock) => format!("{title}: replay from {} UTC", &clock.format(0.0)[..16]),
+            None => format!("{title}: replay"),
+        };
+    }
+    // A live run saved as it runs
+    let live_save = match (&replay, &args.save_snapshot) {
+        (None, Some(path)) => match replay::SnapshotSink::create(
+            path,
+            &scenario,
+            scenario.clock.as_ref(),
+            args.particles.per_release > 0,
+        ) {
+            Ok(sink) => {
+                println!("Saving the run to {}", path.display());
+                Some(sink)
+            }
+            Err(e) => {
+                eprintln!("cannot write {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
+        },
+        _ => None,
     };
     if let Some(ramp) = args.ramp {
         scenario.forcing.ramp = ramp;
@@ -395,18 +507,81 @@ fn main() -> AppExit {
     };
     let periodic = Periodic(scenario.periodic.map(|p| p.map(|x| x as f32)));
 
-    let t_end = args.hours * 3600.0;
-    let channel = solver::spawn(
-        &scenario,
-        SolverConfig {
-            t_end,
-            interval: args.interval,
-            levels: args.levels,
-            threads: args.threads,
-            drag: args.drag,
-            particles: args.particles,
+    // The model times the gauge trace covers
+    let mut span = [0.0, args.hours * 3600.0];
+    let (channel, source, t_end, interval, rate, run_clock) = match replay {
+        Some(replay) => {
+            let source = Source::Replay {
+                name: args
+                    .replay
+                    .as_ref()
+                    .and_then(|d| d.file_name())
+                    .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
+                frames: replay.frames(),
+                t_last: replay.t_last,
+            };
+            let (t_end, interval, clock) = (replay.t_last, replay.interval, replay.clock);
+            span = [replay.t_first, replay.t_last];
+            (
+                replay::spawn(replay, args.threads),
+                source,
+                t_end,
+                interval,
+                args.rate.unwrap_or(3600.0),
+                clock,
+            )
+        }
+        None => {
+            let t_end = args.hours * 3600.0;
+            let channel = solver::spawn(
+                &scenario,
+                SolverConfig {
+                    t_end,
+                    interval: args.interval,
+                    levels: args.levels,
+                    threads: args.threads,
+                    drag: args.drag,
+                    particles: args.particles,
+                },
+                live_save,
+            );
+            let rate = args.rate.unwrap_or(60.0);
+            let clock = scenario.clock;
+            (channel, Source::Solver, t_end, args.interval, rate, clock)
+        }
+    };
+
+    let gauge = match &args.gauge {
+        None => None,
+        Some(path) => match dg_rs::io::read_tide_gauge_file(path) {
+            Ok(file) => {
+                let name = file.station.as_ref().map_or_else(
+                    || {
+                        path.file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    },
+                    |s| s.name.clone(),
+                );
+                let record = file
+                    .time_series
+                    .data
+                    .iter()
+                    .map(|p| (p.time, p.value))
+                    .collect();
+                Some((name, record))
+            }
+            Err(e) => {
+                eprintln!("cannot read the gauge {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
         },
-    );
+    };
+    if gauge.is_some() && run_clock.is_none() {
+        eprintln!("--gauge needs the run's clock: the gauge is not drawn");
+    }
+    let trace = Trace::new(&scenario, &locator, span, gauge, run_clock);
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -434,12 +609,10 @@ fn main() -> AppExit {
     .insert_resource(Colouring::new(args.speed_max))
     .insert_resource(WaterOpacity(args.water_alpha))
     .insert_resource(Title(scenario.name.clone()))
-    .insert_resource(Playback::new(
-        args.rate,
-        args.interval,
-        args.memory_mb << 20,
-    ))
+    .insert_resource(trace)
+    .insert_resource(Playback::new(rate, interval, args.memory_mb << 20))
     .insert_resource(SolverChannel(Mutex::new(channel)))
+    .insert_resource(source)
     .insert_resource(Capture {
         path: args.screenshot,
         at: args.at.unwrap_or(t_end),
@@ -454,6 +627,7 @@ fn main() -> AppExit {
         ParticlesPlugin,
         CameraPlugin,
         HudPlugin,
+        TracePlugin,
     ))
     .add_systems(Startup, move |mut commands: Commands| {
         commands.spawn((
@@ -479,6 +653,9 @@ fn main() -> AppExit {
     .add_systems(Update, field::interpolate)
     .add_systems(Update, capture.after(field::interpolate))
     .add_systems(Last, playback::settle);
+    if let Some(clock) = run_clock {
+        app.insert_resource(RunClock(clock));
+    }
     if let Some((levels, section)) = column {
         app.insert_resource(levels)
             .insert_resource(section)

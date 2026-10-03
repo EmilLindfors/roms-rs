@@ -56,8 +56,16 @@
 //!     --example farm_3d -- [hours=3] [order=2] [levels=16] [dx=60] [nu=1] [cs=0.2] \
 //!     [particles=0] [release=2] [particle_seconds=60] [kh=0.1] \
 //!     [lice=ladim] [start=2025-06-15T00:00:00Z] [wind=0] [waves=0] [closure=k-epsilon] \
-//!     [limiter=none] [tvadv=limited-akima] [runs=all]
+//!     [limiter=none] [tvadv=limited-akima] [runs=all] \
+//!     [snapshot=<file.dgsnap>] [snapshot_minutes=10]
 //! ```
+//!
+//! `snapshot=` writes the 3D run with cages to a snapshot file
+//! (`io::SnapshotWriter::create_3d`: η, ū, v̄ and u, v, T, S on every level
+//! every `snapshot_minutes`, with the mesh, σ-grid, clock, cages and a
+//! section through the first cage), and with `particles=` the particles
+//! beside it (`<file>.dgpart`, `io::ParticleFileWriter`), which the viewer
+//! replays: `cd viz && cargo run --release -- --replay <file.dgsnap>`.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
@@ -66,6 +74,7 @@ use std::time::Instant;
 
 use dg_rs::boundary::Reflective2D;
 use dg_rs::equations::ShallowWater2D;
+use dg_rs::io::{ParticleFileWriter, ParticleFrame, SnapshotWriter, status_code};
 use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::mesh::{Mesh2D, PointLocator2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
@@ -172,6 +181,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_or("2025-06-15T00:00:00Z", String::as_str),
     )?;
     let light = ClearSkyLight::new(clock, SITE[0], SITE[1]);
+    let snapshot_path = args.get("snapshot").cloned();
+    let snapshot_seconds = get("snapshot_minutes", 10.0)? * 60.0;
     let lice = match args.get("lice").map_or("ladim", String::as_str) {
         "ladim" => Some(SalmonLice::ladim(light)),
         "johnsen" => Some(SalmonLice::johnsen_2014(light)),
@@ -344,10 +355,76 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tracking = (with_cages && particles_per_kind > 0)
             .then(|| FarmParticles::new(&mesh, &ops, particles_per_kind, release_time, kh, lice));
         let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
+        // The run with cages to the snapshot file, if asked
+        let mut snapshot = match snapshot_path.as_ref().filter(|_| with_cages) {
+            Some(path) => {
+                let farm = [
+                    0.5 * (CAGES[0][0] + CAGES[1][0]),
+                    0.5 * (CAGES[0][1] + CAGES[1][1]),
+                ];
+                let cage_lines: Vec<String> = cages
+                    .iter()
+                    .zip(CAGES)
+                    .map(|(c, [x, y])| {
+                        format!("{x},{y},{RADIUS},{NET_DEPTH},{}", c.drag_per_length)
+                    })
+                    .collect();
+                let poi = format!("{},{}", farm[0], farm[1]);
+                // Along the flow through the first cage
+                let (x0, y0) = (CAGES[0][0], CAGES[0][1]);
+                let section = format!("{},{y0},{},{y0}", x0 - 600.0, x0 + 600.0);
+                let periodic = format!("{LX},inf");
+                let mut metadata = vec![
+                    (
+                        "title",
+                        "Farm channel, 3D: M2 0.5 m/s, 2 C thermocline at 10 m",
+                    ),
+                    ("source", "farm_3d"),
+                    ("point_of_interest", poi.as_str()),
+                    ("section", section.as_str()),
+                    ("periodic", periodic.as_str()),
+                ];
+                metadata.extend(cage_lines.iter().map(|c| ("cage", c.as_str())));
+                let writer = SnapshotWriter::create_3d(
+                    path,
+                    &mesh,
+                    &ops,
+                    &bathymetry.data,
+                    &sigma,
+                    Some(&clock),
+                    &metadata,
+                )
+                .map_err(|e| format!("{path}: {e}"))?;
+                // The particles beside it, at the same times
+                let particles = match &tracking {
+                    Some(_) => {
+                        let path = std::path::Path::new(path).with_extension("dgpart");
+                        let kinds: Vec<&str> = KINDS.iter().map(|k| k.0).collect();
+                        Some(
+                            ParticleFileWriter::create(&path, &kinds, &[("source", "farm_3d")])
+                                .map_err(|e| format!("{}: {e}", path.display()))?,
+                        )
+                    }
+                    None => None,
+                };
+                let mut writers = (writer, particles);
+                write_frame(&mut writers, &state, 0.0, tracking.as_ref(), &bathymetry)?;
+                println!("{label:>9}: snapshots every {snapshot_seconds} s to {path}");
+                Some(writers)
+            }
+            None => None,
+        };
+        let (mut next_snapshot, mut last_snapshot) = (snapshot_seconds, 0.0);
+        let mut snapshot_error = None;
         let interval = if tracking.is_some() {
             particle_seconds
         } else {
             1800.0
+        };
+        let interval = if snapshot.is_some() {
+            interval.min(snapshot_seconds)
+        } else {
+            interval
         };
         sim = sim.with_callback_interval(interval);
         // The mixing over each half hour, the range of T, and the volume and
@@ -371,6 +448,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(tracking) = tracking.as_mut() {
                 tracking.advance(s, t, &sigma, &bathymetry);
             }
+            // Callbacks land at the first step past each interval: a frame at
+            // the first callback past each snapshot time
+            if let Some(writers) = snapshot.as_mut()
+                && t >= next_snapshot - 1e-6
+            {
+                if let Err(e) = write_frame(writers, s, t, tracking.as_ref(), &bathymetry) {
+                    snapshot_error.get_or_insert(e);
+                }
+                last_snapshot = t;
+                while next_snapshot <= t + 1e-6 {
+                    next_snapshot += snapshot_seconds;
+                }
+            }
             if t - last.0 >= 1800.0 - 1e-6 {
                 density.clone_from(s);
                 eos.update_density(&mut density);
@@ -392,6 +482,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 last = (t, reference);
             }
         });
+        // The end of the run, unless a frame already holds it (the particles
+        // moved on to it first)
+        if let Some(writers) = snapshot.as_mut()
+            && result.final_time > last_snapshot + 1e-6
+        {
+            if let Some(tracking) = tracking.as_mut() {
+                tracking.advance(&state, result.final_time, &sigma, &bathymetry);
+            }
+            if let Err(e) = write_frame(
+                writers,
+                &state,
+                result.final_time,
+                tracking.as_ref(),
+                &bathymetry,
+            ) {
+                snapshot_error.get_or_insert(e);
+            }
+        }
+        if let Some(e) = snapshot_error {
+            return Err(format!("{label}: the snapshot file: {e}"));
+        }
         if let Some(tracking) = &tracking {
             tracking.report(&state, &sigma, &bathymetry);
         }
@@ -550,6 +661,25 @@ const KINDS: [(&str, f64, [f64; 2]); 3] = [
 /// Index of the larvae in [`KINDS`].
 const LARVAE: usize = 0;
 
+/// A snapshot frame of `state` at `t`, and the particles' frame beside it.
+fn write_frame(
+    (fields, particles): &mut (SnapshotWriter, Option<ParticleFileWriter>),
+    state: &Solution3D,
+    t: f64,
+    tracking: Option<&FarmParticles>,
+    bed: &Bathymetry2D,
+) -> Result<(), String> {
+    fields
+        .write_solution_3d(t, state)
+        .map_err(|e| e.to_string())?;
+    if let (Some(writer), Some(tracking)) = (particles.as_mut(), tracking) {
+        writer
+            .write(&tracking.frame(state, t, bed))
+            .map_err(|e| format!("particles: {e}"))?;
+    }
+    Ok(())
+}
+
 /// Particles released from the cages and tracked online in the 3D flow.
 struct FarmParticles<'a> {
     tracker: ParticleTracker3D<'a>,
@@ -594,6 +724,36 @@ impl<'a> FarmParticles<'a> {
 
     fn released(&self) -> usize {
         self.particles.iter().map(Vec::len).sum()
+    }
+
+    /// Every particle released by `t`, kind by kind, at its height in `state`.
+    fn frame(&self, state: &Solution3D, t: f64, bed: &Bathymetry2D) -> ParticleFrame {
+        let mut frame = ParticleFrame {
+            t,
+            ..Default::default()
+        };
+        let mut weights = vec![0.0; self.ops.n_nodes];
+        for (kind, particles) in self.particles.iter().enumerate() {
+            for p in particles {
+                let point = p.point();
+                self.ops
+                    .interpolation_weights_into(point.r, point.s, &mut weights);
+                let (k, n) = (point.element.as_usize(), self.ops.n_nodes);
+                let eta = &state.eta.data[k * n..(k + 1) * n];
+                let (mut e, mut b) = (0.0, 0.0);
+                for (i, (w, z)) in weights.iter().zip(bed.element(point.element)).enumerate() {
+                    e += w * eta[i];
+                    b += w * z;
+                }
+                let [x, y] = p.position();
+                frame.xy.push([x as f32, y as f32]);
+                frame.z.push((e + p.sigma() * (e - b).max(0.0)) as f32);
+                frame.status.push(status_code(p.status()));
+                frame.kind.push(kind as u8);
+                frame.born.push(self.release_time as f32);
+            }
+        }
+        frame
     }
 
     /// `n` particles of each kind in each cage: a sunflower pattern over

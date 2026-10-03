@@ -85,7 +85,8 @@
 //!
 //! ```bash
 //! cargo run --release --example froya_real_data -- [nx=120] [ny=90] [order=2] \
-//!     [hours=12.42] [rest_hours=1] [ramp_hours=1] [output_minutes=60] [wind] \
+//!     [hours=12.42] [rest_hours=1] [ramp_hours=1] [output_minutes=60] \
+//!     [snapshot_minutes=0] [wind] \
 //!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>] \
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [currents=<file,…>] \
 //!     [station_atlas=data/froya_station_tides.txt] \
@@ -96,6 +97,13 @@
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw]
 //! ```
+//!
+//! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
+//! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
+//! the mesh, bed, clock and stations), a tenth of the VTU frames' size. The
+//! viewer replays it without rebuilding the domain:
+//! `cd viz && cargo run --release -- --replay ../output/froya/froya.dgsnap`.
+//! With stations, N is rounded to a multiple of `station_minutes`.
 //!
 //! `rx0=r` smooths the bed, keeping its volume, until the slope factor
 //! r_x0 = |h₁ − h₂|/(h₁ + h₂) between neighbouring nodes at least
@@ -159,8 +167,8 @@ use dg_rs::io::{
 };
 use dg_rs::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection, TideGaugeFile, east_axis, read_adcp_file, read_tide_gauge_file,
-    write_adcp_file, write_tide_gauge_file, write_vtk_swe,
+    LocalProjection, SnapshotWriter, TideGaugeFile, east_axis, read_adcp_file,
+    read_tide_gauge_file, write_adcp_file, write_tide_gauge_file, write_vtk_swe,
 };
 use dg_rs::mesh::{
     Bathymetry2D, BoundaryTag, Mesh2D, MeshPoint, PointLocator2D, inverse_bilinear, read_gmsh_mesh,
@@ -243,6 +251,8 @@ struct Options {
     rest_hours: f64,
     ramp_hours: f64,
     output_minutes: f64,
+    /// Minutes between frames of the snapshot file (`snapshot_minutes=`; 0: none)
+    snapshot_minutes: f64,
     wind: bool,
     start: String,
     tides: String,
@@ -350,6 +360,7 @@ impl Options {
             rest_hours: get("rest_hours", 1.0)?,
             ramp_hours: get("ramp_hours", TIDAL_RAMP_HOURS)?,
             output_minutes: get("output_minutes", 60.0)?,
+            snapshot_minutes: get("snapshot_minutes", 0.0)?,
             land_elevation: get("land_elevation", LAND_ELEVATION)?,
             dem: match args.get("dem").map_or(DEM, String::as_str) {
                 "none" => None,
@@ -1310,14 +1321,58 @@ fn tidal_run(
 
     let mut q = domain.at_rest();
     let volume0 = domain.volume(&q);
-    // Callbacks sample the stations; every `output_every`-th also writes output
-    let (interval, output_every) = if stations.is_empty() {
-        (opts.output_minutes * 60.0, 1)
+    // Callbacks sample the stations; every `output_every`-th also writes
+    // output, every `snapshot_every`-th a snapshot frame
+    let snapshot_minutes = (opts.snapshot_minutes > 0.0).then_some(opts.snapshot_minutes);
+    let base_minutes = if stations.is_empty() {
+        opts.output_minutes
+            .min(snapshot_minutes.unwrap_or(f64::INFINITY))
     } else {
-        let every = (opts.output_minutes / opts.station_minutes)
-            .round()
-            .max(1.0);
-        (opts.station_minutes * 60.0, every as usize)
+        opts.station_minutes
+    };
+    let every = |minutes: f64| (minutes / base_minutes).round().max(1.0) as usize;
+    let (interval, output_every) = (base_minutes * 60.0, every(opts.output_minutes));
+    let snapshot_every = snapshot_minutes.map(every);
+    let mut snapshot = match snapshot_every {
+        Some(every) => {
+            let path = output_dir.join(format!("{}.dgsnap", domain.name));
+            println!(
+                "  Snapshot file: {} every {} min",
+                path.display(),
+                every as f64 * base_minutes
+            );
+            // The stations in mesh coordinates, for the viewer
+            let station_lines: Vec<String> = domain
+                .projection
+                .as_ref()
+                .map(|projection| {
+                    stations
+                        .iter()
+                        .map(|s| {
+                            let (x, y) = projection.geo_to_xy(s.latitude, s.longitude);
+                            format!("{},{x:.1},{y:.1}", s.name)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let title = match domain.projection {
+                // The date is the header's clock
+                Some(_) => "Frøya–Smøla–Hitra",
+                None => "Synthetic basin with an island and a beach",
+            };
+            let mut metadata = vec![("title", title), ("source", "froya_real_data")];
+            metadata.extend(station_lines.iter().map(|s| ("station", s.as_str())));
+            Some(SnapshotWriter::create(
+                path,
+                &domain.mesh,
+                &domain.ops,
+                &domain.bathymetry.data,
+                Some(&clock),
+                &metadata,
+                WetDryConfig::DEFAULT_H_DRY,
+            )?)
+        }
+        None => None,
     };
     let mut n_callbacks = 0;
     let mut frame = 0;
@@ -1328,6 +1383,12 @@ fn tidal_run(
             s.sample(q, &domain.bathymetry, clock.unix(t));
         }
         n_callbacks += 1;
+        if let (Some(writer), Some(every)) = (snapshot.as_mut(), snapshot_every)
+            && (n_callbacks - 1) % every == 0
+            && let Err(e) = writer.write_state(t, q)
+        {
+            write_error.get_or_insert(e.to_string());
+        }
         if (n_callbacks - 1) % output_every != 0 {
             return;
         }
