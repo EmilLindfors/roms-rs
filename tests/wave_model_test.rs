@@ -13,8 +13,8 @@ use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{
-    SourceTerms, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind, group_velocity,
-    wavenumber,
+    SourceTerms, SpectralAdvection, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind,
+    group_velocity, wavenumber,
 };
 
 const G: f64 = 9.81;
@@ -197,7 +197,12 @@ fn shoaling_keeps_the_action_flux() {
 
 /// Oblique incidence (30° from the shore normal) on a shelf from 20 to 4 m deep:
 /// the steady mean direction follows Snell's law, `sin α / c` constant, to the
-/// first order in the direction bins (the refraction is first-order upwind).
+/// first order in the direction bins. The incoming sea is one direction bin, a
+/// spike the bins do not resolve: it leaves its bin through a face whose
+/// turning rate is the face's, O(Δθ) off the bin's, and a limited (TVD)
+/// reconstruction is first order at the extremum, so MUSCL does not help here
+/// (2.13 / 1.04 / 0.52° against upwind's 2.06 / 1.03 / 0.51°). A resolved
+/// spread is second order: [`a_spread_sea_refracts_to_the_exact_steady_state`].
 #[test]
 fn refraction_follows_snells_law() {
     const LX: f64 = 400.0;
@@ -242,9 +247,109 @@ fn refraction_follows_snells_law() {
     assert!(errors[1] < 1.5, "{}° off Snell with 5° bins", errors[1]);
 }
 
+/// A spread sea (cos⁸ about 20° off the shore normal) refracting on the shelf
+/// of [`refraction_follows_snells_law`]. In the steady state of a shelf uniform
+/// along the shore, `k cos θ` is constant along a ray (Snell) and so is the
+/// action density in wavenumber space, `N c_g/k` (Liouville), so the exact
+/// directional spectrum at depth d is `N₀(θ₀) (k c_g₀)/(k₀ c_g)` with
+/// `k₀ cos θ₀ = k cos θ`. The mean direction converges to it at second order
+/// in the direction bins with MUSCL (0.37 / 0.072 / 0.012° at 10 / 5 / 2.5°,
+/// rates 2.4 and 2.5) and at first order with upwind (1.38 / 0.70 / 0.35°).
+#[test]
+fn a_spread_sea_refracts_to_the_exact_steady_state() {
+    const LX: f64 = 400.0;
+    const LY: f64 = 2000.0;
+    let depth = |y: f64| 20.0 - 16.0 * y / LY;
+    let (mean, m) = (70f64.to_radians(), 8.0);
+    let incoming = |theta: f64| {
+        let c = (theta - mean).cos();
+        if c > 0.0 { c.powf(m) } else { 0.0 }
+    };
+    let errors = |scheme: SpectralAdvection| -> Vec<f64> {
+        let mut errors = Vec::new();
+        for n_dir in [36, 72, 144] {
+            let mut mesh = Mesh2D::channel_periodic_x(0.0, LX, 0.0, LY, 1, 20);
+            for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
+                edge.boundary_tag = Some(BoundaryTag::Open);
+            }
+            let grid = SpectralGrid::new(0.12, 0.15, 2, n_dir);
+            let mut e = vec![0.0; grid.n_components()];
+            for j in 0..n_dir {
+                e[grid.component(0, j)] = incoming(grid.theta[j]);
+            }
+            let m = model(mesh, 2, |_, y| -depth(y), grid)
+                .with_boundary_spectrum(&e)
+                .with_spectral_advection(scheme);
+            let sigma = m.grid.sigma[0];
+            let (k0, cg0) = {
+                let k = wavenumber(sigma, depth(0.0), G);
+                (k, group_velocity(sigma, k, depth(0.0)))
+            };
+            let mut n = m.zero_state();
+            // Steady for every direction 20° or more off the shore (those below
+            // carry 1e-3 of the energy)
+            let cg_min = group_velocity(sigma, wavenumber(sigma, 4.0, G), 4.0);
+            run(
+                &m,
+                &mut n,
+                3.0 * LY / (cg_min * 20f64.to_radians().sin()),
+                0.5,
+            );
+            let (xy, params) = (nodes(&m), m.parameters(&n));
+            let mut worst: f64 = 0.0;
+            for p in (0..m.n_points()).filter(|&p| (200.0..1800.0).contains(&xy[p][1])) {
+                let d = depth(xy[p][1]);
+                let k = wavenumber(sigma, d, G);
+                let cg = group_velocity(sigma, k, d);
+                // The exact mean direction, by a fine midpoint rule over (0, π)
+                let (mut a, mut b) = (0.0, 0.0);
+                let fine = 20_000;
+                for q in 0..fine {
+                    let theta = PI * (q as f64 + 0.5) / fine as f64;
+                    let c0 = k / k0 * theta.cos();
+                    if c0.abs() < 1.0 {
+                        let w = incoming(c0.acos()) * k * cg0 / (k0 * cg);
+                        a += w * theta.cos();
+                        b += w * theta.sin();
+                    }
+                }
+                let exact = b.atan2(a);
+                worst = worst.max((params[p].direction - exact).to_degrees().abs());
+            }
+            errors.push(worst);
+        }
+        errors
+    };
+    let rates = |e: &[f64]| -> Vec<f64> { e.windows(2).map(|w| (w[0] / w[1]).log2()).collect() };
+    let (muscl, upwind) = (
+        errors(SpectralAdvection::VanLeer),
+        errors(SpectralAdvection::Upwind),
+    );
+    println!("mean direction off the exact steady state at 10/5/2.5° bins:");
+    println!("  MUSCL {muscl:?}°, rates {:?}", rates(&muscl));
+    println!("  upwind {upwind:?}°, rates {:?}", rates(&upwind));
+    assert!(
+        rates(&muscl).iter().all(|&r| r > 1.7),
+        "MUSCL: {:?}",
+        rates(&muscl)
+    );
+    assert!(
+        rates(&upwind).iter().all(|&r| r > 0.8),
+        "upwind: {:?}",
+        rates(&upwind)
+    );
+    assert!(
+        muscl[1] < 0.25 * upwind[1],
+        "MUSCL {muscl:?} against upwind {upwind:?}"
+    );
+}
+
 /// A following current accelerating from 0 to 0.6 m/s over deep water stretches
 /// the waves: the absolute frequency `σ + k U` is conserved, so the intrinsic
-/// frequency falls as `σ + σ² U/g = σ_0`.
+/// frequency falls as `σ + σ² U/g = σ_0`. One frequency bin comes in, a spike,
+/// so the schemes are first order here (0.34 % upwind, 0.53 % MUSCL): see
+/// [`a_spread_sea_on_a_current_has_the_exact_doppler_shift`] for a resolved
+/// spectrum.
 #[test]
 fn a_following_current_shifts_the_frequency_doppler() {
     const L: f64 = 2000.0;
@@ -298,6 +403,130 @@ fn a_following_current_shifts_the_frequency_doppler() {
     }
     println!("largest relative departure of the mean σ from σ + kU = σ₀: {worst:.2e}");
     assert!(worst < 0.01, "mean frequency off by {worst:e}");
+}
+
+/// A sea smooth in frequency and direction (Gaussian in σ about 0.3 Hz, cos⁸
+/// about +y) on a following current accelerating along y, 0 → 0.6 m/s over
+/// 500 m of deep water, uniform along x (periodic). Along a ray `k_x` and
+/// `ω = σ + k_y V` are constant, and so is the action density in wavenumber
+/// space, `N c_g/k` (Liouville), so the exact steady spectrum is
+/// `N₀(σ₀, θ₀)(σ/σ₀)³` with `σ₀ = ω`, `k₀ cos θ₀ = k cos θ`. The mean
+/// frequency of the model converges to it at second order with MUSCL (9.2e-3 /
+/// 2.0e-3 / 3.3e-4, rates 2.2 and 2.6) and first order with upwind (1.8e-2 /
+/// 9.0e-3 / 4.5e-3, rates 1.00), refining frequencies (γ = 1.105 / 1.051 /
+/// 1.025) and directions (30 / 15 / 7.5°) together.
+#[test]
+fn a_spread_sea_on_a_current_has_the_exact_doppler_shift() {
+    const L: f64 = 500.0;
+    let (centre, width) = (TAU * 0.3, TAU * 0.04);
+    let incoming = |s: f64, theta: f64| {
+        let c = (theta - PI / 2.0).cos();
+        let spread = if c > 0.0 { c.powi(8) } else { 0.0 };
+        (-((s - centre) / width).powi(2)).exp() * spread
+    };
+    let current = |y: f64| 0.6 * y / L;
+    // The exact mean σ at y, by the midpoint rule over (σ, θ)
+    let exact_mean = |y: f64| {
+        let v = current(y);
+        let (lo, hi, n_s, n_t) = (TAU * 0.08, TAU * 0.6, 400, 720);
+        let (mut num, mut den) = (0.0, 0.0);
+        for a in 0..n_s {
+            let s = lo + (hi - lo) * (a as f64 + 0.5) / n_s as f64;
+            let k = s * s / G;
+            for b in 0..n_t {
+                let theta = TAU * (b as f64 + 0.5) / n_t as f64;
+                let (kx, ky) = (k * theta.cos(), k * theta.sin());
+                if ky <= 0.0 {
+                    continue;
+                }
+                let s0 = s + ky * v;
+                let k0 = s0 * s0 / G;
+                if k0 <= kx.abs() {
+                    continue;
+                }
+                let theta0 = (k0 * k0 - kx * kx).sqrt().atan2(kx);
+                let w = incoming(s0, theta0) * (s / s0).powi(3);
+                num += s * w;
+                den += w;
+            }
+        }
+        num / den
+    };
+    let errors = |scheme: SpectralAdvection| -> Vec<f64> {
+        let mut errors = Vec::new();
+        for (n_freq, n_dir) in [(13, 12), (25, 24), (49, 48)] {
+            let mut mesh = Mesh2D::channel_periodic_x(0.0, 100.0, 0.0, L, 1, 5);
+            for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
+                edge.boundary_tag = Some(BoundaryTag::Open);
+            }
+            let grid = SpectralGrid::new(0.15, 0.5, n_freq, n_dir);
+            let mut e = vec![0.0; grid.n_components()];
+            for i in 0..n_freq {
+                for j in 0..n_dir {
+                    // Variance density E = σ N of the incoming action
+                    let s = grid.sigma[i];
+                    e[grid.component(i, j)] = s * incoming(s, grid.theta[j]);
+                }
+            }
+            let mut m = model(mesh, 2, |_, _| -1000.0, grid)
+                .with_boundary_spectrum(&e)
+                .with_spectral_advection(scheme);
+            let xy = nodes(&m);
+            let v: Vec<f64> = xy.iter().map(|p| current(p[1])).collect();
+            m.set_currents(&vec![0.0; v.len()], &v);
+            let mut n = m.zero_state();
+            // Steady for every direction 30° or more off the coast
+            let slowest = G / (2.0 * TAU * 0.5) * 0.5;
+            run(&m, &mut n, 3.0 * L / slowest, 0.5);
+            let (nd, mut worst) = (m.grid.n_dir(), 0.0f64);
+            let mut exact_at: Vec<(f64, f64)> = Vec::new();
+            for p in (0..m.n_points()).filter(|&p| xy[p][1] > 50.0) {
+                let (mut num, mut den) = (0.0, 0.0);
+                for c in 0..m.grid.n_components() {
+                    let i = c / nd;
+                    let w = n.component(c)[p] * m.grid.d_sigma[i];
+                    num += m.grid.sigma[i] * w;
+                    den += w;
+                }
+                let y = xy[p][1];
+                let exact = match exact_at.iter().find(|(yy, _)| (yy - y).abs() < 1e-9) {
+                    Some(&(_, e)) => e,
+                    None => {
+                        let e = exact_mean(y);
+                        exact_at.push((y, e));
+                        e
+                    }
+                };
+                worst = worst.max((num / den / exact - 1.0).abs());
+            }
+            errors.push(worst);
+        }
+        errors
+    };
+    let rates = |e: &[f64]| -> Vec<f64> { e.windows(2).map(|w| (w[0] / w[1]).log2()).collect() };
+    let (muscl, upwind) = (
+        errors(SpectralAdvection::VanLeer),
+        errors(SpectralAdvection::Upwind),
+    );
+    println!(
+        "relative error of the mean σ at (γ, Δθ) = (1.105, 30°), (1.051, 15°), (1.025, 7.5°):"
+    );
+    println!("  MUSCL {muscl:?}, rates {:?}", rates(&muscl));
+    println!("  upwind {upwind:?}, rates {:?}", rates(&upwind));
+    assert!(
+        rates(&muscl).iter().all(|&r| r > 1.7),
+        "MUSCL: {:?}",
+        rates(&muscl)
+    );
+    assert!(
+        rates(&upwind).iter().all(|&r| r > 0.8),
+        "upwind: {:?}",
+        rates(&upwind)
+    );
+    assert!(
+        muscl[1] < 0.25 * upwind[1],
+        "MUSCL {muscl:?} against upwind {upwind:?}"
+    );
 }
 
 /// `(E*, f_p*) = (g² m_0/U₁₀⁴, f_p U₁₀/g)` of the variance density `e`.

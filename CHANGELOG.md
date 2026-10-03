@@ -6,6 +6,10 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Second-order refraction and frequency shifting in the wave model (`waves::SpectralAdvection`; TODO F.4).** The direction and frequency fluxes now use MUSCL by default: the upwind bin linearly reconstructed with van Leer's limiter. First-order `Upwind` remains (`WaveModel2D::with_spectral_advection`). `compute_dt` halves the spectral Courant limits for MUSCL, which is TVD for ≤ ½.
+  - Gates against exact steady states (action density in wavenumber space constant along rays). A spread sea refracting on a shelf: the mean direction is off by 0.072° at 5° bins against upwind's 0.70°, at rates 2.4–2.5. A spread sea on an accelerating current: the mean frequency is off by 2.0e-3 against 9.0e-3, at rates 2.2–2.6.
+  - A single-bin spike (the older Snell and Doppler gates) stays first order with either scheme.
+
 - **Particles carried by the waves' Stokes drift (`particles::stokes`, `waves::StokesDriftField`; TODO F.4 coupling).**
   - `StokesDriftField::new(&wave_model, &state)` compresses each node's spectrum, with no approximation, to one vector per frequency. At any point and depth it sums the exact finite-depth profile, `n_freq` exponentials per sample.
   - `WithStokesDrift2D` adds the drift at a fixed depth (0 for surface drifters) to any `ParticleVelocity2D`. `WithStokesDrift3D` adds it at each particle's own depth `−σD` to any `ParticleVelocity3D`. Either is steady or linear in time between two wave states (`StokesDrift`).

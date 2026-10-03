@@ -29,7 +29,7 @@ pub mod state;
 pub mod stokes;
 
 pub use dispersion::{dsigma_ddepth, group_velocity, group_velocity_ratio, wavenumber};
-pub use model::{DEFAULT_DEPTH_MIN, WaveModel2D, WaveWorkspace};
+pub use model::{DEFAULT_DEPTH_MIN, SpectralAdvection, WaveModel2D, WaveWorkspace};
 pub use nonlinear::{Quadruplets, shallow_water_factor};
 pub use sources::{DEFAULT_LIMITER, DEFAULT_TAIL_POWER, SourceTerms, Wind, breaking_fraction};
 pub use spectrum::{SpectralGrid, WaveParameters, wrap_angle};
