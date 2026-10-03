@@ -656,3 +656,99 @@ fn duration_limited_growth_approaches_pierson_moskowitz() {
     assert!((0.75..1.0).contains(&(es / 3.64e-3)), "E* {es:e}");
     assert!((fs / 0.13 - 1.0).abs() < 0.1, "f_p* {fs}");
 }
+
+/// The spread sea of [`a_spread_sea_refracts_to_the_exact_steady_state`] on a
+/// steep shelf, 20 to 2 m over 300 m in four P2 elements, where refraction
+/// limits the explicit MUSCL step to a third of the geographic one (0.36 s
+/// against 1.11 s). Implicit refraction runs at the geographic step. With the
+/// deferred correction its steady state is MUSCL's up to the splitting: the
+/// mean direction is 0.195° off the exact one against explicit MUSCL's 0.167°,
+/// and 0.174° at a quarter of the step (the splitting error falls about
+/// linearly: backward Euler half-steps around the stages). Without the
+/// correction it is first-order upwind's (0.91° against 0.88° explicitly).
+#[test]
+fn implicit_refraction_steps_past_the_turning_limit() {
+    const LX: f64 = 100.0;
+    const LY: f64 = 300.0;
+    let depth = |y: f64| 20.0 - 18.0 * y / LY;
+    let (mean, m) = (70f64.to_radians(), 8.0);
+    let incoming = |theta: f64| {
+        let c = (theta - mean).cos();
+        if c > 0.0 { c.powf(m) } else { 0.0 }
+    };
+    let n_dir = 72;
+    let solve = |scheme: SpectralAdvection, implicit: bool, cfl: f64| -> (f64, f64) {
+        let mut mesh = Mesh2D::channel_periodic_x(0.0, LX, 0.0, LY, 1, 4);
+        for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
+            edge.boundary_tag = Some(BoundaryTag::Open);
+        }
+        let grid = SpectralGrid::new(0.12, 0.15, 2, n_dir);
+        let mut e = vec![0.0; grid.n_components()];
+        for j in 0..n_dir {
+            e[grid.component(0, j)] = incoming(grid.theta[j]);
+        }
+        let m = model(mesh, 2, |_, y| -depth(y), grid)
+            .with_boundary_spectrum(&e)
+            .with_spectral_advection(scheme)
+            .with_implicit_refraction(implicit);
+        let sigma = m.grid.sigma[0];
+        let (k0, cg0) = {
+            let k = wavenumber(sigma, depth(0.0), G);
+            (k, group_velocity(sigma, k, depth(0.0)))
+        };
+        let mut n = m.zero_state();
+        let cg_min = group_velocity(sigma, wavenumber(sigma, 2.0, G), 2.0);
+        let dt = m.compute_dt(cfl);
+        run(
+            &m,
+            &mut n,
+            3.0 * LY / (cg_min * 20f64.to_radians().sin()),
+            cfl,
+        );
+        let (xy, params) = (nodes(&m), m.parameters(&n));
+        let mut worst: f64 = 0.0;
+        for p in (0..m.n_points()).filter(|&p| (30.0..270.0).contains(&xy[p][1])) {
+            let d = depth(xy[p][1]);
+            let k = wavenumber(sigma, d, G);
+            let cg = group_velocity(sigma, k, d);
+            let (mut a, mut b) = (0.0, 0.0);
+            let fine = 20_000;
+            for q in 0..fine {
+                let theta = PI * (q as f64 + 0.5) / fine as f64;
+                let c0 = k / k0 * theta.cos();
+                if c0.abs() < 1.0 {
+                    let w = incoming(c0.acos()) * k * cg0 / (k0 * cg);
+                    a += w * theta.cos();
+                    b += w * theta.sin();
+                }
+            }
+            let exact = b.atan2(a);
+            worst = worst.max((params[p].direction - exact).to_degrees().abs());
+        }
+        (worst, dt)
+    };
+    let (muscl, dt_muscl) = solve(SpectralAdvection::VanLeer, false, 0.5);
+    let (upwind, dt_upwind) = solve(SpectralAdvection::Upwind, false, 0.5);
+    let (implicit, dt_implicit) = solve(SpectralAdvection::VanLeer, true, 0.5);
+    let (finer, dt_finer) = solve(SpectralAdvection::VanLeer, true, 0.125);
+    let (implicit_upwind, _) = solve(SpectralAdvection::Upwind, true, 0.5);
+    println!(
+        "steep shelf, 5° bins, mean direction off the exact steady state: explicit MUSCL \
+         {muscl:.3}° at Δt {dt_muscl:.3} s, explicit upwind {upwind:.3}° at {dt_upwind:.3} s; \
+         implicit {implicit:.3}° at {dt_implicit:.3} s, {finer:.3}° at {dt_finer:.3} s; \
+         implicit without the correction {implicit_upwind:.3}°"
+    );
+    assert!(
+        dt_implicit > 2.5 * dt_muscl,
+        "implicit Δt {dt_implicit} against explicit {dt_muscl}"
+    );
+    assert!(
+        implicit < 1.3 * muscl,
+        "implicit {implicit}° against MUSCL's {muscl}°"
+    );
+    assert!(finer < 1.1 * muscl, "{finer}° at the smaller step");
+    assert!(
+        (implicit_upwind / upwind - 1.0).abs() < 0.2,
+        "implicit upwind {implicit_upwind}° against explicit {upwind}°"
+    );
+}

@@ -6,6 +6,11 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Implicit refraction in the wave model (`WaveModel2D::with_implicit_refraction`; TODO F.4).** The direction advection is stepped at every node and frequency by backward Euler, first-order upwind in θ. Each step is one cyclic tridiagonal M-matrix solve: positive and conservative at any Courant number. It runs in half-steps around the Runge–Kutta stages (Strang). With `SpectralAdvection::VanLeer` a deferred correction (MUSCL less upwind, FCT-limited per face) makes the steady state MUSCL's. The turning rate no longer limits the step.
+  - At Frøya the step goes from 0.003 s to the geographic 0.30 s on the coastline mesh. On a 1 km P1 wave grid it is 7 s, at 118 s of wall time per model hour.
+  - Gate: on a steep shelf, at three times explicit MUSCL's step, the mean direction is 0.195° off the exact steady state against MUSCL's 0.167°.
+  - `froya_real_data waves=N implicit=1` measures it.
+
 - **The wave model's cost at Frøya (`froya_real_data waves=N`; TODO F.4).** A mode of the Frøya example that times the spectral wave model on the run's domain. It reports the step and what sets it (geographic propagation or refraction), the wall time per step split into propagation and sources, the most local time stepping could save, and the cost per model hour (`wave_grid=`, `turning=`, `order=`, `mesh=` or `nx= ny=`). Findings are in TODO.md: refraction sets the step 10–100× below the geographic limit, so an implicit direction step comes next. With it, a 1 km P1 wave grid would cost ≈ 100 s per model hour.
 
 - **The waves' force in the 3D model, gated (TODO F.4 coupling).** `WaveForce2D` on `Hydrostatic3D`'s barotropic module drives every σ-level through the mode splitting, with no new code. New gate in `tests/wave_coupling_test.rs`: the surf-zone longshore current in 3D (10 levels, uniform eddy viscosity, quadratic bottom drag). Each column holds the exact parabola of a uniform force, `u_b = √(F/C_d)` at the bottom layer with `(F/νD)(Dζ − ζ²/2)` above it, to 0.22 % of the fastest current inside elements and 3.5 % on element faces. The force is still depth-uniform: no undertow yet.

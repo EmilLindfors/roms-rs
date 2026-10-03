@@ -39,6 +39,22 @@
 //! mean after every stage (Zhang & Shu 2010; conservative), then the sources over
 //! the whole step at every node ([`super::SourceTerms::integrate`]), split
 //! first-order in time from the propagation.
+//!
+//! On steep slopes refraction turns the waves fast, and its explicit Courant
+//! limit `|c_θ| Δt ≤ Δθ` sets a step far below the geographic one (100× at
+//! Frøya). [`WaveModel2D::with_implicit_refraction`] takes the direction
+//! advection out of the Runge–Kutta stages and steps it implicitly at every
+//! node and frequency after them, as SWAN does: first-order upwind in θ,
+//! backward Euler, a cyclic tridiagonal system per node and frequency. Its
+//! matrix is an M-matrix whose columns sum to one, so the step is positive
+//! and conserves the action to round-off at any Courant number. With
+//! [`SpectralAdvection::VanLeer`] (the default) a deferred correction adds
+//! MUSCL's flux less upwind's, of the state before the step, to the
+//! right-hand side: the fixed point is MUSCL's steady state (second order in
+//! the bins), and the correction is scaled down where it would make the
+//! right-hand side negative (it sums to zero over the circle, so the action is
+//! still kept). With [`SpectralAdvection::Upwind`] the steady state is the
+//! explicit upwind scheme's (first order).
 
 use std::sync::Arc;
 
@@ -102,6 +118,8 @@ pub struct WaveModel2D {
     /// Largest turning rate |c_θ| (rad/s) refraction may have, or none
     turning_limit: Option<f64>,
     spectral_advection: SpectralAdvection,
+    /// Refraction stepped implicitly after the Runge–Kutta stages
+    implicit_refraction: bool,
 }
 
 impl WaveModel2D {
@@ -134,6 +152,7 @@ impl WaveModel2D {
             boundary: None,
             turning_limit: None,
             spectral_advection: SpectralAdvection::default(),
+            implicit_refraction: false,
             mesh,
             ops,
             geom,
@@ -191,8 +210,16 @@ impl WaveModel2D {
         self
     }
 
+    /// Step refraction implicitly (see the module docs): the step is no longer
+    /// limited by the turning rate, only by the geographic propagation and the
+    /// frequency shifting. Off by default.
+    pub fn with_implicit_refraction(mut self, on: bool) -> Self {
+        self.implicit_refraction = on;
+        self
+    }
+
     /// The scheme of the direction and frequency advection (van Leer's MUSCL by
-    /// default).
+    /// default). With implicit refraction it applies to the frequencies only.
     pub fn with_spectral_advection(mut self, scheme: SpectralAdvection) -> Self {
         self.spectral_advection = scheme;
         self
@@ -336,10 +363,12 @@ impl WaveModel2D {
         for p in 0..n_points {
             for i in 0..self.grid.n_freq() {
                 for j in 0..nd {
-                    let theta = self.grid.theta[j] + 0.5 * dtheta;
-                    let ct = self.c_theta(i, theta, p).abs();
-                    if ct > 0.0 {
-                        dt = dt.min(cfl * dtheta / ct);
+                    if !self.implicit_refraction {
+                        let theta = self.grid.theta[j] + 0.5 * dtheta;
+                        let ct = self.c_theta(i, theta, p).abs();
+                        if ct > 0.0 {
+                            dt = dt.min(cfl * dtheta / ct);
+                        }
                     }
                     let cs = self.c_sigma(i, self.grid.theta[j], p).abs();
                     if cs > 0.0 {
@@ -481,22 +510,25 @@ impl WaveModel2D {
         let inv_dsigma = 1.0 / grid.d_sigma[i];
         let theta = grid.theta[j];
         let at = |field: Option<&[f64]>, p: usize| field.map(|f| f[p]);
+        let explicit_refraction = !self.implicit_refraction;
         for (p, out) in out.iter_mut().enumerate() {
-            let f_hi = face_flux(
-                self.c_theta(i, theta_hi, p),
-                at(below2.is_some().then_some(below), p),
-                here[p],
-                above[p],
-                at(above2, p),
-            );
-            let f_lo = face_flux(
-                self.c_theta(i, theta_lo, p),
-                at(below2, p),
-                below[p],
-                here[p],
-                at(above2.is_some().then_some(above), p),
-            );
-            *out -= (f_hi - f_lo) * inv_dtheta;
+            if explicit_refraction {
+                let f_hi = face_flux(
+                    self.c_theta(i, theta_hi, p),
+                    at(below2.is_some().then_some(below), p),
+                    here[p],
+                    above[p],
+                    at(above2, p),
+                );
+                let f_lo = face_flux(
+                    self.c_theta(i, theta_lo, p),
+                    at(below2, p),
+                    below[p],
+                    here[p],
+                    at(above2.is_some().then_some(above), p),
+                );
+                *out -= (f_hi - f_lo) * inv_dtheta;
+            }
             let cs = self.c_sigma(i, theta, p);
             let g_hi = match upper {
                 Some(up) => face_flux(
@@ -560,8 +592,15 @@ impl WaveModel2D {
     }
 
     /// Advance `n` from `t` by `dt`: SSP-RK3 propagation (positivity limited every
-    /// stage), then the sources over the step.
+    /// stage), then the sources over the step. Implicit refraction takes half the
+    /// step before the stages and half after (Strang), so its splitting error is
+    /// second order in the step.
     pub fn step(&self, n: &mut WaveSolution, t: f64, dt: f64, ws: &mut WaveWorkspace) {
+        // Strang: half of the implicit refraction on each side of the stages
+        let refraction = self.implicit_refraction.then_some(0.5 * dt);
+        if let Some(half) = refraction {
+            self.node_pass(n, ws, Some(half), None);
+        }
         SSPRK3.step_with_workspace(
             n,
             dt,
@@ -570,18 +609,38 @@ impl WaveModel2D {
             |s| self.limit_positivity(s),
             &mut ws.stages,
         );
-        if self.sources.any() {
-            self.apply_sources(n, dt, ws);
+        let sources = self.sources.any().then_some(dt);
+        if refraction.is_some() || sources.is_some() {
+            self.node_pass(n, ws, refraction, sources);
         }
     }
 
     /// The sources over `dt` at every node.
     pub fn apply_sources(&self, n: &mut WaveSolution, dt: f64, ws: &mut WaveWorkspace) {
+        self.node_pass(n, ws, None, Some(dt));
+    }
+
+    /// Implicit refraction over `dt` at every node (see the module docs),
+    /// whether or not the model steps it so.
+    pub fn apply_implicit_refraction(&self, n: &mut WaveSolution, dt: f64, ws: &mut WaveWorkspace) {
+        self.node_pass(n, ws, Some(dt), None);
+    }
+
+    /// At every node, on its spectrum: implicit refraction over the first
+    /// interval, then the sources over the second, each if given.
+    fn node_pass(
+        &self,
+        n: &mut WaveSolution,
+        ws: &mut WaveWorkspace,
+        refraction: Option<f64>,
+        sources: Option<f64>,
+    ) {
         let (np, nc, nf) = (
             self.n_points(),
             self.grid.n_components(),
             self.grid.n_freq(),
         );
+        let nd = self.grid.n_dir();
         ws.node_major.resize(np * nc, 0.0);
         let data = &n.data;
         for_each_chunk(
@@ -597,22 +656,37 @@ impl WaveModel2D {
         for_each_chunk(
             &mut ws.node_major,
             nc,
-            || (vec![0.0; nf], vec![0.0; nc], vec![0.0; nc], vec![0.0; nc]),
-            |(k, e, a, b), p, spectrum| {
-                for (i, k) in k.iter_mut().enumerate() {
-                    *k = self.k[i * np + p];
+            || {
+                (
+                    vec![0.0; nf],
+                    vec![0.0; nc],
+                    vec![0.0; nc],
+                    vec![0.0; nc],
+                    CyclicScratch::new(nd),
+                )
+            },
+            |(k, e, a, b, cyclic), p, spectrum| {
+                if let Some(dt) = refraction {
+                    for (i, row) in spectrum.chunks_exact_mut(nd).enumerate() {
+                        self.refract_implicitly(i, p, row, dt, cyclic);
+                    }
                 }
-                self.sources.integrate(
-                    &self.grid,
-                    spectrum,
-                    k,
-                    self.depth[p],
-                    self.wind,
-                    dt,
-                    e,
-                    a,
-                    b,
-                );
+                if let Some(dt) = sources {
+                    for (i, k) in k.iter_mut().enumerate() {
+                        *k = self.k[i * np + p];
+                    }
+                    self.sources.integrate(
+                        &self.grid,
+                        spectrum,
+                        k,
+                        self.depth[p],
+                        self.wind,
+                        dt,
+                        e,
+                        a,
+                        b,
+                    );
+                }
             },
         );
         let node_major = &ws.node_major;
@@ -626,6 +700,71 @@ impl WaveModel2D {
                 }
             },
         );
+    }
+
+    /// Backward Euler over `dt` for the direction advection of frequency `i` at
+    /// node `p`, on its action densities over the directions `row`: first-order
+    /// upwind fluxes `c⁺ N_j + c⁻ N_{j+1}` through the faces `θ_j + Δθ/2`,
+    /// periodic, so
+    ///
+    /// ```text
+    /// N_j + λ (c⁺_{j+½} − c⁻_{j−½}) N_j + λ c⁻_{j+½} N_{j+1} − λ c⁺_{j−½} N_{j−1} = N*_j
+    /// ```
+    ///
+    /// with `λ = Δt/Δθ`: a cyclic tridiagonal M-matrix whose columns sum to one.
+    fn refract_implicitly(
+        &self,
+        i: usize,
+        p: usize,
+        row: &mut [f64],
+        dt: f64,
+        s: &mut CyclicScratch,
+    ) {
+        let nd = row.len();
+        let (dtheta, lambda) = (self.grid.d_theta, dt / self.grid.d_theta);
+        // The turning rate at the face above each bin
+        for (j, c) in s.faces.iter_mut().enumerate() {
+            *c = self.c_theta(i, self.grid.theta[j] + 0.5 * dtheta, p);
+        }
+        if s.faces.iter().all(|&c| c == 0.0) {
+            return;
+        }
+        for j in 0..nd {
+            let (above, below) = (s.faces[j], s.faces[(j + nd - 1) % nd]);
+            s.diagonal[j] = 1.0 + lambda * (above.max(0.0) - below.min(0.0));
+            s.upper[j] = lambda * above.min(0.0);
+            s.lower[j] = -lambda * below.max(0.0);
+        }
+        if self.spectral_advection == SpectralAdvection::VanLeer {
+            // Deferred correction: MUSCL's flux less upwind's, of the state now
+            let at = |j: usize, offset: isize| {
+                row[(j as isize + offset).rem_euclid(nd as isize) as usize]
+            };
+            for j in 0..nd {
+                let (c, left, right) = (s.faces[j], at(j, 0), at(j, 1));
+                let muscl = face_flux(c, Some(at(j, -1)), left, right, Some(at(j, 2)));
+                s.correction[j] = muscl - (c.max(0.0) * left + c.min(0.0) * right);
+            }
+            // Limit each face's correction by its donor (Zalesak 1979): what
+            // the corrections take out of a bin is at most what it holds, so
+            // the right-hand side stays non-negative, and as fluxes they keep
+            // the action
+            for j in 0..nd {
+                let below = s.correction[(j + nd - 1) % nd];
+                let taken = lambda * (s.correction[j].max(0.0) + (-below).max(0.0));
+                s.divergence[j] = if taken > row[j] { row[j] / taken } else { 1.0 };
+            }
+            for j in 0..nd {
+                let c = s.correction[j];
+                let donor = if c >= 0.0 { j } else { (j + 1) % nd };
+                s.correction[j] = c * s.divergence[donor];
+            }
+            for j in 0..nd {
+                let d = lambda * (s.correction[j] - s.correction[(j + nd - 1) % nd]);
+                row[j] = (row[j] - d).max(0.0);
+            }
+        }
+        solve_cyclic_tridiagonal(row, s);
     }
 
     /// The variance density `E = σ N` at node `p` into `e`.
@@ -743,6 +882,115 @@ fn face_flux(
     }
 }
 
+/// Storage of the implicit refraction at one node: the turning rates at the
+/// faces, a cyclic tridiagonal system over the directions and its solve.
+struct CyclicScratch {
+    faces: Vec<f64>,
+    /// MUSCL's flux less upwind's through each face, then its divergence
+    correction: Vec<f64>,
+    divergence: Vec<f64>,
+    /// `lower[j] x[j−1] + diagonal[j] x[j] + upper[j] x[j+1]`, indices periodic
+    lower: Vec<f64>,
+    diagonal: Vec<f64>,
+    upper: Vec<f64>,
+    modified: Vec<f64>,
+    c_prime: Vec<f64>,
+    x: Vec<f64>,
+    u: Vec<f64>,
+    z: Vec<f64>,
+}
+
+impl CyclicScratch {
+    fn new(n: usize) -> Self {
+        Self {
+            faces: vec![0.0; n],
+            correction: vec![0.0; n],
+            divergence: vec![0.0; n],
+            lower: vec![0.0; n],
+            diagonal: vec![0.0; n],
+            upper: vec![0.0; n],
+            modified: vec![0.0; n],
+            c_prime: vec![0.0; n],
+            x: vec![0.0; n],
+            u: vec![0.0; n],
+            z: vec![0.0; n],
+        }
+    }
+}
+
+/// The Thomas algorithm: `lower[j] x[j−1] + diagonal[j] x[j] + upper[j] x[j+1]
+/// = rhs[j]` (`lower[0]` and `upper[n−1]` ignored) into `x`. Stable without
+/// pivoting for diagonally dominant rows or columns.
+fn thomas(
+    lower: &[f64],
+    diagonal: &[f64],
+    upper: &[f64],
+    rhs: &[f64],
+    x: &mut [f64],
+    c_prime: &mut [f64],
+) {
+    let n = diagonal.len();
+    c_prime[0] = upper[0] / diagonal[0];
+    x[0] = rhs[0] / diagonal[0];
+    for j in 1..n {
+        let m = 1.0 / (diagonal[j] - lower[j] * c_prime[j - 1]);
+        c_prime[j] = upper[j] * m;
+        x[j] = (rhs[j] - lower[j] * x[j - 1]) * m;
+    }
+    for j in (0..n - 1).rev() {
+        x[j] -= c_prime[j] * x[j + 1];
+    }
+}
+
+/// Solve the cyclic tridiagonal system of `s` (`lower[0]` couples to
+/// `x[n−1]`, `upper[n−1]` to `x[0]`) for the right-hand side `rhs`, in place:
+/// the Thomas algorithm on the system without its corners, corrected by
+/// Sherman–Morrison (Press et al., "Numerical Recipes", §2.7).
+fn solve_cyclic_tridiagonal(rhs: &mut [f64], s: &mut CyclicScratch) {
+    let n = rhs.len();
+    // The corners A[n−1][0] and A[0][n−1]
+    let (alpha, beta) = (s.upper[n - 1], s.lower[0]);
+    if alpha == 0.0 && beta == 0.0 {
+        thomas(
+            &s.lower,
+            &s.diagonal,
+            &s.upper,
+            rhs,
+            &mut s.x,
+            &mut s.c_prime,
+        );
+        rhs.copy_from_slice(&s.x);
+        return;
+    }
+    let gamma = -s.diagonal[0];
+    s.modified.copy_from_slice(&s.diagonal);
+    s.modified[0] -= gamma;
+    s.modified[n - 1] -= alpha * beta / gamma;
+    thomas(
+        &s.lower,
+        &s.modified,
+        &s.upper,
+        rhs,
+        &mut s.x,
+        &mut s.c_prime,
+    );
+    s.u.fill(0.0);
+    s.u[0] = gamma;
+    s.u[n - 1] = alpha;
+    thomas(
+        &s.lower,
+        &s.modified,
+        &s.upper,
+        &s.u,
+        &mut s.z,
+        &mut s.c_prime,
+    );
+    let fact = (s.x[0] + beta * s.x[n - 1] / gamma) / (1.0 + s.z[0] + beta * s.z[n - 1] / gamma);
+    for (r, (x, z)) in rhs.iter_mut().zip(s.x.iter().zip(&s.z)) {
+        *r = x - fact * z;
+    }
+}
+
 /// Physical gradient of the nodal field `f` by each element's derivative matrices.
 pub(crate) fn nodal_gradient(
     ops: &DGOperators2D,
@@ -787,5 +1035,82 @@ where
         for (i, chunk) in data.chunks_mut(size).enumerate() {
             f(&mut s, i, chunk);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::Mesh2D;
+
+    /// The cyclic solve against the matrix it inverts: residual at round-off,
+    /// with both corners set and with one (as the upwind refraction has).
+    #[test]
+    fn the_cyclic_solve_inverts_its_matrix() {
+        let n = 9;
+        for corners in [(0.3, -0.7), (0.0, -0.4), (0.25, 0.0)] {
+            let mut s = CyclicScratch::new(n);
+            for j in 0..n {
+                let t = j as f64;
+                s.lower[j] = -0.2 - 0.1 * (1.3 * t).sin().abs();
+                s.upper[j] = -0.3 + 0.05 * (0.7 * t).cos();
+                s.diagonal[j] = 1.5 + 0.2 * (0.4 * t).sin();
+            }
+            s.upper[n - 1] = corners.0;
+            s.lower[0] = corners.1;
+            let rhs: Vec<f64> = (0..n).map(|j| 1.0 + (j as f64).sqrt()).collect();
+            let mut x = rhs.clone();
+            let (lower, diagonal, upper) = (s.lower.clone(), s.diagonal.clone(), s.upper.clone());
+            solve_cyclic_tridiagonal(&mut x, &mut s);
+            for j in 0..n {
+                let ax =
+                    lower[j] * x[(j + n - 1) % n] + diagonal[j] * x[j] + upper[j] * x[(j + 1) % n];
+                assert!(
+                    (ax - rhs[j]).abs() < 1e-13 * rhs[j],
+                    "row {j}: {ax} against {}",
+                    rhs[j]
+                );
+            }
+        }
+    }
+
+    /// Implicit refraction over a step 10⁴ times the geographic limit, on a
+    /// steep slope: the action of every frequency at every node is kept to
+    /// round-off, nothing goes negative, and the waves have turned.
+    #[test]
+    fn implicit_refraction_keeps_the_action_at_any_step() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 200.0, 0.0, 200.0, 2, 2);
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry =
+            Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| -(2.0 + 0.1 * y + 0.02 * x));
+        let grid = SpectralGrid::new(0.06, 0.3, 6, 36);
+        let model = WaveModel2D::new(Arc::new(mesh), ops, geom, &bathymetry, grid, 9.81)
+            .with_implicit_refraction(true);
+        let e = model.grid.jonswap(1.0, 8.0, 3.3, 0.3, 2.0);
+        let mut n = model.uniform_state(&e);
+        let before = n.clone();
+        let explicit = model.compute_dt(1.0).min(1.0);
+        let mut ws = WaveWorkspace::default();
+        model.apply_implicit_refraction(&mut n, 1e4 * explicit, &mut ws);
+        let (nf, nd, np) = (model.grid.n_freq(), model.grid.n_dir(), model.n_points());
+        let mut turned = 0.0f64;
+        for p in 0..np {
+            for i in 0..nf {
+                let sum =
+                    |s: &WaveSolution| -> f64 { (0..nd).map(|j| s.component(i * nd + j)[p]).sum() };
+                let (a, b) = (sum(&before), sum(&n));
+                assert!(
+                    (a - b).abs() <= 1e-13 * a.max(1e-300),
+                    "node {p}, frequency {i}"
+                );
+                for j in 0..nd {
+                    let c = i * nd + j;
+                    assert!(n.component(c)[p] >= 0.0);
+                    turned = turned.max((n.component(c)[p] - before.component(c)[p]).abs());
+                }
+            }
+        }
+        assert!(turned > 1e-3, "nothing turned ({turned})");
     }
 }
