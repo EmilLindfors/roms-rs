@@ -82,6 +82,7 @@ mod bed_raster;
 mod coastline;
 mod constituent_reader;
 pub(crate) mod datetime;
+mod farm_site;
 mod field_series;
 mod geo_grid;
 mod geotiff;
@@ -109,6 +110,10 @@ pub use coastline::{CoastlineData, CoastlineError, CoastlineStatistics, FROYA_BB
 pub use constituent_reader::{
     ConstituentData, ConstituentEntry, ConstituentFileError, constituent_period,
     parse_constituents, read_constituent_file,
+};
+pub use farm_site::{
+    CageGrid, FarmSite, FarmSiteError, Mooring, MooringKind, SiteCage, parse_farm_site_str,
+    read_farm_site_file,
 };
 pub use field_series::{FieldSeries, TimeInterpolation, TimeStencil};
 pub use geo_grid::{
