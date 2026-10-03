@@ -15,7 +15,7 @@
 //!
 //! Every term of the DG derivative is a pressure difference of a pair of
 //! columns. With `D` the element's nodal differentiation matrix
-//! (`Dx = r_x D_r + s_x D_s`),
+//! (`(Dx)_ij = r_x,i (D_r)_ij + s_x,i (D_s)_ij`, the metric at node `i`),
 //!
 //! ```text
 //!     (∂p/∂x|_z)_i ≈ Σ_j Dx_ij Δp_ij,
@@ -107,6 +107,39 @@
 //! force; for a horizontally uniform `ρ_s(z)` this is the subtraction of a
 //! reference profile of Mellor et al. (1998), here for any reference field.
 //!
+//! # Curvilinear elements
+//!
+//! On a general quadrilateral the metric varies over the element, and which
+//! metric a pair is differenced with decides the energy argument above. The
+//! work of the force on the layer transport `Q` is
+//! `Σ_ij w_i D_ij Q_i·X_ij S_ij` for the pair's metric `X_ij` and an
+//! antisymmetric `S_ij`, and under summation by parts (the boundary matrix is
+//! diagonal and `S_ii = 0`) an advection whose pair transport is
+//! `A_ij·Q_i + B_ij·Q_j` matches it when `X_ij = A_ij + B_ji`. The 3D
+//! advection must reduce, for a constant field, to the layer continuity, the
+//! 2D module's mass divergence ([`MetricForm`]), and must be a symmetric
+//! two-point flux to conserve. So the force takes:
+//!
+//! - [`MetricForm::Conservative`] (`Standard` 2D module): each node's own
+//!   metric, `(Dx)_ij = J_i⁻¹[(J∇r)_i (D_r)_ij + (J∇s)_i (D_s)_ij]·x̂`, the
+//!   chain rule, the adjoint of the advection's `{{J∇r·Q}}_ij`;
+//! - [`MetricForm::Averaged`] (the split forms): the pair's mean,
+//!   `J_i⁻¹[{{J∇r}}_ij (D_r)_ij + {{J∇s}}_ij (D_s)_ij]·x̂`, the adjoint of
+//!   `{{J∇r}}_ij·{{Q}}_ij`.
+//!
+//! On a parallelogram both are the affine derivative. Both are consistent
+//! (the averaged one is `½[J∇r·D_r p + D_r(J∇r p)]/J` by the discrete metric
+//! identities) and move momentum only across faces over level σ-surfaces, and
+//! the balances at rest (`Δp_ij = 0`) do not depend on the element shape.
+//! What differs is the aliasing of the metric times the pressure: on meshes
+//! that are not asymptotically parallelograms (each element's bilinear term
+//! a fixed fraction of its size, as on a coastline mesh) the averaged form
+//! is one order lower pointwise (P2 1.1, P3 2.1 against the chain rule's 1.9
+//! and 2.8, `tests/curvilinear_3d_test.rs`), while its element means are the
+//! chain rule's and converge at about `N + 1`: the extra error is grid-scale,
+//! with zero mean on every element. On the faces the normal, `sJ` and `J`
+//! are those of each face node, as in the 3D transport.
+//!
 //! # Common to both forms
 //!
 //! Each column's density anomaly `ρ − ρ_ref` is a piecewise Hermite cubic in
@@ -131,6 +164,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::blocks::{Pooled, for_each_block};
+use crate::solver::rhs::transport_3d::MetricForm;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
@@ -183,6 +217,7 @@ impl BalancedReference {
         rho_0: f64,
         rho_ref: f64,
         min_column_depth: f64,
+        metric: MetricForm,
     ) -> Self {
         let n = state.n_elements * ops.n_nodes * sigma.n_levels();
         let force = |form| {
@@ -199,6 +234,7 @@ impl BalancedReference {
                 rho_ref,
                 min_column_depth,
                 form,
+                metric,
                 &mut fx,
                 &mut fy,
             );
@@ -490,13 +526,15 @@ impl Columns {
 /// * `bathymetry` - Bed elevation B
 /// * `sigma` - Vertical grid configuration
 /// * `ops` - 2D DG operators (for gradients)
-/// * `geom` - Geometric factors (affine elements)
+/// * `geom` - Geometric factors (per node: general quadrilaterals)
 /// * `g` - Gravitational acceleration (m/s²)
 /// * `rho_0` - Reference density ρ₀ used in the `-1/ρ₀` normalization (kg/m³)
 /// * `rho_ref` - Density subtracted from ρ before integrating (0 = full PGF, ρ₀ = baroclinic-only)
 /// * `min_column_depth` - Columns shallower than this (m) exert and feel no
 ///   pressure difference (3D wetting and drying)
 /// * `form` - How two columns' pressures are differenced (see the module docs)
+/// * `metric` - The 3D advection's volume form, whose adjoint the volume term
+///   is on general quadrilaterals (see "Curvilinear elements")
 /// * `grad_px` - Output x-component of PGF (m/s²)
 /// * `grad_py` - Output y-component of PGF (m/s²)
 #[allow(clippy::too_many_arguments)]
@@ -512,6 +550,7 @@ pub fn compute_pressure_gradient(
     rho_ref: f64,
     min_column_depth: f64,
     form: PressureGradientForm,
+    metric: MetricForm,
     grad_px: &mut [f64],
     grad_py: &mut [f64],
 ) {
@@ -541,8 +580,8 @@ pub fn compute_pressure_gradient(
                 dp,
             } = &mut **scratch;
             pressure_gradient_element(
-                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, form, own, across, px, py,
-                dp,
+                k, state, mesh, bathymetry, sigma, ops, geom, rho_ref, form, metric, own, across,
+                px, py, dp,
             );
             for ((fx, fy), (&dx, &dy)) in out_x.iter_mut().zip(out_y).zip(px.iter().zip(&*py)) {
                 *fx = scale * dx;
@@ -594,6 +633,7 @@ fn pressure_gradient_element(
     geom: &GeometricFactors2D,
     rho_ref: f64,
     form: PressureGradientForm,
+    metric: MetricForm,
     own: &mut Columns,
     across: &mut Columns,
     px: &mut [f64],
@@ -610,17 +650,37 @@ fn pressure_gradient_element(
         px.fill(0.0);
         py.fill(0.0);
 
-        // Volume term: Σ_j Dx_ij Δp_ij, with Δp_ji = −Δp_ij
-        let metric = geom.affine_metric(k);
-        let (rx, ry, sx, sy) = (metric.rx, metric.ry, metric.sx, metric.sy);
+        // Volume term: Σ_j Dx_ij Δp_ij, with Δp_ji = −Δp_ij, and the metric
+        // of the pair in the advection's form (see "Curvilinear elements")
+        let averaged = metric.averaged_on(geom, k);
         for i in 0..nn {
             let a = own.view(i);
+            let (ar_i, as_i) = geom.contravariant(k, i);
+            let j_inv_i = geom.jacobian_inv(k, i);
             for j in i + 1..nn {
                 let b = own.view(j);
+                let (ar_j, as_j) = geom.contravariant(k, j);
+                let j_inv_j = geom.jacobian_inv(k, j);
+                // The contravariant vectors the pair is differenced with at
+                // i and at j: each node's own, or both their mean
+                let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
+                    let mean =
+                        |a: (f64, f64), b: (f64, f64)| (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+                    let m = (mean(ar_i, ar_j), mean(as_i, as_j));
+                    (m, m)
+                } else {
+                    ((ar_i, as_i), (ar_j, as_j))
+                };
                 let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
                 let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
-                let (dx_ij, dy_ij) = (rx * dr_ij + sx * ds_ij, ry * dr_ij + sy * ds_ij);
-                let (dx_ji, dy_ji) = (rx * dr_ji + sx * ds_ji, ry * dr_ji + sy * ds_ji);
+                let (dx_ij, dy_ij) = (
+                    j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
+                    j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
+                );
+                let (dx_ji, dy_ji) = (
+                    j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
+                    j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
+                );
                 pressure_differences(&a, &b, form, dp);
                 for (l, &dp) in dp.iter().enumerate() {
                     px[i * nl + l] += dx_ij * dp;
@@ -641,10 +701,10 @@ fn pressure_gradient_element(
                 let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
                 across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
             }
-            let (normal, s_jac) = geom.affine_face(k, f);
-            let lift_scale = s_jac * metric.det_j_inv;
             for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
                 pressure_differences(&own.view(node), &across.view(fi), form, dp);
+                let normal = geom.normal(k, f, fi);
+                let lift_scale = geom.lift_scale(k, f, fi, node);
                 for (l, &dp) in dp.iter().enumerate() {
                     let jump = 0.5 * dp;
                     if jump == 0.0 {
@@ -737,6 +797,7 @@ mod tests {
                 rho_ref,
                 0.0,
                 form,
+                MetricForm::Conservative,
                 &mut fx,
                 &mut fy,
             );
@@ -762,6 +823,7 @@ mod tests {
                 RHO0,
                 RHO0,
                 0.0,
+                MetricForm::Conservative,
             );
             let (mut fx, mut fy) = self.pgf(RHO0, PressureGradientForm::SigmaPairs);
             reference.add_to(&mut fx, &mut fy);

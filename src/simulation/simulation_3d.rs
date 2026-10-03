@@ -714,7 +714,12 @@ mod tests {
                 let eta0 = state.eta.data.clone();
                 integrator.step(&mut state, &physics, dt, n as f64 * dt);
                 let transport = integrator.barotropic_transport().expect("after a step");
-                transport.divergence_into(&seiche.ops, &seiche.geom, &mut div);
+                transport.divergence_into(
+                    &seiche.ops,
+                    &seiche.geom,
+                    physics.metric_form(),
+                    &mut div,
+                );
 
                 let (mut change, mut residual) = (0.0_f64, 0.0_f64);
                 for ((eta, eta0), d) in state.eta.data.iter().zip(&eta0).zip(&div.data) {

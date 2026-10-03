@@ -32,7 +32,10 @@
 //!    `Ω_{l+1/2} = Ω_{l−1/2} − ∇·Q_l − Δσ_l ∂η/∂t + s_l`.
 //!
 //! The DG divergence ([`transport_divergence_element`]) is linear in the nodal
-//! transport and the face flux, so `Σ_l ∇·Q_l = ∇·DU_avg2 = Σ_l s_l − ∂η/∂t`
+//! transport and the face flux, and its volume term takes the 2D module's
+//! metric form ([`MetricForm`]: on general quadrilaterals the split forms'
+//! averaged metric is a different operator from the collocated form's), so
+//! `Σ_l ∇·Q_l = ∇·DU_avg2 = Σ_l s_l − ∂η/∂t`
 //! and `Ω` at the surface vanishes to round-off. That holds wherever the barotropic pass
 //! keeps the nodal identity; where it only keeps element balances (`WetDry`
 //! elements with a dry node, positivity-limited elements, see
@@ -75,6 +78,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::mesh::data::BoundaryTag;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::SWEFormulation2D;
 use crate::solver::core::blocks::{Pooled, for_each_block, max_over_blocks};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
@@ -83,8 +87,48 @@ use crate::source::RiverInflow;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
+/// How the curvilinear metric enters the volume term of a horizontal flux
+/// divergence. The 3D kernels take the 2D module's form
+/// ([`Self::of`]), so that the layer continuity is the barotropic mass
+/// equation's operator and `Σ_l ∇·Q_l = ∇·DU_avg2` holds node by node (see
+/// the module docs). On a parallelogram the metric is constant and the two
+/// are the same operator; on a general quadrilateral they differ by the
+/// aliasing of the metric times the flux.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MetricForm {
+    /// The collocated strong form `J⁻¹[D_r(J∇r·q) + D_s(J∇s·q)]`
+    /// (`SWEFormulation2D::Standard`).
+    #[default]
+    Conservative,
+    /// Two-point fluxes with the averaged metric,
+    /// `J⁻¹ Σ_j [D_r,ij {{J∇r}}_ij + D_s,ij {{J∇s}}_ij]·(q_i + q_j)`: the
+    /// mass flux of the split forms (`EntropyConservative`, `EntropyStable`,
+    /// `WetDry`; Wintermeyer et al. 2017).
+    Averaged,
+}
+
+impl MetricForm {
+    /// The form of the 2D module's mass equation under `formulation`.
+    pub fn of(formulation: SWEFormulation2D) -> Self {
+        match formulation {
+            SWEFormulation2D::Standard => Self::Conservative,
+            SWEFormulation2D::EntropyConservative
+            | SWEFormulation2D::EntropyStable
+            | SWEFormulation2D::WetDry => Self::Averaged,
+        }
+    }
+
+    /// Whether element `k` takes the averaged two-point volume term (on a
+    /// parallelogram it is the conservative one, which is cheaper).
+    #[inline]
+    pub(crate) fn averaged_on(self, geom: &GeometricFactors2D, k: usize) -> bool {
+        self == Self::Averaged && !geom.element_is_affine(k)
+    }
+}
+
 /// The DG divergence of a transport `q = (hu, hv)` on element `k`, in the
-/// strong (conservative) form of the 2D shallow-water kernel:
+/// strong form of the 2D shallow-water kernel with the volume term in
+/// `metric`'s form (conservative shown):
 ///
 /// ```text
 ///     J⁻¹[Dr·(J∇r·q) + Ds·(J∇s·q)] − J⁻¹ Σ_f LIFT_f sJ_f (q·n − F*)
@@ -93,9 +137,11 @@ use crate::vertical::SigmaGrid;
 /// `hu`, `hv` are the element's nodal values; `face` holds the numerical flux
 /// `F*` out of every face node, `face · n_face_nodes + fi`. The result is
 /// linear in `(hu, hv, face)`, which the layer transports rely on.
+#[allow(clippy::too_many_arguments)]
 pub fn transport_divergence_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
+    metric: MetricForm,
     k: usize,
     hu: &[f64],
     hv: &[f64],
@@ -103,15 +149,30 @@ pub fn transport_divergence_element(
     div: &mut [f64],
 ) {
     let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
-    for (i, d) in div.iter_mut().enumerate() {
-        let (mut dr, mut ds) = (0.0, 0.0);
-        for j in 0..nn {
-            let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
-            let (fr, fs) = (ar_x * hu[j] + ar_y * hv[j], as_x * hu[j] + as_y * hv[j]);
-            dr += ops.dr[(i, j)] * fr;
-            ds += ops.ds[(i, j)] * fs;
+    if metric.averaged_on(geom, k) {
+        // ½ Σ_j D_ij (Ja_i + Ja_j)·(q_i + q_j)
+        for (i, d) in div.iter_mut().enumerate() {
+            let (ar_i, as_i) = geom.contravariant(k, i);
+            let (mut dr, mut ds) = (0.0, 0.0);
+            for j in 0..nn {
+                let (ar_j, as_j) = geom.contravariant(k, j);
+                let (qx, qy) = (hu[i] + hu[j], hv[i] + hv[j]);
+                dr += ops.dr[(i, j)] * ((ar_i.0 + ar_j.0) * qx + (ar_i.1 + ar_j.1) * qy);
+                ds += ops.ds[(i, j)] * ((as_i.0 + as_j.0) * qx + (as_i.1 + as_j.1) * qy);
+            }
+            *d = 0.5 * geom.jacobian_inv(k, i) * (dr + ds);
         }
-        *d = geom.jacobian_inv(k, i) * (dr + ds);
+    } else {
+        for (i, d) in div.iter_mut().enumerate() {
+            let (mut dr, mut ds) = (0.0, 0.0);
+            for j in 0..nn {
+                let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
+                let (fr, fs) = (ar_x * hu[j] + ar_y * hv[j], as_x * hu[j] + as_y * hv[j]);
+                dr += ops.dr[(i, j)] * fr;
+                ds += ops.ds[(i, j)] * fs;
+            }
+            *d = geom.jacobian_inv(k, i) * (dr + ds);
+        }
     }
     for f in 0..4 {
         let f_star = &face[f * nfn..(f + 1) * nfn];
@@ -152,6 +213,12 @@ pub fn transport_divergence_element(
 /// tenfold every 6 h (`examples/seamount_3d.rs`). For the momentum it is
 /// what keeps the kinetic energy (see [`MomentumAdvectionForm::Split`]).
 ///
+/// That is the [`MetricForm::Conservative`] pairing, `{{J∇r·q}}_ij`; with
+/// [`MetricForm::Averaged`] the contravariant transport of a pair is
+/// `{{J∇r}}_ij·{{q}}_ij` instead (the 2D split forms' mass flux). Either way
+/// a constant `φ` gives `φ` times [`transport_divergence_element`] of `q` in
+/// the same form, the layer continuity.
+///
 /// `hu`, `hv` and `phi` are the element's nodal values, `face` the
 /// numerical flux `F*` of `qφ` out of every face node, `fr`, `fs` scratch
 /// of `n_nodes` values.
@@ -159,6 +226,7 @@ pub fn transport_divergence_element(
 pub fn advective_divergence_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
+    metric: MetricForm,
     k: usize,
     hu: &[f64],
     hv: &[f64],
@@ -169,18 +237,35 @@ pub fn advective_divergence_element(
     div: &mut [f64],
 ) {
     let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
-    for j in 0..nn {
-        let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
-        fr[j] = ar_x * hu[j] + ar_y * hv[j];
-        fs[j] = as_x * hu[j] + as_y * hv[j];
-    }
-    for (i, d) in div.iter_mut().enumerate() {
-        let mut sum = 0.0;
-        for j in 0..nn {
-            let flux = ops.dr[(i, j)] * (fr[i] + fr[j]) + ops.ds[(i, j)] * (fs[i] + fs[j]);
-            sum += flux * (phi[i] + phi[j]);
+    if metric.averaged_on(geom, k) {
+        // 2{{Ja}}·{{q}} = ½(Ja_i + Ja_j)·(q_i + q_j)
+        for (i, d) in div.iter_mut().enumerate() {
+            let (ar_i, as_i) = geom.contravariant(k, i);
+            let mut sum = 0.0;
+            for j in 0..nn {
+                let (ar_j, as_j) = geom.contravariant(k, j);
+                let (qx, qy) = (hu[i] + hu[j], hv[i] + hv[j]);
+                let flux = 0.5
+                    * (ops.dr[(i, j)] * ((ar_i.0 + ar_j.0) * qx + (ar_i.1 + ar_j.1) * qy)
+                        + ops.ds[(i, j)] * ((as_i.0 + as_j.0) * qx + (as_i.1 + as_j.1) * qy));
+                sum += flux * (phi[i] + phi[j]);
+            }
+            *d = 0.5 * geom.jacobian_inv(k, i) * sum;
         }
-        *d = 0.5 * geom.jacobian_inv(k, i) * sum;
+    } else {
+        for j in 0..nn {
+            let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
+            fr[j] = ar_x * hu[j] + ar_y * hv[j];
+            fs[j] = as_x * hu[j] + as_y * hv[j];
+        }
+        for (i, d) in div.iter_mut().enumerate() {
+            let mut sum = 0.0;
+            for j in 0..nn {
+                let flux = ops.dr[(i, j)] * (fr[i] + fr[j]) + ops.ds[(i, j)] * (fs[i] + fs[j]);
+                sum += flux * (phi[i] + phi[j]);
+            }
+            *d = 0.5 * geom.jacobian_inv(k, i) * sum;
+        }
     }
     for f in 0..4 {
         let f_star = &face[f * nfn..(f + 1) * nfn];
@@ -231,6 +316,9 @@ pub struct LayerTransport {
     /// column (m/s): round-off where the barotropic pass keeps the nodal
     /// identity `η̄ − ηⁿ = −Δt∇·DU_avg2`.
     pub surface_residual: f64,
+    /// The volume form of every horizontal divergence of these transports:
+    /// the 2D module's ([`MetricForm::of`]; see [`Self::with_metric`]).
+    pub metric: MetricForm,
 }
 
 impl LayerTransport {
@@ -245,7 +333,15 @@ impl LayerTransport {
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
+            metric: MetricForm::default(),
         }
+    }
+
+    /// The transports with `metric`'s volume form (the default is
+    /// [`MetricForm::Conservative`], the same on parallelograms).
+    pub fn with_metric(mut self, metric: MetricForm) -> Self {
+        self.metric = metric;
+        self
     }
 
     /// Number of layers.
@@ -285,8 +381,10 @@ impl LayerTransport {
             hv: layer_hv,
             face: layer_face,
             omega: layer_omega,
+            metric,
             ..
         } = self;
+        let metric = *metric;
 
         // 1. Nodal layer transports, corrected to DU_avg2
         for_each_block(
@@ -427,6 +525,7 @@ impl LayerTransport {
                     transport_divergence_element(
                         ops,
                         geom,
+                        metric,
                         k,
                         hu,
                         hv,
@@ -477,6 +576,7 @@ impl LayerTransport {
         let nl = layers.n_levels;
         assert_eq!(self.n_levels, nl + 1, "w-cells of {nl} layers");
         let nw = nl + 1;
+        self.metric = layers.metric;
         for (w_cells, layer_values) in [
             (&mut self.hu, &layers.hu),
             (&mut self.hv, &layers.hv),
@@ -1186,13 +1286,14 @@ impl LayerContext<'_> {
             }
         }
         if split {
-            advective_divergence_element(ops, self.geom, k, hu, hv, phi, face, fr, fs, div);
+            let metric = transport.metric;
+            advective_divergence_element(ops, self.geom, metric, k, hu, hv, phi, face, fr, fs, div);
         } else {
             for ((hu, hv), &phi) in hu.iter_mut().zip(hv.iter_mut()).zip(phi.iter()) {
                 *hu *= phi;
                 *hv *= phi;
             }
-            transport_divergence_element(ops, self.geom, k, hu, hv, face, div);
+            transport_divergence_element(ops, self.geom, transport.metric, k, hu, hv, face, div);
         }
         div
     }
@@ -1343,6 +1444,7 @@ mod tests {
                 transport_divergence_element(
                     &ops,
                     &geom,
+                    MetricForm::Conservative,
                     k,
                     &du_hu[k * nn..(k + 1) * nn],
                     &du_hv[k * nn..(k + 1) * nn],

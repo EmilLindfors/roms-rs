@@ -220,6 +220,38 @@ Convergence on the distorted meshes (8 → 16 elements per side):
 | SWE manufactured, `WetDry` fully wet P2 / P3 | 2.95 / 3.89 |
 | SWE manufactured, `WetDry` subcells forced P1 / P2 / P3 | 1.92 / 1.74 / 1.86 (P2 16 → 32: 1.91; uniform mesh 1.90) |
 
+#### 3D on general quadrilaterals
+
+`tests/curvilinear_3d_test.rs`, on meshes distorted by a smooth field plus a
+checkerboard jitter of 0.1 element (every element a general quadrilateral,
+and not asymptotically parallelograms: the jitter scales with the element).
+The 3D divergences take the 2D module's metric form (`MetricForm`: averaged
+under the split forms, conservative under `Standard`); the pressure gradient
+its adjoint.
+
+| Property | Result |
+|----------|--------|
+| Constant N² at rest over a seamount, both PGF forms and metrics, P1–P4 | ≤ 7.8e-15 m/s² |
+| Tilted η (full PGF = −g∇η); linear ρ(x, y) over a flat bed | 9.7e-16 m/s² each (of 1e-3, 1e-4) |
+| Net PGF force over level σ-surfaces, rough ρ (periodic) | ≤ 5.3e-17 of Σ\|F\| |
+| Stratified seamount at rest, 36 h, Kuzmin limiter (6 × 6 P2, 10 levels) | 3.6e-11 m/s (rectangles: 7.9e-11) |
+| Uniform T, S under a 0.5 m seiche over a sloping bed | 7.0e-13; Ω surface residual 3.5e-18 of Ω 7.3e-3 m/s |
+| Tracer inventories and volume, same run with gradients and the limiter | 2.9e-15 / 1.3e-14 relative |
+| Momentum, flat periodic bed, shear + viscosity | 5.1e-14 of the transport |
+
+Convergence (4 → 32 elements per side, 10 → 80 levels for the PGF):
+
+| Case | Observed orders |
+|------|-----------------|
+| Tracer advection by a uniform flow, P2 (L2) | 2.85, 2.89 |
+| σ-pairs PGF, chain rule (`Conservative`), P2 / P3 (max) | 1.65, 1.91, 1.92 / 2.86, 2.98, 2.84 |
+| σ-pairs PGF, averaged metric, P2 / P3 (max) | 1.48, 1.68, 1.08 / 2.38, 2.10, 2.11 |
+| σ-pairs PGF, element means, either metric, P2 / P3 | 2.15, 3.22, 2.86 / 2.23, 2.83, 2.92 |
+
+The averaged metric loses one order pointwise on these meshes. Its extra
+error is aliasing of the metric times the pressure, with zero mean on every
+element: the resolved force (the element means) is the chain rule's.
+
 ### Numerical Flux Comparison
 
 For smooth solutions, all flux types produce similar results:

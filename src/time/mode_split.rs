@@ -84,7 +84,8 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
 use crate::solver::core::blocks::{for_each_block, update_values, update_with};
 use crate::solver::rhs::{
-    BarotropicFlux, from_inventory, to_inventory, transport_divergence_element, w_cell_thicknesses,
+    BarotropicFlux, MetricForm, from_inventory, to_inventory, transport_divergence_element,
+    w_cell_thicknesses,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -126,6 +127,11 @@ pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
         out: &mut SWESolution2D,
         face_mass: &mut [f64],
     );
+
+    /// The volume form of the mass equation's divergence: the barotropic
+    /// transport's divergence and the 3D layer continuity must be the same
+    /// operator as the 2D module's (they differ on general quadrilaterals).
+    fn metric_form(&self) -> MetricForm;
 }
 
 /// The barotropic transport of one baroclinic step: the fluxes that moved the
@@ -185,13 +191,16 @@ impl BarotropicTransport {
         self.discharge.fill(0.0);
     }
 
-    /// The DG divergence of the transport, in the strong (conservative) form
-    /// of the 2D kernel: `J⁻¹[Dr·(J∇r·q) + Ds·(J∇s·q)] − J⁻¹ Σ_f LIFT_f sJ_f
-    /// (q·n − F*_h)` with `q = (hu, hv)`.
+    /// The DG divergence of the transport, in the strong form of the 2D
+    /// kernel with its volume term in `metric`'s form (the 2D module's,
+    /// [`BarotropicPhysics::metric_form`]): conservatively
+    /// `J⁻¹[Dr·(J∇r·q) + Ds·(J∇s·q)] − J⁻¹ Σ_f LIFT_f sJ_f (q·n − F*_h)` with
+    /// `q = (hu, hv)`.
     pub fn divergence_into(
         &self,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
+        metric: MetricForm,
         out: &mut DGSolution2D,
     ) {
         let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
@@ -199,6 +208,7 @@ impl BarotropicTransport {
             transport_divergence_element(
                 ops,
                 geom,
+                metric,
                 k,
                 &self.hu.data[k * nn..(k + 1) * nn],
                 &self.hv.data[k * nn..(k + 1) * nn],
@@ -886,7 +896,12 @@ impl ModeSplitIntegrator {
         // Elements where the pass broke the nodal identity ∂η/∂t = −∇·DU_avg2
         // (WetDry subcells, positivity limiter) carry their tracers as element
         // means for the step
-        transport.divergence_into(barotropic.operators(), geom, transport_divergence);
+        transport.divergence_into(
+            barotropic.operators(),
+            geom,
+            barotropic.metric_form(),
+            transport_divergence,
+        );
         for (k, mark) in element_means.iter_mut().enumerate() {
             let nodes = k * nn..(k + 1) * nn;
             let bed = bathymetry.element(ElementIndex::new(k));
@@ -1926,7 +1941,7 @@ mod tests {
             integrator
                 .barotropic_transport()
                 .expect("after a step")
-                .divergence_into(&ops, &geom, &mut div);
+                .divergence_into(&ops, &geom, physics.swe.metric_form(), &mut div);
 
             let change: Vec<f64> = state
                 .eta
