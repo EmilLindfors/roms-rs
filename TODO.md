@@ -306,6 +306,8 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
   - Measure the RHS per component·node first, then the fused positivity pass and the source transpose. Allocation: `rates`/`integrate` use per-worker scratch, and `compute_dt` is O(points × components) per call.
 - [ ] Validation at Frøya and Mausund: the nearest wave buoys (MET/Kystverket, the E39 buoys in Sulafjorden and Halsafjorden) and MyWave WAM hindcasts. H_s, T_p and direction skill. The lee of the skerries is where a coastline-resolving DG wave model should beat the 800 m parent.
 - [ ] Viewer: H_s and mean direction as a colouring and arrows. Visual waves on the surface: Gerstner waves sampled from each node's spectrum, animated between snapshots.
+  - [x] The surf-zone beach (2026-10-03): `cd viz && cargo run --release --bin surf_zone` runs both gates' cases in-process (≈ 8 s) and animates crests from the model's H_rms, mean direction and wavenumber per column, with bores and white water where a wave loses a share of its energy to breaking per period (`2 Q_b/β²`), the setup in the mean level, and floats on the longshore current. Keys 1/2 switch the case; `--screenshot` for headless checks.
+  - [ ] The same for the main viewer's meshes: a wave state per snapshot, sampled per node (the beach is uniform alongshore, so its crests come from one phase integral `∫ k_y dy`; on a real mesh the phase needs an eikonal solve, or crests per component as Gerstner waves).
 - [ ] Diffraction behind islands and breakwaters (phase-decoupled refraction–diffraction, Holthuijsen et al. 2003), for farms sheltered by skerries.
 
 ---

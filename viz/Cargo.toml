@@ -5,6 +5,7 @@ edition = "2024"
 description = "3D viewer for dg-rs coastal simulations, built on Bevy"
 license = "MIT"
 publish = false
+default-run = "dg-viz"
 
 # A workspace of its own, so building and testing dg-rs never compiles Bevy.
 [workspace]
