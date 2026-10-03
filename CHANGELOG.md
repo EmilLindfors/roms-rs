@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Wave-enhanced bed friction (`source::WaveCurrentFriction2D`, `WaveModel2D::bed_wave_stress`; TODO F.4 coupling).** Any 2D friction law under waves, scaled by Soulsby's (1995) `1 + 1.2 (τ_w/(τ_c + τ_w))^3.2`, with `τ_w = ½ ρ f_w U_w²` from the spectrum (Soulsby 1997: `f_w = 1.39 (A/z₀)^(−0.52)`, `U_w = √2 U_rms`). Gates: one component's stress exactly; the enhancement's limits; a 0.63 m/s channel current slows to 0.46 m/s under a 6 Pa sea, to 1e-7 of the steady balance.
+
 - **The waves' roughness for the 3D turbulence closure (TODO F.4 coupling).** `Hydrostatic3D::with_surface_roughness` / `set_surface_roughness` take a surface roughness per column, and `WaveModel2D::surface_roughness(n, α)` gives `α H_s` (Terray et al.: α ≈ 0.6). GLS uses the largest of its own constant, the column's and Charnock's.
   - API: `apply_vertical_diffusion` now takes `SurfaceFields { stress, roughness }` in place of the surface-stress field, and `Column` has `surface_roughness`.
   - Gate: per-column roughnesses give bit-for-bit the columns of closures with those constants. A 1.2 m roughness mixes the top 3× more than 0.3 m.

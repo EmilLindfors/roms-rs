@@ -32,5 +32,5 @@ pub use friction::{
 pub use gridded_atmosphere::{GriddedAtmosphere2D, GriddedWindStress};
 pub use tidal::{TidalPotential, TidalPotentialConstituent};
 pub use viscosity::HorizontalViscosity2D;
-pub use waves::WaveForce2D;
+pub use waves::{WaveCurrentFriction2D, WaveForce2D};
 pub use wind::{DragCoefficient, RHO_AIR, RHO_WATER, WindStress2D};
