@@ -33,7 +33,7 @@ Merged 2026-10-03:
 Details in F.3 and F.4. Next, in this order:
 1. ~~**F.4 stage 2: quadruplet interactions (DIA) and a diagnostic tail.**~~ Done 2026-10-03 (branch `feat/waves-dia`): wind seas grow with fetch (f_p to KC92 within 10 %, E* 1.3–0.60×). See F.4.
 2. ~~**Stokes drift into the particle trackers (F.4 coupling).**~~ Done 2026-10-03 (`WithStokesDrift2D`/`3D`, `farm_3d stokes=`). See F.4.
-3. **Second-order θ/σ advection (F.4).** The first-order refraction bias is ≈ 1° at 5° bins.
+3. ~~**Second-order θ/σ advection (F.4).**~~ Done 2026-10-03: MUSCL with van Leer's limiter, second order on resolved spectra. See F.4.
 4. **The rest of the coupling.** Radiation stress or the vortex force on the currents; H_s into GLS wave breaking and surface roughness; wave-enhanced bed stress. Then MET Norway boundary spectra and a cost measurement at Frøya.
 
 The circulation items below (P3.1 and the error budget) stand as they were.
@@ -256,7 +256,13 @@ Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled
 - [ ] Wind-sea energy at long fetch and full development: Komen whitecapping (δ = 1, C_ds = 2.36e-5) leaves E* 0.60× KC92 at X* = 1.2e4 (growth ∝ X*^0.56 against 0.9), and under a steady wind it passes Pierson–Moskowitz after ≈ 180 h, reaching 1.5× at 1000 h (`wave_growth mode=duration hours=1000 dt=300`; SWAN warns of this for δ = 1 without retuning C_ds). The f_p curve is right, so the spectrum is too low for its peak. Try van der Westhuysen et al.'s (2007) saturation-based whitecapping with the Yan (1987) input (SWAN `GEN3 WESTH`), or ST6 (Rogers et al. 2012). Gate on the same two tests, then tighten their bounds.
 - [ ] The whitecapping means (`Means::of` in `src/waves/sources.rs`) integrate over the grid only; SWAN adds the diagnostic tail beyond `σ_max`. Negligible at f_max = 1 Hz for these seas (no tail and an f⁻⁵ tail agree to 1 %), but it matters for young seas near the grid top.
 - [ ] Triads (LTA, Eldeberky 1996) for the surf zone.
-- [ ] Second-order advection in θ and σ (MUSCL with a limiter, or SWAN's hybrid central/upwind). The first-order refraction bias is ≈ 1° at 5° bins (the Snell gate), and its numerical diffusion widens spectra. On steep fjord walls refraction sets the step: `with_turning_limit` caps |c_θ| (Dietrich et al. 2013), or θ could be implicit (a cyclic tridiagonal per node and frequency).
+- [x] Second-order advection in θ and σ (2026-10-03): MUSCL, the upwind bin reconstructed linearly with van Leer's limiter (`SpectralAdvection::VanLeer`, the default; `Upwind` remains). `compute_dt` halves the spectral Courant limits for it (TVD for ≤ ½).
+  - Gates, against exact steady states (`N c_g/k` constant along rays; Snell's `k cos θ` or `ω = σ + k·U` and `k_x`):
+    - `a_spread_sea_refracts_to_the_exact_steady_state` (cos⁸ about 20° off the normal on the 20 → 4 m shelf): mean direction off by 0.37 / 0.072 / 0.012° at 10 / 5 / 2.5° bins (rates 2.4, 2.5) against upwind's 1.38 / 0.70 / 0.35° (rates 1.0).
+    - `a_spread_sea_on_a_current_has_the_exact_doppler_shift` (Gaussian in σ, cos⁸ in θ, a following current 0 → 0.6 m/s over 500 m): mean σ off by 9.2e-3 / 2.0e-3 / 3.3e-4 (rates 2.2, 2.6) against upwind's 1.8e-2 / 9.0e-3 / 4.5e-3 (rates 1.00), refining σ and θ together.
+    - The single-bin gates (Snell, the Doppler spike) stay first order with either scheme: a spike is an extremum, where the limiter falls back to first order, and it leaves its bin through faces whose speed is O(Δθ) off the bin's. MUSCL: 2.13 / 1.04 / 0.52° and 0.53 %; upwind 2.06 / 1.03 / 0.51° and 0.34 %. Swell from a parent model that is one or two bins wide behaves like this; finer bins are the cure there, not the scheme.
+  - Cost: within the noise of the fetch gate (3.0–3.4 s against 2.9 s; the stencil adds two bins per face).
+- [ ] On steep fjord walls refraction sets the step: `with_turning_limit` caps |c_θ| (Dietrich et al. 2013), or θ could be implicit (a cyclic tridiagonal per node and frequency). MUSCL halves the spectral Courant limit, which makes this more pressing.
 - [ ] `c_σ` from a changing depth (`∂σ/∂d ∂d/∂t`): tides shift frequencies over flats. It needs the rate of η from the circulation, or the difference of two water levels.
 - [ ] Coupling (two-way, every coupling interval):
   - circulation → waves: `set_water_level`, `set_currents` (P2 nodes to the wave mesh's).

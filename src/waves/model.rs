@@ -16,10 +16,13 @@
 //!   `m` across the crest (θ + 90°): waves turn towards shallower water;
 //! - frequency shifting by currents, `c_σ = ∂σ/∂d U·∇d − c_g k·∂U/∂s` (`s` along
 //!   θ; the term of a changing depth `∂σ/∂d ∂d/∂t` is not included yet);
-//! - both by first-order upwind finite volumes over the direction bins (periodic)
-//!   and the frequency bins (energy leaves through the ends, none comes in).
-//!   Every term is in flux form, so the total action `Σ Δσ Δθ ∫ N dA` is conserved
-//!   up to what crosses the open boundaries and the spectral ends.
+//! - both by finite volumes over the direction bins (periodic) and the frequency
+//!   bins (energy leaves through the ends, none comes in): MUSCL, the upwind bin
+//!   reconstructed linearly with van Leer's limiter (van Leer 1979; second order
+//!   where the spectrum is smooth, TVD), or first-order upwind
+//!   ([`SpectralAdvection`]). Every term is in flux form, so the total action
+//!   `Σ Δσ Δθ ∫ N dA` is conserved up to what crosses the open boundaries and the
+//!   spectral ends.
 //!
 //! Depth (`d = η − B`, floored at a minimum depth), its gradient, the current and
 //! its gradient are nodal fields (gradients by the element's own derivative
@@ -51,6 +54,17 @@ use super::state::WaveSolution;
 
 /// Default minimum depth (m): shallower water, and land, is taken this deep.
 pub const DEFAULT_DEPTH_MIN: f64 = 0.1;
+
+/// How refraction and frequency shifting move action between the spectral bins.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SpectralAdvection {
+    /// First-order upwind finite volumes
+    Upwind,
+    /// MUSCL: the upwind bin linearly reconstructed with van Leer's limiter,
+    /// second order where the spectrum is smooth, TVD for Courant numbers ≤ ½
+    #[default]
+    VanLeer,
+}
 
 /// Reusable storage of [`WaveModel2D::step`].
 #[derive(Default)]
@@ -87,6 +101,7 @@ pub struct WaveModel2D {
     boundary: Option<Vec<f64>>,
     /// Largest turning rate |c_θ| (rad/s) refraction may have, or none
     turning_limit: Option<f64>,
+    spectral_advection: SpectralAdvection,
 }
 
 impl WaveModel2D {
@@ -118,6 +133,7 @@ impl WaveModel2D {
             sigma_d: vec![0.0; n_freq * n_points],
             boundary: None,
             turning_limit: None,
+            spectral_advection: SpectralAdvection::default(),
             mesh,
             ops,
             geom,
@@ -172,6 +188,13 @@ impl WaveModel2D {
     /// default) leaves refraction exact.
     pub fn with_turning_limit(mut self, rate: Option<f64>) -> Self {
         self.turning_limit = rate;
+        self
+    }
+
+    /// The scheme of the direction and frequency advection (van Leer's MUSCL by
+    /// default).
+    pub fn with_spectral_advection(mut self, scheme: SpectralAdvection) -> Self {
+        self.spectral_advection = scheme;
         self
     }
 
@@ -279,7 +302,9 @@ impl WaveModel2D {
 
     /// The largest stable step (s) for Courant number `cfl` (≤ 1 for SSP-RK3): DG
     /// propagation `Δt ≤ cfl h / ((2N + 1) |c_g e_θ + U|)` per element (h = √area),
-    /// and the spectral advection `|c_θ| Δt ≤ cfl Δθ`, `|c_σ| Δt ≤ cfl Δσ`.
+    /// and the spectral advection `|c_θ| Δt ≤ cfl Δθ`, `|c_σ| Δt ≤ cfl Δσ`, with
+    /// half of that for MUSCL (van Leer's reconstruction is TVD, so positive, for
+    /// Courant numbers ≤ ½).
     pub fn compute_dt(&self, cfl: f64) -> f64 {
         let (n_nodes, n_points) = (self.ops.n_nodes, self.n_points());
         let order_factor = (2 * self.ops.order + 1) as f64;
@@ -299,6 +324,10 @@ impl WaveModel2D {
             }
         }
         let (dtheta, nd) = (self.grid.d_theta, self.grid.n_dir());
+        let cfl = match self.spectral_advection {
+            SpectralAdvection::Upwind => cfl,
+            SpectralAdvection::VanLeer => 0.5 * cfl,
+        };
         for p in 0..n_points {
             for i in 0..self.grid.n_freq() {
                 for j in 0..nd {
@@ -417,38 +446,71 @@ impl WaveModel2D {
         let (nf, nd) = (self.grid.n_freq(), self.grid.n_dir());
         let (i, j) = (c / nd, c % nd);
         let grid = &self.grid;
+        let second_order = self.spectral_advection == SpectralAdvection::VanLeer;
         let here = n.component(c);
-        // Directions: periodic, faces at θ_j ± Δθ/2
-        let (jm, jp) = ((j + nd - 1) % nd, (j + 1) % nd);
-        let (below, above) = (n.component(i * nd + jm), n.component(i * nd + jp));
+        // Directions: periodic, faces at θ_j ± Δθ/2; the bins two away for the
+        // reconstruction
+        let dir = |offset: isize| {
+            let jj = (j as isize + offset).rem_euclid(nd as isize) as usize;
+            n.component(i * nd + jj)
+        };
+        let (below, above) = (dir(-1), dir(1));
+        let (below2, above2) = (second_order.then(|| dir(-2)), second_order.then(|| dir(2)));
         let (theta_lo, theta_hi) = (
             grid.theta[j] - 0.5 * grid.d_theta,
             grid.theta[j] + 0.5 * grid.d_theta,
         );
-        let upwind = |speed: f64, left: f64, right: f64| {
-            if speed >= 0.0 {
-                speed * left
-            } else {
-                speed * right
-            }
-        };
         let inv_dtheta = 1.0 / grid.d_theta;
         // Frequencies: faces between bins; nothing enters at the ends
-        let lower = (i > 0).then(|| n.component((i - 1) * nd + j));
-        let upper = (i + 1 < nf).then(|| n.component((i + 1) * nd + j));
+        let freq = |offset: isize| {
+            let ii = i as isize + offset;
+            (0..nf as isize)
+                .contains(&ii)
+                .then(|| n.component(ii as usize * nd + j))
+        };
+        let (lower, upper) = (freq(-1), freq(1));
+        let (lower2, upper2) = (
+            freq(-2).filter(|_| second_order),
+            freq(2).filter(|_| second_order),
+        );
         let inv_dsigma = 1.0 / grid.d_sigma[i];
         let theta = grid.theta[j];
+        let at = |field: Option<&[f64]>, p: usize| field.map(|f| f[p]);
         for (p, out) in out.iter_mut().enumerate() {
-            let f_hi = upwind(self.c_theta(i, theta_hi, p), here[p], above[p]);
-            let f_lo = upwind(self.c_theta(i, theta_lo, p), below[p], here[p]);
+            let f_hi = face_flux(
+                self.c_theta(i, theta_hi, p),
+                at(below2.is_some().then_some(below), p),
+                here[p],
+                above[p],
+                at(above2, p),
+            );
+            let f_lo = face_flux(
+                self.c_theta(i, theta_lo, p),
+                at(below2, p),
+                below[p],
+                here[p],
+                at(above2.is_some().then_some(above), p),
+            );
             *out -= (f_hi - f_lo) * inv_dtheta;
             let cs = self.c_sigma(i, theta, p);
             let g_hi = match upper {
-                Some(up) => upwind(0.5 * (cs + self.c_sigma(i + 1, theta, p)), here[p], up[p]),
+                Some(up) => face_flux(
+                    0.5 * (cs + self.c_sigma(i + 1, theta, p)),
+                    at(lower.filter(|_| second_order), p),
+                    here[p],
+                    up[p],
+                    at(upper2, p),
+                ),
                 None => cs.max(0.0) * here[p],
             };
             let g_lo = match lower {
-                Some(lo) => upwind(0.5 * (cs + self.c_sigma(i - 1, theta, p)), lo[p], here[p]),
+                Some(lo) => face_flux(
+                    0.5 * (cs + self.c_sigma(i - 1, theta, p)),
+                    at(lower2, p),
+                    lo[p],
+                    here[p],
+                    at(upper.filter(|_| second_order), p),
+                ),
                 None => cs.min(0.0) * here[p],
             };
             *out -= (g_hi - g_lo) * inv_dsigma;
@@ -626,6 +688,30 @@ impl WaveModel2D {
             total += integral * self.grid.d_sigma[c / nd] * self.grid.d_theta;
         }
         total
+    }
+}
+
+/// The upwind flux `speed · N_face` through the face between the bins `left` and
+/// `right`. With the bins beyond them (`far_left`, `far_right`) the face value
+/// is the upwind bin's, reconstructed linearly with van Leer's limited slope
+/// (`2ab/(a + b)` of the one-sided differences, 0 at an extremum): second
+/// order where smooth, TVD; without, first-order upwind.
+#[inline]
+fn face_flux(
+    speed: f64,
+    far_left: Option<f64>,
+    left: f64,
+    right: f64,
+    far_right: Option<f64>,
+) -> f64 {
+    // Half of van Leer's slope from the one-sided differences a and b
+    let half_slope = |a: f64, b: f64| if a * b > 0.0 { a * b / (a + b) } else { 0.0 };
+    if speed >= 0.0 {
+        let value = far_left.map_or(left, |ll| left + half_slope(left - ll, right - left));
+        speed * value
+    } else {
+        let value = far_right.map_or(right, |rr| right - half_slope(right - left, rr - right));
+        speed * value
     }
 }
 
