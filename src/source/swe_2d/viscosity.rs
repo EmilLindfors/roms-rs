@@ -4,32 +4,29 @@
 //!   ∂(hu)/∂t + ... = ... + ∇·(ν h ∇u)
 //!   ∂(hv)/∂t + ... = ... + ∇·(ν h ∇v)
 //!
-//! Two models are provided:
-//! - **Constant**: Uniform eddy viscosity ν = ν₀
-//! - **Smagorinsky**: Strain-dependent ν = (C_s · Δ)² · |S|,
-//!   where |S| is the magnitude of the strain rate tensor
+//! The eddy viscosity is a constant background plus, optionally,
+//! Smagorinsky's (1963) strain-dependent part:
+//!
+//! ```text
+//!     ν = ν₀ + (C_s Δ)² |S|,    Δ = √(area)/N,
+//! ```
+//!
+//! `|S|` the magnitude of the strain rate tensor and `Δ` the node spacing of
+//! an element of order `N` (the filter width of the 3D shear's viscosity,
+//! `solver::rhs::viscosity_3d`, too).
 //!
 //! These terms are injected directly in the RHS (not via `SourceTerm2D`)
 //! because they require access to differentiation operators and geometric
 //! factors for gradient computation.
 
-/// Viscosity model selection.
-#[derive(Debug, Clone, Copy)]
-pub enum ViscosityModel {
-    /// Constant eddy viscosity: ν = ν₀
-    Constant(f64),
-    /// Smagorinsky model: ν = (C_s · Δ)² · |S|
-    ///
-    /// where C_s is the Smagorinsky coefficient (typically 0.1–0.2)
-    /// and Δ is the local grid spacing (estimated from √det_j).
-    Smagorinsky { cs: f64 },
-}
-
-/// Horizontal viscosity configuration for 2D SWE momentum diffusion.
-#[derive(Debug, Clone)]
+/// Horizontal viscosity configuration for 2D SWE momentum diffusion:
+/// `ν = ν₀ + (C_s Δ)²|S|` (m²/s; see the [module documentation](self)).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HorizontalViscosity2D {
-    /// The viscosity model.
-    pub model: ViscosityModel,
+    /// The constant background `ν₀` (m²/s).
+    pub background: f64,
+    /// Smagorinsky's coefficient `C_s` (typically 0.1–0.2; 0 for none).
+    pub smagorinsky: f64,
     /// Minimum depth below which viscosity is disabled (avoids division by tiny h).
     pub h_min: f64,
 }
@@ -41,28 +38,49 @@ impl HorizontalViscosity2D {
     /// * `nu` - Constant viscosity coefficient [m²/s]
     pub fn constant(nu: f64) -> Self {
         Self {
-            model: ViscosityModel::Constant(nu),
+            background: nu,
+            smagorinsky: 0.0,
             h_min: 1e-3,
         }
     }
 
-    /// Create a Smagorinsky viscosity model.
+    /// Create a Smagorinsky viscosity model, without a background.
     ///
     /// # Arguments
     /// * `cs` - Smagorinsky coefficient (typically 0.1–0.2)
     pub fn smagorinsky(cs: f64) -> Self {
         Self {
-            model: ViscosityModel::Smagorinsky { cs },
+            background: 0.0,
+            smagorinsky: cs,
             h_min: 1e-3,
         }
     }
 
-    /// Compute the viscosity at a point given velocity gradients and element size.
+    /// The same model with the constant background `nu` (m²/s) added.
+    pub fn with_background(mut self, nu: f64) -> Self {
+        self.background = nu;
+        self
+    }
+
+    /// Whether ν follows the strain (a nonzero Smagorinsky coefficient).
+    pub fn is_strain_dependent(&self) -> bool {
+        self.smagorinsky != 0.0
+    }
+
+    /// Smagorinsky's filter width `Δ = √(area)/N`, the node spacing of an
+    /// element of area `area` and order `order`.
+    #[inline]
+    pub fn filter_width(area: f64, order: usize) -> f64 {
+        area.sqrt() / order.max(1) as f64
+    }
+
+    /// Compute the viscosity at a point given velocity gradients and the
+    /// filter width.
     ///
     /// # Arguments
     /// * `du_dx`, `du_dy` - Velocity gradients of u
     /// * `dv_dx`, `dv_dy` - Velocity gradients of v
-    /// * `delta` - Local grid spacing (e.g., √det_j)
+    /// * `delta` - Filter width ([`Self::filter_width`])
     pub fn compute_viscosity(
         &self,
         du_dx: f64,
@@ -71,14 +89,11 @@ impl HorizontalViscosity2D {
         dv_dy: f64,
         delta: f64,
     ) -> f64 {
-        match self.model {
-            ViscosityModel::Constant(nu) => nu,
-            ViscosityModel::Smagorinsky { cs } => {
-                // ν = (C_s · Δ)² · |S|
-                let cs_delta = cs * delta;
-                cs_delta * cs_delta * strain_rate_magnitude(du_dx, du_dy, dv_dx, dv_dy)
-            }
+        if self.smagorinsky == 0.0 {
+            return self.background;
         }
+        let cs_delta = self.smagorinsky * delta;
+        self.background + cs_delta * cs_delta * strain_rate_magnitude(du_dx, du_dy, dv_dx, dv_dy)
     }
 }
 
@@ -147,5 +162,25 @@ mod tests {
             (ratio - 4.0).abs() < 1e-10,
             "Doubling cs should give 4x viscosity, got ratio {ratio}"
         );
+    }
+
+    #[test]
+    fn background_adds_to_smagorinsky() {
+        let smagorinsky = HorizontalViscosity2D::smagorinsky(0.1);
+        let combined = smagorinsky.with_background(0.5);
+        let strained = |v: HorizontalViscosity2D| v.compute_viscosity(0.0, 1.0, 1.0, 0.0, 100.0);
+        assert_eq!(strained(combined), 0.5 + strained(smagorinsky));
+        assert_eq!(combined.compute_viscosity(0.0, 0.0, 0.0, 0.0, 100.0), 0.5);
+        assert!(combined.is_strain_dependent());
+        assert!(!HorizontalViscosity2D::constant(0.5).is_strain_dependent());
+    }
+
+    #[test]
+    fn filter_width_is_the_node_spacing() {
+        // A 90 m square: 90, 45, 30 m between nodes at P1, P2, P3
+        for (order, spacing) in [(1, 90.0), (2, 45.0), (3, 30.0)] {
+            let width = HorizontalViscosity2D::filter_width(8100.0, order);
+            assert!((width - spacing).abs() < 1e-12, "P{order}: {width}");
+        }
     }
 }

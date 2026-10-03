@@ -43,6 +43,7 @@ pub use swe_2d::{
     compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel,
     compute_rhs_swe_2d_parallel_face_mass_into, compute_rhs_swe_2d_parallel_into,
 };
+pub use swe_2d_viscosity::largest_viscosity_swe_2d;
 
 // 2D Tracer
 #[cfg(feature = "parallel")]

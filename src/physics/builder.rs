@@ -3,7 +3,7 @@
 //! This module provides builder patterns for constructing physics modules.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::boundary::SWEBoundaryCondition2D;
 use crate::equations::ShallowWater2D;
@@ -27,14 +27,14 @@ use crate::solver::{
 };
 use crate::solver::{
     apply_wet_dry_correction_element, compute_rhs_swe_2d_subset_then, element_dt_swe_2d,
-    element_dt_viscous_swe_2d, min_element_dt_swe_2d,
+    element_dt_viscous_swe_2d, largest_viscosity_swe_2d, min_element_dt_swe_2d,
 };
 use crate::source::{
     BottomFriction2D, CageDrag2D, HorizontalViscosity2D, SourceTerm2D, SourceTerms2D,
-    ViscosityModel,
 };
 use crate::time::multirate::{ElementStage, RhsStencil};
 use crate::time::{LocalTimeStepping, SspScheme};
+use crate::types::ElementIndex;
 
 use super::traits::{PhysicsModule, PhysicsModuleInfo};
 
@@ -114,9 +114,21 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     pub order: usize,
     /// Elements emptied because their mean depth was negative
     negative_depth_clips: AtomicUsize,
-    /// Viscous time step of every element at CFL 1, for the constant
-    /// viscosity it was computed for (geometry only; computed at first use)
-    viscous_dt: OnceLock<(f64, Vec<f64>)>,
+    /// Viscous time step of every element at CFL 1 for ν = 1 m²/s, which
+    /// scales as 1/ν (geometry only; computed at first use)
+    unit_viscous_dt: OnceLock<Vec<f64>>,
+    /// Every element's viscous time step at CFL 1 for the current viscosity,
+    /// reused between steps
+    viscous_dt: Mutex<ViscousDt>,
+}
+
+/// Buffers of [`SWEPhysics2D`]'s viscous time step.
+#[derive(Default)]
+struct ViscousDt {
+    /// The largest Smagorinsky ν of every element
+    nu: Vec<f64>,
+    /// The step of every element at CFL 1
+    dt: Vec<f64>,
 }
 
 impl<BC: SWEBoundaryCondition2D> PhysicsModuleInfo for SWEPhysics2D<BC> {
@@ -210,27 +222,46 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
     }
 
     /// Stable time step of the viscous term alone on every element at CFL 1
-    /// ([`element_dt_viscous_swe_2d`]), for a constant viscosity.
-    /// Smagorinsky's ν follows the strain and is not bounded a priori.
-    fn viscous_dt(&self) -> Option<std::borrow::Cow<'_, [f64]>> {
-        let ViscosityModel::Constant(nu) = self.viscosity.as_deref()?.model else {
+    /// ([`element_dt_viscous_swe_2d`]); `None` without viscosity.
+    ///
+    /// BR1 couples an element to its face neighbours' gradients, so each
+    /// element is bounded by the largest ν of its own nodes and theirs. A
+    /// Smagorinsky ν follows the strain: it is taken from `state`'s
+    /// ([`largest_viscosity_swe_2d`]), so the step follows the shear as it
+    /// develops (one BR1 gradient pass per call).
+    fn viscous_dt(&self, state: &SWESolution2D) -> Option<MutexGuard<'_, ViscousDt>> {
+        let viscosity = self.viscosity.as_deref()?;
+        if viscosity.background <= 0.0 && !viscosity.is_strain_dependent() {
             return None;
-        };
-        let compute = || -> Vec<f64> {
+        }
+        let unit = self.unit_viscous_dt.get_or_init(|| {
             (0..self.mesh.n_elements)
                 .map(|k| {
                     element_dt_viscous_swe_2d(
-                        &self.mesh, &self.ops, &self.geom, nu, self.order, 1.0, k,
+                        &self.mesh, &self.ops, &self.geom, 1.0, self.order, 1.0, k,
                     )
                 })
                 .collect()
-        };
-        let (cached_nu, cached) = self.viscous_dt.get_or_init(|| (nu, compute()));
-        Some(if *cached_nu == nu {
-            std::borrow::Cow::Borrowed(cached.as_slice())
+        });
+        let mut guard = self.viscous_dt.lock().expect("Failed to lock viscous_dt");
+        let ViscousDt { nu, dt } = &mut *guard;
+        dt.resize(self.mesh.n_elements, 0.0);
+        if viscosity.is_strain_dependent() {
+            nu.resize(self.mesh.n_elements, 0.0);
+            largest_viscosity_swe_2d(nu, state, &self.mesh, &self.ops, &self.geom, viscosity);
+            for (k, (dt, &unit)) in dt.iter_mut().zip(unit).enumerate() {
+                let largest = (0..4)
+                    .filter_map(|face| self.mesh.neighbor(ElementIndex::new(k), face))
+                    .map(|nb| nu[nb.element])
+                    .fold(nu[k], f64::max);
+                *dt = unit / largest;
+            }
         } else {
-            std::borrow::Cow::Owned(compute())
-        })
+            for (dt, &unit) in dt.iter_mut().zip(unit) {
+                *dt = unit / viscosity.background;
+            }
+        }
+        Some(guard)
     }
 
     /// RHS configuration for this module's components.
@@ -307,9 +338,9 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
             self.order,
             cfl,
         );
-        match self.viscous_dt() {
+        match self.viscous_dt(state) {
             Some(viscous) => {
-                let dt_viscous = viscous.iter().copied().fold(f64::INFINITY, f64::min);
+                let dt_viscous = viscous.dt.iter().copied().fold(f64::INFINITY, f64::min);
                 combine_dt(dt, cfl * dt_viscous)
             }
             None => dt,
@@ -332,9 +363,9 @@ impl<BC: SWEBoundaryCondition2D> PhysicsModule<SWESolution2D> for SWEPhysics2D<B
             cfl,
             Some(positivity),
         );
-        match self.viscous_dt() {
+        match self.viscous_dt(state) {
             Some(viscous) => {
-                let dt_viscous = viscous.iter().copied().fold(f64::INFINITY, f64::min);
+                let dt_viscous = viscous.dt.iter().copied().fold(f64::INFINITY, f64::min);
                 combine_dt(dt, cfl * dt_viscous)
             }
             None => dt,
@@ -419,8 +450,8 @@ impl<BC: SWEBoundaryCondition2D> LocalTimeStepping<SWESolution2D> for SWEPhysics
             self.positivity_bound(Some(scheme)),
             out,
         );
-        if let Some(viscous) = self.viscous_dt() {
-            for (dt, &dt_viscous) in out.iter_mut().zip(viscous.iter()) {
+        if let Some(viscous) = self.viscous_dt(state) {
+            for (dt, &dt_viscous) in out.iter_mut().zip(viscous.dt.iter()) {
                 *dt = combine_dt(*dt, cfl * dt_viscous);
             }
         }
@@ -726,10 +757,12 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
         self
     }
 
-    /// Add horizontal eddy viscosity (constant or Smagorinsky, BR1 face
-    /// coupling). It couples each element to its neighbours' gradients, so
-    /// the RHS of an element also reads the elements at its neighbours' far
-    /// corners; local time stepping follows that wider stencil.
+    /// Add horizontal eddy viscosity (a constant background plus,
+    /// optionally, Smagorinsky's; BR1 face coupling). It couples each element
+    /// to its neighbours' gradients, so the RHS of an element also reads the
+    /// elements at its neighbours' far corners; local time stepping follows
+    /// that wider stencil. The time step is bounded by the viscous limit,
+    /// with a Smagorinsky ν from the current strain.
     pub fn with_viscosity(mut self, viscosity: HorizontalViscosity2D) -> Self {
         self.viscosity = Some(Arc::new(viscosity));
         self
@@ -823,7 +856,8 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             viscosity: self.viscosity,
             order: self.order,
             negative_depth_clips: AtomicUsize::new(0),
-            viscous_dt: OnceLock::new(),
+            unit_viscous_dt: OnceLock::new(),
+            viscous_dt: Mutex::default(),
         }
     }
 }

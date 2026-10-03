@@ -240,7 +240,7 @@ fn one_level_matches_global(base: StandardIntegrator, viscosity: Option<Horizont
     let physics = || {
         let builder = shoreline_builder(&setup);
         match &viscosity {
-            Some(v) => builder.with_viscosity(v.clone()),
+            Some(v) => builder.with_viscosity(*v),
             None => builder,
         }
         .build()
