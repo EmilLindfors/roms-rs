@@ -15,6 +15,11 @@
 //! - with `wind=1` also `Uwind_eastward`, `Vwind_northward`, the 10 m wind
 //!   NorKyst was forced with (`AtmosphereReader` reads it as `met=`; no
 //!   pressure).
+//! - with `profiles=1` also the 3D fields for nesting a 3D child (P4.2,
+//!   `Nesting3D`): `u_eastward`, `v_northward`, `temperature` and `salinity`
+//!   on NorKyst's z-levels (`depth`, positive down, from the surface), which
+//!   `OceanModelReader::from_file_with_profiles` reads as profiles. A day of a
+//!   90 × 90 window on 16 levels is ≈ 50 MB more.
 //!
 //! The window extends `margin` degrees beyond the box, so that a relaxation
 //! band and the bilinear stencils of boundary nodes near the edge stay
@@ -26,7 +31,7 @@
 //! ```bash
 //! cargo run --release --example norkyst_nesting_subset -- \
 //!     [bbox=8.0,63.6,9.2,64.0] [start=2025-06-15] [hours=72] [margin=0.1] \
-//!     [out=data/froya_norkyst.nc] [wind=1] [url=<OPeNDAP URL>]
+//!     [out=data/froya_norkyst.nc] [wind=1] [profiles=1] [url=<OPeNDAP URL>]
 //! ```
 //!
 //! Requires the `netcdf` feature (default) with a DAP-enabled netCDF-C.
@@ -109,6 +114,7 @@ mod app {
         let hours = num("hours", 72.0)? as usize;
         let margin = num("margin", 0.1)?;
         let wind = num("wind", 0.0)? != 0.0;
+        let profiles = num("profiles", 0.0)? != 0.0;
         let out = args
             .get("out")
             .map_or("data/froya_norkyst.nc".into(), PathBuf::from);
@@ -156,6 +162,14 @@ mod app {
             Packed::new(&file, "u_eastward")?,
             Packed::new(&file, "v_northward")?,
         );
+        let tracers = if profiles {
+            Some((
+                Packed::new(&file, "temperature")?,
+                Packed::new(&file, "salinity")?,
+            ))
+        } else {
+            None
+        };
         let winds = if wind {
             Some((
                 Packed::new(&file, "Uwind_eastward")?,
@@ -185,6 +199,14 @@ mod app {
         nc.add_dimension("time", n)?;
         nc.add_dimension("Y", win.ny)?;
         nc.add_dimension("X", win.nx)?;
+        if profiles {
+            nc.add_dimension("depth", nz)?;
+            let mut dv = nc.add_variable::<f64>("depth", &["depth"])?;
+            dv.put_attribute("units", "m")?;
+            dv.put_attribute("positive", "down")?;
+            dv.put_attribute("standard_name", "depth")?;
+            dv.put_values(&levels, ..)?;
+        }
         let mut tv = nc.add_variable::<f64>("time", &["time"])?;
         tv.put_attribute("units", "seconds since 1970-01-01 00:00:00")?;
         tv.put_attribute("calendar", "standard")?;
@@ -219,6 +241,19 @@ mod app {
             let mut v = nc.add_variable::<f32>(name, &["time", "Y", "X"])?;
             v.put_attribute("units", *units)?;
             v.put_attribute("standard_name", *standard_name)?;
+        }
+        const PROFILES: [(&str, &str, &str); 4] = [
+            ("u_eastward", "m s-1", "eastward_sea_water_velocity"),
+            ("v_northward", "m s-1", "northward_sea_water_velocity"),
+            ("temperature", "degC", "sea_water_temperature"),
+            ("salinity", "1e-3", "sea_water_salinity"),
+        ];
+        if profiles {
+            for (name, units, standard_name) in PROFILES {
+                let mut v = nc.add_variable::<f32>(name, &["time", "depth", "Y", "X"])?;
+                v.put_attribute("units", units)?;
+                v.put_attribute("standard_name", standard_name)?;
+            }
         }
 
         let plane = win.len();
@@ -264,6 +299,25 @@ mod app {
                     "Vwind_northward",
                     to_f32(vw.read(win.extents(&[slice(ts, count)]))?.into_iter()),
                 )?;
+            }
+            if let Some((temperature, salinity)) = &tracers {
+                // [hour][level][Y][X], as read
+                let volume = [
+                    slice(c0, count),
+                    slice(0, nz),
+                    slice(0, win.ny),
+                    slice(0, win.nx),
+                ];
+                for (name, values) in [
+                    ("u_eastward", u.clone()),
+                    ("v_northward", v.clone()),
+                    ("temperature", column(temperature)?),
+                    ("salinity", column(salinity)?),
+                ] {
+                    nc.variable_mut(name)
+                        .ok_or(format!("no output variable {name}"))?
+                        .put_values(&to_f32(values.into_iter()), volume.clone())?;
+                }
             }
             println!(
                 "  hours {c0:3}–{:3} of {hours}: {:.0} s elapsed",
