@@ -650,3 +650,126 @@ fn oblique_breaking_waves_drive_a_longshore_current() {
     );
     assert!((fastest / (largest / cd).sqrt() - 1.0).abs() < 0.05);
 }
+
+/// The oblique swell of `oblique_breaking_waves_drive_a_longshore_current` on
+/// the 3D model (`Hydrostatic3D`, 10 uniform σ-levels, mode splitting, a
+/// constant eddy viscosity ν = 0.01 m²/s and quadratic bottom drag
+/// C_d = 2.5e-3 on the bottom layer). `WaveForce2D` on the barotropic module
+/// reaches the columns as a depth-uniform acceleration `F/D` (the splitting
+/// spreads the depth mean over the levels). Each column then holds the exact
+/// parabola of a uniform force under a uniform viscosity: the stress
+/// `ν ∂u/∂z` carries the force of the water above down to the bed, where the
+/// drag takes it, so the bottom layer moves at `√(F/C_d)` (the 2D balance) and
+/// `u(ζ) = u_b + (F/νD)((Dζ − ζ²/2) − (D ζ_b − ζ_b²/2))` above it (ζ the height
+/// above the bed). The model's layers are that profile at their centres in
+/// the discrete steady state too (the midpoint rule is exact for the linear
+/// stress). Where the force is over a tenth of its largest, after 3 h from
+/// rest, they follow it to 0.22 % of the fastest current (0.67 m/s) at the
+/// nodes inside elements, and to 3.5 % on the faces between them across the
+/// beach, where the numerical flux couples the two sides' different forces
+/// (the 2D model's face nodes are as far off its balance). Where the force is
+/// largest the surface runs at 0.66 m/s over a 0.61 m/s bottom layer.
+///
+/// The radiation stress is still depth-uniform here: no undertow, and no
+/// vertical structure from where the waves break (TODO F.4: the vortex force,
+/// or a surface-intensified breaking force with the Stokes return flow).
+#[test]
+fn a_longshore_current_in_3d_has_the_viscous_profile_of_a_uniform_force() {
+    use dg_rs::physics::vertical_mixing::{ConstantMixing, Forcing};
+    use dg_rs::physics::{BottomDrag3D, Hydrostatic3D, LinearEOS};
+    use dg_rs::simulation::Simulation3D;
+    use dg_rs::solver::state::Solution3D;
+    use dg_rs::source::CoriolisSource2D;
+    use dg_rs::time::ModeSplitIntegrator;
+    use dg_rs::vertical::{SigmaGrid, UniformStretching};
+
+    let beach = Beach::new();
+    let direction = std::f64::consts::FRAC_PI_2 - 20f64.to_radians();
+    let waves = beach.waves(direction, Some(20), 72);
+    let mut n = waves.zero_state();
+    Beach::settle(&waves, &mut n);
+    let force = WaveForce2D::new(&waves, &n);
+    let (nu, cd, levels, rho0) = (1e-2, 2.5e-3, 10, 1025.0);
+
+    let swe = beach
+        .physics()
+        .with_source(force.clone().with_ramp(300.0))
+        .build();
+    let eos = LinearEOS::default();
+    let sigma = Arc::new(SigmaGrid::new(levels, UniformStretching));
+    let physics = Hydrostatic3D::new(
+        beach.mesh.clone(),
+        beach.ops.clone(),
+        beach.geom.clone(),
+        sigma.clone(),
+        beach.bathymetry.clone(),
+        Arc::new(CoriolisSource2D::f_plane(0.0)),
+        eos,
+        ConstantMixing::new(nu, nu),
+        swe,
+        Forcing {
+            surface_stress: [0.0, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        },
+        G,
+        rho0,
+    )
+    .with_bottom_drag(BottomDrag3D::quadratic(cd));
+    let mut state = Solution3D::new(beach.mesh.n_elements, beach.ops.n_nodes, levels);
+    state.temp.fill(eos.t0);
+    state.salt.fill(eos.s0);
+    physics.update_density(&mut state);
+    let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+        .with_cfl(10.0)
+        .with_dt_max(20.0);
+    let result = sim.run(&mut state, 0.0, 10_800.0);
+    assert!(result.success, "3D run failed: {:?}", result.error);
+
+    // Each column against its parabola, where the force is over a tenth of
+    // its largest
+    let largest = force.force().iter().map(|f| f[0]).fold(0.0, f64::max);
+    let nn = beach.ops.n_nodes;
+    // Inside elements, and on the faces between them across the beach
+    let (mut inside, mut on_faces) = (0.0f64, 0.0f64);
+    let (mut fastest, mut strongest) = (0.0f64, (0.0, 0.0, 0.0));
+    for (p, f) in force.force().iter().enumerate() {
+        let column = &state.u[p * levels..(p + 1) * levels];
+        fastest = fastest.max(column[levels - 1]);
+        if f[0] < 0.1 * largest {
+            continue;
+        }
+        let d = state.eta.data[p] - beach.bathymetry.data[p];
+        let shape = |z: f64| d * z - 0.5 * z * z;
+        let zb = (1.0 + sigma.sigma_rho()[0]) * d;
+        let ub = (f[0] / cd).sqrt();
+        for (l, &u) in column.iter().enumerate() {
+            let z = (1.0 + sigma.sigma_rho()[l]) * d;
+            let exact = ub + f[0] / (nu * d) * (shape(z) - shape(zb));
+            let error = (u - exact).abs();
+            if beach.ops.nodes_s[p % nn].abs() > 1.0 - 1e-12 {
+                on_faces = on_faces.max(error);
+            } else {
+                inside = inside.max(error);
+            }
+        }
+        if f[0] > strongest.0 {
+            strongest = (f[0], column[0], column[levels - 1]);
+        }
+    }
+    println!(
+        "longshore current in 3D: off the viscous parabola by ≤ {:.2} % of the fastest \
+         ({fastest:.3} m/s) inside elements, {:.2} % on their faces; where the force is largest \
+         {:.3} m/s at the bed layer, {:.3} m/s at the surface",
+        100.0 * inside / fastest,
+        100.0 * on_faces / fastest,
+        strongest.1,
+        strongest.2
+    );
+    assert!(fastest > 0.5, "the current is {fastest} m/s");
+    assert!(inside < 5e-3 * fastest, "off the parabola by {inside} m/s");
+    assert!(
+        on_faces < 0.05 * fastest,
+        "off the parabola by {on_faces} m/s"
+    );
+}
