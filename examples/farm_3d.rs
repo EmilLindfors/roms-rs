@@ -26,7 +26,12 @@
 //! tide), and again every `release_every` hours (default 1) for `releases`
 //! batches (default 1), and tracks them online (`ParticleTracker3D`, TODO
 //! F.2) between the solver's states every `particle_seconds` (default 60),
-//! with a horizontal walk `kh` (m²/s, default 0.1) and Visser's vertical
+//! with a horizontal walk `kh` (m²/s, default 0.1; a list such as
+//! `kh=0.01,0.1,1` tracks the larvae in each, for the connectivity's
+//! sensitivity, the other kinds in the first; `smag` is Smagorinsky's `K`
+//! from each layer's strain with the model's `cs` and `Pr_t` = 1, without
+//! the model's numerical background `nu`, and `smag+0.01` adds a constant
+//! to it: `particles::diffusivity`) and Visser's vertical
 //! walk in the model's GLS diffusivity:
 //! - lice larvae, neutrally buoyant, released over the top 5 m, swimming
 //!   by `lice` (`SalmonLice`: `ladim`, the default, the operational IMR
@@ -108,9 +113,10 @@ use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::mesh::{Mesh2D, PointLocator2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::particles::{
-    ClearSkyLight, ConnectivityEnsemble, ConnectivityRecorder, Contact, ContactZone, Particle3D,
+    ClearSkyLight, ConnectivityEnsemble, ConnectivityRecorder, Contact, ContactZone,
+    DiffusivityInTime, HorizontalDiffusivity, HorizontalDiffusivityField, Particle3D,
     ParticleStatus, ParticleTracker3D, ParticleVelocity3D, SalmonLice, Solution3DVelocity,
-    StokesDrift, WithStokesDrift3D,
+    StokesDrift, WithHorizontalDiffusivity3D, WithStokesDrift3D,
 };
 use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use dg_rs::physics::{
@@ -217,7 +223,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|b| release_time + b as f64 * release_every)
         .collect();
     let particle_seconds: f64 = get("particle_seconds", 60.0)?;
-    let kh: f64 = get("kh", 0.1)?;
+    // One or more horizontal diffusivities: the larvae are tracked in each
+    // (the other kinds and the snapshot's larvae in the first)
+    let kh: Vec<Mixing> = match args.get("kh") {
+        Some(v) => v.split(',').map(Mixing::parse).collect::<Result<_, _>>()?,
+        None => vec![Mixing::Constant(0.1)],
+    };
     let seeds = (get("seeds", 1.0)? as usize).max(1);
     let contact_depth: f64 = get("contact_depth", NET_DEPTH)?;
     let connectivity_path = args.get("connectivity").cloned();
@@ -429,11 +440,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 particles_per_kind,
                 &centres,
                 batches.clone(),
-                kh,
+                kh[0].constant(),
                 lice,
             )
             .with_stokes_drift(stokes.as_ref())
-            .with_connectivity(seeds, contact_depth)
+            .with_connectivity(&kh, seeds, contact_depth, &geom, cs)
         });
         let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
         // The run with cages to the snapshot file, if asked
@@ -752,6 +763,67 @@ const KINDS: [(&str, f64, [f64; 2]); 3] = [
 /// Index of the larvae in [`KINDS`].
 const LARVAE: usize = 0;
 
+/// The particles' horizontal walk: a constant `K` (m²/s), or Smagorinsky's
+/// from each layer's strain (the model's `cs`, `Pr_t` = 1) plus a constant.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Mixing {
+    Constant(f64),
+    Smagorinsky(f64),
+}
+
+impl Mixing {
+    /// `0.1`, `smag` or `smag+0.01`.
+    fn parse(s: &str) -> Result<Self, String> {
+        let error = || format!("kh={s}: a diffusivity (m²/s), smag or smag+K");
+        match s.strip_prefix("smag") {
+            Some("") => Ok(Self::Smagorinsky(0.0)),
+            Some(rest) => rest
+                .strip_prefix('+')
+                .and_then(|k| k.parse().ok())
+                .map(Self::Smagorinsky)
+                .ok_or_else(error),
+            None => s.parse().map(Self::Constant).map_err(|_| error()),
+        }
+    }
+
+    /// The tracker's constant part (m²/s).
+    fn constant(self) -> f64 {
+        match self {
+            Self::Constant(k) | Self::Smagorinsky(k) => k,
+        }
+    }
+
+    fn is_smagorinsky(self) -> bool {
+        matches!(self, Self::Smagorinsky(_))
+    }
+}
+
+impl std::fmt::Display for Mixing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match *self {
+            Self::Constant(k) => format!("{k}"),
+            Self::Smagorinsky(0.0) => "smag".into(),
+            Self::Smagorinsky(k) => format!("smag+{k}"),
+        };
+        f.pad(&label)
+    }
+}
+
+/// `n` steps of `particles` through `field` from `t`, by `lice` if given.
+fn step_kind(
+    tracker: &ParticleTracker3D,
+    particles: &mut [Particle3D],
+    field: &impl ParticleVelocity3D,
+    lice: Option<&SalmonLice<ClearSkyLight>>,
+    t: f64,
+    dt: f64,
+) {
+    match lice {
+        Some(lice) => tracker.step_with(particles, field, lice, t, dt),
+        None => tracker.step(particles, field, t, dt),
+    }
+}
+
 /// A snapshot frame of `state` at `t`, and the particles' frame beside it.
 fn write_frame(
     (fields, particles): &mut (SnapshotWriter, Option<ParticleFileWriter>),
@@ -792,10 +864,19 @@ struct FarmParticles<'a> {
     particles: [Vec<Particle3D>; 3],
     cages: [Vec<usize>; 3],
     born: [Vec<f64>; 3],
-    /// The larvae again with other seeds (the connectivity's spread)
+    /// The larvae again with other seeds and diffusivities (the
+    /// connectivity's spread and sensitivity to `K`)
     replicates: Vec<(ParticleTracker3D<'a>, Vec<Particle3D>)>,
-    /// The larvae's contacts with the cages, one recorder per seed (the
-    /// first for `particles[LARVAE]`, then one per replicate)
+    /// The walks the larvae are tracked with, and the seeds of each
+    diffusivities: Vec<Mixing>,
+    /// Smagorinsky's diffusivity, if a walk takes it: the builder, `C_s`,
+    /// and the field of the previous state
+    smagorinsky: Option<(HorizontalDiffusivity<'a>, f64)>,
+    smagorinsky_previous: Option<HorizontalDiffusivityField>,
+    seeds: usize,
+    /// The larvae's contacts with the cages, one recorder per diffusivity
+    /// and seed, `[K × seed]` (the first for `particles[LARVAE]`, then one
+    /// per replicate)
     contacts: Vec<ConnectivityRecorder>,
     /// The depth-mean current at the farm, and its value at each release
     farm: Probe2D,
@@ -839,6 +920,10 @@ impl<'a> FarmParticles<'a> {
             cages: Default::default(),
             born: Default::default(),
             replicates: Vec::new(),
+            diffusivities: vec![Mixing::Constant(kh)],
+            smagorinsky: None,
+            smagorinsky_previous: None,
+            seeds: 1,
             contacts: Vec::new(),
             farm,
             release_current: Vec::new(),
@@ -853,8 +938,19 @@ impl<'a> FarmParticles<'a> {
     }
 
     /// Record the larvae's contacts with the cages (each footprint over the
-    /// top `depth` m) for `seeds` independent random walks.
-    fn with_connectivity(mut self, seeds: usize, depth: f64) -> Self {
+    /// top `depth` m) for `seeds` independent random walks in each of the
+    /// walks `diffusivities` (the first is the tracker's own; Smagorinsky's
+    /// with coefficient `cs` on `geom`). The seeds are the same for each
+    /// walk, so the walks of two `K` are correlated and the independent
+    /// errors of their difference overestimate it.
+    fn with_connectivity(
+        mut self,
+        diffusivities: &[Mixing],
+        seeds: usize,
+        depth: f64,
+        geom: &'a GeometricFactors2D,
+        cs: f64,
+    ) -> Self {
         let zones: Vec<ContactZone> = self
             .centres
             .iter()
@@ -863,10 +959,26 @@ impl<'a> FarmParticles<'a> {
         // A return to its own cage only after a cage radius beyond it: not
         // the walk stepping out and back in at the edge
         let recorder = ConnectivityRecorder::new(zones).with_return_distance(RADIUS);
-        self.contacts = vec![recorder; seeds];
-        self.replicates = (1..seeds as u64)
-            .map(|seed| (self.tracker.clone().with_seed(seed), Vec::new()))
+        self.contacts = vec![recorder; diffusivities.len() * seeds];
+        self.replicates = diffusivities
+            .iter()
+            .flat_map(|&k| (0..seeds as u64).map(move |seed| (k, seed)))
+            .skip(1)
+            .map(|(k, seed)| {
+                let tracker = self
+                    .tracker
+                    .clone()
+                    .with_horizontal_diffusivity(k.constant())
+                    .with_seed(seed);
+                (tracker, Vec::new())
+            })
             .collect();
+        self.diffusivities = diffusivities.to_vec();
+        self.seeds = seeds;
+        if diffusivities.iter().any(|m| m.is_smagorinsky()) {
+            let builder = HorizontalDiffusivity::new(self.tracker_mesh, self.ops, geom);
+            self.smagorinsky = Some((builder, cs));
+        }
         self
     }
 
@@ -947,20 +1059,32 @@ impl<'a> FarmParticles<'a> {
     fn advance(&mut self, state: &Solution3D, t: f64, sigma: &SigmaGrid, bed: &Bathymetry2D) {
         let start = Instant::now();
         let previous = self.previous.take();
+        // Smagorinsky's diffusivity of this state, linear in time from the
+        // previous one's
+        let mixing = self.smagorinsky.as_ref().map(|(builder, cs)| {
+            let viscosity = HorizontalViscosity2D::smagorinsky(*cs);
+            builder.smagorinsky_3d(state, sigma, &viscosity, 1.0)
+        });
+        let mixing_previous = self.smagorinsky_previous.take();
         if let Some((t0, s0)) = &previous {
             let field = Solution3DVelocity::between(*t0, s0, t, state, sigma, bed, 0.05);
             let (u0, u1) = (
                 self.farm.evaluate_field(&s0.ubar.data),
                 self.farm.evaluate_field(&state.ubar.data),
             );
+            let diffusivity = match (&mixing_previous, &mixing) {
+                (Some(f0), Some(f1)) => Some(DiffusivityInTime::between(*t0, f0, t, f1)),
+                _ => None,
+            };
             match self.stokes {
                 Some(stokes) => {
                     let field = WithStokesDrift3D::new(field, StokesDrift::steady(stokes));
-                    self.segments(&field, *t0, t, [u0, u1]);
+                    self.track(field, diffusivity, *t0, t, [u0, u1]);
                 }
-                None => self.segments(&field, *t0, t, [u0, u1]),
+                None => self.track(field, diffusivity, *t0, t, [u0, u1]),
             }
         }
+        self.smagorinsky_previous = mixing;
         self.previous = match previous {
             Some((_, mut sp)) => {
                 sp.clone_from(state);
@@ -971,9 +1095,37 @@ impl<'a> FarmParticles<'a> {
         self.seconds += start.elapsed().as_secs_f64();
     }
 
+    /// Track from `t0` to `t` through `field`, and with the diffusivity
+    /// `diffusivity` for the walks that take Smagorinsky's.
+    fn track<F: ParticleVelocity3D + Copy>(
+        &mut self,
+        field: F,
+        diffusivity: Option<DiffusivityInTime>,
+        t0: f64,
+        t: f64,
+        current: [f64; 2],
+    ) {
+        match diffusivity {
+            Some(d) => {
+                let mixed = WithHorizontalDiffusivity3D::new(field, d);
+                self.segments(&field, &mixed, t0, t, current);
+            }
+            None => self.segments(&field, &field, t0, t, current),
+        }
+    }
+
     /// Track from `t0` to `t`, releasing the batches due on the way, with
-    /// the depth-mean current at the farm `current` at `t0` and `t`.
-    fn segments(&mut self, field: &impl ParticleVelocity3D, t0: f64, t: f64, current: [f64; 2]) {
+    /// the depth-mean current at the farm `current` at `t0` and `t`: the
+    /// walks with a constant `K` through `plain`, Smagorinsky's through
+    /// `mixed`.
+    fn segments(
+        &mut self,
+        plain: &impl ParticleVelocity3D,
+        mixed: &impl ParticleVelocity3D,
+        t0: f64,
+        t: f64,
+        current: [f64; 2],
+    ) {
         let mut from = t0;
         while from < t {
             while self
@@ -989,33 +1141,45 @@ impl<'a> FarmParticles<'a> {
                 _ => t,
             };
             if self.released() > 0 {
-                self.steps(field, from, to);
+                self.steps(plain, mixed, from, to);
             }
             from = to;
         }
     }
 
-    /// Steps of at most 10 s from `from` to `to` through `field`, the larvae
-    /// by their behaviour, recording their contacts after each.
-    fn steps(&mut self, field: &impl ParticleVelocity3D, from: f64, to: f64) {
+    /// Steps of at most 10 s from `from` to `to`, through `plain` or, for
+    /// the walks that take Smagorinsky's diffusivity, `mixed`; the larvae by
+    /// their behaviour, recording their contacts after each.
+    fn steps(
+        &mut self,
+        plain: &impl ParticleVelocity3D,
+        mixed: &impl ParticleVelocity3D,
+        from: f64,
+        to: f64,
+    ) {
         let n = ((to - from) / 10.0).ceil().max(1.0) as usize;
         let dt = (to - from) / n as f64;
         let ops = self.ops;
         let mut weights = vec![0.0; ops.n_nodes];
         for s in 0..n {
             let t = from + s as f64 * dt;
+            let main = self.diffusivities[0].is_smagorinsky();
             for (kind, particles) in self.particles.iter_mut().enumerate() {
-                match &self.lice {
-                    Some(lice) if kind == LARVAE => {
-                        self.tracker.step_with(particles, field, lice, t, dt)
-                    }
-                    _ => self.tracker.step(particles, field, t, dt),
+                let lice = self.lice.as_ref().filter(|_| kind == LARVAE);
+                if main {
+                    step_kind(&self.tracker, particles, mixed, lice, t, dt);
+                } else {
+                    step_kind(&self.tracker, particles, plain, lice, t, dt);
                 }
             }
-            for (tracker, larvae) in &mut self.replicates {
-                match &self.lice {
-                    Some(lice) => tracker.step_with(larvae, field, lice, t, dt),
-                    None => tracker.step(larvae, field, t, dt),
+            // Replicate r is walk (r + 1)/seeds of [walk × seed], seed 0 of
+            // the first walk being the main tracker
+            for (r, (tracker, larvae)) in self.replicates.iter_mut().enumerate() {
+                let lice = self.lice.as_ref();
+                if self.diffusivities[(r + 1) / self.seeds].is_smagorinsky() {
+                    step_kind(tracker, larvae, mixed, lice, t, dt);
+                } else {
+                    step_kind(tracker, larvae, plain, lice, t, dt);
                 }
             }
             // Contacts at the end of the step, of the larvae in the water
@@ -1029,7 +1193,7 @@ impl<'a> FarmParticles<'a> {
                     let depth = || {
                         let point = p.point();
                         ops.interpolation_weights_into(point.r, point.s, &mut weights);
-                        p.depth_below_surface(field.depth(point.element, &weights, t + dt))
+                        p.depth_below_surface(plain.depth(point.element, &weights, t + dt))
                     };
                     recorder.record(i, t + dt, dt, p.position(), depth, 1.0);
                 }
@@ -1037,35 +1201,34 @@ impl<'a> FarmParticles<'a> {
         }
     }
 
-    /// The larvae's pen-to-pen connectivity per release batch and over all
-    /// batches (mean ± spread across the seeds), and every seed's matrix per
-    /// batch to `csv`.
+    /// The larvae's pen-to-pen connectivity in each diffusivity, per release
+    /// batch (one diffusivity) and over all batches (mean ± spread across
+    /// the seeds), then the shares against the diffusivity; every seed's
+    /// matrix per batch to `csv`.
     fn report_connectivity(&self, csv: Option<&str>) -> std::io::Result<()> {
         if self.contacts.is_empty() || self.released() == 0 {
             return Ok(());
         }
         let zones = self.contacts[0].zones();
         let n_cages = zones.len();
+        let recorders = |k: usize| &self.contacts[k * self.seeds..(k + 1) * self.seeds];
+        let ensemble = |k: usize, groups: &dyn Fn(usize) -> bool| {
+            ConnectivityEnsemble::new(recorders(k).iter().map(|r| r.matrix(0.0, groups)).collect())
+        };
         println!(
             "\nPen-to-pen connectivity of the larvae: contact inside a cage's footprint over the top {} m (its own cage after a radius beyond it), {} seed{}",
             zones[0].depth[1],
-            self.contacts.len(),
-            if self.contacts.len() == 1 { "" } else { "s" }
+            self.seeds,
+            if self.seeds == 1 { "" } else { "s" }
         );
         println!(
             "  share in contact: mean ± spread across the seeds (one seed's binomial error); exposure per released larva; among those in contact, exposure 10/50/90 % and age at first contact 50 %"
         );
-        let pair_lines = |groups: &dyn Fn(usize) -> bool| {
-            let ensemble = ConnectivityEnsemble::new(
-                self.contacts
-                    .iter()
-                    .map(|r| r.matrix(0.0, groups))
-                    .collect(),
-            );
+        let pair_lines = |k: usize, groups: &dyn Fn(usize) -> bool| {
+            let ensemble = ensemble(k, groups);
             for i in 0..n_cages {
                 for j in 0..n_cages {
-                    let mut contacts: Vec<Contact> = self
-                        .contacts
+                    let mut contacts: Vec<Contact> = recorders(k)
                         .iter()
                         .flat_map(|r| r.contacts(i, j, groups))
                         .collect();
@@ -1097,34 +1260,81 @@ impl<'a> FarmParticles<'a> {
             }
         };
         let phase = |t: f64| (M2 * t).to_degrees().rem_euclid(360.0);
-        for (b, &t) in self.batches[..self.released_batches].iter().enumerate() {
-            println!(
-                "  batch {b}, released at {:.2} h (M2 forcing phase {:.0}°, depth-mean current at the farm {:+.2} m/s):",
-                t / 3600.0,
-                phase(t),
-                self.release_current[b]
-            );
-            pair_lines(&|g| g == b);
+        let released = &self.batches[..self.released_batches];
+        let sweep = self.diffusivities.len() > 1;
+        for (k, kh) in self.diffusivities.iter().enumerate() {
+            if sweep {
+                println!("  K = {kh} (m²/s):");
+            } else {
+                // Per batch for a single diffusivity only, to keep a sweep short
+                for (b, &t) in released.iter().enumerate() {
+                    println!(
+                        "  batch {b}, released at {:.2} h (M2 forcing phase {:.0}°, depth-mean current at the farm {:+.2} m/s):",
+                        t / 3600.0,
+                        phase(t),
+                        self.release_current[b]
+                    );
+                    pair_lines(k, &|g| g == b);
+                }
+            }
+            if released.len() > 1 || sweep {
+                println!("  all batches:");
+                pair_lines(k, &|_| true);
+            }
         }
-        if self.released_batches > 1 {
-            println!("  all batches:");
-            pair_lines(&|_| true);
+        if sweep {
+            // Each share's mean ± standard error of the mean, and its
+            // difference from the first diffusivity in standard errors
+            println!(
+                "  Shares against K over all batches (mean ± standard error of the mean; z against K = {}):",
+                self.diffusivities[0]
+            );
+            let pairs: Vec<(usize, usize)> = (0..n_cages)
+                .flat_map(|i| (0..n_cages).map(move |j| (i, j)))
+                .collect();
+            let header: Vec<String> = pairs
+                .iter()
+                .map(|(i, j)| format!("{:>24}", format!("{i} → {j}")))
+                .collect();
+            println!("    K (m²/s){}", header.join(""));
+            let reference = ensemble(0, &|_| true);
+            for (k, kh) in self.diffusivities.iter().enumerate() {
+                let e = ensemble(k, &|_| true);
+                let cells: Vec<String> = pairs
+                    .iter()
+                    .map(|&(i, j)| {
+                        let z = if k == 0 {
+                            String::new()
+                        } else {
+                            format!(" z {:+.0}", e.difference(&reference, i, j).z())
+                        };
+                        let cell = format!(
+                            "{:.1} ± {:.1} %{z}",
+                            100.0 * e.mean(i, j),
+                            100.0 * e.standard_error(i, j)
+                        );
+                        format!("{cell:>24}")
+                    })
+                    .collect();
+                println!("    {kh:8}{}", cells.join(""));
+            }
         }
         if let Some(path) = csv {
             use std::io::Write;
             let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
             writeln!(
                 out,
-                "seed,batch,release_h,m2_phase_deg,current_farm,source,receiver,released,reached,share,exposure_per_larva_s"
+                "kh,seed,batch,release_h,m2_phase_deg,current_farm,source,receiver,released,reached,share,exposure_per_larva_s"
             )?;
-            for (seed, recorder) in self.contacts.iter().enumerate() {
-                for (b, &t) in self.batches[..self.released_batches].iter().enumerate() {
+            for (index, recorder) in self.contacts.iter().enumerate() {
+                let (kh, seed) = (self.diffusivities[index / self.seeds], index % self.seeds);
+                for (b, &t) in released.iter().enumerate() {
                     let m = recorder.matrix(0.0, |g| g == b);
                     for i in 0..n_cages {
                         for j in 0..n_cages {
                             writeln!(
                                 out,
-                                "{seed},{b},{},{},{},{i},{j},{},{},{},{}",
+                                "{kh},{seed},{b},{},{},{},{i},{j},{},{},{},{}",
                                 t / 3600.0,
                                 phase(t),
                                 self.release_current[b],
@@ -1156,8 +1366,8 @@ impl<'a> FarmParticles<'a> {
             if self.released_batches == 1 { "" } else { "es" },
             self.batches[0] / 3600.0,
             self.seconds,
-            self.contacts.len(),
-            if self.contacts.len() == 1 { "" } else { "s" }
+            self.seeds,
+            if self.seeds == 1 { "" } else { "s" }
         );
         if let Some(lice) = &self.lice {
             let t = self.previous.as_ref().map_or(0.0, |(t, _)| *t);
@@ -1186,6 +1396,34 @@ impl<'a> FarmParticles<'a> {
                 })
                 .collect();
             println!("  K (m²/s) up-current of the farm: {}", profile.join(", "));
+            // Smagorinsky's horizontal K at the end, up-current and behind
+            // the first cage, and over the domain's top layer
+            if let Some((builder, cs)) = &self.smagorinsky {
+                let viscosity = HorizontalViscosity2D::smagorinsky(*cs);
+                let k_h = builder.smagorinsky_3d(state, sigma, &viscosity, 1.0);
+                let at = |p: [f64; 2], z: f64| {
+                    locator.locate(p).map_or(f64::NAN, |point| {
+                        let w = self.ops.interpolation_weights(point.r, point.s);
+                        let depth = field.depth(point.element, &w, 0.0);
+                        k_h.at(point.element, &w, -z / depth).0
+                    })
+                };
+                let lee = [self.centres[0][0] + 100.0, self.centres[0][1]];
+                let n_total = self.tracker_mesh.n_elements * self.ops.n_nodes;
+                let mut top = k_h.values()[k_h.values().len() - n_total..].to_vec();
+                top.sort_by(f64::total_cmp);
+                let pct = |q: f64| top[(q * (top.len() - 1) as f64).round() as usize];
+                println!(
+                    "  Smagorinsky K_h (m²/s, C_s {cs}, Pr_t 1) at 1/10 m: up-current {:.1e}/{:.1e}, 100 m east of cage 0 {:.1e}/{:.1e}; top layer 50/90/100 % {:.1e}/{:.1e}/{:.1e}",
+                    at(ahead, 1.0),
+                    at(ahead, 10.0),
+                    at(lee, 1.0),
+                    at(lee, 10.0),
+                    pct(0.5),
+                    pct(0.9),
+                    pct(1.0)
+                );
+            }
             if let Some(stokes) = self.stokes {
                 let profile: Vec<String> = [0.0, 1.0, 3.0, 5.0, 10.0, 20.0]
                     .iter()

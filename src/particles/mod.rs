@@ -33,8 +33,11 @@
 //! areal distribution uniform (Visser 1997's well-mixed condition in 2D).
 //! This is the dispersion of a surface or depth-uniform concentration; a
 //! depth-integrated tracer (`∂(hc)/∂t = ∇·(hK∇c)`) also needs the drift
-//! `K∇h/h` (Dimou & Adams 1993), which is not implemented, nor is a
-//! variable `K` (drift `∇K`).
+//! `K∇h/h` (Dimou & Adams 1993), which is not implemented. A `K` that varies
+//! in space (a field of the flow's, e.g. Smagorinsky's from the model's own
+//! viscosity) adds the drift `∇K Δt` and is added to the tracker's constant
+//! ([`diffusivity`]: [`WithHorizontalDiffusivity2D`],
+//! [`WithHorizontalDiffusivity3D`]).
 //!
 //! Each particle draws its random numbers from its own SplitMix64 stream,
 //! seeded by the tracker's seed and the particle's id, so a run is
@@ -79,6 +82,7 @@
 
 pub mod behaviour;
 pub mod connectivity;
+pub mod diffusivity;
 pub mod stokes;
 mod tracker;
 pub mod tracker_3d;
@@ -93,6 +97,10 @@ pub use behaviour::{
 pub use connectivity::{
     ConnectivityEnsemble, ConnectivityMatrix, ConnectivityRecorder, Contact, ContactZone,
     Difference,
+};
+pub use diffusivity::{
+    DiffusivityInTime, HorizontalDiffusivity, HorizontalDiffusivityField,
+    WithHorizontalDiffusivity2D, WithHorizontalDiffusivity3D,
 };
 pub use stokes::{StokesDrift, WithStokesDrift2D, WithStokesDrift3D};
 pub use tracker::{Particle2D, ParticleStatus, ParticleTracker2D};
