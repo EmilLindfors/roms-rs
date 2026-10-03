@@ -17,12 +17,17 @@
 //!   reaches, and part of the flow goes underneath;
 //! - the drag force on the cages.
 //!
+//! `layout` places the cages: `across` (the default, a row across the flow,
+//! 120 m apart) or `along` (one behind the other along the channel, 120 m
+//! apart, so the tide carries water from each to the other).
+//!
 //! With `particles=N`, the 3D run with cages also releases N particles of
 //! each kind in each cage at `release` hours (default 2, in the running
-//! tide) and tracks them online (`ParticleTracker3D`, TODO F.2) between the
-//! solver's states every `particle_seconds` (default 60), with a horizontal
-//! walk `kh` (m²/s, default 0.1) and Visser's vertical walk in the model's
-//! GLS diffusivity:
+//! tide), and again every `release_every` hours (default 1) for `releases`
+//! batches (default 1), and tracks them online (`ParticleTracker3D`, TODO
+//! F.2) between the solver's states every `particle_seconds` (default 60),
+//! with a horizontal walk `kh` (m²/s, default 0.1) and Visser's vertical
+//! walk in the model's GLS diffusivity:
 //! - lice larvae, neutrally buoyant, released over the top 5 m, swimming
 //!   by `lice` (`SalmonLice`: `ladim`, the default, the operational IMR
 //!   parameters; `johnsen`, Johnsen et al. 2014; `passive`): up towards the
@@ -33,6 +38,20 @@
 //!
 //! Faeces and feed settle on the bed; the report gives the larvae's depths,
 //! spread and swimming, and where the rest landed.
+//!
+//! Pen-to-pen connectivity of the larvae (`particles::connectivity`): the
+//! share of each cage's larvae that come into contact with each cage (inside
+//! its footprint, in the top `contact_depth` m, default the net's 20 m; its
+//! own cage only once it has been a cage radius beyond it, so the walk
+//! stepping out and back in at the edge is no return), per release batch
+//! with the tide's phase at release, and over all batches. Exposure per pair is the time in
+//! contact: per released larva, and its 10/50/90 % among the larvae in
+//! contact, with the age at first contact. `seeds=R` (default 1) tracks the
+//! larvae R times with independent random walks (the first with the other
+//! kinds, the rest alone) and gives each share's spread across the seeds
+//! beside one seed's binomial error. `connectivity=<file.csv>` writes every
+//! seed's matrix per batch, for comparing runs (layouts, `kh`, meshes).
+//! `runs=cages` runs only the 3D run with cages.
 //!
 //! `stokes=H_s,T_p,direction` (m, s, degrees counter-clockwise from along the
 //! channel; default off) adds the Stokes drift of a uniform sea to the
@@ -55,13 +74,17 @@
 //! it is the advection's. For measuring that: `limiter` (`none`, the
 //! default, or `kuzmin`: the horizontal Kuzmin tracer limiter), `tvadv`
 //! (the tracers' vertical advection: `limited-akima`, the default, `akima`,
-//! `tvd` or `upwind`) and `runs=open` (only the 3D run without cages).
+//! `tvd` or `upwind`) and `runs=open` (only the 3D run without cages;
+//! `runs=cages`, only the one with).
 //!
 //! ```bash
 //! cargo run --release --no-default-features --features parallel,simd \
 //!     --example farm_3d -- [hours=3] [order=2] [levels=16] [dx=60] [nu=1] [cs=0.2] \
-//!     [particles=0] [release=2] [particle_seconds=60] [kh=0.1] \
-//!     [lice=ladim] [start=2025-06-15T00:00:00Z] [stokes=H_s,T_p,direction] //!     [wind=0] [waves=0] [closure=k-epsilon] \
+//!     [layout=across] [particles=0] [release=2] [releases=1] [release_every=1] \
+//!     [particle_seconds=60] [kh=0.1] [seeds=1] [contact_depth=20] \
+//!     [connectivity=<file.csv>] \
+//!     [lice=ladim] [start=2025-06-15T00:00:00Z] [stokes=H_s,T_p,direction] \
+//!     [wind=0] [waves=0] [closure=k-epsilon] \
 //!     [limiter=none] [tvadv=limited-akima] [runs=all] \
 //!     [snapshot=<file.dgsnap>] [snapshot_minutes=10]
 //! ```
@@ -85,8 +108,9 @@ use dg_rs::mesh::data::Bathymetry2D;
 use dg_rs::mesh::{Mesh2D, PointLocator2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::particles::{
-    ClearSkyLight, Particle3D, ParticleStatus, ParticleTracker3D, ParticleVelocity3D, SalmonLice,
-    Solution3DVelocity, StokesDrift, WithStokesDrift3D,
+    ClearSkyLight, ConnectivityEnsemble, ConnectivityRecorder, Contact, ContactZone, Particle3D,
+    ParticleStatus, ParticleTracker3D, ParticleVelocity3D, SalmonLice, Solution3DVelocity,
+    StokesDrift, WithStokesDrift3D,
 };
 use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use dg_rs::physics::{
@@ -115,8 +139,10 @@ const LY: f64 = 600.0;
 const DEPTH: f64 = 40.0;
 const NET_DEPTH: f64 = 20.0;
 const RADIUS: f64 = 25.0;
-/// Cage centres: a row across the flow in the middle of the channel
-const CAGES: [[f64; 2]; 2] = [[3_000.0, 240.0], [3_000.0, 360.0]];
+/// Cage centres of each layout: a row across the flow in the middle of the
+/// channel, or one behind the other along it
+const ACROSS: [[f64; 2]; 2] = [[3_000.0, 240.0], [3_000.0, 360.0]];
+const ALONG: [[f64; 2]; 2] = [[2_940.0, 300.0], [3_060.0, 300.0]];
 const M2: f64 = 2.0 * PI / 44_714.16;
 /// Where the sun is: Mausund, off Frøya (longitude, latitude)
 const SITE: [f64; 2] = [8.67, 63.87];
@@ -179,10 +205,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dx: f64 = get("dx", 60.0)?;
     let nu: f64 = get("nu", 1.0)?;
     let cs: f64 = get("cs", 0.2)?;
+    let centres: Vec<[f64; 2]> = match args.get("layout").map_or("across", String::as_str) {
+        "across" => ACROSS.to_vec(),
+        "along" => ALONG.to_vec(),
+        other => return Err(format!("layout={other}: across or along").into()),
+    };
     let particles_per_kind = get("particles", 0.0)? as usize;
     let release_time = get("release", 2.0)? * 3600.0;
+    let release_every = get("release_every", 1.0)? * 3600.0;
+    let batches: Vec<f64> = (0..get("releases", 1.0)? as usize)
+        .map(|b| release_time + b as f64 * release_every)
+        .collect();
     let particle_seconds: f64 = get("particle_seconds", 60.0)?;
     let kh: f64 = get("kh", 0.1)?;
+    let seeds = (get("seeds", 1.0)? as usize).max(1);
+    let contact_depth: f64 = get("contact_depth", NET_DEPTH)?;
+    let connectivity_path = args.get("connectivity").cloned();
     let clock = ModelClock::parse(
         args.get("start")
             .map_or("2025-06-15T00:00:00Z", String::as_str),
@@ -209,11 +247,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "upwind" => VerticalAdvection::Upwind,
         other => return Err(format!("tvadv={other}: limited-akima, akima, tvd or upwind").into()),
     };
-    let only_open = match args.get("runs").map_or("all", String::as_str) {
-        "all" => false,
-        "open" => true,
-        other => return Err(format!("runs={other}: all or open").into()),
-    };
+    let runs = args.get("runs").map_or("all", String::as_str);
+    if !["all", "open", "cages"].contains(&runs) {
+        return Err(format!("runs={runs}: all, open or cages").into());
+    }
     let sea: Option<[f64; 3]> = match args.get("stokes") {
         Some(v) => {
             let parts: Vec<f64> = v.split(',').map(str::parse).collect::<Result<_, _>>()?;
@@ -269,7 +306,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         StokesDriftField::new(&model, &model.uniform_state(&e))
     });
-    let cages: Vec<NetCage> = CAGES
+    let cages: Vec<NetCage> = centres
         .iter()
         .map(|&c| NetCage::circular(c, RADIUS, NET_DEPTH, 0.25))
         .collect();
@@ -386,27 +423,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let label = if with_cages { "3D cages" } else { "3D open" };
         let start = Instant::now();
         let mut tracking = (with_cages && particles_per_kind > 0).then(|| {
-            FarmParticles::new(&mesh, &ops, particles_per_kind, release_time, kh, lice)
-                .with_stokes_drift(stokes.as_ref())
+            FarmParticles::new(
+                &mesh,
+                &ops,
+                particles_per_kind,
+                &centres,
+                batches.clone(),
+                kh,
+                lice,
+            )
+            .with_stokes_drift(stokes.as_ref())
+            .with_connectivity(seeds, contact_depth)
         });
         let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
         // The run with cages to the snapshot file, if asked
         let mut snapshot = match snapshot_path.as_ref().filter(|_| with_cages) {
             Some(path) => {
                 let farm = [
-                    0.5 * (CAGES[0][0] + CAGES[1][0]),
-                    0.5 * (CAGES[0][1] + CAGES[1][1]),
+                    0.5 * (centres[0][0] + centres[1][0]),
+                    0.5 * (centres[0][1] + centres[1][1]),
                 ];
                 let cage_lines: Vec<String> = cages
                     .iter()
-                    .zip(CAGES)
+                    .zip(&centres)
                     .map(|(c, [x, y])| {
                         format!("{x},{y},{RADIUS},{NET_DEPTH},{}", c.drag_per_length)
                     })
                     .collect();
                 let poi = format!("{},{}", farm[0], farm[1]);
                 // Along the flow through the first cage
-                let (x0, y0) = (CAGES[0][0], CAGES[0][1]);
+                let (x0, y0) = (centres[0][0], centres[0][1]);
                 let section = format!("{},{y0},{},{y0}", x0 - 600.0, x0 + 600.0);
                 let periodic = format!("{LX},inf");
                 let mut metadata = vec![
@@ -540,6 +586,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(tracking) = &tracking {
             tracking.report(&state, &sigma, &bathymetry);
+            tracking
+                .report_connectivity(connectivity_path.as_deref())
+                .map_err(|e| format!("{label}: the connectivity file: {e}"))?;
         }
         // Mixing: the growth of the reference potential energy, GLS's and
         // the advection's spurious mixing together
@@ -580,9 +629,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     println!("\nM2 body force from rest, {hours} h:");
-    if only_open {
-        run_3d(false)?;
-        return Ok(());
+    match runs {
+        "open" => {
+            run_3d(false)?;
+            return Ok(());
+        }
+        "cages" => {
+            run_3d(true)?;
+            return Ok(());
+        }
+        _ => {}
     }
     let caged_3d = run_3d(true)?;
     let open_3d = run_3d(false)?;
@@ -597,19 +653,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sample = p.sample_swe(q, Some(&bathymetry), 1e-3);
         sample.u
     };
-    let farm_u = mean_3d(&open_3d, &probe(CAGES[0]));
+    let farm_u = mean_3d(&open_3d, &probe(centres[0]));
     let lee = farm_u.signum();
     println!(
         "\nUndisturbed current at the farm: 3D {:+.3} m/s, 2D {:+.3} m/s (the lee is {} of the farm)",
         farm_u,
-        mean_2d(&open_2d, &probe(CAGES[0])),
+        mean_2d(&open_2d, &probe(centres[0])),
         if lee > 0.0 { "east" } else { "west" }
     );
 
     println!("\nDepth-mean current behind cage 0 (deficit against the run without cages):");
     println!("  behind    3D (m/s)   deficit    2D (m/s)   deficit");
     for distance in [-150.0, 0.0, 50.0, 100.0, 200.0, 400.0, 800.0] {
-        let p = probe([CAGES[0][0] + lee * distance, CAGES[0][1]]);
+        let p = probe([centres[0][0] + lee * distance, centres[0][1]]);
         let (u3, u3o) = (mean_3d(&caged_3d, &p), mean_3d(&open_3d, &p));
         let (u2, u2o) = (mean_2d(&caged_2d, &p), mean_2d(&open_2d, &p));
         println!(
@@ -631,7 +687,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect()
     };
     for distance in [0.0, 100.0] {
-        let p = probe([CAGES[0][0] + lee * distance, CAGES[0][1]]);
+        let p = probe([centres[0][0] + lee * distance, centres[0][1]]);
         let (caged, open) = (column(&caged_3d, &p), column(&open_3d, &p));
         println!("\n3D profile {distance:.0} m behind cage 0 (z of the layer centre):");
         println!("      z (m)   cages (m/s)   open (m/s)   deficit");
@@ -721,14 +777,29 @@ struct FarmParticles<'a> {
     tracker_mesh: &'a Mesh2D,
     ops: &'a DGOperators2D,
     n: usize,
-    release_time: f64,
+    /// Cage centres
+    centres: Vec<[f64; 2]>,
+    /// Release time of each batch, and how many have been released
+    batches: Vec<f64>,
+    released_batches: usize,
+    next_id: u64,
     /// The larvae's behaviour (`None`: passive)
     lice: Option<SalmonLice<ClearSkyLight>>,
     /// The waves' Stokes drift, added to the flow
     stokes: Option<&'a StokesDriftField>,
-    /// Particles of each kind once released, with the cage of each
+    /// Particles of each kind once released, with the cage and release
+    /// time of each
     particles: [Vec<Particle3D>; 3],
     cages: [Vec<usize>; 3],
+    born: [Vec<f64>; 3],
+    /// The larvae again with other seeds (the connectivity's spread)
+    replicates: Vec<(ParticleTracker3D<'a>, Vec<Particle3D>)>,
+    /// The larvae's contacts with the cages, one recorder per seed (the
+    /// first for `particles[LARVAE]`, then one per replicate)
+    contacts: Vec<ConnectivityRecorder>,
+    /// The depth-mean current at the farm, and its value at each release
+    farm: Probe2D,
+    release_current: Vec<f64>,
     previous: Option<(f64, Solution3D)>,
     seconds: f64,
 }
@@ -738,10 +809,18 @@ impl<'a> FarmParticles<'a> {
         mesh: &'a Mesh2D,
         ops: &'a DGOperators2D,
         n: usize,
-        release_time: f64,
+        centres: &[[f64; 2]],
+        batches: Vec<f64>,
         kh: f64,
         lice: Option<SalmonLice<ClearSkyLight>>,
     ) -> Self {
+        let n_cages = centres.len() as f64;
+        let farm = [
+            centres.iter().map(|c| c[0]).sum::<f64>() / n_cages,
+            centres.iter().map(|c| c[1]).sum::<f64>() / n_cages,
+        ];
+        let farm =
+            Probe2D::at(&PointLocator2D::new(mesh), ops, farm).expect("the farm is in the channel");
         Self {
             tracker: ParticleTracker3D::new(mesh, ops)
                 .with_horizontal_diffusivity(kh)
@@ -750,11 +829,19 @@ impl<'a> FarmParticles<'a> {
             tracker_mesh: mesh,
             ops,
             n,
-            release_time,
+            centres: centres.to_vec(),
+            batches,
+            released_batches: 0,
+            next_id: 0,
             lice,
             stokes: None,
             particles: Default::default(),
             cages: Default::default(),
+            born: Default::default(),
+            replicates: Vec::new(),
+            contacts: Vec::new(),
+            farm,
+            release_current: Vec::new(),
             previous: None,
             seconds: 0.0,
         }
@@ -762,6 +849,24 @@ impl<'a> FarmParticles<'a> {
 
     fn with_stokes_drift(mut self, stokes: Option<&'a StokesDriftField>) -> Self {
         self.stokes = stokes;
+        self
+    }
+
+    /// Record the larvae's contacts with the cages (each footprint over the
+    /// top `depth` m) for `seeds` independent random walks.
+    fn with_connectivity(mut self, seeds: usize, depth: f64) -> Self {
+        let zones: Vec<ContactZone> = self
+            .centres
+            .iter()
+            .map(|&c| ContactZone::circular(c, RADIUS, [0.0, depth]))
+            .collect();
+        // A return to its own cage only after a cage radius beyond it: not
+        // the walk stepping out and back in at the edge
+        let recorder = ConnectivityRecorder::new(zones).with_return_distance(RADIUS);
+        self.contacts = vec![recorder; seeds];
+        self.replicates = (1..seeds as u64)
+            .map(|seed| (self.tracker.clone().with_seed(seed), Vec::new()))
+            .collect();
         self
     }
 
@@ -777,7 +882,7 @@ impl<'a> FarmParticles<'a> {
         };
         let mut weights = vec![0.0; self.ops.n_nodes];
         for (kind, particles) in self.particles.iter().enumerate() {
-            for p in particles {
+            for (p, &born) in particles.iter().zip(&self.born[kind]) {
                 let point = p.point();
                 self.ops
                     .interpolation_weights_into(point.r, point.s, &mut weights);
@@ -793,106 +898,248 @@ impl<'a> FarmParticles<'a> {
                 frame.z.push((e + p.sigma() * (e - b).max(0.0)) as f32);
                 frame.status.push(status_code(p.status()));
                 frame.kind.push(kind as u8);
-                frame.born.push(self.release_time as f32);
+                frame.born.push(born as f32);
             }
         }
         frame
     }
 
-    /// `n` particles of each kind in each cage: a sunflower pattern over
-    /// the footprint, evenly over the kind's depth range.
-    fn release(&mut self) {
+    /// The next batch at `t`: `n` particles of each kind in each cage, a
+    /// sunflower pattern over the footprint, evenly over the kind's depth
+    /// range; the larvae also in each replicate and recorder. `current` is
+    /// the depth-mean current at the farm.
+    fn release(&mut self, t: f64, current: f64) {
+        let batch = self.released_batches;
         let golden_angle = PI * (3.0 - 5.0_f64.sqrt());
-        let mut id = 0;
-        for (c, center) in CAGES.iter().enumerate() {
+        for (c, center) in self.centres.iter().enumerate() {
             for (kind, &(_, speed, [top, bottom])) in KINDS.iter().enumerate() {
                 for i in 0..self.n {
                     let r = RADIUS * ((i as f64 + 0.5) / self.n as f64).sqrt();
                     let angle = i as f64 * golden_angle;
                     let p = [center[0] + r * angle.cos(), center[1] + r * angle.sin()];
                     let below = top + (bottom - top) * (i as f64 + 0.5) / self.n as f64;
-                    let particle = self
-                        .tracker
-                        .release(id, p, -below / DEPTH, speed)
-                        .expect("cages are in the channel");
-                    id += 1;
-                    self.particles[kind].push(particle);
+                    let release = |tracker: &ParticleTracker3D| {
+                        tracker
+                            .release(self.next_id, p, -below / DEPTH, speed)
+                            .expect("cages are in the channel")
+                    };
+                    if kind == LARVAE {
+                        for (tracker, larvae) in &mut self.replicates {
+                            larvae.push(release(tracker));
+                        }
+                        for recorder in &mut self.contacts {
+                            recorder.add(c, batch, t);
+                        }
+                    }
+                    self.particles[kind].push(release(&self.tracker));
                     self.cages[kind].push(c);
+                    self.born[kind].push(t);
+                    self.next_id += 1;
                 }
             }
         }
+        self.release_current.push(current);
+        self.released_batches += 1;
     }
 
-    /// Move the particles from the previous state to `state` at `t`, in
-    /// steps of at most 10 s, linear in time between the two.
+    /// Move the particles from the previous state to `state` at `t`, linear
+    /// in time between the two, releasing the batches due on the way.
     fn advance(&mut self, state: &Solution3D, t: f64, sigma: &SigmaGrid, bed: &Bathymetry2D) {
         let start = Instant::now();
-        if self.previous.is_some() && t > self.release_time && self.released() == 0 {
-            self.release();
-        }
-        if let Some((t0, s0)) = &self.previous
-            && t > self.release_time
-        {
-            let from = t0.max(self.release_time);
+        let previous = self.previous.take();
+        if let Some((t0, s0)) = &previous {
             let field = Solution3DVelocity::between(*t0, s0, t, state, sigma, bed, 0.05);
-            let n = ((t - from) / 10.0).ceil().max(1.0) as usize;
-            let dt = (t - from) / n as f64;
+            let (u0, u1) = (
+                self.farm.evaluate_field(&s0.ubar.data),
+                self.farm.evaluate_field(&state.ubar.data),
+            );
             match self.stokes {
                 Some(stokes) => {
                     let field = WithStokesDrift3D::new(field, StokesDrift::steady(stokes));
-                    Self::steps(
-                        &self.tracker,
-                        &self.lice,
-                        &mut self.particles,
-                        &field,
-                        from,
-                        n,
-                        dt,
-                    );
+                    self.segments(&field, *t0, t, [u0, u1]);
                 }
-                None => Self::steps(
-                    &self.tracker,
-                    &self.lice,
-                    &mut self.particles,
-                    &field,
-                    from,
-                    n,
-                    dt,
-                ),
+                None => self.segments(&field, *t0, t, [u0, u1]),
             }
         }
-        match &mut self.previous {
-            Some((tp, sp)) => {
-                *tp = t;
+        self.previous = match previous {
+            Some((_, mut sp)) => {
                 sp.clone_from(state);
+                Some((t, sp))
             }
-            None => self.previous = Some((t, state.clone())),
-        }
+            None => Some((t, state.clone())),
+        };
         self.seconds += start.elapsed().as_secs_f64();
     }
 
-    /// `n` steps of `dt` from `from` through `field`, the larvae by their
-    /// behaviour.
-    fn steps(
-        tracker: &ParticleTracker3D,
-        lice: &Option<SalmonLice<ClearSkyLight>>,
-        particles: &mut [Vec<Particle3D>; 3],
-        field: &impl ParticleVelocity3D,
-        from: f64,
-        n: usize,
-        dt: f64,
-    ) {
+    /// Track from `t0` to `t`, releasing the batches due on the way, with
+    /// the depth-mean current at the farm `current` at `t0` and `t`.
+    fn segments(&mut self, field: &impl ParticleVelocity3D, t0: f64, t: f64, current: [f64; 2]) {
+        let mut from = t0;
+        while from < t {
+            while self
+                .batches
+                .get(self.released_batches)
+                .is_some_and(|&b| b <= from + 1e-6)
+            {
+                let f = (from - t0) / (t - t0);
+                self.release(from, current[0] + f * (current[1] - current[0]));
+            }
+            let to = match self.batches.get(self.released_batches) {
+                Some(&b) if b < t => b,
+                _ => t,
+            };
+            if self.released() > 0 {
+                self.steps(field, from, to);
+            }
+            from = to;
+        }
+    }
+
+    /// Steps of at most 10 s from `from` to `to` through `field`, the larvae
+    /// by their behaviour, recording their contacts after each.
+    fn steps(&mut self, field: &impl ParticleVelocity3D, from: f64, to: f64) {
+        let n = ((to - from) / 10.0).ceil().max(1.0) as usize;
+        let dt = (to - from) / n as f64;
+        let ops = self.ops;
+        let mut weights = vec![0.0; ops.n_nodes];
         for s in 0..n {
             let t = from + s as f64 * dt;
-            for (kind, particles) in particles.iter_mut().enumerate() {
-                match lice {
+            for (kind, particles) in self.particles.iter_mut().enumerate() {
+                match &self.lice {
                     Some(lice) if kind == LARVAE => {
-                        tracker.step_with(particles, field, lice, t, dt)
+                        self.tracker.step_with(particles, field, lice, t, dt)
                     }
-                    _ => tracker.step(particles, field, t, dt),
+                    _ => self.tracker.step(particles, field, t, dt),
+                }
+            }
+            for (tracker, larvae) in &mut self.replicates {
+                match &self.lice {
+                    Some(lice) => tracker.step_with(larvae, field, lice, t, dt),
+                    None => tracker.step(larvae, field, t, dt),
+                }
+            }
+            // Contacts at the end of the step, of the larvae in the water
+            let larvae = std::iter::once(&self.particles[LARVAE])
+                .chain(self.replicates.iter().map(|(_, larvae)| larvae));
+            for (recorder, larvae) in self.contacts.iter_mut().zip(larvae) {
+                for (i, p) in larvae.iter().enumerate() {
+                    if p.status() != ParticleStatus::Active {
+                        continue;
+                    }
+                    let depth = || {
+                        let point = p.point();
+                        ops.interpolation_weights_into(point.r, point.s, &mut weights);
+                        p.depth_below_surface(field.depth(point.element, &weights, t + dt))
+                    };
+                    recorder.record(i, t + dt, dt, p.position(), depth, 1.0);
                 }
             }
         }
+    }
+
+    /// The larvae's pen-to-pen connectivity per release batch and over all
+    /// batches (mean ± spread across the seeds), and every seed's matrix per
+    /// batch to `csv`.
+    fn report_connectivity(&self, csv: Option<&str>) -> std::io::Result<()> {
+        if self.contacts.is_empty() || self.released() == 0 {
+            return Ok(());
+        }
+        let zones = self.contacts[0].zones();
+        let n_cages = zones.len();
+        println!(
+            "\nPen-to-pen connectivity of the larvae: contact inside a cage's footprint over the top {} m (its own cage after a radius beyond it), {} seed{}",
+            zones[0].depth[1],
+            self.contacts.len(),
+            if self.contacts.len() == 1 { "" } else { "s" }
+        );
+        println!(
+            "  share in contact: mean ± spread across the seeds (one seed's binomial error); exposure per released larva; among those in contact, exposure 10/50/90 % and age at first contact 50 %"
+        );
+        let pair_lines = |groups: &dyn Fn(usize) -> bool| {
+            let ensemble = ConnectivityEnsemble::new(
+                self.contacts
+                    .iter()
+                    .map(|r| r.matrix(0.0, groups))
+                    .collect(),
+            );
+            for i in 0..n_cages {
+                for j in 0..n_cages {
+                    let mut contacts: Vec<Contact> = self
+                        .contacts
+                        .iter()
+                        .flat_map(|r| r.contacts(i, j, groups))
+                        .collect();
+                    let binomial = ensemble.members()[0].binomial_error(i, j);
+                    let (exposure, _) = ensemble.mean_exposure(i, j);
+                    print!(
+                        "    cage {i} → {j}: {:5.1} ± {:4.1} % ({:4.1}), {exposure:6.1} s per larva",
+                        100.0 * ensemble.mean(i, j),
+                        100.0 * ensemble.spread(i, j),
+                        100.0 * binomial
+                    );
+                    if !contacts.is_empty() {
+                        let pct =
+                            |v: &[f64], q: f64| v[(q * (v.len() - 1) as f64).round() as usize];
+                        contacts.sort_by(|a, b| a.exposure.total_cmp(&b.exposure));
+                        let e: Vec<f64> = contacts.iter().map(|c| c.exposure).collect();
+                        let mut first: Vec<f64> = contacts.iter().map(|c| c.first).collect();
+                        first.sort_by(f64::total_cmp);
+                        print!(
+                            "; exposure {:.0}/{:.0}/{:.0} s, first contact at {:.0} min",
+                            pct(&e, 0.1),
+                            pct(&e, 0.5),
+                            pct(&e, 0.9),
+                            pct(&first, 0.5) / 60.0
+                        );
+                    }
+                    println!();
+                }
+            }
+        };
+        let phase = |t: f64| (M2 * t).to_degrees().rem_euclid(360.0);
+        for (b, &t) in self.batches[..self.released_batches].iter().enumerate() {
+            println!(
+                "  batch {b}, released at {:.2} h (M2 forcing phase {:.0}°, depth-mean current at the farm {:+.2} m/s):",
+                t / 3600.0,
+                phase(t),
+                self.release_current[b]
+            );
+            pair_lines(&|g| g == b);
+        }
+        if self.released_batches > 1 {
+            println!("  all batches:");
+            pair_lines(&|_| true);
+        }
+        if let Some(path) = csv {
+            use std::io::Write;
+            let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
+            writeln!(
+                out,
+                "seed,batch,release_h,m2_phase_deg,current_farm,source,receiver,released,reached,share,exposure_per_larva_s"
+            )?;
+            for (seed, recorder) in self.contacts.iter().enumerate() {
+                for (b, &t) in self.batches[..self.released_batches].iter().enumerate() {
+                    let m = recorder.matrix(0.0, |g| g == b);
+                    for i in 0..n_cages {
+                        for j in 0..n_cages {
+                            writeln!(
+                                out,
+                                "{seed},{b},{},{},{},{i},{j},{},{},{},{}",
+                                t / 3600.0,
+                                phase(t),
+                                self.release_current[b],
+                                m.released(i),
+                                m.reached(i, j),
+                                m.share(i, j),
+                                m.mean_exposure(i, j)
+                            )?;
+                        }
+                    }
+                }
+            }
+            println!("  every seed's matrix per batch written to {path}");
+        }
+        Ok(())
     }
 
     /// Per kind: in the water and on the bed; depths, drift and spread of
@@ -903,10 +1150,14 @@ impl<'a> FarmParticles<'a> {
             return;
         }
         println!(
-            "\nParticles: {} released at {:.1} h, {:.2} s tracking",
+            "\nParticles: {} released in {} batch{} from {:.1} h, {:.2} s tracking ({} seed{} of the larvae)",
             self.released(),
-            self.release_time / 3600.0,
-            self.seconds
+            self.released_batches,
+            if self.released_batches == 1 { "" } else { "es" },
+            self.batches[0] / 3600.0,
+            self.seconds,
+            self.contacts.len(),
+            if self.contacts.len() == 1 { "" } else { "s" }
         );
         if let Some(lice) = &self.lice {
             let t = self.previous.as_ref().map_or(0.0, |(t, _)| *t);
@@ -921,7 +1172,7 @@ impl<'a> FarmParticles<'a> {
         let field = Solution3DVelocity::steady(state, sigma, bed, 0.05);
         // The vertical diffusivity the walk sees, 150 m up-current of the farm
         let locator = PointLocator2D::new(self.tracker_mesh);
-        let ahead = [CAGES[0][0] - 150.0, CAGES[0][1]];
+        let ahead = [self.centres[0][0] - 150.0, self.centres[0][1]];
         if let Some(point) = locator.locate(ahead) {
             let w = self.ops.interpolation_weights(point.r, point.s);
             let depth = field.depth(point.element, &w, 0.0);
@@ -949,8 +1200,8 @@ impl<'a> FarmParticles<'a> {
         // Displacement from the cage, the nearest periodic image along x
         let offset = |p: &Particle3D, c: usize| {
             let [x, y] = p.position();
-            let dx = (x - CAGES[c][0] + 0.5 * LX).rem_euclid(LX) - 0.5 * LX;
-            [dx, y - CAGES[c][1]]
+            let dx = (x - self.centres[c][0] + 0.5 * LX).rem_euclid(LX) - 0.5 * LX;
+            [dx, y - self.centres[c][1]]
         };
         for (kind, &(name, ..)) in KINDS.iter().enumerate() {
             let of_kind: Vec<(&Particle3D, usize)> = self.particles[kind]
