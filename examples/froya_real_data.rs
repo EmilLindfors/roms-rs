@@ -103,6 +103,19 @@
 //! capped at `turning=` rad/s, or stepped implicitly with `implicit=1`): the
 //! step, what sets it, and the cost per model hour.
 //!
+//! `levels=N` (N > 0) times `steps_3d=` (10) mode-split steps of the 3D model
+//! on the domain instead of the tidal run: N surface-stretched σ-levels, GLS
+//! k-ε, log-layer bottom drag, Smagorinsky viscosity, the Kuzmin limiter, a
+//! summer pycnocline at rest. It reports the baroclinic step and what sets it
+//! (and what local time stepping in 3D could save), the barotropic substeps,
+//! and the wall time per step and per model hour. `dt_3d=` overrides the step;
+//! `debug_3d=` takes comma-separated switches for diagnosing the 3D model on
+//! the real bed: `trace` (the largest speed and where, every step, and the
+//! momentum tendency at rest), `uniform` (no stratification), `linear`
+//! (linear in z instead of the pycnocline), `balanced` (the initial state as
+//! the PGF's balanced reference), `nolimiter`, `constant` (constant mixing
+//! instead of GLS).
+//!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
 //! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
 //! the mesh, bed, clock and stations), a tenth of the VTU frames' size. The
@@ -340,6 +353,12 @@ struct Options {
     turning: Option<f64>,
     /// Step refraction implicitly (`implicit=1`)
     implicit_refraction: bool,
+    /// Time the 3D model on the domain with this many σ-levels instead of
+    /// the tidal run (`levels=N`; 0: off), for `steps_3d=` steps
+    levels: usize,
+    steps_3d: usize,
+    dt_3d: Option<f64>,
+    debug_3d: String,
     output: Option<PathBuf>,
 }
 
@@ -386,6 +405,14 @@ impl Options {
             },
             profile: get("profile", 0.0)? as usize,
             waves: get("waves", 0.0)? as usize,
+            levels: get("levels", 0.0)? as usize,
+            steps_3d: get("steps_3d", 10.0)? as usize,
+            dt_3d: args
+                .get("dt_3d")
+                .map(|v| v.parse::<f64>())
+                .transpose()
+                .map_err(|e| e.to_string())?,
+            debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
             wave_grid: {
                 let text = args.get("wave_grid").map_or("25,36", String::as_str);
                 let parts: Vec<usize> = text
@@ -1215,6 +1242,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wave_cost(&domain, &opts);
         return Ok(());
     }
+    if opts.levels > 0 {
+        cost_3d(&domain, &opts);
+        return Ok(());
+    }
 
     lake_at_rest(&domain, opts.rest_hours);
     tidal_run(&domain, &opts, parent)
@@ -1779,6 +1810,299 @@ fn wave_cost(domain: &Domain, opts: &Options) {
         t,
         model.total_action(&n)
     );
+}
+
+/// The cost of the 3D model on this domain (`levels=N`, TODO P1.3): the
+/// mode-split step with GLS k-ε, log-layer drag, Smagorinsky viscosity of the
+/// shear and the Kuzmin limiter, over a summer pycnocline at rest (T 4 °C
+/// warmer above ≈ 15 m, S 1.5 psu fresher), with the run's 2D module (walls
+/// everywhere: the open boundaries cost nothing next to the interior). The
+/// median wall time of `steps_3d` steps after a warm-up; the baroclinic step
+/// at rest and with 1 m/s currents everywhere, each element's own step (what
+/// local time stepping could save), and the barotropic substeps per step.
+fn cost_3d(domain: &Domain, opts: &Options) {
+    use dg_rs::physics::{
+        BottomDrag3D, ConstantMixing, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, VerticalMixing,
+    };
+    use dg_rs::solver::state::Solution3D;
+    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+    use dg_rs::time::ModeSplitIntegrator;
+    use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+
+    type Physics3D = Hydrostatic3D<LinearEOS, Box<dyn VerticalMixing + Send + Sync>, Reflective2D>;
+    const RHO0: f64 = 1025.0;
+    let nl = opts.levels;
+    let sigma = Arc::new(SigmaGrid::new(
+        nl,
+        SongHaidvogelStretching::new(5.0, 0.4, 10.0),
+    ));
+    // The 2D module of the run, without its own friction: the 3D bottom
+    // drag's depth mean replaces it
+    let swe = PhysicsBuilder::swe_2d(
+        domain.mesh.clone(),
+        domain.ops.clone(),
+        domain.geom.clone(),
+        ShallowWater2D::new(G),
+        Reflective2D::new(),
+    )
+    .with_bathymetry(domain.bathymetry.clone())
+    .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
+    .with_wet_dry(WetDryConfig::default())
+    .with_source(CoriolisSource2D::f_plane(F_CORIOLIS))
+    .build();
+    let eos = LinearEOS::default();
+    let dbg = |flag: &str| opts.debug_3d.split(',').any(|f| f == flag);
+    let physics: Physics3D = Hydrostatic3D::new(
+        domain.mesh.clone(),
+        domain.ops.clone(),
+        domain.geom.clone(),
+        sigma.clone(),
+        domain.bathymetry.clone(),
+        Arc::new(CoriolisSource2D::f_plane(F_CORIOLIS)),
+        eos,
+        if opts.debug_3d.split(',').any(|f| f == "constant") {
+            Box::new(ConstantMixing::new(1e-3, 1e-5)) as Box<dyn VerticalMixing + Send + Sync>
+        } else {
+            Box::new(GlsMixing::k_epsilon())
+        },
+        swe,
+        Forcing {
+            surface_stress: [0.0, 0.0],
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        },
+        G,
+        RHO0,
+    )
+    .with_bottom_drag(BottomDrag3D::log_layer(0.003))
+    .with_smagorinsky_viscosity(0.1)
+    .with_tracer_limiter(TracerLimiter3DConfig {
+        limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+        ..TracerLimiter3DConfig::default()
+    });
+
+    let (ne, nn) = (domain.mesh.n_elements, domain.ops.n_nodes);
+    let mut state = Solution3D::new(ne, nn, nl);
+    for idx in 0..ne * nn {
+        let bed = domain.bathymetry.data[idx];
+        let eta = bed.max(0.0);
+        state.eta.data[idx] = eta;
+        for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+            let z = eta + s * (eta - bed);
+            let step = if dbg("uniform") || dbg("linear") {
+                0.0
+            } else {
+                0.5 * (1.0 + ((z + 15.0) / 4.0).tanh())
+            };
+            state.temp[idx * nl + l] = eos.t0
+                + 4.0 * step
+                + if dbg("uniform") {
+                    0.0
+                } else if dbg("linear") {
+                    0.02 * z
+                } else {
+                    0.002 * z.min(0.0)
+                };
+            state.salt[idx * nl + l] = eos.s0 - 1.5 * step;
+        }
+    }
+    physics.update_density(&mut state);
+    let wet = (0..ne * nn)
+        .filter(|&idx| state.eta.data[idx] - domain.bathymetry.data[idx] > 0.0)
+        .count();
+    println!(
+        "\n3D model: {ne} elements × {nn} nodes × {nl} levels = {:.2} M points ({wet} wet columns), P{}",
+        (ne * nn * nl) as f64 / 1e6,
+        domain.ops.order
+    );
+
+    // Each element's own step from horizontal advection and internal waves
+    // (the bound of `Hydrostatic3D::compute_dt` that sets it here), at rest
+    // and with `speed` everywhere
+    let cfl = 0.5;
+    let order_factor = (domain.ops.order as f64 + 1.0).powi(2);
+    let element_dt = |speed: f64| -> Vec<f64> {
+        (0..ne)
+            .map(|k| {
+                let mut rate = 0.0_f64;
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let depth = state.eta.data[idx] - domain.bathymetry.data[idx];
+                    if depth < physics.min_column_depth {
+                        continue;
+                    }
+                    let rho = &state.rho[idx * nl..(idx + 1) * nl];
+                    let mut integral = 0.0;
+                    for l in 1..nl {
+                        let dz = (sigma.sigma_rho()[l] - sigma.sigma_rho()[l - 1]) * depth;
+                        integral += (-G / RHO0 * (rho[l] - rho[l - 1]) * dz).max(0.0).sqrt();
+                    }
+                    let c1 =
+                        (integral / std::f64::consts::PI).max(Physics3D::MIN_INTERNAL_WAVE_SPEED);
+                    let ((rx, ry), (sx, sy)) = (domain.geom.grad_r(k, i), domain.geom.grad_s(k, i));
+                    rate = rate.max((speed + c1) * 0.5 * (rx.hypot(ry) + sx.hypot(sy)));
+                }
+                if rate > 0.0 {
+                    cfl / rate / order_factor
+                } else {
+                    f64::INFINITY
+                }
+            })
+            .collect()
+    };
+    let report = |label: &str, dts: &[f64]| -> f64 {
+        let mut sorted: Vec<f64> = dts.iter().copied().filter(|d| d.is_finite()).collect();
+        sorted.sort_by(f64::total_cmp);
+        let smallest = sorted[0];
+        // Every element at its own step against all at the smallest
+        let multirate = sorted.len() as f64 / sorted.iter().map(|d| smallest / d).sum::<f64>();
+        let below = |factor: f64| sorted.iter().filter(|&&d| d < factor * smallest).count();
+        println!(
+            "  {label}: step {smallest:.2} s (median element {:.1} s; {} elements within 2× of \
+             the smallest, {} within 4×); local time stepping could save up to {multirate:.1}×",
+            sorted[sorted.len() / 2],
+            below(2.0),
+            below(4.0)
+        );
+        smallest
+    };
+    let dt_rest = physics.compute_dt(&state, cfl);
+    let own_rest = report("at rest", &element_dt(0.0));
+    let own_flow = report("1 m/s currents", &element_dt(1.0));
+    println!(
+        "  Hydrostatic3D::compute_dt at rest: {dt_rest:.2} s (the element bound alone: \
+         {own_rest:.2} s)"
+    );
+
+    // One 2D RHS, for the share of the barotropic pass
+    let q2d = domain.at_rest();
+    let swe_rhs = {
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let _ = physics.swe_physics.compute_rhs(&q2d, 0.0);
+            times.push(start.elapsed().as_secs_f64());
+        }
+        times.sort_by(f64::total_cmp);
+        times[2]
+    };
+
+    let physics = if dbg("nolimiter") {
+        physics.with_tracer_limiter(TracerLimiter3DConfig::none())
+    } else {
+        physics
+    };
+    let physics = if dbg("balanced") {
+        physics.with_balanced_reference(&state)
+    } else {
+        physics
+    };
+    let mut integrator = ModeSplitIntegrator::new();
+    let dt = opts.dt_3d.unwrap_or(dt_rest);
+    let mut t = 0.0;
+    let mut timed_step = |state: &mut Solution3D, t: &mut f64| {
+        physics.update_density(state);
+        integrator.step(state, &physics, dt, *t);
+        physics.post_process(state);
+        *t += dt;
+    };
+    for _ in 0..2 {
+        timed_step(&mut state, &mut t);
+    }
+    if dbg("trace") {
+        let mut rhs = state.clone();
+        physics.compute_momentum_rhs_into(&state, 0.0, &mut rhs);
+        let (mut best, mut at) = (0.0_f64, 0);
+        for (i, (u, v)) in rhs.u.iter().zip(&rhs.v).enumerate() {
+            if u.hypot(*v) > best {
+                best = u.hypot(*v);
+                at = i;
+            }
+        }
+        let k = at / nl / nn;
+        println!(
+            "  PGF + Coriolis + viscosity of the state: largest {best:.2e} m/s² at element {k} level {}; depths {:?}",
+            at % nl,
+            (0..nn)
+                .map(
+                    |i| ((state.eta.data[k * nn + i] - domain.bathymetry.data[k * nn + i]) * 10.0)
+                        .round()
+                        / 10.0
+                )
+                .collect::<Vec<_>>()
+        );
+        for n in 0..opts.steps_3d {
+            timed_step(&mut state, &mut t);
+            let (mut best, mut at) = (0.0_f64, 0);
+            for (i, (u, v)) in state.u.iter().zip(&state.v).enumerate() {
+                let s = u.hypot(*v);
+                if s.is_nan() || s > best {
+                    best = s;
+                    at = i;
+                }
+            }
+            let column = at / nl;
+            let (k, node) = (column / nn, column % nn);
+            let depths: Vec<f64> = (0..nn)
+                .map(|i| state.eta.data[k * nn + i] - domain.bathymetry.data[k * nn + i])
+                .collect();
+            let [x, y] = domain.mesh.reference_to_physical(
+                ElementIndex::new(k),
+                domain.ops.nodes_r[node],
+                domain.ops.nodes_s[node],
+            );
+            println!(
+                "  step {n}: largest {best:.2e} m/s at element {k} node {node} level {} ({:.1}, {:.1}) km; \
+                 depths {:?}; affine {}",
+                at % nl,
+                x / 1e3,
+                y / 1e3,
+                depths
+                    .iter()
+                    .map(|d| (d * 10.0).round() / 10.0)
+                    .collect::<Vec<_>>(),
+                domain.geom.element_is_affine(k)
+            );
+        }
+        return;
+    }
+    let mut times = Vec::with_capacity(opts.steps_3d);
+    for _ in 0..opts.steps_3d {
+        let start = Instant::now();
+        timed_step(&mut state, &mut t);
+        times.push(start.elapsed().as_secs_f64());
+    }
+    times.sort_by(f64::total_cmp);
+    let per_step = times[times.len() / 2];
+    let n_bt = integrator.last_substeps();
+    // The pass runs ≈ 1.3 n_bt SSP-RK3 substeps of three 2D RHS each
+    let barotropic = 1.3 * n_bt as f64 * 3.0 * swe_rhs;
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    println!(
+        "  {:.0} ms per step on {threads} threads at {dt:.2} s: {n_bt} barotropic substeps \
+         (≈ {:.0} ms, {:.0} %, at {:.2} ms per 2D RHS); the 3D stages and the rest ≈ {:.0} ms",
+        1e3 * per_step,
+        1e3 * barotropic,
+        100.0 * barotropic / per_step,
+        1e3 * swe_rhs,
+        1e3 * (per_step - barotropic)
+    );
+    for (label, dt) in [("at rest", dt), ("1 m/s currents", own_flow.min(dt))] {
+        let per_hour = 3600.0 / dt * per_step;
+        println!(
+            "  {label}: {per_hour:.0} s of wall time per model hour ({:.2}× real time); \
+             15 days ≈ {:.0} h",
+            3600.0 / per_hour,
+            per_hour * 360.0 / 3600.0
+        );
+    }
+    let speed = state
+        .u
+        .iter()
+        .zip(&state.v)
+        .map(|(u, v)| u.hypot(*v))
+        .fold(0.0, |m: f64, s| if s.is_nan() || s > m { s } else { m });
+    println!("  after {t:.0} s at rest: largest layer speed {speed:.2e} m/s");
 }
 
 /// Lower-case ASCII file-name form of a station name.
