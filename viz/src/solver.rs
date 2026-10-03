@@ -17,11 +17,11 @@ use std::time::Instant;
 use std::f64::consts::PI;
 use std::sync::Arc;
 
+use crate::replay::SnapshotSink;
 use dg_rs::boundary::{
     CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D,
 };
 use dg_rs::equations::ShallowWater2D;
-use dg_rs::io::SnapshotWriter;
 use dg_rs::physics::{
     BottomDrag3D, Forcing as Forcing3D, GlsMixing, Hydrostatic3D, LinearEOS, PhysicsBuilder,
 };
@@ -76,10 +76,10 @@ impl SourceTerm2D for TidalForce {
 /// snapshot no later than that (the run's first callback repeats t = 0) is not
 /// written again; on the first error it says so and stops writing, and the run goes
 /// on.
-struct Save(Option<SnapshotWriter>, f64);
+struct Save(Option<SnapshotSink>, f64);
 
 impl Save {
-    fn new(writer: Option<SnapshotWriter>) -> Self {
+    fn new(writer: Option<SnapshotSink>) -> Self {
         Self(writer, f64::NEG_INFINITY)
     }
 
@@ -87,7 +87,7 @@ impl Save {
         let Some(writer) = self.0.as_mut().filter(|_| snapshot.t > self.1) else {
             return;
         };
-        match crate::replay::save(writer, snapshot) {
+        match writer.write(snapshot) {
             Ok(()) => self.1 = snapshot.t,
             Err(e) => {
                 eprintln!(
@@ -217,7 +217,7 @@ pub struct SolverConfig {
 pub fn spawn(
     scenario: &Scenario,
     config: SolverConfig,
-    save: Option<SnapshotWriter>,
+    save: Option<SnapshotSink>,
 ) -> Receiver<SolverMessage> {
     if scenario.three_d.is_some() {
         return spawn_3d(scenario, config, save);
@@ -329,7 +329,7 @@ pub fn spawn(
 fn spawn_3d(
     scenario: &Scenario,
     config: SolverConfig,
-    save: Option<SnapshotWriter>,
+    save: Option<SnapshotSink>,
 ) -> Receiver<SolverMessage> {
     let (tx, rx) = channel();
     let three_d = scenario

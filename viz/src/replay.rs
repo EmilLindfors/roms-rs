@@ -8,8 +8,10 @@
 //!   σ-grid and u, v, T on every level, which become the snapshots' [`Layers`]. The
 //!   scenario is built from the file alone ([`Scenario::from_snapshot`]: mesh, bed,
 //!   cages, σ-grid, section), so the run's domain data and builder are not needed.
-//!   [`writer`] and [`save`] write such a file from the viewer's own snapshots
-//!   (`--save-snapshot`, live or replayed).
+//!   The particles, if the run had them, are in a particle file beside it
+//!   ([`particle_path`], `dg_rs::io::ParticleFileWriter`), and are attached to the
+//!   frames of the same time. A [`SnapshotSink`] writes both from the viewer's own
+//!   snapshots (`--save-snapshot`, live or replayed).
 //! - A directory of VTU frames (`froya_NNNN.vtu`, `dg_rs::io::write_vtk_swe`): every
 //!   element's nodes in the solver's order, with `eta`, `u`, `v`, `bathymetry` and the
 //!   model time (`TimeValue`), in ASCII. These carry no mesh connectivity, so the
@@ -30,12 +32,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
-use dg_rs::io::{SnapshotError, SnapshotFrame, SnapshotReader, SnapshotWriter};
+use dg_rs::io::{
+    ParticleFileReader, ParticleFileWriter, ParticleFrame, SnapshotError, SnapshotFrame,
+    SnapshotReader, SnapshotWriter,
+};
 use dg_rs::source::CageFootprint;
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
 use rayon::prelude::*;
 
+use crate::cloud_3d::KINDS;
 use crate::particles::ParticleSnapshot;
 use crate::scenario::Scenario;
 use crate::solver::{H_DRY, Layers, Snapshot, SolverMessage};
@@ -48,8 +54,25 @@ const TOLERANCE: f64 = 1e-3;
 enum Frames {
     /// VTU files, in time order
     Vtu(Vec<PathBuf>),
-    /// A snapshot file, its number of frames when opened, and its layers in 3D
-    Snapshot(Box<SnapshotReader>, usize, Option<LayerFields>),
+    /// A snapshot file, its number of frames when opened, its layers in 3D and its
+    /// particles
+    Snapshot(
+        Box<SnapshotReader>,
+        usize,
+        Option<LayerFields>,
+        Option<Box<Particles>>,
+    ),
+}
+
+/// A replay's particle file, and its kinds as the viewer's ([`KINDS`]; none in 2D).
+struct Particles {
+    reader: ParticleFileReader,
+    kinds: Option<Vec<u8>>,
+}
+
+/// The particle file beside the snapshot file `path`.
+pub fn particle_path(path: &Path) -> PathBuf {
+    path.with_extension("dgpart")
 }
 
 /// The frames of a finished run.
@@ -65,7 +88,7 @@ pub struct Replay {
     /// The scenario's bed at the nodes, for the dry nodes
     bed: Vec<f64>,
     /// Where the frames are also written as they are read
-    save: Option<SnapshotWriter>,
+    save: Option<SnapshotSink>,
 }
 
 impl Replay {
@@ -179,8 +202,29 @@ impl Replay {
             None => None,
         };
         let scenario = Scenario::from_snapshot(header);
+        // The particles beside it: in 3D of the viewer's kinds, matched by name
+        let particles = match ParticleFileReader::open(particle_path(path)) {
+            Ok(reader) => {
+                let kinds = scenario.three_d.is_some().then(|| {
+                    reader
+                        .kinds
+                        .iter()
+                        .map(|name| {
+                            let word = name.split_whitespace().next().unwrap_or_default();
+                            KINDS
+                                .iter()
+                                .position(|k| k.name.contains(word))
+                                .unwrap_or(0) as u8
+                        })
+                        .collect()
+                });
+                Some(Box::new(Particles { reader, kinds }))
+            }
+            Err(SnapshotError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("{}: {e}", particle_path(path).display()).into()),
+        };
         let replay = Self {
-            frames: Frames::Snapshot(Box::new(reader), n, layers),
+            frames: Frames::Snapshot(Box::new(reader), n, layers, particles),
             t_first,
             t_last,
             interval,
@@ -191,18 +235,29 @@ impl Replay {
         Ok((replay, scenario))
     }
 
-    /// Also write the frames to the snapshot file `path` as they are read
-    /// ([`writer`]).
+    /// Also write the frames to the snapshot file `path` as they are read, with their
+    /// particles if the replay has them ([`SnapshotSink`]).
     pub fn save_to(&mut self, path: &Path, scenario: &Scenario) -> Result<(), Box<dyn Error>> {
-        self.save = Some(writer(path, scenario, self.clock.as_ref())?);
+        let particles = self.has_particles();
+        self.save = Some(SnapshotSink::create(
+            path,
+            scenario,
+            self.clock.as_ref(),
+            particles,
+        )?);
         Ok(())
     }
 
     pub fn frames(&self) -> usize {
         match &self.frames {
             Frames::Vtu(files) => files.len(),
-            Frames::Snapshot(_, n, _) => *n,
+            Frames::Snapshot(_, n, _, _) => *n,
         }
+    }
+
+    /// Whether the replay has particles.
+    pub fn has_particles(&self) -> bool {
+        matches!(self.frames, Frames::Snapshot(_, _, _, Some(_)))
     }
 }
 
@@ -219,71 +274,120 @@ struct LayerFields {
 /// The layered fields the viewer writes: what [`Layers`] holds.
 const VIEWER_FIELDS: [&str; 3] = ["u", "v", "temp"];
 
-/// A snapshot file at `path` for the scenario's runs: its mesh, bed and (in 3D)
-/// σ-grid, `clock`, and as metadata the title, the point of interest, the cages
-/// (`cage=x,y,radius,net_depth,drag_per_length`), the section of a 3D run
-/// (`section=x0,y0,x1,y1`) and the periods of a periodic mesh (`periodic=x,y`), so
-/// that [`Scenario::from_snapshot`] rebuilds what the viewer draws. Frames go in with
-/// [`save`].
-pub fn writer(
-    path: &Path,
-    scenario: &Scenario,
-    clock: Option<&ModelClock>,
-) -> Result<SnapshotWriter, Box<dyn Error>> {
-    let title = scenario
-        .name
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_string();
-    let mut metadata = vec![
-        ("title", title),
-        ("source", "dg-viz --save-snapshot".to_string()),
-        (
-            "point_of_interest",
-            format!("{:.1},{:.1}", scenario.farm[0], scenario.farm[1]),
-        ),
-    ];
-    for cage in &scenario.cages {
-        if let CageFootprint::Circle { center, radius } = cage.footprint {
-            metadata.push((
-                "cage",
-                format!(
-                    "{},{},{radius},{},{}",
-                    center[0], center[1], cage.net_depth, cage.drag_per_length
-                ),
-            ));
-        }
-    }
-    if let Some([x, y]) = scenario.periodic {
-        metadata.push(("periodic", format!("{x},{y}")));
-    }
-    if let Some(three_d) = &scenario.three_d {
-        let [[x0, y0], [x1, y1]] = three_d.section;
-        metadata.push(("section", format!("{x0},{y0},{x1},{y1}")));
-    }
-    let metadata: Vec<(&str, &str)> = metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
-    let levels = scenario
-        .three_d
-        .as_ref()
-        .map(|three_d| (three_d.sigma.as_ref(), &VIEWER_FIELDS[..]));
-    Ok(SnapshotWriter::create_with(
-        path,
-        &scenario.mesh,
-        &scenario.ops,
-        &scenario.bathymetry.data,
-        clock,
-        &metadata,
-        H_DRY as f64,
-        levels,
-    )?)
+/// Where the viewer's snapshots are saved: a snapshot file and, if the run has
+/// particles, a particle file beside it ([`particle_path`]).
+pub struct SnapshotSink {
+    fields: SnapshotWriter,
+    particles: Option<ParticleFileWriter>,
+    /// The particle frame, reused
+    frame: ParticleFrame,
 }
 
-/// Append the viewer's snapshot `s` to a file from [`writer`].
-pub fn save(writer: &mut SnapshotWriter, s: &Snapshot) -> Result<(), SnapshotError> {
-    match &s.layers {
-        Some(l) => writer.write_fields(s.t, &s.eta, &s.u, &s.v, &[&l.u, &l.v, &l.temp]),
-        None => writer.write_fields(s.t, &s.eta, &s.u, &s.v, &[]),
+impl SnapshotSink {
+    /// A snapshot file at `path` for the scenario's runs: its mesh, bed and (in 3D)
+    /// σ-grid, `clock`, and as metadata the title, the point of interest, the cages
+    /// (`cage=x,y,radius,net_depth,drag_per_length`), the section of a 3D run
+    /// (`section=x0,y0,x1,y1`) and the periods of a periodic mesh (`periodic=x,y`), so
+    /// that [`Scenario::from_snapshot`] rebuilds what the viewer draws. With
+    /// `particles`, a particle file of the viewer's kinds beside it (3D: [`KINDS`];
+    /// 2D: one kind).
+    pub fn create(
+        path: &Path,
+        scenario: &Scenario,
+        clock: Option<&ModelClock>,
+        particles: bool,
+    ) -> Result<Self, Box<dyn Error>> {
+        let title = scenario
+            .name
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        let mut metadata = vec![
+            ("title", title),
+            ("source", "dg-viz --save-snapshot".to_string()),
+            (
+                "point_of_interest",
+                format!("{:.1},{:.1}", scenario.farm[0], scenario.farm[1]),
+            ),
+        ];
+        for cage in &scenario.cages {
+            if let CageFootprint::Circle { center, radius } = cage.footprint {
+                metadata.push((
+                    "cage",
+                    format!(
+                        "{},{},{radius},{},{}",
+                        center[0], center[1], cage.net_depth, cage.drag_per_length
+                    ),
+                ));
+            }
+        }
+        if let Some([x, y]) = scenario.periodic {
+            metadata.push(("periodic", format!("{x},{y}")));
+        }
+        if let Some(three_d) = &scenario.three_d {
+            let [[x0, y0], [x1, y1]] = three_d.section;
+            metadata.push(("section", format!("{x0},{y0},{x1},{y1}")));
+        }
+        let metadata: Vec<(&str, &str)> = metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let levels = scenario
+            .three_d
+            .as_ref()
+            .map(|three_d| (three_d.sigma.as_ref(), &VIEWER_FIELDS[..]));
+        let fields = SnapshotWriter::create_with(
+            path,
+            &scenario.mesh,
+            &scenario.ops,
+            &scenario.bathymetry.data,
+            clock,
+            &metadata,
+            H_DRY as f64,
+            levels,
+        )?;
+        let particles = if particles {
+            let kinds: Vec<&str> = match scenario.three_d {
+                Some(_) => KINDS.iter().map(|k| k.name).collect(),
+                None => vec!["particles"],
+            };
+            Some(ParticleFileWriter::create(
+                particle_path(path),
+                &kinds,
+                &[("source", "dg-viz --save-snapshot")],
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            fields,
+            particles,
+            frame: ParticleFrame::default(),
+        })
+    }
+
+    /// Append the viewer's snapshot `s`, and its particles.
+    pub fn write(&mut self, s: &Snapshot) -> Result<(), SnapshotError> {
+        match &s.layers {
+            Some(l) => self
+                .fields
+                .write_fields(s.t, &s.eta, &s.u, &s.v, &[&l.u, &l.v, &l.temp])?,
+            None => self.fields.write_fields(s.t, &s.eta, &s.u, &s.v, &[])?,
+        }
+        if let Some(writer) = self.particles.as_mut() {
+            let (p, f) = (&s.particles, &mut self.frame);
+            f.t = s.t;
+            f.xy.clone_from(&p.xy);
+            f.z.clone_from(&p.z);
+            f.status.clone_from(&p.state);
+            f.born.clone_from(&p.born);
+            if p.kind.is_empty() {
+                f.kind.clear();
+                f.kind.resize(p.len(), 0);
+            } else {
+                f.kind.clone_from(&p.kind);
+            }
+            writer.write(f)?;
+        }
+        Ok(())
     }
 }
 
@@ -318,9 +422,10 @@ fn read_all(
     threads: usize,
     mut send: impl FnMut(Snapshot) -> bool,
 ) -> Result<(), String> {
-    let mut deliver = |snapshot: Snapshot, writer: &mut Option<SnapshotWriter>| {
-        if let Some(writer) = writer {
-            save(writer, &snapshot).map_err(|e| format!("saving the snapshot file: {e}"))?;
+    let mut deliver = |snapshot: Snapshot, sink: &mut Option<SnapshotSink>| {
+        if let Some(sink) = sink {
+            sink.write(&snapshot)
+                .map_err(|e| format!("saving the snapshot file: {e}"))?;
         }
         Ok::<bool, String>(send(snapshot))
     };
@@ -348,8 +453,10 @@ fn read_all(
                 }
             }
         }
-        Frames::Snapshot(mut reader, n, layer_fields) => {
+        Frames::Snapshot(mut reader, n, layer_fields, mut particles) => {
             let mut frame = SnapshotFrame::default();
+            // The next particle frame not yet matched to a field frame
+            let mut next_particles = 0;
             for i in 0..n {
                 reader
                     .read_frame_into(i, &mut frame)
@@ -364,6 +471,29 @@ fn read_all(
                         None => vec![0.0; frame.layers[f.u].len()],
                     },
                 });
+                if let Some(p) = particles.as_mut() {
+                    let r = &mut p.reader;
+                    while next_particles < r.n_frames() && r.time(next_particles) < frame.t - 1e-6 {
+                        next_particles += 1;
+                    }
+                    if next_particles < r.n_frames()
+                        && (r.time(next_particles) - frame.t).abs() <= 1e-6
+                    {
+                        let f = r
+                            .read_frame(next_particles)
+                            .map_err(|e| format!("particle frame {next_particles}: {e}"))?;
+                        snapshot.particles = ParticleSnapshot {
+                            kind: match &p.kinds {
+                                Some(map) => f.kind.iter().map(|&k| map[k as usize]).collect(),
+                                None => Vec::new(),
+                            },
+                            xy: f.xy,
+                            z: f.z,
+                            state: f.status,
+                            born: f.born,
+                        };
+                    }
+                }
                 if !deliver(snapshot, &mut replay.save)? {
                     return Ok(());
                 }
