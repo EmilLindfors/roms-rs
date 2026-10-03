@@ -11,11 +11,13 @@
 //! It sets the water down seaward of the breakers and up in the surf zone, and
 //! drives longshore currents under oblique waves. [`WaveForce2D`] takes `S/(ρg)`
 //! (m²) per node, as [`WaveModel2D::radiation_stress`] gives it on the same mesh
-//! and order, and keeps `−g ∇·(S/ρg)` per node, differentiated within each
-//! element by its own derivative matrices. The jumps of `S` between elements are
-//! left out (they vanish as the wave field converges), so the force is not
-//! exactly in flux form: its total over the domain differs from the boundary
-//! integral of `S·n` by those jumps. Dry nodes (`h ≤ h_min`) get no force.
+//! and order, and keeps `−g ∇·(S/ρg)` per node: the strong-form DG divergence of
+//! each row of `S` (Hesthaven & Warburton 2008, §6.2), the contravariant volume
+//! term plus the lifted jumps to the central flux `S* = ½(S⁻ + S⁺)` on every
+//! interior face (`S* = S⁻` on the boundary). On GLL nodes summation by parts
+//! makes it a flux form: the force's total over the domain is exactly
+//! `−g ∮ S·n` over the boundary, with the momentum the waves give one element
+//! taken from its neighbour. Dry nodes (`h ≤ h_min`) get no force.
 //!
 //! The vortex-force form of McWilliams et al. (2004), which separates the
 //! conservative part into a Bernoulli head and needs the Stokes drift in the
@@ -34,10 +36,11 @@
 //! where the waves dominate; unchanged without them.
 
 use crate::boundary::tidal_ramp;
+use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::SWEState2D;
 use crate::source::{BottomFriction2D, ElementSources, SourceContext2D, SourceTerm2D};
-use crate::waves::model::nodal_gradient;
+use crate::types::ElementIndex;
 use crate::waves::{WaveModel2D, WaveSolution};
 
 /// The radiation-stress force of waves on the 2D flow (see the module docs).
@@ -59,15 +62,12 @@ impl WaveForce2D {
             .flat_map(|k| {
                 let (mesh, ops) = (&model.mesh, &model.ops);
                 (0..ops.n_nodes).map(move |i| {
-                    mesh.reference_to_physical(
-                        crate::types::ElementIndex::new(k),
-                        ops.nodes_r[i],
-                        ops.nodes_s[i],
-                    )
+                    mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
                 })
             })
             .collect();
         Self::from_radiation_stress(
+            &model.mesh,
             &model.ops,
             &model.geom,
             &model.radiation_stress(n),
@@ -77,24 +77,22 @@ impl WaveForce2D {
     }
 
     /// The force of the radiation stress `stress` (`[S_xx, S_xy, S_yy]/(ρg)`, m²,
-    /// per node, element by element) under gravity `g`.
+    /// per node, element by element on `mesh`) under gravity `g`.
     pub fn from_radiation_stress(
+        mesh: &Mesh2D,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
         stress: &[[f64; 3]],
         g: f64,
     ) -> Self {
-        let np = stress.len();
-        assert_eq!(np % ops.n_nodes, 0, "a nodal field element by element");
-        let component = |c: usize| -> Vec<[f64; 2]> {
-            let field: Vec<f64> = stress.iter().map(|s| s[c]).collect();
-            let mut gradient = vec![[0.0; 2]; np];
-            nodal_gradient(ops, geom, &field, &mut gradient);
-            gradient
-        };
-        let (sxx, sxy, syy) = (component(0), component(1), component(2));
-        let force = (0..np)
-            .map(|p| [-g * (sxx[p][0] + sxy[p][1]), -g * (sxy[p][0] + syy[p][1])])
+        assert_eq!(
+            stress.len(),
+            mesh.n_elements * ops.n_nodes,
+            "a nodal field element by element"
+        );
+        let force = stress_divergence(mesh, ops, geom, stress)
+            .into_iter()
+            .map(|[x, y]| [-g * x, -g * y])
             .collect();
         Self {
             n_nodes: ops.n_nodes,
@@ -174,6 +172,70 @@ impl SourceTerm2D for WaveForce2D {
     }
 }
 
+/// The divergence `[∂S_xx/∂x + ∂S_xy/∂y, ∂S_xy/∂x + ∂S_yy/∂y]` of the symmetric
+/// nodal tensor `stress` (`[S_xx, S_xy, S_yy]`) in strong DG form: per element
+/// `J⁻¹ (D_r F̃_r + D_s F̃_s)` of the contravariant fluxes of each row, plus the
+/// lifted `(S* − S⁻)·n` with the central `S* = ½(S⁻ + S⁺)` on interior faces.
+fn stress_divergence(
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    stress: &[[f64; 3]],
+) -> Vec<[f64; 2]> {
+    let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
+    let mut out = vec![[0.0; 2]; stress.len()];
+    let (mut fr, mut fs) = (vec![[0.0; 2]; nn], vec![[0.0; 2]; nn]);
+    for k in 0..mesh.n_elements {
+        let base = k * nn;
+        // The rows (S_xx, S_xy) and (S_xy, S_yy) on the contravariant vectors
+        for a in 0..nn {
+            let [sxx, sxy, syy] = stress[base + a];
+            let ((jrx, jry), (jsx, jsy)) = geom.contravariant(k, a);
+            fr[a] = [jrx * sxx + jry * sxy, jrx * sxy + jry * syy];
+            fs[a] = [jsx * sxx + jsy * sxy, jsx * sxy + jsy * syy];
+        }
+        for a in 0..nn {
+            let (dr, ds) = (
+                &ops.dr_row_major[a * nn..(a + 1) * nn],
+                &ops.ds_row_major[a * nn..(a + 1) * nn],
+            );
+            let mut d = [0.0; 2];
+            for b in 0..nn {
+                for (row, d) in d.iter_mut().enumerate() {
+                    *d += dr[b] * fr[b][row] + ds[b] * fs[b][row];
+                }
+            }
+            let j_inv = geom.jacobian_inv(k, a);
+            out[base + a] = [d[0] * j_inv, d[1] * j_inv];
+        }
+        let element = ElementIndex::new(k);
+        for face in 0..4 {
+            let Some(neighbour) = mesh.neighbor(element, face) else {
+                continue;
+            };
+            let lift = &ops.lift_row_major[face];
+            for fi in 0..nfn {
+                let inside = stress[base + ops.face_nodes[face][fi]];
+                let q = neighbour.element * nn + ops.face_nodes[neighbour.face][nfn - 1 - fi];
+                let outside = stress[q];
+                let (nx, ny) = geom.normal(k, face, fi);
+                let half: [f64; 3] = std::array::from_fn(|c| 0.5 * (outside[c] - inside[c]));
+                let jump = [half[0] * nx + half[1] * ny, half[1] * nx + half[2] * ny];
+                let sj = geom.surface_jacobian(k, face, fi);
+                for b in 0..nn {
+                    let l = lift[b * nfn + fi];
+                    if l != 0.0 {
+                        let w = l * sj * geom.jacobian_inv(k, b);
+                        out[base + b][0] += w * jump[0];
+                        out[base + b][1] += w * jump[1];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Bottom friction of a current enhanced by waves (see the module docs):
 /// `inner`'s damping rate times `1 + 1.2 (τ_w/(τ_c + τ_w))^3.2`.
 #[derive(Clone, Debug)]
@@ -228,8 +290,6 @@ impl<F: BottomFriction2D> BottomFriction2D for WaveCurrentFriction2D<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::Mesh2D;
-    use crate::types::ElementIndex;
 
     /// A radiation stress quadratic in x and y (exact at P2 on any
     /// parallelogram) gives its exact divergence at every node, and the force
@@ -266,7 +326,8 @@ mod tests {
             })
             .collect();
         let stress: Vec<[f64; 3]> = xy.iter().map(|p| stress_at(p[0], p[1])).collect();
-        let force = WaveForce2D::from_radiation_stress(&ops, &geom, &stress, g).with_ramp(100.0);
+        let force =
+            WaveForce2D::from_radiation_stress(&mesh, &ops, &geom, &stress, g).with_ramp(100.0);
         for (p, f) in force.force().iter().enumerate() {
             let e = exact(xy[p][0], xy[p][1]);
             assert!(
@@ -300,6 +361,100 @@ mod tests {
             assert!((hu[i] - 0.5 * f[0]).abs() < 1e-15 && (hv[i] - 0.5 * f[1]).abs() < 1e-15);
         }
         assert!(h.iter().all(|&x| x == 0.0));
+    }
+
+    /// The force is in flux form: for a stress that jumps between every pair
+    /// of elements, its total `Σ w J F` is `−g ∮ S·n` over the boundary to
+    /// round-off, on a sheared mesh with walls and on a periodic one (no
+    /// boundary: no net force). Dropping the face terms (the element-local
+    /// derivative) leaves a net force of the order of the jumps.
+    #[test]
+    fn the_force_conserves_momentum_across_jumps() {
+        let g = 9.81;
+        let ops = DGOperators2D::new(3);
+        let mut sheared = Mesh2D::uniform_rectangle(0.0, 300.0, 0.0, 200.0, 4, 3);
+        for v in sheared.vertices.iter_mut() {
+            v[0] += 0.3 * v[1] + 1e-4 * v[1] * v[1];
+        }
+        let periodic = Mesh2D::uniform_periodic(0.0, 300.0, 0.0, 200.0, 4, 3);
+        for mesh in [sheared, periodic] {
+            let geom = GeometricFactors2D::compute(&mesh, &ops);
+            let nn = ops.n_nodes;
+            // Smooth within elements, discontinuous across them
+            let stress: Vec<[f64; 3]> = (0..mesh.n_elements * nn)
+                .map(|p| {
+                    let (k, i) = (p / nn, p % nn);
+                    let [x, y] = mesh.reference_to_physical(
+                        ElementIndex::new(k),
+                        ops.nodes_r[i],
+                        ops.nodes_s[i],
+                    );
+                    let e = k as f64;
+                    [
+                        0.3 + 0.05 * (e * 1.7).sin() + 1e-3 * x,
+                        0.1 * (e * 0.9).cos() + 2e-4 * y,
+                        0.2 + 0.04 * (e * 2.3).sin() + 1e-6 * x * y,
+                    ]
+                })
+                .collect();
+            let force = WaveForce2D::from_radiation_stress(&mesh, &ops, &geom, &stress, g);
+            let (mut total, mut size) = ([0.0; 2], 0.0);
+            for k in 0..mesh.n_elements {
+                for a in 0..nn {
+                    let w = ops.weights[a] * geom.jacobian(k, a);
+                    let f = force.force()[k * nn + a];
+                    total[0] += w * f[0];
+                    total[1] += w * f[1];
+                    size += w * (f[0].abs() + f[1].abs());
+                }
+            }
+            let mut flux = [0.0; 2];
+            for k in 0..mesh.n_elements {
+                for face in 0..4 {
+                    if mesh.neighbor(ElementIndex::new(k), face).is_some() {
+                        continue;
+                    }
+                    for fi in 0..ops.n_face_nodes {
+                        let [sxx, sxy, syy] = stress[k * nn + ops.face_nodes[face][fi]];
+                        let (nx, ny) = geom.normal(k, face, fi);
+                        let w = ops.weights_1d[fi] * geom.surface_jacobian(k, face, fi);
+                        flux[0] -= g * w * (sxx * nx + sxy * ny);
+                        flux[1] -= g * w * (sxy * nx + syy * ny);
+                    }
+                }
+            }
+            // Against the element-local derivative alone
+            let mut local = [0.0; 2];
+            let mut gradient = vec![[0.0; 2]; stress.len()];
+            for (c, rows) in [(0, [0, 1]), (1, [1, 2])] {
+                for (d, &row) in rows.iter().enumerate() {
+                    let field: Vec<f64> = stress.iter().map(|s| s[row]).collect();
+                    crate::waves::model::nodal_gradient(&ops, &geom, &field, &mut gradient);
+                    for k in 0..mesh.n_elements {
+                        for a in 0..nn {
+                            local[c] -=
+                                g * ops.weights[a] * geom.jacobian(k, a) * gradient[k * nn + a][d];
+                        }
+                    }
+                }
+            }
+            // Round-off of the sum of the force over the domain
+            let scale = size;
+            for c in 0..2 {
+                assert!(
+                    (total[c] - flux[c]).abs() < 1e-12 * scale,
+                    "component {c}: {} against the boundary flux {}",
+                    total[c],
+                    flux[c]
+                );
+                assert!(
+                    (local[c] - flux[c]).abs() > 1e-3 * scale,
+                    "the element-local force conserves too ({} against {})",
+                    local[c],
+                    flux[c]
+                );
+            }
+        }
     }
 
     /// Soulsby's enhancement: none without waves, 1 + 1.2·2^(−3.2) when the
