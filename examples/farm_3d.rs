@@ -34,6 +34,12 @@
 //! Faeces and feed settle on the bed; the report gives the larvae's depths,
 //! spread and swimming, and where the rest landed.
 //!
+//! `stokes=H_s,T_p,direction` (m, s, degrees counter-clockwise from along the
+//! channel; default off) adds the Stokes drift of a uniform sea to the
+//! particles (`WithStokesDrift3D`, TODO F.4): a JONSWAP spectrum (γ = 3.3,
+//! cos⁴ spreading) on the farm's mesh, each particle drifting at its own depth.
+//! The circulation does not feel the waves.
+//!
 //! `wind` (Pa, default 0) blows along the channel: through the columns'
 //! surface stress in 3D, as a body force `τ/ρ₀` in 2D. `waves` (m, default
 //! off) adds breaking waves to GLS (`GlsMixing::with_wave_breaking`, Craig &
@@ -55,7 +61,7 @@
 //! cargo run --release --no-default-features --features parallel,simd \
 //!     --example farm_3d -- [hours=3] [order=2] [levels=16] [dx=60] [nu=1] [cs=0.2] \
 //!     [particles=0] [release=2] [particle_seconds=60] [kh=0.1] \
-//!     [lice=ladim] [start=2025-06-15T00:00:00Z] [wind=0] [waves=0] [closure=k-epsilon] \
+//!     [lice=ladim] [start=2025-06-15T00:00:00Z] [stokes=H_s,T_p,direction] //!     [wind=0] [waves=0] [closure=k-epsilon] \
 //!     [limiter=none] [tvadv=limited-akima] [runs=all] \
 //!     [snapshot=<file.dgsnap>] [snapshot_minutes=10]
 //! ```
@@ -80,7 +86,7 @@ use dg_rs::mesh::{Mesh2D, PointLocator2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::particles::{
     ClearSkyLight, Particle3D, ParticleStatus, ParticleTracker3D, ParticleVelocity3D, SalmonLice,
-    Solution3DVelocity,
+    Solution3DVelocity, StokesDrift, WithStokesDrift3D,
 };
 use dg_rs::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use dg_rs::physics::{
@@ -100,6 +106,7 @@ use dg_rs::source::{
 use dg_rs::time::{ModeSplitIntegrator, ModelClock, SSPRK3};
 use dg_rs::types::ElementIndex;
 use dg_rs::vertical::{SigmaGrid, UniformStretching};
+use dg_rs::waves::{SpectralGrid, StokesDriftField, WaveModel2D};
 
 const G: f64 = 9.81;
 const RHO0: f64 = 1025.0;
@@ -207,6 +214,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "open" => true,
         other => return Err(format!("runs={other}: all or open").into()),
     };
+    let sea: Option<[f64; 3]> = match args.get("stokes") {
+        Some(v) => {
+            let parts: Vec<f64> = v.split(',').map(str::parse).collect::<Result<_, _>>()?;
+            let [hs, tp, direction] = parts[..] else {
+                return Err(format!("stokes={v}: H_s,T_p,direction").into());
+            };
+            Some([hs, tp, direction])
+        }
+        None => None,
+    };
     let wind: f64 = get("wind", 0.0)?;
     let waves: f64 = get("waves", 0.0)?;
     // `none`: no diffusivity of the tracers (a constant viscosity), so that
@@ -236,6 +253,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
     let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -DEPTH));
     let sigma = Arc::new(SigmaGrid::new(n_levels, UniformStretching));
+    // The Stokes drift of a uniform sea over the farm, for the particles
+    let stokes = sea.map(|[hs, tp, direction]| {
+        let model = WaveModel2D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            &bathymetry,
+            SpectralGrid::new(0.04, 1.0, 30, 24),
+            G,
+        );
+        let e = model.grid.jonswap(hs, tp, 3.3, direction.to_radians(), 4.0);
+        println!(
+            "Sea: H_s {hs} m, T_p {tp} s towards {direction}°; Stokes drift for the particles"
+        );
+        StokesDriftField::new(&model, &model.uniform_state(&e))
+    });
     let cages: Vec<NetCage> = CAGES
         .iter()
         .map(|&c| NetCage::circular(c, RADIUS, NET_DEPTH, 0.25))
@@ -352,8 +385,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let reference_0 = energy.compute(&state, &sigma).reference;
         let label = if with_cages { "3D cages" } else { "3D open" };
         let start = Instant::now();
-        let mut tracking = (with_cages && particles_per_kind > 0)
-            .then(|| FarmParticles::new(&mesh, &ops, particles_per_kind, release_time, kh, lice));
+        let mut tracking = (with_cages && particles_per_kind > 0).then(|| {
+            FarmParticles::new(&mesh, &ops, particles_per_kind, release_time, kh, lice)
+                .with_stokes_drift(stokes.as_ref())
+        });
         let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
         // The run with cages to the snapshot file, if asked
         let mut snapshot = match snapshot_path.as_ref().filter(|_| with_cages) {
@@ -689,6 +724,8 @@ struct FarmParticles<'a> {
     release_time: f64,
     /// The larvae's behaviour (`None`: passive)
     lice: Option<SalmonLice<ClearSkyLight>>,
+    /// The waves' Stokes drift, added to the flow
+    stokes: Option<&'a StokesDriftField>,
     /// Particles of each kind once released, with the cage of each
     particles: [Vec<Particle3D>; 3],
     cages: [Vec<usize>; 3],
@@ -715,11 +752,17 @@ impl<'a> FarmParticles<'a> {
             n,
             release_time,
             lice,
+            stokes: None,
             particles: Default::default(),
             cages: Default::default(),
             previous: None,
             seconds: 0.0,
         }
+    }
+
+    fn with_stokes_drift(mut self, stokes: Option<&'a StokesDriftField>) -> Self {
+        self.stokes = stokes;
+        self
     }
 
     fn released(&self) -> usize {
@@ -794,16 +837,28 @@ impl<'a> FarmParticles<'a> {
             let field = Solution3DVelocity::between(*t0, s0, t, state, sigma, bed, 0.05);
             let n = ((t - from) / 10.0).ceil().max(1.0) as usize;
             let dt = (t - from) / n as f64;
-            for s in 0..n {
-                let t = from + s as f64 * dt;
-                for (kind, particles) in self.particles.iter_mut().enumerate() {
-                    match &self.lice {
-                        Some(lice) if kind == LARVAE => {
-                            self.tracker.step_with(particles, &field, lice, t, dt)
-                        }
-                        _ => self.tracker.step(particles, &field, t, dt),
-                    }
+            match self.stokes {
+                Some(stokes) => {
+                    let field = WithStokesDrift3D::new(field, StokesDrift::steady(stokes));
+                    Self::steps(
+                        &self.tracker,
+                        &self.lice,
+                        &mut self.particles,
+                        &field,
+                        from,
+                        n,
+                        dt,
+                    );
                 }
+                None => Self::steps(
+                    &self.tracker,
+                    &self.lice,
+                    &mut self.particles,
+                    &field,
+                    from,
+                    n,
+                    dt,
+                ),
             }
         }
         match &mut self.previous {
@@ -814,6 +869,30 @@ impl<'a> FarmParticles<'a> {
             None => self.previous = Some((t, state.clone())),
         }
         self.seconds += start.elapsed().as_secs_f64();
+    }
+
+    /// `n` steps of `dt` from `from` through `field`, the larvae by their
+    /// behaviour.
+    fn steps(
+        tracker: &ParticleTracker3D,
+        lice: &Option<SalmonLice<ClearSkyLight>>,
+        particles: &mut [Vec<Particle3D>; 3],
+        field: &impl ParticleVelocity3D,
+        from: f64,
+        n: usize,
+        dt: f64,
+    ) {
+        for s in 0..n {
+            let t = from + s as f64 * dt;
+            for (kind, particles) in particles.iter_mut().enumerate() {
+                match lice {
+                    Some(lice) if kind == LARVAE => {
+                        tracker.step_with(particles, field, lice, t, dt)
+                    }
+                    _ => tracker.step(particles, field, t, dt),
+                }
+            }
+        }
     }
 
     /// Per kind: in the water and on the bed; depths, drift and spread of
@@ -856,6 +935,16 @@ impl<'a> FarmParticles<'a> {
                 })
                 .collect();
             println!("  K (m²/s) up-current of the farm: {}", profile.join(", "));
+            if let Some(stokes) = self.stokes {
+                let profile: Vec<String> = [0.0, 1.0, 3.0, 5.0, 10.0, 20.0]
+                    .iter()
+                    .map(|&z| {
+                        let [u, v] = stokes.at(point.element, &w, z);
+                        format!("{z:.0} m {:.1}", 100.0 * u.hypot(v))
+                    })
+                    .collect();
+                println!("  Stokes drift (cm/s): {}", profile.join(", "));
+            }
         }
         // Displacement from the cage, the nearest periodic image along x
         let offset = |p: &Particle3D, c: usize| {

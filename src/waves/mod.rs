@@ -12,6 +12,8 @@
 //! - [`sources`]: wind input, whitecapping, bottom friction, depth-induced breaking,
 //!   and the diagnostic high-frequency tail;
 //! - [`nonlinear`]: four-wave (quadruplet) interactions by the DIA;
+//! - [`stokes`]: [`StokesDriftField`], the Stokes drift of a wave state at any
+//!   point and depth, for the particle trackers;
 //! - [`model`]: [`WaveModel2D`], the geographic DG propagation with refraction and
 //!   current-induced frequency shifting, and the step that combines them.
 //!
@@ -24,6 +26,7 @@ pub mod nonlinear;
 pub mod sources;
 pub mod spectrum;
 pub mod state;
+pub mod stokes;
 
 pub use dispersion::{dsigma_ddepth, group_velocity, group_velocity_ratio, wavenumber};
 pub use model::{DEFAULT_DEPTH_MIN, WaveModel2D, WaveWorkspace};
@@ -31,3 +34,4 @@ pub use nonlinear::{Quadruplets, shallow_water_factor};
 pub use sources::{DEFAULT_LIMITER, DEFAULT_TAIL_POWER, SourceTerms, Wind, breaking_fraction};
 pub use spectrum::{SpectralGrid, WaveParameters, wrap_angle};
 pub use state::WaveSolution;
+pub use stokes::StokesDriftField;
