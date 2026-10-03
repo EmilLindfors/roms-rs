@@ -6,6 +6,10 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The waves' roughness for the 3D turbulence closure (TODO F.4 coupling).** `Hydrostatic3D::with_surface_roughness` / `set_surface_roughness` take a surface roughness per column, and `WaveModel2D::surface_roughness(n, α)` gives `α H_s` (Terray et al.: α ≈ 0.6). GLS uses the largest of its own constant, the column's and Charnock's.
+  - API: `apply_vertical_diffusion` now takes `SurfaceFields { stress, roughness }` in place of the surface-stress field, and `Column` has `surface_roughness`.
+  - Gate: per-column roughnesses give bit-for-bit the columns of closures with those constants. A 1.2 m roughness mixes the top 3× more than 0.3 m.
+
 - **The waves' force on the 2D circulation (`source::WaveForce2D`; TODO F.4 coupling).** The radiation-stress divergence `−g ∇·(S/ρg)` as a momentum source for `SWEPhysics2D`. It is built from a `WaveModel2D` state on the same mesh (`WaveForce2D::new`) or from any nodal stress field (`from_radiation_stress`), with an optional ramp. Dry nodes get no force. New `WaveModel2D::g`.
   - Gates: polynomial exactness of the divergence on a sheared P2 mesh (1e-14). Shoaling swell sets a closed basin down by Longuet-Higgins & Stewart's `η = −E k/sinh 2kh`, to 0.27 % of the 3.3 cm range (`tests/wave_coupling_test.rs`).
 

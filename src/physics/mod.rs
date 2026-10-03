@@ -43,7 +43,7 @@ pub use gls::{GlsMixing, GlsParameters, StabilityFunctions, WaveBreaking};
 pub use hydrostatic_3d::Hydrostatic3D;
 pub use surface_stress::{AnalyticSurfaceStress, SurfaceStress3D};
 pub use traits::{PhysicsConfig, PhysicsModule, PhysicsModuleInfo};
-pub use vertical_diffusion::apply_vertical_diffusion;
+pub use vertical_diffusion::{SurfaceFields, apply_vertical_diffusion};
 pub use vertical_mixing::{
     Column, ConstantMixing, Forcing, PacanowskiPhilanderMixing, Turbulence, VerticalMixing,
 };

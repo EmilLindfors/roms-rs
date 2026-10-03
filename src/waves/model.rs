@@ -663,6 +663,13 @@ impl WaveModel2D {
             .collect()
     }
 
+    /// Surface roughness `alpha · H_s` (m) at every node, for the turbulence
+    /// closure of the circulation (Terray et al. 1996: `alpha ≈ 0.6`; see
+    /// [`crate::physics::Hydrostatic3D::with_surface_roughness`]).
+    pub fn surface_roughness(&self, n: &WaveSolution, alpha: f64) -> Vec<f64> {
+        self.parameters(n).iter().map(|p| alpha * p.hs).collect()
+    }
+
     /// Radiation stress per ρg `[S_xx, S_xy, S_yy]` (m²) at every node.
     pub fn radiation_stress(&self, n: &WaveSolution) -> Vec<[f64; 3]> {
         let (np, nf) = (self.n_points(), self.grid.n_freq());

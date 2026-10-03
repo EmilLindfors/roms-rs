@@ -21,6 +21,10 @@ pub struct Column<'a> {
     /// of the bottom stress (prescribed plus drag) on this column.
     pub surface_friction_velocity: f64,
     pub bottom_friction_velocity: f64,
+    /// The surface roughness of this column (m), e.g. `≈ 0.6 H_s` from the
+    /// waves; closures with a roughness take the larger of it and their own,
+    /// `None` for their own alone.
+    pub surface_roughness: Option<f64>,
 }
 
 /// Prognostic turbulence of one column at its w-points (bottom to surface,
@@ -295,6 +299,7 @@ mod tests {
             rho0: 1025.0,
             surface_friction_velocity: 0.0,
             bottom_friction_velocity: 0.0,
+            surface_roughness: None,
         };
 
         let forcing = Forcing {
@@ -344,6 +349,7 @@ mod tests {
             rho0: 1025.0,
             surface_friction_velocity: 0.0,
             bottom_friction_velocity: 0.0,
+            surface_roughness: None,
         };
 
         let forcing = Forcing {
@@ -387,6 +393,7 @@ mod tests {
             rho0: 1025.0,
             surface_friction_velocity: 0.0,
             bottom_friction_velocity: 0.0,
+            surface_roughness: None,
         };
 
         let forcing = Forcing {
@@ -441,6 +448,7 @@ mod tests {
             rho0: 1025.0,
             surface_friction_velocity: 0.0,
             bottom_friction_velocity: 0.0,
+            surface_roughness: None,
         };
 
         let forcing = Forcing {
