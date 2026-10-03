@@ -95,13 +95,13 @@
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
-//!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=]
+//!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
 //! instead of the tidal run (`wave_grid=frequencies,directions`, refraction
-//! capped at `turning=` rad/s): the step, what sets it, and the cost per model
-//! hour.
+//! capped at `turning=` rad/s, or stepped implicitly with `implicit=1`): the
+//! step, what sets it, and the cost per model hour.
 //!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
 //! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
@@ -338,6 +338,8 @@ struct Options {
     waves: usize,
     wave_grid: [usize; 2],
     turning: Option<f64>,
+    /// Step refraction implicitly (`implicit=1`)
+    implicit_refraction: bool,
     output: Option<PathBuf>,
 }
 
@@ -399,6 +401,7 @@ impl Options {
                 .get("turning")
                 .map(|v| v.parse().map_err(|_| format!("bad turning={v}")))
                 .transpose()?,
+            implicit_refraction: get("implicit", 0.0)? != 0.0,
             lts: get("lts", 0.0)? as usize,
             cfl: get("cfl", f64::NAN)?,
             integrator: match args.get("rk").map_or("43", String::as_str) {
@@ -1677,7 +1680,8 @@ fn wave_cost(domain: &Domain, opts: &Options) {
         direction: 0.0,
     })
     .with_boundary_spectrum(&sea)
-    .with_turning_limit(opts.turning);
+    .with_turning_limit(opts.turning)
+    .with_implicit_refraction(opts.implicit_refraction);
     let np = model.n_points();
     println!(
         "\nSpectral wave model: {} elements, {np} nodes (P{}), {nf} frequencies (0.04–0.5 Hz) × \
