@@ -558,12 +558,15 @@ impl GlsMixing {
         Some((decay, slope))
     }
 
-    /// Surface roughness at the surface friction velocity `u_star`.
+    /// Surface roughness at the surface friction velocity `u_star`, with the
+    /// column's own (from the waves), if any: the largest of the constant
+    /// roughness, the column's and Charnock's.
     #[inline]
-    fn surface_roughness(&self, u_star: f64, g: f64) -> f64 {
+    fn surface_roughness(&self, u_star: f64, g: f64, column: Option<f64>) -> f64 {
+        let z0 = column.map_or(self.z0_surface, |z0| z0.max(self.z0_surface));
         match self.charnock {
-            Some(alpha) => (alpha * u_star * u_star / g).max(self.z0_surface),
-            None => self.z0_surface,
+            Some(alpha) => (alpha * u_star * u_star / g).max(z0),
+            None => z0,
         }
     }
 
@@ -891,7 +894,7 @@ impl VerticalMixing for GlsMixing {
         } = self.params;
         let cm0 = self.stability.cm0;
         let u_surface = column.surface_friction_velocity;
-        let z0_surface = self.surface_roughness(u_surface, column.g);
+        let z0_surface = self.surface_roughness(u_surface, column.g, column.surface_roughness);
 
         for l in 0..nl {
             f.h[l] = column.z_w[l + 1] - column.z_w[l];
@@ -1101,6 +1104,7 @@ mod tests {
                     rho0: RHO0,
                     surface_friction_velocity: self.u_star,
                     bottom_friction_velocity: 0.0,
+                    surface_roughness: None,
                 },
                 &Forcing {
                     surface_stress: [0.0; 2],
@@ -1342,11 +1346,11 @@ mod tests {
     #[test]
     fn charnock_roughness_has_the_constant_roughness_as_its_minimum() {
         let gls = GlsMixing::k_epsilon().with_charnock_roughness(GlsMixing::DEFAULT_CHARNOCK);
-        let z0 = |u_star: f64| gls.surface_roughness(u_star, G);
+        let z0 = |u_star: f64| gls.surface_roughness(u_star, G, None);
         assert!((z0(0.02) - 1400.0 * 4e-4 / G).abs() < 1e-15);
         assert_eq!(z0(0.002), GlsMixing::DEFAULT_ROUGHNESS);
         assert_eq!(
-            GlsMixing::k_epsilon().surface_roughness(0.02, G),
+            GlsMixing::k_epsilon().surface_roughness(0.02, G, None),
             GlsMixing::DEFAULT_ROUGHNESS
         );
     }

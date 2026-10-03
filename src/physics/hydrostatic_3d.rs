@@ -69,7 +69,7 @@ use crate::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use crate::physics::eos::EquationOfState;
 use crate::physics::surface_stress::SurfaceStress3D;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
-use crate::physics::vertical_diffusion::apply_vertical_diffusion;
+use crate::physics::vertical_diffusion::{SurfaceFields, apply_vertical_diffusion};
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
 use crate::solver::core::blocks::{for_each_block, reduce_blocks};
@@ -112,6 +112,10 @@ where
     /// A surface stress field added to `forcing.surface_stress` column by
     /// column, if any (see [`Self::with_surface_stress`]).
     pub surface_stress: Option<Arc<dyn SurfaceStress3D>>,
+    /// The surface roughness `z₀ₛ` (m) of every column (`[element][node]`),
+    /// e.g. from the waves' height, for the closure (see
+    /// [`Self::with_surface_roughness`]).
+    pub surface_roughness: Option<Vec<f64>>,
     pub g: f64,
     pub rho0: f64,
     /// Temperature of water flowing in through a physical boundary (walls
@@ -217,6 +221,7 @@ where
             swe_physics,
             forcing,
             surface_stress: None,
+            surface_roughness: None,
             g,
             rho0,
             temp_bc: Arc::new(ExtrapolationTracerBC3D),
@@ -431,6 +436,32 @@ where
     pub fn with_surface_stress(mut self, stress: impl SurfaceStress3D + 'static) -> Self {
         self.surface_stress = Some(Arc::new(stress));
         self
+    }
+
+    /// A surface roughness `z₀ₛ` (m) per column (`[element][node]`), for a
+    /// closure with one (GLS: the larger of it and its own, then Charnock's).
+    /// From waves, Terray et al.'s (1996) `z₀ₛ ≈ 0.6 H_s` (ROMS `ZOS_HSIG`):
+    /// [`crate::waves::WaveModel2D::surface_roughness`].
+    pub fn with_surface_roughness(mut self, z0: Vec<f64>) -> Self {
+        self.set_surface_roughness(Some(z0));
+        self
+    }
+
+    /// Replace the per-column surface roughness (none: the closure's own), as
+    /// a coupling to a wave model does every coupling interval.
+    pub fn set_surface_roughness(&mut self, z0: Option<Vec<f64>>) {
+        if let Some(z0) = &z0 {
+            assert_eq!(
+                z0.len(),
+                self.bathymetry.data.len(),
+                "one roughness per column"
+            );
+            assert!(
+                z0.iter().all(|&z| z >= 0.0),
+                "roughness must be non-negative"
+            );
+        }
+        self.surface_roughness = z0;
     }
 
     /// Call `f` with the field of [`Self::with_surface_stress`] at time `t`
@@ -1351,7 +1382,10 @@ where
                 dt,
                 &self.mixing,
                 &self.forcing,
-                field,
+                SurfaceFields {
+                    stress: field,
+                    roughness: self.surface_roughness.as_deref(),
+                },
                 self.g,
                 self.rho0,
                 self.min_column_depth,

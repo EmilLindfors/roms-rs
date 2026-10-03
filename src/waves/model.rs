@@ -198,6 +198,11 @@ impl WaveModel2D {
         self
     }
 
+    /// Gravitational acceleration (m/s²).
+    pub fn g(&self) -> f64 {
+        self.g
+    }
+
     pub fn n_points(&self) -> usize {
         self.depth.len()
     }
@@ -658,6 +663,13 @@ impl WaveModel2D {
             .collect()
     }
 
+    /// Surface roughness `alpha · H_s` (m) at every node, for the turbulence
+    /// closure of the circulation (Terray et al. 1996: `alpha ≈ 0.6`; see
+    /// [`crate::physics::Hydrostatic3D::with_surface_roughness`]).
+    pub fn surface_roughness(&self, n: &WaveSolution, alpha: f64) -> Vec<f64> {
+        self.parameters(n).iter().map(|p| alpha * p.hs).collect()
+    }
+
     /// Radiation stress per ρg `[S_xx, S_xy, S_yy]` (m²) at every node.
     pub fn radiation_stress(&self, n: &WaveSolution) -> Vec<[f64; 3]> {
         let (np, nf) = (self.n_points(), self.grid.n_freq());
@@ -716,7 +728,12 @@ fn face_flux(
 }
 
 /// Physical gradient of the nodal field `f` by each element's derivative matrices.
-fn nodal_gradient(ops: &DGOperators2D, geom: &GeometricFactors2D, f: &[f64], out: &mut [[f64; 2]]) {
+pub(crate) fn nodal_gradient(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    f: &[f64],
+    out: &mut [[f64; 2]],
+) {
     let nn = ops.n_nodes;
     for k in 0..f.len() / nn {
         let fk = &f[k * nn..(k + 1) * nn];
