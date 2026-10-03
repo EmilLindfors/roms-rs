@@ -380,7 +380,7 @@ P0.7 fixed Ω and momentum. The tracer kernel still sets `u_ext = u_int` at phys
 
 ### 4.1 [BLOCKER] Geometry: coastline-fitted meshes cannot be loaded
 
-*Status (2026-09-26): the per-node isoparametric metrics are done for the 2D kernels (TODO P1.3; general straight-sided quadrilaterals, verified free-stream preserving, well-balanced and conservative). All-quad Gmsh MSH 4.1/2.2 meshes load, validated (same date). Triangles, CSR and the 3D kernels remain.*
+*Status (2026-09-26): the per-node isoparametric metrics are done for the 2D kernels (TODO P1.3; general straight-sided quadrilaterals, verified free-stream preserving, well-balanced and conservative). All-quad Gmsh MSH 4.1/2.2 meshes load, validated (same date). The 3D kernels followed on 2026-10-03 (`tests/curvilinear_3d_test.rs`). Triangles and CSR remain.*
 
 - `geometric.rs:82,160-186` still panics on any non-parallelogram quad, and the Jacobian is one constant per element.
 - There is no triangle type, and 4 faces are hardcoded in the RHS (`swe_2d.rs:386,908`).

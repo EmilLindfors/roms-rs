@@ -369,7 +369,6 @@ pub fn apply_tracer_limiters_3d(
         state.n_elements,
         state.n_nodes,
         state.n_levels,
-        ops,
         geom,
         bathymetry,
         sigma,
@@ -385,7 +384,6 @@ pub fn apply_tracer_limiters_3d(
         state.n_elements,
         state.n_nodes,
         state.n_levels,
-        ops,
         geom,
         bathymetry,
         sigma,
@@ -403,7 +401,6 @@ pub fn apply_tracer_limiters_3d(
             state.n_elements,
             state.n_nodes,
             state.n_levels,
-            ops,
             geom,
             bathymetry,
             sigma,
@@ -419,7 +416,6 @@ pub fn apply_tracer_limiters_3d(
             state.n_elements,
             state.n_nodes,
             state.n_levels,
-            ops,
             geom,
             bathymetry,
             sigma,
@@ -441,7 +437,6 @@ fn apply_horizontal_bounds_field(
     n_elements: usize,
     n_nodes: usize,
     n_levels: usize,
-    ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     bathymetry: &Bathymetry2D,
     sigma: &SigmaGrid,
@@ -461,16 +456,16 @@ fn apply_horizontal_bounds_field(
         |_, k, [field]| {
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
-            let jac = geom.affine_metric(k).det_j;
             for (level, &ds) in d_sigma.iter().enumerate().take(n_levels) {
                 let mut weight_sum = 0.0;
                 let mut inventory = 0.0;
                 let mut min_value = f64::INFINITY;
                 let mut max_value = f64::NEG_INFINITY;
 
-                for (i, &w) in ops.weights.iter().enumerate().take(n_nodes) {
+                for i in 0..n_nodes {
                     let value = field[index(i, level)];
-                    let weight = w * jac * layer_thickness(eta, bathymetry, element, i, ds);
+                    let weight =
+                        geom.node_mass(k, i) * layer_thickness(eta, bathymetry, element, i, ds);
                     weight_sum += weight;
                     inventory += weight * value;
                     min_value = min_value.min(value);
@@ -529,7 +524,6 @@ fn apply_vertical_column_bounds_field(
     n_elements: usize,
     n_nodes: usize,
     n_levels: usize,
-    ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     bathymetry: &Bathymetry2D,
     sigma: &SigmaGrid,
@@ -550,7 +544,7 @@ fn apply_vertical_column_bounds_field(
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
             for i in 0..n_nodes {
-                let horizontal_weight = ops.weights[i] * geom.affine_metric(k).det_j;
+                let horizontal_weight = geom.node_mass(k, i);
                 let mut weight_sum = 0.0;
                 let mut inventory = 0.0;
                 let mut min_value = f64::INFINITY;
@@ -673,13 +667,12 @@ impl LayerColumns<'_> {
             || (),
             |_, k, [means]| {
                 let element = ElementIndex::new(k);
-                let jac = self.geom.affine_metric(k).det_j;
                 for (level, &ds) in d_sigma.iter().enumerate().take(self.n_levels) {
                     let mut weight_sum = 0.0;
                     let mut inventory = 0.0;
-                    for (i, &w) in self.ops.weights.iter().enumerate().take(self.n_nodes) {
-                        let weight =
-                            w * jac * layer_thickness(self.eta, self.bathymetry, element, i, ds);
+                    for i in 0..self.n_nodes {
+                        let weight = self.geom.node_mass(k, i)
+                            * layer_thickness(self.eta, self.bathymetry, element, i, ds);
                         weight_sum += weight;
                         inventory += weight * value(k, i, level);
                     }
@@ -871,7 +864,6 @@ fn apply_horizontal_kuzmin_field(
             let mut stats = TracerLimiter3DStats::default();
             let element = ElementIndex::new(k);
             let vertices = mesh.element_vertex_indices(element);
-            let jac = columns.geom.affine_metric(k).det_j;
             // The union of the element's vertex patches
             patches.clear();
             for &vertex in &vertices {
@@ -902,15 +894,15 @@ fn apply_horizontal_kuzmin_field(
                 // which its patch's contain (the element is in every patch):
                 // then nothing is limited, and the patches need not be read
                 let mut within_own = true;
-                for (i, &w) in columns.ops.weights.iter().enumerate().take(n_nodes) {
+                for i in 0..n_nodes {
                     let z = columns.centre_height(element, i, level);
                     let Some((own, lower, upper)) = column_at(k, z, level) else {
                         break;
                     };
                     let node_reference = reference_at(k, i, level);
                     let node_value = field[index(i, level)] - node_reference;
-                    let node_weight =
-                        w * jac * layer_thickness(columns.eta, columns.bathymetry, element, i, ds);
+                    let node_weight = columns.geom.node_mass(k, i)
+                        * layer_thickness(columns.eta, columns.bathymetry, element, i, ds);
                     let node_scale = field[index(i, level)].abs().max(node_reference.abs());
                     let (lo, hi) = relaxed_bounds(
                         own.min(lower).min(upper),
@@ -1189,7 +1181,6 @@ mod tests {
     fn total_inventory(
         field: &[f64],
         state: &Solution3D,
-        ops: &DGOperators2D,
         geom: &GeometricFactors2D,
         bathymetry: &Bathymetry2D,
         sigma: &SigmaGrid,
@@ -1199,8 +1190,7 @@ mod tests {
             let element = ElementIndex::new(k);
             for i in 0..state.n_nodes {
                 for (level, &ds) in sigma.d_sigma().iter().enumerate() {
-                    let weight = ops.weights[i]
-                        * geom.affine_metric(k).det_j
+                    let weight = geom.node_mass(k, i)
                         * layer_thickness(&state.eta, bathymetry, element, i, ds);
                     total += weight * field[index(k, i, level, state.n_nodes, state.n_levels)];
                 }
@@ -1218,13 +1208,13 @@ mod tests {
         state.temp[low] = -5.0;
         state.temp[high] = 15.0;
 
-        let before = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let before = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         let config = TracerLimiter3DConfig::bounds(TracerBounds::new(0.0, 10.0, 0.0, 40.0));
 
         let stats =
             apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
 
-        let after = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert!(stats.limited_temperature_cells > 0);
         assert!(
             (before - after).abs() < 1e-10,
@@ -1242,13 +1232,13 @@ mod tests {
     fn preserve_conservation_policy_keeps_out_of_bounds_average_inventory() {
         let (mesh, ops, geom, bathymetry, sigma, mut state) = setup(1, 1, 1, 1);
         state.temp.fill(-3.0);
-        let before = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let before = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         let config = TracerLimiter3DConfig::bounds(TracerBounds::new(0.0, 10.0, 0.0, 40.0));
 
         let stats =
             apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
 
-        let after = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert_eq!(stats.temperature_average_violations, 1);
         assert!((before - after).abs() < 1e-12);
         assert!(state.temp.iter().all(|&value| (value + 3.0).abs() < 1e-12));
@@ -1288,14 +1278,14 @@ mod tests {
             state.temp[index(0, i, 0, n_nodes, 1)] = value;
             state.temp[index(1, i, 0, n_nodes, 1)] = 3.0;
         }
-        let before = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let before = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         let config = TracerLimiter3DConfig::horizontal_kuzmin(
             TracerBounds::new(-100.0, 100.0, 0.0, 40.0),
             1.0,
         );
         let stats =
             apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
-        let after = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert!(stats.limited_temperature_cells > 0);
         for &value in &state.temp[..n_nodes] {
             assert!(
@@ -1367,7 +1357,7 @@ mod tests {
         state.temp[high] = 6.0;
         state.temp[low] = -4.0;
 
-        let before = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let before = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         let config = TracerLimiter3DConfig::horizontal_kuzmin(
             TracerBounds::new(-100.0, 100.0, 0.0, 40.0),
             1.0,
@@ -1376,7 +1366,7 @@ mod tests {
         let stats =
             apply_tracer_limiters_3d(&mut state, &mesh, &ops, &geom, &bathymetry, &sigma, &config);
 
-        let after = total_inventory(&state.temp, &state, &ops, &geom, &bathymetry, &sigma);
+        let after = total_inventory(&state.temp, &state, &geom, &bathymetry, &sigma);
         assert!(stats.limited_temperature_cells > 0);
         assert!(
             state.temp[high] < 6.0,

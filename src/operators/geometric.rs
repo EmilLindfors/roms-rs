@@ -335,9 +335,9 @@ impl GeometricFactors2D {
     }
 
     /// The constant metric of element `k`, for kernels that still assume
-    /// parallelogram elements (the 3D horizontal kernels, the batched SIMD and
-    /// Burn prototypes). Their callers must check [`Self::is_affine`] (see
-    /// [`Self::assert_affine`]); on other elements it is the value at node 0.
+    /// parallelogram elements (the batched SIMD and Burn prototypes). Their
+    /// callers must check [`Self::is_affine`] (see [`Self::assert_affine`]);
+    /// on other elements it is the value at node 0.
     #[inline]
     pub fn affine_metric(&self, k: usize) -> AffineMetric {
         debug_assert!(
@@ -360,8 +360,8 @@ impl GeometricFactors2D {
         assert!(
             self.affine,
             "{component} assumes parallelogram (affine) elements, but the mesh has general \
-             quadrilaterals; only the 2D SWE, tracer, advection and diffusion kernels support \
-             them so far (TODO P1.3)"
+             quadrilaterals; the 2D and 3D model kernels support them, the batched SIMD and \
+             Burn prototypes not yet (TODO P1.3)"
         );
     }
 }

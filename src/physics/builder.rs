@@ -586,6 +586,10 @@ where
             state, &self.mesh, &self.ops, &self.geom, &config, time, out, face_mass,
         );
     }
+
+    fn metric_form(&self) -> crate::solver::rhs::MetricForm {
+        crate::solver::rhs::MetricForm::of(self.formulation)
+    }
 }
 
 // =============================================================================

@@ -75,7 +75,7 @@ use crate::solver::SWESolution2D;
 use crate::solver::core::blocks::{for_each_block, reduce_blocks};
 use crate::solver::rhs::{
     BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
-    HorizontalViscosity3D, LayerTransport, MomentumAdvectionForm, PressureGradientForm,
+    HorizontalViscosity3D, LayerTransport, MetricForm, MomentumAdvectionForm, PressureGradientForm,
     Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
     apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
     apply_tracer_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
@@ -204,9 +204,10 @@ where
         g: f64,
         rho0: f64,
     ) -> Self {
-        geom.assert_affine("Hydrostatic3D (the 3D horizontal kernels)");
-        let transport_scratch =
-            Mutex::new(LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels()));
+        let transport_scratch = Mutex::new(
+            LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels())
+                .with_metric(MetricForm::of(swe_physics.formulation)),
+        );
         // The 3D walls are the 2D boundary condition's
         let boundaries = Boundaries3D::matching(&mesh, &swe_physics.bc);
         Self {
@@ -366,7 +367,15 @@ where
             self.rho0,
             self.rho0,
             self.min_column_depth,
+            self.metric_form(),
         )));
+    }
+
+    /// The volume form of the 3D horizontal divergences: the 2D module's
+    /// mass equation's, so that the layers carry exactly the barotropic
+    /// pass's water on general quadrilaterals too ([`MetricForm`]).
+    pub fn metric_form(&self) -> MetricForm {
+        MetricForm::of(self.swe_physics.formulation)
     }
 
     /// Advection of the turbulence `k`, `ψ` of a prognostic closure
@@ -731,6 +740,7 @@ where
                 PressureGradientForm::SigmaPairs => self.balanced_reference.as_deref(),
                 PressureGradientForm::ConstantDepth => None,
             },
+            metric: self.metric_form(),
         }
     }
 
@@ -802,6 +812,7 @@ where
         // Thin columns at rest change no layer transport: theirs are uniform
         // in σ, which the correction to the barotropic transport replaces
         self.with_thin_columns_at_rest(state, |state| {
+            transport.metric = self.metric_form();
             transport.compute(
                 state,
                 Some(barotropic),
@@ -870,7 +881,8 @@ where
             .expect("Failed to lock w_transport_scratch");
         let TurbulenceScratch { w_cells, advected } =
             guard.get_or_insert_with(|| TurbulenceScratch {
-                w_cells: LayerTransport::new(self.mesh.n_elements, &self.ops, state.n_levels + 1),
+                w_cells: LayerTransport::new(self.mesh.n_elements, &self.ops, state.n_levels + 1)
+                    .with_metric(self.metric_form()),
                 advected: vec![0.0; state.tke.len()],
             });
         w_cells.stagger_from(transport);
@@ -964,8 +976,10 @@ where
     ///
     /// The explicit 3D terms bound it:
     /// - horizontal advection and internal waves, `cfl·h/(|u| + c₁)/(N+1)²`
-    ///   per element (`h = √J`), with `|u|` the largest layer speed and `c₁`
-    ///   the first-mode internal-wave speed of each column in the WKB
+    ///   at every node, with `h = 2/(|∇r| + |∇s|)` from the node's metric
+    ///   (`√J`, half the side, on a square; the narrow side's scale on an
+    ///   elongated element, as in the 2D step), `|u|` the largest layer speed
+    ///   of the column and `c₁` its first-mode internal-wave speed in the WKB
     ///   estimate `c₁ = (1/π) ∫ N dz` (exact `NH/π` for a constant `N`),
     ///   `N² = −(g/ρ₀) ∂ρ/∂z` between the layer centres, unstable parts
     ///   counted as zero, and at least [`Self::MIN_INTERNAL_WAVE_SPEED`];
@@ -986,9 +1000,8 @@ where
             [],
             || (),
             |_, k, []| {
-                // √J: half the side of a square element
-                let h_len = 1.0 / self.geom.affine_metric(k).det_j_inv.sqrt();
-                let (mut wave_speed, mut vertical_rate) = (0.0_f64, 0.0_f64);
+                // Largest (|u| + c₁)/h over the nodes, and |Ω|/H_z
+                let (mut wave_rate, mut vertical_rate) = (0.0_f64, 0.0_f64);
                 for i in 0..nn {
                     let idx = k * nn + i;
                     // Thin films are the 2D module's (and its own CFL's) business
@@ -1016,11 +1029,14 @@ where
                         integral += n2_dz2.max(0.0).sqrt();
                     }
                     let c1 = (integral / std::f64::consts::PI).max(Self::MIN_INTERNAL_WAVE_SPEED);
-                    wave_speed = wave_speed.max(speed + c1);
+                    // 1/h = (|∇r| + |∇s|)/2: 1/√J on a square
+                    let ((rx, ry), (sx, sy)) = (self.geom.grad_r(k, i), self.geom.grad_s(k, i));
+                    let inverse_length = 0.5 * (rx.hypot(ry) + sx.hypot(sy));
+                    wave_rate = wave_rate.max((speed + c1) * inverse_length);
                 }
                 let mut dt = f64::INFINITY;
-                if wave_speed > 1e-12 {
-                    dt = dt.min(cfl * h_len / wave_speed / (self.ops.order as f64 + 1.0).powi(2));
+                if wave_rate > 0.0 {
+                    dt = dt.min(cfl / wave_rate / (self.ops.order as f64 + 1.0).powi(2));
                 }
                 if vertical_rate > 0.0 {
                     dt = dt.min(1.0 / vertical_rate);
@@ -1103,6 +1119,7 @@ where
             .expect("Failed to lock transport_scratch");
         let transport = &mut *guard;
         self.with_thin_columns_at_rest(state, |state| {
+            transport.metric = self.metric_form();
             transport.compute(
                 state,
                 None,
@@ -1199,6 +1216,7 @@ where
 
         self.with_thin_columns_at_rest(state, |state| {
             // Σ_l A_l(u): the columns advected with their own layer transports
+            transport.metric = self.metric_form();
             transport.compute(
                 state,
                 None,
@@ -1231,6 +1249,7 @@ where
             bar.eta.copy_from(&state.eta);
             bar.u.copy_from_slice(&state.ubar.data);
             bar.v.copy_from_slice(&state.vbar.data);
+            bar_transport.metric = self.metric_form();
             bar_transport.compute(
                 bar,
                 None,

@@ -25,8 +25,8 @@ use crate::solver::rhs::baroclinic::{
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
-    LayerTransport, MomentumAdvectionForm, VerticalAdvection, apply_momentum_transport_3d,
-    apply_tracer_transport_3d,
+    LayerTransport, MetricForm, MomentumAdvectionForm, VerticalAdvection,
+    apply_momentum_transport_3d, apply_tracer_transport_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
@@ -62,6 +62,9 @@ pub struct Rhs3DConfig<'a> {
     /// A reference state balanced by the constant-depth form, if any (with
     /// [`PressureGradientForm::SigmaPairs`]).
     pub balanced_reference: Option<&'a BalancedReference>,
+    /// The volume form of the horizontal divergences, the 2D module's (the
+    /// pressure gradient takes its adjoint).
+    pub metric: MetricForm,
 }
 
 /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the pointwise
@@ -90,6 +93,7 @@ pub fn compute_momentum_rhs_3d(rhs: &mut Solution3D, state: &Solution3D, config:
         config.rho0, // baroclinic-only PGF
         config.min_column_depth,
         config.pressure_gradient,
+        config.metric,
         &mut rhs.u,
         &mut rhs.v,
     );
