@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **The wave model's cost at Frøya (`froya_real_data waves=N`; TODO F.4).** A mode of the Frøya example that times the spectral wave model on the run's domain. It reports the step and what sets it (geographic propagation or refraction), the wall time per step split into propagation and sources, the most local time stepping could save, and the cost per model hour (`wave_grid=`, `turning=`, `order=`, `mesh=` or `nx= ny=`). Findings are in TODO.md: refraction sets the step 10–100× below the geographic limit, so an implicit direction step comes next. With it, a 1 km P1 wave grid would cost ≈ 100 s per model hour.
+
 - **The waves' force on the circulation in flux form (`source::WaveForce2D`; TODO F.4 coupling).** The radiation-stress divergence now includes the jumps of `S` between elements: the strong-form DG divergence with the central flux `½(S⁻ + S⁺)` lifted on interior faces. On GLL nodes, summation by parts makes the force's total exactly `−g ∮ S·n` over the boundary (new gate, to round-off, for a stress discontinuous at every face). The surf-zone longshore force is now within 6.8 % of Longuet-Higgins's dissipation force, against 9.5 % before; the spikes at element ends are gone.
   - API: `WaveForce2D::from_radiation_stress` takes the mesh as its first argument.
 

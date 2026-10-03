@@ -95,8 +95,13 @@
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
-//!     [nest_tides=corrected|raw]
+//!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=]
 //! ```
+//!
+//! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
+//! instead of the tidal run (`wave_grid=frequencies,directions`, refraction
+//! capped at `turning=` rad/s): the step, what sets it, and the cost per model
+//! hour.
 //!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
 //! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
@@ -327,6 +332,12 @@ struct Options {
     /// by up to this factor (`tide_transport=`; 0: off)
     tide_transport: f64,
     profile: usize,
+    /// Time this many steps of the spectral wave model on the domain instead
+    /// of the tidal run (`waves=N`; 0: off), on `wave_grid=frequencies,directions`
+    /// with refraction capped at `turning=` rad/s (none by default)
+    waves: usize,
+    wave_grid: [usize; 2],
+    turning: Option<f64>,
     output: Option<PathBuf>,
 }
 
@@ -372,6 +383,22 @@ impl Options {
                 other => return Err(format!("bad bed={other}: projected or point")),
             },
             profile: get("profile", 0.0)? as usize,
+            waves: get("waves", 0.0)? as usize,
+            wave_grid: {
+                let text = args.get("wave_grid").map_or("25,36", String::as_str);
+                let parts: Vec<usize> = text
+                    .split(',')
+                    .map(|v| v.parse().map_err(|_| format!("bad wave_grid={text}")))
+                    .collect::<Result<_, _>>()?;
+                match parts[..] {
+                    [nf, nd] => [nf, nd],
+                    _ => return Err(format!("wave_grid=frequencies,directions, not {text}")),
+                }
+            },
+            turning: args
+                .get("turning")
+                .map(|v| v.parse().map_err(|_| format!("bad turning={v}")))
+                .transpose()?,
             lts: get("lts", 0.0)? as usize,
             cfl: get("cfl", f64::NAN)?,
             integrator: match args.get("rk").map_or("43", String::as_str) {
@@ -1181,6 +1208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     domain.print_summary();
     let parent = domain.nesting(&opts)?;
     domain.close_uncovered_open_faces(&opts)?;
+    if opts.waves > 0 {
+        wave_cost(&domain, &opts);
+        return Ok(());
+    }
 
     lake_at_rest(&domain, opts.rest_hours);
     tidal_run(&domain, &opts, parent)
@@ -1613,6 +1644,140 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
             break;
         }
     }
+}
+
+/// The cost of the spectral wave model on this domain (`waves=N`, TODO F.4):
+/// SWAN's default sources (Komen, the DIA, JONSWAP friction, Battjes–Janssen)
+/// under a 10 m/s wind to the east, a JONSWAP sea of H_s 2.5 m and T_p 10 s from
+/// the west-north-west through the open boundaries and, to start with, over the
+/// whole domain. The median wall time of N steps after a warm-up, split into the
+/// propagation and the sources, the step and what sets it, and the cost per
+/// model hour.
+fn wave_cost(domain: &Domain, opts: &Options) {
+    use dg_rs::waves::{
+        SourceTerms, SpectralGrid, WaveModel2D, WaveWorkspace, Wind, group_velocity, wavenumber,
+    };
+    let [nf, nd] = opts.wave_grid;
+    let grid = SpectralGrid::new(0.04, 0.5, nf, nd);
+    let n_components = grid.n_components();
+    // Travelling to the east-south-east
+    let direction = (-15f64).to_radians();
+    let sea = grid.jonswap(2.5, 10.0, 3.3, direction, 4.0);
+    let model = WaveModel2D::new(
+        domain.mesh.clone(),
+        domain.ops.clone(),
+        domain.geom.clone(),
+        &domain.bathymetry,
+        grid,
+        G,
+    )
+    .with_sources(SourceTerms::swan_defaults(G))
+    .with_wind(Wind {
+        u10: 10.0,
+        direction: 0.0,
+    })
+    .with_boundary_spectrum(&sea)
+    .with_turning_limit(opts.turning);
+    let np = model.n_points();
+    println!(
+        "\nSpectral wave model: {} elements, {np} nodes (P{}), {nf} frequencies (0.04–0.5 Hz) × \
+         {nd} directions = {n_components} components, {:.1} M unknowns",
+        domain.mesh.n_elements,
+        domain.ops.order,
+        (np * n_components) as f64 / 1e6
+    );
+
+    // The step, and the part of it the geographic propagation alone allows
+    let cfl = 0.5;
+    let dt = model.compute_dt(cfl);
+    let sigma_min = model.grid.sigma[0];
+    let nn = domain.ops.n_nodes;
+    let order_factor = (2 * domain.ops.order + 1) as f64;
+    let element_dt: Vec<f64> = (0..domain.mesh.n_elements)
+        .map(|k| {
+            let cg = (k * nn..(k + 1) * nn)
+                .map(|p| {
+                    let d = model.depth()[p];
+                    group_velocity(sigma_min, wavenumber(sigma_min, d, G), d)
+                })
+                .fold(0.0, f64::max);
+            cfl * domain.geom.element_size(k) / (order_factor * cg)
+        })
+        .collect();
+    let dt_geographic = element_dt.iter().cloned().fold(f64::INFINITY, f64::min);
+    // Every element at its own step against all at the smallest: the most
+    // local time stepping could save (power-of-two levels save a little less)
+    let multirate = element_dt.len() as f64
+        / element_dt
+            .iter()
+            .map(|dt| dt_geographic / dt)
+            .sum::<f64>();
+    println!(
+        "  elements' own geographic steps {dt_geographic:.3}–{:.1} s: local time stepping could \
+         save up to {multirate:.1}×",
+        element_dt.iter().cloned().fold(0.0, f64::max)
+    );
+    println!(
+        "  step {dt:.3} s at CFL {cfl}; the geographic propagation alone would allow {dt_geographic:.3} s{}",
+        if dt < 0.99 * dt_geographic {
+            " (refraction or frequency shifting sets it)"
+        } else {
+            ""
+        }
+    );
+
+    let mut n = model.uniform_state(&sea);
+    let mut ws = WaveWorkspace::default();
+    let mut t = 0.0;
+    let median = |times: &mut Vec<f64>| {
+        times.sort_by(f64::total_cmp);
+        times[times.len() / 2]
+    };
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    // Warm-up, then the steps timed
+    for _ in 0..2 {
+        model.step(&mut n, t, dt, &mut ws);
+        t += dt;
+    }
+    let mut steps = Vec::with_capacity(opts.waves);
+    let mut sources = Vec::with_capacity(opts.waves);
+    for _ in 0..opts.waves {
+        let start = Instant::now();
+        model.step(&mut n, t, dt, &mut ws);
+        steps.push(start.elapsed().as_secs_f64());
+        t += dt;
+        let mut scratch = n.clone();
+        let start = Instant::now();
+        model.apply_sources(&mut scratch, dt, &mut ws);
+        sources.push(start.elapsed().as_secs_f64());
+    }
+    let (step, source) = (median(&mut steps), median(&mut sources));
+    let per_hour = 3600.0 / dt * step;
+    println!(
+        "  {:.1} ms per step on {threads} threads: propagation {:.1} ms ({:.0} %), sources {:.1} ms \
+         ({:.0} %)",
+        1e3 * step,
+        1e3 * (step - source),
+        100.0 * (step - source) / step,
+        1e3 * source,
+        100.0 * source / step
+    );
+    println!(
+        "  {:.0} ns per component and node per step ({:.1} ns of it propagation, three RK stages)",
+        1e9 * step / (np * n_components) as f64,
+        1e9 * (step - source) / (np * n_components) as f64,
+    );
+    println!(
+        "  {per_hour:.0} s of wall time per model hour ({:.2}× real time)",
+        3600.0 / per_hour
+    );
+    let params = model.parameters(&n);
+    let hs_max = params.iter().map(|p| p.hs).fold(0.0, f64::max);
+    println!(
+        "  after {:.0} s: H_s ≤ {hs_max:.2} m, total action {:.3e}",
+        t,
+        model.total_action(&n)
+    );
 }
 
 /// Lower-case ASCII file-name form of a station name.
