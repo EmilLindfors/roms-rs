@@ -250,6 +250,66 @@ impl BalancedReference {
         }
     }
 
+    /// The correction of a horizontally uniform reference density
+    /// `profile(z)` (kg/m³), sampled at the levels of `state` (its `η`):
+    /// `−F_σ(ρ_s)`, since the true force of a horizontally uniform field is
+    /// zero (the subtraction of a reference profile of Mellor et al. 1998).
+    /// A fluid resting in the profile then feels no force at all, where
+    /// [`Self::new`] leaves the constant-depth form's interpolation error
+    /// (1.7e-4 m/s² at Frøya's cliff shores for a summer pycnocline, which
+    /// drove 0.6 m/s within half an hour); in motion only the σ-pairs' error
+    /// of the departure from the profile remains. The arguments are
+    /// [`Self::new`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_profile(
+        state: &Solution3D,
+        mesh: &Mesh2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        g: f64,
+        rho_0: f64,
+        rho_ref: f64,
+        min_column_depth: f64,
+        metric: MetricForm,
+        profile: impl Fn(f64) -> f64,
+    ) -> Self {
+        let nl = sigma.n_levels();
+        let mut reference = state.clone();
+        for (idx, column) in reference.rho.chunks_exact_mut(nl).enumerate() {
+            let eta = state.eta.data[idx];
+            let depth = eta - bathymetry.data[idx];
+            for (rho, &s) in column.iter_mut().zip(sigma.sigma_rho()) {
+                *rho = profile(eta + s * depth);
+            }
+        }
+        let n = reference.rho.len();
+        let (mut fx, mut fy) = (vec![0.0; n], vec![0.0; n]);
+        compute_pressure_gradient(
+            &reference,
+            mesh,
+            bathymetry,
+            sigma,
+            ops,
+            geom,
+            g,
+            rho_0,
+            rho_ref,
+            min_column_depth,
+            PressureGradientForm::SigmaPairs,
+            metric,
+            &mut fx,
+            &mut fy,
+        );
+        for f in fx.iter_mut().chain(fy.iter_mut()) {
+            *f = -*f;
+        }
+        Self {
+            correction: [fx, fy],
+        }
+    }
+
     /// Add the correction to the forces `fx`, `fy`.
     pub fn add_to(&self, fx: &mut [f64], fy: &mut [f64]) {
         let [cx, cy] = &self.correction;
@@ -942,6 +1002,63 @@ mod tests {
                 "P{order}, {} m, σ-pairs: spurious |F| = {sigma_pairs:.3e} m/s²",
                 3000 / nx
             );
+        }
+    }
+
+    /// The profile reference ([`BalancedReference::from_profile`]) on the
+    /// review's stratified fjord: at rest in the profile the σ-pairs force
+    /// vanishes exactly (the state reference leaves the constant-depth form's
+    /// interpolation error, ≈ 2e-7–2e-6 m/s² here), and a departure from the
+    /// profile that is uniform in each column (a horizontal density gradient)
+    /// feels exactly the σ-pairs force of the departure alone: adding it
+    /// leaves the monotone Hermite slopes, so the pressure differences are
+    /// linear in it.
+    #[test]
+    fn a_reference_profile_balances_the_fjord_at_rest_exactly() {
+        let a = 1e-4;
+        for (order, nx) in [(1, 6), (3, 12)] {
+            for anomaly in [0.0, a] {
+                let case = |rho: &dyn Fn(f64, f64) -> f64| {
+                    Column3D::new(
+                        3000.0,
+                        nx,
+                        order,
+                        SigmaGrid::new(30, SongHaidvogelStretching::new(5.0, 0.4, 10.0)),
+                        fjord_bed,
+                        |_| 0.0,
+                        rho,
+                    )
+                };
+                let stratified = case(&|x, z| pycnocline(z) + anomaly * (x - 1500.0));
+                let reference = BalancedReference::from_profile(
+                    &stratified.state,
+                    &stratified.mesh,
+                    &stratified.bathymetry,
+                    &stratified.sigma,
+                    &stratified.ops,
+                    &stratified.geom,
+                    G,
+                    RHO0,
+                    RHO0,
+                    0.0,
+                    MetricForm::Conservative,
+                    pycnocline,
+                );
+                let (mut fx, mut fy) = stratified.pgf(RHO0, PressureGradientForm::SigmaPairs);
+                reference.add_to(&mut fx, &mut fy);
+                let departure = case(&|x, _| RHO0 + anomaly * (x - 1500.0));
+                let (dx, dy) = departure.pgf(RHO0, PressureGradientForm::SigmaPairs);
+                let error = largest(
+                    &fx.iter().zip(&dx).map(|(f, d)| f - d).collect::<Vec<_>>(),
+                    &fy.iter().zip(&dy).map(|(f, d)| f - d).collect::<Vec<_>>(),
+                );
+                // Measured 0 at rest, ≤ 5.5e-17 with the departure (the
+                // round-off of the profile's forces, ≈ 1e-3 m/s², cancelling)
+                assert!(
+                    error < 1e-14,
+                    "P{order}, anomaly {anomaly}: off the departure's force by {error:.3e} m/s²"
+                );
+            }
         }
     }
 

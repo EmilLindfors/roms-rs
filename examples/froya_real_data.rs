@@ -1825,7 +1825,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         BottomDrag3D, ConstantMixing, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, VerticalMixing,
     };
     use dg_rs::solver::state::Solution3D;
-    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
     use dg_rs::time::ModeSplitIntegrator;
     use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
 
@@ -1852,6 +1852,21 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     .build();
     let eos = LinearEOS::default();
     let dbg = |flag: &str| opts.debug_3d.split(',').any(|f| f == flag);
+    // The summer stratification, horizontally uniform: T 4 °C warmer and S
+    // 1.5 psu fresher above ≈ 15 m (`linear`: 0.02 °C/m; `uniform`: none)
+    let profile = |z: f64| -> (f64, f64) {
+        if dbg("uniform") {
+            (eos.t0, eos.s0)
+        } else if dbg("linear") {
+            (eos.t0 + 0.02 * z, eos.s0)
+        } else {
+            let step = 0.5 * (1.0 + ((z + 15.0) / 4.0).tanh());
+            (
+                eos.t0 + 4.0 * step + 0.002 * z.min(0.0),
+                eos.s0 - 1.5 * step,
+            )
+        }
+    };
     let physics: Physics3D = Hydrostatic3D::new(
         domain.mesh.clone(),
         domain.ops.clone(),
@@ -1861,7 +1876,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         Arc::new(CoriolisSource2D::f_plane(F_CORIOLIS)),
         eos,
         if opts.debug_3d.split(',').any(|f| f == "constant") {
-            Box::new(ConstantMixing::new(1e-3, 1e-5)) as Box<dyn VerticalMixing + Send + Sync>
+            Box::new(ConstantMixing::new(1e-3, 0.0)) as Box<dyn VerticalMixing + Send + Sync>
         } else {
             Box::new(GlsMixing::k_epsilon())
         },
@@ -1876,9 +1891,22 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     )
     .with_bottom_drag(BottomDrag3D::log_layer(0.003))
     .with_smagorinsky_viscosity(0.1)
-    .with_tracer_limiter(TracerLimiter3DConfig {
-        limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
-        ..TracerLimiter3DConfig::default()
+    .with_tracer_limiter(if dbg("nolimiter") {
+        TracerLimiter3DConfig::none()
+    } else {
+        // The stratification as the limiter's reference: without it the
+        // limiter clips a curved profile where σ-levels cross it steeply
+        let config = TracerLimiter3DConfig {
+            limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+            ..TracerLimiter3DConfig::default()
+        };
+        let deepest = domain.bathymetry.data.iter().copied().fold(0.0, f64::min);
+        config.with_reference_profile(TracerReferenceProfile::from_fn(
+            deepest - 1.0,
+            1.0,
+            4001,
+            profile,
+        ))
     });
 
     let (ne, nn) = (domain.mesh.n_elements, domain.ops.n_nodes);
@@ -1889,21 +1917,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         state.eta.data[idx] = eta;
         for (l, &s) in sigma.sigma_rho().iter().enumerate() {
             let z = eta + s * (eta - bed);
-            let step = if dbg("uniform") || dbg("linear") {
-                0.0
-            } else {
-                0.5 * (1.0 + ((z + 15.0) / 4.0).tanh())
-            };
-            state.temp[idx * nl + l] = eos.t0
-                + 4.0 * step
-                + if dbg("uniform") {
-                    0.0
-                } else if dbg("linear") {
-                    0.02 * z
-                } else {
-                    0.002 * z.min(0.0)
-                };
-            state.salt[idx * nl + l] = eos.s0 - 1.5 * step;
+            (state.temp[idx * nl + l], state.salt[idx * nl + l]) = profile(z);
         }
     }
     physics.update_density(&mut state);
@@ -1987,24 +2001,31 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         times[2]
     };
 
-    let physics = if dbg("nolimiter") {
-        physics.with_tracer_limiter(TracerLimiter3DConfig::none())
-    } else {
+    // The stratification's profile as the PGF's reference, exact at rest
+    // (`balanced`: the state as the balanced reference, which leaves the
+    // constant-depth form's error at rest, 1.7e-4 m/s² at cliff shores;
+    // `unbalanced`: none, the σ-pairs' error, 2.2e-2 m/s²)
+    let physics = if dbg("unbalanced") {
         physics
-    };
-    let physics = if dbg("balanced") {
+    } else if dbg("balanced") {
         physics.with_balanced_reference(&state)
     } else {
-        physics
+        use dg_rs::physics::EquationOfState;
+        physics.with_reference_profile(&state, |z| {
+            let (t, s) = profile(z);
+            eos.compute_density(t, s, z)
+        })
     };
     let mut integrator = ModeSplitIntegrator::new();
-    let dt = opts.dt_3d.unwrap_or(dt_rest);
     let mut t = 0.0;
-    let mut timed_step = |state: &mut Solution3D, t: &mut f64| {
+    // The step of `dt_3d=`, or as `Simulation3D` takes it, every step
+    let mut timed_step = |state: &mut Solution3D, t: &mut f64| -> f64 {
+        let dt = opts.dt_3d.unwrap_or_else(|| physics.compute_dt(state, cfl));
         physics.update_density(state);
         integrator.step(state, &physics, dt, *t);
         physics.post_process(state);
         *t += dt;
+        dt
     };
     for _ in 0..2 {
         timed_step(&mut state, &mut t);
@@ -2031,8 +2052,12 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 )
                 .collect::<Vec<_>>()
         );
+        let every = (opts.steps_3d / 24).max(1);
         for n in 0..opts.steps_3d {
-            timed_step(&mut state, &mut t);
+            let dt = timed_step(&mut state, &mut t);
+            if n % every != 0 && n + 1 != opts.steps_3d {
+                continue;
+            }
             let (mut best, mut at) = (0.0_f64, 0);
             for (i, (u, v)) in state.u.iter().zip(&state.v).enumerate() {
                 let s = u.hypot(*v);
@@ -2052,8 +2077,9 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 domain.ops.nodes_s[node],
             );
             println!(
-                "  step {n}: largest {best:.2e} m/s at element {k} node {node} level {} ({:.1}, {:.1}) km; \
-                 depths {:?}; affine {}",
+                "  step {n} (t {:.2} h, dt {dt:.2} s): largest {best:.2e} m/s at element {k} node \
+                 {node} level {} ({:.1}, {:.1}) km; depths {:?}; affine {}",
+                t / 3600.0,
                 at % nl,
                 x / 1e3,
                 y / 1e3,
@@ -2067,9 +2093,10 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         return;
     }
     let mut times = Vec::with_capacity(opts.steps_3d);
+    let mut dt = dt_rest;
     for _ in 0..opts.steps_3d {
         let start = Instant::now();
-        timed_step(&mut state, &mut t);
+        dt = timed_step(&mut state, &mut t);
         times.push(start.elapsed().as_secs_f64());
     }
     times.sort_by(f64::total_cmp);

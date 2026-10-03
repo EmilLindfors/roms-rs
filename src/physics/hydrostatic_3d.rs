@@ -353,6 +353,36 @@ where
         self
     }
 
+    /// Balance a horizontally uniform reference density `profile(z)`
+    /// (kg/m³) exactly: a fluid resting in it feels no pressure gradient
+    /// force at all (Mellor et al. 1998's subtraction of a reference
+    /// profile; [`BalancedReference::from_profile`]), at the levels of
+    /// `state`'s `η`. Prefer it to [`Self::with_balanced_reference`] where
+    /// the stratification starts horizontally uniform, or has a typical
+    /// profile: over cliff coasts the constant-depth form's own error at rest
+    /// is not small. No effect with [`PressureGradientForm::ConstantDepth`].
+    pub fn with_reference_profile(
+        mut self,
+        state: &Solution3D,
+        profile: impl Fn(f64) -> f64,
+    ) -> Self {
+        self.balanced_reference = Some(Arc::new(BalancedReference::from_profile(
+            state,
+            &self.mesh,
+            &self.bathymetry,
+            &self.sigma,
+            &self.ops,
+            &self.geom,
+            self.g,
+            self.rho0,
+            self.rho0,
+            self.min_column_depth,
+            self.metric_form(),
+            profile,
+        )));
+        self
+    }
+
     /// Replace the balanced reference state (see
     /// [`Self::with_balanced_reference`]).
     pub fn set_balanced_reference(&mut self, state: &Solution3D) {
