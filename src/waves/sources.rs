@@ -1,6 +1,6 @@
 //! Source terms of the wave action balance, per node: wind input, whitecapping,
-//! bottom friction and depth-induced breaking (the SWAN "GEN3 KOMEN" set without
-//! the nonlinear interactions, which come next: see `TODO.md`).
+//! quadruplet interactions, bottom friction and depth-induced breaking (SWAN's
+//! "GEN3 KOMEN" set; triads are not included), and the diagnostic tail.
 //!
 //! Every term is written as `S(σ, θ) = A + B E` in variance density, with `A` the
 //! linear (Phillips-type) wind input and `B` a rate (1/s) that depends on the
@@ -23,18 +23,43 @@
 //!   `D = −¼ α Q_b (σ̃/2π) H_max²`, `H_max = γ d`, `α = 1`, `γ = 0.73`, with the
 //!   fraction of breaking waves from `(1 − Q_b)/ln Q_b = −(H_rms/H_max)²`, spread
 //!   over the spectrum in proportion to `E`: `B_br = D / m_0` (`σ̃ = m_1/m_0`).
+//! - **Quadruplets** by the DIA ([`super::nonlinear`]), scaled for finite depth by
+//!   `R(0.75 k̃ d)`. They are not of the form `A + B E`: each component's gain
+//!   joins `A` and its loss `B` (as the rate `S_nl/E`), both frozen over the step.
+//! - **Diagnostic tail** (Komen et al. 1994, as WAM): above the cut-off
+//!   `σ_c = max(2.5 σ̃, 4 σ_PM)` (`σ_PM` = 2π · 0.13 g/(28 u*), with wind) the
+//!   spectrum is not prognostic but `E(σ_c, θ)(σ_c/σ)^p` after every step, with
+//!   `p` = 4 (SWAN's for the Komen terms) by default; the DIA reads it above the
+//!   grid too.
 //!
 //! [`SourceTerms::integrate`] advances `N = E/σ` over a step with the rates frozen
 //! (an exponential integrator: exact for constant `A`, `B`, and unconditionally
-//! stable for the dissipative terms, which are stiff in the surf zone).
+//! stable for the dissipative terms, which are stiff in the surf zone). The
+//! explicit gains are not: the DIA's grow as σ¹¹E³ at high frequencies, and
+//! without a limit a 2 Hz grid blew up in a 14 h fetch run at 18 s steps.
+//! Ris's (1997) limiter, as SWAN's, caps the growth of `N` over a step at a
+//! fraction γ = 0.1 of the Phillips level, `ΔN ≤ γ α_PM/(2σk³c_g)` (`α_PM` =
+//! 0.0081); losses are not limited (they are stable, and the surf zone needs them
+//! whole).
 
 use std::f64::consts::{PI, TAU};
 
+use super::dispersion::group_velocity;
+use super::nonlinear::{Quadruplets, shallow_water_factor};
 use super::spectrum::SpectralGrid;
 
 /// Air and water densities (kg/m³) for the wind input.
 const RHO_AIR: f64 = 1.225;
 const RHO_WATER: f64 = 1025.0;
+
+/// SWAN's power of the diagnostic tail with the Komen terms.
+pub const DEFAULT_TAIL_POWER: f64 = 4.0;
+
+/// SWAN's fraction γ of the Phillips level in Ris's limiter.
+pub const DEFAULT_LIMITER: f64 = 0.1;
+
+/// Phillips' constant α_PM of the equilibrium range (Pierson & Moskowitz 1964).
+const PHILLIPS: f64 = 0.0081;
 
 /// Wind at a node: speed at 10 m (m/s) and the direction it blows *to* (rad,
 /// counter-clockwise from mesh +x).
@@ -68,6 +93,13 @@ pub struct SourceTerms {
     pub bottom_friction: Option<f64>,
     /// Battjes–Janssen breaking: `α`, `γ`
     pub breaking: Option<(f64, f64)>,
+    /// Quadruplet interactions (DIA)
+    pub quadruplets: Option<Quadruplets>,
+    /// Power `p` of the diagnostic `σ^(−p)` tail, or no tail
+    pub tail: Option<f64>,
+    /// Ris's limiter: the largest growth of `N` over a step, as a fraction γ of
+    /// the Phillips level `α_PM/(2σk³c_g)`, or none
+    pub limiter: Option<f64>,
 }
 
 impl SourceTerms {
@@ -79,11 +111,15 @@ impl SourceTerms {
             whitecapping: None,
             bottom_friction: None,
             breaking: None,
+            quadruplets: None,
+            tail: None,
+            limiter: None,
         }
     }
 
-    /// SWAN's defaults for these terms (wind, Komen whitecapping, JONSWAP friction
-    /// with `C_b = 0.038`, Battjes–Janssen with `α = 1`, `γ = 0.73`).
+    /// SWAN's defaults for these terms (wind, Komen whitecapping, the DIA, JONSWAP
+    /// friction with `C_b = 0.038`, Battjes–Janssen with `α = 1`, `γ = 0.73`, an
+    /// f⁻⁴ tail, Ris's limiter with γ = 0.1).
     pub fn swan_defaults(g: f64) -> Self {
         Self {
             g,
@@ -91,6 +127,9 @@ impl SourceTerms {
             whitecapping: Some((2.36e-5, 1.0, 3.02e-3)),
             bottom_friction: Some(0.038),
             breaking: Some((1.0, 0.73)),
+            quadruplets: Some(Quadruplets::default()),
+            tail: Some(DEFAULT_TAIL_POWER),
+            limiter: Some(DEFAULT_LIMITER),
         }
     }
 
@@ -114,12 +153,32 @@ impl SourceTerms {
         self
     }
 
+    /// Quadruplet interactions by the DIA with these coefficients, or none.
+    pub fn with_quadruplets(mut self, quadruplets: Option<Quadruplets>) -> Self {
+        self.quadruplets = quadruplets;
+        self
+    }
+
+    /// The diagnostic `σ^(−p)` tail of power `p`, or none.
+    pub fn with_tail(mut self, power: Option<f64>) -> Self {
+        self.tail = power;
+        self
+    }
+
+    /// Ris's growth limiter with fraction `gamma` of the Phillips level, or none.
+    pub fn with_limiter(mut self, gamma: Option<f64>) -> Self {
+        self.limiter = gamma;
+        self
+    }
+
     /// Whether any term acts.
     pub fn any(&self) -> bool {
         self.wind
             || self.whitecapping.is_some()
             || self.bottom_friction.is_some()
             || self.breaking.is_some()
+            || self.quadruplets.is_some()
+            || self.tail.is_some()
     }
 
     /// The linear input `a[c]` (m²/(rad/s)/rad/s) and rates `b[c]` (1/s) of the
@@ -140,8 +199,21 @@ impl SourceTerms {
         a.fill(0.0);
         b.fill(0.0);
         let g = self.g;
-        let m0 = grid.moment(e, 0);
+        let means = Means::of(grid, e, k);
 
+        // First, while `b` is free: the DIA's transfer, split into gains and losses
+        if let (Some(quadruplets), Some(means)) = (self.quadruplets, means) {
+            let scale = shallow_water_factor(0.75 * means.k * depth);
+            quadruplets.source(grid, e, self.tail, g, scale, b);
+            for ((a, b), &e) in a.iter_mut().zip(b.iter_mut()).zip(e) {
+                let s = std::mem::take(b);
+                if s >= 0.0 || e <= 0.0 {
+                    *a = s;
+                } else {
+                    *b = s / e;
+                }
+            }
+        }
         if self.wind && wind.u10 > 0.0 {
             let us = wind.friction_velocity();
             let sigma_pm = TAU * 0.13 * g / (28.0 * us);
@@ -157,20 +229,12 @@ impl SourceTerms {
                 }
             }
         }
-        if m0 <= 0.0 {
+        let Some(means) = means else {
             return;
-        }
+        };
+        let m0 = means.m0;
         if let Some((cds, delta, s_pm2)) = self.whitecapping {
-            // Energy-weighted mean σ̃ = ⟨σ⁻¹⟩⁻¹ and k̃ = ⟨k^(−½)⟩⁻²
-            let (mut inv_sigma, mut inv_sqrt_k) = (0.0, 0.0);
-            for i in 0..nf {
-                let row: f64 = e[i * nd..(i + 1) * nd].iter().sum::<f64>() * grid.d_sigma[i];
-                inv_sigma += row / grid.sigma[i];
-                inv_sqrt_k += row / k[i].sqrt();
-            }
-            let scale = grid.d_theta / m0;
-            let sigma_m = 1.0 / (inv_sigma * scale);
-            let k_m = (inv_sqrt_k * scale).powi(-2);
+            let (sigma_m, k_m) = (means.sigma, means.k);
             let steepness2 = k_m * k_m * m0;
             let gamma = cds * (steepness2 / s_pm2).powi(2) * sigma_m;
             for i in 0..nf {
@@ -222,18 +286,93 @@ impl SourceTerms {
             *e = grid.sigma[c / nd] * n;
         }
         self.rates(grid, e, k, depth, wind, a, b);
-        for c in 0..n.len() {
-            let x = b[c] * dt;
-            let growth = x.exp();
-            // (e^x − 1)/x → 1 as x → 0
-            let phi = if x.abs() < 1e-8 {
-                1.0 + 0.5 * x
-            } else {
-                (growth - 1.0) / x
-            };
-            let sigma = grid.sigma[c / nd];
-            n[c] = (n[c] * growth + a[c] / sigma * dt * phi).max(0.0);
+        for (i, (&sigma, &ki)) in grid.sigma.iter().zip(k).enumerate() {
+            // Ris's limit on the growth over a step, or none
+            let max_growth = self.limiter.map_or(f64::INFINITY, |gamma| {
+                gamma * PHILLIPS / (2.0 * sigma * ki.powi(3) * group_velocity(sigma, ki, depth))
+            });
+            for c in i * nd..(i + 1) * nd {
+                let x = b[c] * dt;
+                let growth = x.exp();
+                // (e^x − 1)/x → 1 as x → 0
+                let phi = if x.abs() < 1e-8 {
+                    1.0 + 0.5 * x
+                } else {
+                    (growth - 1.0) / x
+                };
+                let next = n[c] * growth + a[c] / sigma * dt * phi;
+                n[c] = next.min(n[c] + max_growth).max(0.0);
+            }
         }
+        if let Some(power) = self.tail {
+            self.apply_tail(grid, n, k, wind, power, e);
+        }
+    }
+
+    /// Replace the action density above the cut-off `max(2.5 σ̃, 4 σ_PM)` by the
+    /// `σ^(−power)` tail (in variance density) from the last bin below it. `e` is
+    /// scratch.
+    fn apply_tail(
+        &self,
+        grid: &SpectralGrid,
+        n: &mut [f64],
+        k: &[f64],
+        wind: Wind,
+        power: f64,
+        e: &mut [f64],
+    ) {
+        let nd = grid.n_dir();
+        for (c, (e, n)) in e.iter_mut().zip(n.iter()).enumerate() {
+            *e = grid.sigma[c / nd] * n;
+        }
+        let Some(means) = Means::of(grid, e, k) else {
+            return;
+        };
+        let mut cut = 2.5 * means.sigma;
+        if self.wind && wind.u10 > 0.0 {
+            cut = cut.max(4.0 * TAU * 0.13 * self.g / (28.0 * wind.friction_velocity()));
+        }
+        // The last prognostic bin: σ_ic ≤ σ_c
+        let Some(ic) = grid.sigma.iter().rposition(|&s| s <= cut) else {
+            return;
+        };
+        let sigma_c = grid.sigma[ic];
+        for i in ic + 1..grid.n_freq() {
+            let ratio = (sigma_c / grid.sigma[i]).powf(power) / grid.sigma[i];
+            for j in 0..nd {
+                n[i * nd + j] = e[ic * nd + j] * ratio;
+            }
+        }
+    }
+}
+
+/// Energy-weighted means of a spectrum: `m_0`, `σ̃ = ⟨σ⁻¹⟩⁻¹`, `k̃ = ⟨k^(−½)⟩⁻²`
+/// (Komen et al. 1984), or none for no energy.
+#[derive(Clone, Copy, Debug)]
+struct Means {
+    m0: f64,
+    sigma: f64,
+    k: f64,
+}
+
+impl Means {
+    fn of(grid: &SpectralGrid, e: &[f64], k: &[f64]) -> Option<Self> {
+        let nd = grid.n_dir();
+        let (mut m0, mut inv_sigma, mut inv_sqrt_k) = (0.0, 0.0, 0.0);
+        for i in 0..grid.n_freq() {
+            let row: f64 = e[i * nd..(i + 1) * nd].iter().sum::<f64>() * grid.d_sigma[i];
+            m0 += row;
+            inv_sigma += row / grid.sigma[i];
+            inv_sqrt_k += row / k[i].sqrt();
+        }
+        if m0 <= 0.0 {
+            return None;
+        }
+        Some(Self {
+            m0: m0 * grid.d_theta,
+            sigma: m0 / inv_sigma,
+            k: (inv_sqrt_k / m0).powi(-2),
+        })
     }
 }
 

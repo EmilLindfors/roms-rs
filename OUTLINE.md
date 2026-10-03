@@ -100,6 +100,12 @@ src/
 │
 │  # ---- Application layer ----
 ├── simulation/       # Simulation runner (2D), Simulation3D
+├── waves/            # Spectral wind waves (F.4): action balance per (σ, θ)
+│                     # component on the DG mesh (WaveModel2D: DG propagation,
+│                     # refraction, current frequency shift), dispersion,
+│                     # SpectralGrid (JONSWAP, H_s/T_p/direction, Stokes drift,
+│                     # radiation stress), sources (Komen wind/whitecapping,
+│                     # DIA quadruplets, bed friction, breaking, tail, limiter)
 ├── particles/        # Lagrangian tracking: RK4 on the DG velocity, random
 │                     # walk, face-by-face walk with wall reflection, exits;
 │                     # 3D: σ-levels, Visser's vertical walk, sinking/settling;
