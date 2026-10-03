@@ -324,6 +324,8 @@ fn draw(
     for (label, mut text) in &mut labels {
         let s = match label {
             Label::Title => trace.title.clone(),
+            // Millimetres where the range is small (a channel, a lake)
+            Label::Range if hi - lo < 0.1 => format!("{:+.1} to {:+.1} mm", 1e3 * hi, 1e3 * lo),
             Label::Range => format!("{hi:+.2} to {lo:+.2} m"),
             Label::Start => date(t0),
             Label::End => date(t1),

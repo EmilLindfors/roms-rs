@@ -1,17 +1,20 @@
-//! Snapshot files: a 2D shallow-water run's surface and depth-averaged velocity,
-//! frame after frame, in one compact binary file that also carries the mesh and the
-//! bed, so a run can be replayed (e.g. by the `viz/` viewer) without the data and
-//! the code that built its domain.
+//! Snapshot files: a run's surface and depth-averaged velocity, and in 3D its
+//! fields on every σ-level, frame after frame, in one compact binary file that also
+//! carries the mesh, the bed and the σ-grid, so a run can be replayed (e.g. by the
+//! `viz/` viewer) without the data and the code that built its domain.
 //!
-//! A frame is the surface elevation η = h + B and the velocity (u, v) at every DG
-//! node in the solution's element-major order, as `f32`: 12 bytes per node, a tenth
-//! of an ASCII VTU frame. The velocity is `SWEState2D::velocity` with the writer's
-//! `h_min` (desingularised in thin water), as `write_vtk_swe` writes it.
+//! A frame is the surface elevation η and the depth-averaged velocity (u, v) at
+//! every DG node in the solution's element-major order, as `f32`: 12 bytes per node,
+//! a tenth of an ASCII VTU frame. In 2D (`write_state`) η = h + B and the velocity
+//! is `SWEState2D::velocity` with the writer's `h_min` (desingularised in thin
+//! water), as `write_vtk_swe` writes it. In 3D (`create_3d`, `write_solution_3d`)
+//! they are `Solution3D`'s η, ū, v̄, followed by its u, v, T and S on every level,
+//! `[node][level]` from the bed up ([`SOLUTION_3D_FIELDS`]).
 //!
 //! # Format (little-endian)
 //!
 //! ```text
-//! magic        8 bytes   b"DGSNAP\0\x01" (format version 1)
+//! magic        8 bytes   b"DGSNAP\0\x02" (format version 2; version 1 is read too)
 //! header_len   u64       bytes of the header that follows; frames start after it
 //! header:
 //!   order                u32
@@ -22,9 +25,15 @@
 //!   bed                  f64 per node (n_elements × (order + 1)²), B (negative under water)
 //!   clock                f64: Unix time of model time 0, NaN for none
 //!   metadata             u64 bytes of UTF-8, `key=value` lines
+//!   n_levels             u32 (version 2; 0 in 2D, and nothing more), then
+//!     sigma_w            f64 × (n_levels + 1), bed (−1) to surface (0)
+//!     sigma_rho          f64 × n_levels, the layer centres
+//!     stretching         u64 bytes of UTF-8, its name
+//!     n_fields           u32, then per field u64 bytes of UTF-8, its name
 //! frames, each:
 //!   t                    f64 (model time, s)
 //!   eta, u, v            f32 per node each
+//!   per field            f32 per node and level, [node][level]
 //! ```
 //!
 //! Boundary kinds: 0 wall, 1 open, 2 tidal forcing, 3 periodic (value: group),
@@ -40,11 +49,19 @@ use thiserror::Error;
 
 use crate::mesh::{BoundaryTag, ElementFace, Mesh2D, QuadMeshError};
 use crate::operators::DGOperators2D;
+use crate::solver::state::Solution3D;
 use crate::solver::{SWESolution2D, SWEState2D};
 use crate::time::ModelClock;
 use crate::types::Depth;
+use crate::vertical::SigmaGrid;
 
-const MAGIC: &[u8; 8] = b"DGSNAP\0\x01";
+/// The magic number without its version byte, and the version written.
+const MAGIC: &[u8; 7] = b"DGSNAP\0";
+const VERSION: u8 = 2;
+
+/// The layered fields of a 3D snapshot ([`SnapshotWriter::create_3d`]): velocity
+/// along the σ-layers (m/s), temperature (°C) and salinity.
+pub const SOLUTION_3D_FIELDS: [&str; 4] = ["u", "v", "temp", "salt"];
 
 /// Error reading or writing a snapshot file.
 #[derive(Debug, Error)]
@@ -69,6 +86,23 @@ pub struct SnapshotHeader {
     pub clock: Option<ModelClock>,
     /// Free-form `key=value` pairs (title, points of interest, …), in file order
     pub metadata: Vec<(String, String)>,
+    /// The σ-grid and the layered fields of a 3D run
+    pub levels: Option<SnapshotLevels>,
+}
+
+/// The vertical of a 3D snapshot.
+#[derive(Clone)]
+pub struct SnapshotLevels {
+    pub sigma: SigmaGrid,
+    /// Names of the fields stored on every level, in frame order
+    pub fields: Vec<String>,
+}
+
+impl SnapshotLevels {
+    /// Index of the layered field `name` in a frame's `layers`.
+    pub fn field(&self, name: &str) -> Option<usize> {
+        self.fields.iter().position(|f| f == name)
+    }
 }
 
 impl SnapshotHeader {
@@ -84,15 +118,28 @@ impl SnapshotHeader {
     pub fn n_points(&self) -> usize {
         self.bathymetry.len()
     }
+
+    /// Levels of a 3D run, 0 in 2D.
+    pub fn n_levels(&self) -> usize {
+        self.levels.as_ref().map_or(0, |l| l.sigma.n_levels())
+    }
+
+    /// Bytes of one frame.
+    fn frame_bytes(&self) -> usize {
+        let n_fields = self.levels.as_ref().map_or(0, |l| l.fields.len());
+        8 + 4 * self.n_points() * (3 + n_fields * self.n_levels())
+    }
 }
 
-/// One frame: model time, η, u, v at every node.
+/// One frame: model time, η, u, v at every node, and in 3D the layered fields.
 #[derive(Clone, Debug, Default)]
 pub struct SnapshotFrame {
     pub t: f64,
     pub eta: Vec<f32>,
     pub u: Vec<f32>,
     pub v: Vec<f32>,
+    /// Per layered field ([`SnapshotLevels::fields`]), `[node][level]`
+    pub layers: Vec<Vec<f32>>,
 }
 
 /// Writes a snapshot file: the header on creation, then one frame per call.
@@ -100,6 +147,9 @@ pub struct SnapshotWriter {
     out: BufWriter<File>,
     bed: Vec<f64>,
     h_min: Depth,
+    /// Levels and layered fields per frame (0 in 2D)
+    n_levels: usize,
+    n_fields: usize,
     /// Frame buffer, reused
     bytes: Vec<u8>,
     eta: Vec<f32>,
@@ -108,7 +158,7 @@ pub struct SnapshotWriter {
 }
 
 impl SnapshotWriter {
-    /// Create `path` for a run on `mesh` at `ops`' order over the bed `bathymetry`
+    /// Create `path` for a 2D run on `mesh` at `ops`' order over the bed `bathymetry`
     /// (nodal, element-major), with velocities desingularised below `h_min` (m).
     pub fn create(
         path: impl AsRef<Path>,
@@ -118,6 +168,45 @@ impl SnapshotWriter {
         clock: Option<&ModelClock>,
         metadata: &[(&str, &str)],
         h_min: f64,
+    ) -> Result<Self, SnapshotError> {
+        Self::create_with(path, mesh, ops, bathymetry, clock, metadata, h_min, None)
+    }
+
+    /// Create `path` for a 3D run on the σ-grid `sigma`, with the layered fields
+    /// [`SOLUTION_3D_FIELDS`] ([`Self::write_solution_3d`]).
+    pub fn create_3d(
+        path: impl AsRef<Path>,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        bathymetry: &[f64],
+        sigma: &SigmaGrid,
+        clock: Option<&ModelClock>,
+        metadata: &[(&str, &str)],
+    ) -> Result<Self, SnapshotError> {
+        Self::create_with(
+            path,
+            mesh,
+            ops,
+            bathymetry,
+            clock,
+            metadata,
+            0.0,
+            Some((sigma, &SOLUTION_3D_FIELDS)),
+        )
+    }
+
+    /// Create `path` with any layered fields on `levels`' σ-grid (or none), for
+    /// [`Self::write_fields`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with(
+        path: impl AsRef<Path>,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        bathymetry: &[f64],
+        clock: Option<&ModelClock>,
+        metadata: &[(&str, &str)],
+        h_min: f64,
+        levels: Option<(&SigmaGrid, &[&str])>,
     ) -> Result<Self, SnapshotError> {
         let n = mesh.n_elements * ops.n_nodes;
         if bathymetry.len() != n {
@@ -134,16 +223,26 @@ impl SnapshotWriter {
                 "metadata {k:?} = {v:?}: no '=' in keys, no newlines"
             )));
         }
-        let header = encode_header(mesh, ops.order, bathymetry, clock, metadata);
+        if let Some((_, fields)) = levels
+            && let Some(f) = fields.iter().find(|f| f.is_empty())
+        {
+            return Err(SnapshotError::Format(format!(
+                "layered field name {f:?} is empty"
+            )));
+        }
+        let header = encode_header(mesh, ops.order, bathymetry, clock, metadata, levels);
         let mut out = BufWriter::new(File::create(path)?);
         out.write_all(MAGIC)?;
+        out.write_all(&[VERSION])?;
         out.write_all(&(header.len() as u64).to_le_bytes())?;
         out.write_all(&header)?;
         out.flush()?;
         Ok(Self {
             out,
             bed: bathymetry.to_vec(),
-            h_min: Depth::new(h_min),
+            h_min: Depth::new(h_min.max(0.0)),
+            n_levels: levels.map_or(0, |(sigma, _)| sigma.n_levels()),
+            n_fields: levels.map_or(0, |(_, fields)| fields.len()),
             bytes: Vec::with_capacity(8 + 12 * n),
             eta: vec![0.0; n],
             u: vec![0.0; n],
@@ -172,18 +271,48 @@ impl SnapshotWriter {
             std::mem::take(&mut self.u),
             std::mem::take(&mut self.v),
         );
-        let written = self.write_fields(t, &eta, &u, &v);
+        let written = self.write_fields(t, &eta, &u, &v, &[]);
         (self.eta, self.u, self.v) = (eta, u, v);
         written
     }
 
-    /// Append a frame of η, u and v (one value per node each) at model time `t`.
+    /// Append the 3D state `state` at model time `t` (a file from [`Self::create_3d`]).
+    pub fn write_solution_3d(&mut self, t: f64, state: &Solution3D) -> Result<(), SnapshotError> {
+        let n = self.bed.len();
+        if state.n_levels != self.n_levels
+            || self.n_fields != SOLUTION_3D_FIELDS.len()
+            || state.eta.data.len() != n
+        {
+            return Err(SnapshotError::Format(format!(
+                "a state of {} nodes on {} levels, the file has {n} nodes and {} levels of {} fields",
+                state.eta.data.len(),
+                state.n_levels,
+                self.n_levels,
+                self.n_fields
+            )));
+        }
+        self.begin_frame(t);
+        for field in [&state.eta.data, &state.ubar.data, &state.vbar.data]
+            .into_iter()
+            .chain([&state.u, &state.v, &state.temp, &state.salt])
+        {
+            for &x in field.iter() {
+                self.bytes.extend_from_slice(&(x as f32).to_le_bytes());
+            }
+        }
+        self.end_frame()
+    }
+
+    /// Append a frame of η, u and v (one value per node each) at model time `t`, and
+    /// the layered fields (`[node][level]` each, in the order the file was created
+    /// with; none in 2D).
     pub fn write_fields(
         &mut self,
         t: f64,
         eta: &[f32],
         u: &[f32],
         v: &[f32],
+        layers: &[&[f32]],
     ) -> Result<(), SnapshotError> {
         let n = self.bed.len();
         if eta.len() != n || u.len() != n || v.len() != n {
@@ -194,13 +323,28 @@ impl SnapshotWriter {
                 v.len()
             )));
         }
-        self.bytes.clear();
-        self.bytes.extend_from_slice(&t.to_le_bytes());
-        for field in [eta, u, v] {
+        if layers.len() != self.n_fields || layers.iter().any(|l| l.len() != n * self.n_levels) {
+            return Err(SnapshotError::Format(format!(
+                "a frame needs {} layered fields of {} values",
+                self.n_fields,
+                n * self.n_levels
+            )));
+        }
+        self.begin_frame(t);
+        for field in [eta, u, v].into_iter().chain(layers.iter().copied()) {
             for x in field {
                 self.bytes.extend_from_slice(&x.to_le_bytes());
             }
         }
+        self.end_frame()
+    }
+
+    fn begin_frame(&mut self, t: f64) {
+        self.bytes.clear();
+        self.bytes.extend_from_slice(&t.to_le_bytes());
+    }
+
+    fn end_frame(&mut self) -> Result<(), SnapshotError> {
         // One whole frame per flush, so that a reader sees frames complete or not at all
         self.out.write_all(&self.bytes)?;
         self.out.flush()?;
@@ -222,22 +366,28 @@ impl SnapshotReader {
         let mut start = [0u8; 16];
         file.read_exact(&mut start)
             .map_err(|_| SnapshotError::Format("shorter than its magic number".into()))?;
-        if &start[..8] != MAGIC {
+        if &start[..7] != MAGIC {
             return Err(SnapshotError::Format(
-                "wrong magic number (not a dg-rs snapshot, or another version)".into(),
+                "wrong magic number (not a dg-rs snapshot)".into(),
             ));
+        }
+        let version = start[7];
+        if !(1..=VERSION).contains(&version) {
+            return Err(SnapshotError::Format(format!(
+                "format version {version}; this build reads 1 to {VERSION}"
+            )));
         }
         let header_len = u64::from_le_bytes(start[8..].try_into().unwrap());
         let mut header = vec![0u8; header_len as usize];
         file.read_exact(&mut header)
             .map_err(|_| SnapshotError::Format("truncated header".into()))?;
-        let header = decode_header(&header)?;
-        let n = header.n_points();
+        let header = decode_header(&header, version)?;
+        let frame_bytes = header.frame_bytes();
         Ok(Self {
             file,
             header,
             frames_start: 16 + header_len,
-            bytes: vec![0u8; 8 + 12 * n],
+            bytes: vec![0u8; frame_bytes],
         })
     }
 
@@ -283,24 +433,29 @@ impl SnapshotReader {
         frame: &mut SnapshotFrame,
     ) -> Result<(), SnapshotError> {
         let n = self.header.n_points();
+        let layer = n * self.header.n_levels();
+        let n_fields = self.header.levels.as_ref().map_or(0, |l| l.fields.len());
         self.file.seek(SeekFrom::Start(
             self.frames_start + i as u64 * self.frame_bytes(),
         ))?;
         self.file.read_exact(&mut self.bytes)?;
         frame.t = f64::from_le_bytes(self.bytes[..8].try_into().unwrap());
-        for (f, field) in [&mut frame.eta, &mut frame.u, &mut frame.v]
+        frame.layers.resize_with(n_fields, Vec::new);
+        let mut at = 8;
+        for (field, len) in [&mut frame.eta, &mut frame.u, &mut frame.v]
             .into_iter()
-            .enumerate()
+            .map(|f| (f, n))
+            .chain(frame.layers.iter_mut().map(|f| (f, layer)))
         {
-            let at = 8 + 4 * n * f;
             field.clear();
             field.extend(
-                self.bytes[at..at + 4 * n]
+                self.bytes[at..at + 4 * len]
                     .as_chunks::<4>()
                     .0
                     .iter()
                     .map(|&b| f32::from_le_bytes(b)),
             );
+            at += 4 * len;
         }
         Ok(())
     }
@@ -339,6 +494,7 @@ fn encode_header(
     bed: &[f64],
     clock: Option<&ModelClock>,
     metadata: &[(&str, &str)],
+    levels: Option<(&SigmaGrid, &[&str])>,
 ) -> Vec<u8> {
     let mut b = Vec::new();
     let u32_ = |b: &mut Vec<u8>, x: usize| b.extend_from_slice(&(x as u32).to_le_bytes());
@@ -385,8 +541,25 @@ fn encode_header(
     let epoch = clock.map_or(f64::NAN, |c| c.epoch_unix);
     b.extend_from_slice(&epoch.to_le_bytes());
     let text: String = metadata.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    u64_(&mut b, text.len());
-    b.extend_from_slice(text.as_bytes());
+    let string = |b: &mut Vec<u8>, s: &str| {
+        u64_(b, s.len());
+        b.extend_from_slice(s.as_bytes());
+    };
+    string(&mut b, &text);
+    match levels {
+        None => u32_(&mut b, 0),
+        Some((sigma, fields)) => {
+            u32_(&mut b, sigma.n_levels());
+            sigma
+                .sigma_w()
+                .iter()
+                .chain(sigma.sigma_rho())
+                .for_each(|x| b.extend_from_slice(&x.to_le_bytes()));
+            string(&mut b, sigma.stretching_name());
+            u32_(&mut b, fields.len());
+            fields.iter().for_each(|f| string(&mut b, f));
+        }
+    }
     b
 }
 
@@ -419,9 +592,14 @@ impl Bytes<'_> {
     fn f64(&mut self) -> Result<f64, SnapshotError> {
         Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
+    fn string(&mut self) -> Result<&str, SnapshotError> {
+        let n = self.count(1)?;
+        std::str::from_utf8(self.take(n)?)
+            .map_err(|_| SnapshotError::Format("a string is not UTF-8".into()))
+    }
 }
 
-fn decode_header(bytes: &[u8]) -> Result<SnapshotHeader, SnapshotError> {
+fn decode_header(bytes: &[u8], version: u8) -> Result<SnapshotHeader, SnapshotError> {
     let mut b = Bytes(bytes);
     let order = b.index()?;
     let vertices = (0..b.count(16)?)
@@ -457,20 +635,41 @@ fn decode_header(bytes: &[u8]) -> Result<SnapshotHeader, SnapshotError> {
         .map(|_| b.f64())
         .collect::<Result<Vec<_>, _>>()?;
     let epoch = b.f64()?;
-    let n_text = b.count(1)?;
-    let text = std::str::from_utf8(b.take(n_text)?)
-        .map_err(|_| SnapshotError::Format("metadata is not UTF-8".into()))?;
-    let metadata = text
+    let metadata = b
+        .string()?
         .lines()
         .filter_map(|l| l.split_once('='))
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
+    let n_levels = if version >= 2 { b.index()? } else { 0 };
+    let levels = if n_levels > 0 {
+        if b.0.len() < 8 * (2 * n_levels + 1) {
+            return Err(SnapshotError::Format("truncated header".into()));
+        }
+        let sigma_w = (0..=n_levels)
+            .map(|_| b.f64())
+            .collect::<Result<Vec<_>, _>>()?;
+        let sigma_rho = (0..n_levels)
+            .map(|_| b.f64())
+            .collect::<Result<Vec<_>, _>>()?;
+        let stretching = b.string()?.to_string();
+        let sigma = SigmaGrid::from_levels(sigma_rho, sigma_w, &stretching)
+            .map_err(|e| SnapshotError::Format(format!("σ-levels: {e}")))?;
+        let n_fields = b.index()?;
+        let fields = (0..n_fields)
+            .map(|_| b.string().map(str::to_string))
+            .collect::<Result<Vec<_>, _>>()?;
+        Some(SnapshotLevels { sigma, fields })
+    } else {
+        None
+    };
     Ok(SnapshotHeader {
         order,
         mesh,
         bathymetry,
         clock: epoch.is_finite().then(|| ModelClock::new(epoch)),
         metadata,
+        levels,
     })
 }
 
@@ -557,6 +756,112 @@ mod tests {
     }
 
     #[test]
+    fn a_3d_run_reads_back_with_its_levels() {
+        use crate::vertical::SongHaidvogelStretching;
+
+        let path = scratch("3d");
+        let mesh = mesh();
+        let ops = DGOperators2D::new(1);
+        let n = mesh.n_elements * ops.n_nodes;
+        let sigma = SigmaGrid::new(5, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let bed = vec![-20.0; n];
+        let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, 5);
+        // Every value its own, so a misplaced one shows
+        let value = |field: usize, i: usize| field as f64 * 1000.0 + i as f64 * 0.125;
+        for (f, data) in [
+            &mut state.eta.data,
+            &mut state.ubar.data,
+            &mut state.vbar.data,
+            &mut state.u,
+            &mut state.v,
+            &mut state.temp,
+            &mut state.salt,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (i, x) in data.iter_mut().enumerate() {
+                *x = value(f, i);
+            }
+        }
+        let mut writer =
+            SnapshotWriter::create_3d(&path, &mesh, &ops, &bed, &sigma, None, &[("cage", "1,2,3")])
+                .unwrap();
+        writer.write_solution_3d(0.0, &state).unwrap();
+        writer.write_solution_3d(60.0, &state).unwrap();
+        let mut reader = SnapshotReader::open(&path).unwrap();
+        assert_eq!(reader.n_frames().unwrap(), 2);
+        let header = reader.header().clone();
+        let levels = header.levels.as_ref().unwrap();
+        assert_eq!(levels.sigma.sigma_rho(), sigma.sigma_rho());
+        assert_eq!(levels.sigma.sigma_w(), sigma.sigma_w());
+        assert_eq!(levels.sigma.d_sigma(), sigma.d_sigma());
+        assert_eq!(levels.sigma.stretching_name(), sigma.stretching_name());
+        assert_eq!(levels.fields, SOLUTION_3D_FIELDS);
+        assert_eq!(levels.field("temp"), Some(2));
+        assert_eq!(header.metadata("cage"), Some("1,2,3"));
+
+        let frame = reader.read_frame(1).unwrap();
+        assert_eq!(frame.t, 60.0);
+        for (f, data) in [&frame.eta, &frame.u, &frame.v]
+            .into_iter()
+            .chain(&frame.layers)
+            .enumerate()
+        {
+            let len = if f < 3 { n } else { 5 * n };
+            assert_eq!(data.len(), len, "field {f}");
+            for (i, &x) in data.iter().enumerate() {
+                assert_eq!(x, value(f, i) as f32, "field {f}, value {i}");
+            }
+        }
+        // A 2D state does not fit a 3D file
+        let q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        assert!(writer.write_state(0.0, &q).is_err());
+        assert!(
+            writer
+                .write_solution_3d(0.0, &Solution3D::new(mesh.n_elements, ops.n_nodes, 4))
+                .is_err()
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn version_1_files_still_read() {
+        let path = scratch("v1");
+        let mesh = mesh();
+        let ops = DGOperators2D::new(1);
+        let n = mesh.n_elements * ops.n_nodes;
+        let bed = vec![-5.0; n];
+        let mut writer =
+            SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[("title", "old")], 1e-3)
+                .unwrap();
+        let eta = vec![0.5f32; n];
+        writer.write_fields(7.0, &eta, &eta, &eta, &[]).unwrap();
+        drop(writer);
+        // Version 1 is version 2 without the levels' count at the end of the header
+        let mut bytes = std::fs::read(&path).unwrap();
+        let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
+        assert_eq!(bytes[16 + header_len - 4..16 + header_len], [0; 4]);
+        bytes.drain(16 + header_len - 4..16 + header_len);
+        bytes[7] = 1;
+        bytes[8..16].copy_from_slice(&(header_len as u64 - 4).to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut reader = SnapshotReader::open(&path).unwrap();
+        assert!(reader.header().levels.is_none());
+        assert_eq!(reader.header().metadata("title"), Some("old"));
+        assert_eq!(reader.n_frames().unwrap(), 1);
+        let frame = reader.read_frame(0).unwrap();
+        assert_eq!((frame.t, frame.eta[n - 1]), (7.0, 0.5));
+        assert!(frame.layers.is_empty());
+        // A version from the future is refused
+        bytes[7] = VERSION + 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(SnapshotReader::open(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn other_files_are_refused() {
         let path = scratch("bad");
         std::fs::write(&path, b"<?xml version=\"1.0\"?> not a snapshot").unwrap();
@@ -576,7 +881,7 @@ mod tests {
         let mut writer = SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[], 1e-3).unwrap();
         assert!(
             writer
-                .write_fields(0.0, &[0.0; 3], &[0.0; 3], &[0.0; 3])
+                .write_fields(0.0, &[0.0; 3], &[0.0; 3], &[0.0; 3], &[])
                 .is_err()
         );
         assert!(SnapshotWriter::create(&path, &mesh, &ops, &bed[1..], None, &[], 1e-3).is_err());

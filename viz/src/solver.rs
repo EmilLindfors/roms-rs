@@ -21,6 +21,7 @@ use dg_rs::boundary::{
     CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D,
 };
 use dg_rs::equations::ShallowWater2D;
+use dg_rs::io::SnapshotWriter;
 use dg_rs::physics::{
     BottomDrag3D, Forcing as Forcing3D, GlsMixing, Hydrostatic3D, LinearEOS, PhysicsBuilder,
 };
@@ -68,6 +69,34 @@ impl SourceTerm2D for TidalForce {
 
     fn name(&self) -> &'static str {
         "tidal_force"
+    }
+}
+
+/// The snapshot file a run is saved to, if any, and the time of its last frame. A
+/// snapshot no later than that (the run's first callback repeats t = 0) is not
+/// written again; on the first error it says so and stops writing, and the run goes
+/// on.
+struct Save(Option<SnapshotWriter>, f64);
+
+impl Save {
+    fn new(writer: Option<SnapshotWriter>) -> Self {
+        Self(writer, f64::NEG_INFINITY)
+    }
+
+    fn write(&mut self, snapshot: &Snapshot) {
+        let Some(writer) = self.0.as_mut().filter(|_| snapshot.t > self.1) else {
+            return;
+        };
+        match crate::replay::save(writer, snapshot) {
+            Ok(()) => self.1 = snapshot.t,
+            Err(e) => {
+                eprintln!(
+                    "cannot save the snapshot at t = {} s, no more saved: {e}",
+                    snapshot.t
+                );
+                self.0 = None;
+            }
+        }
     }
 }
 
@@ -183,9 +212,15 @@ pub struct SolverConfig {
 }
 
 /// Start the run; snapshots arrive on the returned channel, the first at t = 0.
-pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessage> {
+/// With `save`, every snapshot is also written to that snapshot file
+/// ([`crate::replay::writer`]).
+pub fn spawn(
+    scenario: &Scenario,
+    config: SolverConfig,
+    save: Option<SnapshotWriter>,
+) -> Receiver<SolverMessage> {
     if scenario.three_d.is_some() {
-        return spawn_3d(scenario, config);
+        return spawn_3d(scenario, config, save);
     }
     let (tx, rx) = channel();
     let mesh = scenario.mesh.clone();
@@ -249,6 +284,7 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
                 .build();
 
                 let started = Instant::now();
+                let mut save = Save::new(save);
                 let mut cloud = (config.particles.per_release > 0)
                     .then(|| Cloud::new(&mesh, &ops, &cages, config.particles));
                 // A send fails only once the viewer has closed; the run then ends with the process.
@@ -260,12 +296,9 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
                         }
                         None => ParticleSnapshot::default(),
                     };
-                    let _ = tx.send(SolverMessage::Snapshot(Box::new(Snapshot::of(
-                        q,
-                        &bathymetry.data,
-                        t,
-                        particles,
-                    ))));
+                    let snapshot = Snapshot::of(q, &bathymetry.data, t, particles);
+                    save.write(&snapshot);
+                    let _ = tx.send(SolverMessage::Snapshot(Box::new(snapshot)));
                 };
                 send(&q, 0.0);
                 let result = if config.levels > 0 {
@@ -293,7 +326,11 @@ pub fn spawn(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessag
 /// [`spawn`] for a scenario with a 3D model: the stratified channel of
 /// `examples/farm_3d.rs` (GLS k-ε, log-layer bottom drag, background plus Smagorinsky
 /// viscosity, net-cage drag per layer), from rest.
-fn spawn_3d(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessage> {
+fn spawn_3d(
+    scenario: &Scenario,
+    config: SolverConfig,
+    save: Option<SnapshotWriter>,
+) -> Receiver<SolverMessage> {
     let (tx, rx) = channel();
     let three_d = scenario
         .three_d
@@ -376,6 +413,7 @@ fn spawn_3d(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessage
                 physics.update_density(&mut state);
 
                 let started = Instant::now();
+                let mut save = Save::new(save);
                 let mut cloud = (config.particles.per_release > 0).then(|| {
                     Cloud3D::new(
                         &mesh,
@@ -387,6 +425,7 @@ fn spawn_3d(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessage
                         config.particles,
                     )
                 });
+                let last_sent = std::cell::Cell::new(f64::NEG_INFINITY);
                 let mut send = |s: &Solution3D, t: f64| {
                     let particles = match cloud.as_mut() {
                         Some(cloud) => {
@@ -395,14 +434,20 @@ fn spawn_3d(scenario: &Scenario, config: SolverConfig) -> Receiver<SolverMessage
                         }
                         None => ParticleSnapshot::default(),
                     };
-                    let _ = tx.send(SolverMessage::Snapshot(Box::new(Snapshot::of_3d(
-                        s, t, particles,
-                    ))));
+                    let snapshot = Snapshot::of_3d(s, t, particles);
+                    save.write(&snapshot);
+                    last_sent.set(t);
+                    let _ = tx.send(SolverMessage::Snapshot(Box::new(snapshot)));
                 };
                 let result = Simulation3D::new(physics, ModeSplitIntegrator::new())
                     .with_cfl(0.5)
                     .with_callback_interval(config.interval)
                     .run_with_callback(&mut state, 0.0, config.t_end, &mut send);
+                // `Simulation3D` calls back at the first step past each interval, so
+                // the end of the run may not have been sent
+                if result.final_time > last_sent.get() + 1e-6 {
+                    send(&state, result.final_time);
+                }
                 let _ = tx.send(SolverMessage::Finished {
                     steps: result.n_steps,
                     wall: started.elapsed().as_secs_f64(),

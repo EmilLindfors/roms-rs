@@ -30,7 +30,7 @@ use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::particles::ClearSkyLight;
 use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::NetCage;
+use dg_rs::source::{CageFootprint, NetCage};
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
 use dg_rs::vertical::{SigmaGrid, UniformStretching};
@@ -114,6 +114,8 @@ pub struct Scenario {
     pub three_d: Option<ThreeD>,
     /// The mesh's periods along x and y (m), for a periodic mesh
     pub periodic: Option<[f64; 2]>,
+    /// UTC of model time 0, for a scenario with a date (its tides, its daylight)
+    pub clock: Option<ModelClock>,
 }
 
 impl Scenario {
@@ -149,6 +151,7 @@ impl Scenario {
             },
             three_d: None,
             periodic: None,
+            clock: None,
             mesh,
             ops,
             geom,
@@ -195,6 +198,7 @@ impl Scenario {
             cages,
             // Periodic along the channel only
             periodic: Some([LX, f64::INFINITY]),
+            clock: Some(clock),
             farm: FARM,
             // Low, from the second cage's side, so the section stands behind the cages
             close_up: CloseUp {
@@ -317,6 +321,7 @@ impl Scenario {
             },
             three_d: None,
             periodic: None,
+            clock: Some(clock),
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
             geom: Arc::new(geom),
@@ -326,8 +331,11 @@ impl Scenario {
 
     /// The domain of a snapshot file's header, for a replay: its mesh and bed, a
     /// close-up at its point of interest (`point_of_interest=x,y`, else its first
-    /// `station=name,x,y`, else the domain's centre) framed for the domain's size. It
-    /// runs nothing, so its forcing is none.
+    /// `station=name,x,y`, else the domain's centre) framed for the domain's size,
+    /// the cages (`cage=x,y,radius,net_depth,drag_per_length`) and the periods of a
+    /// periodic mesh (`periodic=x,y`). A 3D file's σ-grid makes it a 3D scenario, with
+    /// its section at `section=x0,y0,x1,y1` (else along x through the point of
+    /// interest). It runs nothing, so its forcing and 3D physics are none.
     pub fn from_snapshot(header: SnapshotHeader) -> Self {
         let (lo, hi) = header.mesh.vertices.iter().fold(
             ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
@@ -350,6 +358,53 @@ impl Scenario {
             .or_else(|| header.metadata("station").and_then(point))
             .unwrap_or([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])]);
         let name = ascii(header.metadata("title").unwrap_or("Snapshot file"));
+        let numbers = |s: &str| -> Option<Vec<f64>> {
+            s.split(',').map(|c| c.trim().parse::<f64>().ok()).collect()
+        };
+        let cages = header
+            .metadata
+            .iter()
+            .filter(|(k, _)| k == "cage")
+            .filter_map(|(_, v)| match numbers(v)?.as_slice() {
+                &[x, y, radius, depth, drag] => Some(NetCage::new(
+                    CageFootprint::Circle {
+                        center: [x, y],
+                        radius,
+                    },
+                    depth,
+                    drag,
+                )),
+                _ => None,
+            })
+            .collect();
+        let periodic = header
+            .metadata("periodic")
+            .and_then(numbers)
+            .and_then(|p| <[f64; 2]>::try_from(p).ok());
+        let three_d = header.levels.as_ref().map(|levels| {
+            let section = header
+                .metadata("section")
+                .and_then(numbers)
+                .and_then(|c| <[f64; 4]>::try_from(c).ok())
+                .map_or(
+                    [
+                        [farm[0] - extent / 10.0, farm[1]],
+                        [farm[0] + extent / 10.0, farm[1]],
+                    ],
+                    |[x0, y0, x1, y1]| [[x0, y0], [x1, y1]],
+                );
+            ThreeD {
+                sigma: Arc::new(levels.sigma.clone()),
+                // A replay runs no model: these are not used
+                temperature: |_| 0.0,
+                salinity: 0.0,
+                roughness: 0.0,
+                viscosity: 0.0,
+                smagorinsky: 0.0,
+                section,
+                light: ClearSkyLight::new(header.clock.unwrap_or_default(), 0.0, 0.0),
+            }
+        });
 
         let ops = DGOperators2D::new(header.order);
         let mesh = header.mesh;
@@ -357,15 +412,20 @@ impl Scenario {
         let mut bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, 0.0);
         bathymetry.data.copy_from_slice(&header.bathymetry);
         bathymetry.compute_gradients(&ops, &geom);
+        // As Frøya's for its ≈ 60 km; in 3D low, so that the section stands behind
+        let (yaw, pitch) = if three_d.is_some() {
+            (2.6, 0.28)
+        } else {
+            (0.7, 0.5)
+        };
         Self {
             name,
-            cages: Vec::new(),
+            cages,
             farm,
-            // As Frøya's for its ≈ 60 km
             close_up: CloseUp {
                 distance: (extent / 10.0) as f32,
-                yaw: 0.7,
-                pitch: 0.5,
+                yaw,
+                pitch,
                 arrow_spacing: extent / 240.0,
                 arrow_radius: extent / 12.0,
             },
@@ -375,8 +435,9 @@ impl Scenario {
                 coriolis: 0.0,
                 ramp: 0.0,
             },
-            three_d: None,
-            periodic: None,
+            three_d,
+            periodic,
+            clock: header.clock,
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
             geom: Arc::new(geom),
