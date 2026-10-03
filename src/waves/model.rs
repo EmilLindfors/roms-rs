@@ -670,6 +670,22 @@ impl WaveModel2D {
         self.parameters(n).iter().map(|p| alpha * p.hs).collect()
     }
 
+    /// The waves' bed stress per ρ (m²/s²) at every node on a bed of roughness
+    /// length `z0` (m), Soulsby's `½ f_w U_w²` ([`SpectralGrid::bed_wave_stress`]),
+    /// for [`crate::source::WaveCurrentFriction2D`].
+    pub fn bed_wave_stress(&self, n: &WaveSolution, z0: f64) -> Vec<f64> {
+        let (np, nf) = (self.n_points(), self.grid.n_freq());
+        let mut e = vec![0.0; self.grid.n_components()];
+        let mut k = vec![0.0; nf];
+        (0..np)
+            .map(|p| {
+                self.energy_spectrum_into(n, p, &mut e);
+                (0..nf).for_each(|i| k[i] = self.k[i * np + p]);
+                self.grid.bed_wave_stress(&e, &k, self.depth[p], z0)
+            })
+            .collect()
+    }
+
     /// Radiation stress per ρg `[S_xx, S_xy, S_yy]` (m²) at every node.
     pub fn radiation_stress(&self, n: &WaveSolution) -> Vec<[f64; 3]> {
         let (np, nf) = (self.n_points(), self.grid.n_freq());

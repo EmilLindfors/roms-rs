@@ -1,7 +1,7 @@
 //! Gates of the coupling from the spectral wave model to the circulation (TODO
-//! F.4): the radiation-stress force of `WaveForce2D` on the 2D shallow-water
-//! model, through the production path (`Simulation` + `SSPRK3` +
-//! `SWEPhysics2D`).
+//! F.4): the radiation-stress force of `WaveForce2D` and the wave-enhanced bed
+//! friction of `WaveCurrentFriction2D` on the 2D shallow-water model, through
+//! the production path (`Simulation` + `SSPRK3` + `SWEPhysics2D`).
 
 use std::sync::Arc;
 
@@ -12,7 +12,9 @@ use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::PhysicsBuilder;
 use dg_rs::simulation::Simulation;
 use dg_rs::solver::{SWESolution2D, SWEState2D};
-use dg_rs::source::{SourceContext2D, SourceTerm2D, WaveForce2D};
+use dg_rs::source::{
+    ChezyFriction2D, SourceContext2D, SourceTerm2D, WaveCurrentFriction2D, WaveForce2D,
+};
 use dg_rs::time::SSPRK3;
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{SpectralGrid, WaveModel2D, WaveWorkspace, wavenumber};
@@ -151,4 +153,107 @@ fn shoaling_waves_set_the_water_down() {
     assert!(range > 0.01, "a set-down of {range} m");
     assert!(speed < 5e-5, "not at rest: {speed} m/s");
     assert!(worst < 0.01 * range, "η off the formula by {worst:e} m");
+}
+
+/// A uniform body force `G` per unit mass along x.
+struct BodyForce(f64);
+
+impl SourceTerm2D for BodyForce {
+    fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
+        SWEState2D::new(0.0, ctx.state.h * self.0, 0.0)
+    }
+
+    fn name(&self) -> &'static str {
+        "body_force"
+    }
+}
+
+/// A current driven along a periodic channel 10 m deep by a body force, under
+/// a uniform sea whose bed stress is that of a 12.5 s wave of 1 m (from the
+/// wave model, on a 2 mm roughness). Steady at
+/// `G h = C_d u² [1 + 1.2 (τ_w/(C_d u² + τ_w))^3.2]`: the waves slow the
+/// current by enhancing its friction, and the model holds the root of that
+/// balance to 1e-7 (the point-implicit friction, applied through
+/// `with_implicit_friction`): 0.63 m/s without the waves, 0.46 m/s under
+/// their 6 Pa.
+#[test]
+fn waves_slow_a_current_by_soulsbys_enhanced_friction() {
+    let (h, forcing, cd, z0) = (10.0, 1e-4, 2.5e-3, 0.002);
+    let mesh = Mesh2D::uniform_periodic(0.0, 2000.0, 0.0, 2000.0, 2, 2);
+    let ops = Arc::new(DGOperators2D::new(2));
+    let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+    let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -h));
+    let mesh = Arc::new(mesh);
+    // The waves' bed stress: one component, 1 m, along y
+    let grid = SpectralGrid::new(0.05, 0.3, 20, 12);
+    let (i, j) = (5, 3);
+    let mut e = vec![0.0; grid.n_components()];
+    e[grid.component(i, j)] = 1.0 / 8.0 / (grid.d_sigma[i] * grid.d_theta);
+    let waves = WaveModel2D::new(
+        mesh.clone(),
+        ops.clone(),
+        geom.clone(),
+        &bathymetry,
+        grid,
+        G,
+    );
+    let tau_w = waves.bed_wave_stress(&waves.uniform_state(&e), z0);
+    let tw = tau_w[0];
+    assert!(tau_w.iter().all(|&t| (t - tw).abs() < 1e-15 * tw));
+
+    let speed = |tau_w: f64| {
+        let law =
+            WaveCurrentFriction2D::new(ChezyFriction2D::new(cd), vec![tau_w; waves.n_points()]);
+        let physics = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::new(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_source(BodyForce(forcing))
+        .with_implicit_friction(law)
+        .build();
+        let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                q.set_state(k, i, SWEState2D::new(h, 0.0, 0.0));
+            }
+        }
+        let result = Simulation::new(physics, SSPRK3).run(&mut q, 0.0, 60_000.0);
+        assert!(result.success, "{result:?}");
+        q.hu_data()[0] / q.h_data()[0]
+    };
+    // The root of G h = C_d u² E(C_d u², τ_w), by bisection
+    let exact = |tau_w: f64| {
+        let residual = |u: f64| {
+            let tau_c = cd * u * u;
+            tau_c * WaveCurrentFriction2D::<ChezyFriction2D>::enhancement(tau_c, tau_w)
+                - forcing * h
+        };
+        let (mut lo, mut hi) = (0.0, 1.0);
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            if residual(mid) > 0.0 {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        0.5 * (lo + hi)
+    };
+    let (calm, rough) = (speed(0.0), speed(tw));
+    println!(
+        "τ_w {:.2} Pa: u {calm:.4} m/s without waves, {rough:.4} m/s under them (exact {:.4}, {:.4})",
+        1025.0 * tw,
+        exact(0.0),
+        exact(tw)
+    );
+    assert!((calm / exact(0.0) - 1.0).abs() < 1e-7, "calm: {calm}");
+    assert!(
+        (rough / exact(tw) - 1.0).abs() < 1e-9,
+        "under waves: {rough}"
+    );
+    assert!(rough < 0.75 * calm, "the waves barely slowed the current");
 }

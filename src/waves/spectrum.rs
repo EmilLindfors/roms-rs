@@ -250,6 +250,37 @@ impl SpectralGrid {
         }
         (u2 * self.d_theta).sqrt()
     }
+
+    /// The bed stress of the waves per ρ (m²/s²) on a bed of roughness length
+    /// `z0` (m), Soulsby's (1997) rough-turbulent `τ_w/ρ = ½ f_w U_w²`,
+    /// `f_w = 1.39 (A/z₀)^(−0.52)`, with the orbital velocity amplitude
+    /// `U_w = √2 U_rms` and excursion `A = U_w T_z/2π` of a spectrum, `T_z`
+    /// the zero-crossing period of the near-bed velocity,
+    /// `2π √(Σ U-spectrum / Σ σ² U-spectrum)`. For one component they are
+    /// the amplitude and period of its orbital motion. Zero without motion at
+    /// the bed.
+    pub fn bed_wave_stress(&self, e: &[f64], k: &[f64], depth: f64, z0: f64) -> f64 {
+        let nd = self.n_dir();
+        let (mut u0, mut u2) = (0.0, 0.0);
+        for i in 0..self.n_freq() {
+            let kd = k[i] * depth;
+            if kd > 30.0 {
+                continue;
+            }
+            let row: f64 = e[i * nd..(i + 1) * nd].iter().sum();
+            let spectrum = (self.sigma[i] / kd.sinh()).powi(2) * row * self.d_sigma[i];
+            u0 += spectrum;
+            u2 += self.sigma[i].powi(2) * spectrum;
+        }
+        if u0 <= 0.0 || u2 <= 0.0 {
+            return 0.0;
+        }
+        let u_w = (2.0 * u0 * self.d_theta).sqrt();
+        // A = U_w / ω_z, ω_z = √(u2/u0)
+        let excursion = u_w * (u0 / u2).sqrt();
+        let f_w = 1.39 * (excursion / z0).powf(-0.52);
+        0.5 * f_w * u_w * u_w
+    }
 }
 
 /// `cosh(2k(z + d))/sinh²(kd)` (`2 e^{2kz}` in deep water), the depth profile of
@@ -362,5 +393,42 @@ mod tests {
             (u / (m0 * G / depth).sqrt() - 1.0).abs() < 0.02,
             "U_rms {u}"
         );
+    }
+
+    #[test]
+    fn the_bed_stress_of_one_component_is_soulsbys() {
+        // A 12.5 s wave of 1 m in 8 m: U_w = a σ/sinh(kd), A = U_w/σ
+        let grid = SpectralGrid::new(0.05, 0.3, 20, 12);
+        let (i, depth, z0) = (5, 8.0, 0.002);
+        let mut e = vec![0.0; grid.n_components()];
+        let m0 = 1.0 / 8.0;
+        e[grid.component(i, 3)] = m0 / (grid.d_sigma[i] * grid.d_theta);
+        let k: Vec<f64> = grid
+            .sigma
+            .iter()
+            .map(|&s| wavenumber(s, depth, G))
+            .collect();
+        let (s, a) = (grid.sigma[i], (2.0 * m0).sqrt());
+        let u_w = a * s / (k[i] * depth).sinh();
+        let f_w = 1.39 * (u_w / s / z0).powf(-0.52);
+        let expected = 0.5 * f_w * u_w * u_w;
+        let got = grid.bed_wave_stress(&e, &k, depth, z0);
+        assert!(
+            (got / expected - 1.0).abs() < 1e-12,
+            "{got} against {expected}"
+        );
+        // U_w 0.54 m/s, A 1.1 m, f_w 0.053: 7.4 Pa, a storm's stress in 8 m
+        assert!(
+            (5.0..10.0).contains(&(1025.0 * got)),
+            "τ_w {} Pa",
+            1025.0 * got
+        );
+        // Nothing reaches a deep bed
+        let deep: Vec<f64> = grid
+            .sigma
+            .iter()
+            .map(|&s| wavenumber(s, 2000.0, G))
+            .collect();
+        assert_eq!(grid.bed_wave_stress(&e, &deep, 2000.0, z0), 0.0);
     }
 }

@@ -20,11 +20,23 @@
 //! The vortex-force form of McWilliams et al. (2004), which separates the
 //! conservative part into a Bernoulli head and needs the Stokes drift in the
 //! advection, is an alternative for 3D (TODO F.4).
+//!
+//! [`WaveCurrentFriction2D`] raises the bed friction of the current under
+//! waves: the wave boundary layer's turbulence enhances the mean stress,
+//! Soulsby's (1995) fit to the combined wave–current models,
+//!
+//! ```text
+//! τ_m = τ_c [1 + 1.2 (τ_w/(τ_c + τ_w))^3.2],
+//! ```
+//!
+//! with `τ_c` the stress of the current alone (any [`BottomFriction2D`] law) and
+//! `τ_w` the waves' ([`WaveModel2D::bed_wave_stress`]). Up to 2.2× the current's
+//! where the waves dominate; unchanged without them.
 
 use crate::boundary::tidal_ramp;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::SWEState2D;
-use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
+use crate::source::{BottomFriction2D, ElementSources, SourceContext2D, SourceTerm2D};
 use crate::waves::model::nodal_gradient;
 use crate::waves::{WaveModel2D, WaveSolution};
 
@@ -162,6 +174,57 @@ impl SourceTerm2D for WaveForce2D {
     }
 }
 
+/// Bottom friction of a current enhanced by waves (see the module docs):
+/// `inner`'s damping rate times `1 + 1.2 (τ_w/(τ_c + τ_w))^3.2`.
+#[derive(Clone, Debug)]
+pub struct WaveCurrentFriction2D<F> {
+    inner: F,
+    /// The waves' bed stress per ρ (m²/s²) per node
+    wave_stress: Vec<f64>,
+}
+
+impl<F: BottomFriction2D> WaveCurrentFriction2D<F> {
+    /// `inner` under waves whose bed stress per ρ is `wave_stress` (m²/s², per
+    /// node, element by element: [`WaveModel2D::bed_wave_stress`]).
+    pub fn new(inner: F, wave_stress: Vec<f64>) -> Self {
+        assert!(
+            wave_stress.iter().all(|&t| t >= 0.0),
+            "wave stresses must be non-negative"
+        );
+        if let Some(n) = inner.n_total_nodes() {
+            assert_eq!(n, wave_stress.len(), "one wave stress per node of the law");
+        }
+        Self { inner, wave_stress }
+    }
+
+    /// Replace the waves' stress, as a coupling does every interval.
+    pub fn set_wave_stress(&mut self, wave_stress: &[f64]) {
+        assert_eq!(wave_stress.len(), self.wave_stress.len());
+        self.wave_stress.copy_from_slice(wave_stress);
+    }
+
+    /// Soulsby's enhancement `1 + 1.2 (τ_w/(τ_c + τ_w))^3.2` of the current's
+    /// stress `tau_c` under the waves' `tau_w` (any common units).
+    pub fn enhancement(tau_c: f64, tau_w: f64) -> f64 {
+        if tau_w <= 0.0 {
+            return 1.0;
+        }
+        1.0 + 1.2 * (tau_w / (tau_c + tau_w)).powf(3.2)
+    }
+}
+
+impl<F: BottomFriction2D> BottomFriction2D for WaveCurrentFriction2D<F> {
+    /// The inner rate `Λ_c`, times the enhancement with `τ_c/ρ = Λ_c h |u|`.
+    fn damping_rate(&self, node: usize, h: f64, speed: f64) -> f64 {
+        let rate = self.inner.damping_rate(node, h, speed);
+        rate * Self::enhancement(rate * h * speed, self.wave_stress[node])
+    }
+
+    fn n_total_nodes(&self) -> Option<usize> {
+        Some(self.wave_stress.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +300,26 @@ mod tests {
             assert!((hu[i] - 0.5 * f[0]).abs() < 1e-15 && (hv[i] - 0.5 * f[1]).abs() < 1e-15);
         }
         assert!(h.iter().all(|&x| x == 0.0));
+    }
+
+    /// Soulsby's enhancement: none without waves, 1 + 1.2·2^(−3.2) when the
+    /// stresses are equal, 2.2 where the waves dominate; the friction law
+    /// scales its inner rate by it, node by node.
+    #[test]
+    fn waves_enhance_the_bed_friction_as_soulsby_fits() {
+        use crate::source::ChezyFriction2D;
+        type Law = WaveCurrentFriction2D<ChezyFriction2D>;
+        assert_eq!(Law::enhancement(0.3, 0.0), 1.0);
+        assert!((Law::enhancement(0.3, 0.3) - (1.0 + 1.2 * 0.5f64.powf(3.2))).abs() < 1e-15);
+        assert!((Law::enhancement(1e-9, 1.0) - 2.2).abs() < 1e-8);
+        let (cd, h, speed) = (2.5e-3, 10.0, 0.4);
+        let law = Law::new(ChezyFriction2D::new(cd), vec![0.0, 4e-4, 10.0]);
+        let plain = cd * speed / h;
+        let tau_c = cd * speed * speed;
+        assert_eq!(law.damping_rate(0, h, speed), plain);
+        let expected = plain * Law::enhancement(tau_c, 4e-4);
+        assert!((law.damping_rate(1, h, speed) - expected).abs() < 1e-18);
+        assert!((law.damping_rate(2, h, speed) / plain - 2.2).abs() < 1e-3);
+        assert_eq!(law.n_total_nodes(), Some(3));
     }
 }
