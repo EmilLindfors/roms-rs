@@ -3,9 +3,13 @@
 //! Two kinds of output replay:
 //! - A snapshot file (`dg_rs::io::SnapshotWriter`, `.dgsnap`), as
 //!   `examples/froya_real_data.rs snapshot_minutes=N` writes it: f32 η, u, v per node,
-//!   with the mesh, the bed, the clock and the stations in its header. The scenario is
-//!   built from the file alone ([`Scenario::from_snapshot`]), so the run's domain data
-//!   and builder are not needed.
+//!   with the mesh, the bed, the clock and the stations in its header; a 3D file
+//!   (`examples/farm_3d.rs snapshot=`, or a live 3D run saved by the viewer) adds the
+//!   σ-grid and u, v, T on every level, which become the snapshots' [`Layers`]. The
+//!   scenario is built from the file alone ([`Scenario::from_snapshot`]: mesh, bed,
+//!   cages, σ-grid, section), so the run's domain data and builder are not needed.
+//!   [`writer`] and [`save`] write such a file from the viewer's own snapshots
+//!   (`--save-snapshot`, live or replayed).
 //! - A directory of VTU frames (`froya_NNNN.vtu`, `dg_rs::io::write_vtk_swe`): every
 //!   element's nodes in the solver's order, with `eta`, `u`, `v`, `bathymetry` and the
 //!   model time (`TimeValue`), in ASCII. These carry no mesh connectivity, so the
@@ -26,14 +30,15 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
-use dg_rs::io::{SnapshotFrame, SnapshotReader, SnapshotWriter};
+use dg_rs::io::{SnapshotError, SnapshotFrame, SnapshotReader, SnapshotWriter};
+use dg_rs::source::CageFootprint;
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
 use rayon::prelude::*;
 
 use crate::particles::ParticleSnapshot;
 use crate::scenario::Scenario;
-use crate::solver::{H_DRY, Snapshot, SolverMessage};
+use crate::solver::{H_DRY, Layers, Snapshot, SolverMessage};
 
 /// How far (m) the frames' node positions and bed may lie from the scenario's: the
 /// files carry ten significant digits, ≈ 1e-6 m over a domain tens of km wide.
@@ -43,8 +48,8 @@ const TOLERANCE: f64 = 1e-3;
 enum Frames {
     /// VTU files, in time order
     Vtu(Vec<PathBuf>),
-    /// A snapshot file, and its number of frames when opened
-    Snapshot(Box<SnapshotReader>, usize),
+    /// A snapshot file, its number of frames when opened, and its layers in 3D
+    Snapshot(Box<SnapshotReader>, usize, Option<LayerFields>),
 }
 
 /// The frames of a finished run.
@@ -148,16 +153,34 @@ impl Replay {
         }
         let t_first = reader.time(0)?;
         let t_last = reader.time(n - 1)?;
+        // The mean spacing: a run's callbacks need not be evenly spaced
         let interval = if n > 1 {
-            reader.time(1)? - t_first
+            (t_last - t_first) / (n - 1) as f64
         } else {
             0.0
         };
         let header = reader.header().clone();
         let clock = header.clock;
+        // The layered fields the viewer draws: u, v and T on every level
+        let layers = match &header.levels {
+            Some(levels) => {
+                let field = |name: &str| {
+                    levels
+                        .field(name)
+                        .ok_or_else(|| format!("the file's levels have no {name} field"))
+                };
+                Some(LayerFields {
+                    n_levels: levels.sigma.n_levels(),
+                    u: field("u")?,
+                    v: field("v")?,
+                    temp: levels.field("temp"),
+                })
+            }
+            None => None,
+        };
         let scenario = Scenario::from_snapshot(header);
         let replay = Self {
-            frames: Frames::Snapshot(Box::new(reader), n),
+            frames: Frames::Snapshot(Box::new(reader), n, layers),
             t_first,
             t_last,
             interval,
@@ -168,32 +191,99 @@ impl Replay {
         Ok((replay, scenario))
     }
 
-    /// Also write the frames to the snapshot file `path` as they are read, with the
-    /// scenario's mesh and bed, the clock, the title and the point of interest.
+    /// Also write the frames to the snapshot file `path` as they are read
+    /// ([`writer`]).
     pub fn save_to(&mut self, path: &Path, scenario: &Scenario) -> Result<(), Box<dyn Error>> {
-        let poi = format!("{:.1},{:.1}", scenario.farm[0], scenario.farm[1]);
-        let title = scenario.name.split(':').next().unwrap_or_default();
-        self.save = Some(SnapshotWriter::create(
-            path,
-            &scenario.mesh,
-            &scenario.ops,
-            &scenario.bathymetry.data,
-            self.clock.as_ref(),
-            &[
-                ("title", title),
-                ("source", "dg-viz --save-snapshot"),
-                ("point_of_interest", &poi),
-            ],
-            H_DRY as f64,
-        )?);
+        self.save = Some(writer(path, scenario, self.clock.as_ref())?);
         Ok(())
     }
 
     pub fn frames(&self) -> usize {
         match &self.frames {
             Frames::Vtu(files) => files.len(),
-            Frames::Snapshot(_, n) => *n,
+            Frames::Snapshot(_, n, _) => *n,
         }
+    }
+}
+
+/// Where a 3D snapshot file's frames hold what the viewer's [`Layers`] draw.
+#[derive(Clone, Copy)]
+struct LayerFields {
+    n_levels: usize,
+    /// Indices into the frame's layered fields; no temperature is drawn as 0 °C
+    u: usize,
+    v: usize,
+    temp: Option<usize>,
+}
+
+/// The layered fields the viewer writes: what [`Layers`] holds.
+const VIEWER_FIELDS: [&str; 3] = ["u", "v", "temp"];
+
+/// A snapshot file at `path` for the scenario's runs: its mesh, bed and (in 3D)
+/// σ-grid, `clock`, and as metadata the title, the point of interest, the cages
+/// (`cage=x,y,radius,net_depth,drag_per_length`), the section of a 3D run
+/// (`section=x0,y0,x1,y1`) and the periods of a periodic mesh (`periodic=x,y`), so
+/// that [`Scenario::from_snapshot`] rebuilds what the viewer draws. Frames go in with
+/// [`save`].
+pub fn writer(
+    path: &Path,
+    scenario: &Scenario,
+    clock: Option<&ModelClock>,
+) -> Result<SnapshotWriter, Box<dyn Error>> {
+    let title = scenario
+        .name
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut metadata = vec![
+        ("title", title),
+        ("source", "dg-viz --save-snapshot".to_string()),
+        (
+            "point_of_interest",
+            format!("{:.1},{:.1}", scenario.farm[0], scenario.farm[1]),
+        ),
+    ];
+    for cage in &scenario.cages {
+        if let CageFootprint::Circle { center, radius } = cage.footprint {
+            metadata.push((
+                "cage",
+                format!(
+                    "{},{},{radius},{},{}",
+                    center[0], center[1], cage.net_depth, cage.drag_per_length
+                ),
+            ));
+        }
+    }
+    if let Some([x, y]) = scenario.periodic {
+        metadata.push(("periodic", format!("{x},{y}")));
+    }
+    if let Some(three_d) = &scenario.three_d {
+        let [[x0, y0], [x1, y1]] = three_d.section;
+        metadata.push(("section", format!("{x0},{y0},{x1},{y1}")));
+    }
+    let metadata: Vec<(&str, &str)> = metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let levels = scenario
+        .three_d
+        .as_ref()
+        .map(|three_d| (three_d.sigma.as_ref(), &VIEWER_FIELDS[..]));
+    Ok(SnapshotWriter::create_with(
+        path,
+        &scenario.mesh,
+        &scenario.ops,
+        &scenario.bathymetry.data,
+        clock,
+        &metadata,
+        H_DRY as f64,
+        levels,
+    )?)
+}
+
+/// Append the viewer's snapshot `s` to a file from [`writer`].
+pub fn save(writer: &mut SnapshotWriter, s: &Snapshot) -> Result<(), SnapshotError> {
+    match &s.layers {
+        Some(l) => writer.write_fields(s.t, &s.eta, &s.u, &s.v, &[&l.u, &l.v, &l.temp]),
+        None => writer.write_fields(s.t, &s.eta, &s.u, &s.v, &[]),
     }
 }
 
@@ -228,11 +318,9 @@ fn read_all(
     threads: usize,
     mut send: impl FnMut(Snapshot) -> bool,
 ) -> Result<(), String> {
-    let mut deliver = |snapshot: Snapshot, save: &mut Option<SnapshotWriter>| {
-        if let Some(writer) = save {
-            writer
-                .write_fields(snapshot.t, &snapshot.eta, &snapshot.u, &snapshot.v)
-                .map_err(|e| format!("saving the snapshot file: {e}"))?;
+    let mut deliver = |snapshot: Snapshot, writer: &mut Option<SnapshotWriter>| {
+        if let Some(writer) = writer {
+            save(writer, &snapshot).map_err(|e| format!("saving the snapshot file: {e}"))?;
         }
         Ok::<bool, String>(send(snapshot))
     };
@@ -260,13 +348,22 @@ fn read_all(
                 }
             }
         }
-        Frames::Snapshot(mut reader, n) => {
+        Frames::Snapshot(mut reader, n, layer_fields) => {
             let mut frame = SnapshotFrame::default();
             for i in 0..n {
                 reader
                     .read_frame_into(i, &mut frame)
                     .map_err(|e| format!("frame {i}: {e}"))?;
-                let snapshot = snapshot(frame.t, &frame.eta, &frame.u, &frame.v, &replay.bed);
+                let mut snapshot = snapshot(frame.t, &frame.eta, &frame.u, &frame.v, &replay.bed);
+                snapshot.layers = layer_fields.map(|f| Layers {
+                    n_levels: f.n_levels,
+                    u: frame.layers[f.u].clone(),
+                    v: frame.layers[f.v].clone(),
+                    temp: match f.temp {
+                        Some(t) => frame.layers[t].clone(),
+                        None => vec![0.0; frame.layers[f.u].len()],
+                    },
+                });
                 if !deliver(snapshot, &mut replay.save)? {
                     return Ok(());
                 }

@@ -112,6 +112,41 @@ impl SigmaGrid {
         }
     }
 
+    /// A grid of given levels, e.g. as stored in an output file: `sigma_w` the
+    /// n + 1 faces from −1 (bed) to 0 (surface), increasing, and `sigma_rho` the n
+    /// centres, each between its faces. `stretching` names where they came from.
+    pub fn from_levels(
+        sigma_rho: Vec<f64>,
+        sigma_w: Vec<f64>,
+        stretching: &str,
+    ) -> Result<Self, String> {
+        let n_levels = sigma_rho.len();
+        if n_levels == 0 || sigma_w.len() != n_levels + 1 {
+            return Err(format!(
+                "{n_levels} centres need {} faces, not {}",
+                n_levels + 1,
+                sigma_w.len()
+            ));
+        }
+        if (sigma_w[0] + 1.0).abs() > 1e-12 || sigma_w[n_levels].abs() > 1e-12 {
+            return Err("the faces must run from -1 to 0".into());
+        }
+        if let Some(k) =
+            (0..n_levels).find(|&k| !(sigma_w[k] < sigma_rho[k] && sigma_rho[k] < sigma_w[k + 1]))
+        {
+            return Err(format!("level {k}'s centre is not between its faces"));
+        }
+        let d_sigma = (0..n_levels).map(|k| sigma_w[k + 1] - sigma_w[k]).collect();
+        Ok(Self {
+            n_levels,
+            sigma_rho,
+            sigma_w,
+            d_sigma,
+            stretching_name: stretching.to_string(),
+            stretching_description: format!("{stretching} (from stored levels)"),
+        })
+    }
+
     /// Create a uniform sigma grid (convenience constructor).
     #[inline]
     pub fn uniform(n_levels: usize) -> Self {
@@ -685,6 +720,27 @@ mod tests {
     use crate::vertical::stretching::{SongHaidvogelStretching, UniformStretching};
 
     const TOL: f64 = 1e-10;
+
+    #[test]
+    fn a_grid_is_rebuilt_from_its_levels() {
+        let grid = SigmaGrid::new(7, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let rebuilt = SigmaGrid::from_levels(
+            grid.sigma_rho().to_vec(),
+            grid.sigma_w().to_vec(),
+            grid.stretching_name(),
+        )
+        .unwrap();
+        assert_eq!(rebuilt.d_sigma(), grid.d_sigma());
+        assert_eq!(
+            rebuilt.sigma_to_z(-0.3, 0.2, 40.0),
+            grid.sigma_to_z(-0.3, 0.2, 40.0)
+        );
+        // Faces not from −1 to 0, a centre outside its layer, or lengths that disagree
+        assert!(SigmaGrid::from_levels(vec![-0.5], vec![-1.0, 0.1], "x").is_err());
+        assert!(SigmaGrid::from_levels(vec![-0.9, -0.95], vec![-1.0, -0.5, 0.0], "x").is_err());
+        assert!(SigmaGrid::from_levels(vec![-0.5], vec![-1.0, -0.5, 0.0], "x").is_err());
+        assert!(SigmaGrid::from_levels(vec![], vec![-1.0], "x").is_err());
+    }
 
     #[test]
     fn test_depth_average() {

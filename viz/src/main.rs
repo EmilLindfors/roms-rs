@@ -38,9 +38,10 @@
 //!     scenario (Frøya unless `--scenario` says otherwise) must be built as the run
 //!     was: the frames' nodes and bed are checked against it. Frames are read in
 //!     parallel on `--threads`; the clock comes from the run's `run.log`.
-//! - `--save-snapshot FILE` with `--replay`: also write the frames read to a snapshot
-//!   file, a tenth of the VTU frames' size, which later replays read without the
-//!   scenario's data.
+//! - `--save-snapshot FILE` write the snapshots shown to a snapshot file (with the
+//!   mesh, bed, cages and, in 3D, the σ-grid and u, v, T on every level): a live run as
+//!   it runs, or the frames of a `--replay` as they are read (a tenth of VTU frames'
+//!   size). `--replay FILE` replays it later without the scenario's data.
 //! - `--gauge FILE` a tide-gauge record (`scripts/kartverket_gauge.sh` format, e.g.
 //!   `../data/tide_gauges/mausund_obs.txt`) drawn against the model's surface at the
 //!   close-up point in the trace (top right, G; [`trace`]); it needs the run's clock,
@@ -381,10 +382,21 @@ fn main() -> AppExit {
             Some(clock) => format!("{title}: replay from {} UTC", &clock.format(0.0)[..16]),
             None => format!("{title}: replay"),
         };
-    } else if args.save_snapshot.is_some() {
-        eprintln!("--save-snapshot needs --replay");
-        return AppExit::from_code(2);
     }
+    // A live run saved as it runs
+    let live_save = match (&replay, &args.save_snapshot) {
+        (None, Some(path)) => match replay::writer(path, &scenario, scenario.clock.as_ref()) {
+            Ok(writer) => {
+                println!("Saving the run to {}", path.display());
+                Some(writer)
+            }
+            Err(e) => {
+                eprintln!("cannot write {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
+        },
+        _ => None,
+    };
     if let Some(ramp) = args.ramp {
         scenario.forcing.ramp = ramp;
     }
@@ -526,9 +538,11 @@ fn main() -> AppExit {
                     drag: args.drag,
                     particles: args.particles,
                 },
+                live_save,
             );
             let rate = args.rate.unwrap_or(60.0);
-            (channel, Source::Solver, t_end, args.interval, rate, None)
+            let clock = scenario.clock;
+            (channel, Source::Solver, t_end, args.interval, rate, clock)
         }
     };
 

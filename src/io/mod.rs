@@ -131,7 +131,10 @@ pub use norkyst_reader::{
 pub use ocean_model::{OceanModelReader, OceanState};
 pub use profile_series::{ProfileLevels, ProfileSeries};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
-pub use snapshot::{SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotReader, SnapshotWriter};
+pub use snapshot::{
+    SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLevels,
+    SnapshotReader, SnapshotWriter,
+};
 pub use tide_gauge_reader::{
     TideGaugeFile, TideGaugeFileError, files_to_observation_map, read_tide_gauge_directory,
     read_tide_gauge_file, write_tide_gauge_file,
