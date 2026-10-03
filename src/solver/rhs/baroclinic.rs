@@ -91,6 +91,16 @@
 //! a penalty on the layer velocities' face jumps, nor a gentler slope
 //! (`r_x0` 0.08: blew up after 3 days) stopped the growth of the first row.
 //!
+//! Exact energy exchange is not enough on its own. Rest is stable when a
+//! conserved functional has its minimum there. The split form also conserves
+//! the tracer variance `Σ H_z ρ²`, and for a linear `ρ(z)` energy plus
+//! `g/(2|∂_z ρ|)` times the variance is such a functional. For a curved
+//! profile there is none once a σ-level crosses the pycnocline between two
+//! nodes of one element, as at the cliffs of a fjord coast. There the pair's
+//! chord `Δρ/Δz` is far steeper than the stratification at either node, and
+//! round-off grows (e-folding ≈ 15 min on the Frøya bed, ≈ 45 min in the
+//! x–z cliff of `a_pycnocline_over_a_cliff_stays_at_rest`; TODO P1.3).
+//!
 //! # Balanced reference
 //!
 //! The price of σ-pairs is the σ form's error at rest. A stored reference
@@ -175,8 +185,10 @@ use crate::vertical::SigmaGrid;
 pub enum PressureGradientForm {
     /// `(p_j − p_i) + ½(ρ_i + ρ_j)(z_j − z_i)` along the σ-level: consistent
     /// in energy with the split-form advection, so a stratified fluid over a
-    /// slope stays stable; the σ form's error at rest for curved profiles
-    /// (take it back with a [`BalancedReference`]).
+    /// slope stays stable (for curved profiles only while no σ-level crosses
+    /// the pycnocline within an element, see the module docs); the σ form's
+    /// error at rest for curved profiles (take it back with a
+    /// [`BalancedReference`]).
     #[default]
     SigmaPairs,
     /// Differences at a common depth (Stelling & van Kester 1994): at rest

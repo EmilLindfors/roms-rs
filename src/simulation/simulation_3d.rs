@@ -1643,6 +1643,109 @@ mod tests {
         );
     }
 
+    /// A stratified x–z channel at rest (8 P2 elements of 1 km, walls, 20
+    /// surface-stretched levels, no tracer diffusion) whose bed falls from
+    /// 15 to 300 m inside one element (a `tanh` cliff): every σ-level of
+    /// that element spans most of the water column, so its pairs of nodes
+    /// straddle whatever the density does in between. `rho(z)` sets T, and
+    /// is the PGF's reference profile, so the initial state feels no force.
+    /// Steps of 36 s for `hours`; the largest layer speed.
+    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
+        use crate::physics::EquationOfState;
+        use crate::vertical::SongHaidvogelStretching;
+        let (nx, dx) = (8, 1000.0);
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(
+            0.0,
+            nx as f64 * dx,
+            0.0,
+            dx,
+            nx,
+            1,
+        ));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            let t = (x / dx - 3.0).clamp(0.0, 1.0);
+            -(300.0 - 285.0 * 0.5 * (1.0 + (8.0 * (t - 0.5)).tanh()))
+        }));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_source(CoriolisSource2D::f_plane(1.2e-4))
+        .build();
+        let sigma = SigmaGrid::new(20, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let eos = LinearEOS::default();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
+            eos,
+            ConstantMixing::new(1e-3, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        // T of the density ρ(z) under the linear equation of state
+        let temp = |z: f64| eos.t0 - (rho(z) / eos.rho0 - 1.0) / eos.alpha;
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        for idx in 0..mesh.n_elements * nn {
+            let depth = -bathymetry.data[idx];
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                state.temp[idx * nl + l] = temp(s * depth);
+                state.salt[idx * nl + l] = eos.s0;
+            }
+        }
+        physics.update_density(&mut state);
+        let physics =
+            physics.with_reference_profile(&state, |z| eos.compute_density(temp(z), eos.s0, z));
+        let mut integrator = ModeSplitIntegrator::new();
+        let dt = 36.0;
+        for n in 0..(hours * 3600.0 / dt).round() as usize {
+            physics.update_density(&mut state);
+            integrator.step(&mut state, &physics, dt, n as f64 * dt);
+            physics.post_process(&mut state);
+        }
+        let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+        println!("cliff at rest: largest speed {speed:.2e} m/s after {hours} h");
+        speed
+    }
+
+    /// The cliff with N² constant (0.01 kg/m⁴): round-off stays round-off.
+    /// The split-form advection conserves the tracer variance besides the
+    /// energy, and for a linear profile energy plus a multiple of the
+    /// variance has its minimum at rest (TODO P1.3).
+    #[test]
+    fn constant_stratification_over_a_cliff_stays_at_rest() {
+        let speed = cliff_at_rest(|z| RHO0 - 0.01 * z, 6.0);
+        // Measured 1.8e-11 m/s
+        assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
+    }
+
+    /// TODO P1.3 gate (fails today): the cliff under a pycnocline (2 kg/m³
+    /// across ≈ 8 m at 15 m depth, 4e-4 kg/m⁴ above and below). Where a
+    /// σ-level crosses the pycnocline between two nodes of one element, the
+    /// pair's chord is far steeper than the stratification at either node,
+    /// no conserved functional has its minimum at rest, and round-off grows
+    /// with an e-folding of ≈ 45 min (2.3e-8 m/s after 6 h; on the Frøya bed
+    /// ≈ 15 min).
+    #[test]
+    #[ignore = "known failure, TODO P1.3: the pycnocline over a cliff is unstable at rest"]
+    fn a_pycnocline_over_a_cliff_stays_at_rest() {
+        let speed = cliff_at_rest(|z| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z, 6.0);
+        assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
+    }
+
     /// A stratified seamount at rest (Beckmann & Haidvogel 1993; TODO P4.6):
     /// `H = 400 m · (1 − 0.9 e^{−r²/L²})`, `L` = 4 km, in a doubly periodic
     /// 24 km square (6 × 6 P2), 10 stretched levels, f-plane, density

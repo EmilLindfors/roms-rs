@@ -114,7 +114,9 @@
 //! momentum tendency at rest), `uniform` (no stratification), `linear`
 //! (linear in z instead of the pycnocline), `balanced` (the initial state as
 //! the PGF's balanced reference), `nolimiter`, `constant` (constant mixing
-//! instead of GLS), `thin=D` (the 3D thin-column depth, 0.1 m by default).
+//! instead of GLS), `thin=D` (the 3D thin-column depth, 0.1 m by default),
+//! `vcentred` (centred vertical tracer advection), `nu=V` (a constant
+//! horizontal viscosity of the shear, m²/s, added to Smagorinsky's).
 //!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
 //! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
@@ -1897,6 +1899,17 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             .unwrap_or(0.1),
     )
     .with_smagorinsky_viscosity(0.1)
+    .with_horizontal_viscosity(
+        opts.debug_3d
+            .split(',')
+            .find_map(|f| f.strip_prefix("nu=").and_then(|v| v.parse().ok()))
+            .unwrap_or(0.0),
+    )
+    .with_vertical_advection(if dbg("vcentred") {
+        dg_rs::solver::rhs::VerticalAdvection::Centred
+    } else {
+        dg_rs::solver::rhs::VerticalAdvection::default()
+    })
     .with_tracer_limiter(if dbg("nolimiter") {
         TracerLimiter3DConfig::none()
     } else {
