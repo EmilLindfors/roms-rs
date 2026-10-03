@@ -27,6 +27,13 @@
 //!   threads, so play it back at `--rate 30` or below to keep up with the solver.
 //!   The channel runs in 3D, from rest with the tide ramped up over an hour; its
 //!   particles start at once, three kinds per cage.
+//! - `--replay DIR` play back a finished run's VTU frames instead of running the
+//!   solver ([`replay`]): the hourly `froya_NNNN.vtu` of `examples/froya_real_data.rs`
+//!   with `mesh=data/froya_coast.msh`, e.g. `--replay ../output/froya_15d_k1o1`. The
+//!   scenario (Frøya unless `--scenario` says otherwise) must be built as the run was:
+//!   the frames' nodes and bed are checked against it. Frames are read in parallel on
+//!   `--threads`, and shown linear in time between them; the rate defaults to an hour
+//!   per second, the status shows the run's UTC date when its `run.log` has the clock.
 //! - `--sigma N` σ-levels of a 3D run [16]; `--start TIME` the UTC instant of model
 //!   time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
 //!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
@@ -39,7 +46,7 @@
 //! - `--hours H` model hours to run [25]; `--interval S` model seconds between
 //!   snapshots [60]; `--threads N` solver threads [all but two cores]
 //! - `--memory MB` snapshots kept, oldest dropped first [2048]
-//! - `--rate R` model seconds shown per second [60]
+//! - `--rate R` model seconds shown per second [60; 3600 in a replay]
 //! - `--vz Z` vertical exaggeration [3]; `--speed-max V` fix the speed scale (m/s)
 //!   instead of letting it follow the flow in round steps
 //! - `--water-alpha A` opacity of the translucent water, 0.05–0.95 [0.4]; lower shows
@@ -70,6 +77,7 @@ mod hud;
 mod layers;
 mod particles;
 mod playback;
+mod replay;
 mod scenario;
 mod solver;
 mod surface;
@@ -87,16 +95,18 @@ use cages::{CageLayout, CagesPlugin};
 use camera::{CameraPlugin, OrbitCamera, Views};
 use contours::ContoursPlugin;
 use field::{Field, Frame, Nodes, Probe, ShownLayer};
-use hud::{HudPlugin, Title};
+use hud::{HudPlugin, RunClock, Title};
 use layers::{LayersPlugin, Levels, Section, SectionShows};
 use particles::{Lice, ParticleConfig, ParticlesPlugin, Periodic};
-use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState};
+use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState, Source};
+use replay::Replay;
 use scenario::Scenario;
 use solver::SolverConfig;
 use surface::{Colouring, SurfacePlugin, WaterOpacity};
 
 struct Args {
-    scenario: String,
+    scenario: Option<String>,
+    replay: Option<PathBuf>,
     mesh: Option<PathBuf>,
     order: usize,
     levels: usize,
@@ -104,7 +114,7 @@ struct Args {
     interval: f64,
     threads: usize,
     memory_mb: usize,
-    rate: f64,
+    rate: Option<f64>,
     vz: f32,
     speed_max: Option<f32>,
     water_alpha: f32,
@@ -123,7 +133,8 @@ struct Args {
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut args = Self {
-            scenario: "fjord".into(),
+            scenario: None,
+            replay: None,
             mesh: None,
             order: 2,
             levels: 8,
@@ -132,7 +143,7 @@ impl Args {
             threads: std::thread::available_parallelism()
                 .map_or(1, |n| n.get().saturating_sub(2).max(1)),
             memory_mb: 2048,
-            rate: 60.0,
+            rate: None,
             vz: 3.0,
             speed_max: None,
             water_alpha: WaterOpacity::default().0,
@@ -156,7 +167,8 @@ impl Args {
         while let Some(flag) = it.next() {
             let value = it.next().ok_or_else(|| format!("{flag} needs a value"))?;
             match flag.as_str() {
-                "--scenario" => args.scenario = value,
+                "--scenario" => args.scenario = Some(value),
+                "--replay" => args.replay = Some(value.into()),
                 "--mesh" => args.mesh = Some(value.into()),
                 "--order" => args.order = num(&flag, &value)?,
                 "--levels" => args.levels = num(&flag, &value)?,
@@ -164,7 +176,7 @@ impl Args {
                 "--interval" => args.interval = num(&flag, &value)?,
                 "--threads" => args.threads = num(&flag, &value)?,
                 "--memory" => args.memory_mb = num(&flag, &value)?,
-                "--rate" => args.rate = num(&flag, &value)?,
+                "--rate" => args.rate = Some(num(&flag, &value)?),
                 "--vz" => args.vz = num(&flag, &value)?,
                 "--speed-max" => args.speed_max = Some(num(&flag, &value)?),
                 "--water-alpha" => {
@@ -248,7 +260,16 @@ fn main() -> AppExit {
         }
     };
     let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
-    let built = match args.scenario.as_str() {
+    // A replay is of a Frøya run unless told otherwise
+    let scenario_name = args.scenario.clone().unwrap_or_else(|| {
+        if args.replay.is_some() {
+            "froya"
+        } else {
+            "fjord"
+        }
+        .into()
+    });
+    let built = match scenario_name.as_str() {
         "fjord" => {
             let mesh = args
                 .mesh
@@ -286,10 +307,46 @@ fn main() -> AppExit {
     let mut scenario = match built {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("cannot build the {} scenario: {e}", args.scenario);
+            eprintln!("cannot build the {scenario_name} scenario: {e}");
             return AppExit::from_code(1);
         }
     };
+    let replay = match args
+        .replay
+        .as_deref()
+        .map(|dir| Replay::open(dir, &scenario))
+    {
+        None => None,
+        Some(Ok(replay)) => Some(replay),
+        Some(Err(e)) => {
+            eprintln!(
+                "cannot replay {}: {e}",
+                args.replay.as_ref().unwrap().display()
+            );
+            return AppExit::from_code(1);
+        }
+    };
+    if let Some(replay) = &replay {
+        println!(
+            "Replaying {} frames of {}, {} s apart, t = {} to {} s",
+            replay.frames(),
+            replay.dir.display(),
+            replay.interval,
+            replay.t_first,
+            replay.t_last
+        );
+        scenario.name = match replay.clock {
+            Some(clock) => format!(
+                "{}: replay from {} UTC",
+                scenario.name.split(':').next().unwrap_or_default(),
+                &clock.format(0.0)[..16]
+            ),
+            None => format!(
+                "{}: replay",
+                scenario.name.split(':').next().unwrap_or_default()
+            ),
+        };
+    }
     if let Some(ramp) = args.ramp {
         scenario.forcing.ramp = ramp;
     }
@@ -395,18 +452,44 @@ fn main() -> AppExit {
     };
     let periodic = Periodic(scenario.periodic.map(|p| p.map(|x| x as f32)));
 
-    let t_end = args.hours * 3600.0;
-    let channel = solver::spawn(
-        &scenario,
-        SolverConfig {
-            t_end,
-            interval: args.interval,
-            levels: args.levels,
-            threads: args.threads,
-            drag: args.drag,
-            particles: args.particles,
-        },
-    );
+    let (channel, source, t_end, interval, rate, run_clock) = match replay {
+        Some(replay) => {
+            let source = Source::Replay {
+                name: args
+                    .replay
+                    .as_ref()
+                    .and_then(|d| d.file_name())
+                    .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
+                frames: replay.frames(),
+                t_last: replay.t_last,
+            };
+            let (t_end, interval, clock) = (replay.t_last, replay.interval, replay.clock);
+            (
+                replay::spawn(replay, args.threads),
+                source,
+                t_end,
+                interval,
+                args.rate.unwrap_or(3600.0),
+                clock,
+            )
+        }
+        None => {
+            let t_end = args.hours * 3600.0;
+            let channel = solver::spawn(
+                &scenario,
+                SolverConfig {
+                    t_end,
+                    interval: args.interval,
+                    levels: args.levels,
+                    threads: args.threads,
+                    drag: args.drag,
+                    particles: args.particles,
+                },
+            );
+            let rate = args.rate.unwrap_or(60.0);
+            (channel, Source::Solver, t_end, args.interval, rate, None)
+        }
+    };
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -434,12 +517,9 @@ fn main() -> AppExit {
     .insert_resource(Colouring::new(args.speed_max))
     .insert_resource(WaterOpacity(args.water_alpha))
     .insert_resource(Title(scenario.name.clone()))
-    .insert_resource(Playback::new(
-        args.rate,
-        args.interval,
-        args.memory_mb << 20,
-    ))
+    .insert_resource(Playback::new(rate, interval, args.memory_mb << 20))
     .insert_resource(SolverChannel(Mutex::new(channel)))
+    .insert_resource(source)
     .insert_resource(Capture {
         path: args.screenshot,
         at: args.at.unwrap_or(t_end),
@@ -479,6 +559,9 @@ fn main() -> AppExit {
     .add_systems(Update, field::interpolate)
     .add_systems(Update, capture.after(field::interpolate))
     .add_systems(Last, playback::settle);
+    if let Some(clock) = run_clock {
+        app.insert_resource(RunClock(clock));
+    }
     if let Some((levels, section)) = column {
         app.insert_resource(levels)
             .insert_resource(section)

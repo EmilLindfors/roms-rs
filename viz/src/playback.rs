@@ -4,7 +4,8 @@
 //! beyond a memory budget, and a clock that runs `rate` seconds of model time per
 //! second. The clock never passes the newest snapshot: while the solver is behind, the
 //! view waits for it. Between two snapshots the field is interpolated linearly in
-//! time ([`crate::field::Field`]).
+//! time ([`crate::field::Field`]). A replay ([`Source::Replay`]) sends the frames of a
+//! finished run down the same channel.
 //!
 //! Keys: Space pauses, `[` and `]` halve and double the rate, ← and → step back and
 //! forward by ten snapshots, Home and End jump to the oldest and newest.
@@ -17,6 +18,22 @@ use std::time::Instant;
 use bevy::prelude::*;
 
 use crate::solver::{Snapshot, SolverMessage};
+
+/// Where the snapshots come from.
+#[derive(Resource)]
+pub enum Source {
+    /// The solver, running while the viewer draws
+    Solver,
+    /// The frames of a finished run ([`crate::replay`])
+    Replay {
+        /// The run's output directory, as named on the command line
+        name: String,
+        /// Frames in the run
+        frames: usize,
+        /// Model time of the last frame (s)
+        t_last: f64,
+    },
+}
 
 /// How the run on the solver thread ended.
 pub enum SolverState {
