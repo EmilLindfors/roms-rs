@@ -6,6 +6,10 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Surf-zone gates for the wave-driven circulation (TODO F.4 coupling).** Two coupled runs on a plane beach (1:100, 4 m to a wall at 0.5 m, alongshore periodic), with 8 s swell of H_rms = 0.6 m breaking by Battjes–Janssen (`tests/wave_coupling_test.rs`). New `Mesh2D::channel_periodic_x_with_sides` (a mesh periodic in x with its own south and north tags).
+  - Normal incidence, two-way coupled (the waves see the circulation's level): 0.69 cm set-down at the breaker line, 5.6 cm setup at the wall. The level follows the cross-shore momentum balance of the force to 0.04 % of its range. The coupling changes the setup by 3.5 % against waves on still water, and converges (0.15 % on the third pass). The surf slope is 0.039 of the bed's, below Bowen's 0.062 for saturated waves: Battjes–Janssen's H_rms/D rises from 0.34 to 0.48 shoreward.
+  - 20° oblique incidence: a longshore current of 0.6 m/s. In the surf zone it follows Longuet-Higgins's (1970) `C_d u² = g Σ (k cos θ/σ) D`, the force from the waves' dissipation alone, to 3.8 %. Seaward of the breakers the discrete refraction leaves a −0.8 cm/s current at 5° bins (0.15 cm/s at 2.5°).
+
 - **Wave-enhanced bed friction (`source::WaveCurrentFriction2D`, `WaveModel2D::bed_wave_stress`; TODO F.4 coupling).** Any 2D friction law under waves, scaled by Soulsby's (1995) `1 + 1.2 (τ_w/(τ_c + τ_w))^3.2`, with `τ_w = ½ ρ f_w U_w²` from the spectrum (Soulsby 1997: `f_w = 1.39 (A/z₀)^(−0.52)`, `U_w = √2 U_rms`). Gates: one component's stress exactly; the enhancement's limits; a 0.63 m/s channel current slows to 0.46 m/s under a 6 Pa sea, to 1e-7 of the steady balance.
 
 - **The waves' roughness for the 3D turbulence closure (TODO F.4 coupling).** `Hydrostatic3D::with_surface_roughness` / `set_surface_roughness` take a surface roughness per column, and `WaveModel2D::surface_roughness(n, α)` gives `α H_s` (Terray et al.: α ≈ 0.6). GLS uses the largest of its own constant, the column's and Charnock's.
