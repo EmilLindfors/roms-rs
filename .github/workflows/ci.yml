@@ -16,6 +16,11 @@ env:
   # chosen at run time by `pulp`, so this loses no coverage.
   RUSTFLAGS: "-C target-cpu=x86-64"
 
+# A newer push to the same PR cancels the run in progress
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # The default feature set pulls in NetCDF, which needs native HDF5/netCDF-C
   # (see docs/windows-native-deps.md) and is awkward to provision on hosted
@@ -24,58 +29,44 @@ jobs:
   # which regressed once (TODO P0.10) because a hot loop called
   # `rayon::current_num_threads()` unconditionally.
   check:
-    name: check (${{ matrix.name }})
+    name: check (other features)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: no-default-features
-            features: "--no-default-features"
-          - name: parallel+simd
-            features: "--no-default-features --features parallel,simd"
-          - name: parallel-only
-            features: "--no-default-features --features parallel"
-          - name: simd-only
-            features: "--no-default-features --features simd"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
-      - name: cargo check
-        run: cargo check ${{ matrix.features }}
+          key: check-other-features
+      # `--tests` also compiles the test code, which `cargo check` alone
+      # skips: feature-gated test code rotted unnoticed once (the
+      # `parallel`-only test build was broken since at least July 2026).
+      # Compiled, not run, while the crate is in development, to save
+      # Actions minutes; the tests run under parallel+simd below.
+      - name: cargo check --tests (no-default-features)
+        run: cargo check --tests --no-default-features
+      - name: cargo check --tests (parallel-only)
+        run: cargo check --tests --no-default-features --features parallel
+      - name: cargo check --tests (simd-only)
+        run: cargo check --tests --no-default-features --features simd
 
-  # `cargo check` above skips test code, so feature-gated test code can rot
-  # unnoticed (the `parallel`-only test build was broken since at least July
-  # 2026). Build and run the tests under every feature combination.
+  # The tests run under parallel+simd only while the crate is in
+  # development (Actions minutes); the other feature sets are compiled with
+  # their tests above. Restore the matrix (no-default-features, parallel-only,
+  # simd-only) before a release.
   test:
-    name: test (${{ matrix.name }})
+    name: test (parallel+simd)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: no-default-features
-            features: "--no-default-features"
-          - name: parallel+simd
-            features: "--no-default-features --features parallel,simd"
-          - name: parallel-only
-            features: "--no-default-features --features parallel"
-          - name: simd-only
-            features: "--no-default-features --features simd"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: test-${{ matrix.name }}
+          key: test-parallel+simd
       - uses: taiki-e/install-action@nextest
       # The `ci` profile (Cargo.toml) is the test profile at opt-level 1: the
       # unoptimized suite spent ~10 min in a few dozen simulation gates.
       - name: cargo nextest run
-        run: cargo nextest run --cargo-profile ci ${{ matrix.features }}
+        run: cargo nextest run --cargo-profile ci --no-default-features --features parallel,simd
 
   clippy:
     name: clippy (parallel+simd)
