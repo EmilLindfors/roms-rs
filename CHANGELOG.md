@@ -6,6 +6,8 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A tide-gauge trace in the viewer (`viz/src/trace.rs`, TODO F.3).** A panel (top right, G) plots η at the close-up point over the run, sampled from every snapshot by the element polynomial as frames arrive, with a marker at the shown time. `--gauge FILE` overlays a gauge's observations (Kartverket format) on the run's clock. A point in an element that is not fully ≥ 3 m deep is sampled at the nearest node of one that is, as `froya_real_data` does. Over the 15-day Frøya replay it shows the spring–neap cycle at Mausund against the gauge.
+
 - **Snapshot files: compact replayable output of a 2D run (`io::SnapshotWriter`, `io::SnapshotReader`; TODO F.3).** A `.dgsnap` file holds a header with the mesh (vertices, quads, periodic pairs, boundary tags), the polynomial order, the nodal bed, the clock and `key=value` metadata. Frames of f32 η, u, v per node follow (velocity as `write_vtk_swe` writes it), 12 bytes per node: a tenth of an ASCII VTU frame. Frames are flushed whole and counted from the file length, so a partial last frame of a run still writing is ignored. Gates: a periodic mesh with an open face reads back with its edges and tags, bed, clock, metadata and frames; other files and wrongly sized frames are refused.
   - `examples/froya_real_data.rs snapshot_minutes=N` writes `<output>/froya.dgsnap`, with the stations in mesh coordinates.
   - `dg-viz --replay FILE` replays a snapshot file with no scenario data or builder. `--replay DIR --save-snapshot FILE` converts a VTU run while playing it: the 15-day Frøya run's 6.5 GB of VTU became a 505 MB snapshot file.
