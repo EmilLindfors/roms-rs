@@ -6,6 +6,20 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **A spectral wave model (`waves`, TODO F.4 stage 1).** The wave action balance on the DG mesh, one nodal field per (frequency, direction) component.
+  - `waves::dispersion`: the wavenumber (Guo's start, Newton), group velocity and ∂σ/∂d.
+  - `waves::spectrum::SpectralGrid`: log-spaced frequencies and uniform directions; JONSWAP with cos^m spreading, normalised on the grid; H_s, T_m01, T_m02, T_p, mean direction and spread; the Stokes drift profile, radiation stress and bed orbital velocity.
+  - `waves::sources::SourceTerms`: Komen wind input with linear growth, Komen whitecapping, JONSWAP bottom friction, Battjes–Janssen breaking, integrated with frozen rates (an exponential integrator).
+  - `waves::WaveModel2D`: strong-form DG propagation per component at c_g e_θ + U, with upwind faces, open boundaries bringing in a spectrum, and absorbing coasts. Refraction by depth and current shear and frequency shifting by currents (first-order upwind in θ and σ). SSP-RK3 with a Zhang–Shu positivity scaling, then the sources; in parallel over components.
+  - Gates:
+    - DG propagation converges at rate 3.0 at P2;
+    - total action kept to 3.9e-15 under refraction;
+    - shoaling keeps c_g N to 2e-14;
+    - Snell's law met to first order in the direction bins (1.03° at 5°);
+    - a following current keeps σ + kU to 0.34 %;
+    - per-node gates for each source term and the integrated quantities.
+  - Not yet: quadruplet interactions (so no realistic wind-sea growth), coupling to the circulation, mixing and particles, and real boundary spectra. See TODO F.4.
+
 - **Particle files (`io::ParticleFileWriter`, `ParticleFileReader`, `ParticleFrame`, `status_code`; TODO F.2/F.3).** The particles of a run frame by frame, beside its snapshot file (`.dgpart`): position, height, status, kind and release time per particle, in release order. Frames grow, so each carries its length; the reader indexes them on opening and ignores a partial last one. The header names the kinds. Gate: frames of 0, 4 and 9 particles read back exactly, a partial frame is ignored, and unknown kinds or fields of different lengths are refused.
   - `examples/farm_3d.rs snapshot=FILE particles=N` writes the larvae, faeces and feed at every snapshot frame, the last one moved on to the end of the run.
   - The viewer saves the particles of a live run with `--save-snapshot`, and of a replayed file that has them. A replay attaches each particle frame to the field frame of the same time, mapping kinds by name.

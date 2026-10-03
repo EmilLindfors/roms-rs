@@ -46,6 +46,7 @@ pub mod tides;
 pub mod time;
 pub mod types;
 pub mod vertical;
+pub mod waves;
 
 // Re-export main types for convenience
 // 1D types

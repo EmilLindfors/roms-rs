@@ -24,6 +24,20 @@ This roadmap is driven by the full-crate review of **2026-09-25** in `REVIEW.md`
 
 ## ▶ Next session — start here
 
+**State on 2026-10-03.**
+
+Merged 2026-10-03:
+- [#89](https://github.com/EmilLindfors/roms-rs/pull/89)–[#93](https://github.com/EmilLindfors/roms-rs/pull/93): the viewer's VTU replays; snapshot files (2D and 3D); the gauge trace; live `--save-snapshot`; particle files.
+- [#94](https://github.com/EmilLindfors/roms-rs/pull/94): the spectral wave model, stage 1.
+
+Details in F.3 and F.4. Next, in this order:
+1. **F.4 stage 2: quadruplet interactions (DIA) and a diagnostic tail.** Gate them by fetch-limited growth against Kahma & Calkoen (1992). Until then the wave model propagates swell and dissipates, but does not grow a realistic wind sea.
+2. **Stokes drift into the particle trackers (F.4 coupling).** The lice larvae in the top metres are what the farm goal needs from the waves. `WaveModel2D::stokes_drift` gives the profile.
+3. **Second-order θ/σ advection (F.4).** The first-order refraction bias is ≈ 1° at 5° bins.
+4. **The rest of the coupling.** Radiation stress or the vortex force on the currents; H_s into GLS wave breaking and surface roughness; wave-enhanced bed stress. Then MET Norway boundary spectra and a cost measurement at Frøya.
+
+The circulation items below (P3.1 and the error budget) stand as they were.
+
 Last reviewed: 2026-09-25 (`REVIEW.md`). Done so far: Priority 0 (except the deferred P0.11 GPU), P1.1 for the `Simulation` path, and the P1.2 core (split form; `WetDry` with second-order shoreline subcells as the wet/dry default). Frøya now runs on `Simulation` + `WetDry` on a water-only mesh, with correctly georeferenced bathymetry: the GeoTIFF reader had ignored its georeferencing. Lake at rest over the real bathymetry holds to 1.5e-10 m/s for 1 h. P1.4 is done: one characteristic OBC (`CharacteristicOBC` + external-state providers), NorKyst-800 boundary tides from a harmonic atlas, and a `ModelClock`. A full M2 cycle with NorKyst boundary tides at 9,653 P2 elements is stable, with 0 clips, in 6 min. Pick up in this order:
 
 1. **P3.1 validation: the tooling is done; the month-long run is still to do.** Heimsjø and Kristiansund lie outside the Frøya domain. Mausund (Kartverket MSU) is the gauge inside it, with a year of observations in `data/tide_gauges/mausund_obs.txt` and NorKyst at the gauge in `data/froya_station_tides.txt`. Both are untracked, like all of `data/`. Regenerate them with `./scripts/kartverket_gauge.sh Mausund 63.869331 8.665231 2024-07-01 2025-07-01` and `norkyst_boundary_tides -- spacing_km=0 points=8.665231,63.869331 out=/dev/null` (≈ 20 min). The run takes ≈ 9 h at 8.2 ms/step, so it waits until P2 makes it cheaper, or is started overnight:
@@ -213,6 +227,50 @@ Not needed for this goal: P0.11/P2.7 (GPU, MPI), P3.2, P5.2–P5.4, most of P6 a
   - [ ] The section is one fixed line per scenario and opaque: a cross-channel section behind the cages, or a section placed with the mouse; and it hides what is behind it (T hides the water, not the section).
   - [ ] The temperature scale is fitted to the first snapshot; with surface heat fluxes (P4.4) it should follow the field like the speed scale.
   - [ ] Only the channel runs in 3D: Frøya and the fjord in 3D need 3D open boundaries (P4.2) and a stratification from NorKyst (P1.5 nesting in 3D).
+
+### F.4 Surface waves: a spectral wave model (`src/waves/`)
+Goal (added 2026-10-03): the sea state at the farms and along the coast, coupled to the circulation and the particles. Lice larvae live in the top metres, where the waves' Stokes drift carries them. Breaking waves mix the surface layer (GLS already takes a breaking-wave flux, P4.4). Waves raise the stress on the bed in shallow water, and they load the cages. The model is phase-averaged (SWAN/WAM-type): the action balance on the DG mesh, one nodal field per (frequency, direction) component.
+- [x] Stage 1 (2026-10-03): kinematics, propagation, the basic sources, the integrated quantities.
+  - `waves::dispersion`: k from σ and d (Guo's start, Newton to 1e-12), c_g, ∂σ/∂d.
+  - `waves::spectrum`: log-spaced frequencies, uniform directions, JONSWAP with cos^m spreading, normalised on the grid. H_s, T_m01, T_m02, T_p (parabolic peak), mean direction, Kuik spread. Stokes drift profile, radiation stress, bed orbital velocity.
+  - `waves::sources`: Komen wind input with Cavaleri–Malanotte linear growth, Komen whitecapping (δ = 1), JONSWAP bottom friction (C_b = 0.038), Battjes–Janssen breaking. Integrated over a step with frozen rates (exponential integrator, stable for the stiff surf-zone sinks).
+  - `waves::WaveModel2D`: strong-form DG propagation per component at c_g e_θ + U, upwind faces, open faces bringing in a boundary spectrum and every other face absorbing. Refraction by depth and current shear, and frequency shifting by currents, by first-order upwind finite volumes in θ (periodic) and σ. SSP-RK3 with a Zhang–Shu positivity scaling per element, then the sources (Lie splitting). In parallel over components.
+  - Gates (`tests/wave_model_test.rs`; unit gates in each module):
+    - propagation converges at rate 3.0 at P2, along x and along the diagonal;
+    - refraction over a periodic shoal keeps the total action to 3.9e-15;
+    - shoaling 20 → 3 m keeps the action flux c_g N to 2e-14;
+    - Snell's law on a 20 → 4 m shelf at 30° incidence: off by 2.06 / 1.03 / 0.51° at 10 / 5 / 2.5° bins (first order, the θ scheme);
+    - a following current 0 → 0.6 m/s keeps σ + kU = σ₀ to 0.34 %;
+    - per node: bottom friction decays at its rate, wind grows a sea from calm downwind only, breaking bounds H_s in shallow water;
+    - Stokes drift, radiation stress and orbital velocity match the single-component and shallow limits exactly.
+- [ ] Stage 2: four-wave (quadruplet) interactions, without which wind seas do not grow or shape realistically. Then validate growth.
+  - The DIA (Hasselmann et al. 1985), as in SWAN and WAM; a high-frequency diagnostic tail (f⁻⁴ or f⁻⁵ beyond a cut-off at a few times the mean frequency); a growth limiter (Hersbach & Janssen 1999) if needed.
+  - Gate: fetch-limited growth of H_s and T_p against Kahma & Calkoen (1992), and duration-limited growth.
+  - Triads (LTA, Eldeberky 1996) for the surf zone later.
+- [ ] Second-order advection in θ and σ (MUSCL with a limiter, or SWAN's hybrid central/upwind). The first-order refraction bias is ≈ 1° at 5° bins (the Snell gate), and its numerical diffusion widens spectra. On steep fjord walls refraction sets the step: `with_turning_limit` caps |c_θ| (Dietrich et al. 2013), or θ could be implicit (a cyclic tridiagonal per node and frequency).
+- [ ] `c_σ` from a changing depth (`∂σ/∂d ∂d/∂t`): tides shift frequencies over flats. It needs the rate of η from the circulation, or the difference of two water levels.
+- [ ] Coupling (two-way, every coupling interval):
+  - circulation → waves: `set_water_level`, `set_currents` (P2 nodes to the wave mesh's).
+  - waves → 2D/3D circulation: the radiation-stress gradient as a momentum source (or the vortex force with Stokes drift, McWilliams et al. 2004, as COAWST); a wave-enhanced bottom stress from the orbital velocity (Soulsby 1997 or Grant–Madsen).
+  - waves → GLS: `H_s` for `with_wave_breaking` and the surface roughness (z₀ₛ ≈ 0.6 H_s, replacing `farm_3d waves=`).
+  - waves → particles: the Stokes drift profile added to the 2D and 3D trackers' velocity (lice larvae in the top metres; LADiM has this option).
+  - waves → cages: drag from the orbital velocity, later.
+- [ ] Wet/dry: depth is floored at 0.1 m and breaking takes the energy, but dry elements are not walls. Make fully dry elements absorbing like the coast, and use the shoreline subcells (`WetDry`) for the partly dry ones.
+- [ ] Forcing:
+  - wind from the gridded atmosphere (`AtmosphereReader`, MEPS/MET Nordic) per node, instead of uniform;
+  - boundary spectra from MET Norway's wave model (MyWave WAM 800 m / 4 km on THREDDS, or NORA3 hindcasts) along the open faces, converting from the nautical "coming from" directions;
+  - a reflection coefficient for walls (cliffs, quays).
+- [ ] Cost.
+  - Each component is a scalar DG advection, so a step costs ≈ n_components/3 SWE right-hand sides (≈ 300 for 36 × 24). The group velocity is ≈ 20 m/s at 0.04 Hz, against √(gh) ≈ 64 m/s at 420 m, so the wave step is ≈ 3× the SWE's. Frøya at P2 would cost ≈ 70× its tidal run (unmeasured: estimate from the kernel shape).
+  - Options:
+    - P1 or a coarser mesh for the waves, with interpolation between orders in the coupling;
+    - local time stepping per component group (low frequencies are fastest);
+    - fewer components (24 × 25);
+    - implicit geographic stepping as SWAN (Gauss–Seidel sweeps).
+  - Measure the RHS per component·node first, then the fused positivity pass and the source transpose. Allocation: `rates`/`integrate` use per-worker scratch, and `compute_dt` is O(points × components) per call.
+- [ ] Validation at Frøya and Mausund: the nearest wave buoys (MET/Kystverket, the E39 buoys in Sulafjorden and Halsafjorden) and MyWave WAM hindcasts. H_s, T_p and direction skill. The lee of the skerries is where a coastline-resolving DG wave model should beat the 800 m parent.
+- [ ] Viewer: H_s and mean direction as a colouring and arrows. Visual waves on the surface: Gerstner waves sampled from each node's spectrum, animated between snapshots.
+- [ ] Diffraction behind islands and breakwaters (phase-decoupled refraction–diffraction, Holthuijsen et al. 2003), for farms sheltered by skerries.
 
 ---
 
@@ -906,7 +964,7 @@ The 2026-02-11 plan (vertical infrastructure → mode splitting → mixing → p
 - [ ] Data assimilation (start with EnKF, then 4D-Var).
 - [ ] Two-way nesting (child feeds back to parent).
 - [ ] MPI for distributed memory (see P2.7).
-- [ ] Wave–current interaction.
+- [ ] Wave–current interaction: now F.4 (the spectral wave model, stage 1 done 2026-10-03; coupling is a stage there).
 - [ ] Biological coupling (NPZD). Salmon-lice dispersion is particle tracking, now F.2 under "Application target".
 - [ ] Sediment transport.
 
