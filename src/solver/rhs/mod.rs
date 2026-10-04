@@ -82,5 +82,10 @@ pub use viscosity_3d::{
     largest_horizontal_viscosity_3d,
 };
 
+pub mod tracer_diffusion_3d;
+pub use tracer_diffusion_3d::{
+    TracerAnomalyDiffusion3D, TracerDiffusionScratch3D, apply_tracer_anomaly_diffusion_3d,
+};
+
 pub mod rhs_3d;
 pub use rhs_3d::{Rhs3DConfig, compute_momentum_rhs_3d, compute_transport_rhs_3d};

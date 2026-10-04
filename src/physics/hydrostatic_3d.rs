@@ -76,14 +76,17 @@ use crate::solver::core::blocks::{for_each_block, reduce_blocks};
 use crate::solver::rhs::{
     BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
     HorizontalViscosity3D, LayerTransport, MetricForm, MomentumAdvectionForm, PressureGradientForm,
-    Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
-    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
-    apply_tracer_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
-    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
+    Rhs3DConfig, TracerAnomalyDiffusion3D, TracerBoundaryCondition3D, TracerDiffusionScratch3D,
+    VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
+    apply_momentum_transport_3d, apply_tracer_anomaly_diffusion_3d, apply_tracer_transport_3d,
+    compute_momentum_rhs_3d, compute_transport_rhs_3d, element_dt_viscous_swe_2d,
+    largest_horizontal_viscosity_3d,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
-use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
+use crate::solver::{
+    TracerLimiter3DConfig, TracerLimiter3DStats, TracerReferenceProfile, apply_tracer_limiters_3d,
+};
 use crate::source::{CageDrag2D, CageNode, CoriolisSource2D, RiverSources};
 use crate::time::{Integrable, ModeSplitPhysics, StepDrag};
 use crate::types::ElementIndex;
@@ -159,6 +162,9 @@ where
     /// [`Self::with_horizontal_viscosity`] and
     /// [`Self::with_smagorinsky_viscosity`]).
     pub horizontal_viscosity: HorizontalViscosity3D,
+    /// Horizontal diffusion of T and S about a reference stratification, if
+    /// any (see [`Self::with_tracer_anomaly_diffusion`]).
+    pub tracer_diffusion: Option<TracerAnomalyDiffusion3D>,
     /// A parent model's profiles at open boundaries and in a relaxation
     /// band, if nested (see [`Self::with_nesting`]).
     pub nesting: Option<Nesting3D>,
@@ -178,6 +184,8 @@ where
     masked_scratch: Mutex<Option<Solution3D>>,
     /// Buffers of the horizontal viscosity (allocated on first use).
     viscosity_scratch: Mutex<Option<ViscosityScratch3D>>,
+    /// Buffers of the tracer diffusion (allocated on first use).
+    tracer_diffusion_scratch: Mutex<Option<TracerDiffusionScratch3D>>,
     /// `[τ_x, τ_y]` of `surface_stress` on every column (allocated on first
     /// use).
     surface_stress_scratch: Mutex<[Vec<f64>; 2]>,
@@ -239,6 +247,7 @@ where
             bottom_drag: None,
             cage_drag: None,
             horizontal_viscosity: HorizontalViscosity3D::default(),
+            tracer_diffusion: None,
             nesting: None,
             rivers: None,
             open_boundary_check: Once::new(),
@@ -247,6 +256,7 @@ where
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
+            tracer_diffusion_scratch: Mutex::new(None),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
         }
     }
@@ -553,6 +563,22 @@ where
             "Smagorinsky coefficient must be finite and non-negative, got {cs}"
         );
         self.horizontal_viscosity.smagorinsky = cs;
+        self
+    }
+
+    /// Horizontal diffusion of T and S along σ-surfaces, of their departure
+    /// from `reference` (diffusivity `kappa`, m²/s; ROMS's `TS_MIX_CLIMA`):
+    /// a fluid at rest in the reference feels none, however steep the
+    /// σ-surfaces, while grid-scale anomalies are damped. Over cliffs, where
+    /// σ-levels cross the pycnocline within an element, the stratified rest
+    /// state is otherwise unstable (TODO P1.3; see
+    /// [`crate::solver::rhs::tracer_diffusion_3d`]).
+    pub fn with_tracer_anomaly_diffusion(
+        mut self,
+        kappa: f64,
+        reference: TracerReferenceProfile,
+    ) -> Self {
+        self.tracer_diffusion = Some(TracerAnomalyDiffusion3D::new(kappa, reference));
         self
     }
 
@@ -872,6 +898,29 @@ where
             let thin = |idx| self.is_thin(state, idx);
             columns.relax_tracers(state, &self.bathymetry, &self.sigma, rhs, thin);
         }
+        if let Some(diffusion) = &self.tracer_diffusion {
+            let mut guard = self
+                .tracer_diffusion_scratch
+                .lock()
+                .expect("Failed to lock tracer_diffusion_scratch");
+            let scratch = guard.get_or_insert_with(|| {
+                TracerDiffusionScratch3D::new(self.mesh.n_elements, &self.ops)
+            });
+            apply_tracer_anomaly_diffusion_3d(
+                &mut rhs.temp,
+                &mut rhs.salt,
+                state,
+                diffusion,
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                &self.bathymetry,
+                &self.sigma,
+                &self.boundaries,
+                self.min_column_depth,
+                scratch,
+            );
+        }
         self.zero_thin_momentum(state, rhs);
     }
 
@@ -1120,6 +1169,21 @@ where
                     &self.ops,
                     &self.geom,
                     nu,
+                    self.ops.order,
+                    cfl,
+                    k,
+                ));
+            }
+        }
+
+        // The tracer diffusion, explicit like the viscosity
+        if let Some(diffusion) = self.tracer_diffusion.as_ref().filter(|d| d.kappa > 0.0) {
+            for k in 0..self.mesh.n_elements {
+                min_dt = min_dt.min(element_dt_viscous_swe_2d(
+                    &self.mesh,
+                    &self.ops,
+                    &self.geom,
+                    diffusion.kappa,
                     self.ops.order,
                     cfl,
                     k,
