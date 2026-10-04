@@ -276,7 +276,8 @@ pub struct Rx0Smoothing {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ElementSlopeBound {
     /// Largest slope factor r_x0 between two nodes of one element whose
-    /// deeper node is deeper than `free_depth` (0.2 in ROMS practice).
+    /// deeper node is deeper than `free_depth` (ROMS practice is 0.2 between
+    /// neighbours; 0.15 within an element, see [`Self::for_pycnocline`]).
     pub r_max: f64,
     /// Depth (m, positive) above which the element's depth range is free.
     pub free_depth: f64,
@@ -284,10 +285,13 @@ pub struct ElementSlopeBound {
 
 impl ElementSlopeBound {
     /// The calibrated bound for a pycnocline whose bottom is `bottom` m
-    /// deep: r_x0 ≤ 0.2 and a free depth of 1.5 × `bottom`.
+    /// deep: r_x0 ≤ 0.15 and a free depth of 1.5 × `bottom`. The x–z slices
+    /// hold at 0.2, but on the Frøya coastline mesh an element at that bound
+    /// (33.6 m nodes and one 50.4 m corner) grew with an e-folding of 36 min;
+    /// at 0.15 a patch around it holds round-off for 12 h.
     pub fn for_pycnocline(bottom: f64) -> Self {
         Self {
-            r_max: 0.2,
+            r_max: 0.15,
             free_depth: 1.5 * bottom,
         }
     }
@@ -1897,9 +1901,10 @@ mod tests {
         for shallow in [-3.0, 0.0, 5.0, 19.0] {
             assert_eq!(bound.deepest_beside(shallow), 28.5);
         }
-        // Deeper: r_x0 = 0.2, a depth ratio of 1.5
-        assert!((bound.deepest_beside(30.0) - 45.0).abs() < 1e-12);
-        assert!((bound.excess(30.0, 50.0) - 5.0).abs() < 1e-12);
+        // Deeper: r_x0 = 0.15, a depth ratio of 1.15/0.85
+        let ratio = 1.15 / 0.85;
+        assert!((bound.deepest_beside(30.0) - 30.0 * ratio).abs() < 1e-12);
+        assert!((bound.excess(30.0, 50.0) - (50.0 - 30.0 * ratio)).abs() < 1e-12);
         assert_eq!(bound.excess(30.0, 40.0), 0.0);
         assert_eq!(bound.excess(0.0, 28.0), 0.0);
         assert!((bound.excess(0.0, 40.0) - 11.5).abs() < 1e-12);

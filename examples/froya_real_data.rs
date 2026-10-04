@@ -135,7 +135,7 @@
 //! `slopes3d=on` (3D runs, `levels=N`) smooths the bed, keeping its volume,
 //! until no element's depth range lets a σ-level cross the summer
 //! pycnocline between two of its nodes (`Bathymetry2D::smooth_element_slopes`,
-//! TODO P1.3): within an element r_x0 ≤ 0.2 (`slopes3d=r` for another bound)
+//! TODO P1.3): within an element r_x0 ≤ 0.15 (`slopes3d=r` for another bound)
 //! between columns that are not thin (`debug_3d=thin=`, 0.1 m) wherever the
 //! deeper one is below `free_depth` (28.5 m, 1.5 × the pycnocline's bottom).
 //! Shores need none (the 3D wetting and drying moves their layers on the 2D
@@ -357,7 +357,7 @@ struct Options {
     rx0_min_depth: f64,
     /// For 3D runs (`levels=`), smooth the bed until every element is within
     /// this bound (`Bathymetry2D::smooth_element_slopes`): `slopes3d=on` (r_x0
-    /// 0.2) or `slopes3d=r`, off by default; `free_depth=` sets the depth
+    /// 0.15) or `slopes3d=r`, off by default; `free_depth=` sets the depth
     /// above which elements are free (1.5 × the summer pycnocline's bottom by
     /// default)
     slopes_3d: Option<ElementSlopeBound>,
