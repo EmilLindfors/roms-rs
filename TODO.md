@@ -549,6 +549,9 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
             - A minimum reference gradient of 0.01 kg/m⁴ (`DGRS_EC_MIN`) caps the stiffness: `thin=2` then holds 5e-9 m/s for 6 h with constant mixing and no limiter. After that, shoreline elements with dry nodes (553, 554) grow.
             - At 0.05 kg/m⁴ the reference no longer matches the deep water, and element 335 grows at the old rate.
             - With GLS and the limiter, every variant reaches 0.5–0.9 m/s within 1.5–3 h, worse than the unchanged scheme (0.16 m/s at 2.4 h).
+        - **Also tried 2026-10-04: horizontal diffusion of T and S about the reference profile** (ROMS `TS_MIX_CLIMA`; local branch `exp/anomaly-diffusion`, `with_tracer_anomaly_diffusion`). It is zero at rest and conservative, and it slows the growth without stopping it. On the 15 → 300 m cliff (1 km P2 elements) the e-folding is 38 min at κ = 0, 50 min at 10, 1.6 h at 30 and ≈ 4.4 h at 100 m²/s. So the growing mode is not a grid-scale anomaly that a Laplacian removes cheaply.
+          - The constant-depth PGF on the same cliff is worse: 1e-2 m/s at 2 h, NaN by 12 h.
+          - Bed slope: in the slices, a beach of slope 0.005 (≈ 5 m of depth change per 1 km element against a pycnocline ≈ 8 m thick) stays at rest. A 15 → 60 m step over one element grows with e-folding ≈ 1.7 h.
         - Options, roughly cheapest first:
           - (a) Bound the inconsistency with the mesh and the bed, as ROMS does: a Haney number (rx1) per element on the σ-levels, smoothed for 3D runs, plus a rule for shore elements whose levels span the pycnocline.
           - (b) The pair density with a cap on its stiffness, or the stiff pairs implicit.
