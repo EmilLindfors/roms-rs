@@ -130,6 +130,14 @@
 //! `rx0_min_depth` (3 m) deep is at most r (`Bathymetry2D::smooth_rx0`):
 //! shoals a node wide otherwise carry spurious m/s currents.
 //!
+//! `slopes3d=on` (3D runs, `levels=N`) smooths the bed until no element's
+//! depth range lets a σ-level cross the summer pycnocline between two of its
+//! nodes (`Bathymetry2D::smooth_element_slopes`, TODO P1.3): within an
+//! element r_x0 ≤ 0.2 (`slopes3d=r` for another bound) wherever the deeper
+//! node is below `free_depth` (28.5 m, 1.5 × the pycnocline's bottom). Shore
+//! nodes shallower than `rx0_min_depth` never move. Off by default: it holds
+//! fully wet cliffs, but not shore elements with one deep wet node (P1.3).
+//!
 //! `bbox=west,south,east,north` runs a smaller box, e.g. the 22 × 19 km
 //! around Mausund (a quarter of the cost), with its own mesh and boundary
 //! atlas (use `tide_transport=3` there): see "Mausund sub-domain" in
@@ -191,7 +199,8 @@ use dg_rs::io::{
     read_tide_gauge_file, write_adcp_file, write_tide_gauge_file, write_vtk_swe,
 };
 use dg_rs::mesh::{
-    Bathymetry2D, BoundaryTag, Mesh2D, MeshPoint, PointLocator2D, inverse_bilinear, read_gmsh_mesh,
+    Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, MeshPoint, PointLocator2D,
+    inverse_bilinear, read_gmsh_mesh,
 };
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
@@ -227,6 +236,9 @@ const FROYA_BBOX: [f64; 4] = [8.0, 63.6, 9.2, 64.0];
 /// Default depth (m) below which `rx0=` leaves the bed alone: the shore and
 /// the dry area keep their shape
 const RX0_MIN_DEPTH: f64 = 3.0;
+/// Depth (m) of the bottom of the 3D runs' summer pycnocline (T and S step as
+/// `tanh((z + 15)/4)`), for the bound of `slopes3d=`
+const PYCNOCLINE_BOTTOM: f64 = 19.0;
 /// Land-mask cells per bathymetry pixel and direction: the coastline is
 /// rasterised at ≈ 25 × 58 m
 const LAND_MASK_REFINEMENT: usize = 4;
@@ -340,6 +352,12 @@ struct Options {
     /// nodes deeper than `rx0_min_depth` (`rx0=`, e.g. 0.3; off by default)
     rx0: Option<f64>,
     rx0_min_depth: f64,
+    /// For 3D runs (`levels=`), smooth the bed until every element is within
+    /// this bound (`Bathymetry2D::smooth_element_slopes`): `slopes3d=on` (r_x0
+    /// 0.2) or `slopes3d=r`, off by default; `free_depth=` sets the depth
+    /// above which elements are free (1.5 × the summer pycnocline's bottom by
+    /// default)
+    slopes_3d: Option<ElementSlopeBound>,
     /// Domain box `west,south,east,north` (°; `bbox=`). A smaller box needs
     /// its own boundary atlas (`tides=`, from `norkyst_boundary_tides bbox=`)
     bbox: [f64; 4],
@@ -443,6 +461,22 @@ impl Options {
                 .map(|v| v.parse().map_err(|_| format!("bad rx0={v}")))
                 .transpose()?,
             rx0_min_depth: get("rx0_min_depth", RX0_MIN_DEPTH)?,
+            slopes_3d: {
+                let default = ElementSlopeBound::for_pycnocline(PYCNOCLINE_BOTTOM);
+                let free_depth = get("free_depth", default.free_depth)?;
+                match args.get("slopes3d").map(String::as_str) {
+                    _ if get("levels", 0.0)? == 0.0 => None,
+                    None | Some("off") => None,
+                    Some("on") => Some(ElementSlopeBound {
+                        free_depth,
+                        ..default
+                    }),
+                    Some(r) => Some(ElementSlopeBound {
+                        r_max: r.parse().map_err(|_| format!("bad slopes3d={r}"))?,
+                        free_depth,
+                    }),
+                }
+            },
             bbox: match args.get("bbox") {
                 None => FROYA_BBOX,
                 Some(v) => v
@@ -650,6 +684,25 @@ impl Domain {
                 report.changed,
                 report.max_change,
                 describe(&grid_bed)
+            );
+        }
+        // 3D: no σ-level may cross the pycnocline between two nodes of one
+        // element (TODO P1.3)
+        if let Some(bound) = opts.slopes_3d {
+            let report = grid_bed.smooth_element_slopes(&grid, &ops, &grid_geom, bound, min_depth);
+            println!(
+                "  Smoothed for 3D (within an element r_x0 ≤ {} below {:.1} m, {} sweeps): \
+                 {} elements over the bound (largest excess {:.1} m), {} nodes changed by up to \
+                 {:.1} m, {:.3} km³ of water removed beside the shore; {} elements left over",
+                bound.r_max,
+                bound.free_depth,
+                report.sweeps,
+                report.elements_before,
+                report.excess_before,
+                report.changed,
+                report.max_change,
+                report.volume_removed / 1e9,
+                report.elements_after
             );
         }
         let has_water = |k: ElementIndex| grid_bed.element(k).iter().any(|&b| b < 0.0);

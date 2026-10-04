@@ -202,8 +202,8 @@ mod tests {
         SWEBoundaryCondition2D,
     };
     use crate::equations::ShallowWater2D;
-    use crate::mesh::data::Bathymetry2D;
     use crate::mesh::data::BoundaryTag;
+    use crate::mesh::data::{Bathymetry2D, ElementSlopeBound};
     use crate::mesh::{Mesh2D, Mesh2DBuilder};
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::physics::vertical_mixing::{ConstantMixing, Forcing};
@@ -1643,14 +1643,18 @@ mod tests {
         );
     }
 
-    /// A stratified x–z channel at rest (8 P2 elements of 1 km, walls, 20
-    /// surface-stretched levels, no tracer diffusion) whose bed falls from
-    /// 15 to 300 m inside one element (a `tanh` cliff): every σ-level of
-    /// that element spans most of the water column, so its pairs of nodes
-    /// straddle whatever the density does in between. `rho(z)` sets T, and
-    /// is the PGF's reference profile, so the initial state feels no force.
-    /// Steps of 36 s for `hours`; the largest layer speed.
-    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
+    /// A stratified x–z channel at rest: 8 P2 elements of 1 km, walls, 20
+    /// surface-stretched levels, no tracer diffusion, the bed `bed(x)` (dry
+    /// where it is above 0). `rho(z)` sets T, and is the PGF's reference
+    /// profile, so the initial state feels no force. With a `bound`, the bed is
+    /// first smoothed to it (min depth 3 m). Steps of 36 s; the largest layer
+    /// speed at each of `hours` (increasing).
+    fn channel_at_rest(
+        bed: impl Fn(f64) -> f64,
+        bound: Option<ElementSlopeBound>,
+        rho: impl Fn(f64) -> f64 + Copy,
+        hours: &[f64],
+    ) -> Vec<f64> {
         use crate::physics::EquationOfState;
         use crate::vertical::SongHaidvogelStretching;
         let (nx, dx) = (8, 1000.0);
@@ -1664,10 +1668,13 @@ mod tests {
         ));
         let ops = Arc::new(DGOperators2D::new(2));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
-        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
-            let t = (x / dx - 3.0).clamp(0.0, 1.0);
-            -(300.0 - 285.0 * 0.5 * (1.0 + (8.0 * (t - 0.5)).tanh()))
-        }));
+        let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| bed(x));
+        if let Some(bound) = bound {
+            let report = bathymetry.smooth_element_slopes(&mesh, &ops, &geom, bound, 3.0);
+            println!("channel bed smoothed: {report:?}");
+        }
+        let bathymetry = Arc::new(bathymetry);
+        let shore = bathymetry.data.iter().any(|&b| b >= 0.0);
         let swe = PhysicsBuilder::swe_2d(
             mesh.clone(),
             ops.clone(),
@@ -1677,6 +1684,7 @@ mod tests {
         )
         .with_bathymetry(bathymetry.clone())
         .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(shore)
         .with_source(CoriolisSource2D::f_plane(1.2e-4))
         .build();
         let sigma = SigmaGrid::new(20, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
@@ -1700,9 +1708,11 @@ mod tests {
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
         let mut state = Solution3D::new(mesh.n_elements, nn, nl);
         for idx in 0..mesh.n_elements * nn {
-            let depth = -bathymetry.data[idx];
+            let b = bathymetry.data[idx];
+            let eta = b.max(0.0);
+            state.eta.data[idx] = eta;
             for (l, &s) in sigma.sigma_rho().iter().enumerate() {
-                state.temp[idx * nl + l] = temp(s * depth);
+                state.temp[idx * nl + l] = temp(eta + s * (eta - b));
                 state.salt[idx * nl + l] = eos.s0;
             }
         }
@@ -1711,14 +1721,108 @@ mod tests {
             physics.with_reference_profile(&state, |z| eos.compute_density(temp(z), eos.s0, z));
         let mut integrator = ModeSplitIntegrator::new();
         let dt = 36.0;
-        for n in 0..(hours * 3600.0 / dt).round() as usize {
-            physics.update_density(&mut state);
-            integrator.step(&mut state, &physics, dt, n as f64 * dt);
-            physics.post_process(&mut state);
+        let mut n = 0;
+        let mut speeds = Vec::with_capacity(hours.len());
+        for &until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+            }
+            let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+            println!("channel at rest: largest speed {speed:.2e} m/s after {until} h");
+            speeds.push(speed);
         }
-        let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
-        println!("cliff at rest: largest speed {speed:.2e} m/s after {hours} h");
-        speed
+        speeds
+    }
+
+    /// [`channel_at_rest`] with a cliff: the bed falls from 15 to 300 m inside
+    /// element 3 (a `tanh` step), so every σ-level of that element spans most
+    /// of the water column, and its pairs of nodes straddle whatever the
+    /// density does in between. The largest layer speed after `hours`.
+    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
+        channel_at_rest(|x| step_bed(x, 3, -300.0, -15.0), None, rho, &[hours])[0]
+    }
+
+    /// Calibration probe for the straddle bound: steps inside one element
+    /// with straddle numbers S (pycnocline band 11–19 m) under the pycnocline
+    /// of [`a_pycnocline_over_a_cliff_stays_at_rest`]; the largest speed at
+    /// 12 and 48 h and the e-folding between.
+    #[test]
+    #[ignore = "probe: calibration of the straddle bound"]
+    fn probe_straddle_steps() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let (top, bottom) = (11.0_f64, 19.0_f64);
+        let straddle = |s: f64, d: f64| {
+            if d <= top {
+                0.0
+            } else {
+                (bottom / s.max(0.0)).min(1.0) * (d - s.max(0.0)) / (bottom - top)
+            }
+        };
+        // (shallow elevation, deep elevation)
+        let cases = [
+            (-15.0, -19.0),
+            (-15.0, -23.0),
+            (-15.0, -27.0),
+            (-15.0, -31.0),
+            (-15.0, -39.0),
+            (-60.0, -80.0),
+            (-60.0, -100.0),
+            (-60.0, -140.0),
+            (-5.0, -13.0),
+            (-5.0, -17.0),
+            (-5.0, -21.0),
+            (5.0, -12.0),
+            (5.0, -16.0),
+            (5.0, -20.0),
+            (5.0, -27.0),
+        ];
+        // DGRS_STRADDLE="shallow:deep,…" (elevations) and DGRS_STRADDLE_HOURS
+        // override the cases and the last hour
+        let custom: Vec<(f64, f64)> = std::env::var("DGRS_STRADDLE")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|c| {
+                let (s, d) = c.split_once(':')?;
+                Some((s.parse().ok()?, d.parse().ok()?))
+            })
+            .collect();
+        let last: f64 = std::env::var("DGRS_STRADDLE_HOURS")
+            .ok()
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(48.0);
+        let cases = if custom.is_empty() {
+            cases.to_vec()
+        } else {
+            custom
+        };
+        for (shallow, deep) in cases {
+            let speeds = channel_at_rest(
+                |x| step_bed(x, 3, deep, shallow),
+                None,
+                pycnocline,
+                &[12.0, last],
+            );
+            let efold = (last - 12.0) / (speeds[1] / speeds[0]).ln();
+            println!(
+                "PROBE {:5.1} → {:6.1} m: S {:.2}, {:.2e} → {:.2e} m/s, e-folding {:.1} h",
+                -shallow,
+                -deep,
+                straddle(-shallow, -deep),
+                speeds[0],
+                speeds[1],
+                efold
+            );
+        }
+    }
+
+    /// A bed (elevation) of `left` left of element `k` of 1 km and `right`
+    /// right of it, joined by a `tanh` step inside that element.
+    fn step_bed(x: f64, k: usize, left: f64, right: f64) -> f64 {
+        let t = (x / 1000.0 - k as f64).clamp(0.0, 1.0);
+        right + (left - right) * 0.5 * (1.0 - (8.0 * (t - 0.5)).tanh())
     }
 
     /// The cliff with N² constant (0.01 kg/m⁴): round-off stays round-off.
@@ -1744,6 +1848,22 @@ mod tests {
     fn a_pycnocline_over_a_cliff_stays_at_rest() {
         let speed = cliff_at_rest(|z| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z, 6.0);
         assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
+    }
+
+    /// The pycnocline over the 15 → 300 m cliff, and over land beside 300 m
+    /// of water inside one element, with the bed smoothed to
+    /// [`ElementSlopeBound::for_pycnocline`] (the pycnocline's bottom ≈ 19 m):
+    /// round-off stays round-off for a day (TODO P1.3).
+    #[test]
+    fn a_pycnocline_over_a_smoothed_cliff_stays_at_rest() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let bound = Some(ElementSlopeBound::for_pycnocline(19.0));
+        for (name, left, right) in [("cliff", -300.0, -15.0), ("shore", -300.0, 5.0)] {
+            let speed =
+                channel_at_rest(|x| step_bed(x, 3, left, right), bound, pycnocline, &[24.0])[0];
+            println!("smoothed {name}: {speed:.2e} m/s after 24 h");
+            assert!(speed < 1e-9, "the smoothed {name} spun up {speed:.3e} m/s");
+        }
     }
 
     /// A stratified seamount at rest (Beckmann & Haidvogel 1993; TODO P4.6):

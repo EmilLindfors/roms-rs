@@ -11,6 +11,9 @@ mod boundary_tags;
 mod land_mask;
 
 pub use bathymetry::{Bathymetry1D, profiles as bathymetry_profiles};
-pub use bathymetry_2d::{Bathymetry2D, Rx0, Rx0Smoothing, profiles as bathymetry_profiles_2d};
+pub use bathymetry_2d::{
+    Bathymetry2D, ElementSlopeBound, ElementSlopeSmoothing, Rx0, Rx0Smoothing,
+    profiles as bathymetry_profiles_2d,
+};
 pub use boundary_tags::BoundaryTag;
 pub use land_mask::{LandMask2D, LandMaskStatistics};

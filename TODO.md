@@ -563,6 +563,11 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
           - Every run grows in shoreline elements with dry nodes beside 40–135 m ones (553, 393, 77). That is far faster than the unchanged scheme (6e-4 m/s at 0.7 h, first at the fully wet element 335).
           - Also: the limiter alone changes the rest state's force from 1e-9 to 3e-6 m/s² at the first step.
         - **Tried 2026-10-04: a pressure-work partner for wet–dry pairs (`DGRS_DRYBANK=1` on `exp/pair-density-wet-dry`): worse.** It is the σ-pairs difference with the wet column's density, matching the wet-side rule. On the cliff-to-land slice the e-folding drops from ≈ 5.8 h to ≈ 3.1 h. A dry node holds no volume, so the wet node's exchange with it ends in its own Ω, whose pressure work no horizontal PGF term can balance. The flux has to be blocked instead, in the 2D `WetDry` mass flux and the 3D layers alike, as ROMS does.
+        - **Done 2026-10-04: per-element bed smoothing for 3D (`Bathymetry2D::smooth_element_slopes`, `froya_real_data slopes3d=on`, off by default).** The bound is r_x0 ≤ 0.2 between the nodes of an element below a free depth of 1.5 × the pycnocline's bottom (calibrated on slices, see CHANGELOG). It holds the smoothed cliff and land beside 300 m for 24 h (`a_pycnocline_over_a_smoothed_cliff_stays_at_rest`). It does not hold Frøya at rest (GLS, limiter, 36 s steps):
+          - 1 km, fully wet pairs smoothed (5237 nodes, up to 256 m, volume kept): 0.6 m/s at 3 h, NaN at 5.3 h. Unsmoothed: 0.36 m/s at 3 h.
+          - With deep nodes beside the shore raised to 28.5 m (44.5 km³ removed): 0.017 m/s at 3 h, 0.78 m/s at 6 h.
+          - Coastline mesh with the same: 42 km³ removed, 21k nodes changed, and 0.16 m/s within 15 min.
+          - Everywhere the growth starts in elements whose only wet node is deep among dry ones (1 km: 297, 31; coastline mesh: 12040). That is the wet–dry leak, next.
         - Options, roughly cheapest first:
           - (a) Bound the inconsistency with the mesh and the bed, as ROMS does: a Haney number (rx1) per element on the σ-levels, smoothed for 3D runs, plus a rule for shore elements whose levels span the pycnocline.
           - (b) The pair density with a cap on its stiffness, or the stiff pairs implicit.
