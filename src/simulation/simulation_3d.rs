@@ -1759,11 +1759,15 @@ mod tests {
             let t = (x / 1000.0 - 3.0).clamp(0.0, 1.0);
             -(300.0 - 285.0 * 0.5 * (1.0 + (8.0 * (t - 0.5)).tanh()))
         };
+        let only = std::env::var("DGRS_PROBE").unwrap_or_default();
         for (name, bed) in [
             ("land", &land as &dyn Fn(f64) -> f64),
             ("wall", &wall),
             ("cliff", &cliff),
         ] {
+            if !only.is_empty() && !only.split(',').any(|o| o == name) {
+                continue;
+            }
             for (pname, rho) in [("pycnocline", &pycnocline as &dyn Fn(f64) -> f64)] {
                 for hours in [6.0, 24.0] {
                     let (speed, at) = stratified_channel_at_rest(|x| bed(x), |z| rho(z), hours);

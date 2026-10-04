@@ -434,6 +434,17 @@ fn pressure_differences(
     out: &mut [f64],
 ) {
     if !(a.wet && b.wet) {
+        // Experiment (DGRS_DRYBANK=1): a pair with one thin column keeps its
+        // σ-pairs difference with the wet column's density, the pressure-work
+        // partner of the wet-side rule in the advection
+        let dry_bank = std::env::var("DGRS_DRYBANK").is_ok_and(|v| v == "1");
+        if dry_bank && form == PressureGradientForm::SigmaPairs && (a.wet || b.wet) {
+            let wet = if a.wet { a } else { b };
+            for (l, dp) in out.iter_mut().enumerate() {
+                *dp = (b.at_level[l] - a.at_level[l]) + wet.rho[l] * (b.z[l] - a.z[l]);
+            }
+            return;
+        }
         out.fill(0.0);
         return;
     }
