@@ -1643,14 +1643,16 @@ mod tests {
         );
     }
 
-    /// A stratified x–z channel at rest (8 P2 elements of 1 km, walls, 20
-    /// surface-stretched levels, no tracer diffusion) whose bed falls from
-    /// 15 to 300 m inside one element (a `tanh` cliff): every σ-level of
-    /// that element spans most of the water column, so its pairs of nodes
-    /// straddle whatever the density does in between. `rho(z)` sets T, and
-    /// is the PGF's reference profile, so the initial state feels no force.
-    /// Steps of 36 s for `hours`; the largest layer speed.
-    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
+    /// A stratified x–z channel at rest: 8 P2 elements of 1 km, walls, 20
+    /// surface-stretched levels, no tracer diffusion, the bed `bed(x)` (dry
+    /// where above 0). `rho(z)` sets T, and is the PGF's reference profile, so
+    /// the initial state feels no force. Steps of 36 s for `hours`; the
+    /// largest layer speed and its element.
+    fn stratified_channel_at_rest(
+        bed: impl Fn(f64) -> f64,
+        rho: impl Fn(f64) -> f64 + Copy,
+        hours: f64,
+    ) -> (f64, usize) {
         use crate::physics::EquationOfState;
         use crate::vertical::SongHaidvogelStretching;
         let (nx, dx) = (8, 1000.0);
@@ -1665,8 +1667,7 @@ mod tests {
         let ops = Arc::new(DGOperators2D::new(2));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
-            let t = (x / dx - 3.0).clamp(0.0, 1.0);
-            -(300.0 - 285.0 * 0.5 * (1.0 + (8.0 * (t - 0.5)).tanh()))
+            bed(x)
         }));
         let swe = PhysicsBuilder::swe_2d(
             mesh.clone(),
@@ -1677,6 +1678,7 @@ mod tests {
         )
         .with_bathymetry(bathymetry.clone())
         .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(true)
         .with_source(CoriolisSource2D::f_plane(1.2e-4))
         .build();
         let sigma = SigmaGrid::new(20, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
@@ -1700,9 +1702,11 @@ mod tests {
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
         let mut state = Solution3D::new(mesh.n_elements, nn, nl);
         for idx in 0..mesh.n_elements * nn {
-            let depth = -bathymetry.data[idx];
+            let b = bathymetry.data[idx];
+            let eta = b.max(0.0);
+            state.eta.data[idx] = eta;
             for (l, &s) in sigma.sigma_rho().iter().enumerate() {
-                state.temp[idx * nl + l] = temp(s * depth);
+                state.temp[idx * nl + l] = temp(eta + s * (eta - b));
                 state.salt[idx * nl + l] = eos.s0;
             }
         }
@@ -1716,9 +1720,57 @@ mod tests {
             integrator.step(&mut state, &physics, dt, n as f64 * dt);
             physics.post_process(&mut state);
         }
-        let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
-        println!("cliff at rest: largest speed {speed:.2e} m/s after {hours} h");
-        speed
+        let (mut speed, mut at) = (0.0_f64, 0);
+        for (i, (u, v)) in state.u.iter().zip(&state.v).enumerate() {
+            let s = u.hypot(*v);
+            if s.is_nan() || s > speed {
+                (speed, at) = (s, i / nl / nn);
+            }
+        }
+        println!("channel at rest: largest speed {speed:.2e} m/s in element {at} after {hours} h");
+        (speed, at)
+    }
+
+    /// [`stratified_channel_at_rest`] with a cliff: the bed falls from 15 to
+    /// 300 m inside element 3 (a `tanh` step), so every σ-level of that
+    /// element spans most of the water column, and its pairs of nodes
+    /// straddle whatever the density does in between.
+    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
+        let cliff = |x: f64| {
+            let t = (x / 1000.0 - 3.0).clamp(0.0, 1.0);
+            -(300.0 - 285.0 * 0.5 * (1.0 + (8.0 * (t - 0.5)).tanh()))
+        };
+        stratified_channel_at_rest(cliff, rho, hours).0
+    }
+
+    #[test]
+    #[ignore = "probe"]
+    fn probe_beach() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let linear = |z: f64| RHO0 - 0.01 * z;
+        let step = |x: f64, top: f64| {
+            let t = (x / 1000.0 - 6.0).clamp(0.0, 1.0);
+            -300.0 + (300.0 + top) * 0.5 * (1.0 + (8.0 * (t - 0.5)).tanh())
+        };
+        let land = |x: f64| step(x, 5.0);
+        let wall = |x: f64| step(x, -15.0);
+        let _ = &linear;
+        let cliff = |x: f64| {
+            let t = (x / 1000.0 - 3.0).clamp(0.0, 1.0);
+            -(300.0 - 285.0 * 0.5 * (1.0 + (8.0 * (t - 0.5)).tanh()))
+        };
+        for (name, bed) in [
+            ("land", &land as &dyn Fn(f64) -> f64),
+            ("wall", &wall),
+            ("cliff", &cliff),
+        ] {
+            for (pname, rho) in [("pycnocline", &pycnocline as &dyn Fn(f64) -> f64)] {
+                for hours in [6.0, 24.0] {
+                    let (speed, at) = stratified_channel_at_rest(|x| bed(x), |z| rho(z), hours);
+                    println!("PROBE {name} {pname} {hours} h: {speed:.2e} m/s in element {at}");
+                }
+            }
+        }
     }
 
     /// The cliff with N² constant (0.01 kg/m⁴): round-off stays round-off.

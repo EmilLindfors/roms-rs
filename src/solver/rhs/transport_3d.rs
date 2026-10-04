@@ -82,6 +82,7 @@ use crate::solver::SWEFormulation2D;
 use crate::solver::core::blocks::{Pooled, for_each_block, max_over_blocks};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
+use crate::solver::rhs::stratification::{ReferencePoint, ReferenceStratification};
 use crate::solver::state::Solution3D;
 use crate::source::RiverInflow;
 use crate::types::ElementIndex;
@@ -236,6 +237,41 @@ pub fn advective_divergence_element(
     fs: &mut [f64],
     div: &mut [f64],
 ) {
+    advective_divergence_with_pairs(
+        ops,
+        geom,
+        metric,
+        k,
+        hu,
+        hv,
+        phi,
+        |i, j| phi[i] + phi[j],
+        face,
+        fr,
+        fs,
+        div,
+    );
+}
+
+/// [`advective_divergence_element`] with `2φ*_ij = pair(i, j)` in place of
+/// `φ_i + φ_j` in the volume term: any symmetric, consistent two-point mean
+/// (`pair(i, i) = 2φ_i`) keeps it conservative, and a constant field
+/// constant if its mean is that constant.
+#[allow(clippy::too_many_arguments)]
+fn advective_divergence_with_pairs(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    metric: MetricForm,
+    k: usize,
+    hu: &[f64],
+    hv: &[f64],
+    phi: &[f64],
+    pair: impl Fn(usize, usize) -> f64,
+    face: &[f64],
+    fr: &mut [f64],
+    fs: &mut [f64],
+    div: &mut [f64],
+) {
     let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
     if metric.averaged_on(geom, k) {
         // 2{{Ja}}·{{q}} = ½(Ja_i + Ja_j)·(q_i + q_j)
@@ -248,7 +284,7 @@ pub fn advective_divergence_element(
                 let flux = 0.5
                     * (ops.dr[(i, j)] * ((ar_i.0 + ar_j.0) * qx + (ar_i.1 + ar_j.1) * qy)
                         + ops.ds[(i, j)] * ((as_i.0 + as_j.0) * qx + (as_i.1 + as_j.1) * qy));
-                sum += flux * (phi[i] + phi[j]);
+                sum += flux * pair(i, j);
             }
             *d = 0.5 * geom.jacobian_inv(k, i) * sum;
         }
@@ -262,7 +298,7 @@ pub fn advective_divergence_element(
             let mut sum = 0.0;
             for j in 0..nn {
                 let flux = ops.dr[(i, j)] * (fr[i] + fr[j]) + ops.ds[(i, j)] * (fs[i] + fs[j]);
-                sum += flux * (phi[i] + phi[j]);
+                sum += flux * pair(i, j);
             }
             *d = 0.5 * geom.jacobian_inv(k, i) * sum;
         }
@@ -808,6 +844,22 @@ pub enum MomentumAdvectionForm {
     Conservative,
 }
 
+/// The pair density of the active tracers ([`crate::solver::rhs::stratification`]):
+/// the reference stratification and the current density
+/// (`[element][node][level]`) that sets each pair's weight, and the columns'
+/// depths: a pair with a thin column (shallower than `min_column_depth`)
+/// carries the wet column's own tracers (the pressure gradient ignores such
+/// pairs, so the wet column must get no density anomaly from them either).
+#[derive(Clone, Copy)]
+pub struct PairDensity<'a> {
+    pub reference: &'a ReferenceStratification,
+    pub rho: &'a [f64],
+    /// Free surface and bed elevation per column, `[element][node]`.
+    pub eta: &'a [f64],
+    pub bed: &'a [f64],
+    pub min_column_depth: f64,
+}
+
 /// Overwrite `rhs` with the inventory tendency `∂(H_z C)/∂t` of the tracer
 /// concentration `tracer`, advected by the layer transports `transport`:
 ///
@@ -837,6 +889,7 @@ pub fn apply_tracer_transport_3d(
     exterior: Option<ExteriorField>,
     boundaries: &Boundaries3D,
     vertical: VerticalAdvection,
+    pair_density: Option<PairDensity>,
 ) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
     let context = LayerContext {
@@ -867,7 +920,24 @@ pub fn apply_tracer_transport_3d(
                             })
                         })
                 };
-                let div = context.flux_divergence(k, l, tracer, true, inflow, scratch);
+                if let Some(pairs) = pair_density {
+                    for i in 0..nn {
+                        let column = k * nn + i;
+                        let rho = pairs.rho[column * nl + l];
+                        scratch.points[i] = pairs.reference.point(rho);
+                        scratch.wet[i] =
+                            pairs.eta[column] - pairs.bed[column] >= pairs.min_column_depth;
+                    }
+                }
+                let div = context.flux_divergence(
+                    k,
+                    l,
+                    tracer,
+                    true,
+                    pair_density.map(|p| p.reference),
+                    inflow,
+                    scratch,
+                );
                 for (i, &d) in div.iter().enumerate() {
                     rhs_k[i * nl + l] = -d;
                 }
@@ -1221,7 +1291,7 @@ pub fn apply_momentum_transport_3d(
                             .and_then(|e| e.at(tag, node, l))
                             .unwrap_or(interior)
                     };
-                    let div = context.flux_divergence(k, l, field, split, inflow, scratch);
+                    let div = context.flux_divergence(k, l, field, split, None, inflow, scratch);
                     for (i, &d) in div.iter().enumerate() {
                         rhs_k[i * nl + l] -= d;
                     }
@@ -1257,6 +1327,7 @@ impl LayerContext<'_> {
         l: usize,
         field: &[f64],
         split: bool,
+        reference: Option<&ReferenceStratification>,
         inflow: impl Fn(usize, usize, usize, BoundaryTag, f64, f64) -> f64,
         scratch: &'s mut TransportScratch,
     ) -> &'s [f64] {
@@ -1270,6 +1341,8 @@ impl LayerContext<'_> {
             fs,
             face,
             div,
+            points,
+            wet,
             ..
         } = scratch;
         for i in 0..nn {
@@ -1298,7 +1371,25 @@ impl LayerContext<'_> {
                 face[f * nfn + fi] = flux * upwind;
             }
         }
-        if split {
+        if let (true, Some(reference)) = (split, reference) {
+            // The pair density's means: φ_i + φ_j + 2θ_ij (φ_j − φ_i)
+            let phi = &*phi;
+            let (points, wet) = (&*points, &*wet);
+            let pair = |i: usize, j: usize| {
+                // A thin column takes the wet one's value (θ = ±½)
+                let theta = match (wet[i], wet[j]) {
+                    (true, true) => reference.pair_weight(&points[i], &points[j]),
+                    (true, false) => -0.5,
+                    (false, true) => 0.5,
+                    (false, false) => 0.0,
+                };
+                phi[i] + phi[j] + 2.0 * theta * (phi[j] - phi[i])
+            };
+            let metric = transport.metric;
+            advective_divergence_with_pairs(
+                ops, self.geom, metric, k, hu, hv, phi, pair, face, fr, fs, div,
+            );
+        } else if split {
             let metric = transport.metric;
             advective_divergence_element(ops, self.geom, metric, k, hu, hv, phi, face, fr, fs, div);
         } else {
@@ -1324,6 +1415,11 @@ struct TransportScratch {
     div: Vec<f64>,
     vertical: Vec<f64>,
     slope: Vec<f64>,
+    /// The reference points of the element's nodes on one level (with a
+    /// pair density).
+    points: Vec<ReferencePoint>,
+    /// Whether each of those nodes' columns is wet.
+    wet: Vec<bool>,
 }
 
 impl TransportScratch {
@@ -1352,6 +1448,8 @@ impl TransportScratch {
             div: vec![0.0; ops.n_nodes],
             vertical: vec![0.0; n_levels + 1],
             slope: vec![0.0; n_levels],
+            points: vec![ReferencePoint::default(); ops.n_nodes],
+            wet: vec![true; ops.n_nodes],
         }
     }
 }
@@ -1541,6 +1639,7 @@ mod tests {
                 None,
                 &self.boundaries,
                 VerticalAdvection::default(),
+                None,
             );
             rhs
         }
@@ -1825,6 +1924,7 @@ mod tests {
                 None,
                 &Boundaries3D::default(),
                 VerticalAdvection::Upwind,
+                None,
             );
             for column in rhs.chunks_exact(nl) {
                 for (got, want) in column.iter().zip(expected) {
@@ -2659,6 +2759,7 @@ mod tests {
             exterior.temp,
             &case.boundaries,
             VerticalAdvection::default(),
+            None,
         );
         let (mut rhs_u, mut rhs_v) = (vec![0.0; rhs_t.len()], vec![0.0; rhs_t.len()]);
         apply_momentum_transport_3d(
@@ -2743,6 +2844,7 @@ mod tests {
             exterior.temp,
             &case.boundaries,
             VerticalAdvection::default(),
+            None,
         );
         let scale = c * max_abs(case.eta_rate.iter().copied());
         for (idx, column) in rhs.chunks_exact(nl).enumerate() {

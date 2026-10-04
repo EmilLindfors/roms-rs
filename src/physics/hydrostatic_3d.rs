@@ -76,10 +76,10 @@ use crate::solver::core::blocks::{for_each_block, reduce_blocks};
 use crate::solver::rhs::{
     BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
     HorizontalViscosity3D, LayerTransport, MetricForm, MomentumAdvectionForm, PressureGradientForm,
-    Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
-    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
-    apply_tracer_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
-    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
+    ReferenceStratification, Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection,
+    ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
+    apply_momentum_transport_3d, apply_tracer_transport_3d, compute_momentum_rhs_3d,
+    compute_transport_rhs_3d, element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
@@ -145,6 +145,10 @@ where
     /// A reference state whose pressure gradient is the constant-depth
     /// form's, if any (see [`Self::with_balanced_reference`]).
     pub balanced_reference: Option<Arc<BalancedReference>>,
+    /// The reference stratification whose pair density the σ-pairs force
+    /// and the advection of T and S share, if any (see
+    /// [`Self::with_reference_profile`]).
+    pub pair_density: Option<Arc<ReferenceStratification>>,
     /// Advection of a prognostic closure's turbulence, with this vertical
     /// reconstruction; `None` keeps it in its column (see
     /// [`Self::with_turbulence_advection`]).
@@ -235,6 +239,7 @@ where
             momentum_vertical_advection: VerticalAdvection::Centred,
             pressure_gradient: PressureGradientForm::default(),
             balanced_reference: None,
+            pair_density: None,
             turbulence_advection: Some(VerticalAdvection::LimitedAkima),
             bottom_drag: None,
             cage_drag: None,
@@ -366,6 +371,15 @@ where
         state: &Solution3D,
         profile: impl Fn(f64) -> f64,
     ) -> Self {
+        if std::env::var_os("DGRS_EC").is_some() {
+            let deepest = self.bathymetry.data.iter().copied().fold(0.0, f64::min);
+            let highest = state.eta.data.iter().copied().fold(0.0, f64::max);
+            let (z_min, z_max) = (deepest - 1.0, highest + 1.0);
+            let n = ((z_max - z_min) / 0.05).ceil() as usize + 1;
+            self.pair_density = Some(Arc::new(ReferenceStratification::from_fn(
+                z_min, z_max, n, &profile,
+            )));
+        }
         self.balanced_reference = Some(Arc::new(BalancedReference::from_profile(
             state,
             &self.mesh,
@@ -378,6 +392,7 @@ where
             self.rho0,
             self.min_column_depth,
             self.metric_form(),
+            self.pair_density.as_deref(),
             profile,
         )));
         self
@@ -398,6 +413,7 @@ where
             self.rho0,
             self.min_column_depth,
             self.metric_form(),
+            self.pair_density.as_deref(),
         )));
     }
 
@@ -771,6 +787,10 @@ where
                 PressureGradientForm::ConstantDepth => None,
             },
             metric: self.metric_form(),
+            pair_density: match self.pressure_gradient {
+                PressureGradientForm::SigmaPairs => self.pair_density.as_deref(),
+                PressureGradientForm::ConstantDepth => None,
+            },
         }
     }
 
@@ -936,6 +956,7 @@ where
                 None,
                 &self.boundaries,
                 scheme,
+                None,
             );
             // River water brings the column's own turbulence: its volume
             // source must not dilute it
