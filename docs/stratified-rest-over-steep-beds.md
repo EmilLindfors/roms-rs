@@ -90,3 +90,21 @@ Three independent pieces, none sufficient alone:
 3. **The pair density with its stiff part implicit.** The stiff coupling is local to one element and one level (the pair term of the force and of the advection): for P2, 9 nodes × (u, v, ρ) per element and level. That makes a linearly implicit (Rosenbrock/W-method or IMEX) stage solve of a 27 × 27 system per element-level feasible. It needs a reference profile, though, so it does not carry over to evolving stratifications (rivers, nesting, GLS mixing layers) without updating the Casimir.
 
 The alternatives that avoid the problem do so by geometry: z-pairs or shaved cells as in SCHISM's LSC², or envelopes. They are a larger change here because the 2D/3D mode splitting pairs layer transports with the barotropic pair flux.
+
+## Follow-up 2026-10-04: wetting and drying made consistent, and smoothing
+
+Piece 2 is done, and it did not need the 2D kernel to change. Its wet/dry subcells already block a dry bank: Audusse et al.'s hydrostatic reconstruction gives `h* = 0` there. The 3D layers of those elements ignored that and moved their volume with the DG pairs. Now:
+
+- The 2D kernel reports the mass flux through every subcell interface, and the mode splitter averages it like the face fluxes.
+- Elements that took the subcells throughout the pass move their layers through the same interfaces (`Δσ_l F̄` plus the central baroclinic part between columns that are not thin), so the layers sum to the 2D update node by node.
+- The pressure gradient's volume term in such an element is the subcell interfaces' central difference, the adjoint of that divergence.
+- A thin column exchanges no baroclinic transport across faces either.
+- 2D takes its subcells in exactly the elements where 3D has a thin column.
+
+Which form the advection takes on the subcell interfaces matters. Upwind moved a steep shore's linear stratification by 8e-3 °C, the diapycnal mixing of diffusion along steep σ-levels (Marchesiello et al. 2009). Central keeps it to 5e-4 °C and is the PGF's energy partner.
+
+With the shores consistent, the bed smoothing needs no shore rule. Pairs of columns that are not thin are bounded per element (r_x0 ≤ 0.2 below 1.5 × the pycnocline's bottom), volume-preserving, and the coastline does not move. Slices hold for a day at ≈ 2e-10 m/s: the 15 → 300 m cliff, 0.5 m beside 150 m, and land beside 300 m. Before, land beside 300 m reached 1.3e-3 m/s in 48 h unsmoothed.
+
+Frøya at rest (20 levels, GLS and the limiter): on the 1 km grid, constant mixing without the limiter holds 5.8e-10 m/s for 24 h. With GLS and the limiter the speed creeps up, to 1.1e-3 m/s at 8 h and 1.1e-2 at 24 h, at the bed of shallow elements: mixing at the slopes, as the control shows. The coastline mesh with GLS: about 1e-3 m/s per hour for 1.5 h, then 8e-3 m/s at 2 h in a shore element at a wetting front. Before, it reached 0.16 m/s within 15 min.
+
+The smoothing is still heavy on the coastline mesh: 23k of ≈ 50k nodes change, by up to 210 m. The ratio bound chains outward from every steep coast element, about a kilometre at 200 m elements. Pieces 1 and 3 (a spectrum harness, and an implicit pair density) remain the route to a lighter bound.

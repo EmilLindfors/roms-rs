@@ -164,6 +164,17 @@
 //! PGF) sitting on a face exerts its force. In a fluid at rest the jump is
 //! zero.
 //!
+//! **Wetting and drying.** A column thinner than `min_column_depth` exerts
+//! and feels no pressure difference, and exchanges no baroclinic transport
+//! ([`crate::solver::rhs::LayerTransport::compute`]). An element with such a
+//! column moves its layers on the GLL subcells of the 2D wet/dry kernel, so
+//! its volume term is the central subcell difference over each interface
+//! between two wet columns, `½ m Δp / (w J)` at both nodes: the adjoint of
+//! that divergence, which keeps the energy exchange exact there too. (The
+//! DG pairs of a shore element exchanged layer volume with dry nodes that
+//! had no pressure-work partner, and a stratified shore at rest grew within
+//! hours; TODO P1.3.)
+//!
 //! **Reference density.** The integrated density is `ρ − rho_ref`:
 //! `rho_ref = 0` gives the full PGF, whose `ρ`-uniform part is `−g∇η`
 //! (DG-coupled through the face lift); `rho_ref = ρ₀` gives the
@@ -174,6 +185,7 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::blocks::{Pooled, for_each_block};
+use crate::solver::rhs::subcells::{line_metric, line_node, telescoped_interfaces};
 use crate::solver::rhs::transport_3d::MetricForm;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
@@ -712,83 +724,149 @@ fn pressure_gradient_element(
     py: &mut [f64],
     dp: &mut [f64],
 ) {
-    let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
-    let nl = sigma.n_levels();
-    {
-        let el = ElementIndex::new(k);
-        for i in 0..nn {
-            own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
-        }
-        px.fill(0.0);
-        py.fill(0.0);
+    let nn = ops.n_nodes;
+    let el = ElementIndex::new(k);
+    for i in 0..nn {
+        own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
+    }
+    px.fill(0.0);
+    py.fill(0.0);
 
-        // Volume term: Σ_j Dx_ij Δp_ij, with Δp_ji = −Δp_ij, and the metric
-        // of the pair in the advection's form (see "Curvilinear elements")
-        let averaged = metric.averaged_on(geom, k);
-        for i in 0..nn {
-            let a = own.view(i);
-            let (ar_i, as_i) = geom.contravariant(k, i);
-            let j_inv_i = geom.jacobian_inv(k, i);
-            for j in i + 1..nn {
-                let b = own.view(j);
-                let (ar_j, as_j) = geom.contravariant(k, j);
-                let j_inv_j = geom.jacobian_inv(k, j);
-                // The contravariant vectors the pair is differenced with at
-                // i and at j: each node's own, or both their mean
-                let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
-                    let mean =
-                        |a: (f64, f64), b: (f64, f64)| (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
-                    let m = (mean(ar_i, ar_j), mean(as_i, as_j));
-                    (m, m)
-                } else {
-                    ((ar_i, as_i), (ar_j, as_j))
-                };
-                let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
-                let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
-                let (dx_ij, dy_ij) = (
-                    j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
-                    j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
-                );
-                let (dx_ji, dy_ji) = (
-                    j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
-                    j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
-                );
-                pressure_differences(&a, &b, form, dp);
-                for (l, &dp) in dp.iter().enumerate() {
-                    px[i * nl + l] += dx_ij * dp;
-                    py[i * nl + l] += dy_ij * dp;
-                    px[j * nl + l] -= dx_ji * dp;
-                    py[j * nl + l] -= dy_ji * dp;
+    // An element with a thin column moves its layers on the GLL subcells
+    // (`LayerTransport`): its volume term is the adjoint of that divergence,
+    // a central difference over each subcell interface
+    if own.wet[..nn].iter().any(|&w| !w) {
+        subcell_volume_term(k, ops, geom, form, own, px, py, dp);
+    } else {
+        dg_volume_term(k, ops, geom, form, metric, own, px, py, dp);
+    }
+
+    // Face terms: LIFT (n·(p* − p⁻)), p* − p⁻ = ½ Δp at a common depth
+    let (nfn, nl) = (ops.n_face_nodes, own.n_levels);
+    for f in 0..4 {
+        let Some(nb) = mesh.neighbor(el, f) else {
+            continue;
+        };
+        let nb_el = ElementIndex::new(nb.element);
+        for fi in 0..nfn {
+            let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
+            across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
+        }
+        for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
+            pressure_differences(&own.view(node), &across.view(fi), form, dp);
+            let normal = geom.normal(k, f, fi);
+            let lift_scale = geom.lift_scale(k, f, fi, node);
+            for (l, &dp) in dp.iter().enumerate() {
+                let jump = 0.5 * dp;
+                if jump == 0.0 {
+                    continue;
+                }
+                let (jx, jy) = (lift_scale * normal.0 * jump, lift_scale * normal.1 * jump);
+                for i in 0..nn {
+                    let lift = ops.lift[f][(i, fi)];
+                    px[i * nl + l] += lift * jx;
+                    py[i * nl + l] += lift * jy;
                 }
             }
         }
+    }
+}
 
-        // Face terms: LIFT (n·(p* − p⁻)), p* − p⁻ = ½ Δp at a common depth
-        for f in 0..4 {
-            let Some(nb) = mesh.neighbor(el, f) else {
-                continue;
+/// The subcell volume term of `pressure_gradient_element`: over every
+/// interface between nodes `a` and `b` of a GLL line, with its contravariant
+/// direction `m` and both columns wet, `½ m Δp_ab / (w J)` at both nodes:
+/// the negative adjoint, under the nodal masses `w_a w_j J`, of the subcell
+/// divergence of the layer fluxes `m·½(Q_a + Q_b)`
+/// ([`crate::solver::rhs::subcell_divergence_element`]). At the line ends
+/// the faces' `½Δp` lift is the same term.
+#[allow(clippy::too_many_arguments)]
+fn subcell_volume_term(
+    k: usize,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    form: PressureGradientForm,
+    own: &Columns,
+    px: &mut [f64],
+    py: &mut [f64],
+    dp: &mut [f64],
+) {
+    let nl = own.n_levels;
+    let n1 = ops.n_1d;
+    let w = &ops.weights_1d;
+    // Stack buffers, polynomial order ≤ 15
+    let mut metric = [(0.0, 0.0); 16];
+    let mut interfaces = [(0.0, 0.0); 17];
+    for dir in 0..2 {
+        for line in 0..n1 {
+            let affine = line_metric(ops, geom, k, dir, line, &mut metric[..n1]);
+            telescoped_interfaces(ops, &metric[..n1], affine, &mut interfaces);
+            for a in 0..n1 - 1 {
+                let (ia, ib) = (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
+                pressure_differences(&own.view(ia), &own.view(ib), form, dp);
+                let m = interfaces[a + 1];
+                let scale_a = 0.5 * geom.jacobian_inv(k, ia) / w[a];
+                let scale_b = 0.5 * geom.jacobian_inv(k, ib) / w[a + 1];
+                for (l, &dp) in dp.iter().enumerate() {
+                    px[ia * nl + l] += scale_a * m.0 * dp;
+                    py[ia * nl + l] += scale_a * m.1 * dp;
+                    px[ib * nl + l] += scale_b * m.0 * dp;
+                    py[ib * nl + l] += scale_b * m.1 * dp;
+                }
+            }
+        }
+    }
+}
+
+/// The DG volume term of `pressure_gradient_element`: `Σ_j Dx_ij Δp_ij`,
+/// with `Δp_ji = −Δp_ij`, and the metric of the pair in the advection's form
+/// (see "Curvilinear elements").
+#[allow(clippy::too_many_arguments)]
+fn dg_volume_term(
+    k: usize,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    form: PressureGradientForm,
+    metric: MetricForm,
+    own: &Columns,
+    px: &mut [f64],
+    py: &mut [f64],
+    dp: &mut [f64],
+) {
+    let (nn, nl) = (ops.n_nodes, own.n_levels);
+    let averaged = metric.averaged_on(geom, k);
+    for i in 0..nn {
+        let a = own.view(i);
+        let (ar_i, as_i) = geom.contravariant(k, i);
+        let j_inv_i = geom.jacobian_inv(k, i);
+        for j in i + 1..nn {
+            let b = own.view(j);
+            let (ar_j, as_j) = geom.contravariant(k, j);
+            let j_inv_j = geom.jacobian_inv(k, j);
+            // The contravariant vectors the pair is differenced with at i
+            // and at j: each node's own, or both their mean
+            let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
+                let mean = |a: (f64, f64), b: (f64, f64)| (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+                let m = (mean(ar_i, ar_j), mean(as_i, as_j));
+                (m, m)
+            } else {
+                ((ar_i, as_i), (ar_j, as_j))
             };
-            let nb_el = ElementIndex::new(nb.element);
-            for fi in 0..nfn {
-                let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
-                across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
-            }
-            for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                pressure_differences(&own.view(node), &across.view(fi), form, dp);
-                let normal = geom.normal(k, f, fi);
-                let lift_scale = geom.lift_scale(k, f, fi, node);
-                for (l, &dp) in dp.iter().enumerate() {
-                    let jump = 0.5 * dp;
-                    if jump == 0.0 {
-                        continue;
-                    }
-                    let (jx, jy) = (lift_scale * normal.0 * jump, lift_scale * normal.1 * jump);
-                    for i in 0..nn {
-                        let lift = ops.lift[f][(i, fi)];
-                        px[i * nl + l] += lift * jx;
-                        py[i * nl + l] += lift * jy;
-                    }
-                }
+            let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+            let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
+            let (dx_ij, dy_ij) = (
+                j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
+                j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
+            );
+            let (dx_ji, dy_ji) = (
+                j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
+                j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
+            );
+            pressure_differences(&a, &b, form, dp);
+            for (l, &dp) in dp.iter().enumerate() {
+                px[i * nl + l] += dx_ij * dp;
+                py[i * nl + l] += dy_ij * dp;
+                px[j * nl + l] -= dx_ji * dp;
+                py[j * nl + l] -= dy_ji * dp;
             }
         }
     }

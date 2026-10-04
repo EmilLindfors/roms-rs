@@ -83,9 +83,10 @@ use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
 use crate::solver::core::blocks::{for_each_block, update_values, update_with};
+use crate::solver::rhs::subcells::subcell_interfaces;
 use crate::solver::rhs::{
-    BarotropicFlux, MetricForm, from_inventory, to_inventory, transport_divergence_element,
-    w_cell_thicknesses,
+    BarotropicFlux, MetricForm, from_inventory, subcell_divergence_element, to_inventory,
+    transport_divergence_element, w_cell_thicknesses,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
@@ -113,19 +114,33 @@ const NODAL_IDENTITY_TOLERANCE: f64 = 1e-9;
 /// transport, whose relative residual is O(1).
 const DEPTH_ROUND_OFF: f64 = 1e-12;
 
+/// Relative error of a column's water, `|∂η/∂t + ∇·DU_avg2|·Δt / D`, above
+/// which an element is treated as balanced only as a whole: a tracer's
+/// constancy error at that node. Without it, a film at a wetting front (a
+/// millimetre of water) turns the round-off of a subcell element's residual
+/// into ≈ 1e-6 of its tracers.
+const CONSTANCY_TOLERANCE: f64 = 1e-12;
+
+/// Depth (m) below which a column counts as this deep for
+/// [`CONSTANCY_TOLERANCE`] (its tracers are not defined below it, see
+/// [`crate::solver::rhs::from_inventory`]).
+const MIN_COLUMN_VOLUME_DEPTH: f64 = 1e-6;
+
 /// The fast-mode module: a 2D shallow-water RHS in transport form that can
 /// also report the numerical mass flux at every element face.
 pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
     /// [`PhysicsModule::compute_rhs_into`], also writing the mass component
     /// of `F*` at every element face node along its outward normal into
-    /// `face_mass` (layout of
-    /// [`crate::solver::compute_rhs_swe_2d_face_mass_into`]).
-    fn compute_rhs_face_mass_into(
+    /// `face_mass`, and the mass flux through every subcell interface of the
+    /// wet/dry subcell elements into `subcell_mass` (NaN in other elements;
+    /// layouts of [`crate::solver::compute_rhs_swe_2d_mass_fluxes_into`]).
+    fn compute_rhs_mass_fluxes_into(
         &self,
         state: &SWESolution2D,
         time: f64,
         out: &mut SWESolution2D,
         face_mass: &mut [f64],
+        subcell_mass: &mut [f64],
     );
 
     /// The volume form of the mass equation's divergence: the barotropic
@@ -149,11 +164,15 @@ pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
 ///
 /// The DG divergence is linear in the nodal `(hu, hv)` and the face mass flux
 /// `F*_h`, so both are accumulated ([`Self::divergence_into`]). The identity is
-/// exact to round-off for the collocated and flux-differencing forms. Two
+/// exact to round-off for the collocated and flux-differencing forms. In
+/// `WetDry` elements with a shallow node the volume term is a subcell
+/// finite-volume update; its interface mass fluxes are accumulated too
+/// ([`Self::subcell`]), and where every stage of the pass took the subcells
+/// the identity holds in their form ([`subcell_divergence_element`]). Two
 /// cases only keep the element balance `∫ (η̄ − ηⁿ) = −Δt ∮ F*_h`, not the
 /// nodal identity:
-/// - `WetDry` elements with a dry node, where the volume term is a subcell
-///   finite-volume update;
+/// - elements that switched between the volume term and the subcells during
+///   the pass;
 /// - elements the positivity limiter or wet/dry correction changed (they
 ///   keep the element mean).
 ///
@@ -170,16 +189,28 @@ pub struct BarotropicTransport {
     /// Mass flux out of every element face node (m²/s), laid out as
     /// `(k · 4 + face) · n_face_nodes + fi`.
     pub face: Vec<f64>,
+    /// Mass flux through every subcell interface of the wet/dry subcell
+    /// elements, `k · n_sub + slot` ([`crate::solver::rhs::subcells`]); NaN
+    /// in the elements where some stage of the pass took the
+    /// flux-differencing volume term.
+    pub subcell: Vec<f64>,
     /// Discharge of every river averaged with the same weights (m³/s).
     pub discharge: Vec<f64>,
 }
 
 impl BarotropicTransport {
-    fn new(n_elements: usize, n_nodes: usize, n_face_values: usize, n_rivers: usize) -> Self {
+    fn new(
+        n_elements: usize,
+        n_nodes: usize,
+        n_face_values: usize,
+        n_subcell_values: usize,
+        n_rivers: usize,
+    ) -> Self {
         Self {
             hu: DGSolution2D::new(n_elements, n_nodes),
             hv: DGSolution2D::new(n_elements, n_nodes),
             face: vec![0.0; n_face_values],
+            subcell: vec![0.0; n_subcell_values],
             discharge: vec![0.0; n_rivers],
         }
     }
@@ -188,14 +219,24 @@ impl BarotropicTransport {
         self.hu.fill(0.0);
         self.hv.fill(0.0);
         self.face.fill(0.0);
+        self.subcell.fill(0.0);
         self.discharge.fill(0.0);
     }
 
-    /// The DG divergence of the transport, in the strong form of the 2D
-    /// kernel with its volume term in `metric`'s form (the 2D module's,
-    /// [`BarotropicPhysics::metric_form`]): conservatively
+    /// The subcell interface fluxes of element `k` if every stage of the pass
+    /// moved its mass on the subcells, else `None`.
+    pub fn subcells_of(&self, k: usize, n_1d: usize) -> Option<&[f64]> {
+        let n_sub = subcell_interfaces(n_1d);
+        let fluxes = &self.subcell[k * n_sub..(k + 1) * n_sub];
+        fluxes.iter().all(|f| f.is_finite()).then_some(fluxes)
+    }
+
+    /// The divergence of the transport, in the 2D kernel's form: the strong
+    /// form with its volume term in `metric`'s form (the 2D module's,
+    /// [`BarotropicPhysics::metric_form`]; conservatively
     /// `J⁻¹[Dr·(J∇r·q) + Ds·(J∇s·q)] − J⁻¹ Σ_f LIFT_f sJ_f (q·n − F*_h)` with
-    /// `q = (hu, hv)`.
+    /// `q = (hu, hv)`), or in the subcell elements of the pass the subcell
+    /// form ([`subcell_divergence_element`]).
     pub fn divergence_into(
         &self,
         ops: &DGOperators2D,
@@ -205,16 +246,18 @@ impl BarotropicTransport {
     ) {
         let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
         for k in 0..out.n_elements {
-            transport_divergence_element(
-                ops,
-                geom,
-                metric,
-                k,
+            let (hu, hv) = (
                 &self.hu.data[k * nn..(k + 1) * nn],
                 &self.hv.data[k * nn..(k + 1) * nn],
-                &self.face[k * 4 * nfn..(k + 1) * 4 * nfn],
-                &mut out.data[k * nn..(k + 1) * nn],
             );
+            let face = &self.face[k * 4 * nfn..(k + 1) * 4 * nfn];
+            let div = &mut out.data[k * nn..(k + 1) * nn];
+            match self.subcells_of(k, ops.n_1d) {
+                Some(subcells) => {
+                    subcell_divergence_element(ops, geom, k, hu, hv, subcells, face, div)
+                }
+                None => transport_divergence_element(ops, geom, metric, k, hu, hv, face, div),
+            }
         }
     }
 }
@@ -586,6 +629,8 @@ struct Buffers {
     transport: BarotropicTransport,
     /// Face mass fluxes of one 2D RHS evaluation.
     face_mass: Vec<f64>,
+    /// Subcell interface mass fluxes of one 2D RHS evaluation.
+    subcell_mass: Vec<f64>,
     /// Depth means of the u/v tendency (or of u/v after diffusion).
     mean_u: DGSolution2D,
     mean_v: DGSolution2D,
@@ -606,9 +651,10 @@ struct Buffers {
 }
 
 impl Buffers {
-    fn new(state: &Solution3D, n_face_nodes: usize, n_rivers: usize) -> Self {
+    fn new(state: &Solution3D, ops: &DGOperators2D, n_rivers: usize) -> Self {
         let (ne, nn) = (state.n_elements, state.n_nodes);
-        let n_face_values = ne * 4 * n_face_nodes;
+        let n_face_values = ne * 4 * ops.n_face_nodes;
+        let n_subcell_values = ne * subcell_interfaces(ops.n_1d);
         Self {
             rhs_n: Solution3D::new(ne, nn, state.n_levels),
             concentrations: Solution3D::new(ne, nn, state.n_levels),
@@ -623,8 +669,9 @@ impl Buffers {
             q_avg: SWESolution2D::new(ne, nn),
             forcing: SWESolution2D::new(ne, nn),
             history: SlowForcingHistory::new(ne, nn),
-            transport: BarotropicTransport::new(ne, nn, n_face_values, n_rivers),
+            transport: BarotropicTransport::new(ne, nn, n_face_values, n_subcell_values, n_rivers),
             face_mass: vec![0.0; n_face_values],
+            subcell_mass: vec![0.0; n_subcell_values],
             mean_u: DGSolution2D::new(ne, nn),
             mean_v: DGSolution2D::new(ne, nn),
             rate_eta: DGSolution2D::new(ne, nn),
@@ -734,6 +781,7 @@ impl ModeSplitIntegrator {
             history,
             transport,
             face_mass,
+            subcell_mass,
             mean_u,
             mean_v,
             rate_eta,
@@ -744,9 +792,9 @@ impl ModeSplitIntegrator {
             drag_rate,
             layer_drag_rate,
             column_drag_rate,
-        } = self.buffers.get_or_insert_with(|| {
-            Buffers::new(state, barotropic.operators().n_face_nodes, n_rivers)
-        });
+        } = self
+            .buffers
+            .get_or_insert_with(|| Buffers::new(state, barotropic.operators(), n_rivers));
         assert_eq!(
             transport.discharge.len(),
             n_rivers,
@@ -827,7 +875,7 @@ impl ModeSplitIntegrator {
                     StageInput::First => (&*u1, &mut *u2, Some(&*q)),
                     StageInput::Second => (&*u2, &mut *q, None),
                 };
-                barotropic.compute_rhs_face_mass_into(x, time, k_2d, face_mass);
+                barotropic.compute_rhs_mass_fluxes_into(x, time, k_2d, face_mass, subcell_mass);
                 let c = w_secondary * stage.weight / n_bt as f64;
                 if let Some(rivers) = rivers {
                     for (i, mean) in transport.discharge.iter_mut().enumerate() {
@@ -844,6 +892,7 @@ impl ModeSplitIntegrator {
                     rhs: k_2d,
                     forcing: g_term,
                     face_mass,
+                    subcell_mass,
                     drag: stage_drag,
                 };
                 let weights = PassWeights {
@@ -889,6 +938,7 @@ impl ModeSplitIntegrator {
             hu: &transport.hu.data,
             hv: &transport.hv.data,
             face: &transport.face,
+            subcell: &transport.subcell,
             eta_rate: &rate_eta.data,
             rivers: river_inflow,
         };
@@ -907,18 +957,26 @@ impl ModeSplitIntegrator {
             let bed = bathymetry.element(ElementIndex::new(k));
             let source = river_inflow.map_or(0.0, |r| r.volume_rate(k));
             let (mut residual, mut scale, mut depth) = (0.0_f64, 0.0_f64, 0.0_f64);
+            // The largest relative change of a column's volume that its layers
+            // would not carry (a tracer's constancy error there)
+            let mut constancy = 0.0_f64;
             for ((&rate, &div), (&eta, &b)) in rate_eta.data[nodes.clone()]
                 .iter()
                 .zip(&transport_divergence.data[nodes.clone()])
                 .zip(state.eta.data[nodes].iter().zip(bed))
             {
-                residual = residual.max((rate + div - source).abs());
+                let r = (rate + div - source).abs();
+                residual = residual.max(r);
                 scale = scale.max(rate.abs()).max(div.abs()).max(source);
                 depth = depth.max(eta - b);
+                constancy = constancy.max(r * dt / (eta - b).max(MIN_COLUMN_VOLUME_DEPTH));
             }
-            // Relative to the flow, and not round-off of a fluid at rest
-            *mark = residual > NODAL_IDENTITY_TOLERANCE * scale
-                && residual * dt > DEPTH_ROUND_OFF * depth;
+            // Relative to the flow, and not round-off of a fluid at rest; or
+            // large against a thin column's own water (a film at a wetting
+            // front, whose tracers it would otherwise skew)
+            *mark = (residual > NODAL_IDENTITY_TOLERANCE * scale
+                && residual * dt > DEPTH_ROUND_OFF * depth)
+                || constancy > CONSTANCY_TOLERANCE;
         }
         let means: &[bool] = element_means;
         w_cell_thicknesses(sigma.d_sigma(), d_sigma_w);
@@ -1109,6 +1167,7 @@ struct StageRates<'a> {
     rhs: &'a SWESolution2D,
     forcing: &'a SWESolution2D,
     face_mass: &'a [f64],
+    subcell_mass: &'a [f64],
     drag: StageDrag<'a>,
 }
 
@@ -1151,6 +1210,7 @@ fn barotropic_stage(
 ) {
     let (ne, nn) = (x.n_elements, x.n_nodes);
     let n_face = rates.face_mass.len() / ne.max(1);
+    let n_sub = rates.subcell_mass.len() / ne.max(1);
     let dt_stage = stage.dt_fraction * dt;
     let [h, hu, hv] = &mut target.data;
     let [avg_h, avg_hu, avg_hv] = &mut average.data;
@@ -1161,6 +1221,7 @@ fn barotropic_stage(
         &mut transport.hu.data[..],
         &mut transport.hv.data[..],
         &mut transport.face[..],
+        &mut transport.subcell[..],
         avg_h,
         avg_hu,
         avg_hv,
@@ -1169,7 +1230,20 @@ fn barotropic_stage(
         ne,
         outputs,
         || (),
-        |_, k, [h, hu, hv, tr_hu, tr_hv, tr_face, avg_h, avg_hu, avg_hv]| {
+        |_,
+         k,
+         [
+            h,
+            hu,
+            hv,
+            tr_hu,
+            tr_hv,
+            tr_face,
+            tr_subcell,
+            avg_h,
+            avg_hu,
+            avg_hv,
+        ]| {
             let nodes = k * nn..(k + 1) * nn;
             for (var, new) in [&mut *h, &mut *hu, &mut *hv].into_iter().enumerate() {
                 let x = &x.data[var][nodes.clone()];
@@ -1223,6 +1297,11 @@ fn barotropic_stage(
             }
             let faces = &rates.face_mass[k * n_face..(k + 1) * n_face];
             for (a, &b) in tr_face.iter_mut().zip(faces) {
+                *a += c * b;
+            }
+            // NaN (a stage without subcells) stays NaN
+            let subcells = &rates.subcell_mass[k * n_sub..(k + 1) * n_sub];
+            for (a, &b) in tr_subcell.iter_mut().zip(subcells) {
                 *a += c * b;
             }
             if let Some(w) = weights.average {
@@ -1620,7 +1699,7 @@ mod tests {
         // Reference: SSPRK3 with each operation as its own sweep
         let mut q = q0.clone();
         let mut avg = SWESolution2D::new(ne, nn);
-        let mut transport = BarotropicTransport::new(ne, nn, ne * n_face, 0);
+        let mut transport = BarotropicTransport::new(ne, nn, ne * n_face, 0, 0);
         let mut face = vec![0.0; ne * n_face];
         let mut workspace = StageWorkspace::new();
         let damp = |s: &mut SWESolution2D, dt: f64| {
@@ -1667,7 +1746,7 @@ mod tests {
         let mut q_fused = q0.clone();
         let (mut u1, mut u2, mut k) = (q0.clone(), q0.clone(), q0.clone());
         let mut avg_fused = SWESolution2D::new(ne, nn);
-        let mut transport_fused = BarotropicTransport::new(ne, nn, ne * n_face, 0);
+        let mut transport_fused = BarotropicTransport::new(ne, nn, ne * n_face, 0, 0);
         let mut pending = None;
         for m in 0..2 {
             for stage in SSP_RK3_STAGES {
@@ -1681,6 +1760,7 @@ mod tests {
                     rhs: &k,
                     forcing: &g,
                     face_mass: &face,
+                    subcell_mass: &[],
                     drag,
                 };
                 let weights = PassWeights {

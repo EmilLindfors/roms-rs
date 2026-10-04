@@ -199,11 +199,13 @@ where
         coriolis: Arc<CoriolisSource2D>,
         eos: EOS,
         mixing: MIX,
-        swe_physics: SWEPhysics2D<BC>,
+        mut swe_physics: SWEPhysics2D<BC>,
         forcing: Forcing,
         g: f64,
         rho0: f64,
     ) -> Self {
+        // The 2D wet/dry kernel's subcells where the layers take them
+        swe_physics.subcell_depth = Some(Self::DEFAULT_MIN_COLUMN_DEPTH);
         let transport_scratch = Mutex::new(
             LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels())
                 .with_metric(MetricForm::of(swe_physics.formulation)),
@@ -285,21 +287,30 @@ where
     ///   their momentum tendency is zero, and they get no vertical diffusion;
     /// - the surface and bottom stresses do not reach the depth mean through
     ///   them (masked in G);
-    /// - they exert and feel no baroclinic pressure difference;
+    /// - they exert and feel no baroclinic pressure difference, and exchange
+    ///   no baroclinic transport (only their share of the barotropic flux);
+    /// - an element with a thin column moves its layers, tracers and momentum
+    ///   through the GLL subcell interfaces of the 2D `WetDry` kernel, which
+    ///   this sets to take its subcells in the same elements
+    ///   (`SWEPhysics2D::subcell_depth`): the layers then carry exactly the
+    ///   water the 2D pass moved node by node, a dry bank blocked by its
+    ///   hydrostatic reconstruction (see
+    ///   [`crate::solver::rhs::LayerTransport::compute`]).
     ///
-    /// (The tracers need no threshold: the mode splitter carries them as
-    /// element means per level wherever the 2D pass balanced an element only
-    /// as a whole, see [`crate::solver::rhs::from_inventory`].)
+    /// Where the pass still kept an element's balance only as a whole (it
+    /// switched to the subcells during the step, or the positivity limiter
+    /// changed it), the mode splitter carries its tracers as element means
+    /// per level ([`crate::solver::rhs::from_inventory`]).
     ///
     /// Everything else stays 3D, including the wet nodes of shoreline
-    /// elements. The 2D module's own wetting and drying (`WetDry`) is
-    /// unaffected.
+    /// elements.
     pub fn with_min_column_depth(mut self, depth: f64) -> Self {
         assert!(
             depth > 0.0,
             "minimum column depth must be positive, got {depth}"
         );
         self.min_column_depth = depth;
+        self.swe_physics.subcell_depth = Some(depth);
         self
     }
 
@@ -853,6 +864,7 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &exterior,
+                self.min_column_depth,
             );
             let config = Rhs3DConfig {
                 exterior,
@@ -1160,6 +1172,7 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &Exterior3D::default(),
+                self.min_column_depth,
             );
         });
         let nl = state.n_levels;
@@ -1257,6 +1270,7 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &Exterior3D::default(),
+                self.min_column_depth,
             );
             advection_u.fill(0.0);
             advection_v.fill(0.0);
@@ -1290,6 +1304,7 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &Exterior3D::default(),
+                self.min_column_depth,
             );
             bar_rhs.u.fill(0.0);
             bar_rhs.v.fill(0.0);

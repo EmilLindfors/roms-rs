@@ -1635,8 +1635,9 @@ mod tests {
             "steep shore: T off its profile by {deviation:.2e} °C, largest speed {speed:.2e} m/s"
         );
         assert!(shoreline > 0, "test regime: no shallow water at the shore");
-        // Measured 4.8e-4 °C (largest speed 2.9e-3 m/s); with the element
-        // means alone 0.12 °C (1.8e-2 m/s)
+        // Measured 5.3e-4 °C (largest speed 2.9e-3 m/s; 4.8e-4 before the shore
+        // elements moved their layers on the subcells); with the element
+        // means alone 0.12 °C (1.8e-2 m/s), with upwind on the subcells 8e-3 °C
         assert!(
             deviation < 1e-3,
             "the stratification moved by {deviation:.3e} °C at a node's height"
@@ -1647,7 +1648,8 @@ mod tests {
     /// surface-stretched levels, no tracer diffusion, the bed `bed(x)` (dry
     /// where it is above 0). `rho(z)` sets T, and is the PGF's reference
     /// profile, so the initial state feels no force. With a `bound`, the bed is
-    /// first smoothed to it (min depth 3 m). Steps of 36 s; the largest layer
+    /// first smoothed to it over the columns that are not thin (the 3D
+    /// model's default thin depth). Steps of 36 s; the largest layer
     /// speed at each of `hours` (increasing).
     fn channel_at_rest(
         bed: impl Fn(f64) -> f64,
@@ -1670,7 +1672,8 @@ mod tests {
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| bed(x));
         if let Some(bound) = bound {
-            let report = bathymetry.smooth_element_slopes(&mesh, &ops, &geom, bound, 3.0);
+            let thin = Physics::DEFAULT_MIN_COLUMN_DEPTH;
+            let report = bathymetry.smooth_element_slopes(&mesh, &ops, &geom, bound, thin);
             println!("channel bed smoothed: {report:?}");
         }
         let bathymetry = Arc::new(bathymetry);
@@ -1850,15 +1853,22 @@ mod tests {
         assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
     }
 
-    /// The pycnocline over the 15 → 300 m cliff, and over land beside 300 m
-    /// of water inside one element, with the bed smoothed to
-    /// [`ElementSlopeBound::for_pycnocline`] (the pycnocline's bottom ≈ 19 m):
-    /// round-off stays round-off for a day (TODO P1.3).
+    /// The pycnocline over the 15 → 300 m cliff, over 0.5 m of water beside
+    /// 150 m, and over land beside 300 m of water, each inside one element,
+    /// with the bed smoothed to [`ElementSlopeBound::for_pycnocline`] (the
+    /// pycnocline's bottom ≈ 19 m) between the columns that are not thin:
+    /// round-off stays round-off for a day (TODO P1.3). The shore needs no
+    /// smoothing: its element moves the layers on the 2D kernel's subcells,
+    /// and the land node exchanges no baroclinic transport.
     #[test]
     fn a_pycnocline_over_a_smoothed_cliff_stays_at_rest() {
         let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
         let bound = Some(ElementSlopeBound::for_pycnocline(19.0));
-        for (name, left, right) in [("cliff", -300.0, -15.0), ("shore", -300.0, 5.0)] {
+        for (name, left, right) in [
+            ("cliff", -300.0, -15.0),
+            ("shallows", -150.0, -0.5),
+            ("shore", -300.0, 5.0),
+        ] {
             let speed =
                 channel_at_rest(|x| step_bed(x, 3, left, right), bound, pycnocline, &[24.0])[0];
             println!("smoothed {name}: {speed:.2e} m/s after 24 h");

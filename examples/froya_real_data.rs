@@ -130,13 +130,14 @@
 //! `rx0_min_depth` (3 m) deep is at most r (`Bathymetry2D::smooth_rx0`):
 //! shoals a node wide otherwise carry spurious m/s currents.
 //!
-//! `slopes3d=on` (3D runs, `levels=N`) smooths the bed until no element's
-//! depth range lets a σ-level cross the summer pycnocline between two of its
-//! nodes (`Bathymetry2D::smooth_element_slopes`, TODO P1.3): within an
-//! element r_x0 ≤ 0.2 (`slopes3d=r` for another bound) wherever the deeper
-//! node is below `free_depth` (28.5 m, 1.5 × the pycnocline's bottom). Shore
-//! nodes shallower than `rx0_min_depth` never move. Off by default: it holds
-//! fully wet cliffs, but not shore elements with one deep wet node (P1.3).
+//! `slopes3d=on` (3D runs, `levels=N`) smooths the bed, keeping its volume,
+//! until no element's depth range lets a σ-level cross the summer
+//! pycnocline between two of its nodes (`Bathymetry2D::smooth_element_slopes`,
+//! TODO P1.3): within an element r_x0 ≤ 0.2 (`slopes3d=r` for another bound)
+//! between columns that are not thin (`debug_3d=thin=`, 0.1 m) wherever the
+//! deeper one is below `free_depth` (28.5 m, 1.5 × the pycnocline's bottom).
+//! Shores need none (the 3D wetting and drying moves their layers on the 2D
+//! kernel's subcells) and do not move. Off by default.
 //!
 //! `bbox=west,south,east,north` runs a smaller box, e.g. the 22 × 19 km
 //! around Mausund (a quarter of the cost), with its own mesh and boundary
@@ -382,7 +383,23 @@ struct Options {
     output: Option<PathBuf>,
 }
 
+/// The 3D model of `levels=N`.
+type Physics3D = dg_rs::physics::Hydrostatic3D<
+    dg_rs::physics::LinearEOS,
+    Box<dyn dg_rs::physics::VerticalMixing + Send + Sync>,
+    Reflective2D,
+>;
+
 impl Options {
+    /// The 3D thin-column depth (`debug_3d=thin=D`, else the model's
+    /// default).
+    fn thin_depth(&self) -> f64 {
+        self.debug_3d
+            .split(',')
+            .find_map(|f| f.strip_prefix("thin=").and_then(|v| v.parse().ok()))
+            .unwrap_or(Physics3D::DEFAULT_MIN_COLUMN_DEPTH)
+    }
+
     fn parse() -> Result<Self, String> {
         let args: HashMap<String, String> = std::env::args()
             .skip(1)
@@ -687,13 +704,15 @@ impl Domain {
             );
         }
         // 3D: no σ-level may cross the pycnocline between two nodes of one
-        // element (TODO P1.3)
+        // element (TODO P1.3), between the columns that are not thin (the
+        // shores are the wetting and drying's)
         if let Some(bound) = opts.slopes_3d {
-            let report = grid_bed.smooth_element_slopes(&grid, &ops, &grid_geom, bound, min_depth);
+            let thin = opts.thin_depth();
+            let report = grid_bed.smooth_element_slopes(&grid, &ops, &grid_geom, bound, thin);
             println!(
-                "  Smoothed for 3D (within an element r_x0 ≤ {} below {:.1} m, {} sweeps): \
-                 {} elements over the bound (largest excess {:.1} m), {} nodes changed by up to \
-                 {:.1} m, {:.3} km³ of water removed beside the shore; {} elements left over",
+                "  Smoothed for 3D (within an element r_x0 ≤ {} below {:.1} m, columns ≥ {thin} m, \
+                 {} sweeps): {} elements over the bound (largest excess {:.1} m), {} nodes \
+                 changed by up to {:.1} m, volume kept; {} elements left over",
                 bound.r_max,
                 bound.free_depth,
                 report.sweeps,
@@ -701,7 +720,6 @@ impl Domain {
                 report.excess_before,
                 report.changed,
                 report.max_change,
-                report.volume_removed / 1e9,
                 report.elements_after
             );
         }
@@ -1884,7 +1902,6 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     use dg_rs::time::ModeSplitIntegrator;
     use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
 
-    type Physics3D = Hydrostatic3D<LinearEOS, Box<dyn VerticalMixing + Send + Sync>, Reflective2D>;
     const RHO0: f64 = 1025.0;
     let nl = opts.levels;
     let sigma = Arc::new(SigmaGrid::new(
@@ -1945,12 +1962,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         RHO0,
     )
     .with_bottom_drag(BottomDrag3D::log_layer(0.003))
-    .with_min_column_depth(
-        opts.debug_3d
-            .split(',')
-            .find_map(|f| f.strip_prefix("thin=").and_then(|v| v.parse().ok()))
-            .unwrap_or(0.1),
-    )
+    .with_min_column_depth(opts.thin_depth())
     .with_smagorinsky_viscosity(0.1)
     .with_horizontal_viscosity(
         opts.debug_3d

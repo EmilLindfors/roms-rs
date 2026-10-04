@@ -37,19 +37,33 @@
 //! averaged metric is a different operator from the collocated form's), so
 //! `Σ_l ∇·Q_l = ∇·DU_avg2 = Σ_l s_l − ∂η/∂t`
 //! and `Ω` at the surface vanishes to round-off. That holds wherever the barotropic pass
-//! keeps the nodal identity; where it only keeps element balances (`WetDry`
-//! elements with a dry node, positivity-limited elements, see
-//! `BarotropicTransport`), the surface residual is spread linearly over the
-//! column. It integrates to zero over the element (the element balance), so
-//! every layer's continuity still holds for the element as a whole, and the
-//! mode splitter carries the tracers of those elements as element means per
-//! level ([`from_inventory`]): constant and conservative there
-//! too. This is what makes 3D wetting and drying work.
+//! keeps the nodal identity.
+//!
+//! **Wetting and drying.** `WetDry` elements with a shallow node move their
+//! mass on GLL subcells instead (finite volumes with Audusse et al.'s
+//! hydrostatic reconstruction, which closes the interface to a dry bank;
+//! [`crate::solver::rhs::subcells`]). The pass reports and averages the mass
+//! flux through every subcell interface, and in the elements it moved on
+//! the subcells throughout, the layers move through the same interfaces:
+//! their share of the barotropic flux plus the central baroclinic transport
+//! between two columns that are not thin ([`LayerTransport::compute`],
+//! [`subcell_divergence_element`]). So the nodal identity holds there too,
+//! and a dry bank passes no layer volume. A thin column exchanges no
+//! baroclinic transport across faces either, as the pressure gradient exerts
+//! no force between thin columns. Where the pass keeps only element balances
+//! (an element that switched to the subcells during the step, or one the
+//! positivity limiter changed, see `BarotropicTransport`), the surface
+//! residual is spread linearly over the column. It integrates to zero over
+//! the element (the element balance), so every layer's continuity still
+//! holds for the element as a whole, and the mode splitter carries the
+//! tracers of those elements as element means per level
+//! ([`from_inventory`]): constant and conservative there too.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
 //! inventory form: in split form within the elements
 //! ([`advective_divergence_element`], which the 3D model's energy balance
-//! over sloping σ-levels needs), upwind in `C` on the face fluxes, and on
+//! over sloping σ-levels needs; central on the subcell interfaces of a
+//! subcell element, the same pairing), upwind in `C` on the face fluxes, and on
 //! `Ω` by one of
 //! the [`VerticalAdvection`] schemes (by default fourth-order Akima under a
 //! TVD limiter, [`VerticalAdvection::LimitedAkima`]).
@@ -82,6 +96,9 @@ use crate::solver::SWEFormulation2D;
 use crate::solver::core::blocks::{Pooled, for_each_block, max_over_blocks};
 use crate::solver::rhs::advection_3d::{TracerBCContext3D, TracerBoundaryCondition3D};
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D, ExteriorField, FaceExterior};
+use crate::solver::rhs::subcells::{
+    line_metric, line_node, subcell_interfaces, subcell_slot, telescoped_interfaces,
+};
 use crate::solver::state::Solution3D;
 use crate::source::RiverInflow;
 use crate::types::ElementIndex;
@@ -148,7 +165,7 @@ pub fn transport_divergence_element(
     face: &[f64],
     div: &mut [f64],
 ) {
-    let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
+    let nn = ops.n_nodes;
     if metric.averaged_on(geom, k) {
         // ½ Σ_j D_ij (Ja_i + Ja_j)·(q_i + q_j)
         for (i, d) in div.iter_mut().enumerate() {
@@ -174,6 +191,21 @@ pub fn transport_divergence_element(
             *d = geom.jacobian_inv(k, i) * (dr + ds);
         }
     }
+    subtract_face_lift(ops, geom, k, hu, hv, face, div);
+}
+
+/// The face part of the strong-form divergence, `− J⁻¹ Σ_f LIFT_f sJ_f (q·n −
+/// F*)`, subtracted from `div`.
+fn subtract_face_lift(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    k: usize,
+    hu: &[f64],
+    hv: &[f64],
+    face: &[f64],
+    div: &mut [f64],
+) {
+    let nfn = ops.n_face_nodes;
     for f in 0..4 {
         let f_star = &face[f * nfn..(f + 1) * nfn];
         for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
@@ -186,6 +218,67 @@ pub fn transport_divergence_element(
         }
     }
 }
+
+/// The divergence of a transport on the GLL subcells of element `k`, the
+/// form of the 2D wet/dry kernel's subcell finite volumes
+/// ([`crate::solver::rhs::subcells`]):
+///
+/// ```text
+///     J_i⁻¹ Σ_dir (q_{a+½} − q_{a−½}) / w_a  − J⁻¹ Σ_f LIFT_f sJ_f (q·n − F*),
+/// ```
+///
+/// with `q_{a+½}` the flux through each interior interface (`interfaces`, one
+/// per subcell slot, already along the interface's contravariant direction)
+/// and, at the two ends of a line, the node's own `m·(hu, hv)` with its
+/// contravariant vector `m`, which the face term replaces by `F*` (`face`).
+/// Linear in `(hu, hv, interfaces, face)`. With the 2D kernel's interface
+/// mass fluxes and `F*_h` it is that kernel's mass tendency node by node.
+#[allow(clippy::too_many_arguments)]
+pub fn subcell_divergence_element(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    k: usize,
+    hu: &[f64],
+    hv: &[f64],
+    interfaces: &[f64],
+    face: &[f64],
+    div: &mut [f64],
+) {
+    let n1 = ops.n_1d;
+    let w = &ops.weights_1d;
+    div.fill(0.0);
+    let mut metric = [(0.0, 0.0); MAX_N_1D];
+    for dir in 0..2 {
+        for line in 0..n1 {
+            line_metric(ops, geom, k, dir, line, &mut metric[..n1]);
+            let end_flux = |a: usize| {
+                let node = line_node(n1, dir, line, a);
+                metric[a].0 * hu[node] + metric[a].1 * hv[node]
+            };
+            for a in 0..n1 {
+                let right = if a + 1 < n1 {
+                    interfaces[subcell_slot(n1, dir, line, a)]
+                } else {
+                    end_flux(a)
+                };
+                let left = if a > 0 {
+                    interfaces[subcell_slot(n1, dir, line, a - 1)]
+                } else {
+                    end_flux(a)
+                };
+                div[line_node(n1, dir, line, a)] += (right - left) / w[a];
+            }
+        }
+    }
+    for (i, d) in div.iter_mut().enumerate() {
+        *d *= geom.jacobian_inv(k, i);
+    }
+    subtract_face_lift(ops, geom, k, hu, hv, face, div);
+}
+
+/// Largest number of GLL nodes per direction of the subcell kernels' stack
+/// buffers (polynomial order 15).
+const MAX_N_1D: usize = 16;
 
 /// The DG divergence of the advective flux `q φ` of a field `φ` carried by
 /// the transport `q = (hu, hv)` on element `k`, with the volume term in
@@ -290,6 +383,11 @@ pub struct BarotropicFlux<'a> {
     /// Barotropic mass flux out of every element face node (m²/s),
     /// `(k · 4 + face) · n_face_nodes + fi`.
     pub face: &'a [f64],
+    /// Barotropic mass flux through every subcell interface,
+    /// `k · n_sub + slot` ([`crate::solver::rhs::subcells`]); NaN in the
+    /// elements where the pass did not move the mass on the subcells
+    /// throughout ([`crate::time::BarotropicTransport::subcell`]).
+    pub subcell: &'a [f64],
     /// `∂η/∂t = (η̄ − ηⁿ)/Δt` over the step (m/s), `[element][node]`.
     pub eta_rate: &'a [f64],
     /// The rivers of the step, if any: volume sources of the layers, so
@@ -307,6 +405,16 @@ pub struct LayerTransport {
     /// Layer volume flux out of every element face node (m²/s),
     /// `((k · 4 + face) · n_face_nodes + fi) · n_levels + level`.
     pub face: Vec<f64>,
+    /// Layer volume flux through every subcell interface of the subcell
+    /// elements, along the interface's contravariant direction (as the 2D
+    /// kernel's), `((k · n_sub + slot) · n_levels + level`
+    /// ([`crate::solver::rhs::subcells`]; zero in other elements).
+    pub subcell: Vec<f64>,
+    /// Elements whose layers move through their subcell interfaces: those
+    /// with a column thinner than the minimum column depth, where the 2D
+    /// wet/dry kernel moves the mass on the GLL subcells (see
+    /// [`Self::compute`]).
+    pub subcell_elements: Vec<bool>,
     /// `Ω` at the w-points (m/s), `n_levels + 1` per column, bed first.
     pub omega: Vec<f64>,
     /// σ-thickness `Δσ_l` of the layers (uniform until the first
@@ -330,6 +438,8 @@ impl LayerTransport {
             hu: vec![0.0; n_elements * nn * n_levels],
             hv: vec![0.0; n_elements * nn * n_levels],
             face: vec![0.0; n_elements * 4 * nfn * n_levels],
+            subcell: vec![0.0; n_elements * subcell_interfaces(ops.n_1d) * n_levels],
+            subcell_elements: vec![false; n_elements],
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
@@ -358,6 +468,30 @@ impl LayerTransport {
     /// `Ω` closed by the free-surface rate their divergence implies,
     /// `∂η/∂t = −Σ_l ∇·Q_l`. (The slow forcing of the mode splitter uses them
     /// before the barotropic pass of a step exists.)
+    ///
+    /// # Wetting and drying
+    ///
+    /// A column thinner than `min_column_depth` exchanges no baroclinic
+    /// transport: across a face with such a column on either side the layers
+    /// carry only their share `Δσ_l F*` of the barotropic flux, as the
+    /// baroclinic pressure gradient exerts no force between such columns.
+    /// An element with a thin column is a subcell element
+    /// ([`Self::subcell_elements`]): its layers move through the GLL subcell
+    /// interfaces of the 2D wet/dry kernel ([`crate::solver::rhs::subcells`])
+    /// instead of the DG volume term,
+    ///
+    /// ```text
+    ///     q_l = Δσ_l F̄ + m·½(Q̃_l,a + Q̃_l,b),    Q̃_l = Q_l − Δσ_l DU_avg2,
+    /// ```
+    ///
+    /// with `F̄` the pass's barotropic flux through the interface (where it
+    /// moved the element's mass on the subcells throughout; else the central
+    /// `m·{{DU_avg2}}`) and the baroclinic part zero where either column is
+    /// thin. So the layers sum to the 2D update node by node and `Ω` closes
+    /// at the surface (the 2D kernel blocks a dry bank, its hydrostatic
+    /// reconstruction giving `F̄ = 0`); without the subcells the element kept
+    /// only its balance as a whole, and its tracers had to be carried as
+    /// element means.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
@@ -370,21 +504,39 @@ impl LayerTransport {
         bathymetry: &Bathymetry2D,
         boundaries: &Boundaries3D,
         exterior: &Exterior3D,
+        min_column_depth: f64,
     ) {
         let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, self.n_levels);
         assert_eq!(state.n_levels, nl, "layer count of the state");
         let n_elements = state.n_elements;
+        let n1 = ops.n_1d;
+        let n_sub = subcell_interfaces(n1);
         let d_sigma = sigma.d_sigma();
         self.d_sigma.copy_from_slice(d_sigma);
         let Self {
             hu: layer_hu,
             hv: layer_hv,
             face: layer_face,
+            subcell: layer_subcell,
+            subcell_elements,
             omega: layer_omega,
             metric,
             ..
         } = self;
         let metric = *metric;
+        let thin = |flat: usize| state.eta.data[flat] - bathymetry.data[flat] < min_column_depth;
+        // The subcell elements: those the pass moved on the subcells
+        // throughout (so the layers sum to its update node by node), or
+        // without a pass those with a thin column
+        for (k, sub) in subcell_elements.iter_mut().enumerate() {
+            *sub = match barotropic {
+                Some(b) => b.subcell[k * n_sub..(k + 1) * n_sub]
+                    .iter()
+                    .all(|f| f.is_finite()),
+                None => (k * nn..(k + 1) * nn).any(thin),
+            };
+        }
+        let subcell_elements: &[bool] = subcell_elements;
 
         // 1. Nodal layer transports, corrected to DU_avg2
         for_each_block(
@@ -460,10 +612,15 @@ impl LayerTransport {
                         };
                         let local = f * nfn + fi;
                         let fluxes = &mut face_k[local * nl..(local + 1) * nl];
+                        // A thin column on either side: no baroclinic
+                        // exchange (the barotropic share only)
+                        let blocked =
+                            thin(flat) || matches!(across, Across::Node(e) if thin(e / nl));
                         let mut sum = 0.0;
                         for (l, flux) in fluxes.iter_mut().enumerate() {
                             let q_in = nx * layer_hu[interior + l] + ny * layer_hv[interior + l];
                             *flux = match across {
+                                _ if blocked => 0.0,
                                 Across::Node(e) => {
                                     0.5 * (q_in + nx * layer_hu[e + l] + ny * layer_hv[e + l])
                                 }
@@ -489,6 +646,71 @@ impl LayerTransport {
         );
         let layer_face: &[f64] = layer_face;
 
+        // 2b. Subcell interface fluxes of the subcell elements: the layer's
+        // share of the barotropic flux plus the central baroclinic transport
+        // between two columns that are not thin
+        for_each_block(
+            n_elements,
+            [&mut layer_subcell[..]],
+            || (),
+            |_, k, [sub_k]| {
+                if !subcell_elements[k] {
+                    sub_k.fill(0.0);
+                    return;
+                }
+                let pass = barotropic.and_then(|b| {
+                    let fluxes = &b.subcell[k * n_sub..(k + 1) * n_sub];
+                    fluxes.iter().all(|f| f.is_finite()).then_some(fluxes)
+                });
+                let mut metric = [(0.0, 0.0); MAX_N_1D];
+                let mut interfaces = [(0.0, 0.0); MAX_N_1D + 1];
+                for dir in 0..2 {
+                    for line in 0..n1 {
+                        let affine = line_metric(ops, geom, k, dir, line, &mut metric[..n1]);
+                        telescoped_interfaces(ops, &metric[..n1], affine, &mut interfaces);
+                        for a in 0..n1 - 1 {
+                            let slot = subcell_slot(n1, dir, line, a);
+                            let m = interfaces[a + 1];
+                            let (ia, ib) = (
+                                k * nn + line_node(n1, dir, line, a),
+                                k * nn + line_node(n1, dir, line, a + 1),
+                            );
+                            let fluxes = &mut sub_k[slot * nl..(slot + 1) * nl];
+                            let along = |idx: usize| m.0 * layer_hu[idx] + m.1 * layer_hv[idx];
+                            let column =
+                                |flat: usize| (0..nl).map(|l| along(flat * nl + l)).sum::<f64>();
+                            let blocked = thin(ia) || thin(ib);
+                            // The barotropic interface flux and the column
+                            // transports the baroclinic parts are taken from
+                            let (bar, du_a, du_b) = match barotropic {
+                                Some(_) => {
+                                    let (du_a, du_b) = (column(ia), column(ib));
+                                    let bar = match pass {
+                                        Some(fluxes) => fluxes[slot],
+                                        None if blocked => 0.0,
+                                        None => 0.5 * (du_a + du_b),
+                                    };
+                                    (bar, du_a, du_b)
+                                }
+                                None => (0.0, 0.0, 0.0),
+                            };
+                            for (l, flux) in fluxes.iter_mut().enumerate() {
+                                let baroclinic = if blocked {
+                                    0.0
+                                } else {
+                                    0.5 * (along(ia * nl + l) - d_sigma[l] * du_a
+                                        + along(ib * nl + l)
+                                        - d_sigma[l] * du_b)
+                                };
+                                *flux = d_sigma[l] * bar + baroclinic;
+                            }
+                        }
+                    }
+                }
+            },
+        );
+        let layer_subcell: &[f64] = layer_subcell;
+
         // 3. Ω from the bed up
         let sigma_w = sigma.sigma_w();
         let residual = max_over_blocks(
@@ -496,8 +718,8 @@ impl LayerTransport {
             [&mut layer_omega[..]],
             || {
                 Pooled::take(
-                    |s: &OmegaScratch| s.fits(nn, nfn, nl),
-                    || OmegaScratch::new(nn, nfn, nl),
+                    |s: &OmegaScratch| s.fits(nn, nfn, nl, n_sub),
+                    || OmegaScratch::new(nn, nfn, nl, n_sub),
                 )
             },
             |scratch, k, [omega_k]| {
@@ -505,6 +727,7 @@ impl LayerTransport {
                     hu,
                     hv,
                     face,
+                    sub,
                     div,
                     source,
                 } = &mut **scratch;
@@ -522,16 +745,15 @@ impl LayerTransport {
                     for (slot, flux) in face.iter_mut().enumerate() {
                         *flux = layer_face[((k * 4 * nfn) + slot) * nl + l];
                     }
-                    transport_divergence_element(
-                        ops,
-                        geom,
-                        metric,
-                        k,
-                        hu,
-                        hv,
-                        face,
-                        &mut div[l * nn..(l + 1) * nn],
-                    );
+                    let div = &mut div[l * nn..(l + 1) * nn];
+                    if subcell_elements[k] {
+                        for (slot, flux) in sub.iter_mut().enumerate() {
+                            *flux = layer_subcell[(k * n_sub + slot) * nl + l];
+                        }
+                        subcell_divergence_element(ops, geom, k, hu, hv, sub, face, div);
+                    } else {
+                        transport_divergence_element(ops, geom, metric, k, hu, hv, face, div);
+                    }
                 }
                 let mut largest = 0.0_f64;
                 for i in 0..nn {
@@ -577,10 +799,13 @@ impl LayerTransport {
         assert_eq!(self.n_levels, nl + 1, "w-cells of {nl} layers");
         let nw = nl + 1;
         self.metric = layers.metric;
+        self.subcell_elements
+            .copy_from_slice(&layers.subcell_elements);
         for (w_cells, layer_values) in [
             (&mut self.hu, &layers.hu),
             (&mut self.hv, &layers.hv),
             (&mut self.face, &layers.face),
+            (&mut self.subcell, &layers.subcell),
         ] {
             for (w, l) in w_cells
                 .chunks_exact_mut(nw)
@@ -630,24 +855,28 @@ struct OmegaScratch {
     hu: Vec<f64>,
     hv: Vec<f64>,
     face: Vec<f64>,
+    /// A layer's subcell interface fluxes
+    sub: Vec<f64>,
     div: Vec<f64>,
     source: Vec<f64>,
 }
 
 impl OmegaScratch {
-    fn new(nn: usize, nfn: usize, nl: usize) -> Self {
+    fn new(nn: usize, nfn: usize, nl: usize, n_sub: usize) -> Self {
         Self {
             hu: vec![0.0; nn],
             hv: vec![0.0; nn],
             face: vec![0.0; 4 * nfn],
+            sub: vec![0.0; n_sub],
             div: vec![0.0; nn * nl],
             source: vec![0.0; nl],
         }
     }
 
-    fn fits(&self, nn: usize, nfn: usize, nl: usize) -> bool {
+    fn fits(&self, nn: usize, nfn: usize, nl: usize, n_sub: usize) -> bool {
         self.hu.len() == nn
             && self.face.len() == 4 * nfn
+            && self.sub.len() == n_sub
             && self.div.len() == nn * nl
             && self.source.len() == nl
     }
@@ -1269,6 +1498,7 @@ impl LayerContext<'_> {
             fr,
             fs,
             face,
+            sub,
             div,
             ..
         } = scratch;
@@ -1298,7 +1528,31 @@ impl LayerContext<'_> {
                 face[f * nfn + fi] = flux * upwind;
             }
         }
-        if split {
+        if transport.subcell_elements[k] {
+            // Through the subcell interfaces the 2D wet/dry kernel moves the
+            // water through, with the central value: the exact partner of the
+            // pressure gradient's subcell term in energy, and no diffusion
+            // along σ-levels that cut steeply through the stratification
+            // (upwind moved a steep shore's stratification by 8e-3 °C)
+            let n1 = ops.n_1d;
+            let n_sub = subcell_interfaces(n1);
+            for dir in 0..2 {
+                for line in 0..n1 {
+                    for a in 0..n1 - 1 {
+                        let slot = subcell_slot(n1, dir, line, a);
+                        let flux = transport.subcell[(k * n_sub + slot) * nl + l];
+                        let (ia, ib) =
+                            (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
+                        sub[slot] = flux * 0.5 * (phi[ia] + phi[ib]);
+                    }
+                }
+            }
+            for ((hu, hv), &phi) in hu.iter_mut().zip(hv.iter_mut()).zip(phi.iter()) {
+                *hu *= phi;
+                *hv *= phi;
+            }
+            subcell_divergence_element(ops, self.geom, k, hu, hv, sub, face, div);
+        } else if split {
             let metric = transport.metric;
             advective_divergence_element(ops, self.geom, metric, k, hu, hv, phi, face, fr, fs, div);
         } else {
@@ -1321,6 +1575,8 @@ struct TransportScratch {
     fr: Vec<f64>,
     fs: Vec<f64>,
     face: Vec<f64>,
+    /// A layer's advective fluxes through the subcell interfaces
+    sub: Vec<f64>,
     div: Vec<f64>,
     vertical: Vec<f64>,
     slope: Vec<f64>,
@@ -1349,6 +1605,7 @@ impl TransportScratch {
             fr: vec![0.0; ops.n_nodes],
             fs: vec![0.0; ops.n_nodes],
             face: vec![0.0; 4 * ops.n_face_nodes],
+            sub: vec![0.0; subcell_interfaces(ops.n_1d)],
             div: vec![0.0; ops.n_nodes],
             vertical: vec![0.0; n_levels + 1],
             slope: vec![0.0; n_levels],
@@ -1382,6 +1639,9 @@ mod tests {
         du_hu: Vec<f64>,
         du_hv: Vec<f64>,
         du_face: Vec<f64>,
+        /// No subcell fluxes from a pass (NaN): thin elements take the
+        /// central DU_avg2
+        du_subcell: Vec<f64>,
         eta_rate: Vec<f64>,
         boundaries: Boundaries3D,
     }
@@ -1466,6 +1726,7 @@ mod tests {
                 );
             }
             eta_rate.iter_mut().for_each(|r| *r = -*r);
+            let du_subcell = vec![f64::NAN; mesh.n_elements * subcell_interfaces(ops.n_1d)];
             Self {
                 mesh,
                 ops,
@@ -1475,6 +1736,7 @@ mod tests {
                 state,
                 du_hu,
                 du_hv,
+                du_subcell,
                 du_face,
                 eta_rate,
                 boundaries,
@@ -1506,6 +1768,7 @@ mod tests {
                 hu: &self.du_hu,
                 hv: &self.du_hv,
                 face: &self.du_face,
+                subcell: &self.du_subcell,
                 eta_rate: &self.eta_rate,
                 rivers: None,
             };
@@ -1519,6 +1782,7 @@ mod tests {
                 &self.bathymetry,
                 &self.boundaries,
                 exterior,
+                0.0,
             );
             transport
         }
@@ -2456,6 +2720,7 @@ mod tests {
             &case.bathymetry,
             &case.boundaries,
             &Exterior3D::default(),
+            0.0,
         );
         let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
         for idx in 0..case.mesh.n_elements * nn {
@@ -2510,6 +2775,7 @@ mod tests {
             &bathymetry,
             &Boundaries3D::default(),
             &Exterior3D::default(),
+            0.0,
         );
         let scale = max_abs(transport.omega.iter().copied());
         assert!(scale > 1e-3, "test flow should drive a non-trivial Ω");

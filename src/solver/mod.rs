@@ -90,6 +90,7 @@ pub use rhs::{
     compute_rhs_swe_2d,
     compute_rhs_swe_2d_face_mass_into,
     compute_rhs_swe_2d_into,
+    compute_rhs_swe_2d_mass_fluxes_into,
     compute_rhs_swe_2d_subset_then,
     compute_rhs_swe_2d_where_into,
     compute_rhs_tracer_2d,
@@ -102,6 +103,7 @@ pub use rhs::{
     linear_cfl_swe_2d,
     min_element_dt_swe_2d,
     positivity_cfl_swe_2d,
+    subcell_mass_len,
 };
 
 // Re-export limiter types
@@ -182,4 +184,5 @@ pub use limiters::{
 pub use rhs::{
     compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel,
     compute_rhs_swe_2d_parallel_face_mass_into, compute_rhs_swe_2d_parallel_into,
+    compute_rhs_swe_2d_parallel_mass_fluxes_into,
 };
