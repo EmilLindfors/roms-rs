@@ -44,11 +44,11 @@
 //! hydrostatic reconstruction, which closes the interface to a dry bank;
 //! [`crate::solver::rhs::subcells`]). The pass reports and averages the mass
 //! flux through every subcell interface, and in the elements it moved on
-//! the subcells throughout, the layers move through the same interfaces:
-//! their share of the barotropic flux plus the central baroclinic transport
-//! between two columns that are not thin ([`LayerTransport::compute`],
+//! the subcells throughout, the layers move through the same interfaces,
+//! each with its share of the barotropic flux ([`LayerTransport::compute`],
 //! [`subcell_divergence_element`]). So the nodal identity holds there too,
-//! and a dry bank passes no layer volume. A thin column exchanges no
+//! a dry bank passes no layer volume, and such a shore element exchanges no
+//! baroclinic transport within itself (as ROMS masks its wet–dry cells). A thin column exchanges no
 //! baroclinic transport across faces either, as the pressure gradient exerts
 //! no force between thin columns. Where the pass keeps only element balances
 //! (an element that switched to the subcells during the step, or one the
@@ -63,7 +63,7 @@
 //! inventory form: in split form within the elements
 //! ([`advective_divergence_element`], which the 3D model's energy balance
 //! over sloping σ-levels needs; central on the subcell interfaces of a
-//! subcell element, the same pairing), upwind in `C` on the face fluxes, and on
+//! subcell element), upwind in `C` on the face fluxes, and on
 //! `Ω` by one of
 //! the [`VerticalAdvection`] schemes (by default fourth-order Akima under a
 //! TVD limiter, [`VerticalAdvection::LimitedAkima`]).
@@ -478,20 +478,19 @@ impl LayerTransport {
     /// An element with a thin column is a subcell element
     /// ([`Self::subcell_elements`]): its layers move through the GLL subcell
     /// interfaces of the 2D wet/dry kernel ([`crate::solver::rhs::subcells`])
-    /// instead of the DG volume term,
-    ///
-    /// ```text
-    ///     q_l = Δσ_l F̄ + m·½(Q̃_l,a + Q̃_l,b),    Q̃_l = Q_l − Δσ_l DU_avg2,
-    /// ```
-    ///
-    /// with `F̄` the pass's barotropic flux through the interface (where it
-    /// moved the element's mass on the subcells throughout; else the central
-    /// `m·{{DU_avg2}}`) and the baroclinic part zero where either column is
-    /// thin. So the layers sum to the 2D update node by node and `Ω` closes
-    /// at the surface (the 2D kernel blocks a dry bank, its hydrostatic
-    /// reconstruction giving `F̄ = 0`); without the subcells the element kept
-    /// only its balance as a whole, and its tracers had to be carried as
-    /// element means.
+    /// instead of the DG volume term, each with its share of the barotropic
+    /// flux, `q_l = Δσ_l F̄`, with `F̄` the pass's flux through the interface
+    /// (where it moved the element's mass on the subcells throughout; else
+    /// the central `m·{{DU_avg2}}`, none beside a thin column). So the layers
+    /// sum to the 2D update node by node and `Ω` closes at the surface (the
+    /// 2D kernel blocks a dry bank, its hydrostatic reconstruction giving
+    /// `F̄ = 0`), and the element exchanges no baroclinic transport within
+    /// itself, matching the pressure gradient, which exerts no force within
+    /// it (its faces exchange both, with any wet neighbour). Baroclinic
+    /// exchange through the subcells, with the matching central-difference
+    /// force, kept energy exact but was unstable under a pycnocline: a shore
+    /// element of the Frøya coastline mesh grew with an e-folding of 38 min
+    /// (TODO P1.3).
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
@@ -646,9 +645,8 @@ impl LayerTransport {
         );
         let layer_face: &[f64] = layer_face;
 
-        // 2b. Subcell interface fluxes of the subcell elements: the layer's
-        // share of the barotropic flux plus the central baroclinic transport
-        // between two columns that are not thin
+        // 2b. Subcell interface fluxes of the subcell elements: each layer's
+        // share of the barotropic flux, none between a column and a thin one
         for_each_block(
             n_elements,
             [&mut layer_subcell[..]],
@@ -675,34 +673,24 @@ impl LayerTransport {
                                 k * nn + line_node(n1, dir, line, a),
                                 k * nn + line_node(n1, dir, line, a + 1),
                             );
-                            let fluxes = &mut sub_k[slot * nl..(slot + 1) * nl];
-                            let along = |idx: usize| m.0 * layer_hu[idx] + m.1 * layer_hv[idx];
-                            let column =
-                                |flat: usize| (0..nl).map(|l| along(flat * nl + l)).sum::<f64>();
-                            let blocked = thin(ia) || thin(ib);
-                            // The barotropic interface flux and the column
-                            // transports the baroclinic parts are taken from
-                            let (bar, du_a, du_b) = match barotropic {
-                                Some(_) => {
-                                    let (du_a, du_b) = (column(ia), column(ib));
-                                    let bar = match pass {
-                                        Some(fluxes) => fluxes[slot],
-                                        None if blocked => 0.0,
-                                        None => 0.5 * (du_a + du_b),
-                                    };
-                                    (bar, du_a, du_b)
-                                }
-                                None => (0.0, 0.0, 0.0),
+                            // The column transport along the interface
+                            let column = |flat: usize| {
+                                (0..nl)
+                                    .map(|l| {
+                                        m.0 * layer_hu[flat * nl + l]
+                                            + m.1 * layer_hv[flat * nl + l]
+                                    })
+                                    .sum::<f64>()
                             };
-                            for (l, flux) in fluxes.iter_mut().enumerate() {
-                                let baroclinic = if blocked {
-                                    0.0
-                                } else {
-                                    0.5 * (along(ia * nl + l) - d_sigma[l] * du_a
-                                        + along(ib * nl + l)
-                                        - d_sigma[l] * du_b)
-                                };
-                                *flux = d_sigma[l] * bar + baroclinic;
+                            let bar = match pass {
+                                Some(fluxes) => fluxes[slot],
+                                None if thin(ia) || thin(ib) => 0.0,
+                                None => 0.5 * (column(ia) + column(ib)),
+                            };
+                            for (flux, &ds) in
+                                sub_k[slot * nl..(slot + 1) * nl].iter_mut().zip(d_sigma)
+                            {
+                                *flux = ds * bar;
                             }
                         }
                     }
@@ -1530,10 +1518,9 @@ impl LayerContext<'_> {
         }
         if transport.subcell_elements[k] {
             // Through the subcell interfaces the 2D wet/dry kernel moves the
-            // water through, with the central value: the exact partner of the
-            // pressure gradient's subcell term in energy, and no diffusion
-            // along σ-levels that cut steeply through the stratification
-            // (upwind moved a steep shore's stratification by 8e-3 °C)
+            // water through, with the central value: no diffusion along
+            // σ-levels that cut steeply through the stratification (upwind
+            // moved a steep shore's stratification by 8e-3 °C)
             let n1 = ops.n_1d;
             let n_sub = subcell_interfaces(n1);
             for dir in 0..2 {

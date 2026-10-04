@@ -1657,20 +1657,28 @@ mod tests {
         rho: impl Fn(f64) -> f64 + Copy,
         hours: &[f64],
     ) -> Vec<f64> {
+        let (nx, dx) = (8, 1000.0);
+        let mesh = Mesh2D::uniform_rectangle(0.0, nx as f64 * dx, 0.0, dx, nx, 1);
+        basin_at_rest(mesh, |x, _| bed(x), bound, rho, hours, 36.0).0
+    }
+
+    /// [`channel_at_rest`] on any `mesh` (walls) with the bed `bed(x, y)`
+    /// and steps of `dt`: the largest layer speed at each of `hours`, and
+    /// its element at the last.
+    fn basin_at_rest(
+        mesh: Mesh2D,
+        bed: impl Fn(f64, f64) -> f64,
+        bound: Option<ElementSlopeBound>,
+        rho: impl Fn(f64) -> f64 + Copy,
+        hours: &[f64],
+        dt: f64,
+    ) -> (Vec<f64>, usize) {
         use crate::physics::EquationOfState;
         use crate::vertical::SongHaidvogelStretching;
-        let (nx, dx) = (8, 1000.0);
-        let mesh = Arc::new(Mesh2D::uniform_rectangle(
-            0.0,
-            nx as f64 * dx,
-            0.0,
-            dx,
-            nx,
-            1,
-        ));
+        let mesh = Arc::new(mesh);
         let ops = Arc::new(DGOperators2D::new(2));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
-        let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| bed(x));
+        let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
         if let Some(bound) = bound {
             let thin = Physics::DEFAULT_MIN_COLUMN_DEPTH;
             let report = bathymetry.smooth_element_slopes(&mesh, &ops, &geom, bound, thin);
@@ -1723,7 +1731,6 @@ mod tests {
         let physics =
             physics.with_reference_profile(&state, |z| eos.compute_density(temp(z), eos.s0, z));
         let mut integrator = ModeSplitIntegrator::new();
-        let dt = 36.0;
         let mut n = 0;
         let mut speeds = Vec::with_capacity(hours.len());
         for &until in hours {
@@ -1734,10 +1741,22 @@ mod tests {
                 n += 1;
             }
             let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
-            println!("channel at rest: largest speed {speed:.2e} m/s after {until} h");
+            println!("at rest: largest speed {speed:.2e} m/s after {until} h");
             speeds.push(speed);
         }
-        speeds
+        let nl = state.n_levels;
+        let at = state
+            .u
+            .iter()
+            .zip(&state.v)
+            .map(|(u, v)| u.hypot(*v))
+            .enumerate()
+            .fold(
+                (0.0_f64, 0),
+                |m, (i, s)| if s > m.0 { (s, i / nl / nn) } else { m },
+            )
+            .1;
+        (speeds, at)
     }
 
     /// [`channel_at_rest`] with a cliff: the bed falls from 15 to 300 m inside
@@ -1746,6 +1765,67 @@ mod tests {
     /// density does in between. The largest layer speed after `hours`.
     fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
         channel_at_rest(|x| step_bed(x, 3, -300.0, -15.0), None, rho, &[hours])[0]
+    }
+
+    /// Probe (TODO P1.3): the pycnocline at rest around land inside one
+    /// element of a 6 × 6 basin of 200 m P2 elements, smoothed like Frøya
+    /// (`ElementSlopeBound::for_pycnocline(19)` between columns that are not
+    /// thin), constant mixing, no limiter: an islet, a spit ending in the
+    /// element, a spit between deep and shallow water (the coastline mesh's
+    /// element 8722 grew with e-folding ≈ 40 min), a land corner. The
+    /// largest speed at 6 and 12 h and the e-folding between.
+    #[test]
+    #[ignore = "probe: shore elements in 2D"]
+    fn probe_shore_elements_2d() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let bound = Some(ElementSlopeBound::for_pycnocline(19.0));
+        let ridge = |x: f64, y: f64| {
+            (-((x - 500.0) / 40.0).powi(2)).exp() * 0.5 * (1.0 - ((y - 500.0) / 40.0).tanh())
+        };
+        let shallow_east = |x: f64| -30.0 + 27.0 * 0.5 * (1.0 + ((x - 500.0) / 40.0).tanh());
+        let cases: [(&str, &dyn Fn(f64, f64) -> f64); 4] = [
+            ("islet", &|x, y| {
+                -30.0 + 32.0 * (-((x - 500.0).powi(2) + (y - 500.0).powi(2)) / 2500.0).exp()
+            }),
+            ("spit", &|x, y| -30.0 + 32.0 * ridge(x, y)),
+            ("spit, shallow east", &|x, y| {
+                let base = shallow_east(x);
+                base + (2.0 - base) * ridge(x, y)
+            }),
+            ("corner", &|x, y| {
+                let land = 0.25
+                    * (1.0 - ((x - 500.0) / 60.0).tanh())
+                    * (1.0 - ((y - 500.0) / 60.0).tanh());
+                -30.0 + 32.0 * land
+            }),
+        ];
+        let only = std::env::var("DGRS_PROBE").unwrap_or_default();
+        for (name, bed) in cases {
+            if !only.is_empty() && !only.split(',').any(|o| name.starts_with(o)) {
+                continue;
+            }
+            let mut mesh = Mesh2D::uniform_rectangle(0.0, 1200.0, 0.0, 1200.0, 6, 6);
+            // DGRS_DISTORT=a: interior vertices moved by up to a (m), general
+            // quadrilaterals as on the coastline mesh
+            if let Some(a) = std::env::var("DGRS_DISTORT")
+                .ok()
+                .and_then(|a| a.parse::<f64>().ok())
+            {
+                let tau = std::f64::consts::TAU;
+                for v in &mut mesh.vertices {
+                    let [x, y] = *v;
+                    let bump = (tau * x / 1200.0).sin() * (tau * y / 1200.0).sin();
+                    let wiggle = (3.0 * tau * x / 1200.0).sin() * (2.0 * tau * y / 1200.0).cos();
+                    *v = [x + a * bump, y + a * (0.7 * wiggle - 0.5 * bump)];
+                }
+            }
+            let (speeds, at) = basin_at_rest(mesh, bed, bound, pycnocline, &[6.0, 12.0], 30.0);
+            let efold = 6.0 / (speeds[1] / speeds[0]).ln();
+            println!(
+                "PROBE {name}: {:.2e} → {:.2e} m/s (6 → 12 h), e-folding {efold:.1} h, element {at}",
+                speeds[0], speeds[1]
+            );
+        }
     }
 
     /// Calibration probe for the straddle bound: steps inside one element

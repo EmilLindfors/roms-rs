@@ -167,13 +167,13 @@
 //! **Wetting and drying.** A column thinner than `min_column_depth` exerts
 //! and feels no pressure difference, and exchanges no baroclinic transport
 //! ([`crate::solver::rhs::LayerTransport::compute`]). An element with such a
-//! column moves its layers on the GLL subcells of the 2D wet/dry kernel, so
-//! its volume term is the central subcell difference over each interface
-//! between two wet columns, `½ m Δp / (w J)` at both nodes: the adjoint of
-//! that divergence, which keeps the energy exchange exact there too. (The
+//! column moves its layers on the GLL subcells of the 2D wet/dry kernel with
+//! their barotropic shares only, so it has no volume term here either: its
+//! columns feel the pressure of their neighbours through its faces alone. (The
 //! DG pairs of a shore element exchanged layer volume with dry nodes that
 //! had no pressure-work partner, and a stratified shore at rest grew within
-//! hours; TODO P1.3.)
+//! hours; baroclinic exchange through the subcells with its central-difference
+//! force grew too, with an e-folding of 38 min; TODO P1.3.)
 //!
 //! **Reference density.** The integrated density is `ρ − rho_ref`:
 //! `rho_ref = 0` gives the full PGF, whose `ρ`-uniform part is `−g∇η`
@@ -185,7 +185,6 @@ use crate::mesh::Mesh2D;
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::blocks::{Pooled, for_each_block};
-use crate::solver::rhs::subcells::{line_metric, line_node, telescoped_interfaces};
 use crate::solver::rhs::transport_3d::MetricForm;
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
@@ -733,11 +732,9 @@ fn pressure_gradient_element(
     py.fill(0.0);
 
     // An element with a thin column moves its layers on the GLL subcells
-    // (`LayerTransport`): its volume term is the adjoint of that divergence,
-    // a central difference over each subcell interface
-    if own.wet[..nn].iter().any(|&w| !w) {
-        subcell_volume_term(k, ops, geom, form, own, px, py, dp);
-    } else {
+    // with their barotropic shares only (`LayerTransport`): no baroclinic
+    // exchange within it, so no force within it either
+    if own.wet[..nn].iter().all(|&w| w) {
         dg_volume_term(k, ops, geom, form, metric, own, px, py, dp);
     }
 
@@ -766,51 +763,6 @@ fn pressure_gradient_element(
                     let lift = ops.lift[f][(i, fi)];
                     px[i * nl + l] += lift * jx;
                     py[i * nl + l] += lift * jy;
-                }
-            }
-        }
-    }
-}
-
-/// The subcell volume term of `pressure_gradient_element`: over every
-/// interface between nodes `a` and `b` of a GLL line, with its contravariant
-/// direction `m` and both columns wet, `½ m Δp_ab / (w J)` at both nodes:
-/// the negative adjoint, under the nodal masses `w_a w_j J`, of the subcell
-/// divergence of the layer fluxes `m·½(Q_a + Q_b)`
-/// ([`crate::solver::rhs::subcell_divergence_element`]). At the line ends
-/// the faces' `½Δp` lift is the same term.
-#[allow(clippy::too_many_arguments)]
-fn subcell_volume_term(
-    k: usize,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-    form: PressureGradientForm,
-    own: &Columns,
-    px: &mut [f64],
-    py: &mut [f64],
-    dp: &mut [f64],
-) {
-    let nl = own.n_levels;
-    let n1 = ops.n_1d;
-    let w = &ops.weights_1d;
-    // Stack buffers, polynomial order ≤ 15
-    let mut metric = [(0.0, 0.0); 16];
-    let mut interfaces = [(0.0, 0.0); 17];
-    for dir in 0..2 {
-        for line in 0..n1 {
-            let affine = line_metric(ops, geom, k, dir, line, &mut metric[..n1]);
-            telescoped_interfaces(ops, &metric[..n1], affine, &mut interfaces);
-            for a in 0..n1 - 1 {
-                let (ia, ib) = (line_node(n1, dir, line, a), line_node(n1, dir, line, a + 1));
-                pressure_differences(&own.view(ia), &own.view(ib), form, dp);
-                let m = interfaces[a + 1];
-                let scale_a = 0.5 * geom.jacobian_inv(k, ia) / w[a];
-                let scale_b = 0.5 * geom.jacobian_inv(k, ib) / w[a + 1];
-                for (l, &dp) in dp.iter().enumerate() {
-                    px[ia * nl + l] += scale_a * m.0 * dp;
-                    py[ia * nl + l] += scale_a * m.1 * dp;
-                    px[ib * nl + l] += scale_b * m.0 * dp;
-                    py[ib * nl + l] += scale_b * m.1 * dp;
                 }
             }
         }

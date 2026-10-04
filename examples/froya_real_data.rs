@@ -116,7 +116,9 @@
 //! the PGF's balanced reference), `nolimiter`, `constant` (constant mixing
 //! instead of GLS), `thin=D` (the 3D thin-column depth, 0.1 m by default),
 //! `vcentred` (centred vertical tracer advection), `nu=V` (a constant
-//! horizontal viscosity of the shear, m²/s, added to Smagorinsky's).
+//! horizontal viscosity of the shear, m²/s, added to Smagorinsky's),
+//! `around=K:R` (only the elements within R m of element K, walls around:
+//! a local growth reproduced in minutes).
 //!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
 //! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
@@ -1903,6 +1905,45 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
 
     const RHO0: f64 = 1025.0;
+    // `debug_3d=around=K:R`: only the elements within R m of element K
+    // (centres), walls around, to reproduce a local growth quickly
+    let around = opts.debug_3d.split(',').find_map(|f| {
+        let (k, r) = f.strip_prefix("around=")?.split_once(':')?;
+        Some((k.parse::<usize>().ok()?, r.parse::<f64>().ok()?))
+    });
+    let patch;
+    let domain = match around {
+        None => domain,
+        Some((k, radius)) => {
+            let centre = |e: ElementIndex| domain.mesh.reference_to_physical(e, 0.0, 0.0);
+            let [x0, y0] = centre(ElementIndex::new(k));
+            let (mesh, kept) = domain.mesh.retain_elements(
+                |e| {
+                    let [x, y] = centre(e);
+                    (x - x0).hypot(y - y0) <= radius
+                },
+                BoundaryTag::Wall,
+            );
+            let geom = GeometricFactors2D::compute(&mesh, &domain.ops);
+            let bathymetry = domain.bathymetry.select_elements(&kept);
+            println!(
+                "  Patch of {} elements within {radius} m of element {k} (now element {})",
+                kept.len(),
+                kept.iter()
+                    .position(|&e| e == k)
+                    .expect("the element is in its patch")
+            );
+            patch = Domain {
+                name: domain.name,
+                mesh: Arc::new(mesh),
+                ops: domain.ops.clone(),
+                geom: Arc::new(geom),
+                bathymetry: Arc::new(bathymetry),
+                projection: domain.projection,
+            };
+            &patch
+        }
+    };
     let nl = opts.levels;
     let sigma = Arc::new(SigmaGrid::new(
         nl,
