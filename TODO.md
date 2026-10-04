@@ -538,6 +538,17 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
           - It holds the slice for 30 h. On Frøya it blows up within 0.1 h at dt 36 s. At dt 4 s it still grows, e-folding ≈ 150 s, at a shoreline element with dry nodes.
           - It is stiff: `∂ρ*/∂ρ_i` is the chord over the local gradient, up to ≈ 100 where a pair straddles the pycnocline closely over weakly stratified water (effective wave speeds ≈ 10 m/s against 0.5).
           - Prototype on the local branch `exp/reference-pair-density` (`DGRS_EC=1`).
+        - **Followed up 2026-10-04: the pair density with a wet-side rule and a regularised reference. It does not hold the production setup.** Local branch `exp/pair-density-wet-dry`; its ignored `probe_beach` runs the slices.
+          - Wet-side rule: a pair with a thin column carries the wet column's tracers (θ = ±½), so the wet node gets no anomaly from pairs the PGF ignores.
+          - Without the pair density, wet–dry pairs alone are harmless: a steep shore to land under linear N² holds 1e-11 m/s. Under the pycnocline it is worse than the same cliff ending at a wall: 4.1e-7 against 2.8e-8 m/s after 6 h.
+          - With the pair density: the cliff and the wall hold 1e-10 m/s for 48 h. The cliff to land grows with e-folding ≈ 9 min without the wet-side rule and ≈ 5.7 h with it.
+          - The shoreline element there is not marked for element means (`from_inventory` is not involved). Left over: the wet node's layer volume exchange with the dry node, which has no pressure-work partner in the PGF.
+          - Frøya 1 km, at the 36 s step:
+            - The default thin depth (0.1 m) blows up, from pairs of shallow wet nodes (0.2–0.4 m) beside 50–100 m ones: ∂ρ*/∂ρ ≈ 50.
+            - `thin=2` needs dt ≤ 12 s.
+            - A minimum reference gradient of 0.01 kg/m⁴ (`DGRS_EC_MIN`) caps the stiffness: `thin=2` then holds 5e-9 m/s for 6 h with constant mixing and no limiter. After that, shoreline elements with dry nodes (553, 554) grow.
+            - At 0.05 kg/m⁴ the reference no longer matches the deep water, and element 335 grows at the old rate.
+            - With GLS and the limiter, every variant reaches 0.5–0.9 m/s within 1.5–3 h, worse than the unchanged scheme (0.16 m/s at 2.4 h).
         - Options, roughly cheapest first:
           - (a) Bound the inconsistency with the mesh and the bed, as ROMS does: a Haney number (rx1) per element on the σ-levels, smoothed for 3D runs, plus a rule for shore elements whose levels span the pycnocline.
           - (b) The pair density with a cap on its stiffness, or the stiff pairs implicit.
