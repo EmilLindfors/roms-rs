@@ -2215,6 +2215,30 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 domain.geom.element_is_affine(k)
             );
         }
+        // The ten fastest elements at the end: how far a growing mode reaches
+        let mut elements: Vec<(f64, usize, usize, usize)> = (0..state.n_elements)
+            .map(|k| {
+                (0..nn * nl)
+                    .map(|j| {
+                        let i = k * nn * nl + j;
+                        (state.u[i].hypot(state.v[i]), k, j / nl, j % nl)
+                    })
+                    .fold((0.0, k, 0, 0), |a, b| if b.0 > a.0 { b } else { a })
+            })
+            .collect();
+        elements.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!("  Fastest elements at the end:");
+        for &(speed, k, node, level) in elements.iter().take(10) {
+            let depths: Vec<f64> = (0..nn)
+                .map(|i| {
+                    let d = state.eta.data[k * nn + i] - domain.bathymetry.data[k * nn + i];
+                    (d * 10.0).round() / 10.0
+                })
+                .collect();
+            println!(
+                "    {speed:.2e} m/s element {k} node {node} level {level}; depths {depths:?}"
+            );
+        }
         return;
     }
     let mut times = Vec::with_capacity(opts.steps_3d);
