@@ -181,6 +181,19 @@ where
     /// `[τ_x, τ_y]` of `surface_stress` on every column (allocated on first
     /// use).
     surface_stress_scratch: Mutex<[Vec<f64>; 2]>,
+    /// The stratification about which the vertical tracer advection
+    /// reconstructs, if any (see [`Self::with_vertical_reference`]).
+    vertical_reference: Option<VerticalReference>,
+}
+
+/// The temperature and salinity about which [`Hydrostatic3D`]'s vertical
+/// tracer advection reconstructs (see [`Hydrostatic3D::with_vertical_reference`]),
+/// per node and level, and how it follows the state.
+struct VerticalReference {
+    /// `[temperature, salinity]`, `[element][node][level]`.
+    fields: Mutex<[Vec<f64>; 2]>,
+    /// The time scale (s) of the relaxation towards the state, if any.
+    timescale: Option<f64>,
 }
 
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
@@ -250,7 +263,138 @@ where
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
+            vertical_reference: None,
         }
+    }
+
+    /// Reconstruct the tracers at the σ-surfaces about `state`'s temperature
+    /// and salinity, its stratification (at rest, or a parent model's): the
+    /// vertical scheme ([`Self::with_vertical_advection`]) keeps its limiting
+    /// for departures from it, while the stratification itself is advected
+    /// with the centred value (see
+    /// [`crate::solver::rhs::apply_tracer_transport_3d_about`]).
+    ///
+    /// Use it for stratified runs: about a stratified rest state, a
+    /// dissipative or higher-order vertical scheme mixes the background at a
+    /// rate set by a perturbation's own vertical flow, which feeds the
+    /// perturbation. On the Frøya coastline mesh at rest that grew with an
+    /// e-folding of 35 min for the default `LimitedAkima` (26 min upwind,
+    /// 50 min Akima) at terrace edges beside shore elements; centred, or any
+    /// scheme about the reference, holds round-off (TODO P1.3,
+    /// `docs/stratified-rest-over-steep-beds.md`).
+    ///
+    /// The reference is per node and level, so it follows the σ-levels as a
+    /// tide stretches the columns. A uniform tracer stays uniform whatever
+    /// the reference, and a column stratified like it at a fraction of its
+    /// strength is still advected centred. Refresh it with
+    /// [`Self::set_vertical_reference`], or let it follow the state with
+    /// [`Self::with_vertical_reference_timescale`].
+    pub fn with_vertical_reference(mut self, state: &Solution3D) -> Self {
+        self.vertical_reference = Some(VerticalReference {
+            fields: Mutex::new([state.temp.clone(), state.salt.clone()]),
+            timescale: None,
+        });
+        self
+    }
+
+    /// [`Self::with_vertical_reference`] of a horizontally uniform profile
+    /// `profile(z) = (T, S)`, sampled at the levels of `state` (its `η`).
+    pub fn with_vertical_reference_profile(
+        self,
+        state: &Solution3D,
+        profile: impl Fn(f64) -> (f64, f64),
+    ) -> Self {
+        let mut reference = state.clone();
+        let nl = state.n_levels;
+        for (idx, (temp, salt)) in reference
+            .temp
+            .chunks_exact_mut(nl)
+            .zip(reference.salt.chunks_exact_mut(nl))
+            .enumerate()
+        {
+            let eta = state.eta.data[idx];
+            let depth = eta - self.bathymetry.data[idx];
+            for (l, &s) in self.sigma.sigma_rho().iter().enumerate() {
+                (temp[l], salt[l]) = profile(eta + s * depth);
+            }
+        }
+        self.with_vertical_reference(&reference)
+    }
+
+    /// Relax the reference of [`Self::with_vertical_reference`] towards the
+    /// state with the time scale `timescale` (s) at every
+    /// [`Self::relax_vertical_reference`] (each step of [`crate::simulation::Simulation3D`]),
+    /// so that it follows a stratification that changes slowly (mixing,
+    /// rivers, a parent model) while departures faster than `timescale`
+    /// are still limited. A day or more keeps the tide's departures.
+    ///
+    /// # Panics
+    /// Without a reference, or if `timescale` is not positive.
+    pub fn with_vertical_reference_timescale(mut self, timescale: f64) -> Self {
+        assert!(
+            timescale > 0.0,
+            "the reference's time scale must be positive, got {timescale}"
+        );
+        self.vertical_reference
+            .as_mut()
+            .expect("with_vertical_reference_timescale needs with_vertical_reference first")
+            .timescale = Some(timescale);
+        self
+    }
+
+    /// Replace the reference of [`Self::with_vertical_reference`] by
+    /// `state`'s temperature and salinity (none set: sets one).
+    pub fn set_vertical_reference(&mut self, state: &Solution3D) {
+        match &self.vertical_reference {
+            Some(reference) => {
+                let mut fields = reference
+                    .fields
+                    .lock()
+                    .expect("Failed to lock the vertical reference");
+                fields[0].copy_from_slice(&state.temp);
+                fields[1].copy_from_slice(&state.salt);
+            }
+            None => {
+                self.vertical_reference = Some(VerticalReference {
+                    fields: Mutex::new([state.temp.clone(), state.salt.clone()]),
+                    timescale: None,
+                });
+            }
+        }
+    }
+
+    /// Relax the reference towards `state` over a step `dt` (s):
+    /// `C_ref += (1 − e^{−dt/τ})(C − C_ref)` with the time scale of
+    /// [`Self::with_vertical_reference_timescale`]; nothing without one.
+    pub fn relax_vertical_reference(&self, state: &Solution3D, dt: f64) {
+        let Some(VerticalReference {
+            fields,
+            timescale: Some(timescale),
+        }) = &self.vertical_reference
+        else {
+            return;
+        };
+        let weight = 1.0 - (-dt / timescale).exp();
+        let mut fields = fields
+            .lock()
+            .expect("Failed to lock the vertical reference");
+        for (reference, field) in fields.iter_mut().zip([&state.temp, &state.salt]) {
+            for (r, &c) in reference.iter_mut().zip(field.iter()) {
+                *r += weight * (c - *r);
+            }
+        }
+    }
+
+    /// The reference's temperature and salinity, if any (see
+    /// [`Self::with_vertical_reference`]).
+    pub fn vertical_reference(&self) -> Option<[Vec<f64>; 2]> {
+        self.vertical_reference.as_ref().map(|reference| {
+            reference
+                .fields
+                .lock()
+                .expect("Failed to lock the vertical reference")
+                .clone()
+        })
     }
 
     /// Rivers as volume sources (see [`crate::source::river`]). The mode
@@ -782,6 +926,8 @@ where
                 PressureGradientForm::ConstantDepth => None,
             },
             metric: self.metric_form(),
+            // The vertical reference is locked where the transport needs it
+            tracer_reference: [None, None],
         }
     }
 
@@ -866,8 +1012,18 @@ where
                 &exterior,
                 self.min_column_depth,
             );
+            let reference = self.vertical_reference.as_ref().map(|reference| {
+                reference
+                    .fields
+                    .lock()
+                    .expect("Failed to lock the vertical reference")
+            });
             let config = Rhs3DConfig {
                 exterior,
+                tracer_reference: match &reference {
+                    Some(fields) => [Some(fields[0].as_slice()), Some(fields[1].as_slice())],
+                    None => [None, None],
+                },
                 ..self.rhs_config()
             };
             compute_transport_rhs_3d(rhs, state, transport, &config);

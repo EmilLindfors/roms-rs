@@ -112,3 +112,105 @@ The smoothing is still heavy on the coastline mesh: 23k of ≈ 50k nodes change,
 ### Follow-up: baroclinic exchange inside shore elements
 
 Longer runs on the coastline mesh (constant mixing, no limiter) showed a slower instability. Shore element 8722 grew with an e-folding of 38 min from 3.7 h on. It holds 28.5 and 16.6 m columns beside 2.9 and 0.3 m ones across a line of dry nodes. The baroclinic exchange through its subcells was energy-exact, yet it grew; the Casimir argument above has no reason to hold on this stencil either. A smaller thin depth or free depth, or upwind tracers, did not stop it. Shore elements now carry only their layers' share of the barotropic flux and feel no pressure gradient within themselves, which is the ROMS wet–dry mask in DG form. With that, a patch around the element holds 9e-10 m/s for 8.8 h. Their faces still couple them fully to wet neighbours.
+
+## The 36-min mode: the vertical reconstruction of the background (2026-10-04)
+
+After the r_x0 0.15 smoothing, the coastline mesh still grew from ≈ 4.5 h on, with an e-folding of ≈ 36 min, in the bed layers of near-shore terraces (TODO P1.3). Every earlier fix moved this mode without removing it. It is not the straddle mechanism above. It comes from how the vertical tracer advection reconstructs the *background* stratification at the σ-surfaces.
+
+### Harness
+
+`froya_real_data … debug_3d=…,dump=PREFIX` writes the state at rest, `gap=` steps before the end, and at the end (`PREFIX.{init,prev,end}.bin`, with `PREFIX.geom.bin`). `seed=PREFIX:AMP` starts a run from rest plus the grown mode, scaled to a largest speed of AMP. On the 95-element patch `around=11048:1500` a seeded test takes 39 s of wall time for 2 model hours. It shows the e-folding from the first step, instead of after 4.5 h of round-off. `deep=` sets the gradient below the pycnocline and `vadv=` the vertical tracer scheme. `scripts/mode3d_dump.py PREFIX` reads the dumps.
+
+### The mode
+
+- It is real: dumps an hour apart correlate to 0.997 in u, v, T and S, with a growth of 5.7× per hour (e-folding 34.5 min) and no oscillation. Neither the time step (half the step: 34.6 min) nor the stratification below the pycnocline (0.001, 0.002 or 0.004 °C/m: 34.4–34.8 min) changes the rate. It is a property of the semi-discrete scheme and of the pycnocline.
+- It sits at one vertex on a terrace edge (30.6 m beside 22.6–23.3 m, r_x0 0.14) shared by shore element 91, which has one dry node and so is a subcell element, and its wet neighbours 90 and 92. The three elements' velocities at the vertex differ in direction: the mode is at the grid scale.
+- It is largest in the bed layers 0–2 (z −27 to −13 m). In the 23 m columns these cross the pycnocline's lower flank (11–19 m). δρ alternates in sign from level to level from the bed up to ≈ −8 m.
+
+### What sets it: the background's surface values
+
+Seeded with the mode, 2 model hours, constant mixing and no limiter:
+
+| vertical tracer scheme | e-folding | KE after 2 h (from 1.5e-9) |
+|---|---|---|
+| upwind | 26–36 min | 7.6e-6 |
+| TVD | 29 min | 4.0e-6 |
+| LimitedAkima (the default) | 34.6 min | 1.5e-6 |
+| Akima | ≈ 50 min | 1.4e-7 |
+| Hermite mean (the PGF's energy partner) | ≈ 75 min (transient, see the spectrum below) | 3.0e-8 |
+| centred | decays, then ≥ 10 h | 5.0e-9 |
+| LimitedAkima, TVD or upwind, about the rest state (`vref`) | as centred | 5.0e-9 |
+
+From round-off, centred and the Hermite mean show no exponential mode in 8.8 h on the patch (1e-9 m/s, the noise floor), where LimitedAkima reaches 3.5e-6 m/s. The Hermite mean's growth when seeded is transient: the seed is LimitedAkima's mode, not its own, and its spectrum (below) has nothing faster than centred's.
+
+**Why.** At rest `Ω̄ = 0`. To first order a scheme then acts only through the surface value `C̄*` it gives the *background* at each σ-surface, multiplied by the perturbation's `δΩ`. How the perturbation itself is reconstructed is second order. Centred takes the arithmetic mean of the two layers. Upwind takes the upwind layer's value, which is the mean plus `½|δΩ|ΔC̄`: it mixes the background stratification at a rate set by the perturbation's own vertical flow. The mixing makes a density anomaly, its pressure gradient drives flow, and that flow's `|Ω|` mixes more. In the continuum the mixing does not depend on the flow it causes, so this feedback has no physical counterpart. TVD and LimitedAkima clip where the profile curves, at the pycnocline's foot, and so act partly the same way. Akima is linear and non-dissipative, but it moves the surface value off the mean by a curvature term, `h(d_{l−1} − d_l)/6` on uniform levels, and grows as an oscillatory pair.
+
+**Energy is not the edge.** The exact vertical partner of the PGF's Hermite pressure integral is the Hermite mean, `½(C_{l−1} + C_l) + h(d_{l−1} − d_l)/12`: the mean of the pressure integral's cubic between the two layer centres. On uniform levels it is centred plus half of Akima's curvature correction. The spectrum below sweeps that correction's weight `c` (0 centred, ½ the Hermite mean, 1 Akima):
+
+| c | leading growth |
+|---|---|
+| −0.5 | oscillatory pair, 91 min |
+| 0 | real, 8.8 h |
+| 0.25 | real, 8.4 h |
+| 0.5 | real, 7.2 h |
+| 0.75 | real, 5.5 h |
+| 1 | oscillatory pair, 66 min |
+
+A band from below centred to beyond the energy partner holds, and a correction as large as Akima's in either direction grows. Exact energy exchange is neither needed nor the boundary. What the band's edges are set by is open. The candidate is the weighted norm in which the linearised operator is dissipative (Bell, Peixoto & Thuburn 2017), which the harness's Krylov basis could approximate. Upwind and the limiters fail differently, through `|δΩ|`.
+
+**Reconstruction about a reference: `Hydrostatic3D::with_vertical_reference`.** It stores T and S per node and level, at rest (`with_vertical_reference(state)`) or from a z-profile sampled at the levels (`with_vertical_reference_profile`). At every σ-surface the scheme's value is corrected by the share `ψ` of the reference's own departure from the centred value: `C_s = V(C)_s − ψ[V(C_ref)_s − ½(C_ref,l−1 + C_ref,l)]`, with `ψ = clamp(ΔC/ΔC_ref, 0, 1)`. The correction moves the value towards the column's centred one, never past it.
+- **At rest** `ψ = 1`, so the background's flux is centred to first order.
+- **Constancy:** a uniform tracer has `ψ = 0`, so it stays uniform whatever the reference. The first prototype (`centred(C_ref) + V(C − C_ref)`) did not keep it: in a mixed column under a stratified reference, upwind restratified it by `½|Ω|ΔC_ref`, ≈ 0.1 °C/h at tidal Ω.
+- **Weakened stratification:** a column stratified like the reference at a fraction of its strength (`C = a + bC_ref`, 0 < b ≤ 1) stays exactly centred.
+- **Fronts:** jumps beyond the reference's keep the limiter.
+- **Moving references:** `set_vertical_reference` refreshes it, and `with_vertical_reference_timescale(τ)` relaxes it towards the state at every step of `Simulation3D`.
+
+On the patch, upwind, TVD, Akima and LimitedAkima about the rest state all give centred's numbers. The gates are `a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference` and the transport unit tests (centred at the reference, constancy, the scaled stratification, a bounded front).
+
+### The spectrum
+
+`probe_terrace_spectrum` (ignored test) runs Arnoldi with 24 vectors on finite differences of the 600 s step map, about rest on a 22-element fixture: the elements within 400 m of 11048, which hold the mode on their own (`tests/data/froya_terrace_patch.txt`, 16k unknowns). It reports the leading Ritz values. For upwind and the limited schemes the map is only positively homogeneous (`|Ω|`), so their values describe one linearisation and are indicative.
+
+| vertical tracer scheme | leading growth (e-folding) |
+|---|---|
+| upwind | 10 min (real; seeded runs: 26–36 min) |
+| TVD | 21 min (real) |
+| LimitedAkima | 30 min (real), then a pair at 74 min |
+| Akima | 66 min (oscillatory pair, period 1.8 h) |
+| Hermite mean | 7.2 h (real) |
+| centred | 8.8 h (real) |
+| LimitedAkima about the rest state | 8.8 h (as centred) |
+
+The slow real mode of centred and the Hermite mean (7–9 h) does not depend on the vertical scheme. It is probably the straddle mechanism, weakened by the smoothing.
+
+### Two mechanisms, not one
+
+The unsmoothed 15 → 300 m cliff (`a_pycnocline_over_a_cliff_stays_at_rest`, 6 h) barely depends on the vertical scheme: 2.9e-8 m/s with LimitedAkima, 2.7e-8 with centred or `vref`, 2.8e-8 with Akima, 3.3e-8 with the Hermite mean, 4.0e-8 with TVD and 4.7e-8 with upwind. That is the straddle mechanism of the analysis above, which the per-element smoothing bounds. The 36-min mode of the smoothed coastline mesh is the vertical one. The 2D shore probes (islet, spit, corner) stay at round-off with every scheme (1e-11 m/s, e-folding ≥ 7 h at noise level). What makes the terrace vertex beside a subcell element the place where it grows is still open.
+
+### The r_x0 0.2 failure was the same mode
+
+The bound was tightened from 0.2 to 0.15 because element 12097 of the coastline mesh grew at 0.2. On the patch `around=12097:1500 slopes3d=0.2` (constant mixing, no limiter), the default grows from ≈ 5 h with an e-folding of 41 min, to 5.2e-5 m/s at 12.6 h. The mode has the same shape: shore element 103 (22.9 m beside 33.7 m, one dry node) and its neighbours 104 (12097) and 102, with dumps correlating to 0.9996. With `vref` the patch holds 7.6e-10 m/s for 12.6 h. With the reconstruction about a reference, the smoothing could be lighter.
+
+### The full coastline mesh
+
+With `vref` (r_x0 0.15, constant mixing, no limiter), the whole mesh stays at round-off (≤ 3e-9 m/s, in deep water) until ≈ 7 h. Without it the 36-min mode grows from ≈ 4.5 h, to 1.4e-6 m/s at 8.2 h. After 7 h a much slower growth appears: 3.3e-8 m/s at 8.6 h, oscillating (velocities an hour apart correlate 0.24), with density growing ×1.2 per hour. It sits in element 9381, which is fully wet but has 28.5 m beside 2.6 m inside it. The free-depth rule leaves that pair unsmoothed, because the deeper column is not below 28.5 m. It is probably the straddle mechanism, and it is open.
+
+### The bound with the reference, and a trade-off
+
+On the full mesh with the reference (constant mixing, no limiter, 8.6 h):
+- **r_x0 0.15**: 3.3e-8 m/s, at element 9381.
+- **r_x0 0.2**: 1.9e-8 m/s, at fully wet element 11163 (35–53 m, exactly at the bound, e-folding ≈ 55 min from 6.8 h) and at exempted shore elements.
+
+On the patch `around=11163:1500 slopes3d=0.2` the default holds 8.6e-10 m/s for 9.1 h, but the reference grows with e-folding ≈ 59 min. So the vertical scheme's dissipation cuts both ways. LimitedAkima feeds the terrace mode beside shore elements and damps the straddle mode of fully wet elements at the bound; centred-type advection of the background does the opposite. At r_x0 0.15 the reference was strictly better. A lighter bound needs a cure for the straddle mode itself (the pair density with its stiff part implicit, piece 3 above, or a bound on the Haney number).
+
+The 9381 patch (`around=9381:1500`, r_x0 0.15, the free-depth exemption: 28.5 m beside 2.6 m in one fully wet element) grows with e-folding ≈ 43 min from ≈ 7 h, with or without the reference, and saturates near 4e-2 m/s at 20 h: the straddle mechanism. The 1D calibration slices let shallow-to-28 m steps go unsmoothed. In 2D they do not hold. With `free_depth=19` (the pycnocline's bottom) the patch holds below 9e-10 m/s for 20.6 h, with or without the reference, at the cost of 32.1k smoothed nodes of the coastline mesh instead of 26.2k. On the full mesh with the reference (constant mixing, no limiter), `free_depth=19` holds ≤ 3.7e-9 m/s through 10 h and 8.4e-9 m/s at 11.7 h. The only rise is a faint one at a 19 m column beside 0.2–8.6 m ones, now at the new free depth. That is the best rest state of the coastline mesh so far. With GLS and the limiter it ends at 2.8e-3 m/s after 8.6 h, against 2.6e-2 m/s with the 28.5 m free depth, and it levels off (2.0e-3 m/s at 4 h, 2.7e-3 at 8.2 h). What is left is spread over the bed layers of shallow elements: the GLS creep at slopes, with no exponential growth.
+
+### With GLS and the limiter
+
+On the full coastline mesh with the reference (r_x0 0.15, 8.6 h), the largest speed is 1.9e-3 m/s at 3–4 h. Before the reference, this setup reached 8e-3 m/s at 2 h. It then grows slowly (e-folding ≈ 2.5 h) to 2.6e-2 m/s, at elements with 27–28.5 m beside 2–9 m: the shallow-deep pairs the free depth exempts.
+
+
+On the 11048 patch from rest, 8.8 h:
+- **Default**: 2.2e-2 m/s, in elements 90–92 (the mode).
+- **`vref`**: 1.4e-3 m/s, still rising slowly and close to linearly, in shallow shore elements 13 and 63 (5–28 m). That is the GLS creep at the slopes.
+- **Centred**: 1.5e-3 m/s, in the same elements as `vref`.

@@ -118,7 +118,14 @@
 //! `vcentred` (centred vertical tracer advection), `nu=V` (a constant
 //! horizontal viscosity of the shear, m²/s, added to Smagorinsky's),
 //! `around=K:R` (only the elements within R m of element K, walls around:
-//! a local growth reproduced in minutes).
+//! a local growth reproduced in minutes), `every=N` (trace every N steps),
+//! `dump=PREFIX` (the state at rest, `gap=N` steps before the end and at the
+//! end, for `scripts/mode3d_dump.py`), `seed=PREFIX:AMP` (start from rest
+//! plus a dumped mode at a largest speed of AMP m/s), `deep=G` (°C/m below
+//! the pycnocline, 0.002), `vadv=centred|akima|tvd|upwind|hermite` (the
+//! vertical tracer scheme), `vref` (that scheme about the state at rest;
+//! TODO P1.3), `tadv=none|centred` (the turbulence's advection) and
+//! `export=PATH` (with `around=`: the patch as a test fixture).
 //!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
 //! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
@@ -1933,6 +1940,14 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                     .position(|&e| e == k)
                     .expect("the element is in its patch")
             );
+            // `debug_3d=export=PATH`: the patch as a text fixture for tests
+            if let Some(path) = opts
+                .debug_3d
+                .split(',')
+                .find_map(|f| f.strip_prefix("export="))
+            {
+                write_patch_fixture(path, &mesh, &bathymetry, k, radius);
+            }
             patch = Domain {
                 name: domain.name,
                 mesh: Arc::new(mesh),
@@ -1965,6 +1980,15 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     .build();
     let eos = LinearEOS::default();
     let dbg = |flag: &str| opts.debug_3d.split(',').any(|f| f == flag);
+    // `debug_3d=key=value`
+    let dbg_value = |key: &str| {
+        opts.debug_3d
+            .split(',')
+            .find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_string)
+    };
+    // The temperature gradient below the pycnocline (`deep=`, °C/m)
+    let deep_gradient: f64 = dbg_value("deep").map_or(0.002, |v| v.parse().expect("deep="));
     // The summer stratification, horizontally uniform: T 4 °C warmer and S
     // 1.5 psu fresher above ≈ 15 m (`linear`: 0.02 °C/m; `uniform`: none)
     let profile = |z: f64| -> (f64, f64) {
@@ -1975,7 +1999,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         } else {
             let step = 0.5 * (1.0 + ((z + 15.0) / 4.0).tanh());
             (
-                eos.t0 + 4.0 * step + 0.002 * z.min(0.0),
+                eos.t0 + 4.0 * step + deep_gradient * z.min(0.0),
                 eos.s0 - 1.5 * step,
             )
         }
@@ -2005,16 +2029,31 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     .with_bottom_drag(BottomDrag3D::log_layer(0.003))
     .with_min_column_depth(opts.thin_depth())
     .with_smagorinsky_viscosity(0.1)
+    // `tadv=none|centred`: the turbulence's advection (LimitedAkima by default)
+    .with_turbulence_advection(match dbg_value("tadv").as_deref() {
+        Some("none") => None,
+        Some("centred") => Some(dg_rs::solver::rhs::VerticalAdvection::Centred),
+        Some(other) => panic!("tadv={other}"),
+        None => Some(dg_rs::solver::rhs::VerticalAdvection::LimitedAkima),
+    })
     .with_horizontal_viscosity(
         opts.debug_3d
             .split(',')
             .find_map(|f| f.strip_prefix("nu=").and_then(|v| v.parse().ok()))
             .unwrap_or(0.0),
     )
-    .with_vertical_advection(if dbg("vcentred") {
-        dg_rs::solver::rhs::VerticalAdvection::Centred
-    } else {
-        dg_rs::solver::rhs::VerticalAdvection::default()
+    .with_vertical_advection({
+        use dg_rs::solver::rhs::VerticalAdvection;
+        match dbg_value("vadv").as_deref() {
+            _ if dbg("vcentred") => VerticalAdvection::Centred,
+            Some("centred") => VerticalAdvection::Centred,
+            Some("akima") => VerticalAdvection::Akima,
+            Some("tvd") => VerticalAdvection::Tvd,
+            Some("upwind") => VerticalAdvection::Upwind,
+            Some("hermite") => VerticalAdvection::HermiteMean,
+            Some(other) => panic!("vadv={other}"),
+            None => VerticalAdvection::default(),
+        }
     })
     .with_tracer_limiter(if dbg("nolimiter") {
         TracerLimiter3DConfig::none()
@@ -2141,6 +2180,12 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             eos.compute_density(t, s, z)
         })
     };
+    // `vref`: the vertical tracer advection about the state at rest
+    let physics = if dbg("vref") {
+        physics.with_vertical_reference(&state)
+    } else {
+        physics
+    };
     let mut integrator = ModeSplitIntegrator::new();
     let mut t = 0.0;
     // The step of `dt_3d=`, or as `Simulation3D` takes it, every step
@@ -2152,8 +2197,40 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         *t += dt;
         dt
     };
+    let init = state.clone();
+    let dump = dbg_value("dump");
+    if let Some(prefix) = &dump {
+        write_mode_geometry(prefix, domain, &sigma, &state);
+        write_mode_dump(&format!("{prefix}.init.bin"), &state);
+    }
     for _ in 0..2 {
         timed_step(&mut state, &mut t);
+    }
+    // `seed=PREFIX:AMP`: add the perturbation PREFIX.end.bin − PREFIX.init.bin
+    // of an earlier run, scaled to a largest speed of AMP m/s
+    if let Some(seed) = dbg_value("seed") {
+        let (prefix, amp) = seed.rsplit_once(':').expect("seed=PREFIX:AMP");
+        let amp: f64 = amp.parse().expect("seed amplitude");
+        let a = read_mode_dump(&format!("{prefix}.init.bin"), &state);
+        let b = read_mode_dump(&format!("{prefix}.end.bin"), &state);
+        let speed = (0..state.u.len())
+            .map(|i| (b.u[i] - a.u[i]).hypot(b.v[i] - a.v[i]))
+            .fold(0.0, f64::max);
+        let scale = amp / speed;
+        let add = |x: &mut [f64], b: &[f64], a: &[f64]| {
+            for ((x, b), a) in x.iter_mut().zip(b).zip(a) {
+                *x += scale * (b - a);
+            }
+        };
+        add(&mut state.u, &b.u, &a.u);
+        add(&mut state.v, &b.v, &a.v);
+        add(&mut state.temp, &b.temp, &a.temp);
+        add(&mut state.salt, &b.salt, &a.salt);
+        add(&mut state.eta.data, &b.eta.data, &a.eta.data);
+        add(&mut state.ubar.data, &b.ubar.data, &a.ubar.data);
+        add(&mut state.vbar.data, &b.vbar.data, &a.vbar.data);
+        physics.update_density(&mut state);
+        println!("  Seeded with {prefix}'s perturbation at {amp:.1e} m/s (scale {scale:.3e})");
     }
     if dbg("trace") {
         let mut rhs = state.clone();
@@ -2177,12 +2254,44 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 )
                 .collect::<Vec<_>>()
         );
-        let every = (opts.steps_3d / 24).max(1);
+        let every =
+            dbg_value("every").map_or((opts.steps_3d / 24).max(1), |v| v.parse().expect("every="));
+        let gap: usize = dbg_value("gap").map_or(opts.steps_3d / 8, |v| v.parse().expect("gap="));
         for n in 0..opts.steps_3d {
             let dt = timed_step(&mut state, &mut t);
+            if let Some(prefix) = &dump
+                && n + 1 + gap == opts.steps_3d
+            {
+                write_mode_dump(&format!("{prefix}.prev.bin"), &state);
+            }
             if n % every != 0 && n + 1 != opts.steps_3d {
                 continue;
             }
+            // The perturbation about the initial state: kinetic energy
+            // ½ Σ m H_z |u|² (per unit density), and its tracers and η
+            let (mut ke, mut d_t, mut d_s, mut d_eta) = (0.0, 0.0_f64, 0.0_f64, 0.0_f64);
+            for k in 0..ne {
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let depth = state.eta.data[idx] - domain.bathymetry.data[idx];
+                    d_eta = d_eta.max((state.eta.data[idx] - init.eta.data[idx]).abs());
+                    if depth <= 0.0 {
+                        continue;
+                    }
+                    let m = domain.geom.node_mass(k, i);
+                    for l in 0..nl {
+                        let j = idx * nl + l;
+                        let hz = sigma.d_sigma()[l] * depth;
+                        ke += 0.5 * m * hz * (state.u[j].powi(2) + state.v[j].powi(2));
+                        d_t = d_t.max((state.temp[j] - init.temp[j]).abs());
+                        d_s = d_s.max((state.salt[j] - init.salt[j]).abs());
+                    }
+                }
+            }
+            println!(
+                "  pert t {:.4} h: KE {ke:.4e}; max |dT| {d_t:.3e} |dS| {d_s:.3e} |deta| {d_eta:.3e}",
+                t / 3600.0
+            );
             let (mut best, mut at) = (0.0_f64, 0);
             for (i, (u, v)) in state.u.iter().zip(&state.v).enumerate() {
                 let s = u.hypot(*v);
@@ -2227,6 +2336,9 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             })
             .collect();
         elements.sort_by(|a, b| b.0.total_cmp(&a.0));
+        if let Some(prefix) = &dump {
+            write_mode_dump(&format!("{prefix}.end.bin"), &state);
+        }
         println!("  Fastest elements at the end:");
         for &(speed, k, node, level) in elements.iter().take(10) {
             let depths: Vec<f64> = (0..nn)
@@ -2279,6 +2391,135 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         .map(|(u, v)| u.hypot(*v))
         .fold(0.0, |m: f64, s| if s.is_nan() || s > m { s } else { m });
     println!("  after {t:.0} s at rest: largest layer speed {speed:.2e} m/s");
+}
+
+/// Write `state`'s η, ū, v̄ and per-level u, v, T, S, ρ as little-endian
+/// f64 after a header of (elements, nodes, levels) as u64 (`debug_3d=dump=`).
+fn write_mode_dump(path: &str, state: &dg_rs::solver::state::Solution3D) {
+    let mut bytes = Vec::new();
+    for n in [state.n_elements, state.n_nodes, state.n_levels] {
+        bytes.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    for field in [
+        &state.eta.data,
+        &state.ubar.data,
+        &state.vbar.data,
+        &state.u,
+        &state.v,
+        &state.temp,
+        &state.salt,
+        &state.rho,
+    ] {
+        for x in field.iter() {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    fs::write(path, bytes).expect("write the mode dump");
+}
+
+/// Read a dump of [`write_mode_dump`] into a copy of `like`.
+fn read_mode_dump(
+    path: &str,
+    like: &dg_rs::solver::state::Solution3D,
+) -> dg_rs::solver::state::Solution3D {
+    let bytes = fs::read(path).expect("read the mode dump");
+    let mut words = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&c| u64::from_le_bytes(c));
+    let header: Vec<usize> = (0..3).map(|_| words.next().unwrap() as usize).collect();
+    assert_eq!(
+        header,
+        [like.n_elements, like.n_nodes, like.n_levels],
+        "dump {path} is for another domain"
+    );
+    let mut out = like.clone();
+    for field in [
+        &mut out.eta.data,
+        &mut out.ubar.data,
+        &mut out.vbar.data,
+        &mut out.u,
+        &mut out.v,
+        &mut out.temp,
+        &mut out.salt,
+        &mut out.rho,
+    ] {
+        for x in field.iter_mut() {
+            *x = f64::from_bits(words.next().expect("dump too short"));
+        }
+    }
+    out
+}
+
+/// The nodes' x, y (m), bed (m), mass weights, and the σ of the layer
+/// centres and the layers' Δσ, for analysing mode dumps (`PREFIX.geom.bin`:
+/// a header of (elements, nodes, levels) as u64, then f64).
+fn write_mode_geometry(
+    prefix: &str,
+    domain: &Domain,
+    sigma: &dg_rs::vertical::SigmaGrid,
+    state: &dg_rs::solver::state::Solution3D,
+) {
+    let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
+    let mut bytes = Vec::new();
+    for n in [ne, nn, nl] {
+        bytes.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    let mut push = |x: f64| bytes.extend_from_slice(&x.to_le_bytes());
+    let points: Vec<[f64; 2]> = (0..ne * nn)
+        .map(|idx| {
+            domain.mesh.reference_to_physical(
+                ElementIndex::new(idx / nn),
+                domain.ops.nodes_r[idx % nn],
+                domain.ops.nodes_s[idx % nn],
+            )
+        })
+        .collect();
+    points.iter().for_each(|p| push(p[0]));
+    points.iter().for_each(|p| push(p[1]));
+    domain.bathymetry.data.iter().for_each(|&b| push(b));
+    (0..ne * nn).for_each(|idx| push(domain.geom.node_mass(idx / nn, idx % nn)));
+    sigma.sigma_rho().iter().for_each(|&s| push(s));
+    sigma.d_sigma().iter().for_each(|&s| push(s));
+    fs::write(format!("{prefix}.geom.bin"), bytes).expect("write the mode geometry");
+}
+
+/// Write a patch of the domain (`debug_3d=around=K:R,export=PATH`) as a text
+/// fixture: the vertices (m, relative to the first), the quadrilaterals, and
+/// per element node its bed elevation and the bed's gradient (all faces
+/// walls). Read by the 3D tests (`tests/data/`).
+fn write_patch_fixture(
+    path: &str,
+    mesh: &dg_rs::mesh::Mesh2D,
+    bathymetry: &Bathymetry2D,
+    element: usize,
+    radius: f64,
+) {
+    use std::fmt::Write as _;
+    let [x0, y0] = mesh.vertices[0];
+    let mut text = format!(
+        "# dg-rs patch fixture: the elements of froya_coast.msh within {radius} m of element \
+         {element}, bed smoothed for 3D (slopes3d), walls around\n"
+    );
+    writeln!(text, "vertices {}", mesh.vertices.len()).unwrap();
+    for &[x, y] in &mesh.vertices {
+        writeln!(text, "{} {}", x - x0, y - y0).unwrap();
+    }
+    writeln!(text, "quads {}", mesh.elements.len()).unwrap();
+    for quad in &mesh.elements {
+        writeln!(text, "{} {} {} {}", quad[0], quad[1], quad[2], quad[3]).unwrap();
+    }
+    writeln!(text, "bed {}", bathymetry.n_nodes).unwrap();
+    for idx in 0..bathymetry.data.len() {
+        writeln!(
+            text,
+            "{} {} {}",
+            bathymetry.data[idx], bathymetry.gradient_x[idx], bathymetry.gradient_y[idx]
+        )
+        .unwrap();
+    }
+    fs::write(path, text).expect("write the patch fixture");
 }
 
 /// Lower-case ASCII file-name form of a station name.

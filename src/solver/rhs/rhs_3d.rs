@@ -26,7 +26,7 @@ use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
     LayerTransport, MetricForm, MomentumAdvectionForm, VerticalAdvection,
-    apply_momentum_transport_3d, apply_tracer_transport_3d,
+    apply_momentum_transport_3d, apply_tracer_transport_3d_about,
 };
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
@@ -65,6 +65,9 @@ pub struct Rhs3DConfig<'a> {
     /// The volume form of the horizontal divergences, the 2D module's (the
     /// pressure gradient takes its adjoint).
     pub metric: MetricForm,
+    /// Temperature and salinity at rest (`[element][node][level]`), about
+    /// which the vertical advection reconstructs, if any (experimental).
+    pub tracer_reference: [Option<&'a [f64]>; 2],
 }
 
 /// Overwrite `rhs.u` and `rhs.v` with the velocity tendency of the pointwise
@@ -135,18 +138,21 @@ pub fn compute_transport_rhs_3d(
             &state.temp,
             config.temp_bc,
             config.exterior.temp,
+            config.tracer_reference[0],
         ),
         (
             &mut rhs.salt,
             &state.salt,
             config.salt_bc,
             config.exterior.salt,
+            config.tracer_reference[1],
         ),
     ];
-    for (out, tracer, bc, exterior) in tracers {
-        apply_tracer_transport_3d(
+    for (out, tracer, bc, exterior, reference) in tracers {
+        apply_tracer_transport_3d_about(
             out,
             tracer,
+            reference,
             transport,
             config.mesh,
             config.ops,

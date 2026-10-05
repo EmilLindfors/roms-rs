@@ -6,6 +6,47 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Vertical tracer advection about a reference stratification (`Hydrostatic3D::with_vertical_reference`; TODO P1.3): it removes the 36-min mode of the smoothed coastline mesh.** At rest `Ω̄ = 0`, so to first order a vertical scheme acts only through the surface value it gives the background stratification, times a perturbation's `δΩ`. An upwind or limited value mixes the pycnocline at the rate of the perturbation's own vertical flow, which feeds back through the pressure gradient; Akima's curvature correction grows as an oscillatory pair (a band of corrections from centred to beyond the exact energy partner holds). On the coastline mesh this grew at terrace edges beside shore elements, e-folding ≈ 35 min for the default `LimitedAkima` (it was also the r_x0 0.2 failure that set the 0.15 bound). Leading eigenvalues on a 22-element fixture of that mesh (`probe_terrace_spectrum`):
+
+  | vertical tracer scheme | leading growth (e-folding) |
+  |---|---|
+  | upwind | 10 min (indicative: positively homogeneous map) |
+  | TVD | 21 min (indicative) |
+  | LimitedAkima (the default) | 30 min |
+  | Akima | 66 min (oscillatory) |
+  | Hermite mean | 7.2 h |
+  | centred | 8.8 h |
+  | LimitedAkima about the rest state | 8.8 h |
+
+  The slow 7–9 h mode does not depend on the vertical scheme (the straddle mechanism, bounded by the smoothing). Details in `docs/stratified-rest-over-steep-beds.md`.
+  - The form: at each σ-surface `C_s = V(C)_s − ψ[V(C_ref)_s − ½(C_ref,l−1 + C_ref,l)]`, with `ψ = clamp(ΔC/ΔC_ref, 0, 1)`. The correction moves the value towards the column's centred one and never past it.
+    - At the reference the flux is centred.
+    - A uniform tracer stays uniform (constancy).
+    - A column at a fraction of the reference's stratification stays exactly centred.
+    - Fronts beyond the reference keep the limiter.
+    - It is conservative.
+  - The reference is stored per node and level, so it follows the σ-levels in a tide. The API:
+    - `with_vertical_reference(state)`, or `with_vertical_reference_profile(state, |z| (T, S))`;
+    - `set_vertical_reference` to refresh it;
+    - `with_vertical_reference_timescale(τ)` to relax it towards the state (each `Simulation3D` step, or `relax_vertical_reference`);
+    - `vertical_reference()` to read it.
+  - Low-level: `apply_tracer_transport_3d_about` and `Rhs3DConfig::tracer_reference`; `VerticalAdvection::HermiteMean`, the exact vertical energy partner of the PGF's Hermite pressure integral, for comparison.
+  - Results:
+    - Patch of 95 elements, constant mixing: round-off where the default grew from 4.5 h.
+    - The r_x0 0.2 patch: 7.6e-10 m/s for 12.6 h, against 5.2e-5 m/s.
+    - With GLS and the limiter, 8.8 h: 1.4e-3 m/s (the GLS creep), against 2.2e-2 m/s.
+    - The full coastline mesh: round-off until ≈ 7 h (the default grew from 4.5 h to 1.4e-6 m/s at 8.2 h). Then slower straddle growth at a shallow–deep pair the free-depth rule exempts (3.3e-8 m/s at 8.6 h). With the free depth lowered to the pycnocline's bottom (`free_depth=19`) it holds 8.4e-9 m/s after 11.7 h, and with GLS and the limiter it levels off at 2.8e-3 m/s at 8.6 h (the GLS creep). With GLS and the limiter (28.5 m free depth) it reaches 1.9e-3 m/s at 3–4 h, where it reached 8e-3 m/s at 2 h before, then 2.6e-2 m/s at 8.6 h at exempted shallow–deep pairs.
+  - Gates:
+    - transport unit tests: centred at the reference, constancy and inventory, a bounded front;
+    - `a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference`, on `tests/data/froya_terrace_patch.txt`, the 22 elements within 400 m of the mode;
+    - the ignored `the_default_vertical_scheme_grows_on_the_terrace` checks the fixture still has the mode.
+  - `froya_real_data levels=N debug_3d=` gets these switches:
+    - `dump=PREFIX` (the state at rest, `gap=` steps before the end and at the end; `scripts/mode3d_dump.py` reads it);
+    - `seed=PREFIX:AMP` (start from rest plus a dumped mode);
+    - `export=PATH` (the patch as a fixture);
+    - `deep=`, `vadv=`, `vref`, `tadv=`, `every=`.
+  - `channel_at_rest` takes `DGRS_VADV` and `DGRS_VREF=1`.
+
 - **A reference density profile for the 3D pressure gradient (`Hydrostatic3D::with_reference_profile`, `BalancedReference::from_profile`; TODO P1.3/P4.3).** For a horizontally uniform `ρ_s(z)` the correction is `−F_σ(ρ_s)`, since its true force is zero (Mellor et al. 1998's subtraction of a reference profile). A fluid resting in the profile feels no force at all. `with_balanced_reference` leaves the constant-depth form's interpolation error, which at Frøya's cliff shores is 1.7e-4 m/s² for a summer pycnocline (now 6.5e-7). A departure uniform in each column feels exactly σ-pairs' force of the departure alone. Gate: `a_reference_profile_balances_the_fjord_at_rest_exactly` (0 at rest, 5.5e-17 m/s² with a horizontal gradient). `froya_real_data levels=N` uses it by default (`debug_3d=balanced` for the state reference).
 
 - **3D wetting and drying on the 2D kernel's subcells (TODO P1.3).** A stratified shore at rest no longer grows. In `WetDry` elements with a shallow node the 2D module moves the mass on GLL subcells, and Audusse et al.'s hydrostatic reconstruction closes the interface to a dry bank. The 3D layers of such an element used the DG volume term instead. They exchanged volume with dry nodes, which the pressure gradient (zero for thin pairs) had no work partner for, and the surface residual was spread over the column. On Frøya, shore elements with one deep wet node among dry ones grew with an e-folding of ≈ 20 min.
@@ -270,6 +311,13 @@ All notable changes to this project should be documented in this file.
 - **Lock exchange gate (TODO P4.6).** `a_lock_exchange_runs_at_the_gravity_current_speed`: an 8 km × 20 m channel with ΔT = 5 °C, run at P1. Both fronts move at Fr = 0.483 (0.473 at 62 m), a little below Benjamin's ½, and T stays in range. At P2 the run needs horizontal viscosity (TODO P4.5): the interface's hydrostatic shear instability blows it up after ≈ 1500 s. (Since added, see above.)
 
 ### Fixed
+
+- **BR1 diffusion at boundaries was not dissipative (3D and 2D viscosity; TODO P1.3).** `br1_diffusion_element` gave every boundary face the interior flux. That matches only a zero-Dirichlet exterior state; with the 3D viscosity's mirrored walls and extrapolated open faces, the operator had eigenvalues with positive real parts. `nu=10` on the Frøya coastline mesh blew up at a coastline corner with an e-folding of 1.5 min at any time step. The kernel now takes a boundary flux that matches the exterior state the gradient used, `F* = ½(I − R)(F·n)` for an exterior state `R u` (see its docs):
+  - a mirrored (free-slip) wall passes the normal stress only;
+  - a zero-gradient face passes no viscous flux;
+  - a prescribed exterior state keeps the interior flux.
+
+  The 3D viscosity takes all three. The 2D viscosity takes the wall rule (`is_wall` of its boundary condition) and keeps the interior flux elsewhere. The largest real part of the 3D operator is now round-off (≤ 3e-16 /s at ν = 10 and 50, against +1.1e-2 /s), and the patch's seeded mode decays under ν = 10 and 50. Gates: `shear_viscosity_is_dissipative_at_walls_and_open_faces` (a distorted basin with wavy walls; +3.4e-3 /s at its open faces before) and `shear_viscosity_is_dissipative_on_the_coastline_fixture`. The 2D tracer diffusion still takes the interior flux (TODO).
 
 - **3D shoreline elements flattened the stratification (TODO P4.5, P1.3).**
   - Where the barotropic pass keeps only element balances (`WetDry` elements with a dry node, positivity-limited elements), the mode splitter carries the tracers and velocities as element means per level. `from_inventory` set every node of such an element to that mean. Across a shoreline element spanning 0.6 to 105 m of water a σ-level crosses 100 m of depth, so this flattened the stratification. On the Frøya bed a stratified fluid at rest blew up within 7 steps, on the coastline mesh and the structured 500 m grid alike.

@@ -1055,6 +1055,59 @@ pub fn apply_tracer_transport_3d(
     boundaries: &Boundaries3D,
     vertical: VerticalAdvection,
 ) {
+    apply_tracer_transport_3d_about(
+        rhs, tracer, None, transport, mesh, ops, geom, bc, exterior, boundaries, vertical,
+    );
+}
+
+/// [`apply_tracer_transport_3d`] with the vertical reconstruction about a
+/// reference stratification `reference` of the tracer (`[element][node][level]`,
+/// e.g. its values at rest), if any.
+///
+/// At every σ-surface the surface value is `vertical`'s, less the share `ψ`
+/// of the reference's own departure from the centred value:
+///
+/// ```text
+///     C_s = V(C)_s − ψ_s [V(C_ref)_s − ½(C_ref,l−1 + C_ref,l)],
+///     ψ_s = clamp((C_l − C_l−1)/(C_ref,l − C_ref,l−1), 0, 1),
+/// ```
+///
+/// with both reconstructions taken for the same `Ω`, the correction moving
+/// `C_s` towards the column's centred value `½(C_l−1 + C_l)` and never past
+/// it (so a bounded `V` stays bounded where its limiter clipped `C` but not
+/// `C_ref`). In a column at its
+/// reference (`ψ = 1`) this is the centred value, so about a fluid resting
+/// in the reference the flux of the background is the arithmetic mean to
+/// first order, whatever `V` does to the departures. A dissipative or
+/// higher-order `V` otherwise feeds a grid-scale instability of the
+/// stratified rest state: it mixes the background at a rate set by the
+/// perturbation's own `|Ω|`, and that drives the perturbation (TODO P1.3,
+/// `docs/stratified-rest-over-steep-beds.md`: e-folding 26–75 min on the
+/// Frøya coastline mesh for upwind to the Hermite mean; centred holds).
+///
+/// - A uniform tracer stays uniform (`ψ = 0`): constancy, whatever the
+///   reference.
+/// - A column stratified like its reference at a fraction of its strength
+///   (`C = a + b C_ref`, `0 < b ≤ 1`) has `ψ = b`, and its surface values are
+///   exactly centred (every [`VerticalAdvection`] commutes with
+///   `C → a + bC` for `b > 0`).
+/// - Jumps beyond the reference's, or against it, keep `V`'s full limiting
+///   (fronts).
+/// - The flux is single-valued on every surface: conservative.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_tracer_transport_3d_about(
+    rhs: &mut [f64],
+    tracer: &[f64],
+    reference: Option<&[f64]>,
+    transport: &LayerTransport,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    bc: &dyn TracerBoundaryCondition3D,
+    exterior: Option<ExteriorField>,
+    boundaries: &Boundaries3D,
+    vertical: VerticalAdvection,
+) {
     let (nn, nl) = (ops.n_nodes, transport.n_levels);
     let context = LayerContext {
         transport,
@@ -1090,7 +1143,9 @@ pub fn apply_tracer_transport_3d(
                 }
             }
 
-            subtract_vertical_flux(rhs_k, tracer, transport, k, nn, vertical, scratch);
+            subtract_vertical_flux(
+                rhs_k, tracer, reference, transport, k, nn, vertical, scratch,
+            );
         },
     );
 }
@@ -1098,9 +1153,11 @@ pub fn apply_tracer_transport_3d(
 /// Subtract `δ(Ω φ)`, with `φ` at the σ-surfaces reconstructed by `scheme`,
 /// from `rhs_k` (element `k`'s block, `[node][level]`) in every column of
 /// element `k`.
+#[allow(clippy::too_many_arguments)]
 fn subtract_vertical_flux(
     rhs_k: &mut [f64],
     field: &[f64],
+    reference: Option<&[f64]>,
     transport: &LayerTransport,
     k: usize,
     nn: usize,
@@ -1111,6 +1168,7 @@ fn subtract_vertical_flux(
     let TransportScratch {
         vertical: flux,
         slope,
+        reference_surface,
         ..
     } = scratch;
     for i in 0..nn {
@@ -1118,6 +1176,29 @@ fn subtract_vertical_flux(
         let omega = &transport.omega[idx * (nl + 1)..(idx + 1) * (nl + 1)];
         let column = &field[idx * nl..(idx + 1) * nl];
         scheme.surface_values(column, omega, &transport.d_sigma, slope, flux);
+        if let Some(reference) = reference {
+            let reference = &reference[idx * nl..(idx + 1) * nl];
+            scheme.surface_values(
+                reference,
+                omega,
+                &transport.d_sigma,
+                slope,
+                reference_surface,
+            );
+            for l in 1..nl {
+                let jump = reference[l] - reference[l - 1];
+                if jump == 0.0 {
+                    continue;
+                }
+                let share = ((column[l] - column[l - 1]) / jump).clamp(0.0, 1.0);
+                let correction =
+                    -share * (reference_surface[l] - 0.5 * (reference[l - 1] + reference[l]));
+                // Only ever towards the column's centred value, not past it:
+                // a limited value stays bounded
+                let to_centred = 0.5 * (column[l - 1] + column[l]) - flux[l];
+                flux[l] += correction.clamp(to_centred.min(0.0), to_centred.max(0.0));
+            }
+        }
         for l in 0..=nl {
             flux[l] *= omega[l];
         }
@@ -1216,6 +1297,12 @@ pub enum VerticalAdvection {
     /// [`Self::Tvd`]. The tracers' default.
     #[default]
     LimitedAkima,
+    /// The mean between the two layer centres of the Hermite cubic with the
+    /// harmonic-mean slopes of the baroclinic pressure integral,
+    /// `½(C_{l−1} + C_l) + h(d_{l−1} − d_l)/12` with `h` the centres'
+    /// spacing: the energy partner of that pressure integral
+    /// (experimental, TODO P1.3).
+    HermiteMean,
 }
 
 impl VerticalAdvection {
@@ -1251,6 +1338,15 @@ impl VerticalAdvection {
                 }
             }
             Self::Akima if nl > 1 => akima_surface_values(column, d_sigma, slope, surface),
+            Self::HermiteMean if nl > 1 => {
+                // Akima's slopes are the pressure integral's harmonic means
+                akima_surface_values(column, d_sigma, slope, surface);
+                for l in 1..nl {
+                    let h = 0.5 * (d_sigma[l - 1] + d_sigma[l]);
+                    surface[l] =
+                        0.5 * (column[l - 1] + column[l]) + h * (slope[l - 1] - slope[l]) / 12.0;
+                }
+            }
             Self::LimitedAkima if nl > 1 => {
                 akima_surface_values(column, d_sigma, slope, surface);
                 for l in 1..nl {
@@ -1290,7 +1386,7 @@ impl VerticalAdvection {
                     surface[l] = column[up] + tvd_limited(increment, behind, ahead);
                 }
             }
-            Self::Akima | Self::LimitedAkima => {}
+            Self::Akima | Self::LimitedAkima | Self::HermiteMean => {}
         }
     }
 }
@@ -1444,7 +1540,7 @@ pub fn apply_momentum_transport_3d(
                     }
                 }
 
-                subtract_vertical_flux(rhs_k, field, transport, k, nn, vertical, scratch);
+                subtract_vertical_flux(rhs_k, field, None, transport, k, nn, vertical, scratch);
             }
         },
     );
@@ -1567,6 +1663,8 @@ struct TransportScratch {
     div: Vec<f64>,
     vertical: Vec<f64>,
     slope: Vec<f64>,
+    /// The surface values of a column's reference (`[level]`, bed first)
+    reference_surface: Vec<f64>,
 }
 
 impl TransportScratch {
@@ -1596,6 +1694,7 @@ impl TransportScratch {
             div: vec![0.0; ops.n_nodes],
             vertical: vec![0.0; n_levels + 1],
             slope: vec![0.0; n_levels],
+            reference_surface: vec![0.0; n_levels + 1],
         }
     }
 }
@@ -2080,6 +2179,156 @@ mod tests {
             for column in rhs.chunks_exact(nl) {
                 for (got, want) in column.iter().zip(expected) {
                     assert!((got - want).abs() < 1e-14, "Ω = {w}: {column:?}");
+                }
+            }
+        }
+    }
+
+    const ALL_SCHEMES: [VerticalAdvection; 6] = [
+        VerticalAdvection::Centred,
+        VerticalAdvection::Upwind,
+        VerticalAdvection::Tvd,
+        VerticalAdvection::Akima,
+        VerticalAdvection::LimitedAkima,
+        VerticalAdvection::HermiteMean,
+    ];
+
+    /// The vertical tracer tendency of `tracer` (one column per node of a
+    /// single P1 element, 4 stretched layers, no horizontal transport) for
+    /// `Ω` = `omega` at the σ-surfaces, about `reference` if any.
+    fn vertical_tendency(
+        scheme: VerticalAdvection,
+        tracer: &[f64],
+        reference: Option<&[f64]>,
+        omega: [f64; 5],
+    ) -> Vec<f64> {
+        let mesh = Mesh2D::uniform_periodic(0.0, 1.0, 0.0, 1.0, 1, 1);
+        let ops = DGOperators2D::new(1);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let mut transport = LayerTransport::new(1, &ops, 4);
+        transport.d_sigma.copy_from_slice(&[0.4, 0.3, 0.2, 0.1]);
+        for column in transport.omega.as_chunks_mut::<5>().0 {
+            column.copy_from_slice(&omega);
+        }
+        let mut rhs = vec![0.0; tracer.len()];
+        apply_tracer_transport_3d_about(
+            &mut rhs,
+            tracer,
+            reference,
+            &transport,
+            &mesh,
+            &ops,
+            &geom,
+            &ExtrapolationTracerBC3D,
+            None,
+            &Boundaries3D::default(),
+            scheme,
+        );
+        rhs
+    }
+
+    /// One 4-layer column, bed first, repeated at the 4 nodes of a P1 element.
+    fn columns(column: [f64; 4]) -> Vec<f64> {
+        (0..4).flat_map(|_| column).collect()
+    }
+
+    /// Two up and one down: both upwind sides at the interior surfaces.
+    const OMEGAS: [[f64; 5]; 2] = [[0.0, 0.3, -0.15, 0.3, 0.0], [0.0, -0.3, 0.15, -0.3, 0.0]];
+
+    /// A curved stratification (warm above a pycnocline), where the schemes
+    /// differ from centred.
+    const STRATIFIED: [f64; 4] = [6.9, 7.0, 9.8, 10.0];
+
+    /// About a reference equal to the tracer, every scheme's vertical flux is
+    /// centred's (TODO P1.3: the background's surface values must be the
+    /// arithmetic mean), as is a column stratified like the reference at a
+    /// fraction of its strength.
+    #[test]
+    fn vertical_flux_about_its_own_stratification_is_centred() {
+        let reference = columns(STRATIFIED);
+        for omega in OMEGAS {
+            for scaled in [1.0, 0.6, 0.1] {
+                let tracer: Vec<f64> = reference.iter().map(|r| 3.0 + scaled * r).collect();
+                let centred = vertical_tendency(VerticalAdvection::Centred, &tracer, None, omega);
+                for scheme in ALL_SCHEMES {
+                    let about = vertical_tendency(scheme, &tracer, Some(&reference), omega);
+                    let error = about
+                        .iter()
+                        .zip(&centred)
+                        .map(|(a, c)| (a - c).abs())
+                        .fold(0.0, f64::max);
+                    assert!(
+                        error < 1e-13,
+                        "{scheme:?} at {scaled}: off centred by {error:.2e}"
+                    );
+                    if scheme != VerticalAdvection::Centred && scaled == 1.0 {
+                        let plain = vertical_tendency(scheme, &tracer, None, omega);
+                        assert!(
+                            plain
+                                .iter()
+                                .zip(&centred)
+                                .any(|(a, c)| (a - c).abs() > 1e-3),
+                            "{scheme:?} should differ from centred on a curved profile"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A uniform tracer stays uniform about any reference (constancy: its
+    /// tendency is `C δΩ`, the layer thickness's change), and the vertical
+    /// fluxes conserve the column's inventory about any reference.
+    #[test]
+    fn vertical_flux_about_a_reference_keeps_constancy_and_inventory() {
+        let reference = columns(STRATIFIED);
+        let uniform = columns([4.0; 4]);
+        let mixed = columns([7.2, 6.8, 9.9, 9.0]);
+        for omega in OMEGAS {
+            for scheme in ALL_SCHEMES {
+                let about = vertical_tendency(scheme, &uniform, Some(&reference), omega);
+                for column in about.as_chunks::<4>().0 {
+                    for (l, &r) in column.iter().enumerate() {
+                        let want = -4.0 * (omega[l + 1] - omega[l]);
+                        assert!(
+                            (r - want).abs() < 1e-14,
+                            "{scheme:?} level {l}: {r} against {want}"
+                        );
+                    }
+                }
+                let about = vertical_tendency(scheme, &mixed, Some(&reference), omega);
+                for column in about.as_chunks::<4>().0 {
+                    let sum: f64 = column.iter().sum();
+                    assert!(sum.abs() < 1e-14, "{scheme:?}: the column gained {sum:.2e}");
+                }
+            }
+        }
+    }
+
+    /// A front far sharper than the reference keeps the scheme's limiting:
+    /// with the bounded schemes its surface value stays between the two
+    /// layers'.
+    #[test]
+    fn vertical_flux_about_a_reference_keeps_a_front_bounded() {
+        let reference = columns([7.0, 7.1, 7.2, 7.3]);
+        let front = columns([7.0, 7.0, 12.0, 12.0]);
+        let omega = [0.0, 0.3, 0.3, 0.3, 0.0];
+        for scheme in [
+            VerticalAdvection::Upwind,
+            VerticalAdvection::Tvd,
+            VerticalAdvection::LimitedAkima,
+        ] {
+            let plain = vertical_tendency(scheme, &front, None, omega);
+            let about = vertical_tendency(scheme, &front, Some(&reference), omega);
+            // Below the front, layer 1 passes up water at a surface value
+            // between 7 and 12 and gets 7: its tendency lies in
+            // [−0.3·(12 − 7), 0] for a bounded surface value
+            for (rhs, name) in [(&plain, "plain"), (&about, "about")] {
+                for column in rhs.as_chunks::<4>().0 {
+                    assert!(
+                        (-1.5 - 1e-14..=1e-14).contains(&column[1]),
+                        "{scheme:?} {name}: {column:?}"
+                    );
                 }
             }
         }
