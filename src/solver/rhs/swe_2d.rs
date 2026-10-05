@@ -2114,7 +2114,9 @@ mod tests {
         config: &SWE2DRhsConfig<BC>,
         time: f64,
     ) {
-        use super::super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
+        use super::super::diffusion_2d::{
+            DiffusionScratch, br1_diffusion_element, compute_br1_gradient_2d,
+        };
 
         let visc = config.viscosity.expect("viscosity");
         let n_nodes = ops.n_nodes;
@@ -2169,8 +2171,33 @@ mod tests {
                 }
             }
         }
-        let diff_u = compute_br1_diffusion_rhs_2d(&u, &coeff, &grad_u, mesh, ops, geom);
-        let diff_v = compute_br1_diffusion_rhs_2d(&v, &coeff, &grad_v, mesh, ops, geom);
+        // Both components at once: a wall (every face of `Reflective2D`)
+        // mirrors the velocity and passes the normal stress only
+        let (mut diff_u, mut diff_v) = (vec![0.0; total_nodes], vec![0.0; total_nodes]);
+        let mut scratch = DiffusionScratch::<2>::new(n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let rows = k.as_usize() * n_nodes..(k.as_usize() + 1) * n_nodes;
+            br1_diffusion_element(
+                k,
+                mesh,
+                ops,
+                geom,
+                |j, node| {
+                    let flat = j.as_usize() * n_nodes + node;
+                    let c = coeff[flat].max(0.0);
+                    [
+                        (c * grad_u[flat].dx, c * grad_u[flat].dy),
+                        (c * grad_v[flat].dx, c * grad_v[flat].dy),
+                    ]
+                },
+                |_, _, _, (nx, ny), [fu, fv]| {
+                    let normal = nx * fu + ny * fv;
+                    [nx * normal, ny * normal]
+                },
+                &mut scratch,
+                [&mut diff_u[rows.clone()], &mut diff_v[rows]],
+            );
+        }
         for flat in 0..total_nodes {
             rhs.data[1][flat] += diff_u[flat];
             rhs.data[2][flat] += diff_v[flat];

@@ -140,13 +140,33 @@ impl<const N: usize> DiffusionScratch<N> {
 ///
 /// The interface flux is single-valued and opposite on neighbouring
 /// elements, so the element-integrated diffusion is conservative across
-/// interior faces. Boundary faces take the interior flux (no correction).
+/// interior faces.
+///
+/// On a boundary face the normal flux is `boundary_flux(k, face, fi,
+/// normal, F·n)`, from the interior's `F·n` per scalar. It must match the
+/// exterior state the gradient took ([`br1_gradient_element`]'s
+/// `boundary_value`), or the operator is not dissipative: with the strong
+/// form's summation by parts, `Σ u·div(c∇u)` is `−Σ c|∇u|²` plus, on the
+/// boundary, `(u* − u)·(F·n) + u·F*` with `u*` the gradient's face value
+/// and `F*` this flux. For an exterior state `R u` (linear, `u* = ½(I + R)u`)
+/// the flux `F* = ½(I − R)(F·n)` cancels it:
+/// - `R = −I` (zero Dirichlet): the interior flux;
+/// - `R = I` (zero gradient, a copy): no flux;
+/// - a free-slip wall's mirror of a velocity, `R = I − 2nnᵀ`: the normal
+///   stress only, `F* = n (n·(F·n))`.
+///
+/// The interior flux at a mirrored wall made the 3D viscosity grow with an
+/// e-folding of 1.5 min at ν = 10 m²/s on the Frøya coastline mesh (TODO
+/// P1.3). An inhomogeneous exterior state (`R u + g`, e.g. an open
+/// boundary's external data) adds the forcing of `g` only.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn br1_diffusion_element<const N: usize>(
     k: ElementIndex,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
     flux: impl Fn(ElementIndex, usize) -> [(f64, f64); N],
+    boundary_flux: impl Fn(ElementIndex, usize, usize, (f64, f64), [f64; N]) -> [f64; N],
     scratch: &mut DiffusionScratch<N>,
     out: [&mut [f64]; N],
 ) {
@@ -207,15 +227,16 @@ pub(super) fn br1_diffusion_element<const N: usize>(
                 )
             });
 
+            let flux_int_n: [f64; N] =
+                std::array::from_fn(|c| flux_x[node][c] * normal.0 + flux_y[node][c] * normal.1);
+            let flux_star_n = match exterior {
+                Some(fluxes) => std::array::from_fn(|c| {
+                    0.5 * (flux_int_n[c] + fluxes[c].0 * normal.0 + fluxes[c].1 * normal.1)
+                }),
+                None => boundary_flux(k, face, fi, normal, flux_int_n),
+            };
             for c in 0..N {
-                let flux_int_n = flux_x[node][c] * normal.0 + flux_y[node][c] * normal.1;
-                let flux_ext_n = match exterior {
-                    Some(fluxes) => fluxes[c].0 * normal.0 + fluxes[c].1 * normal.1,
-                    None => flux_int_n,
-                };
-                let flux_star_n = 0.5 * (flux_int_n + flux_ext_n);
-                let correction = flux_star_n - flux_int_n;
-                out[c][node] += lift_entry * lift_scale * correction;
+                out[c][node] += lift_entry * lift_scale * (flux_star_n[c] - flux_int_n[c]);
             }
         }
     }
@@ -258,6 +279,10 @@ where
 /// as zero.
 ///
 /// The returned array is a scalar RHS contribution for every element node.
+/// Boundary faces take the interior flux, which matches an exterior state
+/// that is a (shifted) mirror of the interior, `2u_b − u` (see
+/// [`br1_diffusion_element`]); for a zero-gradient exterior it is not
+/// dissipative (TODO P1.3: the 2D tracer diffusion's walls).
 pub(super) fn compute_br1_diffusion_rhs_2d(
     values: &[f64],
     coefficients: &[f64],
@@ -279,7 +304,16 @@ pub(super) fn compute_br1_diffusion_rhs_2d(
     let mut rhs = vec![0.0; values.len()];
     let mut scratch = DiffusionScratch::<1>::new(n_nodes);
     for (k, out) in ElementIndex::iter(mesh.n_elements).zip(rhs.chunks_exact_mut(n_nodes)) {
-        br1_diffusion_element(k, mesh, ops, geom, flux, &mut scratch, [out]);
+        br1_diffusion_element(
+            k,
+            mesh,
+            ops,
+            geom,
+            flux,
+            |_, _, _, _, f| f,
+            &mut scratch,
+            [out],
+        );
     }
     rhs
 }
