@@ -335,14 +335,18 @@ fn main() -> AppExit {
                 return AppExit::from_code(2);
             }
         };
-        let scenario = match built {
+        let mut scenario = match built {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("cannot build the {scenario_name} scenario: {e}");
                 return AppExit::from_code(1);
             }
         };
-        let replay = match args.replay.as_deref().map(|d| Replay::vtu(d, &scenario)) {
+        let replay = match args
+            .replay
+            .as_deref()
+            .map(|d| Replay::vtu(d, &mut scenario))
+        {
             None => None,
             Some(Ok(replay)) => Some(replay),
             Some(Err(e)) => {

@@ -95,7 +95,10 @@ impl Replay {
     /// The `*.vtu` frames in `dir` (in file-name order, which is time order for
     /// zero-padded numbers), checked against `scenario`. The clock is that of the
     /// run's `run.log` (its `Clock:` line), if it has one.
-    pub fn vtu(dir: &Path, scenario: &Scenario) -> Result<Self, Box<dyn Error>> {
+    ///
+    /// The nodes must be the scenario's. A different bed is the run's own (e.g.
+    /// smoothed for 3D, `froya_real_data slopes3d=on`): the scenario takes it.
+    pub fn vtu(dir: &Path, scenario: &mut Scenario) -> Result<Self, Box<dyn Error>> {
         let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
             .filter_map(|entry| entry.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|e| e == "vtu"))
@@ -141,13 +144,23 @@ impl Replay {
             .iter()
             .zip(&scenario.bathymetry.data)
             .fold(0.0f64, |m, (a, b)| m.max((a - b).abs()));
-        if bed.len() != n || bed_off > TOLERANCE {
+        if bed.len() != n {
             return Err(format!(
-                "the bed of {} differs from the scenario's by up to {bed_off:.3} m: \
-                 the run built its bed otherwise",
-                first.display()
+                "{} has {} bed values for {n} nodes",
+                first.display(),
+                bed.len()
             )
             .into());
+        }
+        if bed_off > TOLERANCE {
+            println!(
+                "The run's bed differs from the scenario's by up to {bed_off:.1} m (smoothed \
+                 for 3D?): showing the run's"
+            );
+            let mut bathymetry = (*scenario.bathymetry).clone();
+            bathymetry.data.copy_from_slice(&bed);
+            bathymetry.compute_gradients(&scenario.ops, &scenario.geom);
+            scenario.bathymetry = std::sync::Arc::new(bathymetry);
         }
 
         let t_first = time_value(&text)?;
