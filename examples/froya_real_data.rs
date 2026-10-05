@@ -139,7 +139,8 @@
 //! `rx0_min_depth` (3 m) deep is at most r (`Bathymetry2D::smooth_rx0`):
 //! shoals a node wide otherwise carry spurious m/s currents.
 //!
-//! `slopes3d=on` (3D runs, `levels=N`) smooths the bed, keeping its volume,
+//! `slopes3d=on` (for 3D runs, `levels=N`; in a 2D run it shows what the 3D
+//! bed does to the tide) smooths the bed, keeping its volume,
 //! until no element's depth range lets a σ-level cross the summer
 //! pycnocline between two of its nodes (`Bathymetry2D::smooth_element_slopes`,
 //! TODO P1.3): within an element r_x0 ≤ 0.15 (`slopes3d=r` for another bound)
@@ -491,7 +492,6 @@ impl Options {
                 let default = ElementSlopeBound::for_pycnocline(PYCNOCLINE_BOTTOM);
                 let free_depth = get("free_depth", default.free_depth)?;
                 match args.get("slopes3d").map(String::as_str) {
-                    _ if get("levels", 0.0)? == 0.0 => None,
                     None | Some("off") => None,
                     Some("on") => Some(ElementSlopeBound {
                         free_depth,

@@ -602,7 +602,18 @@ Decision (2026-07-09): keep `src/solver/burn/` behind the `burn` feature for now
               - On the 11163 patch at 0.2, the reference lets the fully wet element at the bound grow (e-folding ≈ 59 min) where the default's LimitedAkima damps it: vertical dissipation feeds the terrace mode but damps the straddle mode.
               - Full coastline mesh with `free_depth=19` and the reference (constant mixing, no limiter, 12 h): ≤ 3.7e-9 m/s through 10 h, 8.4e-9 m/s at 11.7 h. The old default reached 1.4e-6 m/s at 8.2 h, and the reference with the 28.5 m free depth 3.3e-8 at 8.6 h. The only rise is a faint one after 10 h at element 1410 (19 m beside 0.2–8.6 m, now at the new free depth).
               - With GLS and the limiter (8.6 h): 2.8e-3 m/s at the end, against 2.6e-2 m/s with the 28.5 m free depth. It levels off rather than growing: 2.0e-3 at 4 h, 2.3e-3 at 6.5 h, 2.7e-3 at 8.2 h. It is spread over shallow elements' bed layers (the GLS creep at slopes), plus one 72–97 m element at level 4. No exponential growth is left.
-              - [ ] Make 19 m the default free depth (`ElementSlopeBound::for_pycnocline`: the pycnocline's bottom instead of 1.5×) together with the reference reconstruction, after measuring what the extra smoothing (32.1k instead of 26.2k nodes) does to the 2D tide at Mausund.
+              - The 2D tide on the Mausund sub-domain with the 3D bed (hours 24–72 from 2025-06-15, `tide_transport=3`; `slopes3d` now applies to 2D runs too):
+
+                | bed | RMSE vs prediction (centred) | vs observations | M2 ratio, phase | M2 current at NorKyst's point (NorKyst 0.246 m/s, 149°) | gauge node depth |
+                |---|---|---|---|---|---|
+                | unsmoothed | 4.1 cm | 6.3 cm | 1.014, −8.7° | 0.014 m/s | 8.1 m |
+                | 3D bed, free depth 28.5 m (4.9k nodes) | 2.5 cm | 4.4 cm | 1.014, −12.3° | 0.067 m/s | 8.1 m |
+                | 3D bed, free depth 19 m (6.5k nodes) | 3.1 cm | 4.5 cm | 1.028, −13.9° | 0.102 m/s, 157° | 14.8 m |
+
+                - The time series improve with either smoothing (as `rx0=0.3` did), while the 2-day M2 phase gets 3.6–5° worse. The NorKyst point's M2 current moves towards NorKyst's: the smoothing opens the island lee, and its node goes from 45 to 26–29 m deep.
+                - 19 m against 28.5 m: about the same skill, a further 1.6° of M2 phase, and the gauge's node deepened from 8 to 15 m.
+                - No blocker for 3D runs. The skill differences are within what resolution and station sampling already move.
+              - [ ] Make 19 m the default free depth (`ElementSlopeBound::for_pycnocline`: the pycnocline's bottom instead of 1.5×) and the reference reconstruction the default for stratified 3D runs. Optionally check the full mesh's 3-day tide with the 19 m bed first (≈ 2.5 h).
             - [x] Linear spectrum harness (2026-10-04): `probe_terrace_spectrum` (ignored test; Arnoldi, 24 vectors, finite differences of the 600 s step map about rest on the 22-element fixture, 16k unknowns; `DGRS_VADV`, `DGRS_VREF`). Leading growth: upwind 10 min, TVD 21 (both real; their map is only positively homogeneous, so indicative), LimitedAkima 30 (real) and a pair at 74, Akima 66 (oscillatory pair), Hermite mean 7.2 h, centred 8.8 h, LimitedAkima about the rest state 8.8 h. ≈ 1–5 min per scheme in the ci profile.
               - [ ] The slow real mode of centred and the Hermite mean (7–9 h on the fixture) does not depend on the vertical scheme: probably the straddle mechanism. Use the harness on the 1D slices and on candidate bounds or pair densities.
               - Sweeping the weight `c` of Akima's curvature correction (0 centred, ½ the Hermite mean, 1 Akima): −0.5 grows (pair, 91 min), 0 / 0.25 / 0.5 / 0.75 hold to 8.8 / 8.4 / 7.2 / 5.5 h, 1 grows (pair, 66 min). The energy partner is not the edge.

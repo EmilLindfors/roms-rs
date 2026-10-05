@@ -205,6 +205,16 @@ On the patch `around=11163:1500 slopes3d=0.2` the default holds 8.6e-10 m/s for 
 
 The 9381 patch (`around=9381:1500`, r_x0 0.15, the free-depth exemption: 28.5 m beside 2.6 m in one fully wet element) grows with e-folding ≈ 43 min from ≈ 7 h, with or without the reference, and saturates near 4e-2 m/s at 20 h: the straddle mechanism. The 1D calibration slices let shallow-to-28 m steps go unsmoothed. In 2D they do not hold. With `free_depth=19` (the pycnocline's bottom) the patch holds below 9e-10 m/s for 20.6 h, with or without the reference, at the cost of 32.1k smoothed nodes of the coastline mesh instead of 26.2k. On the full mesh with the reference (constant mixing, no limiter), `free_depth=19` holds ≤ 3.7e-9 m/s through 10 h and 8.4e-9 m/s at 11.7 h. The only rise is a faint one at a 19 m column beside 0.2–8.6 m ones, now at the new free depth. That is the best rest state of the coastline mesh so far. With GLS and the limiter it ends at 2.8e-3 m/s after 8.6 h, against 2.6e-2 m/s with the 28.5 m free depth, and it levels off (2.0e-3 m/s at 4 h, 2.7e-3 at 8.2 h). What is left is spread over the bed layers of shallow elements: the GLS creep at slopes, with no exponential growth.
 
+The 2D tide on the Mausund sub-domain with the 3D bed (hours 24–72):
+
+| bed | centred RMSE vs prediction / observations | M2 phase |
+|---|---|---|
+| unsmoothed | 4.1 / 6.3 cm | −8.7° |
+| free depth 28.5 m | 2.5 / 4.4 cm | −12.3° |
+| free depth 19 m | 3.1 / 4.5 cm | −13.9° |
+
+The time series improve and the 2-day M2 phase worsens. At NorKyst's point near Mausund the M2 current rises towards NorKyst's (0.014 → 0.067 → 0.102 m/s, against 0.246): the smoothing opens part of the island lee.
+
 ### With GLS and the limiter
 
 On the full coastline mesh with the reference (r_x0 0.15, 8.6 h), the largest speed is 1.9e-3 m/s at 3–4 h. Before the reference, this setup reached 8e-3 m/s at 2 h. It then grows slowly (e-folding ≈ 2.5 h) to 2.6e-2 m/s, at elements with 27–28.5 m beside 2–9 m: the shallow-deep pairs the free depth exempts.
