@@ -265,10 +265,11 @@ pub struct Rx0Smoothing {
 /// hold at a depth ratio of 1.5 (r_x0 = 0.2) and grow at 1.67–2.3
 /// (e-folding 27 h down to 3 h); from 30 m, 45 m holds and 55 m grows
 /// (10 h). In shallow water the depth ratio does not matter: steps from
-/// 0.5–5 m of water to 21–40 m hold, to 60 m grow (2 h). The bound
-/// [`Self::for_pycnocline`] takes the free depth as 1.5 times the depth of
-/// the pycnocline's bottom (28.5 m for 19 m), below every step that grew
-/// (15 → 35 m: e-folding 12.6 h). Steps to land need no bound: a thin
+/// 0.5–5 m of water to 21–40 m hold, to 60 m grow (2 h). The slices allowed a
+/// free depth of 1.5 times the pycnocline's bottom, but in 2D shallow–deep
+/// pairs below it grew (the Frøya coastline mesh: 2.6 m beside 28.5 m inside
+/// one element, e-folding 43 min), so [`Self::for_pycnocline`] takes the
+/// pycnocline's bottom itself. Steps to land need no bound: a thin
 /// column exchanges no baroclinic transport, and its element moves the
 /// layers on the 2D wet/dry kernel's subcells (land beside 300 m holds at
 /// 1e-10 m/s for a day once the wet pairs are smoothed; see
@@ -285,14 +286,22 @@ pub struct ElementSlopeBound {
 
 impl ElementSlopeBound {
     /// The calibrated bound for a pycnocline whose bottom is `bottom` m
-    /// deep: r_x0 ≤ 0.15 and a free depth of 1.5 × `bottom`. The x–z slices
-    /// hold at 0.2, but on the Frøya coastline mesh an element at that bound
-    /// (33.6 m nodes and one 50.4 m corner) grew with an e-folding of 36 min;
-    /// at 0.15 a patch around it holds round-off for 12 h.
+    /// deep: r_x0 ≤ 0.15 and a free depth of `bottom`.
+    ///
+    /// The x–z slices hold at r_x0 0.2, but on the Frøya coastline mesh an
+    /// element at that bound (33.6 m nodes and one 50.4 m corner) grew with
+    /// an e-folding of 36 min; at 0.15 a patch around it holds round-off for
+    /// 12 h. With a free depth of 1.5 × `bottom` (28.5 m), shallow–deep pairs
+    /// below it grew (e-folding 43 min). At `bottom` the full coastline mesh
+    /// at rest holds 8.4e-9 m/s for 11.7 h with constant mixing, with the
+    /// 3D model's vertical reference (`Hydrostatic3D::with_vertical_reference`),
+    /// and levels off at 2.8e-3 m/s with GLS (TODO P1.3). The 2D tide at
+    /// Mausund on that bed: centred RMSE 2.8 cm against the gauge's
+    /// prediction, 4.0 cm against the observations.
     pub fn for_pycnocline(bottom: f64) -> Self {
         Self {
             r_max: 0.15,
-            free_depth: 1.5 * bottom,
+            free_depth: bottom,
         }
     }
 
@@ -1896,18 +1905,18 @@ mod tests {
     #[test]
     fn test_element_slope_bound() {
         let bound = ElementSlopeBound::for_pycnocline(19.0);
-        assert_eq!(bound.free_depth, 28.5);
-        // Shallow water and land: free down to 28.5 m
-        for shallow in [-3.0, 0.0, 5.0, 19.0] {
-            assert_eq!(bound.deepest_beside(shallow), 28.5);
+        assert_eq!(bound.free_depth, 19.0);
+        // Shallow water and land: free down to the pycnocline's bottom
+        for shallow in [-3.0, 0.0, 5.0, 14.0] {
+            assert_eq!(bound.deepest_beside(shallow), 19.0);
         }
         // Deeper: r_x0 = 0.15, a depth ratio of 1.15/0.85
         let ratio = 1.15 / 0.85;
         assert!((bound.deepest_beside(30.0) - 30.0 * ratio).abs() < 1e-12);
         assert!((bound.excess(30.0, 50.0) - (50.0 - 30.0 * ratio)).abs() < 1e-12);
         assert_eq!(bound.excess(30.0, 40.0), 0.0);
-        assert_eq!(bound.excess(0.0, 28.0), 0.0);
-        assert!((bound.excess(0.0, 40.0) - 11.5).abs() < 1e-12);
+        assert_eq!(bound.excess(0.0, 18.0), 0.0);
+        assert!((bound.excess(0.0, 40.0) - 21.0).abs() < 1e-12);
     }
 
     #[test]
@@ -1964,7 +1973,7 @@ mod tests {
 
     #[test]
     fn test_smooth_element_slopes_leaves_a_bed_within_the_bound_alone() {
-        // 20 → 28 m: within the free depth everywhere
+        // 20 → 28 m over 4 elements: within the depth ratio everywhere
         let bound = ElementSlopeBound::for_pycnocline(19.0);
         let (mesh, ops, geom) = setup(distorted_mesh(4), 2);
         let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -20.0 - 8.0 * x);

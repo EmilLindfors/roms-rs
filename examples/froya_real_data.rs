@@ -123,8 +123,9 @@
 //! end, for `scripts/mode3d_dump.py`), `seed=PREFIX:AMP` (start from rest
 //! plus a dumped mode at a largest speed of AMP m/s), `deep=G` (°C/m below
 //! the pycnocline, 0.002), `vadv=centred|akima|tvd|upwind|hermite` (the
-//! vertical tracer scheme), `vref` (that scheme about the state at rest;
-//! TODO P1.3), `tadv=none|centred` (the turbulence's advection) and
+//! vertical tracer scheme), `noref` (that scheme without the reference of
+//! the state at rest, which 3D runs take by default; TODO P1.3),
+//! `tadv=none|centred` (the turbulence's advection) and
 //! `export=PATH` (with `around=`: the patch as a test fixture).
 //!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
@@ -145,7 +146,7 @@
 //! pycnocline between two of its nodes (`Bathymetry2D::smooth_element_slopes`,
 //! TODO P1.3): within an element r_x0 ≤ 0.15 (`slopes3d=r` for another bound)
 //! between columns that are not thin (`debug_3d=thin=`, 0.1 m) wherever the
-//! deeper one is below `free_depth` (28.5 m, 1.5 × the pycnocline's bottom).
+//! deeper one is below `free_depth` (19 m, the pycnocline's bottom).
 //! Shores need none (the 3D wetting and drying moves their layers on the 2D
 //! kernel's subcells) and do not move. Off by default.
 //!
@@ -2180,11 +2181,12 @@ fn cost_3d(domain: &Domain, opts: &Options) {
             eos.compute_density(t, s, z)
         })
     };
-    // `vref`: the vertical tracer advection about the state at rest
-    let physics = if dbg("vref") {
-        physics.with_vertical_reference(&state)
-    } else {
+    // The vertical tracer advection about the state at rest, as
+    // `Simulation3D` does (`noref`: the plain scheme)
+    let physics = if dbg("noref") {
         physics
+    } else {
+        physics.with_vertical_reference(&state)
     };
     let mut integrator = ModeSplitIntegrator::new();
     let mut t = 0.0;

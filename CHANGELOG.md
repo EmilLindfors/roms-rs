@@ -264,6 +264,15 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **Stratified 3D runs take the vertical reference and the 19 m free depth by default (TODO P1.3).**
+  - `Simulation3D` takes a stratified initial state as the vertical tracer advection's reference (`Hydrostatic3D::ensure_vertical_reference`) when none was given. Opt out with `Hydrostatic3D::without_vertical_reference`. Unmixed runs are unchanged.
+  - `froya_real_data levels=N`, `seamount_3d` and `profile_3d` step the model themselves and set it too (`debug_3d=noref`, `vref=0` for the plain scheme).
+  - `ElementSlopeBound::for_pycnocline(bottom)` now leaves only depths above the pycnocline's bottom free, not 1.5 × it. Shallow–deep pairs below 28.5 m grew on the Frøya coastline mesh, with e-folding 43 min.
+  - With both, the coastline mesh at rest holds 8.4e-9 m/s for 11.7 h with constant mixing, and levels off at 2.8e-3 m/s with GLS.
+  - The 3-day 2D tide on that bed (32.1k nodes smoothed): Mausund centred RMSE 2.8 cm against the gauge's prediction and 4.0 cm against the observations (unsmoothed, recorded 2026-09-28: 2.3 / 4.7 cm). M2 −14.4° (−12.0°). At NorKyst's point the M2 current is 0.269 m/s at 151°, against NorKyst's 0.246 m/s at 149° (unsmoothed: 0.021 m/s, an island lee).
+  - `froya_real_data`'s `slopes3d` applies to 2D runs too.
+  - The viewer's VTU replay (`viz --replay DIR`) takes a run's own bed, e.g. smoothed for 3D, where it refused it before.
+
 - **The BR1 viscous kernels take both velocity components in one pass (TODO P2.5).** `br1_gradient_element` and `br1_diffusion_element` (`solver/rhs/diffusion_2d.rs`) are const-generic over the number of components `N`: the components share each node's value, boundary-value and flux evaluation, and each is computed with the same operations as alone. The 2D viscous term ran u and v separately, dividing by h twice per node and evaluating the boundary condition twice per boundary node (a tidal evaluation at open boundaries), and computed the Smagorinsky ν once per component; the 3D shear viscosity likewise. Both now make one call for (u, v); the tracer helpers make one for a scalar.
   - Bit-identical: RHS bit hashes (inviscid, constant ν, Smagorinsky with a background), the farm run's printed results and `profile_3d`'s state checksum are unchanged.
   - 8192 P2 elements, release: the viscous part of the 2D RHS 4.05 → 2.58 ms on one thread with a constant ν (RHS 7.87 → 6.39 ms against 3.81 inviscid) and 5.2 → 3.4 ms with Smagorinsky; on 24 threads the RHS 1.18 → 1.03 ms (constant) and 1.24–1.30 → 1.04 ms (Smagorinsky). `local_time_stepping_farm hours=0.25 nu=1 run=local`, alternating runs: 39.7 / 40.4 → 34.0 / 32.2 s on 8 threads, median 31.8 → 28.7 s on 24. `profile_3d` at 8192 elements: `momentum_rhs` 102–105 → 93 ms per step.

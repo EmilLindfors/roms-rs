@@ -184,6 +184,10 @@ where
     /// The stratification about which the vertical tracer advection
     /// reconstructs, if any (see [`Self::with_vertical_reference`]).
     vertical_reference: Option<VerticalReference>,
+    /// Whether [`Self::ensure_vertical_reference`] takes a stratified initial
+    /// state as the reference (the default; see
+    /// [`Self::without_vertical_reference`]).
+    automatic_vertical_reference: bool,
 }
 
 /// The temperature and salinity about which [`Hydrostatic3D`]'s vertical
@@ -264,6 +268,7 @@ where
             viscosity_scratch: Mutex::new(None),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
             vertical_reference: None,
+            automatic_vertical_reference: true,
         }
     }
 
@@ -289,6 +294,12 @@ where
     /// strength is still advected centred. Refresh it with
     /// [`Self::set_vertical_reference`], or let it follow the state with
     /// [`Self::with_vertical_reference_timescale`].
+    ///
+    /// It is the default: [`crate::simulation::Simulation3D`] takes a
+    /// stratified initial state as the reference when none was given
+    /// ([`Self::ensure_vertical_reference`]; opt out with
+    /// [`Self::without_vertical_reference`]). Loops that step the model
+    /// themselves call this, or [`Self::ensure_vertical_reference`].
     pub fn with_vertical_reference(mut self, state: &Solution3D) -> Self {
         self.vertical_reference = Some(VerticalReference {
             fields: Mutex::new([state.temp.clone(), state.salt.clone()]),
@@ -340,6 +351,39 @@ where
             .expect("with_vertical_reference_timescale needs with_vertical_reference first")
             .timescale = Some(timescale);
         self
+    }
+
+    /// The plain vertical scheme, without a reference, and no automatic one
+    /// from [`Self::ensure_vertical_reference`].
+    pub fn without_vertical_reference(mut self) -> Self {
+        self.vertical_reference = None;
+        self.automatic_vertical_reference = false;
+        self
+    }
+
+    /// Take `state`'s temperature and salinity as the reference of
+    /// [`Self::with_vertical_reference`] if none is set, the state is
+    /// stratified (a column's T or S varies by more than 1e-9) and
+    /// [`Self::without_vertical_reference`] did not opt out.
+    /// [`crate::simulation::Simulation3D`] calls it with its initial state.
+    pub fn ensure_vertical_reference(&mut self, state: &Solution3D) {
+        if self.vertical_reference.is_some() || !self.automatic_vertical_reference {
+            return;
+        }
+        let nl = state.n_levels;
+        let stratified = [&state.temp, &state.salt].iter().any(|field| {
+            field.chunks_exact(nl).any(|column| {
+                let (lo, hi) = column
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &c| {
+                        (lo.min(c), hi.max(c))
+                    });
+                hi - lo > 1e-9
+            })
+        });
+        if stratified {
+            self.set_vertical_reference(state);
+        }
     }
 
     /// Replace the reference of [`Self::with_vertical_reference`] by

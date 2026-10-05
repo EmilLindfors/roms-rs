@@ -98,7 +98,9 @@ where
         F: FnMut(&Solution3D, f64),
     {
         let start_wall = std::time::Instant::now();
-        // ... implementation
+        // The vertical tracer advection about the initial stratification,
+        // unless the physics has its own reference or opted out
+        self.physics.ensure_vertical_reference(state);
         let mut t = t_start;
         let mut n_steps = 0;
         let mut dt_min_used = f64::INFINITY;
@@ -2439,6 +2441,58 @@ mod tests {
             best < 1e-10 * scale,
             "an eigenvalue with real part {best:.3e} /s (scale {scale:.1e})"
         );
+    }
+
+    /// `Simulation3D` takes a stratified initial state as the vertical
+    /// tracer advection's reference (TODO P1.3), and only then: an unmixed
+    /// state, a reference of the caller's, or `without_vertical_reference`
+    /// keep theirs.
+    #[test]
+    fn simulation_takes_a_stratified_initial_state_as_the_vertical_reference() {
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 300.0, 0.0, 100.0, 3, 1));
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0));
+        let physics = || {
+            let swe = PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(G),
+                Reflective2D::default(),
+            )
+            .with_bathymetry(bathymetry.clone())
+            .build();
+            hydrostatic(&mesh, &ops, &geom, &bathymetry, swe, no_stress(), 1e-3, 0.0)
+        };
+        let nl = 3;
+        let uniform = {
+            let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, nl);
+            state.eta.data.fill(0.0);
+            state.temp.fill(10.0);
+            state.salt.fill(35.0);
+            state
+        };
+        let mut stratified = uniform.clone();
+        for column in stratified.temp.chunks_exact_mut(nl) {
+            column.copy_from_slice(&[8.0, 9.0, 12.0]);
+        }
+        let reference_after = |physics: Physics, state: &Solution3D| {
+            let mut simulation = Simulation3D::new(physics, ModeSplitIntegrator::new());
+            let mut state = state.clone();
+            simulation.run(&mut state, 0.0, 1.0);
+            simulation.physics.vertical_reference()
+        };
+        assert!(reference_after(physics(), &uniform).is_none(), "unmixed");
+        let taken = reference_after(physics(), &stratified).expect("stratified");
+        assert_eq!(taken[0], stratified.temp, "the initial temperature");
+        assert!(
+            reference_after(physics().without_vertical_reference(), &stratified).is_none(),
+            "opted out"
+        );
+        let own = reference_after(physics().with_vertical_reference(&uniform), &stratified)
+            .expect("the caller's");
+        assert_eq!(own[0], uniform.temp, "the caller's reference is kept");
     }
 
     /// A stratified seamount at rest (Beckmann & Haidvogel 1993; TODO P4.6):
