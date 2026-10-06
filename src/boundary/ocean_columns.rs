@@ -12,7 +12,8 @@
 //! - vertically at the depths of the child's layer centres,
 //!   `d_l = −σ_l (η − B)` below the surface: each parent column is
 //!   interpolated linearly between its valid levels, held constant beyond
-//!   them ([`crate::io::ProfileSeries::sample`]);
+//!   them ([`crate::io::ProfileSeries::sample`]); with a [`DeepReference`],
+//!   tracers below the parent's bed relax to a horizontally uniform profile;
 //! - the velocity is rotated from east/north to the mesh axes.
 //!
 //! The depth mean is the 2D nesting's ([`crate::boundary::OceanModelState`]);
@@ -30,6 +31,33 @@ use crate::mesh::Mesh2D;
 use crate::operators::DGOperators2D;
 use crate::time::ModelClock;
 use crate::vertical::SigmaGrid;
+
+/// The tracers below a parent's bed ([`OceanModelColumns::with_deep_reference`]).
+///
+/// A parent grid of hundreds of metres has a smoother, shallower bed than a
+/// child that resolves deep holes and fjord basins, and its profiles end at
+/// its bed. Held below it, each child column takes its parent cell's bottom
+/// water down its whole hole, so neighbouring holes carry different water
+/// down their walls: a horizontal density difference the parent does not
+/// have, over the height of the cliff. NorKyst at Mausund is 10–59 m deep
+/// over a 90–140 m hole; its bottom water, 0.6 °C apart between neighbouring
+/// cells, drove a bed jet of 0.4 m/s within five minutes of a run at rest
+/// (TODO P1.3). Below the parent's bed `h`, the tracers are instead
+///
+/// ```text
+/// C(d) = C_ref(d) + (C_parent(d) − C_ref(h)) e^{−(d − h)/decay},
+/// ```
+///
+/// the reference profile plus the parent's anomaly at its bed, decaying with
+/// the depth below it.
+#[derive(Clone)]
+pub struct DeepReference {
+    /// Temperature (°C) and salinity at depth `d` below the surface (m,
+    /// positive down), the same everywhere
+    pub profile: Arc<dyn Fn(f64) -> (f64, f64) + Send + Sync>,
+    /// e-folding depth of the parent's anomaly below its bed (m)
+    pub decay: f64,
+}
 
 /// Most child layers [`OceanModelColumns`] samples (a stack buffer of the
 /// layer depths).
@@ -62,6 +90,8 @@ pub struct OceanModelColumns<P> {
     projection: P,
     clock: ModelClock,
     options: OceanColumnsOptions,
+    /// The tracers below the parent's bed, if not held
+    deep: Option<DeepReference>,
     /// Horizontal stencil and east axis of every mesh node (`[element][node]`),
     /// `None` if the parent does not cover it; computed on first use.
     nodes: Vec<OnceLock<Option<NodeStencil>>>,
@@ -100,10 +130,23 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
             projection,
             clock,
             options,
+            deep: None,
             nodes: (0..mesh.n_elements * ops.n_nodes)
                 .map(|_| OnceLock::new())
                 .collect(),
         }
+    }
+
+    /// Below the parent's bed (its `depth` field, interpolated as the
+    /// profiles are), the tracers relax to `deep` (see [`DeepReference`]).
+    /// Without the parent's depth they are held as before.
+    ///
+    /// # Panics
+    /// If `deep.decay` is not positive.
+    pub fn with_deep_reference(mut self, deep: DeepReference) -> Self {
+        assert!(deep.decay > 0.0, "DeepReference: decay must be positive");
+        self.deep = Some(deep);
+        self
     }
 
     /// The stencil and east axis of `node` at `position`.
@@ -196,6 +239,28 @@ impl<P: CoordinateProjection + Send + Sync> ParentColumns3D for OceanModelColumn
                 && sample(&self.reader.salinity_profile, out.salt))
         {
             return false;
+        }
+        // Below the parent's bed: the reference plus the decaying anomaly
+        if supplied.tracers
+            && let (Some(deep), Some(depth)) = (&self.deep, &self.reader.depth)
+        {
+            let h: f64 = stencil
+                .idx
+                .iter()
+                .zip(stencil.w)
+                .map(|(&k, w)| w * depth[k as usize])
+                .sum();
+            if h.is_finite() {
+                let (t_h, s_h) = (deep.profile)(h);
+                for (l, &d) in depths.iter().enumerate() {
+                    if d > h {
+                        let decay = (-(d - h) / deep.decay).exp();
+                        let (t_d, s_d) = (deep.profile)(d);
+                        out.temp[l] = t_d + decay * (out.temp[l] - t_h);
+                        out.salt[l] = s_d + decay * (out.salt[l] - s_h);
+                    }
+                }
+            }
         }
         true
     }
@@ -312,6 +377,63 @@ mod tests {
         };
         let [u, v, temp, salt] = &mut values;
         assert!(!parent.column(&land, &sigma, ParentColumn { u, v, temp, salt }));
+    }
+
+    /// TODO P1.3 regression: below the parent's bed (5 m here), the tracers
+    /// are the deep reference plus the parent's anomaly at its bed, decaying
+    /// with the depth below it; above it they are the parent's.
+    #[test]
+    fn below_the_parent_bed_the_tracers_decay_to_the_reference() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let mesh = Mesh2D::uniform_rectangle(-2000.0, 2000.0, -2000.0, 2000.0, 2, 2);
+        let ops = DGOperators2D::new(1);
+        let shallow = Arc::try_unwrap(reader(&projection)).expect("one owner");
+        let m = shallow.grid.len();
+        let reference = |d: f64| (10.0 - 0.1 * d, 35.0);
+        let parent = OceanModelColumns::new(
+            Arc::new(shallow.with_depth(vec![5.0; m])),
+            &mesh,
+            &ops,
+            projection,
+            ModelClock::new(T0),
+            OceanColumnsOptions::default(),
+        )
+        .with_deep_reference(DeepReference {
+            profile: Arc::new(reference),
+            decay: 2.0,
+        });
+        let sigma = SigmaGrid::uniform(4);
+        let [x, y] =
+            mesh.reference_to_physical(ElementIndex::new(0), ops.nodes_r[0], ops.nodes_s[0]);
+        let ctx = ColumnContext3D {
+            time: 1800.0,
+            node: 0,
+            position: (x, y),
+            bed: -12.0,
+            eta: 0.4,
+        };
+        let mut values = [[0.0; 4]; 4];
+        let [u, v, temp, salt] = &mut values;
+        assert!(parent.column(&ctx, &sigma, ParentColumn { u, v, temp, salt }));
+        let (t_h, s_h) = reference(5.0);
+        for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+            let d = -s * 12.4;
+            let (t_parent, s_parent) = (12.5 - 0.2 * d, 34.0);
+            let (t, s) = if d > 5.0 {
+                let decay = (-(d - 5.0) / 2.0).exp();
+                let (t_d, s_d) = reference(d);
+                (
+                    t_d + decay * (t_parent - t_h),
+                    s_d + decay * (s_parent - s_h),
+                )
+            } else {
+                (t_parent, s_parent)
+            };
+            assert!((values[2][l] - t).abs() < 1e-5, "{l}: {:?}", values[2]);
+            assert!((values[3][l] - s).abs() < 1e-5, "{l}: {:?}", values[3]);
+        }
+        // The velocity is the parent's
+        assert!((values[1][3] - 0.1).abs() < 1e-6);
     }
 
     #[test]

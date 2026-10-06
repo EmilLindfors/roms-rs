@@ -377,6 +377,8 @@ pub fn advective_divergence_element(
 /// it: `DU_avg2` and the rate of the free surface over the step.
 #[derive(Clone, Copy)]
 pub struct BarotropicFlux<'a> {
+    /// Length of the baroclinic step (s).
+    pub dt: f64,
     /// Nodal barotropic transport `DU_avg2` (m²/s), `[element][node]`.
     pub hu: &'a [f64],
     pub hv: &'a [f64],
@@ -1851,6 +1853,7 @@ mod tests {
             let mut transport =
                 LayerTransport::new(self.mesh.n_elements, &self.ops, self.sigma.n_levels());
             let barotropic = BarotropicFlux {
+                dt: 1.0,
                 hu: &self.du_hu,
                 hv: &self.du_hv,
                 face: &self.du_face,

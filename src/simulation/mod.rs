@@ -25,4 +25,4 @@ mod runner;
 mod simulation_3d;
 
 pub use runner::{Simulation, SimulationConfig, SimulationResult};
-pub use simulation_3d::Simulation3D;
+pub use simulation_3d::{RunContext3D, Simulation3D};

@@ -30,7 +30,8 @@
 //! (a 5 m child node under a 60 m parent cell would otherwise get 12× the
 //! velocity). [`OceanModelState::blend_bathymetry`] removes the mismatch at
 //! the source: it blends the child bed to the parent's across the relaxation
-//! band, so the ratio is 1 at the boundary.
+//! band, so the ratio is 1 at the boundary, except at the child's shores,
+//! which the parent's grid does not resolve.
 //!
 //! # Relaxation band
 //!
@@ -67,7 +68,7 @@
 //! let options = NestingOptions::default().with_band(3000.0);
 //! let parent = OceanModelState::new(reader, &mesh, &ops, &projection, BoundaryTag::Open, clock, &options)?;
 //! parent.check_time_coverage(0.0, t_end)?;
-//! parent.blend_bathymetry(&mut bathymetry, &ops, &geom);
+//! parent.blend_bathymetry(&mut bathymetry, &ops, &geom, 2.0);
 //! let band = parent.relaxation(1800.0);     // a SourceTerm2D
 //! let bc = CharacteristicOBC::new(parent);
 //! ```
@@ -137,7 +138,8 @@ pub struct NestingOptions {
     /// Added to the parent's ζ (m), e.g. to move it to the child's datum
     pub reference_level: f64,
     /// Ramp the parent state up from rest over this many seconds (a run
-    /// started at rest would otherwise be hit by the parent's full ζ and ū)
+    /// started at rest would otherwise be hit by the parent's full ζ and ū);
+    /// the reference level ramps with it
     pub ramp: Option<f64>,
 }
 
@@ -505,7 +507,8 @@ impl OceanModelState {
             }
         }
         let [zeta, u, v] = sum.map(|x| moment.ramp * x);
-        let eta = zeta + inner.options.reference_level;
+        // The datum shift ramps with ζ: the run starts at rest at 0
+        let eta = zeta + moment.ramp * inner.options.reference_level;
         if !inner.has_velocity {
             return (eta, None);
         }
@@ -589,20 +592,52 @@ impl OceanModelState {
     /// recompute the bed gradients. Coincident nodes of neighbouring
     /// elements get the same value, so a continuous bed stays continuous.
     ///
+    /// Shores keep their bed: the nodes of every element with a node
+    /// shallower than `shore_depth` (m; take the depth of the lowest water,
+    /// below which the shore dries), and those coincident with them. A parent
+    /// grid of hundreds of metres has no skerries or shore, and blending its
+    /// smooth depth into a shore element deepened a 0.4 m node beside dry land
+    /// to 32 m, half-way across a 3 km band at Mausund: the cliff carried
+    /// 3.9 m/s and η from −1.0 to +4.2 m within three minutes of the start
+    /// (TODO P1.5). 0 blends every wet node.
+    ///
     /// Returns the number of nodes changed.
     pub fn blend_bathymetry(
         &self,
         bathymetry: &mut Bathymetry2D,
         ops: &DGOperators2D,
         geom: &GeometricFactors2D,
+        shore_depth: f64,
     ) -> usize {
+        // Nodes by position to the millimetre: coincident nodes of
+        // neighbouring elements share a position
+        let at = |(x, y): (f64, f64)| ((x * 1e3).round() as i64, (y * 1e3).round() as i64);
+        let n = ops.n_nodes;
+        let shore: std::collections::HashSet<(i64, i64)> = self
+            .inner
+            .slot_of_node
+            .iter()
+            .enumerate()
+            .filter_map(|(flat, &slot)| {
+                let node = self.inner.nodes.get(slot as usize)?;
+                let k = flat / n;
+                bathymetry.data[k * n..(k + 1) * n]
+                    .iter()
+                    .any(|&b| b > -shore_depth)
+                    .then(|| at(node.position))
+            })
+            .collect();
         let mut changed = 0;
         for (flat, &slot) in self.inner.slot_of_node.iter().enumerate() {
             let Some(node) = self.inner.nodes.get(slot as usize) else {
                 continue;
             };
             let b = bathymetry.data[flat];
-            if node.weight > 0.0 && node.parent_depth > 0.0 && b < 0.0 {
+            if node.weight > 0.0
+                && node.parent_depth > 0.0
+                && b < 0.0
+                && !shore.contains(&at(node.position))
+            {
                 bathymetry.data[flat] = (1.0 - node.weight) * b - node.weight * node.parent_depth;
                 changed += 1;
             }
@@ -932,6 +967,24 @@ mod tests {
         assert!((s.eta - 0.3).abs() < 1e-6);
     }
 
+    /// TODO P1.5 regression: the reference level ramps with ζ. Added after
+    /// the ramp, it stood at the boundary from the start (NorKyst at Mausund:
+    /// +0.27 m at rest, which flooded in as a bore, the mean level rising
+    /// 5 cm in three minutes).
+    #[test]
+    fn the_reference_level_ramps_with_the_parent() {
+        let options = NestingOptions::default()
+            .with_ramp_up(3600.0)
+            .with_reference_level(0.25);
+        let (_, _, parent) = setup(&options);
+        let s = parent.external_state(&ctx(0.0, -DEPTH));
+        assert_eq!(s.eta, 0.0);
+        let s = parent.external_state(&ctx(1800.0, -DEPTH));
+        assert!((s.eta - 0.5 * (0.175 + 0.25)).abs() < 1e-6, "{}", s.eta);
+        let s = parent.external_state(&ctx(3600.0, -DEPTH));
+        assert!((s.eta - (0.3 + 0.25)).abs() < 1e-6, "{}", s.eta);
+    }
+
     #[test]
     #[should_panic(expected = "outside the parent file")]
     fn forcing_past_the_last_snapshot_panics() {
@@ -984,11 +1037,49 @@ mod tests {
         let geom = GeometricFactors2D::compute(&mesh, &ops);
         let mut bed = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0);
         assert_eq!(parent.depth_ratios(&bed), Some((2.5, 2.5, 2.5)));
-        let changed = parent.blend_bathymetry(&mut bed, &ops, &geom);
+        let changed = parent.blend_bathymetry(&mut bed, &ops, &geom, 0.0);
         assert!(changed > 0);
         let (r0, _, r1) = parent.depth_ratios(&bed).unwrap();
         assert!((r0 - 1.0).abs() < 1e-12 && (r1 - 1.0).abs() < 1e-12);
         assert_eq!(bed.get(ElementIndex::new(12), 4), -20.0);
+    }
+
+    /// TODO P1.5 regression: shores keep their bed, and the bed stays
+    /// continuous. A 1 m deep corner element in a 20 m sea: it and the
+    /// elements touching it keep their nodes; the rest of the band blends.
+    #[test]
+    fn blending_leaves_the_shores_alone() {
+        let (mesh, ops, parent) = setup(&NestingOptions::default().with_band(2000.0));
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let shallow = |x: f64, y: f64| x <= -3000.0 + 1e-6 && y <= -3000.0 + 1e-6;
+        let bed_at = |x: f64, y: f64| if shallow(x, y) { -1.0 } else { -20.0 };
+        let mut bed = Bathymetry2D::from_function(&mesh, &ops, &geom, bed_at);
+        let changed = parent.blend_bathymetry(&mut bed, &ops, &geom, 2.0);
+        assert!(changed > 0);
+        let mut by_position = std::collections::HashMap::new();
+        let mut far_corner = None;
+        for k in ElementIndex::iter(mesh.n_elements) {
+            // Elements with a shallow node
+            let shore = (0..ops.n_nodes).any(|i| {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                shallow(x, y)
+            });
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let b = bed.get(k, i);
+                if shore {
+                    assert_eq!(b, bed_at(x, y), "shore element node ({x}, {y})");
+                }
+                let key = ((x * 1e3).round() as i64, (y * 1e3).round() as i64);
+                let first = *by_position.entry(key).or_insert(b);
+                assert_eq!(first, b, "discontinuous at ({x}, {y})");
+                if (x - 5000.0).abs() < 1e-6 && (y + 5000.0).abs() < 1e-6 {
+                    far_corner = Some(b);
+                }
+            }
+        }
+        // The open corner far from the shore is the parent's depth
+        assert_eq!(far_corner, Some(-50.0));
     }
 
     #[test]

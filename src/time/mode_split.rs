@@ -359,6 +359,21 @@ pub trait ModeSplitPhysics {
     /// time if `drag.layers` holds the rates of [`Self::layer_drag_into`].
     fn vertical_implicit(&self, state: &mut Solution3D, t: f64, dt: f64, drag: StepDrag<'_>);
 
+    /// Advect the stage value `stage` (inventories, as the stages carry
+    /// them, with the stage's `η`) over `dt` with the implicit part of the
+    /// vertical flux of the last [`Self::transport_rhs_into`], if any: after
+    /// every 3D stage `u⁽ⁱ⁾ = Σ_k α_ik u⁽ᵏ⁾ + β_i Δt L(u⁽ⁱ⁻¹⁾)`, with
+    /// `dt = β_i Δt` (see [`crate::physics::implicit_advection`]). The
+    /// elements marked in `element_means` carry their fields as element
+    /// means for the step. By default nothing.
+    fn implicit_vertical_advection(
+        &self,
+        _stage: &mut Solution3D,
+        _dt: f64,
+        _element_means: &[bool],
+    ) {
+    }
+
     /// Runs on every 3D stage value (with the tracers as concentrations),
     /// including the last: limiters, density.
     fn post_stage(&self, state: &mut Solution3D);
@@ -470,6 +485,35 @@ impl SlowForcingHistory {
         &mut self.g[0]
     }
 
+    /// The history as a restart carries it.
+    fn record(&self) -> SlowForcingRecord {
+        SlowForcingRecord {
+            g: self.g[..self.len].to_vec(),
+            t: self.t[..self.len].to_vec(),
+            next_t: self.next_t,
+        }
+    }
+
+    /// Continue from `record` (see [`ModeSplitIntegrator::restore_slow_forcing`]).
+    fn restore(&mut self, record: SlowForcingRecord) {
+        let len = record.g.len();
+        assert!(
+            len <= 3 && record.t.len() == len,
+            "a slow-forcing record holds up to three G with their times, got {len} G and {} times",
+            record.t.len()
+        );
+        for (slot, g) in self.g.iter_mut().zip(record.g) {
+            assert!(
+                g.n_elements == slot.n_elements && g.n_nodes == slot.n_nodes,
+                "the slow-forcing record is of another mesh"
+            );
+            *slot = g;
+        }
+        self.t[..len].copy_from_slice(&record.t);
+        self.len = len;
+        self.next_t = record.next_t;
+    }
+
     /// Step average of `G` over `[t, t + dt]` into `out`.
     fn step_average(&mut self, dt: f64, out: &mut SWESolution2D) {
         let mut tau = [0.0; 3];
@@ -482,6 +526,33 @@ impl SlowForcingHistory {
             out.axpy(wj, g);
         }
         self.next_t = self.t[0] + dt;
+    }
+}
+
+/// The slow forcing `G` of the last (up to three) baroclinic steps and their
+/// start times, newest first: what [`ModeSplitIntegrator`] carries from one
+/// step to the next (its AB3 step average), and so what a restart must hold
+/// besides the state (see [`crate::io::Restart3D`]).
+#[derive(Clone)]
+pub struct SlowForcingRecord {
+    /// `G` of each step (`h` component zero), newest first.
+    pub g: Vec<SWESolution2D>,
+    /// The steps' start times (s), newest first.
+    pub t: Vec<f64>,
+    /// Start time (s) of the step that continues the run: a step starting
+    /// elsewhere restarts the history. NaN before the first step.
+    pub next_t: f64,
+}
+
+impl SlowForcingRecord {
+    /// No history: the next step starts the AB3 average afresh, as the first
+    /// step of a run does.
+    pub fn empty() -> Self {
+        Self {
+            g: Vec::new(),
+            t: Vec::new(),
+            next_t: f64::NAN,
+        }
     }
 }
 
@@ -696,6 +767,9 @@ pub struct ModeSplitIntegrator {
     filter: Option<BarotropicFilter>,
     buffers: Option<Buffers>,
     stages_3d: StageWorkspace<Solution3D>,
+    /// A history to continue from, applied at the next step (see
+    /// [`Self::restore_slow_forcing`]).
+    restored_slow_forcing: Option<SlowForcingRecord>,
 }
 
 impl Default for ModeSplitIntegrator {
@@ -718,6 +792,7 @@ impl ModeSplitIntegrator {
             filter: None,
             buffers: None,
             stages_3d: StageWorkspace::new(),
+            restored_slow_forcing: None,
         }
     }
 
@@ -744,6 +819,24 @@ impl ModeSplitIntegrator {
     /// The barotropic transport (DU_avg2) of the last step, if any.
     pub fn barotropic_transport(&self) -> Option<&BarotropicTransport> {
         self.buffers.as_ref().map(|b| &b.transport)
+    }
+
+    /// The slow forcing the next step's AB3 average continues from (empty
+    /// before the first step): with the state, what a restart needs to
+    /// continue the run bit for bit.
+    pub fn slow_forcing_record(&self) -> SlowForcingRecord {
+        match (&self.restored_slow_forcing, &self.buffers) {
+            (Some(record), _) => record.clone(),
+            (None, Some(buffers)) => buffers.history.record(),
+            (None, None) => SlowForcingRecord::empty(),
+        }
+    }
+
+    /// Continue the AB3 average of `G` from `record` (from
+    /// [`Self::slow_forcing_record`] of the run being resumed) at the next
+    /// step, in place of whatever history this integrator has.
+    pub fn restore_slow_forcing(&mut self, record: SlowForcingRecord) {
+        self.restored_slow_forcing = Some(record);
     }
 
     /// Barotropic substeps per baroclinic step used by the last step (0 before
@@ -800,6 +893,9 @@ impl ModeSplitIntegrator {
             n_rivers,
             "the number of rivers changed between steps"
         );
+        if let Some(record) = self.restored_slow_forcing.take() {
+            history.restore(record);
+        }
         let nn = state.n_nodes;
 
         // 1. Slow forcing: Gⁿ from R₃D at tⁿ, averaged over the step (AB3);
@@ -935,6 +1031,7 @@ impl ModeSplitIntegrator {
             discharge: &transport.discharge,
         });
         let barotropic_flux = BarotropicFlux {
+            dt,
             hu: &transport.hu.data,
             hv: &transport.hv.data,
             face: &transport.face,
@@ -1016,7 +1113,7 @@ impl ModeSplitIntegrator {
         let last_values = &last_values_cell;
         to_inventories(state);
         let mut first_stage = true;
-        SSPRK3.step_with_workspace(
+        SSPRK3.step_with_relaxation(
             state,
             dt,
             t,
@@ -1052,6 +1149,9 @@ impl ModeSplitIntegrator {
                 out.ubar.copy_from(rate_ubar);
                 out.vbar.copy_from(rate_vbar);
             },
+            // The implicit part of the vertical advection, on the stage's
+            // inventories and thicknesses
+            |s, _, stage_dt| physics.implicit_vertical_advection(s, stage_dt, means),
             |s| {
                 let mut last = last_values.borrow_mut();
                 to_values(s, &mut last);

@@ -250,6 +250,41 @@ impl SnapshotWriter {
         })
     }
 
+    /// Continue the file `path` for a resumed run (see [`crate::io::Restart3D`]):
+    /// keep its frames up to model time `keep_until` (s), drop the later ones
+    /// (written by the stopped run after its restart) and a partial last
+    /// frame, and append after them. `h_min` as in [`Self::create`].
+    pub fn append(
+        path: impl AsRef<Path>,
+        keep_until: f64,
+        h_min: f64,
+    ) -> Result<Self, SnapshotError> {
+        let path = path.as_ref();
+        let mut reader = SnapshotReader::open(path)?;
+        let kept = reader
+            .times()?
+            .iter()
+            .take_while(|&&t| t <= keep_until)
+            .count() as u64;
+        let end = reader.frames_start + kept * reader.frame_bytes();
+        let header = reader.into_header();
+        let n = header.n_points();
+        let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
+        file.set_len(end)?;
+        file.seek(SeekFrom::End(0))?;
+        Ok(Self {
+            out: BufWriter::new(file),
+            n_levels: header.n_levels(),
+            n_fields: header.levels.as_ref().map_or(0, |l| l.fields.len()),
+            bed: header.bathymetry,
+            h_min: Depth::new(h_min.max(0.0)),
+            bytes: Vec::with_capacity(8 + 12 * n),
+            eta: vec![0.0; n],
+            u: vec![0.0; n],
+            v: vec![0.0; n],
+        })
+    }
+
     /// Append the state `q` at model time `t`.
     pub fn write_state(&mut self, t: f64, q: &SWESolution2D) -> Result<(), SnapshotError> {
         let [h, hu, hv] = &q.data;
@@ -417,6 +452,37 @@ impl SnapshotReader {
         ))?;
         self.file.read_exact(&mut t)?;
         Ok(f64::from_le_bytes(t))
+    }
+
+    /// Model times of every complete frame, in file order.
+    pub fn times(&mut self) -> Result<Vec<f64>, SnapshotError> {
+        (0..self.n_frames()?).map(|i| self.time(i)).collect()
+    }
+
+    /// η of frame `i` at the nodes `first..first + out.len()`, into `out`, without
+    /// reading the rest of the frame: a time series at one element of every frame
+    /// reads a few bytes per frame.
+    pub fn read_eta_into(
+        &mut self,
+        i: usize,
+        first: usize,
+        out: &mut [f32],
+    ) -> Result<(), SnapshotError> {
+        if first + out.len() > self.header.n_points() {
+            return Err(SnapshotError::Format(format!(
+                "nodes {first}..{} of {}",
+                first + out.len(),
+                self.header.n_points()
+            )));
+        }
+        let at = self.frames_start + i as u64 * self.frame_bytes() + 8 + 4 * first as u64;
+        self.file.seek(SeekFrom::Start(at))?;
+        let bytes = &mut self.bytes[..4 * out.len()];
+        self.file.read_exact(bytes)?;
+        for (x, b) in out.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *x = f32::from_le_bytes(*b);
+        }
+        Ok(())
     }
 
     /// Frame `i`.
@@ -869,6 +935,64 @@ mod tests {
             SnapshotReader::open(&path),
             Err(SnapshotError::Format(_))
         ));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn eta_reads_back_in_part() {
+        let path = scratch("part");
+        let mesh = mesh();
+        let ops = DGOperators2D::new(1);
+        let n = mesh.n_elements * ops.n_nodes;
+        let bed = vec![-5.0; n];
+        let mut writer = SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[], 1e-3).unwrap();
+        let eta = |t: f64| (0..n).map(|j| (t + j as f64) as f32).collect::<Vec<_>>();
+        let zero = vec![0.0; n];
+        for t in [0.0, 600.0, 1200.0] {
+            writer.write_fields(t, &eta(t), &zero, &zero, &[]).unwrap();
+        }
+        let mut reader = SnapshotReader::open(&path).unwrap();
+        assert_eq!(reader.times().unwrap(), [0.0, 600.0, 1200.0]);
+        let mut part = [0.0f32; 3];
+        reader.read_eta_into(1, n - 3, &mut part).unwrap();
+        assert_eq!(part, eta(600.0)[n - 3..]);
+        assert!(reader.read_eta_into(1, n - 2, &mut part).is_err());
+        // A whole frame after a partial one
+        assert_eq!(reader.read_frame(2).unwrap().eta, eta(1200.0));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A resumed run continues the file from its restart: the stopped run's
+    /// later frames and its partial last frame go.
+    #[test]
+    fn a_resumed_run_appends_after_its_restart() {
+        let path = scratch("append");
+        let mesh = mesh();
+        let ops = DGOperators2D::new(1);
+        let n = mesh.n_elements * ops.n_nodes;
+        let bed = vec![-5.0; n];
+        let eta = |t: f64| vec![t as f32; n];
+        let zero = vec![0.0; n];
+        let mut writer =
+            SnapshotWriter::create(&path, &mesh, &ops, &bed, None, &[("title", "run")], 1e-3)
+                .unwrap();
+        for t in [0.0, 600.0, 1200.0, 1800.0] {
+            writer.write_fields(t, &eta(t), &zero, &zero, &[]).unwrap();
+        }
+        writer.out.write_all(&[0u8; 20]).unwrap();
+        writer.out.flush().unwrap();
+        drop(writer);
+
+        let mut resumed = SnapshotWriter::append(&path, 600.0, 1e-3).unwrap();
+        resumed
+            .write_fields(1200.0, &eta(1201.0), &zero, &zero, &[])
+            .unwrap();
+        drop(resumed);
+        let mut reader = SnapshotReader::open(&path).unwrap();
+        assert_eq!(reader.header().metadata("title"), Some("run"));
+        assert_eq!(reader.times().unwrap(), [0.0, 600.0, 1200.0]);
+        assert_eq!(reader.read_frame(2).unwrap().eta, eta(1201.0));
+        assert_eq!(reader.read_frame(1).unwrap().eta, eta(600.0));
         std::fs::remove_file(&path).unwrap();
     }
 

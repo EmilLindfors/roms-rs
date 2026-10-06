@@ -14,7 +14,7 @@
 use faer::Mat;
 use faer::linalg::solvers::Solve;
 
-use crate::mesh::Mesh2D;
+use crate::mesh::{BoundaryTag, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::polynomial::{gauss_legendre_nodes_weights, legendre, mode_degrees};
 use crate::types::ElementIndex;
@@ -242,6 +242,19 @@ pub struct Rx0Smoothing {
     pub max_change: f64,
     /// Sweeps over the constrained pairs
     pub sweeps: usize,
+}
+
+/// What [`Bathymetry2D::lower_wall_land`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WallLandLowering {
+    /// Elements whose wall nodes were lowered
+    pub elements: usize,
+    /// Global nodes (sets of coincident nodes) whose bed changed
+    pub changed: usize,
+    /// Largest change of the bed (m)
+    pub max_change: f64,
+    /// Still water added below `level`, `Σ w J ΔB` over the changed nodes (m³)
+    pub volume: f64,
 }
 
 /// How much the still-water depth may change within one element for the 3D
@@ -715,6 +728,125 @@ impl Bathymetry2D {
             self.compute_gradients(ops, geom);
         }
         raised
+    }
+
+    /// Lower the land at the walls of elements that are otherwise water: in
+    /// every element with a [`BoundaryTag::Wall`] face whose nodes off its
+    /// walls are all below `level`, a wall node at or above `level` takes
+    /// the bed of its inward neighbour across the wall (or, where that is a
+    /// wall node too, the element's shallowest node off its walls).
+    /// Coincident nodes move together, to the shallowest such value over the
+    /// elements that lower them; the gradients are recomputed.
+    ///
+    /// A coastline-fitted mesh puts its walls on the coast, but the coast it
+    /// fits is simplified to the element size, so the bed at the walls is
+    /// the elevation model's on either side of the real coastline: on the
+    /// Frøya mesh (`data/froya_coast.msh`, ≈ 100 m faces) two thirds of the
+    /// wall nodes are land, by 2 m in the median. An element of water whose
+    /// wall nodes stand on such land is partly dry at every water level
+    /// (1016 of its 12,101 elements at mean sea level): it carries the
+    /// `WetDry` subcells, the steep dry–wet pair that sets the shoreline
+    /// time step, and no baroclinic pressure in 3D, for a strip of land a
+    /// fraction of a node spacing wide that the mesh puts outside its coast
+    /// anyway. Lowered, the wall stands in the water in front of it.
+    ///
+    /// Take `level` below the lowest water: an element that dries off its
+    /// walls at low tide gains nothing, and lowering its wall only widens a
+    /// flat (at 0 m on the Mausund mesh, +3–4 m wall nodes of a sound
+    /// 0.2–3 m deep went to −0.5 m, and its current rose from 2.4 to
+    /// 3.0 m/s). Elements with nodes off their walls at or above `level` are
+    /// shores the mesh resolves and are left alone: a node shared with one
+    /// stays unless that element is below `level` everywhere else, so a
+    /// lowered corner never stands as a lone deep node in a shore. The
+    /// lowered nodes only join water their element already connects, so no
+    /// sound opens.
+    pub fn lower_wall_land(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        level: f64,
+    ) -> WallLandLowering {
+        let (n, n_1d) = (self.n_nodes, ops.n_1d);
+        let mut on_wall = vec![false; self.data.len()];
+        let mut wall_faces: Vec<Vec<usize>> = vec![Vec::new(); mesh.n_elements];
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for face in 0..4 {
+                if mesh.boundary_tag(k, face) == Some(BoundaryTag::Wall) {
+                    wall_faces[k.as_usize()].push(face);
+                    for &i in &ops.face_nodes[face] {
+                        on_wall[k.as_usize() * n + i] = true;
+                    }
+                }
+            }
+        }
+        // One step into the element from a node of each face
+        let inward = [n_1d as isize, -1, -(n_1d as isize), 1];
+        let group = coincident_nodes(mesh, ops);
+        let mut target = vec![f64::NEG_INFINITY; self.data.len()];
+        let mut qualifies = vec![false; mesh.n_elements];
+        for (k, faces) in wall_faces.iter().enumerate() {
+            let bed = &self.data[k * n..][..n];
+            let shallowest = (0..n)
+                .filter(|&i| !on_wall[k * n + i])
+                .map(|i| bed[i])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let land = faces
+                .iter()
+                .any(|&f| ops.face_nodes[f].iter().any(|&i| bed[i] >= level));
+            if !(land && shallowest.is_finite() && shallowest < level) {
+                continue;
+            }
+            qualifies[k] = true;
+            for &f in faces {
+                for &i in &ops.face_nodes[f] {
+                    if bed[i] < level {
+                        continue;
+                    }
+                    let j = i.checked_add_signed(inward[f]).expect("inward node");
+                    let value = if on_wall[k * n + j] {
+                        shallowest
+                    } else {
+                        bed[j]
+                    };
+                    let g = group[k * n + i];
+                    target[g] = target[g].max(value);
+                }
+            }
+        }
+        // A node shared with a shore the mesh resolves stays
+        let mut accepted = vec![true; self.data.len()];
+        for node in 0..self.data.len() {
+            let (g, k) = (group[node], node / n);
+            if target[g].is_finite() && !qualifies[k] {
+                let dry = (0..n).any(|i| group[k * n + i] != g && self.data[k * n + i] >= level);
+                if dry {
+                    accepted[g] = false;
+                }
+            }
+        }
+        let mut report = WallLandLowering::default();
+        let mut changed = vec![false; self.data.len()];
+        let mut lowered = vec![false; mesh.n_elements];
+        for node in 0..self.data.len() {
+            let g = group[node];
+            let (old, new) = (self.data[node], target[g]);
+            if new.is_finite() && accepted[g] && old > new {
+                report.max_change = report.max_change.max(old - new);
+                report.volume += geom.mass[node] * ((-new).max(0.0) - (-old).max(0.0));
+                self.data[node] = new;
+                lowered[node / n] |= qualifies[node / n];
+                if !changed[g] {
+                    changed[g] = true;
+                    report.changed += 1;
+                }
+            }
+        }
+        report.elements = lowered.iter().filter(|&&l| l).count();
+        if report.changed > 0 {
+            self.compute_gradients(ops, geom);
+        }
+        report
     }
 
     /// The largest slope factor r_x0 = |h₁ − h₂| / (h₁ + h₂) between
@@ -1835,6 +1967,97 @@ mod tests {
         }
         // Nothing left to raise
         assert_eq!(bathy.raise_isolated_wet_nodes(&mesh, &ops, &geom, 0.0), 0);
+    }
+
+    #[test]
+    fn test_lower_wall_land() {
+        // 3 × 2 unit squares, P2, walls on the west, north and east, open to
+        // the south. Water deepening eastward, land (+3 m) along the north
+        // wall and the open south side, and a dry node inside the north-east
+        // element: a shore the mesh resolves
+        let mut mesh =
+            Mesh2D::uniform_rectangle_with_bc(0.0, 3.0, 0.0, 2.0, 3, 2, BoundaryTag::Wall);
+        for e in 0..mesh.edges.len() {
+            let edge = &mesh.edges[e];
+            if edge.right.is_none() {
+                let (k, face) = (ElementIndex::new(edge.left.element), edge.left.face);
+                let (r, s) = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)][face];
+                let [_, y] = mesh.reference_to_physical(k, r, s);
+                if y < 1e-9 {
+                    mesh.edges[e].boundary_tag = Some(BoundaryTag::Open);
+                }
+            }
+        }
+        let (mesh, ops, geom) = setup(mesh, 2);
+        let at = |x: f64, y: f64, p: [f64; 2]| (x - p[0]).abs() < 1e-9 && (y - p[1]).abs() < 1e-9;
+        let water = |x: f64, y: f64| -10.0 + y - x;
+        let bed = |x: f64, y: f64| {
+            if y > 2.0 - 1e-9 || y < 1e-9 || at(x, y, [2.5, 1.5]) {
+                3.0
+            } else {
+                water(x, y)
+            }
+        };
+        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+
+        // Below a lowest water of −12 m the north row is a flat: it stays
+        let mut flat = bathy.clone();
+        assert_eq!(flat.lower_wall_land(&mesh, &ops, &geom, -12.0).changed, 0);
+        assert_eq!(flat.data, bathy.data);
+
+        let report = bathy.lower_wall_land(&mesh, &ops, &geom, 0.0);
+
+        // North-west: the corner's inward neighbours are wall nodes, so it
+        // takes the element's shallowest node off the walls, (0.5, 1.5);
+        // the other north nodes take the node below them; (1, 2) and (2, 2)
+        // take the shallower of their two elements' (the same node). The
+        // north-east element is a shore and keeps its land, and its corner
+        // (2, 2) with it, though the north-middle element would lower it. The
+        // open side is not a wall
+        let expected = |x: f64, y: f64| {
+            if y > 2.0 - 1e-9 && x < 2.0 - 1e-9 {
+                if x < 1e-9 {
+                    water(0.5, 1.5)
+                } else {
+                    water(x, 1.5)
+                }
+            } else {
+                bed(x, y)
+            }
+        };
+        for e in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                assert_eq!(bathy.get(e, i), expected(x, y), "({x}, {y})");
+            }
+        }
+        assert_eq!(report.elements, 2);
+        assert_eq!(report.changed, 4);
+        assert_eq!(report.max_change, 3.0 - water(1.5, 1.5));
+        let reference = Bathymetry2D::from_function(&mesh, &ops, &geom, expected);
+        let added: f64 = (0..bathy.data.len())
+            .map(|m| {
+                geom.mass[m] * (reference.data[m].min(0.0) - bed_at(&mesh, &ops, m, bed).min(0.0))
+            })
+            .sum::<f64>()
+            .abs();
+        assert!(
+            (report.volume - added).abs() < 1e-12 * added,
+            "{} {added}",
+            report.volume
+        );
+        assert_eq!(bathy.gradient_x, reference.gradient_x);
+        assert_eq!(bathy.gradient_y, reference.gradient_y);
+
+        // Nothing left: the north-east element is a resolved shore
+        assert_eq!(bathy.lower_wall_land(&mesh, &ops, &geom, 0.0).changed, 0);
+    }
+
+    /// `f` at node `m` (`k·n_nodes + i`).
+    fn bed_at(mesh: &Mesh2D, ops: &DGOperators2D, m: usize, f: impl Fn(f64, f64) -> f64) -> f64 {
+        let (k, i) = (ElementIndex::new(m / ops.n_nodes), m % ops.n_nodes);
+        let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+        f(x, y)
     }
 
     #[test]

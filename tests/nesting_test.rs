@@ -386,7 +386,7 @@ fn parent_at_rest_keeps_a_lake_at_rest_with_band_and_blended_bed() {
     let mut bed = Bathymetry2D::from_function(&domain.mesh, &domain.ops, &domain.geom, |x, y| {
         -12.0 - 8.0 * (x / 1300.0).sin() * (y / 1700.0).cos()
     });
-    let changed = nesting.blend_bathymetry(&mut bed, &domain.ops, &domain.geom);
+    let changed = nesting.blend_bathymetry(&mut bed, &domain.ops, &domain.geom, 0.0);
     assert!(changed > 0);
     let (r0, _, r1) = nesting.depth_ratios(&bed).unwrap();
     assert!(

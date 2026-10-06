@@ -6,6 +6,8 @@
 //! - **VTK output**: Solution visualization in ParaView (VTU format)
 //! - **Snapshot files**: compact f32 frames of a 2D or 3D run with its mesh, bed and
 //!   σ-grid, for replay; **particle files** with the particles alongside
+//! - **Restart files**: a 3D run's full state between two steps (`Restart3D`),
+//!   to resume it bit for bit
 //! - **NetCDF I/O**: CF-conventions output (requires `netcdf` feature)
 //! - **Gridded external models**: parent ocean models (`OceanModelReader`) and
 //!   weather models (`AtmosphereReader`) on structured lon/lat grids
@@ -97,6 +99,7 @@ mod ocean_model;
 mod particle_file;
 mod profile_series;
 mod projection;
+mod restart;
 mod snapshot;
 mod tide_gauge_reader;
 mod timeseries_reader;
@@ -112,8 +115,8 @@ pub use constituent_reader::{
     parse_constituents, read_constituent_file,
 };
 pub use farm_site::{
-    CageGrid, FarmSite, FarmSiteError, Mooring, MooringKind, SiteCage, parse_farm_site_str,
-    read_farm_site_file,
+    CageGrid, FarmSite, FarmSiteError, FrameCells, Mooring, MooringKind, SiteCage,
+    parse_farm_site_str, read_farm_site_file,
 };
 pub use field_series::{FieldSeries, TimeInterpolation, TimeStencil};
 pub use geo_grid::{
@@ -139,6 +142,7 @@ pub use ocean_model::{OceanModelReader, OceanState};
 pub use particle_file::{ParticleFileReader, ParticleFileWriter, ParticleFrame, status_code};
 pub use profile_series::{ProfileLevels, ProfileSeries};
 pub use projection::{CoordinateProjection, GeoBoundingBox, LocalProjection, UtmProjection};
+pub use restart::{Restart3D, RestartError, domain_fingerprint};
 pub use snapshot::{
     SOLUTION_3D_FIELDS, SnapshotError, SnapshotFrame, SnapshotHeader, SnapshotLevels,
     SnapshotReader, SnapshotWriter,
