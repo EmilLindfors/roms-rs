@@ -1,0 +1,46 @@
+# Two tiers of the test suite (see `.github/workflows/ci.yml`).
+#
+# `default`: the whole suite. CI runs it on every push to main and on demand
+# (workflow_dispatch); run it locally before merging changes to the numerics.
+#
+# `pr` (`cargo nextest run --profile pr`): the fast tier for pull requests,
+# every test but the slow gates below. Each took 15 s or more in CI
+# (2026-10-06, 4-core runner, `--cargo-profile ci`); together they were 70 %
+# of the suite's test time, and with the wave tests trimmed since, the tier
+# runs in a few minutes. They are long simulations, convergence ladders and
+# statistical particle runs, all still gating on main. Add a gate here when
+# it takes more than 15 s in CI, or make it cheaper first: a coarser mesh or
+# spectral grid often keeps the checked numbers (`wave_model_test`'s
+# Snell-law gate gave the same departures on a 1 × 20 mesh as on 4 × 40, at
+# a thirtieth of the cost).
+
+[profile.pr]
+default-filter = '''
+not (
+    test(=test_convergence_swe_2d_split_form_distorted_mesh)
+  | test(=a_stratified_seamount_at_rest_stays_at_rest_on_distorted_elements)
+  | test(=simulation::simulation_3d::tests::a_pycnocline_over_a_smoothed_cliff_stays_at_rest)
+  | test(=simulation::simulation_3d::tests::a_river_drives_an_estuarine_circulation_in_a_fjord)
+  | test(=simulation::simulation_3d::tests::a_sharp_lock_exchange_interface_stays_in_range)
+  | test(=simulation::simulation_3d::tests::a_stratified_seamount_at_rest_stays_at_rest)
+  | test(=simulation::simulation_3d::tests::a_stratified_seamount_at_rest_stays_at_rest_under_the_kuzmin_limiter)
+  | test(=simulation::simulation_3d::tests::a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference)
+  | test(=simulation::simulation_3d::tests::implicit_vertical_advection_holds_beyond_the_explicit_courant_limit)
+  | test(=simulation::simulation_3d::tests::spurious_mixing_is_set_by_the_grid_reynolds_number)
+  | test(=variable_diffusivity_keeps_a_uniform_distribution_uniform)
+  | test(=a_halocline_traps_swimming_larvae)
+  | test(=light_seeking_larvae_reach_the_analytic_profile)
+  | test(=the_model_diffusivity_keeps_a_well_mixed_population_well_mixed)
+  | test(=a_longshore_current_in_3d_has_the_viscous_profile_of_a_uniform_force)
+  | test(=breaking_waves_set_the_water_up_in_the_surf_zone)
+  | test(=oblique_breaking_waves_drive_a_longshore_current)
+  | test(=shoaling_waves_set_the_water_down)
+  | test(=a_following_current_shifts_the_frequency_doppler)
+  | test(=a_spread_sea_on_a_current_has_the_exact_doppler_shift)
+  | test(=a_spread_sea_refracts_to_the_exact_steady_state)
+  | test(=fetch_limited_growth_follows_kahma_and_calkoen)
+  | test(=implicit_refraction_steps_past_the_turning_limit)
+  | test(=thacker_planar_oscillation_converges_standard)
+  | test(=thacker_planar_oscillation_converges_wet_dry)
+)
+'''

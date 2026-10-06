@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The whole test suite on any branch, on demand
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -65,8 +67,13 @@ jobs:
       - uses: taiki-e/install-action@nextest
       # The `ci` profile (Cargo.toml) is the test profile at opt-level 1: the
       # unoptimized suite spent ~10 min in a few dozen simulation gates.
+      # Pull requests run the fast tier (nextest profile `pr`,
+      # `.config/nextest.toml`: every test but the slow gates listed there);
+      # pushes to main and manual runs run the whole suite.
       - name: cargo nextest run
-        run: cargo nextest run --cargo-profile ci --no-default-features --features parallel,simd
+        run: >-
+          cargo nextest run --cargo-profile ci --no-default-features --features parallel,simd
+          --profile ${{ github.event_name == 'pull_request' && 'pr' || 'default' }}
 
   clippy:
     name: clippy (parallel+simd)
