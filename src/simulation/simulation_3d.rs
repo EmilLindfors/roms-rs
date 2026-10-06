@@ -1908,8 +1908,19 @@ mod tests {
             ]
         };
         let names = [
-            "eta", "ubar", "vbar", "u", "v", "w", "temp", "salt", "rho", "eddy_viscosity",
-            "eddy_diffusivity", "tke", "gls",
+            "eta",
+            "ubar",
+            "vbar",
+            "u",
+            "v",
+            "w",
+            "temp",
+            "salt",
+            "rho",
+            "eddy_viscosity",
+            "eddy_diffusivity",
+            "tke",
+            "gls",
         ];
         for ((name, x), y) in names.iter().zip(fields(a)).zip(fields(b)) {
             assert_eq!(x.len(), y.len(), "{name}: sizes differ");
@@ -1948,7 +1959,10 @@ mod tests {
         assert!(result.success, "{:?}", result.error);
         let checkpoint = checkpoint.expect("the run passed 400 s");
         assert_eq!(checkpoint.slow_forcing.g.len(), 3, "a full AB3 history");
-        assert!(!checkpoint.state.tke.is_empty(), "the turbulence is carried");
+        assert!(
+            !checkpoint.state.tke.is_empty(),
+            "the turbulence is carried"
+        );
         assert!(
             (0..uninterrupted.eta.data.len())
                 .any(|idx| uninterrupted.eta.data[idx] <= sim.physics().bathymetry.data[idx]),

@@ -55,8 +55,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::mesh::Mesh2D;
-use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::solver::state::Solution3D;
+use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::time::SlowForcingRecord;
 use crate::vertical::SigmaGrid;
 
@@ -163,10 +163,7 @@ impl Restart3D {
             let mut inner = out.inner;
             inner.write_all(&checksum.to_le_bytes())?;
             inner.flush()?;
-            inner
-                .into_inner()
-                .map_err(|e| e.into_error())?
-                .sync_all()?;
+            inner.into_inner().map_err(|e| e.into_error())?.sync_all()?;
         }
         std::fs::rename(&temporary, path)?;
         Ok(())
@@ -375,7 +372,10 @@ impl Restart3D {
 
         let t = take("slow_forcing.t", None)?;
         if t.len() > 3 {
-            return Err(format(format!("{} slow-forcing steps (at most 3)", t.len())));
+            return Err(format(format!(
+                "{} slow-forcing steps (at most 3)",
+                t.len()
+            )));
         }
         let next_t = take("slow_forcing.next_t", Some(1))?[0];
         let mut g = Vec::with_capacity(t.len());
@@ -593,7 +593,10 @@ mod tests {
         let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         assert_eq!(a.time.to_bits(), b.time.to_bits());
         assert_eq!(a.domain, b.domain);
-        for ((name, x), (_, y)) in state_fields(&a.state).into_iter().zip(state_fields(&b.state)) {
+        for ((name, x), (_, y)) in state_fields(&a.state)
+            .into_iter()
+            .zip(state_fields(&b.state))
+        {
             assert_eq!(bits(x), bits(y), "state.{name}");
         }
         assert_eq!(bits(&a.slow_forcing.t), bits(&b.slow_forcing.t));
@@ -629,7 +632,10 @@ mod tests {
         let path = dir.path().join("run.restart");
         let restart = sample();
         restart.write(&path).unwrap();
-        assert!(!temporary_path(&path).exists(), "the temporary file is left");
+        assert!(
+            !temporary_path(&path).exists(),
+            "the temporary file is left"
+        );
         assert_same(&restart, &Restart3D::read(&path).unwrap());
 
         // Without the optional parts
