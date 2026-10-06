@@ -65,6 +65,17 @@ pub const SEABED: &[[u8; 3]] = &[
     [0x22, 0x32, 0x3F],
 ];
 
+/// Pale green on the shore through heath and brown to bare grey rock (hypsometric
+/// tints): land height.
+pub const LAND: &[[u8; 3]] = &[
+    [0xA7, 0xB5, 0x86],
+    [0x86, 0x9A, 0x66],
+    [0x8E, 0x8A, 0x5E],
+    [0x8A, 0x74, 0x58],
+    [0x9C, 0x93, 0x8A],
+    [0xCF, 0xCC, 0xC6],
+];
+
 /// 256 samples of a colour map, linear RGBA.
 pub struct Lut([[f32; 4]; 256]);
 

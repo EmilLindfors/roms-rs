@@ -4,7 +4,7 @@
 //! Each arrow samples (u, v) by the element polynomial at its point ([`Probe`]), so it
 //! shows the current there, not at the nearest node. Its length is the grid spacing at
 //! the top of the speed scale; it is white over water coloured by speed, else coloured
-//! by speed itself. A (key) toggles them.
+//! by speed itself. A (key) toggles them; the photo view ([`crate::photo`]) has none.
 
 use bevy::prelude::*;
 use dg_rs::mesh::PointLocator2D;
@@ -12,6 +12,7 @@ use dg_rs::mesh::PointLocator2D;
 use crate::camera::OrbitCamera;
 use crate::colormap::{Lut, VIRIDIS};
 use crate::field::{Field, Frame, Probe};
+use crate::photo::Photo;
 use crate::scenario::Scenario;
 use crate::surface::{ColourBy, Colouring};
 
@@ -134,10 +135,11 @@ fn draw(
     field: Res<Field>,
     frame: Res<Frame>,
     colouring: Res<Colouring>,
+    photo: Res<Photo>,
     camera: Query<&OrbitCamera>,
     mut gizmos: Gizmos,
 ) {
-    if !arrows.on || field.t.is_none() {
+    if !arrows.on || photo.on || field.t.is_none() {
         return;
     }
     let near = camera.single().is_ok_and(|c| c.distance < arrows.near);

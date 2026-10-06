@@ -13,6 +13,7 @@
 
 use bevy::prelude::*;
 use dg_rs::mesh::PointLocator2D;
+use dg_rs::operators::DGOperators2D;
 use dg_rs::solver::Probe2D;
 use dg_rs::types::ElementIndex;
 
@@ -196,15 +197,33 @@ pub struct Probe {
 impl Probe {
     /// A probe at mesh point `p`, or `None` outside the mesh.
     pub fn at(locator: &PointLocator2D, scenario: &Scenario, p: [f64; 2]) -> Option<Self> {
-        let probe = Probe2D::at(locator, &scenario.ops, p)?;
+        Self::with_operators(locator, &scenario.ops, p)
+    }
+
+    /// [`Self::at`] with the scenario's operators alone.
+    pub fn with_operators(
+        locator: &PointLocator2D,
+        ops: &DGOperators2D,
+        p: [f64; 2],
+    ) -> Option<Self> {
+        let probe = Probe2D::at(locator, ops, p)?;
         Some(Self {
-            start: probe.element().as_usize() * scenario.ops.n_nodes,
+            start: probe.element().as_usize() * ops.n_nodes,
             weights: probe.weights().iter().map(|&w| w as f32).collect(),
         })
     }
 
     pub fn eval(&self, field: &[f32]) -> f32 {
-        let values = &field[self.start..self.start + self.weights.len()];
+        self.eval_element(&field[self.nodes()])
+    }
+
+    /// The nodes of the point's element in a nodal field.
+    pub fn nodes(&self) -> std::ops::Range<usize> {
+        self.start..self.start + self.weights.len()
+    }
+
+    /// The point's value from its element's nodal `values` alone.
+    pub fn eval_element(&self, values: &[f32]) -> f32 {
         self.weights.iter().zip(values).map(|(w, v)| w * v).sum()
     }
 

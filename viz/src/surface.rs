@@ -7,11 +7,21 @@
 //!
 //! Along the mesh boundary both meshes hang walls: the bed's reach down to a flat base
 //! and the water's from the surface to the bed, so the domain reads as a cut-out block.
+//! With an elevation model around the domain ([`crate::terrain`]) the land and the sea
+//! bed carry on beyond the mesh instead: where they do, the bed's walls rise to the
+//! land at the boundary (the coast's cliffs) and the water has none. Where the
+//! elevation model ends at the mesh boundary (Frøya's covers just the domain), the
+//! domain keeps its cut-out edge.
 //!
 //! The water's heights, normals and colours are rewritten whenever the shown field
 //! changes. Keys: C colours the water by current speed or by surface elevation; T
 //! cycles the water through translucent, opaque and hidden; - and = make the
 //! translucent water clearer or denser, down to a tint over the bed.
+//!
+//! In the photo view ([`crate::photo`]) both meshes carry what its shader needs too:
+//! the water the current (UV 0, world X and Z, averaged over the nodes elements share
+//! so the waves riding it have no seams at element edges), the bed the depth of the
+//! water over it (UV 1).
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -20,8 +30,10 @@ use bevy::prelude::*;
 
 use crate::colormap::{DIVERGING, Lut, SEABED, VIRIDIS};
 use crate::field::{Field, Frame, Nodes};
+use crate::photo::{Photo, PhotoPart};
 use crate::playback::Playback;
 use crate::solver::H_DRY;
+use crate::terrain::{GroundColours, Terrain};
 
 pub struct SurfacePlugin;
 
@@ -168,6 +180,27 @@ struct Water {
     mesh: Handle<Mesh>,
     material: Handle<StandardMaterial>,
     wall_nodes: Vec<usize>,
+    bed_mesh: Handle<Mesh>,
+    /// The place of every node, shared by the elements' nodes there: `shared[g]` < `n_shared`
+    shared: Vec<u32>,
+    n_shared: usize,
+}
+
+/// Numbers the nodes' places, the nodes of neighbouring elements on their common face
+/// sharing one: returns the number of each node's place and how many there are.
+fn shared_places(nodes: &Nodes) -> (Vec<u32>, usize) {
+    // Within a centimetre: a place's nodes are the same point mapped from each element
+    let mut places = std::collections::HashMap::new();
+    let shared = nodes
+        .xz
+        .iter()
+        .map(|p| {
+            let key = ((p.x * 100.0).round() as i64, (p.y * 100.0).round() as i64);
+            let next = places.len() as u32;
+            *places.entry(key).or_insert(next)
+        })
+        .collect();
+    (shared, places.len())
 }
 
 #[derive(Component)]
@@ -210,17 +243,19 @@ impl Sheet {
     }
 
     /// Walls down from each boundary node's vertex to height `bottom(node)` (m), two
-    /// vertices per column (top, bottom); returns the node of every column.
+    /// vertices per column (top, bottom), on the boundary faces `(element, face)` that
+    /// `on` takes; returns the node of every column.
     fn walls(
         &mut self,
         nodes: &Nodes,
         vz: f32,
+        on: impl Fn(usize, usize) -> bool,
         bottom: impl Fn(usize) -> f32,
         bottom_colour: impl Fn(usize) -> [f32; 4],
     ) -> Vec<usize> {
         let n = nodes.n_nodes;
         let mut columns = Vec::new();
-        for &(k, face) in &nodes.boundary {
+        for &(k, face) in nodes.boundary.iter().filter(|&&(k, f)| on(k, f)) {
             let column_nodes: Vec<usize> =
                 nodes.face_nodes[face].iter().map(|&i| k * n + i).collect();
             // Outward: along the face turned away from the element's centre.
@@ -252,6 +287,7 @@ impl Sheet {
     }
 
     fn mesh(self) -> Mesh {
+        let n = self.positions.len();
         Mesh::new(
             PrimitiveTopology::TriangleList,
             RenderAssetUsages::default(),
@@ -259,6 +295,9 @@ impl Sheet {
         .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
         .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colours)
+        // The photo view's current (water) and depth (bed)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, vec![[0.0f32; 2]; n])
+        .with_inserted_attribute(Mesh::ATTRIBUTE_UV_1, vec![[0.0f32; 2]; n])
         .with_inserted_indices(Indices::U32(self.indices))
     }
 }
@@ -266,11 +305,12 @@ impl Sheet {
 /// Colour of the water where the walls meet the bed.
 const WATER_DEEP: [f32; 4] = [0.004, 0.02, 0.035, 0.9];
 
-fn spawn(
+pub(crate) fn spawn(
     mut commands: Commands,
     nodes: Res<Nodes>,
     frame: Res<Frame>,
     opacity: Res<WaterOpacity>,
+    terrain: Option<Res<Terrain>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
@@ -293,15 +333,36 @@ fn spawn(
         |g: usize| seabed.at((shallowest - nodes.bed[g]) / (shallowest - deepest).max(1e-6));
     let mut bed = Sheet::surface(&nodes, &nodes.bed, vz, bed_colour);
     let earth = Color::srgb(0.16, 0.14, 0.12).to_linear();
+    // Whether the terrain carries on beyond a boundary face
+    let beyond = |k: usize, face: usize| {
+        terrain.as_ref().is_some_and(|terrain| {
+            let ends = &nodes.face_nodes[face];
+            let n = nodes.n_nodes;
+            let mid = 0.5 * (nodes.xz[k * n + ends[0]] + nodes.xz[k * n + ends[ends.len() - 1]]);
+            terrain.covers(mid)
+        })
+    };
+    let open = |k: usize, face: usize| !beyond(k, face);
     bed.walls(
         &nodes,
         vz,
+        open,
         |_| base,
         |_| [earth.red, earth.green, earth.blue, 1.0],
     );
+    if let Some(terrain) = &terrain {
+        let ground = GroundColours::new(BedScale {
+            shallow: -shallowest,
+            deep: -deepest,
+        });
+        let land = |g: usize| terrain.coast(g).unwrap_or(nodes.bed[g]);
+        bed.walls(&nodes, vz, beyond, land, |g| ground.at(land(g)));
+    }
+    let bed_mesh = meshes.add(bed.mesh());
     commands.spawn((
         Name::new("Bed"),
-        Mesh3d(meshes.add(bed.mesh())),
+        PhotoPart::Bed,
+        Mesh3d(bed_mesh.clone()),
         MeshMaterial3d(materials.add(StandardMaterial {
             perceptual_roughness: 0.95,
             reflectance: 0.2,
@@ -314,7 +375,7 @@ fn spawn(
     // At rest until the first snapshot arrives.
     let still: Vec<f32> = nodes.bed.iter().map(|&b| b.max(0.0)).collect();
     let mut water = Sheet::surface(&nodes, &still, vz, |_| [0.1, 0.3, 0.45, 1.0]);
-    let wall_nodes = water.walls(&nodes, vz, |g| nodes.bed[g], |_| WATER_DEEP);
+    let wall_nodes = water.walls(&nodes, vz, open, |g| nodes.bed[g], |_| WATER_DEEP);
     let material = materials.add(StandardMaterial {
         base_color: Color::srgba(1.0, 1.0, 1.0, opacity.0),
         alpha_mode: AlphaMode::Blend,
@@ -328,15 +389,20 @@ fn spawn(
     commands.spawn((
         Name::new("Water"),
         WaterSurface,
+        PhotoPart::Sea,
         Mesh3d(mesh.clone()),
         MeshMaterial3d(material.clone()),
         // The surface moves: its bounding box from rest would cull it wrongly.
         NoFrustumCulling,
     ));
+    let (shared, n_shared) = shared_places(&nodes);
     commands.insert_resource(Water {
         mesh,
         material,
         wall_nodes,
+        bed_mesh,
+        shared,
+        n_shared,
     });
 }
 
@@ -404,6 +470,8 @@ struct WaterScratch {
     heights: Vec<f32>,
     speed: Vec<f32>,
     normals: Vec<[f32; 3]>,
+    /// Sums of the current (world X, Z) and node counts at each shared place
+    current: Vec<[f32; 3]>,
 }
 
 #[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its queries
@@ -413,18 +481,20 @@ fn update_water(
     nodes: Res<Nodes>,
     frame: Res<Frame>,
     water: Option<Res<Water>>,
+    photo: Res<Photo>,
     mut colouring: ResMut<Colouring>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut scratch: Local<WaterScratch>,
 ) {
     let Some(water) = water else { return };
-    if field.t.is_none() || !(playback.changed || colouring.is_changed()) {
+    if field.t.is_none() || !(playback.changed || colouring.is_changed() || photo.is_changed()) {
         return;
     }
     let WaterScratch {
         heights,
         speed,
         normals,
+        current,
     } = &mut *scratch;
     // Dry nodes sink just under the bed, out of sight.
     heights.clear();
@@ -469,6 +539,42 @@ fn update_water(
         }
         for (c, &g) in water.wall_nodes.iter().enumerate() {
             colours[n + 2 * c] = colours[g];
+        }
+    }
+    if !photo.on {
+        return;
+    }
+    // The current at each place, the mean of its nodes': mesh (u, v) is world (u, −v)
+    current.clear();
+    current.resize(water.n_shared, [0.0; 3]);
+    for g in 0..n {
+        let c = &mut current[water.shared[g] as usize];
+        c[0] += field.u[g];
+        c[1] -= field.v[g];
+        c[2] += 1.0;
+    }
+    let at = |g: usize| {
+        let [x, z, count] = current[water.shared[g] as usize];
+        [x / count, z / count]
+    };
+    if let Some(VertexAttributeValues::Float32x2(uv)) = mesh.attribute_mut(Mesh::ATTRIBUTE_UV_0) {
+        for (g, uv) in uv.iter_mut().enumerate().take(n) {
+            *uv = at(g);
+        }
+        for (c, &g) in water.wall_nodes.iter().enumerate() {
+            uv[n + 2 * c] = at(g);
+            uv[n + 2 * c + 1] = at(g);
+        }
+    }
+    // The depth of the water over the bed, 0 where it is dry
+    drop(mesh);
+    let Some(mut bed) = meshes.get_mut(&water.bed_mesh) else {
+        return;
+    };
+    if let Some(VertexAttributeValues::Float32x2(uv)) = bed.attribute_mut(Mesh::ATTRIBUTE_UV_1) {
+        for (g, uv) in uv.iter_mut().enumerate().take(n) {
+            let depth = field.eta[g] - nodes.bed[g];
+            uv[0] = if depth > H_DRY { depth } else { 0.0 };
         }
     }
 }

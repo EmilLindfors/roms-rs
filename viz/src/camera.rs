@@ -1,6 +1,6 @@
 //! An orbit camera: left-drag turns about the focus, right- or middle-drag (or
 //! Shift+left-drag) slides the focus over the water, the wheel zooms. F frames the
-//! farm, O the whole domain.
+//! farm, O the whole domain, 1 to 9 the scenario's named places.
 
 use bevy::input::mouse::{AccumulatedMouseMotion, AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
@@ -27,12 +27,27 @@ impl OrbitCamera {
     }
 }
 
-/// The two framings F and O return to.
-#[derive(Resource, Clone, Copy, Debug)]
+/// The framings F, O and the number keys return to.
+#[derive(Resource, Clone, Debug)]
 pub struct Views {
     pub farm: OrbitCamera,
     pub domain: OrbitCamera,
+    /// Named places, framed as the farm is: keys 1 to 9
+    pub places: Vec<(String, OrbitCamera)>,
 }
+
+/// The number keys, 1 to 9.
+pub const DIGITS: [KeyCode; 9] = [
+    KeyCode::Digit1,
+    KeyCode::Digit2,
+    KeyCode::Digit3,
+    KeyCode::Digit4,
+    KeyCode::Digit5,
+    KeyCode::Digit6,
+    KeyCode::Digit7,
+    KeyCode::Digit8,
+    KeyCode::Digit9,
+];
 
 pub struct CameraPlugin;
 
@@ -58,6 +73,11 @@ fn input(
     }
     if keys.just_pressed(KeyCode::KeyO) {
         *orbit = views.domain;
+    }
+    for ((_, view), key) in views.places.iter().zip(DIGITS) {
+        if keys.just_pressed(key) {
+            *orbit = *view;
+        }
     }
     let shift = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
     let pan = mouse.pressed(MouseButton::Right)

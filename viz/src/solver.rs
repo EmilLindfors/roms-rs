@@ -128,11 +128,13 @@ pub struct Layers {
     pub v: Vec<f32>,
     /// Temperature (°C)
     pub temp: Vec<f32>,
+    /// Salinity; empty if the run's file has none
+    pub salt: Vec<f32>,
 }
 
 impl Layers {
     fn bytes(&self) -> usize {
-        4 * (self.u.len() + self.v.len() + self.temp.len())
+        4 * (self.u.len() + self.v.len() + self.temp.len() + self.salt.len())
     }
 }
 
@@ -175,6 +177,7 @@ impl Snapshot {
                 u: f32s(&state.u),
                 v: f32s(&state.v),
                 temp: f32s(&state.temp),
+                salt: f32s(&state.salt),
             }),
         }
     }
@@ -188,6 +191,13 @@ impl Snapshot {
 
 pub enum SolverMessage {
     Snapshot(Box<Snapshot>),
+    /// A frame of a snapshot file read on demand ([`crate::replay::serve`])
+    Frame(Box<Snapshot>),
+    /// (model time, η) at the trace's probe of the next frames of a file read on
+    /// demand
+    Series(Vec<(f64, f32)>),
+    /// Model times of frames a run has appended to a file read on demand
+    Grown(Vec<f64>),
     Finished {
         steps: usize,
         wall: f64,

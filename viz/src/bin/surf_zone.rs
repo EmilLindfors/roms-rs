@@ -548,6 +548,7 @@ fn main() {
         .insert_resource(Views {
             farm: close,
             domain: whole,
+            places: Vec::new(),
         })
         .insert_resource(Capture {
             path: args.screenshot,

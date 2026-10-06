@@ -4,15 +4,20 @@
 //! depth-averaged current every `--interval` seconds of model time; the viewer plays
 //! them back ([`playback`]) as the water surface over the bed ([`surface`]), coloured by
 //! current speed or elevation, with depth contours on the bed ([`contours`]), current
-//! arrows ([`arrows`]), the farm's net cages riding the surface ([`cages`]) and
-//! particles released from the cages, tracked with the flow ([`particles`]).
+//! arrows ([`arrows`]), the land and sea around a domain on a real coast ([`terrain`]),
+//! the farm's net cages riding the surface ([`cages`]) and particles released from
+//! the cages, tracked with the flow ([`particles`]). R switches to the photo view
+//! ([`photo`]): the sea as a camera would see it, wind waves riding the model's
+//! current, the sky and the sun reflected in them, the bed through the water.
 //!
 //! Scenarios ([`scenario`]): the farm fjord of `examples/local_time_stepping_farm.rs`,
 //! Frøya–Smøla–Hitra on the coastline mesh with NorKyst-800 boundary tides, as
 //! `examples/froya_real_data.rs` runs it (its data files in `../data/`), or the
 //! stratified farm channel of `examples/farm_3d.rs` in 3D: there the water shows the
 //! depth-mean current or any σ-layer's, a vertical section along the flow through a
-//! cage shows the speed or temperature in the water column ([`layers`]), and lice
+//! cage shows the speed or temperature in the water column ([`layers`]), a sheet at
+//! the strongest stratification of every column shows the pycnocline, halocline or
+//! thermocline ([`stratification`]), and lice
 //! larvae, faeces and feed are tracked in 3D ([`cloud_3d`]).
 //!
 //! ```bash
@@ -32,7 +37,9 @@
 //!   second, and the status shows the run's UTC date when the run has a clock.
 //!   - A snapshot file (`froya_real_data snapshot_minutes=N` writes
 //!     `<output>/froya.dgsnap`) carries its mesh and bed: no scenario is built, and
-//!     the close-up is its first station.
+//!     the close-up is its first station. Its frames are read as they are shown, so
+//!     a run of any length (15 days of 10-minute frames are ≈ 3 GB at Frøya) plays
+//!     and seeks without `--memory`, and the trace has every frame.
 //!   - A directory of VTU frames, the `froya_NNNN.vtu` of `examples/froya_real_data.rs`
 //!     with `mesh=data/froya_coast.msh`, e.g. `--replay ../output/froya_15d_k1o1`. The
 //!     scenario (Frøya unless `--scenario` says otherwise) must be built as the run
@@ -42,6 +49,27 @@
 //!   mesh, bed, cages and, in 3D, the σ-grid and u, v, T on every level): a live run as
 //!   it runs, or the frames of a `--replay` as they are read (a tenth of VTU frames'
 //!   size). `--replay FILE` replays it later without the scenario's data.
+//! - `--terrain FILE[,FILE...]|none` elevation models (longitude/latitude GeoTIFFs of
+//!   bed elevations with land heights, `scripts/kartverket_topobathy.sh`) drawn around
+//!   and under the domain ([`terrain`]): the land, and the sea bed beyond the model
+//!   under a still sea. The first is the base, the others finer patches over it (the
+//!   1 m level around a farm, e.g. `../data/kattholmen_topobathy_2m.tif`). Only for a
+//!   domain on a real coast, placed by its projection (Frøya, or a snapshot file with
+//!   `projection=` metadata) [`../data/froya_topobathy.tif` if present]. `--terrain-margin F` how far around the mesh, in mesh extents [0.25];
+//!   `--origin LAT,LON` the point the mesh's local projection is about, for snapshot
+//!   files written before they carried it (`froya_real_data`: its `bbox=` centre,
+//!   63.8,8.6 by default)
+//! - `--site FILE` a fish farm site (`scripts/fiskeridir_site.sh`, e.g.
+//!   `../data/sites/14042.txt`) on the map ([`site`]): its frame, moorings, feed raft
+//!   and cages, the cages dragging on the flow of a live run. Repeat it for more sites;
+//!   the close-up (F) then frames the first. Needs the domain's projection, as
+//!   `--terrain` does
+//! - `--pin X,Y` pin the point at mesh coordinates X, Y (km) at the start, as a click
+//!   on it does ([`inspect`]: hover any point for its readout, click to pin one, Esc
+//!   to let go)
+//! - `--place NAME,X,Y` a named place the number keys frame (1 to 9, in the order:
+//!   the run's stations, the `--site`s, then these), at mesh coordinates X, Y in km
+//!   as the solver's logs print them; repeat it for more
 //! - `--gauge FILE` a tide-gauge record (`scripts/kartverket_gauge.sh` format, e.g.
 //!   `../data/tide_gauges/mausund_obs.txt`) drawn against the model's surface at the
 //!   close-up point in the trace (top right, G; [`trace`]); it needs the run's clock,
@@ -50,14 +78,17 @@
 //!   time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
 //!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
 //!   [ladim]; `--section speed|temperature|off` what the section shows at the start
-//!   [speed]; `--layer mean|surface|bed|N` the current the water shows at the start
-//!   (N: σ-layer from the bed, 0) [mean]
+//!   [speed]; `--sheet density|salinity|temperature|off` what the stratification
+//!   sheet follows at the start ([`stratification`]) [density]; `--layer
+//!   mean|surface|bed|N` the current the water shows at the start (N: σ-layer from the
+//!   bed, 0) [mean]
 //! - `--mesh PATH` Gmsh mesh [`../tests/data/gmsh/fjord_farm.msh`, or Frøya's]
 //! - `--order N` polynomial order [2]; `--levels N` local time stepping levels, 0 for
 //!   global SSP-RK3 [8]
 //! - `--hours H` model hours to run [25]; `--interval S` model seconds between
 //!   snapshots [60]; `--threads N` solver threads [all but two cores]
-//! - `--memory MB` snapshots kept, oldest dropped first [2048]
+//! - `--memory MB` snapshots kept, oldest dropped first (a live run, or VTU frames)
+//!   [2048]
 //! - `--rate R` model seconds shown per second [60; 3600 in a replay]
 //! - `--vz Z` vertical exaggeration [3]; `--speed-max V` fix the speed scale (m/s)
 //!   instead of letting it follow the flow in round steps
@@ -70,13 +101,20 @@
 //! - `--particles N` particles released in each cage every `--release S` model seconds
 //!   [20, 60] (in 3D, of each kind); 0 for none. `--kh K` horizontal diffusivity of
 //!   their random walk (m²/s) [0.1]
-//! - `--view farm|domain` starting framing: the close-up (the farm, or the gauge) or
-//!   the whole domain [farm]
+//! - `--view farm|domain|N` starting framing: the close-up (the farm, or the gauge),
+//!   the whole domain, or the Nth named place (its number key) [farm]
+//! - `--eye X,Y,HEIGHT,BEARING,TILT` start from a photographer's view instead: standing
+//!   over mesh point X, Y (km), HEIGHT m above mean sea level, looking toward the
+//!   compass BEARING and TILT degrees down (the photo view's status prints the view's
+//!   own; with `--vz 1` the heights are true)
+//! - `--photo on|off` start in the photo view [off]; `--wind SPEED,FROM` its wind, in
+//!   m/s at 10 m and the compass degrees it blows from [6,225]; `--fetch KM` the open
+//!   water upwind of the view, which sets how developed its sea is [10]
 //! - `--screenshot PATH` save a frame once the shown time reaches `--at S` (model
 //!   seconds; default the end of the run) and quit: for checking a change headlessly.
 //!
-//! Keys: see [`hud`] (B: bed contours; - and =: water opacity; in 3D , and . the
-//! layer shown, V the section).
+//! Keys: see [`hud`] (B: bed contours; L: the terrain; - and =: water opacity; in
+//! 3D , and . the layer shown, V the section, N the stratification sheet).
 
 mod arrows;
 mod cages;
@@ -86,14 +124,24 @@ mod colormap;
 mod contours;
 mod field;
 mod hud;
+mod inspect;
 mod layers;
 mod particles;
+mod photo;
 mod playback;
+mod plot;
 mod replay;
 mod scenario;
+mod site;
 mod solver;
+mod stratification;
 mod surface;
+mod terrain;
 mod trace;
+
+/// The viewer's font: Fira Mono (SIL Open Font License 1.1, `assets/fonts/OFL.txt`),
+/// whole, where Bevy bundles a subset without Norwegian letters.
+const FONT: &[u8] = include_bytes!("../assets/fonts/FiraMono-Regular.ttf");
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -110,12 +158,16 @@ use contours::ContoursPlugin;
 use field::{Field, Frame, Nodes, Probe, ShownLayer};
 use hud::{HudPlugin, RunClock, Title};
 use layers::{LayersPlugin, Levels, Section, SectionShows};
+use stratification::{SheetShows, Stratification, StratificationPlugin};
 use particles::{Lice, ParticleConfig, ParticlesPlugin, Periodic};
+use photo::{Photo, PhotoPlugin};
 use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState, Source};
 use replay::Replay;
 use scenario::Scenario;
+use site::{SiteDrawing, SitePlugin, Sites};
 use solver::SolverConfig;
 use surface::{Colouring, SurfacePlugin, WaterOpacity};
+use terrain::{Terrain, TerrainPlugin};
 use trace::{Trace, TracePlugin};
 
 struct Args {
@@ -123,6 +175,14 @@ struct Args {
     replay: Option<PathBuf>,
     save_snapshot: Option<PathBuf>,
     gauge: Option<PathBuf>,
+    terrain: Option<String>,
+    terrain_margin: f64,
+    sites: Vec<PathBuf>,
+    /// Named places (`--place NAME,X_KM,Y_KM`), in mesh metres
+    places: Vec<(String, [f64; 2])>,
+    /// A point pinned at the start (`--pin X_KM,Y_KM`), in mesh metres
+    pin: Option<[f64; 2]>,
+    origin: Option<String>,
     mesh: Option<PathBuf>,
     order: usize,
     levels: usize,
@@ -143,7 +203,11 @@ struct Args {
     sigma: usize,
     start: String,
     section: SectionShows,
+    sheet: SheetShows,
     layer: String,
+    photo: Photo,
+    /// `--eye`: mesh point (m), height (m), bearing and tilt (degrees)
+    eye: Option<([f64; 2], f32, f32, f32)>,
 }
 
 impl Args {
@@ -153,6 +217,12 @@ impl Args {
             replay: None,
             save_snapshot: None,
             gauge: None,
+            terrain: None,
+            terrain_margin: 0.25,
+            sites: Vec::new(),
+            places: Vec::new(),
+            pin: None,
+            origin: None,
             mesh: None,
             order: 2,
             levels: 8,
@@ -179,7 +249,16 @@ impl Args {
             sigma: 16,
             start: "2025-06-15T00:00:00Z".into(),
             section: SectionShows::Speed,
+            sheet: SheetShows::Density,
             layer: "mean".into(),
+            photo: Photo {
+                on: false,
+                wind_speed: 6.0,
+                wind_from: 225.0,
+                fetch: 10e3,
+                place: None,
+            },
+            eye: None,
         };
         let mut it = std::env::args().skip(1);
         while let Some(flag) = it.next() {
@@ -188,6 +267,16 @@ impl Args {
                 "--scenario" => args.scenario = Some(value),
                 "--replay" => args.replay = Some(value.into()),
                 "--gauge" => args.gauge = Some(value.into()),
+                "--terrain" => args.terrain = Some(value),
+                "--terrain-margin" => args.terrain_margin = num(&flag, &value)?,
+                "--site" => args.sites.push(value.into()),
+                "--place" => args.places.push(place(&value)?),
+                "--pin" => {
+                    let (_, at) = place(&format!("pin,{value}"))
+                        .map_err(|_| format!("--pin takes X,Y (km), not {value}"))?;
+                    args.pin = Some(at);
+                }
+                "--origin" => args.origin = Some(value),
                 "--save-snapshot" => args.save_snapshot = Some(value.into()),
                 "--mesh" => args.mesh = Some(value.into()),
                 "--order" => args.order = num(&flag, &value)?,
@@ -242,7 +331,38 @@ impl Args {
                         }
                     }
                 }
+                "--sheet" => {
+                    args.sheet = match value.as_str() {
+                        "density" => SheetShows::Density,
+                        "salinity" => SheetShows::Salinity,
+                        "temperature" => SheetShows::Temperature,
+                        "off" => SheetShows::Off,
+                        _ => {
+                            return Err(format!(
+                                "--sheet takes density, salinity, temperature or off, not {value}"
+                            ));
+                        }
+                    }
+                }
                 "--layer" => args.layer = value,
+                "--photo" => {
+                    args.photo.on = match value.as_str() {
+                        "on" => true,
+                        "off" => false,
+                        _ => return Err(format!("--photo takes on or off, not {value}")),
+                    }
+                }
+                "--wind" => {
+                    let bad = || format!("--wind takes SPEED,FROM (m/s, degrees), not {value}");
+                    let (speed, from) = value.split_once(',').ok_or_else(bad)?;
+                    args.photo.wind_speed = speed.trim().parse().map_err(|_| bad())?;
+                    args.photo.wind_from = from.trim().parse().map_err(|_| bad())?;
+                    if args.photo.wind_speed < 0.0 {
+                        return Err(bad());
+                    }
+                }
+"--eye" => args.eye = Some(eye(&value)?),
+                "--fetch" => args.photo.fetch = 1e3 * num::<f32>(&flag, &value)?,
                 "--view" => args.view = value,
                 "--screenshot" => args.screenshot = Some(value),
                 "--at" => args.at = Some(num(&flag, &value)?),
@@ -269,6 +389,44 @@ struct Capture {
     path: Option<String>,
     at: f64,
     frames: Option<u32>,
+}
+
+/// `X,Y,HEIGHT,BEARING,TILT` (X, Y in km of mesh coordinates) as a photographer's view.
+fn eye(value: &str) -> Result<([f64; 2], f32, f32, f32), String> {
+    let bad = || format!("--eye takes X,Y,HEIGHT,BEARING,TILT (km, km, m, °, °), not {value}");
+    let parts: Vec<f64> = value
+        .split(',')
+        .map(|s| s.trim().parse().map_err(|_| bad()))
+        .collect::<Result<_, _>>()?;
+    match parts[..] {
+        [x, y, height, bearing, tilt] => Ok((
+            [1e3 * x, 1e3 * y],
+            height as f32,
+            bearing as f32,
+            tilt as f32,
+        )),
+        _ => Err(bad()),
+    }
+}
+
+/// `NAME,X,Y` (X, Y in km of mesh coordinates) as a named place in metres.
+fn place(value: &str) -> Result<(String, [f64; 2]), String> {
+    let bad = || format!("--place takes NAME,X,Y (km), not {value}");
+    let mut parts = value.rsplitn(3, ',');
+    let y: f64 = parts
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(bad)?;
+    let x: f64 = parts
+        .next()
+        .and_then(|s| s.trim().parse().ok())
+        .ok_or_else(bad)?;
+    let name = parts
+        .next()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(bad)?;
+    Ok((name.to_string(), [1e3 * x, 1e3 * y]))
 }
 
 fn main() -> AppExit {
@@ -359,6 +517,59 @@ fn main() -> AppExit {
         };
         (scenario, replay)
     };
+    if let Some(origin) = &args.origin {
+        match scenario::parse_projection(&format!("local,{origin}")) {
+            Some(projection) => scenario.projection = Some(projection),
+            None => {
+                eprintln!("--origin takes LAT,LON in degrees, not {origin}");
+                return AppExit::from_code(2);
+            }
+        }
+    }
+    // The gauge trace stays at the scenario's point of interest when a site takes the
+    // close-up
+    let gauge_point = scenario.farm;
+    // The scenario's own framing, for its stations and `--place`s
+    let place_framing = scenario.close_up;
+    // Fish farm sites: their cages join the scenario's, the close-up frames the first
+    let mut sites = Vec::new();
+    let mut site_places = Vec::new();
+    for path in &args.sites {
+        let Some(projection) = scenario.projection else {
+            eprintln!(
+                "--site {}: the domain has no projection (--origin LAT,LON)",
+                path.display()
+            );
+            return AppExit::from_code(2);
+        };
+        let site = match dg_rs::io::read_farm_site_file(path) {
+            Ok(site) => site,
+            Err(e) => {
+                eprintln!("cannot read the site {}: {e}", path.display());
+                return AppExit::from_code(1);
+            }
+        };
+        let cages = site::site_cages(&site, &projection, &scenario.cages);
+        println!(
+            "Site {} {}: {} cages added",
+            site.number,
+            site.name,
+            cages.len()
+        );
+        if sites.is_empty() {
+            scenario.farm = site::site_centre(&site, &projection);
+            scenario.close_up = scenario::CloseUp {
+                distance: 700.0,
+                yaw: 0.7,
+                pitch: 0.45,
+                arrow_spacing: 25.0,
+                arrow_radius: 600.0,
+            };
+        }
+        scenario.cages.extend(cages);
+        site_places.push((site.name.clone(), site::site_centre(&site, &projection)));
+        sites.push(site);
+    }
     let mut replay = replay;
     if let Some(replay) = &mut replay {
         println!(
@@ -409,6 +620,10 @@ fn main() -> AppExit {
     if let Some(ramp) = args.ramp {
         scenario.forcing.ramp = ramp;
     }
+    if !sites.is_empty() {
+        let names: Vec<&str> = sites.iter().map(|s| s.name.as_str()).collect();
+        scenario.name = format!("{} + {}", scenario.name, names.join(", "));
+    }
 
     let (lo, hi) = scenario.mesh.vertices.iter().fold(
         ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]),
@@ -436,6 +651,58 @@ fn main() -> AppExit {
             })
             .collect(),
     );
+    // The land and sea around a domain on a real coast
+    let terrain_paths: Option<Vec<PathBuf>> = match args.terrain.as_deref() {
+        Some("none") => None,
+        Some(list) => Some(list.split(',').map(PathBuf::from).collect()),
+        None => Some(vec![repo.join("data/froya_topobathy.tif")]).filter(|p| p[0].is_file()),
+    };
+    let terrain = match (terrain_paths, &scenario.projection) {
+        (Some(paths), Some(projection)) => {
+            let started = std::time::Instant::now();
+            let built = Terrain::build(
+                &paths,
+                projection,
+                args.terrain_margin,
+                &scenario,
+                &nodes,
+                &locator,
+                &frame,
+            );
+            match built {
+                Ok(terrain) => {
+                    let grids: Vec<String> = terrain
+                        .grids()
+                        .iter()
+                        .map(|([nx, ny], dx)| format!("{nx} x {ny} at {dx:.1} m"))
+                        .collect();
+                    println!(
+                        "Terrain: {}, built in {:.1} s",
+                        grids.join(" + "),
+                        started.elapsed().as_secs_f64()
+                    );
+                    Some(terrain)
+                }
+                Err(e) => {
+                    eprintln!("no terrain: {e}");
+                    None
+                }
+            }
+        }
+        (Some(_), None) if args.terrain.is_some() => {
+            eprintln!("no terrain: the domain has no projection (--origin LAT,LON)");
+            None
+        }
+        _ => None,
+    };
+    let sites = scenario.projection.map(|projection| {
+        Sites(
+            sites
+                .iter()
+                .map(|site| SiteDrawing::new(site, &projection, &scenario, &nodes, &locator))
+                .collect(),
+        )
+    });
     let arrows = Arrows::new(
         &locator,
         &scenario,
@@ -454,13 +721,33 @@ fn main() -> AppExit {
     );
 
     let extent = (hi[0] - lo[0]).max(hi[1] - lo[1]) as f32;
+    // A place framed as `close_up` frames the point of interest
+    let framed = |at: [f64; 2], close_up: &scenario::CloseUp| OrbitCamera {
+        focus: frame.world(at, 0.0),
+        yaw: close_up.yaw,
+        pitch: close_up.pitch,
+        distance: close_up.distance,
+    };
+    // The run's stations and the `--place`s as the scenario frames its point of
+    // interest, the sites as the farm close-up
+    let places = scenario
+        .places
+        .iter()
+        .map(|(name, at)| (name.clone(), framed(*at, &place_framing)))
+        .chain(
+            site_places
+                .iter()
+                .map(|(name, at)| (name.clone(), framed(*at, &scenario.close_up))),
+        )
+        .chain(
+            args.places
+                .iter()
+                .map(|(name, at)| (name.clone(), framed(*at, &place_framing))),
+        )
+        .collect();
     let views = Views {
-        farm: OrbitCamera {
-            focus: frame.world(scenario.farm, 0.0),
-            yaw: scenario.close_up.yaw,
-            pitch: scenario.close_up.pitch,
-            distance: scenario.close_up.distance,
-        },
+        farm: framed(scenario.farm, &scenario.close_up),
+        places,
         domain: OrbitCamera {
             focus: Vec3::ZERO,
             yaw: 0.35,
@@ -468,10 +755,28 @@ fn main() -> AppExit {
             distance: 0.85 * extent,
         },
     };
-    let start = if args.view == "domain" {
-        views.domain
-    } else {
-        views.farm
+    let start = match args.eye {
+        Some((at, height, bearing, tilt)) => {
+            photo::eye_view(&frame, at, height, bearing, tilt)
+        }
+        None => match args.view.as_str() {
+            "farm" => views.farm,
+            "domain" => views.domain,
+            n => match n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| views.places.get(n.wrapping_sub(1)))
+            {
+                Some((_, view)) => *view,
+                None => {
+                    eprintln!(
+                        "--view takes farm, domain or a place's number (1 to {}), not {n}",
+                        views.places.len()
+                    );
+                    return AppExit::from_code(2);
+                }
+            },
+        },
     };
 
     // The water column of a 3D run: its levels and the section
@@ -511,50 +816,11 @@ fn main() -> AppExit {
     };
     let periodic = Periodic(scenario.periodic.map(|p| p.map(|x| x as f32)));
 
-    // The model times the gauge trace covers
-    let mut span = [0.0, args.hours * 3600.0];
-    let (channel, source, t_end, interval, rate, run_clock) = match replay {
-        Some(replay) => {
-            let source = Source::Replay {
-                name: args
-                    .replay
-                    .as_ref()
-                    .and_then(|d| d.file_name())
-                    .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
-                frames: replay.frames(),
-                t_last: replay.t_last,
-            };
-            let (t_end, interval, clock) = (replay.t_last, replay.interval, replay.clock);
-            span = [replay.t_first, replay.t_last];
-            (
-                replay::spawn(replay, args.threads),
-                source,
-                t_end,
-                interval,
-                args.rate.unwrap_or(3600.0),
-                clock,
-            )
-        }
-        None => {
-            let t_end = args.hours * 3600.0;
-            let channel = solver::spawn(
-                &scenario,
-                SolverConfig {
-                    t_end,
-                    interval: args.interval,
-                    levels: args.levels,
-                    threads: args.threads,
-                    drag: args.drag,
-                    particles: args.particles,
-                },
-                live_save,
-            );
-            let rate = args.rate.unwrap_or(60.0);
-            let clock = scenario.clock;
-            (channel, Source::Solver, t_end, args.interval, rate, clock)
-        }
+    // The model times the gauge trace covers, and the run's clock
+    let (span, run_clock) = match &replay {
+        Some(replay) => ([replay.t_first, replay.t_last], replay.clock),
+        None => ([0.0, args.hours * 3600.0], scenario.clock),
     };
-
     let gauge = match &args.gauge {
         None => None,
         Some(path) => match dg_rs::io::read_tide_gauge_file(path) {
@@ -585,7 +851,73 @@ fn main() -> AppExit {
     if gauge.is_some() && run_clock.is_none() {
         eprintln!("--gauge needs the run's clock: the gauge is not drawn");
     }
-    let trace = Trace::new(&scenario, &locator, span, gauge, run_clock);
+    let trace = Trace::new(&scenario, &locator, gauge_point, span, gauge, run_clock);
+    let mut inspector = inspect::Inspector::new(
+        scenario.mesh.clone(),
+        scenario.ops.clone(),
+        scenario.projection,
+        &scenario.bathymetry.data,
+        scenario.three_d.as_ref().map(|three_d| {
+            three_d
+                .sigma
+                .sigma_rho()
+                .iter()
+                .map(|&s| s as f32)
+                .collect()
+        }),
+    );
+
+    // A snapshot file is read on demand: its frame times, and where to ask for frames
+    let mut on_demand = None;
+    let (channel, source, t_end, interval, rate) = match replay {
+        Some(replay) => {
+            let source = Source::Replay {
+                name: args
+                    .replay
+                    .as_ref()
+                    .and_then(|d| d.file_name())
+                    .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
+                frames: replay.frames(),
+                t_last: replay.t_last,
+            };
+            let (t_end, interval) = (replay.t_last, replay.interval);
+            let channel = match replay::serve(replay, trace.probe().cloned()) {
+                Ok(served) => {
+                    on_demand = Some((served.times, served.requests));
+                    served.messages
+                }
+                Err(replay) => replay::spawn(*replay, args.threads),
+            };
+            (
+                channel,
+                source,
+                t_end,
+                interval,
+                args.rate.unwrap_or(3600.0),
+            )
+        }
+        None => {
+            let t_end = args.hours * 3600.0;
+            let channel = solver::spawn(
+                &scenario,
+                SolverConfig {
+                    t_end,
+                    interval: args.interval,
+                    levels: args.levels,
+                    threads: args.threads,
+                    drag: args.drag,
+                    particles: args.particles,
+                },
+                live_save,
+            );
+            let rate = args.rate.unwrap_or(60.0);
+            (channel, Source::Solver, t_end, args.interval, rate)
+        }
+    };
+    let mut playback = Playback::new(rate, interval, args.memory_mb << 20);
+    if let Some((times, requests)) = on_demand {
+        playback = playback.read_on_demand(times, requests);
+    }
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -613,8 +945,23 @@ fn main() -> AppExit {
     .insert_resource(Colouring::new(args.speed_max))
     .insert_resource(WaterOpacity(args.water_alpha))
     .insert_resource(Title(scenario.name.clone()))
+    .insert_resource(Photo {
+        // The real sun stands over the domain's centre
+        place: scenario.projection.map(|p| {
+            let [x, y] = frame.origin;
+            let (lat, lon) = dg_rs::io::CoordinateProjection::xy_to_geo(&p, x, y);
+            [lat, lon]
+        }),
+        ..args.photo.clone()
+    })
     .insert_resource(trace)
-    .insert_resource(Playback::new(rate, interval, args.memory_mb << 20))
+    .insert_resource({
+        if let Some(at) = args.pin {
+            inspector.pin(at);
+        }
+        inspector
+    })
+    .insert_resource(playback)
     .insert_resource(SolverChannel(Mutex::new(channel)))
     .insert_resource(source)
     .insert_resource(Capture {
@@ -632,6 +979,10 @@ fn main() -> AppExit {
         CameraPlugin,
         HudPlugin,
         TracePlugin,
+        TerrainPlugin,
+        SitePlugin,
+        inspect::InspectPlugin,
+        PhotoPlugin,
     ))
     .add_systems(Startup, move |mut commands: Commands| {
         commands.spawn((
@@ -660,11 +1011,23 @@ fn main() -> AppExit {
     if let Some(clock) = run_clock {
         app.insert_resource(RunClock(clock));
     }
+    if let Some(terrain) = terrain {
+        app.insert_resource(terrain);
+    }
+    if let Some(sites) = sites {
+        app.insert_resource(sites);
+    }
     if let Some((levels, section)) = column {
         app.insert_resource(levels)
             .insert_resource(section)
-            .add_plugins(LayersPlugin);
+            .insert_resource(Stratification::new(args.sheet))
+            .add_plugins((LayersPlugin, StratificationPlugin));
     }
+    // Fira Mono in full in place of Bevy's default subset, which has no ø, æ, å
+    app.world_mut()
+        .resource_mut::<Assets<Font>>()
+        .insert(AssetId::default(), Font::from_bytes(FONT.to_vec()))
+        .expect("the default font's handle");
     app.run()
 }
 
@@ -681,6 +1044,7 @@ fn capture(
     match capture.frames.as_mut() {
         None => {
             let ended = !matches!(playback.solver, SolverState::Running)
+                && !playback.growing()
                 && playback.newest().is_some_and(|t| playback.t >= t);
             if field.t.is_some_and(|t| t >= capture.at) || (field.t.is_some() && ended) {
                 playback.paused = true;
@@ -698,5 +1062,22 @@ fn capture(
                 exit.write(AppExit::Success);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_place_is_named_in_km() {
+        assert_eq!(
+            place("pinnacle, 10.6,-13.8").unwrap(),
+            ("pinnacle".to_string(), [10_600.0, -13_800.0])
+        );
+        // The name may hold commas; the last two fields are the point
+        assert_eq!(place("Hitra, south,1,2").unwrap().0, "Hitra, south");
+        assert!(place("10.6,-13.8").is_err());
+        assert!(place("pinnacle,x,-13.8").is_err());
     }
 }
