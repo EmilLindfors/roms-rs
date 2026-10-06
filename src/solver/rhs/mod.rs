@@ -9,6 +9,7 @@ mod advection_2d;
 pub mod baroclinic;
 mod diffusion_2d;
 mod scalar_1d;
+pub mod subcells;
 mod swe_1d;
 mod swe_2d;
 mod swe_2d_split_form;
@@ -34,14 +35,16 @@ pub use swe_2d::{
     ElementRhsThen, LINEAR_CFL_SAFETY, POSITIVITY_RELAXATION_SAFETY, PositivityBound,
     SUBCELL_CAP_DEPTH_FACTOR, SWE2DRhsConfig, SWEFormulation2D, compute_dt_swe_2d,
     compute_dt_viscosity, compute_rhs_swe_2d, compute_rhs_swe_2d_face_mass_into,
-    compute_rhs_swe_2d_into, compute_rhs_swe_2d_subset_then, compute_rhs_swe_2d_where_into,
-    element_dt_swe_2d, element_dt_viscous_swe_2d, face_mass_len, linear_cfl_subcells_swe_2d,
-    linear_cfl_swe_2d, min_element_dt_swe_2d, positivity_cfl_swe_2d,
+    compute_rhs_swe_2d_into, compute_rhs_swe_2d_mass_fluxes_into, compute_rhs_swe_2d_subset_then,
+    compute_rhs_swe_2d_where_into, element_dt_swe_2d, element_dt_viscous_swe_2d, face_mass_len,
+    linear_cfl_subcells_swe_2d, linear_cfl_swe_2d, min_element_dt_swe_2d, positivity_cfl_swe_2d,
+    subcell_mass_len,
 };
 #[cfg(feature = "parallel")]
 pub use swe_2d::{
     compute_dt_swe_2d_parallel, compute_rhs_swe_2d_parallel,
     compute_rhs_swe_2d_parallel_face_mass_into, compute_rhs_swe_2d_parallel_into,
+    compute_rhs_swe_2d_parallel_mass_fluxes_into,
 };
 pub use swe_2d_viscosity::largest_viscosity_swe_2d;
 
@@ -73,7 +76,8 @@ pub mod transport_3d;
 pub use transport_3d::{
     BarotropicFlux, LayerTransport, MetricForm, MomentumAdvectionForm, VerticalAdvection,
     advective_divergence_element, apply_momentum_transport_3d, apply_tracer_transport_3d,
-    from_inventory, to_inventory, transport_divergence_element, w_cell_thicknesses,
+    apply_tracer_transport_3d_about, from_inventory, subcell_divergence_element, to_inventory,
+    transport_divergence_element, w_cell_thicknesses,
 };
 
 pub mod viscosity_3d;

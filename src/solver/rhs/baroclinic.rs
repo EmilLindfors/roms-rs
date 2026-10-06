@@ -91,6 +91,16 @@
 //! a penalty on the layer velocities' face jumps, nor a gentler slope
 //! (`r_x0` 0.08: blew up after 3 days) stopped the growth of the first row.
 //!
+//! Exact energy exchange is not enough on its own. Rest is stable when a
+//! conserved functional has its minimum there. The split form also conserves
+//! the tracer variance `Σ H_z ρ²`, and for a linear `ρ(z)` energy plus
+//! `g/(2|∂_z ρ|)` times the variance is such a functional. For a curved
+//! profile there is none once a σ-level crosses the pycnocline between two
+//! nodes of one element, as at the cliffs of a fjord coast. There the pair's
+//! chord `Δρ/Δz` is far steeper than the stratification at either node, and
+//! round-off grows (e-folding ≈ 15 min on the Frøya bed, ≈ 45 min in the
+//! x–z cliff of `a_pycnocline_over_a_cliff_stays_at_rest`; TODO P1.3).
+//!
 //! # Balanced reference
 //!
 //! The price of σ-pairs is the σ form's error at rest. A stored reference
@@ -154,6 +164,17 @@
 //! PGF) sitting on a face exerts its force. In a fluid at rest the jump is
 //! zero.
 //!
+//! **Wetting and drying.** A column thinner than `min_column_depth` exerts
+//! and feels no pressure difference, and exchanges no baroclinic transport
+//! ([`crate::solver::rhs::LayerTransport::compute`]). An element with such a
+//! column moves its layers on the GLL subcells of the 2D wet/dry kernel with
+//! their barotropic shares only, so it has no volume term here either: its
+//! columns feel the pressure of their neighbours through its faces alone. (The
+//! DG pairs of a shore element exchanged layer volume with dry nodes that
+//! had no pressure-work partner, and a stratified shore at rest grew within
+//! hours; baroclinic exchange through the subcells with its central-difference
+//! force grew too, with an e-folding of 38 min; TODO P1.3.)
+//!
 //! **Reference density.** The integrated density is `ρ − rho_ref`:
 //! `rho_ref = 0` gives the full PGF, whose `ρ`-uniform part is `−g∇η`
 //! (DG-coupled through the face lift); `rho_ref = ρ₀` gives the
@@ -175,8 +196,10 @@ use crate::vertical::SigmaGrid;
 pub enum PressureGradientForm {
     /// `(p_j − p_i) + ½(ρ_i + ρ_j)(z_j − z_i)` along the σ-level: consistent
     /// in energy with the split-form advection, so a stratified fluid over a
-    /// slope stays stable; the σ form's error at rest for curved profiles
-    /// (take it back with a [`BalancedReference`]).
+    /// slope stays stable (for curved profiles only while no σ-level crosses
+    /// the pycnocline within an element, see the module docs); the σ form's
+    /// error at rest for curved profiles (take it back with a
+    /// [`BalancedReference`]).
     #[default]
     SigmaPairs,
     /// Differences at a common depth (Stelling & van Kester 1994): at rest
@@ -247,6 +270,66 @@ impl BalancedReference {
         }
         Self {
             correction: [zx, zy],
+        }
+    }
+
+    /// The correction of a horizontally uniform reference density
+    /// `profile(z)` (kg/m³), sampled at the levels of `state` (its `η`):
+    /// `−F_σ(ρ_s)`, since the true force of a horizontally uniform field is
+    /// zero (the subtraction of a reference profile of Mellor et al. 1998).
+    /// A fluid resting in the profile then feels no force at all, where
+    /// [`Self::new`] leaves the constant-depth form's interpolation error
+    /// (1.7e-4 m/s² at Frøya's cliff shores for a summer pycnocline, which
+    /// drove 0.6 m/s within half an hour); in motion only the σ-pairs' error
+    /// of the departure from the profile remains. The arguments are
+    /// [`Self::new`]'s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_profile(
+        state: &Solution3D,
+        mesh: &Mesh2D,
+        bathymetry: &Bathymetry2D,
+        sigma: &SigmaGrid,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        g: f64,
+        rho_0: f64,
+        rho_ref: f64,
+        min_column_depth: f64,
+        metric: MetricForm,
+        profile: impl Fn(f64) -> f64,
+    ) -> Self {
+        let nl = sigma.n_levels();
+        let mut reference = state.clone();
+        for (idx, column) in reference.rho.chunks_exact_mut(nl).enumerate() {
+            let eta = state.eta.data[idx];
+            let depth = eta - bathymetry.data[idx];
+            for (rho, &s) in column.iter_mut().zip(sigma.sigma_rho()) {
+                *rho = profile(eta + s * depth);
+            }
+        }
+        let n = reference.rho.len();
+        let (mut fx, mut fy) = (vec![0.0; n], vec![0.0; n]);
+        compute_pressure_gradient(
+            &reference,
+            mesh,
+            bathymetry,
+            sigma,
+            ops,
+            geom,
+            g,
+            rho_0,
+            rho_ref,
+            min_column_depth,
+            PressureGradientForm::SigmaPairs,
+            metric,
+            &mut fx,
+            &mut fy,
+        );
+        for f in fx.iter_mut().chain(fy.iter_mut()) {
+            *f = -*f;
+        }
+        Self {
+            correction: [fx, fy],
         }
     }
 
@@ -640,83 +723,102 @@ fn pressure_gradient_element(
     py: &mut [f64],
     dp: &mut [f64],
 ) {
-    let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
-    let nl = sigma.n_levels();
-    {
-        let el = ElementIndex::new(k);
-        for i in 0..nn {
-            own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
-        }
-        px.fill(0.0);
-        py.fill(0.0);
+    let nn = ops.n_nodes;
+    let el = ElementIndex::new(k);
+    for i in 0..nn {
+        own.fill(i, state, bathymetry, sigma, el, i, rho_ref);
+    }
+    px.fill(0.0);
+    py.fill(0.0);
 
-        // Volume term: Σ_j Dx_ij Δp_ij, with Δp_ji = −Δp_ij, and the metric
-        // of the pair in the advection's form (see "Curvilinear elements")
-        let averaged = metric.averaged_on(geom, k);
-        for i in 0..nn {
-            let a = own.view(i);
-            let (ar_i, as_i) = geom.contravariant(k, i);
-            let j_inv_i = geom.jacobian_inv(k, i);
-            for j in i + 1..nn {
-                let b = own.view(j);
-                let (ar_j, as_j) = geom.contravariant(k, j);
-                let j_inv_j = geom.jacobian_inv(k, j);
-                // The contravariant vectors the pair is differenced with at
-                // i and at j: each node's own, or both their mean
-                let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
-                    let mean =
-                        |a: (f64, f64), b: (f64, f64)| (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
-                    let m = (mean(ar_i, ar_j), mean(as_i, as_j));
-                    (m, m)
-                } else {
-                    ((ar_i, as_i), (ar_j, as_j))
-                };
-                let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
-                let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
-                let (dx_ij, dy_ij) = (
-                    j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
-                    j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
-                );
-                let (dx_ji, dy_ji) = (
-                    j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
-                    j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
-                );
-                pressure_differences(&a, &b, form, dp);
-                for (l, &dp) in dp.iter().enumerate() {
-                    px[i * nl + l] += dx_ij * dp;
-                    py[i * nl + l] += dy_ij * dp;
-                    px[j * nl + l] -= dx_ji * dp;
-                    py[j * nl + l] -= dy_ji * dp;
+    // An element with a thin column moves its layers on the GLL subcells
+    // with their barotropic shares only (`LayerTransport`): no baroclinic
+    // exchange within it, so no force within it either
+    if own.wet[..nn].iter().all(|&w| w) {
+        dg_volume_term(k, ops, geom, form, metric, own, px, py, dp);
+    }
+
+    // Face terms: LIFT (n·(p* − p⁻)), p* − p⁻ = ½ Δp at a common depth
+    let (nfn, nl) = (ops.n_face_nodes, own.n_levels);
+    for f in 0..4 {
+        let Some(nb) = mesh.neighbor(el, f) else {
+            continue;
+        };
+        let nb_el = ElementIndex::new(nb.element);
+        for fi in 0..nfn {
+            let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
+            across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
+        }
+        for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
+            pressure_differences(&own.view(node), &across.view(fi), form, dp);
+            let normal = geom.normal(k, f, fi);
+            let lift_scale = geom.lift_scale(k, f, fi, node);
+            for (l, &dp) in dp.iter().enumerate() {
+                let jump = 0.5 * dp;
+                if jump == 0.0 {
+                    continue;
+                }
+                let (jx, jy) = (lift_scale * normal.0 * jump, lift_scale * normal.1 * jump);
+                for i in 0..nn {
+                    let lift = ops.lift[f][(i, fi)];
+                    px[i * nl + l] += lift * jx;
+                    py[i * nl + l] += lift * jy;
                 }
             }
         }
+    }
+}
 
-        // Face terms: LIFT (n·(p* − p⁻)), p* − p⁻ = ½ Δp at a common depth
-        for f in 0..4 {
-            let Some(nb) = mesh.neighbor(el, f) else {
-                continue;
+/// The DG volume term of `pressure_gradient_element`: `Σ_j Dx_ij Δp_ij`,
+/// with `Δp_ji = −Δp_ij`, and the metric of the pair in the advection's form
+/// (see "Curvilinear elements").
+#[allow(clippy::too_many_arguments)]
+fn dg_volume_term(
+    k: usize,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    form: PressureGradientForm,
+    metric: MetricForm,
+    own: &Columns,
+    px: &mut [f64],
+    py: &mut [f64],
+    dp: &mut [f64],
+) {
+    let (nn, nl) = (ops.n_nodes, own.n_levels);
+    let averaged = metric.averaged_on(geom, k);
+    for i in 0..nn {
+        let a = own.view(i);
+        let (ar_i, as_i) = geom.contravariant(k, i);
+        let j_inv_i = geom.jacobian_inv(k, i);
+        for j in i + 1..nn {
+            let b = own.view(j);
+            let (ar_j, as_j) = geom.contravariant(k, j);
+            let j_inv_j = geom.jacobian_inv(k, j);
+            // The contravariant vectors the pair is differenced with at i
+            // and at j: each node's own, or both their mean
+            let ((ar_ij, as_ij), (ar_ji, as_ji)) = if averaged {
+                let mean = |a: (f64, f64), b: (f64, f64)| (0.5 * (a.0 + b.0), 0.5 * (a.1 + b.1));
+                let m = (mean(ar_i, ar_j), mean(as_i, as_j));
+                (m, m)
+            } else {
+                ((ar_i, as_i), (ar_j, as_j))
             };
-            let nb_el = ElementIndex::new(nb.element);
-            for fi in 0..nfn {
-                let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
-                across.fill(fi, state, bathymetry, sigma, nb_el, nb_node, rho_ref);
-            }
-            for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
-                pressure_differences(&own.view(node), &across.view(fi), form, dp);
-                let normal = geom.normal(k, f, fi);
-                let lift_scale = geom.lift_scale(k, f, fi, node);
-                for (l, &dp) in dp.iter().enumerate() {
-                    let jump = 0.5 * dp;
-                    if jump == 0.0 {
-                        continue;
-                    }
-                    let (jx, jy) = (lift_scale * normal.0 * jump, lift_scale * normal.1 * jump);
-                    for i in 0..nn {
-                        let lift = ops.lift[f][(i, fi)];
-                        px[i * nl + l] += lift * jx;
-                        py[i * nl + l] += lift * jy;
-                    }
-                }
+            let (dr_ij, ds_ij) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+            let (dr_ji, ds_ji) = (ops.dr[(j, i)], ops.ds[(j, i)]);
+            let (dx_ij, dy_ij) = (
+                j_inv_i * (ar_ij.0 * dr_ij + as_ij.0 * ds_ij),
+                j_inv_i * (ar_ij.1 * dr_ij + as_ij.1 * ds_ij),
+            );
+            let (dx_ji, dy_ji) = (
+                j_inv_j * (ar_ji.0 * dr_ji + as_ji.0 * ds_ji),
+                j_inv_j * (ar_ji.1 * dr_ji + as_ji.1 * ds_ji),
+            );
+            pressure_differences(&a, &b, form, dp);
+            for (l, &dp) in dp.iter().enumerate() {
+                px[i * nl + l] += dx_ij * dp;
+                py[i * nl + l] += dy_ij * dp;
+                px[j * nl + l] -= dx_ji * dp;
+                py[j * nl + l] -= dy_ji * dp;
             }
         }
     }
@@ -942,6 +1044,63 @@ mod tests {
                 "P{order}, {} m, σ-pairs: spurious |F| = {sigma_pairs:.3e} m/s²",
                 3000 / nx
             );
+        }
+    }
+
+    /// The profile reference ([`BalancedReference::from_profile`]) on the
+    /// review's stratified fjord: at rest in the profile the σ-pairs force
+    /// vanishes exactly (the state reference leaves the constant-depth form's
+    /// interpolation error, ≈ 2e-7–2e-6 m/s² here), and a departure from the
+    /// profile that is uniform in each column (a horizontal density gradient)
+    /// feels exactly the σ-pairs force of the departure alone: adding it
+    /// leaves the monotone Hermite slopes, so the pressure differences are
+    /// linear in it.
+    #[test]
+    fn a_reference_profile_balances_the_fjord_at_rest_exactly() {
+        let a = 1e-4;
+        for (order, nx) in [(1, 6), (3, 12)] {
+            for anomaly in [0.0, a] {
+                let case = |rho: &dyn Fn(f64, f64) -> f64| {
+                    Column3D::new(
+                        3000.0,
+                        nx,
+                        order,
+                        SigmaGrid::new(30, SongHaidvogelStretching::new(5.0, 0.4, 10.0)),
+                        fjord_bed,
+                        |_| 0.0,
+                        rho,
+                    )
+                };
+                let stratified = case(&|x, z| pycnocline(z) + anomaly * (x - 1500.0));
+                let reference = BalancedReference::from_profile(
+                    &stratified.state,
+                    &stratified.mesh,
+                    &stratified.bathymetry,
+                    &stratified.sigma,
+                    &stratified.ops,
+                    &stratified.geom,
+                    G,
+                    RHO0,
+                    RHO0,
+                    0.0,
+                    MetricForm::Conservative,
+                    pycnocline,
+                );
+                let (mut fx, mut fy) = stratified.pgf(RHO0, PressureGradientForm::SigmaPairs);
+                reference.add_to(&mut fx, &mut fy);
+                let departure = case(&|x, _| RHO0 + anomaly * (x - 1500.0));
+                let (dx, dy) = departure.pgf(RHO0, PressureGradientForm::SigmaPairs);
+                let error = largest(
+                    &fx.iter().zip(&dx).map(|(f, d)| f - d).collect::<Vec<_>>(),
+                    &fy.iter().zip(&dy).map(|(f, d)| f - d).collect::<Vec<_>>(),
+                );
+                // Measured 0 at rest, ≤ 5.5e-17 with the departure (the
+                // round-off of the profile's forces, ≈ 1e-3 m/s², cancelling)
+                assert!(
+                    error < 1e-14,
+                    "P{order}, anomaly {anomaly}: off the departure's force by {error:.3e} m/s²"
+                );
+            }
         }
     }
 

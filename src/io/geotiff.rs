@@ -22,7 +22,7 @@ use std::fs::File;
 use std::path::Path;
 
 use thiserror::Error;
-use tiff::decoder::{Decoder, DecodingResult};
+use tiff::decoder::{ChunkType, Decoder, DecodingResult};
 use tiff::tags::Tag;
 
 use super::projection::GeoBoundingBox;
@@ -171,6 +171,67 @@ pub struct GeoTiffBathymetry {
     nodata: f32,
 }
 
+/// The pixel values as `f32`.
+fn to_f32(result: DecodingResult) -> Vec<f32> {
+    match result {
+        DecodingResult::U8(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::U16(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::U32(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::U64(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::F32(data) => data,
+        DecodingResult::F64(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::I8(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::I16(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::I32(data) => data.into_iter().map(|v| v as f32).collect(),
+        DecodingResult::I64(data) => data.into_iter().map(|v| v as f32).collect(),
+    }
+}
+
+/// The image's `width` × `height` pixels, row-major from the top.
+///
+/// A chunk (tile or strip) with no bytes is sparse, as GDAL writes a block
+/// that is all no-data or all zero: it reads as `sparse` (the no-data value,
+/// else 0), as GDAL reads it. The `tiff` crate (0.9) does not know sparse
+/// chunks and decodes garbage from offset 0 for them: Kartverket's 1 m level
+/// writes its flat-sea tiles sparse (64 of 144 tiles around the Kattholmen
+/// farm), which read as values up to 10³⁵. Files without sparse chunks are
+/// decoded whole.
+fn read_pixels(
+    decoder: &mut Decoder<File>,
+    width: u32,
+    height: u32,
+    sparse: f32,
+) -> Result<Vec<f32>, GeoTiffError> {
+    let counts_tag = match decoder.get_chunk_type() {
+        ChunkType::Tile => Tag::TileByteCounts,
+        ChunkType::Strip => Tag::StripByteCounts,
+    };
+    let counts = decoder.get_tag_u64_vec(counts_tag)?;
+    if counts.iter().all(|&count| count > 0) {
+        return Ok(to_f32(decoder.read_image()?));
+    }
+    let (width, height) = (width as usize, height as usize);
+    let mut pixels = vec![sparse; width * height];
+    let (chunk_width, chunk_height) = decoder.chunk_dimensions();
+    let across = width.div_ceil(chunk_width as usize);
+    for (index, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let (data_width, data_height) = decoder.chunk_data_dimensions(index as u32);
+        let data = to_f32(decoder.read_chunk(index as u32)?);
+        let col0 = (index % across) * chunk_width as usize;
+        let row0 = (index / across) * chunk_height as usize;
+        let data_width = data_width as usize;
+        for r in 0..(data_height as usize).min(height - row0) {
+            let start = (row0 + r) * width + col0;
+            pixels[start..start + data_width]
+                .copy_from_slice(&data[r * data_width..(r + 1) * data_width]);
+        }
+    }
+    Ok(pixels)
+}
+
 impl GeoTiffBathymetry {
     /// Load bathymetry from a GeoTIFF file.
     ///
@@ -224,27 +285,13 @@ impl GeoTiffBathymetry {
                 )
             })?,
         };
-        let nodata = decoder
+        let nodata_tag = decoder
             .get_tag_ascii_string(GDAL_NODATA)
             .ok()
-            .and_then(|s| s.trim_matches(char::from(0)).trim().parse::<f32>().ok())
-            .unwrap_or(-9999.0);
+            .and_then(|s| s.trim_matches(char::from(0)).trim().parse::<f32>().ok());
+        let nodata = nodata_tag.unwrap_or(-9999.0);
 
-        // Decode the image
-        let result = decoder.read_image()?;
-
-        let depths_flat: Vec<f32> = match result {
-            DecodingResult::U8(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::U16(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::U32(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::U64(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::F32(data) => data,
-            DecodingResult::F64(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::I8(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::I16(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::I32(data) => data.into_iter().map(|v| v as f32).collect(),
-            DecodingResult::I64(data) => data.into_iter().map(|v| v as f32).collect(),
-        };
+        let depths_flat = read_pixels(&mut decoder, width, height, nodata_tag.unwrap_or(0.0))?;
 
         // Convert flat array to 2D array
         let mut depths = Vec::with_capacity(height as usize);
@@ -569,6 +616,105 @@ mod tests {
 
     /// Geographic (EPSG:4326), PixelIsArea
     const GEOGRAPHIC: [u16; 16] = [1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326];
+
+    /// Write a 40 × 16 Float32 GeoTIFF in three 16 × 16 tiles (the last
+    /// partial) with pixel value row·100 + col + 1, and the middle tile
+    /// sparse (no bytes, offset 0), as GDAL and Kartverket's service write an
+    /// all-zero tile; with a GDAL no-data tag if given. Written by hand: the
+    /// `tiff` crate's encoder writes neither tiles nor sparse chunks.
+    fn write_sparse_tiled(name: &str, nodata: Option<&str>) -> std::path::PathBuf {
+        const TILE: u32 = 16;
+        let path = std::env::temp_dir().join(format!("dg_rs_geotiff_{name}.tif"));
+        let tile = |t: u32| -> Vec<u8> {
+            (0..TILE)
+                .flat_map(|r| (0..TILE).map(move |c| (r, t * TILE + c)))
+                .flat_map(|(r, c)| ((r * 100 + c + 1) as f32).to_le_bytes())
+                .collect()
+        };
+        // Header, then tiles 0 and 2, then the arrays the IFD points to
+        let mut bytes: Vec<u8> = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
+        let tile_offsets = [8u32, 0, 8 + 4 * TILE * TILE];
+        let tile_counts = [4 * TILE * TILE, 0, 4 * TILE * TILE];
+        bytes.extend(tile(0));
+        bytes.extend(tile(2));
+        let extra = |bytes: &mut Vec<u8>, data: Vec<u8>| -> u32 {
+            let at = bytes.len() as u32;
+            bytes.extend(data);
+            at
+        };
+        let le32 = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let le64 = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let offsets_at = extra(&mut bytes, le32(&tile_offsets));
+        let counts_at = extra(&mut bytes, le32(&tile_counts));
+        let scale_at = extra(&mut bytes, le64(&[0.01, 0.01, 0.0]));
+        let tie_at = extra(&mut bytes, le64(&[0.0, 0.0, 0.0, 8.0, 64.0, 0.0]));
+        let keys: Vec<u8> = GEOGRAPHIC.iter().flat_map(|k| k.to_le_bytes()).collect();
+        let keys_at = extra(&mut bytes, keys);
+        let nodata = nodata.map(|s| format!("{s}\0"));
+        let nodata_at = nodata
+            .as_ref()
+            .map(|s| extra(&mut bytes, s.as_bytes().to_vec()));
+        // (tag, type, count, value or offset): SHORT 3, LONG 4, ASCII 2, DOUBLE 12
+        let mut entries: Vec<(u16, u16, u32, u32)> = vec![
+            (256, 4, 1, 40),
+            (257, 4, 1, TILE),
+            (258, 3, 1, 32),
+            (259, 3, 1, 1),
+            (262, 3, 1, 1),
+            (277, 3, 1, 1),
+            (322, 4, 1, TILE),
+            (323, 4, 1, TILE),
+            (324, 4, 3, offsets_at),
+            (325, 4, 3, counts_at),
+            (339, 3, 1, 3),
+            (33550, 12, 3, scale_at),
+            (33922, 12, 6, tie_at),
+            (34735, 3, 16, keys_at),
+        ];
+        if let (Some(s), Some(at)) = (&nodata, nodata_at) {
+            entries.push((42113, 2, s.len() as u32, at));
+        }
+        if bytes.len() % 2 == 1 {
+            bytes.push(0);
+        }
+        let ifd_at = bytes.len() as u32;
+        bytes[4..8].copy_from_slice(&ifd_at.to_le_bytes());
+        bytes.extend((entries.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in entries {
+            bytes.extend(tag.to_le_bytes());
+            bytes.extend(kind.to_le_bytes());
+            bytes.extend(count.to_le_bytes());
+            bytes.extend(value.to_le_bytes());
+        }
+        bytes.extend(0u32.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Regression: a sparse tile (no bytes) read as garbage from offset 0
+    /// (the `tiff` crate does not know them), up to 10³⁵ in Kartverket's
+    /// 1 m level, whose flat-sea tiles are sparse. It reads as 0, or as
+    /// no-data with a no-data tag; the other tiles, the partial one too, are
+    /// in place.
+    #[test]
+    fn sparse_tiles_read_as_zero_or_no_data() {
+        let bathy = GeoTiffBathymetry::load(write_sparse_tiled("sparse", None)).unwrap();
+        assert_eq!(bathy.dimensions(), (40, 16));
+        for row in 0..16 {
+            for col in 0..40 {
+                let expected = if (16..32).contains(&col) {
+                    0.0
+                } else {
+                    (row * 100 + col + 1) as f64
+                };
+                assert_eq!(bathy.pixel(row, col), Some(expected), "({row}, {col})");
+            }
+        }
+        let bathy =
+            GeoTiffBathymetry::load(write_sparse_tiled("sparse_nodata", Some("-9999"))).unwrap();
+        assert_eq!(bathy.pixel(3, 20), None);
+        assert_eq!(bathy.pixel(3, 35), Some(336.0));
+    }
 
     /// Origin (7°E, 64°N), 0.5° × 0.25° pixels: extent 7–9°E, 63.25–64°N
     const TRANSFORMATION: [f64; 16] = [

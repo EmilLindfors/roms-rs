@@ -147,6 +147,58 @@ impl CageGrid {
     }
 }
 
+/// The frame of a site in mesh coordinates, divided into cells of about a
+/// given size: [`FarmSite::frame_cells`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FrameCells {
+    /// The frame's corners, in order around it
+    pub corners: [[f64; 2]; 4],
+    /// Cells along the first side (corner 0 to 1) and along the second (1 to 2)
+    pub n_s: usize,
+    pub n_t: usize,
+}
+
+impl FrameCells {
+    /// The point at frame coordinates `(s, t)` ∈ [0, 1]²: bilinear in the
+    /// corners, `s` along the first side, `t` along the second.
+    pub fn point(&self, s: f64, t: f64) -> [f64; 2] {
+        let [p0, p1, p2, p3] = self.corners;
+        [0, 1].map(|d| {
+            (1.0 - s) * (1.0 - t) * p0[d]
+                + s * (1.0 - t) * p1[d]
+                + s * t * p2[d]
+                + (1.0 - s) * t * p3[d]
+        })
+    }
+
+    /// The cell centres, row by row along the first side.
+    pub fn centres(&self) -> Vec<[f64; 2]> {
+        (0..self.n_t)
+            .flat_map(|j| {
+                (0..self.n_s).map(move |i| {
+                    let s = (i as f64 + 0.5) / self.n_s as f64;
+                    let t = (j as f64 + 0.5) / self.n_t as f64;
+                    self.point(s, t)
+                })
+            })
+            .collect()
+    }
+
+    /// The frame's lines: its sides and the lines between the cells, each
+    /// as its two ends.
+    pub fn lines(&self) -> Vec<[[f64; 2]; 2]> {
+        let across = (0..=self.n_s).map(|i| {
+            let s = i as f64 / self.n_s as f64;
+            [self.point(s, 0.0), self.point(s, 1.0)]
+        });
+        let along = (0..=self.n_t).map(|j| {
+            let t = j as f64 / self.n_t as f64;
+            [self.point(0.0, t), self.point(1.0, t)]
+        });
+        across.chain(along).collect()
+    }
+}
+
 /// Read a farm site file (see the [module docs](self)).
 pub fn read_farm_site_file(path: impl AsRef<Path>) -> Result<FarmSite, FarmSiteError> {
     parse_farm_site_str(&std::fs::read_to_string(path)?)
@@ -264,6 +316,26 @@ impl FarmSite {
             .collect()
     }
 
+    /// The frame in mesh coordinates, in cells of about `spacing` m: the
+    /// boundary if it has four vertices, else the rectangle along its
+    /// longest edge that holds it (see the [module docs](self)). `None`
+    /// without a boundary polygon.
+    pub fn frame_cells(
+        &self,
+        projection: &impl CoordinateProjection,
+        spacing: f64,
+    ) -> Option<FrameCells> {
+        let corners = self.frame(projection)?;
+        let [p0, p1, p2, p3] = corners;
+        let length = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]).hypot(b[1] - a[1]);
+        let cells = |l: f64| ((l / spacing).round() as usize).max(1);
+        Some(FrameCells {
+            corners,
+            n_s: cells(0.5 * (length(p0, p1) + length(p3, p2))),
+            n_t: cells(0.5 * (length(p1, p2) + length(p0, p3))),
+        })
+    }
+
     /// The four corners of the frame in mesh coordinates, in order around
     /// it: the boundary if it has four vertices, else the rectangle along
     /// its longest edge that holds it.
@@ -325,27 +397,8 @@ impl FarmSite {
                 .map(|c| project(projection, c.position))
                 .collect();
         }
-        let Some([p0, p1, p2, p3]) = self.frame(projection) else {
-            return Vec::new();
-        };
-        let length = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]).hypot(b[1] - a[1]);
-        let cells = |l: f64| ((l / spacing).round() as usize).max(1);
-        let n_s = cells(0.5 * (length(p0, p1) + length(p3, p2)));
-        let n_t = cells(0.5 * (length(p1, p2) + length(p0, p3)));
-        let mut centres = Vec::with_capacity(n_s * n_t);
-        for j in 0..n_t {
-            let t = (j as f64 + 0.5) / n_t as f64;
-            for i in 0..n_s {
-                let s = (i as f64 + 0.5) / n_s as f64;
-                centres.push([0, 1].map(|d| {
-                    (1.0 - s) * (1.0 - t) * p0[d]
-                        + s * (1.0 - t) * p1[d]
-                        + s * t * p2[d]
-                        + (1.0 - s) * t * p3[d]
-                }));
-            }
-        }
-        centres
+        self.frame_cells(projection, spacing)
+            .map_or_else(Vec::new, |frame| frame.centres())
     }
 
     /// The site's cages as [`NetCage`]s in mesh coordinates (see the
@@ -436,6 +489,34 @@ mooring 8.6808167 63.8726000 8.6856500 63.8724667 farm
             gap(xy[0], xy[2])
         );
         assert!(cages.iter().all(|c| c.net_depth == 20.0));
+    }
+
+    /// The frame's lines are its sides and the lines between its cells, and
+    /// the cages sit at the cells' centres.
+    #[test]
+    fn the_frame_lines_bound_the_cells() {
+        let site = parse_farm_site_str(KATTHOLMEN).unwrap();
+        let projection = LocalProjection::new(63.871, 8.679);
+        let frame = site.frame_cells(&projection, 90.0).unwrap();
+        assert_eq!((frame.n_s, frame.n_t), (2, 4));
+        let lines = frame.lines();
+        assert_eq!(lines.len(), (frame.n_s + 1) + (frame.n_t + 1));
+        // The sides are the boundary's: corners 0-3 (s = 0) and 0-1 (t = 0)
+        let boundary = site.boundary_xy(&projection);
+        let close = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < 1e-9;
+        assert!(close(lines[0][0], boundary[0]) && close(lines[0][1], boundary[3]));
+        assert!(close(lines[frame.n_s + 1][0], boundary[0]));
+        assert!(close(lines[frame.n_s + 1][1], boundary[1]));
+        // Each centre is the mean of its cell's corners on a parallelogram,
+        // and the layout's cages are the centres
+        let centres = frame.centres();
+        let cages = site.cage_layout(&projection, &CageGrid::new(90.0, 25.0, 20.0));
+        assert!(
+            centres
+                .iter()
+                .zip(&cages)
+                .all(|(&p, c)| close(p, centre(c)))
+        );
     }
 
     /// `cage` lines win over the frame, with their own dimensions; a

@@ -1,29 +1,33 @@
 //! What is shown and how far the solver has got (top left), the colour scales of the
 //! water and of the bed's depth (bottom left) and the keys (bottom right; H hides
 //! them). In a 3D run the status also names the layer the water shows, what the
-//! section shows, and the particles of each kind.
+//! section shows, and the particles of each kind. The photo view ([`crate::photo`])
+//! has no water colour scale; the status names its wind.
 
 use bevy::prelude::*;
 use bevy::text::FontSize;
 use bevy::ui::{BackgroundGradient, ColorStop, LinearGradient};
 use dg_rs::time::ModelClock;
 
+use crate::camera::{DIGITS, OrbitCamera, Views};
 use crate::cloud_3d::KINDS;
 use crate::colormap::{SEABED, srgb_at};
 use crate::contours::Contours;
-use crate::field::ShownLayer;
+use crate::field::{Frame, ShownLayer};
 use crate::layers::{Levels, Section, SectionShows};
+use crate::stratification::{SheetShows, Stratification};
 use crate::particles::{ACTIVE, DEAD, EXITED, Particles, SETTLED, STRANDED};
+use crate::photo::Photo;
 use crate::playback::{Playback, SolverState, Source};
 use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 
-// ASCII only: Bevy's default font has no arrows or middle dots.
-const KEYS: &str = "Space pause   [ ] rate   Left/Right seek   Home/End\n\
-C colour   T water   - = water opacity   B contours   A arrows\n\
+const KEYS: &str = "Space pause   [ ] rate   ← → seek   Home/End\n\
+C colour   T water   - = water opacity   B contours   L land   A arrows\n\
 P particles   F close-up   O overview   G gauge trace   H keys\n\
+R photo view   W wind speed   Shift+W wind direction\n\
 drag orbit   right-drag pan   wheel zoom";
 /// The keys of a 3D run, added to [`KEYS`].
-const KEYS_3D: &str = ", . layer (depth mean, surface ... bed)   V section";
+const KEYS_3D: &str = ", . layer (depth mean, surface … bed)   V section   N stratification sheet";
 
 /// The scenario's one-line description, heading the status.
 #[derive(Resource)]
@@ -65,7 +69,7 @@ pub struct HudPlugin;
 impl Plugin for HudPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn)
-            .add_systems(Update, (status, scale, bed_scale, help));
+            .add_systems(Update, (status, scale, bed_scale, help, photo_scale));
     }
 }
 
@@ -83,11 +87,22 @@ fn font(size: f32) -> TextFont {
     }
 }
 
-fn spawn(mut commands: Commands, levels: Option<Res<Levels>>) {
-    let keys = match levels {
+fn spawn(mut commands: Commands, levels: Option<Res<Levels>>, views: Res<Views>) {
+    let mut keys = match levels {
         Some(_) => format!("{KEYS_3D}\n{KEYS}"),
         None => KEYS.to_string(),
     };
+    // The places the number keys frame: `1 name   2 name …`
+    let places: Vec<String> = views
+        .places
+        .iter()
+        .take(DIGITS.len())
+        .enumerate()
+        .map(|(i, (name, _))| format!("{} {name}", i + 1))
+        .collect();
+    if !places.is_empty() {
+        keys = format!("{}\n{keys}", places.join("   "));
+    }
     commands.spawn((
         Status,
         Text::new(""),
@@ -189,6 +204,11 @@ fn status(
     particles: Res<Particles>,
     shown: Res<ShownLayer>,
     column: Option<(Res<Levels>, Res<Section>)>,
+    sheet: Option<Res<Stratification>>,
+    photo: Res<Photo>,
+    frame: Res<Frame>,
+    sun: Option<Res<crate::photo::Sun>>,
+    camera: Query<&OrbitCamera>,
     mut text: Query<&mut Text, With<Status>>,
 ) {
     let Ok(mut text) = text.single_mut() else {
@@ -214,7 +234,7 @@ fn status(
                 format!(" ({} UTC)", &c.0.format(playback.t)[..16])
             });
             s += &format!(
-                "t = {}{date}   x{:.0}{state}\n",
+                "t = {}{date}   ×{:.0}{state}\n",
                 clock(playback.t),
                 playback.rate
             );
@@ -237,6 +257,24 @@ fn status(
             clock(newest),
             clock(*t_last)
         ),
+        (Source::Replay { name, .. }, SolverState::Finished { .. })
+            if let Some(file) = &playback.on_demand =>
+        {
+            // A file a run is still writing
+            let growing = match file.grew {
+                Some(wall) if playback.growing() => {
+                    let ago = playback.started_secs() - wall;
+                    format!(", growing (last frame {ago:.0} s ago)")
+                }
+                _ => String::new(),
+            };
+            format!(
+                "replay of {name}: {} frames {} apart{growing}, read as shown,\n\
+                 linear in time between them\n",
+                file.times.len(),
+                clock(playback.interval)
+            )
+        }
         (Source::Replay { name, frames, .. }, SolverState::Finished { wall, .. }) => format!(
             "replay of {name}: {frames} frames {} apart (read in {wall:.0} s),\n\
              linear in time between them\n",
@@ -244,7 +282,14 @@ fn status(
         ),
         (Source::Replay { .. }, SolverState::Failed(e)) => format!("replay failed: {e}\n"),
     };
-    if let (Some(lo), Some(hi)) = (playback.oldest(), playback.newest()) {
+    if let Some(file) = &playback.on_demand {
+        s += &format!(
+            "holding {} of {} frames ({:.0} MB)",
+            playback.frames.len(),
+            file.times.len(),
+            playback.bytes() as f64 / 1e6
+        );
+    } else if let (Some(lo), Some(hi)) = (playback.oldest(), playback.newest()) {
         s += &format!(
             "kept {} to {} ({} snapshots, {:.0} MB)",
             clock(lo),
@@ -273,6 +318,18 @@ fn status(
             }
             (SectionShows::Temperature, _, None) => "\nsection: temperature (V)".into(),
             (SectionShows::Off, ..) => "\nsection: off (V)".into(),
+        };
+    }
+    if let Some(sheet) = &sheet {
+        let (name, unit) = sheet.shows.describe();
+        s += &match (sheet.shows, sheet.threshold(), sheet.depth_scale()) {
+            (SheetShows::Off, ..) => "\nsheet: off (N)".into(),
+            (_, Some(threshold), Some([shallow, deep])) => format!(
+                "\nsheet: {name} at its strongest, {shallow:.0} (yellow) to {deep:.0} m deep \
+                 (blue);\n  cut out below {threshold:.1e} {unit}; {} columns (N)",
+                sheet.shown_columns
+            ),
+            _ => format!("\nsheet: {name} (N)"),
         };
     }
     let counts = particles.counts;
@@ -305,13 +362,46 @@ fn status(
             s += " (hidden, P)";
         }
     }
-    s += &match *style {
-        SurfaceStyle::Translucent => {
+    s += &match (photo.on, *style) {
+        (true, _) if photo.wind_speed > 0.0 => format!(
+            "\nphoto view (R): wind {:.0} m/s from {} (W, Shift+W), fetch {:.0} km",
+            photo.wind_speed,
+            photo.wind_name(),
+            photo.fetch / 1e3
+        ),
+        (true, _) => "\nphoto view (R): calm (W)".into(),
+        (false, SurfaceStyle::Translucent) => {
             format!("\nwater {:.0} % opaque (- =)", 100.0 * opacity.0)
         }
-        SurfaceStyle::Opaque => "\nwater opaque (T)".into(),
-        SurfaceStyle::Hidden => "\nwater hidden (T)".into(),
+        (false, SurfaceStyle::Opaque) => "\nwater opaque (T)".into(),
+        (false, SurfaceStyle::Hidden) => "\nwater hidden (T)".into(),
     };
+    if photo.on
+        && let Some(sun) = &sun
+    {
+        let place = if sun.real {
+            "at the shown time"
+        } else {
+            "the scene's light"
+        };
+        s += &format!(
+            "\nsun {:.0}° {} the horizon in the {} ({place})",
+            sun.elevation.abs(),
+            if sun.elevation >= 0.0 { "above" } else { "below" },
+            crate::photo::compass(sun.azimuth)
+        );
+    }
+    // The view as `--eye` gives it, to come back to it
+    if photo.on
+        && let Ok(camera) = camera.single()
+    {
+        let (at, height, bearing, tilt) = crate::photo::eye_of(camera, &frame);
+        s += &format!(
+            "\n--eye {:.3},{:.3},{height:.0},{bearing:.0},{tilt:.1}",
+            at[0] / 1e3,
+            at[1] / 1e3
+        );
+    }
     if text.0 != s {
         text.0 = s;
     }
@@ -386,6 +476,26 @@ fn bed_scale(
     for (tick, mut text) in &mut ticks {
         let depth = bed.shallow + (bed.deep - bed.shallow) * tick.0 as f32 / 2.0;
         text.0 = format!("{depth:.0}");
+    }
+}
+
+/// The water's colour scale: its title, bar and labels.
+type WaterScale = Or<(With<Bar>, With<Tick>, With<ScaleTitle>)>;
+
+/// The water's colour scale has nothing to say in the photo view.
+fn photo_scale(
+    photo: Res<Photo>,
+    mut parts: Query<&mut Visibility, WaterScale>,
+) {
+    if !photo.is_changed() {
+        return;
+    }
+    for mut visibility in &mut parts {
+        *visibility = if photo.on {
+            Visibility::Hidden
+        } else {
+            Visibility::Inherited
+        };
     }
 }
 

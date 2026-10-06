@@ -1,8 +1,21 @@
 //! 3D Simulation Runner.
 //!
 //! Specialized runner for 3D hydrostatic simulations using mode splitting.
+//!
+//! # Restarts
+//!
+//! A run can stop between two steps and resume bit for bit.
+//! [`Simulation3D::restart`] (between runs) or [`RunContext3D::restart`] (from
+//! a callback of [`Simulation3D::run_with_context_callback`], without changing
+//! the steps the run takes) captures a [`Restart3D`], which
+//! [`Restart3D::write`] saves. A new process builds the same physics,
+//! [`Simulation3D::resume`]s from the file and runs on from
+//! [`Restart3D::time`] with [`Restart3D::state`]. A restart taken in a
+//! callback is at a callback time, so the resumed run's callbacks fall where
+//! the uninterrupted run's do; its first callback repeats the restart's time.
 
 use crate::boundary::SWEBoundaryCondition2D;
+use crate::io::{Restart3D, RestartError, domain_fingerprint};
 use crate::physics::eos::EquationOfState;
 use crate::physics::hydrostatic_3d::Hydrostatic3D;
 use crate::physics::traits::PhysicsModule; // For 2D trait bounds
@@ -81,6 +94,51 @@ where
         &self.integrator
     }
 
+    /// The physics (e.g. for
+    /// [`Hydrostatic3D::take_implicit_advection_stats`] after a run).
+    pub fn physics(&self) -> &Hydrostatic3D<EOS, MIX, BC> {
+        &self.physics
+    }
+
+    /// The run's state between two steps, at time `t`, to save with
+    /// [`Restart3D::write`] (see the [module docs](self)).
+    pub fn restart(&self, state: &Solution3D, t: f64) -> Restart3D {
+        capture_restart(&self.physics, &self.integrator, state, t)
+    }
+
+    /// Continue the run `restart` holds: check that it is of this domain
+    /// (mesh, bed, σ-grid), and take its slow-forcing history and vertical
+    /// reference. Then run from [`Restart3D::time`] with [`Restart3D::state`].
+    /// The physics must be built as the restarted run's was: its forcing,
+    /// boundaries and options are not in the file.
+    pub fn resume(&mut self, restart: &Restart3D) -> Result<(), RestartError> {
+        let physics = &self.physics;
+        let s = &restart.state;
+        let expected = (
+            physics.mesh.n_elements,
+            physics.ops.n_nodes,
+            physics.sigma.n_levels(),
+        );
+        if (s.n_elements, s.n_nodes, s.n_levels) != expected {
+            return Err(RestartError::Domain(format!(
+                "{} elements × {} nodes × {} levels, this run has {} × {} × {}",
+                s.n_elements, s.n_nodes, s.n_levels, expected.0, expected.1, expected.2
+            )));
+        }
+        let domain = domain_fingerprint(&physics.mesh, &physics.bathymetry.data, &physics.sigma);
+        if restart.domain != domain {
+            return Err(RestartError::Domain(format!(
+                "its mesh, bed or σ-grid differ (fingerprint {:016x}, this run {domain:016x})",
+                restart.domain
+            )));
+        }
+        self.physics
+            .restore_vertical_reference(restart.vertical_reference.clone());
+        self.integrator
+            .restore_slow_forcing(restart.slow_forcing.clone());
+        Ok(())
+    }
+
     /// Run the simulation.
     pub fn run(&mut self, state: &mut Solution3D, t_start: f64, t_end: f64) -> SimulationResult {
         self.run_with_callback(state, t_start, t_end, |_, _| {})
@@ -97,8 +155,44 @@ where
     where
         F: FnMut(&Solution3D, f64),
     {
+        self.run_with_physics_callback(state, t_start, t_end, |s, t, _| callback(s, t))
+    }
+
+    /// [`Self::run_with_callback`] with the physics handed to the callback
+    /// too (e.g. for [`Hydrostatic3D::time_step_limits`] or
+    /// [`Hydrostatic3D::take_implicit_advection_stats`] during a run).
+    pub fn run_with_physics_callback<F>(
+        &mut self,
+        state: &mut Solution3D,
+        t_start: f64,
+        t_end: f64,
+        mut callback: F,
+    ) -> SimulationResult
+    where
+        F: FnMut(&Solution3D, f64, &Hydrostatic3D<EOS, MIX, BC>),
+    {
+        self.run_with_context_callback(state, t_start, t_end, |s, t, context| {
+            callback(s, t, context.physics)
+        })
+    }
+
+    /// [`Self::run_with_physics_callback`] with a [`RunContext3D`], which can
+    /// also take a restart of the run at the callback's time
+    /// ([`RunContext3D::restart`]).
+    pub fn run_with_context_callback<F>(
+        &mut self,
+        state: &mut Solution3D,
+        t_start: f64,
+        t_end: f64,
+        mut callback: F,
+    ) -> SimulationResult
+    where
+        F: FnMut(&Solution3D, f64, &RunContext3D<'_, EOS, MIX, BC>),
+    {
         let start_wall = std::time::Instant::now();
-        // ... implementation
+        // The vertical tracer advection about the initial stratification,
+        // unless the physics has its own reference or opted out
+        self.physics.ensure_vertical_reference(state);
         let mut t = t_start;
         let mut n_steps = 0;
         let mut dt_min_used = f64::INFINITY;
@@ -106,7 +200,7 @@ where
         let mut last_callback_time = t_start;
 
         // Initial callback
-        callback(state, t);
+        callback(state, t, &self.context());
 
         if self.config.verbose {
             println!("Starting 3D simulation...");
@@ -165,15 +259,16 @@ where
 
             // Post-process
             self.physics.post_process(state);
+            self.physics.relax_vertical_reference(state, dt);
 
             // Callback
             if let Some(interval) = self.config.callback_interval {
                 if t - last_callback_time >= interval {
-                    callback(state, t);
+                    callback(state, t, &self.context());
                     last_callback_time = t;
                 }
             } else {
-                callback(state, t);
+                callback(state, t, &self.context());
                 last_callback_time = t;
             }
 
@@ -192,6 +287,70 @@ where
 
         SimulationResult::success(t, n_steps, dt_min_used, dt_max_used, wall_time)
     }
+
+    fn context(&self) -> RunContext3D<'_, EOS, MIX, BC> {
+        RunContext3D {
+            physics: &self.physics,
+            integrator: &self.integrator,
+        }
+    }
+}
+
+/// What a callback of [`Simulation3D::run_with_context_callback`] sees
+/// besides the state: the physics, and the run between steps for a restart.
+pub struct RunContext3D<'a, EOS, MIX, BC>
+where
+    EOS: EquationOfState,
+    MIX: VerticalMixing,
+    BC: SWEBoundaryCondition2D,
+{
+    /// The run's physics.
+    pub physics: &'a Hydrostatic3D<EOS, MIX, BC>,
+    integrator: &'a ModeSplitIntegrator,
+}
+
+impl<EOS, MIX, BC> RunContext3D<'_, EOS, MIX, BC>
+where
+    EOS: EquationOfState,
+    MIX: VerticalMixing,
+    crate::physics::SWEPhysics2D<BC>: PhysicsModule<crate::solver::SWESolution2D>,
+    BC: Clone + Send + Sync + SWEBoundaryCondition2D,
+{
+    /// The run at the callback, `state` at time `t` (the callback's
+    /// arguments), to save with [`Restart3D::write`] and continue with
+    /// [`Simulation3D::resume`].
+    pub fn restart(&self, state: &Solution3D, t: f64) -> Restart3D {
+        capture_restart(self.physics, self.integrator, state, t)
+    }
+
+    /// The mode-split integrator (e.g. for
+    /// [`ModeSplitIntegrator::last_substeps`]).
+    pub fn integrator(&self) -> &ModeSplitIntegrator {
+        self.integrator
+    }
+}
+
+fn capture_restart<EOS, MIX, BC>(
+    physics: &Hydrostatic3D<EOS, MIX, BC>,
+    integrator: &ModeSplitIntegrator,
+    state: &Solution3D,
+    t: f64,
+) -> Restart3D
+where
+    EOS: EquationOfState,
+    MIX: VerticalMixing,
+    crate::physics::SWEPhysics2D<BC>: PhysicsModule<crate::solver::SWESolution2D>,
+    BC: Clone + Send + Sync + SWEBoundaryCondition2D,
+{
+    Restart3D {
+        time: t,
+        domain: domain_fingerprint(&physics.mesh, &physics.bathymetry.data, &physics.sigma),
+        state: state.clone(),
+        slow_forcing: integrator.slow_forcing_record(),
+        vertical_reference: physics.vertical_reference(),
+        metadata: Vec::new(),
+        extra: Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -202,16 +361,17 @@ mod tests {
         SWEBoundaryCondition2D,
     };
     use crate::equations::ShallowWater2D;
-    use crate::mesh::data::Bathymetry2D;
     use crate::mesh::data::BoundaryTag;
+    use crate::mesh::data::{Bathymetry2D, ElementSlopeBound};
     use crate::mesh::{Mesh2D, Mesh2DBuilder};
     use crate::operators::{DGOperators2D, GeometricFactors2D};
     use crate::physics::vertical_mixing::{ConstantMixing, Forcing};
     use crate::physics::{
-        AnalyticSurfaceStress, BottomDrag3D, Hydrostatic3D, LinearEOS, PhysicsBuilder, SWEPhysics2D,
+        AnalyticSurfaceStress, BottomDrag3D, Hydrostatic3D, ImplicitVerticalAdvection, LinearEOS,
+        PhysicsBuilder, SWEPhysics2D,
     };
     use crate::simulation::Simulation;
-    use crate::solver::rhs::w_cell_thicknesses;
+    use crate::solver::rhs::{VerticalAdvection, w_cell_thicknesses};
     use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
     use crate::solver::{DGSolution2D, SWEFormulation2D, SWESolution2D, SWEState2D};
     use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
@@ -966,6 +1126,244 @@ mod tests {
         );
     }
 
+    /// The vertical advection all but entirely implicit (explicit outflow
+    /// Courant number below 1e-3): the gates of the implicit relaxation run
+    /// it on every column with vertical flow.
+    fn all_implicit() -> ImplicitVerticalAdvection {
+        ImplicitVerticalAdvection::new(0.0, 1e-3)
+    }
+
+    /// TODO P1.3 gate: with the vertical advection implicit
+    /// (`Hydrostatic3D::with_implicit_vertical_advection`), uniform T and S
+    /// stay uniform under the tide over a sloping bed, and stratified
+    /// tracers keep their inventories: every stage's thickness carries the
+    /// implicit flux's divergence, which the relaxation hands back.
+    #[test]
+    fn implicit_vertical_advection_keeps_constancy_and_conservation() {
+        let case = SlopingTide::new();
+        let eos = LinearEOS::default();
+        let physics = case
+            .physics()
+            .with_implicit_vertical_advection(all_implicit());
+        let mut state = case.state(&physics, |_, _| (eos.t0 + 2.3, eos.s0 - 0.9));
+        let mut drift = 0.0_f64;
+        case.run(&physics, &mut state, |s, _| {
+            drift = max_or_nan(
+                s.temp
+                    .iter()
+                    .map(|t| (t - (eos.t0 + 2.3)).abs())
+                    .chain(s.salt.iter().map(|x| (x - (eos.s0 - 0.9)).abs()))
+                    .chain([drift]),
+            );
+        });
+        let stats = physics.take_implicit_advection_stats();
+        let columns = case.mesh.n_elements * case.ops.n_nodes;
+        assert!(
+            stats.columns > columns / 2,
+            "test regime: {} of {columns} columns implicit",
+            stats.columns
+        );
+        // Measured 8.5e-13 (9.3e-13 explicit)
+        assert!(
+            drift < 1e-11 * eos.s0,
+            "uniform tracers drifted by {drift:.3e} under the tide"
+        );
+
+        let physics = case
+            .physics()
+            .with_implicit_vertical_advection(all_implicit());
+        let mut state = case.state(&physics, |x, s| {
+            (
+                10.0 + 3.0 * x / case.length - 2.0 * s,
+                33.0 + x / case.length + s,
+            )
+        });
+        let (t0, s0) = (
+            case.inventory(&state, &state.temp),
+            case.inventory(&state, &state.salt),
+        );
+        let mut max_err = 0.0_f64;
+        case.run(&physics, &mut state, |s, _| {
+            max_err = max_or_nan([
+                max_err,
+                (case.inventory(s, &s.temp) - t0).abs() / t0,
+                (case.inventory(s, &s.salt) - s0).abs() / s0,
+            ]);
+        });
+        // Measured 3.1e-15
+        assert!(
+            max_err < 1e-12,
+            "tracer inventory drifted by {max_err:.3e} (relative)"
+        );
+    }
+
+    /// A periodic channel along x, 2 km × 200 m, with a Gaussian ridge
+    /// (bed −10 m, 2 m over the crest), a transport of 3 m²/s across it with
+    /// 1 m/s of shear from the bed to the surface (sheared layer transports
+    /// over a slope cross the σ-surfaces), linearly stratified (0.3 °C/m),
+    /// on `levels` uniform σ-levels.
+    fn ridge_flow(
+        levels: usize,
+        implicit: Option<ImplicitVerticalAdvection>,
+    ) -> (Physics, Solution3D) {
+        let q = 3.0;
+        let length = 2000.0;
+        let mesh = Arc::new(Mesh2D::channel_periodic_x(0.0, length, 0.0, 200.0, 10, 1));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            -10.0 + 8.0 * (-((x - 0.5 * length) / 200.0).powi(2)).exp()
+        }));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::EntropyStable)
+        .build();
+        let sigma = SigmaGrid::new(levels, UniformStretching);
+        let mut physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-4, 1e-5),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        if let Some(split) = implicit {
+            physics = physics.with_implicit_vertical_advection(split);
+        }
+        let (nn, nl) = (ops.n_nodes, levels);
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        let eos = LinearEOS::default();
+        for idx in 0..mesh.n_elements * nn {
+            let depth = -bathymetry.data[idx];
+            state.ubar.data[idx] = q / depth;
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                state.u[idx * nl + l] = q / depth + 1.0 * (s + 0.5);
+                state.temp[idx * nl + l] = eos.t0 - 0.3 * s * depth;
+                state.salt[idx * nl + l] = eos.s0;
+            }
+        }
+        physics.update_density(&mut state);
+        (physics, state)
+    }
+
+    /// TODO P1.3 gate: sheared flow over a ridge at a step where the
+    /// explicit vertical advection's Courant number reaches 3.5: it blows up
+    /// within 20 steps (the explicit schemes hold to ≈ 1–1.7), while with the
+    /// implicit part the run stays stable for the hour, keeps the temperature
+    /// within the explicit run's range at a quarter of the step, and keeps
+    /// its inventory.
+    #[test]
+    fn implicit_vertical_advection_holds_beyond_the_explicit_courant_limit() {
+        // One hour
+        let run = |implicit: Option<ImplicitVerticalAdvection>, dt: f64| {
+            let steps = (3600.0 / dt) as usize;
+            let (physics, mut state) = ridge_flow(40, implicit);
+            let t0 = ridge_inventory(&physics, &state);
+            let (lo, hi) = (
+                state.temp.iter().copied().fold(f64::MAX, f64::min),
+                state.temp.iter().copied().fold(f64::MIN, f64::max),
+            );
+            let mut integrator = ModeSplitIntegrator::new();
+            let (mut courant, mut overshoot) = (0.0_f64, 0.0_f64);
+            for n in 0..steps {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                let largest = max_or_nan(state.u.iter().chain(&state.temp).map(|x| x.abs()));
+                if !largest.is_finite() || largest > 1e3 {
+                    return Err(n);
+                }
+                courant = courant.max(physics.take_implicit_advection_stats().largest_courant);
+                for &t in &state.temp {
+                    overshoot = overshoot.max(lo - t).max(t - hi);
+                }
+            }
+            let drift = (ridge_inventory(&physics, &state) - t0).abs() / t0;
+            Ok((courant, overshoot, drift))
+        };
+        let explicit = run(None, 32.0);
+        assert!(
+            matches!(explicit, Err(n) if n < 40),
+            "test regime: the explicit run should blow up ({explicit:?})"
+        );
+        let (courant, overshoot, drift) = run(Some(ImplicitVerticalAdvection::default()), 32.0)
+            .expect("the implicit run blew up");
+        assert!(courant > 3.0, "test regime: Courant number {courant:.2}");
+        // The explicit schemes over- and undershoot at a stable step too:
+        // measured 1.9e-2 °C at 32 s with the implicit part, 0.11 °C
+        // explicit at 8 s (Courant number 0.9)
+        let (_, explicit_overshoot, _) = run(None, 8.0).expect("the explicit run at 8 s blew up");
+        assert!(
+            overshoot <= explicit_overshoot,
+            "temperature left its range by {overshoot:.3e} (explicit at 8 s: {explicit_overshoot:.3e})"
+        );
+        // Measured 5.7e-15, at a Courant number of 3.7
+        assert!(
+            drift < 1e-12,
+            "temperature inventory drifted by {drift:.3e}"
+        );
+    }
+
+    /// `∫ Σ_l H_z T dA` on [`ridge_flow`]'s channel.
+    fn ridge_inventory(physics: &Physics, state: &Solution3D) -> f64 {
+        let nl = state.n_levels;
+        let mut column = DGSolution2D::new(state.n_elements, state.n_nodes);
+        for (idx, c) in column.data.iter_mut().enumerate() {
+            let depth = state.eta.data[idx] - physics.bathymetry.data[idx];
+            *c = (0..nl)
+                .map(|l| depth * physics.sigma.d_sigma()[l] * state.temp[idx * nl + l])
+                .sum();
+        }
+        column.integrate(&physics.ops, &physics.geom)
+    }
+
+    /// Below the split's lower Courant number the run is the explicit one,
+    /// bit for bit (the tide's vertical Courant number here is ≈ 0.03).
+    #[test]
+    fn slow_vertical_flow_stays_explicit_bit_for_bit() {
+        let case = SlopingTide::new();
+        let explicit = case.physics();
+        let implicit = case
+            .physics()
+            .with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
+        let tracers = |x: f64, s: f64| (10.0 + 3.0 * x / case.length - 2.0 * s, 33.0 + s);
+        let mut a = case.state(&explicit, tracers);
+        let mut b = case.state(&implicit, tracers);
+        case.run(&explicit, &mut a, |_, _| {});
+        case.run(&implicit, &mut b, |_, _| {});
+        let stats = implicit.take_implicit_advection_stats();
+        assert_eq!(
+            stats.columns, 0,
+            "largest Courant {}",
+            stats.largest_courant
+        );
+        assert!(
+            stats.largest_courant > 1e-3,
+            "test regime: no vertical flow"
+        );
+        for (x, y) in [
+            (&a.u, &b.u),
+            (&a.v, &b.v),
+            (&a.temp, &b.temp),
+            (&a.salt, &b.salt),
+        ] {
+            assert!(x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()));
+        }
+        assert_eq!(a.eta.data, b.eta.data);
+    }
+
     /// `∫ Σ_j H_w φ_j dA` of a field `field` at the w-points, over the
     /// w-cells (dry columns hold none).
     fn w_inventory(physics: &Physics, state: &Solution3D, field: &[f64]) -> f64 {
@@ -1072,6 +1470,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// TODO P1.3 gate: [`turbulence_is_advected_with_constancy_and_conservation`]
+    /// with the vertical advection implicit: the w-cells' share of `Ω_i`,
+    /// the end w-points taken at their neighbours' values.
+    #[test]
+    fn implicit_turbulence_advection_keeps_constancy_and_conservation() {
+        let case = SlopingTide::new();
+        let eos = LinearEOS::default();
+        let (k0, nl) = (3.1e-4, case.sigma.n_levels());
+        let physics = case
+            .physics()
+            .with_implicit_vertical_advection(all_implicit());
+        let mut state = case.state(&physics, |_, _| (eos.t0, eos.s0));
+        state.tke = w_point_field(&physics, nl, case.axis, |_, j| {
+            if j == 0 || j == nl { 50.0 * k0 } else { k0 }
+        });
+        state.gls = w_point_field(&physics, nl, case.axis, |x, j| {
+            1e-6 * (2.0 + (std::f64::consts::PI * x / case.length).sin() + j as f64)
+        });
+        let psi0 = w_inventory(&physics, &state, &state.gls);
+        let (mut drift, mut psi_error) = (0.0_f64, 0.0_f64);
+        case.run(&physics, &mut state, |s, p| {
+            let interior = s.tke.chunks_exact(nl + 1).flat_map(|c| &c[1..nl]);
+            drift = max_or_nan(interior.map(|k| (k - k0).abs()).chain([drift]));
+            psi_error = max_or_nan([psi_error, (w_inventory(p, s, &s.gls) - psi0).abs() / psi0]);
+        });
+        assert!(physics.take_implicit_advection_stats().columns > 0);
+        // Measured 8.1e-18
+        assert!(drift < 1e-13 * k0, "uniform k drifted by {drift:.3e}");
+        // Measured 3.0e-15
+        assert!(
+            psi_error < 1e-12,
+            "ψ inventory drifted by {psi_error:.3e} (relative)"
+        );
     }
 
     /// A river into the middle of [`SlopingTide`]'s basin, entering over the
@@ -1385,6 +1818,207 @@ mod tests {
         (physics, state, bathymetry)
     }
 
+    type RestartPhysics = Hydrostatic3D<LinearEOS, crate::physics::GlsMixing, Reflective2D>;
+
+    /// A run that carries every kind of state from step to step: a stratified
+    /// beach (bed −12 → +2 m) sloshing up and down its shore through the
+    /// `WetDry` 2D module, with wind, GLS k-ε turbulence (`k`, `ψ`), log-layer
+    /// drag, implicit vertical advection, and a vertical reference relaxing
+    /// towards the state over an hour. `bed_shift` moves the bed (m).
+    fn restart_case(bed_shift: f64) -> (RestartPhysics, Solution3D) {
+        use crate::physics::GlsMixing;
+        let length = 1000.0;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 200.0, 10, 2));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+            -12.0 + 14.0 * x / length + 0.5 * (y / 200.0) + bed_shift
+        }));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(true)
+        .build();
+        let sigma = SigmaGrid::new(6, UniformStretching);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let eos = LinearEOS::default();
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        for k in 0..mesh.n_elements {
+            for i in 0..nn {
+                let el = ElementIndex::new(k);
+                let [x, _] = mesh.reference_to_physical(el, ops.nodes_r[i], ops.nodes_s[i]);
+                let idx = k * nn + i;
+                let b = bathymetry.data[idx];
+                let eta = (0.4 * (std::f64::consts::PI * x / length).cos()).max(b);
+                state.eta.data[idx] = eta;
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    let z = eta + s * (eta - b);
+                    state.temp[idx * nl + l] = eos.t0 + 4.0 * (0.4 * (z + 4.0)).tanh();
+                    state.salt[idx * nl + l] = eos.s0 - 0.05 * z;
+                }
+            }
+        }
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma),
+            bathymetry,
+            Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
+            eos,
+            GlsMixing::k_epsilon().with_roughness(0.02, 0.005),
+            swe,
+            Forcing {
+                surface_stress: [0.1, 0.03],
+                ..no_stress()
+            },
+            G,
+            RHO0,
+        )
+        .with_bottom_drag(BottomDrag3D::log_layer(0.005))
+        .with_implicit_vertical_advection(all_implicit())
+        .with_vertical_reference(&state)
+        .with_vertical_reference_timescale(3600.0);
+        physics.update_density(&mut state);
+        (physics, state)
+    }
+
+    fn assert_bitwise_equal(a: &Solution3D, b: &Solution3D) {
+        let fields = |s: &Solution3D| {
+            [
+                s.eta.data.clone(),
+                s.ubar.data.clone(),
+                s.vbar.data.clone(),
+                s.u.clone(),
+                s.v.clone(),
+                s.w.clone(),
+                s.temp.clone(),
+                s.salt.clone(),
+                s.rho.clone(),
+                s.eddy_viscosity.clone(),
+                s.eddy_diffusivity.clone(),
+                s.tke.clone(),
+                s.gls.clone(),
+            ]
+        };
+        let names = [
+            "eta",
+            "ubar",
+            "vbar",
+            "u",
+            "v",
+            "w",
+            "temp",
+            "salt",
+            "rho",
+            "eddy_viscosity",
+            "eddy_diffusivity",
+            "tke",
+            "gls",
+        ];
+        for ((name, x), y) in names.iter().zip(fields(a)).zip(fields(b)) {
+            assert_eq!(x.len(), y.len(), "{name}: sizes differ");
+            let differ = x
+                .iter()
+                .zip(&y)
+                .filter(|(p, q)| p.to_bits() != q.to_bits())
+                .count();
+            assert_eq!(differ, 0, "{name}: {differ} of {} values differ", x.len());
+        }
+    }
+
+    /// TODO P5.3 gate: a 3D run restarted halfway, from a file, in a new
+    /// simulation, ends bit for bit where the uninterrupted run does
+    /// (`restart_case`: wetting and drying, GLS, implicit vertical advection, a
+    /// relaxing vertical reference). The same state without
+    /// `Simulation3D::resume` (a fresh AB3 history of the slow forcing, the
+    /// initial reference) ends elsewhere, so the gate sees what the file adds
+    /// to the state.
+    #[test]
+    fn a_restarted_run_ends_bit_for_bit_where_the_uninterrupted_run_does() {
+        let t_end = 900.0;
+        let (physics, mut uninterrupted) = restart_case(0.0);
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
+        let mut checkpoint = None;
+        let mut steps_before = 0;
+        let result = sim.run_with_context_callback(&mut uninterrupted, 0.0, t_end, |s, t, run| {
+            if checkpoint.is_none() {
+                if t >= 400.0 {
+                    checkpoint = Some(run.restart(s, t));
+                } else {
+                    steps_before += 1;
+                }
+            }
+        });
+        assert!(result.success, "{:?}", result.error);
+        let checkpoint = checkpoint.expect("the run passed 400 s");
+        assert_eq!(checkpoint.slow_forcing.g.len(), 3, "a full AB3 history");
+        assert!(
+            !checkpoint.state.tke.is_empty(),
+            "the turbulence is carried"
+        );
+        assert!(
+            (0..uninterrupted.eta.data.len())
+                .any(|idx| uninterrupted.eta.data[idx] <= sim.physics().bathymetry.data[idx]),
+            "the beach has dry nodes"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("beach.restart");
+        checkpoint.write(&path).unwrap();
+        let restart = Restart3D::read(&path).unwrap();
+
+        let (physics, _) = restart_case(0.0);
+        let mut resumed_sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
+        resumed_sim.resume(&restart).unwrap();
+        let mut resumed = restart.state.clone();
+        let resumed_result = resumed_sim.run(&mut resumed, restart.time, t_end);
+        assert!(resumed_result.success, "{:?}", resumed_result.error);
+        // Callbacks before the checkpoint: the initial one and one per step
+        // but the last, which the checkpoint's callback follows
+        assert_eq!(steps_before + resumed_result.n_steps, result.n_steps);
+        assert_bitwise_equal(&uninterrupted, &resumed);
+
+        let (physics, _) = restart_case(0.0);
+        let mut fresh_sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
+        let mut fresh = restart.state.clone();
+        fresh_sim.run(&mut fresh, restart.time, t_end);
+        let largest_difference = max_or_nan(
+            fresh
+                .temp
+                .iter()
+                .zip(&uninterrupted.temp)
+                .chain(fresh.u.iter().zip(&uninterrupted.u))
+                .map(|(a, b)| (a - b).abs()),
+        );
+        assert!(
+            largest_difference > 1e-12,
+            "without the restart's history and reference the run ends within {largest_difference:.1e}"
+        );
+    }
+
+    /// TODO P5.3 gate: a restart does not continue on another bed or another
+    /// σ-grid.
+    #[test]
+    fn a_restart_is_refused_on_another_domain() {
+        let (physics, state) = restart_case(0.0);
+        let restart = Simulation3D::new(physics, ModeSplitIntegrator::new()).restart(&state, 0.0);
+        let (deeper, _) = restart_case(-0.01);
+        let error = Simulation3D::new(deeper, ModeSplitIntegrator::new())
+            .resume(&restart)
+            .err();
+        assert!(
+            matches!(error, Some(RestartError::Domain(_))),
+            "resumed on a deeper bed"
+        );
+    }
+
     /// Runs `steps` mode-split steps of 10 s on `state`, asserting every
     /// step stays finite, calling `check` after each.
     fn run_beach(
@@ -1530,6 +2164,75 @@ mod tests {
         assert!(psi_err < 2e-10, "ψ inventory drifted by {psi_err:.3e}");
     }
 
+    /// TODO P1.3 gate: [`beach_tracers_are_constant_and_conserved`] with the
+    /// vertical advection implicit, through the shoreline elements whose
+    /// fields are element means per level.
+    #[test]
+    fn beach_tracers_are_constant_and_conserved_with_implicit_vertical_advection() {
+        let (physics, mut state, _) = beach_3d(0.3);
+        let physics = physics.with_implicit_vertical_advection(all_implicit());
+        let nl = state.n_levels;
+        state.temp.fill(12.3);
+        state.salt.fill(33.1);
+        state.tke = w_point_field(&physics, nl, 0, |_, _| 12.3);
+        state.gls = w_point_field(&physics, nl, 0, |x, j| 1.0 + x / 1000.0 + 0.1 * j as f64);
+        let mut drift = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| {
+            let tke = s.tke.chunks_exact(nl + 1).flat_map(|c| &c[1..nl]);
+            drift = max_or_nan(
+                s.temp
+                    .iter()
+                    .chain(tke)
+                    .map(|t| (t - 12.3).abs())
+                    .chain(s.salt.iter().map(|x| (x - 33.1).abs()))
+                    .chain([drift]),
+            );
+        });
+        assert!(physics.take_implicit_advection_stats().columns > 0);
+        // Measured 4.7e-9 explicit (see above)
+        assert!(drift < 5e-8, "uniform tracers drifted by {drift:.3e}");
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+
+        let (physics, mut state, _) = beach_3d(0.3);
+        let physics = physics.with_implicit_vertical_advection(all_implicit());
+        state.tke = w_point_field(&physics, nl, 0, |_, _| 1e-6);
+        state.gls = w_point_field(&physics, nl, 0, |x, j| 1.0 + x / 1000.0 + 0.1 * j as f64);
+        let (t0, s0, psi0) = (
+            beach_inventory(&physics, &state, &state.temp),
+            beach_inventory(&physics, &state, &state.salt),
+            w_inventory(&physics, &state, &state.gls),
+        );
+        let (mut max_err, mut psi_err) = (0.0_f64, 0.0_f64);
+        let (t_min, t_max) = (
+            state.temp.iter().copied().fold(f64::MAX, f64::min),
+            state.temp.iter().copied().fold(f64::MIN, f64::max),
+        );
+        let mut overshoot = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| {
+            max_err = max_or_nan([
+                max_err,
+                (beach_inventory(&physics, s, &s.temp) - t0).abs() / t0,
+                (beach_inventory(&physics, s, &s.salt) - s0).abs() / s0,
+            ]);
+            psi_err = max_or_nan([
+                psi_err,
+                (w_inventory(&physics, s, &s.gls) - psi0).abs() / psi0,
+            ]);
+            for &t in &s.temp {
+                overshoot = max_or_nan([overshoot, t_min - t, t - t_max]);
+            }
+        });
+        // Explicit: 2.3e-11 and 7.9e-11 (see above)
+        assert!(max_err < 5e-11, "inventories drifted by {max_err:.3e}");
+        assert!(psi_err < 2e-10, "ψ inventory drifted by {psi_err:.3e}");
+        // Upwind in the vertical: within the initial range (explicit limited
+        // Akima leaves it by 5.2e-3 °C, see `a_beach_wets_and_dries_in_3d`)
+        assert!(
+            overshoot < 8e-3,
+            "temperature left its range by {overshoot:.3e}"
+        );
+    }
+
     /// TODO P4.5 gate: a stratified lake at rest with dry land stays at
     /// rest: the thin columns at the shoreline exert no baroclinic pressure.
     #[test]
@@ -1546,6 +2249,950 @@ mod tests {
         });
         // Measured 1.3e-13 m/s
         assert!(max_speed < 1e-10, "the lake spun up {max_speed:.3e} m/s");
+    }
+
+    /// Regression (Frøya, 2026-10-03): a stratified basin with a steep shore
+    /// (the bed from −100 m to +2 m over 1 km, five P2 elements, so the
+    /// shoreline element spans tens of metres of water), `WetDry`, linear in
+    /// z (0.02 °C/m, no diffusion), stirred only by a 1 cm seiche that wets
+    /// and dries the shore. The shoreline elements are carried as element
+    /// balances (the 2D pass keeps only those there), and their tracers
+    /// were the element's mean per level at every node: across the shoreline
+    /// element a σ-level spans tens of metres of depth, and the flattened
+    /// stratification drove a baroclinic flow (on the Frøya bed, 0.1–1 m/s
+    /// at rest). Now each node keeps its departure from the mean, and the
+    /// temperature at every node stays its initial profile's at the node's
+    /// height to within the seiche's heave of the σ-levels.
+    #[test]
+    fn a_steep_stratified_shore_keeps_its_stratification() {
+        let length = 1000.0;
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 200.0, 5, 1));
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
+            -100.0 + 102.0 * x / length
+        }));
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(true)
+        .build();
+        let sigma = SigmaGrid::new(10, UniformStretching);
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(0.0)),
+            LinearEOS::default(),
+            ConstantMixing::new(1e-3, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let eos = LinearEOS::default();
+        let profile = |z: f64| eos.t0 + 0.02 * (z + 50.0);
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        for k in 0..mesh.n_elements {
+            for i in 0..nn {
+                let el = ElementIndex::new(k);
+                let [x, _] = mesh.reference_to_physical(el, ops.nodes_r[i], ops.nodes_s[i]);
+                let idx = k * nn + i;
+                let b = bathymetry.data[idx];
+                let eta = (0.01 * (std::f64::consts::PI * x / length).cos()).max(b);
+                state.eta.data[idx] = eta;
+                for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                    state.temp[idx * nl + l] = profile(eta + s * (eta - b));
+                    state.salt[idx * nl + l] = eos.s0;
+                }
+            }
+        }
+        physics.update_density(&mut state);
+        let (mut deviation, mut shoreline) = (0.0_f64, 0_usize);
+        run_beach(&physics, &mut state, 100, |s| {
+            for idx in 0..s.eta.data.len() {
+                let depth = s.eta.data[idx] - bathymetry.data[idx];
+                if depth < physics.min_column_depth {
+                    continue;
+                }
+                if depth < 10.0 {
+                    shoreline += 1;
+                }
+                for (l, &sig) in sigma.sigma_rho().iter().enumerate() {
+                    let z = s.eta.data[idx] + sig * depth;
+                    deviation = max_or_nan([deviation, (s.temp[idx * nl + l] - profile(z)).abs()]);
+                }
+            }
+        });
+        let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+        println!(
+            "steep shore: T off its profile by {deviation:.2e} °C, largest speed {speed:.2e} m/s"
+        );
+        assert!(shoreline > 0, "test regime: no shallow water at the shore");
+        // Measured 5.3e-4 °C (largest speed 2.9e-3 m/s; 4.8e-4 before the shore
+        // elements moved their layers on the subcells); with the element
+        // means alone 0.12 °C (1.8e-2 m/s), with upwind on the subcells 8e-3 °C
+        assert!(
+            deviation < 1e-3,
+            "the stratification moved by {deviation:.3e} °C at a node's height"
+        );
+    }
+
+    /// A stratified x–z channel at rest: 8 P2 elements of 1 km, walls, 20
+    /// surface-stretched levels, no tracer diffusion, the bed `bed(x)` (dry
+    /// where it is above 0). `rho(z)` sets T, and is the PGF's reference
+    /// profile, so the initial state feels no force. With a `bound`, the bed is
+    /// first smoothed to it over the columns that are not thin (the 3D
+    /// model's default thin depth). Steps of 36 s; the largest layer
+    /// speed at each of `hours` (increasing).
+    fn channel_at_rest(
+        bed: impl Fn(f64) -> f64,
+        bound: Option<ElementSlopeBound>,
+        rho: impl Fn(f64) -> f64 + Copy,
+        hours: &[f64],
+    ) -> Vec<f64> {
+        let (nx, dx) = (8, 1000.0);
+        let mesh = Mesh2D::uniform_rectangle(0.0, nx as f64 * dx, 0.0, dx, nx, 1);
+        basin_at_rest(mesh, |x, _| bed(x), bound, rho, hours, 36.0).0
+    }
+
+    /// [`channel_at_rest`] on any `mesh` (walls) with the bed `bed(x, y)`
+    /// and steps of `dt`: the largest layer speed at each of `hours`, and
+    /// its element at the last.
+    fn basin_at_rest(
+        mesh: Mesh2D,
+        bed: impl Fn(f64, f64) -> f64,
+        bound: Option<ElementSlopeBound>,
+        rho: impl Fn(f64) -> f64 + Copy,
+        hours: &[f64],
+        dt: f64,
+    ) -> (Vec<f64>, usize) {
+        use crate::physics::EquationOfState;
+        use crate::vertical::SongHaidvogelStretching;
+        let mesh = Arc::new(mesh);
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        if let Some(bound) = bound {
+            let thin = Physics::DEFAULT_MIN_COLUMN_DEPTH;
+            let report = bathymetry.smooth_element_slopes(&mesh, &ops, &geom, bound, thin);
+            println!("channel bed smoothed: {report:?}");
+        }
+        let bathymetry = Arc::new(bathymetry);
+        let shore = bathymetry.data.iter().any(|&b| b >= 0.0);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_formulation(SWEFormulation2D::WetDry)
+        .with_wet_dry_correction(shore)
+        .with_source(CoriolisSource2D::f_plane(1.2e-4))
+        .build();
+        let sigma = SigmaGrid::new(20, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let eos = LinearEOS::default();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(CoriolisSource2D::f_plane(1.2e-4)),
+            eos,
+            ConstantMixing::new(1e-3, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        );
+        // T of the density ρ(z) under the linear equation of state
+        let temp = |z: f64| eos.t0 - (rho(z) / eos.rho0 - 1.0) / eos.alpha;
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        for idx in 0..mesh.n_elements * nn {
+            let b = bathymetry.data[idx];
+            let eta = b.max(0.0);
+            state.eta.data[idx] = eta;
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                state.temp[idx * nl + l] = temp(eta + s * (eta - b));
+                state.salt[idx * nl + l] = eos.s0;
+            }
+        }
+        physics.update_density(&mut state);
+        let physics =
+            physics.with_reference_profile(&state, |z| eos.compute_density(temp(z), eos.s0, z));
+        // Experiment (TODO P1.3): DGRS_VADV picks the vertical tracer scheme,
+        // DGRS_VREF=1 reconstructs it about the state at rest
+        let physics = match std::env::var("DGRS_VADV").as_deref() {
+            Ok("centred") => physics.with_vertical_advection(VerticalAdvection::Centred),
+            Ok("akima") => physics.with_vertical_advection(VerticalAdvection::Akima),
+            Ok("hermite") => physics.with_vertical_advection(VerticalAdvection::HermiteMean),
+            Ok("upwind") => physics.with_vertical_advection(VerticalAdvection::Upwind),
+            Ok("tvd") => physics.with_vertical_advection(VerticalAdvection::Tvd),
+            _ => physics,
+        };
+        let physics = if std::env::var("DGRS_VREF").is_ok_and(|v| v == "1") {
+            physics.with_vertical_reference(&state)
+        } else {
+            physics
+        };
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut n = 0;
+        let mut speeds = Vec::with_capacity(hours.len());
+        for &until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+            }
+            let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+            println!("at rest: largest speed {speed:.2e} m/s after {until} h");
+            speeds.push(speed);
+        }
+        let nl = state.n_levels;
+        let at = state
+            .u
+            .iter()
+            .zip(&state.v)
+            .map(|(u, v)| u.hypot(*v))
+            .enumerate()
+            .fold(
+                (0.0_f64, 0),
+                |m, (i, s)| if s > m.0 { (s, i / nl / nn) } else { m },
+            )
+            .1;
+        (speeds, at)
+    }
+
+    /// [`channel_at_rest`] with a cliff: the bed falls from 15 to 300 m inside
+    /// element 3 (a `tanh` step), so every σ-level of that element spans most
+    /// of the water column, and its pairs of nodes straddle whatever the
+    /// density does in between. The largest layer speed after `hours`.
+    fn cliff_at_rest(rho: impl Fn(f64) -> f64 + Copy, hours: f64) -> f64 {
+        channel_at_rest(|x| step_bed(x, 3, -300.0, -15.0), None, rho, &[hours])[0]
+    }
+
+    /// Probe (TODO P1.3): the pycnocline at rest around land inside one
+    /// element of a 6 × 6 basin of 200 m P2 elements, smoothed like Frøya
+    /// (`ElementSlopeBound::for_pycnocline(19)` between columns that are not
+    /// thin), constant mixing, no limiter: an islet, a spit ending in the
+    /// element, a spit between deep and shallow water (the coastline mesh's
+    /// element 8722 grew with e-folding ≈ 40 min), a land corner. The
+    /// largest speed at 6 and 12 h and the e-folding between.
+    #[test]
+    #[ignore = "probe: shore elements in 2D"]
+    fn probe_shore_elements_2d() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let bound = Some(ElementSlopeBound::for_pycnocline(19.0));
+        let ridge = |x: f64, y: f64| {
+            (-((x - 500.0) / 40.0).powi(2)).exp() * 0.5 * (1.0 - ((y - 500.0) / 40.0).tanh())
+        };
+        let shallow_east = |x: f64| -30.0 + 27.0 * 0.5 * (1.0 + ((x - 500.0) / 40.0).tanh());
+        let cases: [(&str, &dyn Fn(f64, f64) -> f64); 4] = [
+            ("islet", &|x, y| {
+                -30.0 + 32.0 * (-((x - 500.0).powi(2) + (y - 500.0).powi(2)) / 2500.0).exp()
+            }),
+            ("spit", &|x, y| -30.0 + 32.0 * ridge(x, y)),
+            ("spit, shallow east", &|x, y| {
+                let base = shallow_east(x);
+                base + (2.0 - base) * ridge(x, y)
+            }),
+            ("corner", &|x, y| {
+                let land = 0.25
+                    * (1.0 - ((x - 500.0) / 60.0).tanh())
+                    * (1.0 - ((y - 500.0) / 60.0).tanh());
+                -30.0 + 32.0 * land
+            }),
+        ];
+        let only = std::env::var("DGRS_PROBE").unwrap_or_default();
+        for (name, bed) in cases {
+            if !only.is_empty() && !only.split(',').any(|o| name.starts_with(o)) {
+                continue;
+            }
+            let mut mesh = Mesh2D::uniform_rectangle(0.0, 1200.0, 0.0, 1200.0, 6, 6);
+            // DGRS_DISTORT=a: interior vertices moved by up to a (m), general
+            // quadrilaterals as on the coastline mesh
+            if let Some(a) = std::env::var("DGRS_DISTORT")
+                .ok()
+                .and_then(|a| a.parse::<f64>().ok())
+            {
+                let tau = std::f64::consts::TAU;
+                for v in &mut mesh.vertices {
+                    let [x, y] = *v;
+                    let bump = (tau * x / 1200.0).sin() * (tau * y / 1200.0).sin();
+                    let wiggle = (3.0 * tau * x / 1200.0).sin() * (2.0 * tau * y / 1200.0).cos();
+                    *v = [x + a * bump, y + a * (0.7 * wiggle - 0.5 * bump)];
+                }
+            }
+            let (speeds, at) = basin_at_rest(mesh, bed, bound, pycnocline, &[6.0, 12.0], 30.0);
+            let efold = 6.0 / (speeds[1] / speeds[0]).ln();
+            println!(
+                "PROBE {name}: {:.2e} → {:.2e} m/s (6 → 12 h), e-folding {efold:.1} h, element {at}",
+                speeds[0], speeds[1]
+            );
+        }
+    }
+
+    /// Calibration probe for the straddle bound: steps inside one element
+    /// with straddle numbers S (pycnocline band 11–19 m) under the pycnocline
+    /// of [`a_pycnocline_over_a_cliff_stays_at_rest`]; the largest speed at
+    /// 12 and 48 h and the e-folding between.
+    #[test]
+    #[ignore = "probe: calibration of the straddle bound"]
+    fn probe_straddle_steps() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let (top, bottom) = (11.0_f64, 19.0_f64);
+        let straddle = |s: f64, d: f64| {
+            if d <= top {
+                0.0
+            } else {
+                (bottom / s.max(0.0)).min(1.0) * (d - s.max(0.0)) / (bottom - top)
+            }
+        };
+        // (shallow elevation, deep elevation)
+        let cases = [
+            (-15.0, -19.0),
+            (-15.0, -23.0),
+            (-15.0, -27.0),
+            (-15.0, -31.0),
+            (-15.0, -39.0),
+            (-60.0, -80.0),
+            (-60.0, -100.0),
+            (-60.0, -140.0),
+            (-5.0, -13.0),
+            (-5.0, -17.0),
+            (-5.0, -21.0),
+            (5.0, -12.0),
+            (5.0, -16.0),
+            (5.0, -20.0),
+            (5.0, -27.0),
+        ];
+        // DGRS_STRADDLE="shallow:deep,…" (elevations) and DGRS_STRADDLE_HOURS
+        // override the cases and the last hour
+        let custom: Vec<(f64, f64)> = std::env::var("DGRS_STRADDLE")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|c| {
+                let (s, d) = c.split_once(':')?;
+                Some((s.parse().ok()?, d.parse().ok()?))
+            })
+            .collect();
+        let last: f64 = std::env::var("DGRS_STRADDLE_HOURS")
+            .ok()
+            .and_then(|h| h.parse().ok())
+            .unwrap_or(48.0);
+        let cases = if custom.is_empty() {
+            cases.to_vec()
+        } else {
+            custom
+        };
+        for (shallow, deep) in cases {
+            let speeds = channel_at_rest(
+                |x| step_bed(x, 3, deep, shallow),
+                None,
+                pycnocline,
+                &[12.0, last],
+            );
+            let efold = (last - 12.0) / (speeds[1] / speeds[0]).ln();
+            println!(
+                "PROBE {:5.1} → {:6.1} m: S {:.2}, {:.2e} → {:.2e} m/s, e-folding {:.1} h",
+                -shallow,
+                -deep,
+                straddle(-shallow, -deep),
+                speeds[0],
+                speeds[1],
+                efold
+            );
+        }
+    }
+
+    /// A bed (elevation) of `left` left of element `k` of 1 km and `right`
+    /// right of it, joined by a `tanh` step inside that element.
+    fn step_bed(x: f64, k: usize, left: f64, right: f64) -> f64 {
+        let t = (x / 1000.0 - k as f64).clamp(0.0, 1.0);
+        right + (left - right) * 0.5 * (1.0 - (8.0 * (t - 0.5)).tanh())
+    }
+
+    /// The cliff with N² constant (0.01 kg/m⁴): round-off stays round-off.
+    /// The split-form advection conserves the tracer variance besides the
+    /// energy, and for a linear profile energy plus a multiple of the
+    /// variance has its minimum at rest (TODO P1.3).
+    #[test]
+    fn constant_stratification_over_a_cliff_stays_at_rest() {
+        let speed = cliff_at_rest(|z| RHO0 - 0.01 * z, 6.0);
+        // Measured 1.8e-11 m/s
+        assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
+    }
+
+    /// TODO P1.3 gate (fails today): the cliff under a pycnocline (2 kg/m³
+    /// across ≈ 8 m at 15 m depth, 4e-4 kg/m⁴ above and below). Where a
+    /// σ-level crosses the pycnocline between two nodes of one element, the
+    /// pair's chord is far steeper than the stratification at either node,
+    /// no conserved functional has its minimum at rest, and round-off grows
+    /// with an e-folding of ≈ 45 min (2.3e-8 m/s after 6 h; on the Frøya bed
+    /// ≈ 15 min).
+    #[test]
+    #[ignore = "known failure, TODO P1.3: the pycnocline over a cliff is unstable at rest"]
+    fn a_pycnocline_over_a_cliff_stays_at_rest() {
+        let speed = cliff_at_rest(|z| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z, 6.0);
+        assert!(speed < 1e-9, "the cliff spun up {speed:.3e} m/s");
+    }
+
+    /// The pycnocline over the 15 → 300 m cliff, over 0.5 m of water beside
+    /// 150 m, and over land beside 300 m of water, each inside one element,
+    /// with the bed smoothed to [`ElementSlopeBound::for_pycnocline`] (the
+    /// pycnocline's bottom ≈ 19 m) between the columns that are not thin:
+    /// round-off stays round-off for a day (TODO P1.3). The shore needs no
+    /// smoothing: its element moves the layers on the 2D kernel's subcells,
+    /// and the land node exchanges no baroclinic transport.
+    #[test]
+    fn a_pycnocline_over_a_smoothed_cliff_stays_at_rest() {
+        let pycnocline = |z: f64| RHO0 + 1.0 - ((z + 15.0) / 4.0).tanh() - 4e-4 * z;
+        let bound = Some(ElementSlopeBound::for_pycnocline(19.0));
+        for (name, left, right) in [
+            ("cliff", -300.0, -15.0),
+            ("shallows", -150.0, -0.5),
+            ("shore", -300.0, 5.0),
+        ] {
+            let speed =
+                channel_at_rest(|x| step_bed(x, 3, left, right), bound, pycnocline, &[24.0])[0];
+            println!("smoothed {name}: {speed:.2e} m/s after 24 h");
+            assert!(speed < 1e-9, "the smoothed {name} spun up {speed:.3e} m/s");
+        }
+    }
+
+    /// The 22 elements of the Frøya coastline mesh within 400 m of its
+    /// element 11048 (`tests/data/froya_terrace_patch.txt`, written by
+    /// `froya_real_data … slopes3d=on debug_3d=around=11048:400,export=…`):
+    /// terraces the per-element smoothing made (22.6, 30.6, 41 m) beside a
+    /// shore element with one dry node, walls around. The mesh, and the bed
+    /// with its gradient per element node.
+    fn terrace_patch() -> (Mesh2D, Bathymetry2D) {
+        let text = include_str!("../../tests/data/froya_terrace_patch.txt");
+        let mut lines = text.lines().filter(|l| !l.starts_with('#'));
+        let count = |lines: &mut dyn Iterator<Item = &str>, name: &str| -> usize {
+            let line = lines.next().expect("fixture header");
+            let (key, n) = line.split_once(' ').expect("fixture header");
+            assert_eq!(key, name, "fixture section");
+            n.parse().expect("fixture count")
+        };
+        let numbers = |line: &str| -> Vec<f64> {
+            line.split_whitespace()
+                .map(|v| v.parse().expect("fixture number"))
+                .collect()
+        };
+        let n_vertices = count(&mut lines, "vertices");
+        let vertices: Vec<[f64; 2]> = (0..n_vertices)
+            .map(|_| {
+                let v = numbers(lines.next().expect("vertex"));
+                [v[0], v[1]]
+            })
+            .collect();
+        let n_quads = count(&mut lines, "quads");
+        let quads: Vec<[usize; 4]> = (0..n_quads)
+            .map(|_| {
+                let q = numbers(lines.next().expect("quad"));
+                [q[0] as usize, q[1] as usize, q[2] as usize, q[3] as usize]
+            })
+            .collect();
+        let n_nodes = count(&mut lines, "bed");
+        let mesh =
+            Mesh2D::from_quads(vertices, quads, &[], |_| BoundaryTag::Wall).expect("fixture mesh");
+        let mut bathymetry = Bathymetry2D::constant(n_quads, n_nodes, 0.0);
+        for idx in 0..n_quads * n_nodes {
+            let b = numbers(lines.next().expect("bed"));
+            bathymetry.data[idx] = b[0];
+            bathymetry.gradient_x[idx] = b[1];
+            bathymetry.gradient_y[idx] = b[2];
+        }
+        (mesh, bathymetry)
+    }
+
+    /// The summer pycnocline of `froya_real_data levels=N`: T 4 °C warmer
+    /// and S 1.5 psu fresher above ≈ 15 m, 0.002 °C/m below.
+    fn summer_pycnocline(eos: &LinearEOS, z: f64) -> (f64, f64) {
+        let step = 0.5 * (1.0 + ((z + 15.0) / 4.0).tanh());
+        (
+            eos.t0 + 4.0 * step + 0.002 * z.min(0.0),
+            eos.s0 - 1.5 * step,
+        )
+    }
+
+    /// [`terrace_patch`] at rest under [`summer_pycnocline`] as
+    /// `froya_real_data` sets it up (20 stretched levels, P2, constant mixing,
+    /// no limiter, the profile as the PGF's reference), with the vertical
+    /// tracer scheme `scheme` (the default if none), about the rest state if
+    /// `about_rest`: the physics and the state at rest.
+    fn terrace_patch_physics(
+        scheme: Option<VerticalAdvection>,
+        about_rest: bool,
+    ) -> (Physics, Solution3D) {
+        use crate::physics::EquationOfState;
+        use crate::solver::{StandardLimiter2D, WetDryConfig};
+        use crate::vertical::SongHaidvogelStretching;
+        let (mesh, mut bathymetry) = terrace_patch();
+        let mesh = Arc::new(mesh);
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        assert_eq!(bathymetry.n_nodes, ops.n_nodes, "the fixture is P2");
+        bathymetry.n_elements = mesh.n_elements;
+        let bathymetry = Arc::new(bathymetry);
+        let f = CoriolisSource2D::f_plane(1.31e-4);
+        let swe = PhysicsBuilder::swe_2d(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            ShallowWater2D::new(G),
+            Reflective2D::default(),
+        )
+        .with_bathymetry(bathymetry.clone())
+        .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
+        .with_wet_dry(WetDryConfig::default())
+        .with_source(f)
+        .build();
+        let sigma = SigmaGrid::new(20, SongHaidvogelStretching::new(5.0, 0.4, 10.0));
+        let eos = LinearEOS::default();
+        let physics = Hydrostatic3D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom,
+            Arc::new(sigma.clone()),
+            bathymetry.clone(),
+            Arc::new(f),
+            eos,
+            ConstantMixing::new(1e-3, 0.0),
+            swe,
+            no_stress(),
+            G,
+            RHO0,
+        )
+        .with_bottom_drag(BottomDrag3D::log_layer(0.003))
+        .with_smagorinsky_viscosity(0.1);
+        let (nn, nl) = (ops.n_nodes, sigma.n_levels());
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        for idx in 0..mesh.n_elements * nn {
+            let b = bathymetry.data[idx];
+            let eta = b.max(0.0);
+            state.eta.data[idx] = eta;
+            for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+                (state.temp[idx * nl + l], state.salt[idx * nl + l]) =
+                    summer_pycnocline(&eos, eta + s * (eta - b));
+            }
+        }
+        physics.update_density(&mut state);
+        let physics = physics.with_reference_profile(&state, |z| {
+            let (t, s) = summer_pycnocline(&eos, z);
+            eos.compute_density(t, s, z)
+        });
+        let physics = match scheme {
+            Some(scheme) => physics.with_vertical_advection(scheme),
+            None => physics,
+        };
+        let physics = if about_rest {
+            physics.with_vertical_reference(&state)
+        } else {
+            physics
+        };
+        (physics, state)
+    }
+
+    /// [`terrace_patch_physics`] with the default vertical scheme, from a
+    /// temperature perturbation of 1e-6 °C: the largest layer speed after
+    /// each of `hours`.
+    fn terrace_patch_at_rest(about_rest: bool, hours: &[f64]) -> Vec<f64> {
+        let (physics, mut state) = terrace_patch_physics(None, about_rest);
+        let (nl, bathymetry) = (state.n_levels, physics.bathymetry.clone());
+        // A deterministic perturbation of 1e-6 °C at every wet point
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for (idx, t) in state.temp.iter_mut().enumerate() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            if state.eta.data[idx / nl] - bathymetry.data[idx / nl] > 0.1 {
+                *t += 1e-6 * ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
+            }
+        }
+        let dt = 5.0;
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut n = 0;
+        let mut speeds = Vec::with_capacity(hours.len());
+        for &until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+            }
+            let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+            println!("terrace patch (about rest: {about_rest}): {speed:.2e} m/s after {until} h");
+            speeds.push(speed);
+        }
+        speeds
+    }
+
+    /// TODO P1.3 gate: the 36-min mode of the smoothed Frøya coastline mesh
+    /// (`docs/stratified-rest-over-steep-beds.md`). With a dissipative or
+    /// higher-order vertical tracer scheme the rest state mixes its own
+    /// pycnocline at the rate of a perturbation's vertical flow, which drives
+    /// the perturbation (`the_default_vertical_scheme_grows_on_the_terrace`).
+    /// Reconstructed about the rest state (`with_vertical_reference`), the
+    /// background is advected centred and the patch stays at rest: measured
+    /// 4.0e-7 → 3.6e-7 m/s from 2 to 4 h (the seed's own transient).
+    #[test]
+    fn a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference() {
+        let speeds = terrace_patch_at_rest(true, &[1.0, 3.0]);
+        assert!(
+            speeds[1] < 2.0 * speeds[0],
+            "about the rest state the terrace grew: {speeds:?}"
+        );
+    }
+
+    /// The fixture of the gate above still holds the mode: the default
+    /// `LimitedAkima` grows (measured ×11 from 2 to 4 h, the e-folding
+    /// approaching 33 min as the mode emerges from the seed).
+    #[test]
+    #[ignore = "slow (≈ 2 min): the mode of the terrace fixture under the default vertical scheme"]
+    fn the_default_vertical_scheme_grows_on_the_terrace() {
+        let speeds = terrace_patch_at_rest(false, &[2.0, 4.0]);
+        assert!(
+            speeds[1] > 5.0 * speeds[0],
+            "the default should grow on the terrace: {speeds:?}"
+        );
+    }
+
+    /// The state's u, v, T, S, η, ū and v̄ as one vector, or back.
+    fn pack(state: &Solution3D, out: &mut Vec<f64>) {
+        out.clear();
+        for field in [&state.u, &state.v, &state.temp, &state.salt] {
+            out.extend_from_slice(field);
+        }
+        for field in [&state.eta.data, &state.ubar.data, &state.vbar.data] {
+            out.extend_from_slice(field);
+        }
+    }
+
+    fn unpack(x: &[f64], state: &mut Solution3D) {
+        let mut rest = x;
+        for field in [
+            &mut state.u,
+            &mut state.v,
+            &mut state.temp,
+            &mut state.salt,
+            &mut state.eta.data,
+            &mut state.ubar.data,
+            &mut state.vbar.data,
+        ] {
+            let (head, tail) = rest.split_at(field.len());
+            field.copy_from_slice(head);
+            rest = tail;
+        }
+    }
+
+    /// Probe (TODO P1.3): the leading eigenvalues of the linearised step map
+    /// about rest on the terrace fixture, by Arnoldi on finite differences
+    /// of `DGRS_SPECTRUM_SECONDS` (600 s) of 5 s steps, `DGRS_KRYLOV` (24)
+    /// vectors. The vertical tracer scheme from `DGRS_VADV` (centred,
+    /// akima, hermite, upwind, tvd; default LimitedAkima), about the rest
+    /// state with `DGRS_VREF=1`. Prints the growth rates (e-folding) and
+    /// frequencies of the Ritz values. Upwind-type schemes are only
+    /// positively homogeneous about rest (`|Ω|`), so their Ritz values are
+    /// those of one linearisation, along the Krylov directions.
+    #[test]
+    #[ignore = "probe: the spectrum of the terrace fixture at rest"]
+    fn probe_terrace_spectrum() {
+        let scheme = match std::env::var("DGRS_VADV").as_deref() {
+            Ok("centred") => Some(VerticalAdvection::Centred),
+            Ok("akima") => Some(VerticalAdvection::Akima),
+            Ok("hermite") => Some(VerticalAdvection::HermiteMean),
+            Ok("upwind") => Some(VerticalAdvection::Upwind),
+            Ok("tvd") => Some(VerticalAdvection::Tvd),
+            _ => None,
+        };
+        let about_rest = std::env::var("DGRS_VREF").is_ok_and(|v| v == "1");
+        let env = |key: &str, default: f64| {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let horizon = env("DGRS_SPECTRUM_SECONDS", 600.0);
+        let m = env("DGRS_KRYLOV", 24.0) as usize;
+        let dt = 5.0;
+        let (physics, rest) = terrace_patch_physics(scheme, about_rest);
+        let steps = (horizon / dt).round() as usize;
+        // The step map over the horizon, from a fresh integrator each time
+        let advance = |x: &[f64]| -> Vec<f64> {
+            let mut state = rest.clone();
+            unpack(x, &mut state);
+            let mut integrator = ModeSplitIntegrator::new();
+            for n in 0..steps {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+            }
+            let mut out = Vec::new();
+            pack(&state, &mut out);
+            out
+        };
+        let mut x0 = Vec::new();
+        pack(&rest, &mut x0);
+        let base = advance(&x0);
+        let n = x0.len();
+        // Perturbations of 1e-6 in the norm's units (velocities in m/s,
+        // tracers in °C or psu, η in m): far above round-off, far below
+        // nonlinearity
+        let epsilon = 1e-6;
+        let norm = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let apply = |v: &[f64]| -> Vec<f64> {
+            let x: Vec<f64> = x0.iter().zip(v).map(|(a, b)| a + epsilon * b).collect();
+            advance(&x)
+                .iter()
+                .zip(&base)
+                .map(|(a, b)| (a - b) / epsilon)
+                .collect()
+        };
+        // Arnoldi with full re-orthogonalisation, from a deterministic start
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut start: Vec<f64> = (0..n)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+            })
+            .collect();
+        let s = norm(&start);
+        start.iter_mut().for_each(|x| *x /= s);
+        let mut basis = vec![start];
+        let mut h = vec![vec![0.0; m]; m + 1];
+        let mut size = m;
+        for j in 0..m {
+            let mut w = apply(&basis[j]);
+            for _ in 0..2 {
+                for (i, q) in basis.iter().enumerate() {
+                    let dot: f64 = w.iter().zip(q).map(|(a, b)| a * b).sum();
+                    h[i][j] += dot;
+                    w.iter_mut().zip(q).for_each(|(a, b)| *a -= dot * b);
+                }
+            }
+            let beta = norm(&w);
+            h[j + 1][j] = beta;
+            if beta < 1e-12 {
+                size = j + 1;
+                break;
+            }
+            w.iter_mut().for_each(|x| *x /= beta);
+            basis.push(w);
+        }
+        let hessenberg = faer::Mat::<f64>::from_fn(size, size, |i, j| h[i][j]);
+        let mut ritz = hessenberg.eigenvalues().expect("Hessenberg eigenvalues");
+        ritz.sort_by(|a, b| (b.re.hypot(b.im)).total_cmp(&a.re.hypot(a.im)));
+        println!(
+            "SPECTRUM scheme {scheme:?} about rest {about_rest}: {size} Ritz values of the \
+             {horizon} s map ({n} unknowns)"
+        );
+        for mu in ritz.iter().take(10) {
+            let modulus = mu.re.hypot(mu.im);
+            let rate = modulus.ln() / horizon;
+            let efold = if rate > 0.0 {
+                1.0 / rate / 60.0
+            } else {
+                f64::INFINITY
+            };
+            println!(
+                "  |μ| {modulus:.6}: growth {rate:+.3e} /s (e-folding {efold:.1} min), \
+                 frequency {:.3e} rad/s",
+                mu.im.atan2(mu.re) / horizon
+            );
+        }
+    }
+
+    /// Regression (TODO P1.3): the 3D horizontal viscosity of the shear on
+    /// the terrace fixture, as a matrix (`DGRS_NU`, 10 m²/s; 4 levels; at
+    /// rest), has no eigenvalue with a positive real part. With the interior
+    /// flux at its walls (before) it had one of +1.1e-2 /s at a coastline
+    /// corner, and `nu=10` on the Frøya patch blew up with an e-folding of
+    /// 1.5 min at any time step. `DGRS_VISC_LIFT` and `DGRS_VISC_FLAT` vary
+    /// the water (see below) for probing.
+    #[test]
+    fn shear_viscosity_is_dissipative_on_the_coastline_fixture() {
+        use crate::solver::rhs::{
+            Boundaries3D, HorizontalViscosity3D, ViscosityScratch3D, apply_horizontal_viscosity_3d,
+        };
+        let nu: f64 = std::env::var("DGRS_NU")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10.0);
+        let (mesh, mut bathymetry) = terrace_patch();
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        bathymetry.n_elements = mesh.n_elements;
+        let nl = 4;
+        let sigma = SigmaGrid::new(nl, UniformStretching);
+        let nn = ops.n_nodes;
+        let mut state = Solution3D::new(mesh.n_elements, nn, nl);
+        // DGRS_VISC_LIFT=m raises the water by m (no thin columns for m > 0.1),
+        // DGRS_VISC_FLAT=d makes the bed flat at depth d
+        let env = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<f64>().ok());
+        if let Some(depth) = env("DGRS_VISC_FLAT") {
+            bathymetry.data.fill(-depth);
+        }
+        let lift = env("DGRS_VISC_LIFT").unwrap_or(0.0);
+        for (eta, &b) in state.eta.data.iter_mut().zip(&bathymetry.data) {
+            *eta = b.max(0.0) + lift;
+        }
+        let thin = Physics::DEFAULT_MIN_COLUMN_DEPTH;
+        let wet: Vec<usize> = (0..mesh.n_elements * nn)
+            .filter(|&idx| state.eta.data[idx] - bathymetry.data[idx] >= thin)
+            .collect();
+        // Unknowns: u then v of every wet node and level
+        let unknowns: Vec<(usize, usize, usize)> = (0..2)
+            .flat_map(|c| {
+                wet.iter()
+                    .flat_map(move |&idx| (0..nl).map(move |l| (c, idx, l)))
+            })
+            .collect();
+        let n = unknowns.len();
+        let boundaries = Boundaries3D::default();
+        let mut scratch = ViscosityScratch3D::new(mesh.n_elements, &ops);
+        let mut matrix = faer::Mat::<f64>::zeros(n, n);
+        let (mut rhs_u, mut rhs_v) = (vec![0.0; state.u.len()], vec![0.0; state.u.len()]);
+        for (j, &(c, idx, l)) in unknowns.iter().enumerate() {
+            state.u.fill(0.0);
+            state.v.fill(0.0);
+            if c == 0 {
+                state.u[idx * nl + l] = 1.0;
+            } else {
+                state.v[idx * nl + l] = 1.0;
+            }
+            rhs_u.fill(0.0);
+            rhs_v.fill(0.0);
+            apply_horizontal_viscosity_3d(
+                &mut rhs_u,
+                &mut rhs_v,
+                &state,
+                HorizontalViscosity3D::constant(nu),
+                &mesh,
+                &ops,
+                &geom,
+                &bathymetry,
+                &sigma,
+                &boundaries,
+                thin,
+                &mut scratch,
+            );
+            for (i, &(ci, idx_i, li)) in unknowns.iter().enumerate() {
+                let r = if ci == 0 { &rhs_u } else { &rhs_v };
+                matrix[(i, j)] = r[idx_i * nl + li];
+            }
+        }
+        let eigen = matrix.eigen().expect("eigendecomposition");
+        let values = eigen.S().column_vector();
+        let (mut best, mut at) = (f64::NEG_INFINITY, 0);
+        for i in 0..n {
+            if values[i].re > best {
+                best = values[i].re;
+                at = i;
+            }
+        }
+        println!(
+            "VISCOSITY ν = {nu}: {n} unknowns, largest real part {best:.3e} /s              (e-folding {:.1} min), imaginary {:.3e}",
+            1.0 / best / 60.0,
+            values[at].im
+        );
+        // Where its eigenvector lives
+        let vector = eigen.U().col(at);
+        let mut weights: Vec<(f64, usize)> = (0..n)
+            .map(|i| (vector[i].re.hypot(vector[i].im), i))
+            .collect();
+        weights.sort_by(|a, b| b.0.total_cmp(&a.0));
+        for &(w, i) in weights.iter().take(3) {
+            let (c, idx, l) = unknowns[i];
+            let k = idx / nn;
+            let depths: Vec<f64> = (0..nn)
+                .map(|m| {
+                    ((state.eta.data[k * nn + m] - bathymetry.data[k * nn + m]) * 10.0).round()
+                        / 10.0
+                })
+                .collect();
+            println!(
+                "  {w:.3} at element {k} node {} level {l} ({}); affine {}; depths {depths:?}",
+                idx % nn,
+                if c == 0 { "u" } else { "v" },
+                geom.element_is_affine(k)
+            );
+        }
+        // The operator's scale: ν/Δx² over ≈ 50 m nodes
+        let scale = nu / 50.0_f64.powi(2);
+        assert!(
+            best < 1e-10 * scale,
+            "an eigenvalue with real part {best:.3e} /s (scale {scale:.1e})"
+        );
+    }
+
+    /// `Simulation3D` takes a stratified initial state as the vertical
+    /// tracer advection's reference (TODO P1.3), and only then: an unmixed
+    /// state, a reference of the caller's, or `without_vertical_reference`
+    /// keep theirs.
+    #[test]
+    fn simulation_takes_a_stratified_initial_state_as_the_vertical_reference() {
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 300.0, 0.0, 100.0, 3, 1));
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Arc::new(Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0));
+        let physics = || {
+            let swe = PhysicsBuilder::swe_2d(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                ShallowWater2D::new(G),
+                Reflective2D::default(),
+            )
+            .with_bathymetry(bathymetry.clone())
+            .build();
+            hydrostatic(&mesh, &ops, &geom, &bathymetry, swe, no_stress(), 1e-3, 0.0)
+        };
+        let nl = 3;
+        let uniform = {
+            let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, nl);
+            state.eta.data.fill(0.0);
+            state.temp.fill(10.0);
+            state.salt.fill(35.0);
+            state
+        };
+        let mut stratified = uniform.clone();
+        for column in stratified.temp.chunks_exact_mut(nl) {
+            column.copy_from_slice(&[8.0, 9.0, 12.0]);
+        }
+        let reference_after = |physics: Physics, state: &Solution3D| {
+            let mut simulation = Simulation3D::new(physics, ModeSplitIntegrator::new());
+            let mut state = state.clone();
+            simulation.run(&mut state, 0.0, 1.0);
+            simulation.physics.vertical_reference()
+        };
+        assert!(reference_after(physics(), &uniform).is_none(), "unmixed");
+        let taken = reference_after(physics(), &stratified).expect("stratified");
+        assert_eq!(taken[0], stratified.temp, "the initial temperature");
+        assert!(
+            reference_after(physics().without_vertical_reference(), &stratified).is_none(),
+            "opted out"
+        );
+        let own = reference_after(physics().with_vertical_reference(&uniform), &stratified)
+            .expect("the caller's");
+        assert_eq!(own[0], uniform.temp, "the caller's reference is kept");
     }
 
     /// A stratified seamount at rest (Beckmann & Haidvogel 1993; TODO P4.6):

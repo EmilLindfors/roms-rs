@@ -93,15 +93,48 @@
 //!     [station_minutes=10] [spinup_hours=24] [gauge_gains=K1,O1] \
 //!     [gauge_ratios=N2,Q1,P1] [land_elevation=5] \
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
+//!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
-//!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0]
+//!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
+//!     [levels=0] [tide3d=0] [restart_hours=0] [resume=<file>]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
 //! instead of the tidal run (`wave_grid=frequencies,directions`, refraction
 //! capped at `turning=` rad/s, or stepped implicitly with `implicit=1`): the
 //! step, what sets it, and the cost per model hour.
+//!
+//! `levels=N tide3d=1` runs the tide in 3D instead (`tidal_run_3d`, TODO P1.3):
+//! the 2D run's open boundary (NorKyst nesting with `norkyst=`, else the atlas
+//! tides) drives the barotropic mode, and with `norkyst=` the same file, read
+//! with its profiles (`norkyst_nesting_subset profiles=1`), gives the initial
+//! T and S at every node, the initial velocity's shear (NorKyst's profile
+//! less its depth mean: the tide's depth mean ramps up from rest), and nests
+//! u, v, T, S in the band (`Nesting3D`, `OceanModelColumns`); without it the
+//! open faces relax to the stratification at rest (the summer pycnocline).
+//! The PGF, the tracer limiter and the vertical advection take the domain's
+//! mean initial profile as their reference. GLS k-ε, log-layer bottom drag
+//! (no 2D Manning friction), Smagorinsky viscosity; the vertical advection
+//! beyond an explicit Courant number implicit
+//! (`Hydrostatic3D::with_implicit_vertical_advection`). `wind` and `met=` as
+//! in 2D: the pressure gradient on the 2D module, the wind stress on the
+//! columns (`GriddedAtmosphere2D::split_for_3d`). The stations, the progress
+//! lines and a 3D snapshot file (`snapshot_minutes=`,
+//! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step. Use
+//! `slopes3d=on` for the stratified rest state on steep beds.
+//!
+//! A long 3D tide can stop and resume bit for bit. `restart_hours=H` writes
+//! `<output>/<domain>.restart` (`Restart3D`, replaced in one rename, so a
+//! crash while writing keeps the previous one) at the first progress line at
+//! or after every H model hours. It holds the state, the mode splitter's slow
+//! forcing, the vertical reference, the station records and the sampling
+//! counters. `resume=<file>`, with the same other options (the domain's
+//! fingerprint is checked), builds the run as before from its initial state,
+//! then continues from the file's time to `hours=`: the snapshot file drops
+//! the frames written after the restart and goes on, and the stations' report
+//! covers the whole run. A resumed run's outputs equal the uninterrupted
+//! run's, byte for byte.
 //!
 //! `levels=N` (N > 0) times `steps_3d=` (10) mode-split steps of the 3D model
 //! on the domain instead of the tidal run: N surface-stretched σ-levels, GLS
@@ -114,12 +147,25 @@
 //! momentum tendency at rest), `uniform` (no stratification), `linear`
 //! (linear in z instead of the pycnocline), `balanced` (the initial state as
 //! the PGF's balanced reference), `nolimiter`, `constant` (constant mixing
-//! instead of GLS).
+//! instead of GLS), `thin=D` (the 3D thin-column depth, 0.1 m by default),
+//! `vcentred` (centred vertical tracer advection), `nu=V` (a constant
+//! horizontal viscosity of the shear, m²/s, added to Smagorinsky's),
+//! `around=K:R` (only the elements within R m of element K, walls around:
+//! a local growth reproduced in minutes), `every=N` (trace every N steps),
+//! `dump=PREFIX` (the state at rest, `gap=N` steps before the end and at the
+//! end, for `scripts/mode3d_dump.py`), `seed=PREFIX:AMP` (start from rest
+//! plus a dumped mode at a largest speed of AMP m/s), `deep=G` (°C/m below
+//! the pycnocline, 0.002), `vadv=centred|akima|tvd|upwind|hermite` (the
+//! vertical tracer scheme), `noref` (that scheme without the reference of
+//! the state at rest, which 3D runs take by default; TODO P1.3),
+//! `tadv=none|centred` (the turbulence's advection) and
+//! `export=PATH` (with `around=`: the patch as a test fixture).
 //!
 //! `snapshot_minutes=N` (N > 0) also writes the state every N minutes to
 //! `<output>/froya.dgsnap` (`io::SnapshotWriter`: f32 η, u, v per node, with
-//! the mesh, bed, clock and stations), a tenth of the VTU frames' size. The
-//! viewer replays it without rebuilding the domain:
+//! the mesh, bed, clock, stations and projection), a tenth of the VTU frames'
+//! size. The viewer replays it without rebuilding the domain, with the land
+//! around it from the elevation model:
 //! `cd viz && cargo run --release -- --replay ../output/froya/froya.dgsnap`.
 //! With stations, N is rounded to a multiple of `station_minutes`.
 //!
@@ -127,6 +173,24 @@
 //! r_x0 = |h₁ − h₂|/(h₁ + h₂) between neighbouring nodes at least
 //! `rx0_min_depth` (3 m) deep is at most r (`Bathymetry2D::smooth_rx0`):
 //! shoals a node wide otherwise carry spurious m/s currents.
+//!
+//! `wall_land=lower` lowers the land at the walls of a coastline mesh
+//! (`mesh=`) in elements that are otherwise water to the water beside it
+//! (`Bathymetry2D::lower_wall_land`): the simplified coastline leaves a strip
+//! of the elevation model's land a fraction of a node spacing wide in front
+//! of two thirds of its walls, and every element with such a strip is partly
+//! dry at every water level. Only elements wet off their walls below the
+//! lowest water (2 m below MSL) are lowered. Off by default.
+//!
+//! `slopes3d=on` (for 3D runs, `levels=N`; in a 2D run it shows what the 3D
+//! bed does to the tide) smooths the bed, keeping its volume,
+//! until no element's depth range lets a σ-level cross the summer
+//! pycnocline between two of its nodes (`Bathymetry2D::smooth_element_slopes`,
+//! TODO P1.3): within an element r_x0 ≤ 0.15 (`slopes3d=r` for another bound)
+//! between columns that are not thin (`debug_3d=thin=`, 0.1 m) wherever the
+//! deeper one is below `free_depth` (19 m, the pycnocline's bottom).
+//! Shores need none (the 3D wetting and drying moves their layers on the 2D
+//! kernel's subcells) and do not move. Off by default.
 //!
 //! `bbox=west,south,east,north` runs a smaller box, e.g. the 22 × 19 km
 //! around Mausund (a quarter of the cost), with its own mesh and boundary
@@ -176,20 +240,19 @@ use dg_rs::boundary::NestingOptions;
 use dg_rs::boundary::{
     AtlasPoint, BCContext2D, BoundaryLevel, BoundaryTides, CharacteristicOBC,
     ExternalStateProvider, HarmonicTide, InverseBarometer, MultiBoundaryCondition2D,
-    OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
+    NestingRelaxation2D, OceanModelState, Reflective2D, SWEBoundaryCondition2D, TidalAtlas,
 };
 use dg_rs::equations::ShallowWater2D;
 #[cfg(feature = "netcdf")]
-use dg_rs::io::{
-    AtmosphereReader, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig, OceanModelReader,
-};
+use dg_rs::io::{AtmosphereReader, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
 use dg_rs::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
-    LocalProjection, SnapshotWriter, TideGaugeFile, east_axis, read_adcp_file,
+    LocalProjection, OceanModelReader, SnapshotWriter, TideGaugeFile, east_axis, read_adcp_file,
     read_tide_gauge_file, write_adcp_file, write_tide_gauge_file, write_vtk_swe,
 };
 use dg_rs::mesh::{
-    Bathymetry2D, BoundaryTag, Mesh2D, MeshPoint, PointLocator2D, inverse_bilinear, read_gmsh_mesh,
+    Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, MeshPoint, PointLocator2D,
+    inverse_bilinear, read_gmsh_mesh,
 };
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
@@ -200,7 +263,7 @@ use dg_rs::solver::{
 };
 use dg_rs::source::{
     AtmosphericPressure2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
-    ManningFriction2D, WindStress2D,
+    GriddedWindStress, ManningFriction2D, WindStress2D,
 };
 use dg_rs::tides::canonical_name;
 use dg_rs::time::{IntegratorInfo, ModelClock, Multirate, SSPRK3, SspScheme, StandardIntegrator};
@@ -217,6 +280,12 @@ const MANNING_N: f64 = 0.025;
 /// Default bed elevation given to land nodes of shoreline elements (m above
 /// MSL; `land_elevation=`)
 const LAND_ELEVATION: f64 = 5.0;
+/// Lowest water for `wall_land=lower` (m above MSL): below the lowest
+/// astronomical tide at Mausund (chart datum, 1.43 m below MSL), so that the
+/// elements it lowers stay wet through the tide
+const WALL_LOW_WATER: f64 = -2.0;
+/// The thin-column depth of a 3D tide (m; `Options::thin_depth`)
+const TIDE_3D_THIN_DEPTH: f64 = 1.0;
 /// Default elevation model: Kartverket's topobathy model at 50 m
 /// (`scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif`)
 const DEM: &str = "data/froya_topobathy.tif";
@@ -225,6 +294,9 @@ const FROYA_BBOX: [f64; 4] = [8.0, 63.6, 9.2, 64.0];
 /// Default depth (m) below which `rx0=` leaves the bed alone: the shore and
 /// the dry area keep their shape
 const RX0_MIN_DEPTH: f64 = 3.0;
+/// Depth (m) of the bottom of the 3D runs' summer pycnocline (T and S step as
+/// `tanh((z + 15)/4)`), for the bound of `slopes3d=`
+const PYCNOCLINE_BOTTOM: f64 = 19.0;
 /// Land-mask cells per bathymetry pixel and direction: the coastline is
 /// rasterised at ≈ 25 × 58 m
 const LAND_MASK_REFINEMENT: usize = 4;
@@ -320,6 +392,10 @@ struct Options {
     /// 1 km the M2 current near Mausund was 0.41 of NorKyst's with point
     /// samples and 0.63 projected, the gauge's centred RMSE 4.4 and 4.0 cm
     project_bed: bool,
+    /// Lower the land at the coastline walls of elements that are otherwise
+    /// water to their water (`wall_land=lower`, `Bathymetry2D::lower_wall_land`)
+    /// or keep the elevation model's (`wall_land=keep`, the default)
+    lower_wall_land: bool,
     /// Coastline-fitted Gmsh mesh (`mesh=`, from
     /// `scripts/gmsh_coastline_mesh.py`) instead of the `nx` × `ny` grid
     mesh: Option<String>,
@@ -338,6 +414,12 @@ struct Options {
     /// nodes deeper than `rx0_min_depth` (`rx0=`, e.g. 0.3; off by default)
     rx0: Option<f64>,
     rx0_min_depth: f64,
+    /// For 3D runs (`levels=`), smooth the bed until every element is within
+    /// this bound (`Bathymetry2D::smooth_element_slopes`): `slopes3d=on` (r_x0
+    /// 0.15) or `slopes3d=r`, off by default; `free_depth=` sets the depth
+    /// above which elements are free (1.5 × the summer pycnocline's bottom by
+    /// default)
+    slopes_3d: Option<ElementSlopeBound>,
     /// Domain box `west,south,east,north` (°; `bbox=`). A smaller box needs
     /// its own boundary atlas (`tides=`, from `norkyst_boundary_tides bbox=`)
     bbox: [f64; 4],
@@ -356,13 +438,47 @@ struct Options {
     /// Time the 3D model on the domain with this many σ-levels instead of
     /// the tidal run (`levels=N`; 0: off), for `steps_3d=` steps
     levels: usize,
+    /// Run the tide in 3D with `levels` σ-levels (`tide3d=1`) instead of
+    /// timing steps of it
+    tide_3d: bool,
     steps_3d: usize,
     dt_3d: Option<f64>,
     debug_3d: String,
+    /// Write a restart of the 3D tide every this many model hours
+    /// (`restart_hours=`; 0: none), at the first progress line at or after it
+    restart_hours: f64,
+    /// Resume the 3D tide from this restart file (`resume=`)
+    resume: Option<PathBuf>,
     output: Option<PathBuf>,
 }
 
+/// The 3D model of `levels=N`.
+type Physics3D = dg_rs::physics::Hydrostatic3D<
+    dg_rs::physics::LinearEOS,
+    Box<dyn dg_rs::physics::VerticalMixing + Send + Sync>,
+    Reflective2D,
+>;
+
 impl Options {
+    /// The 3D thin-column depth (`debug_3d=thin=D`, else the model's
+    /// default).
+    /// The 3D thin-column depth (`debug_3d=thin=`): the model's default, or
+    /// for a 3D tide 1 m. A column just over 0.1 m deep has millimetre layers,
+    /// and as the tide floods the shore their `|Ω|/H_z` bound took the step
+    /// from 4.6 s to 0.7 s within 20 minutes at Mausund; at 1 m it stays at
+    /// 4–5 s (the shore films are the 2D module's)
+    fn thin_depth(&self) -> f64 {
+        let default = if self.tide_3d {
+            TIDE_3D_THIN_DEPTH
+        } else {
+            Physics3D::DEFAULT_MIN_COLUMN_DEPTH
+        };
+        self.debug_3d
+            .split(',')
+            .find_map(|f| f.strip_prefix("thin=").and_then(|v| v.parse().ok()))
+            .unwrap_or(default)
+    }
+
     fn parse() -> Result<Self, String> {
         let args: HashMap<String, String> = std::env::args()
             .skip(1)
@@ -403,9 +519,15 @@ impl Options {
                 "point" => false,
                 other => return Err(format!("bad bed={other}: projected or point")),
             },
+            lower_wall_land: match args.get("wall_land").map_or("keep", String::as_str) {
+                "lower" => true,
+                "keep" => false,
+                other => return Err(format!("bad wall_land={other}: keep or lower")),
+            },
             profile: get("profile", 0.0)? as usize,
             waves: get("waves", 0.0)? as usize,
             levels: get("levels", 0.0)? as usize,
+            tide_3d: get("tide3d", 0.0)? != 0.0,
             steps_3d: get("steps_3d", 10.0)? as usize,
             dt_3d: args
                 .get("dt_3d")
@@ -413,6 +535,8 @@ impl Options {
                 .transpose()
                 .map_err(|e| e.to_string())?,
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
+            restart_hours: get("restart_hours", 0.0)?,
+            resume: args.get("resume").map(PathBuf::from),
             wave_grid: {
                 let text = args.get("wave_grid").map_or("25,36", String::as_str);
                 let parts: Vec<usize> = text
@@ -441,6 +565,21 @@ impl Options {
                 .map(|v| v.parse().map_err(|_| format!("bad rx0={v}")))
                 .transpose()?,
             rx0_min_depth: get("rx0_min_depth", RX0_MIN_DEPTH)?,
+            slopes_3d: {
+                let default = ElementSlopeBound::for_pycnocline(PYCNOCLINE_BOTTOM);
+                let free_depth = get("free_depth", default.free_depth)?;
+                match args.get("slopes3d").map(String::as_str) {
+                    None | Some("off") => None,
+                    Some("on") => Some(ElementSlopeBound {
+                        free_depth,
+                        ..default
+                    }),
+                    Some(r) => Some(ElementSlopeBound {
+                        r_max: r.parse().map_err(|_| format!("bad slopes3d={r}"))?,
+                        free_depth,
+                    }),
+                }
+            },
             bbox: match args.get("bbox") {
                 None => FROYA_BBOX,
                 Some(v) => v
@@ -615,6 +754,18 @@ impl Domain {
         } else {
             Bathymetry2D::from_function(&grid, &ops, &grid_geom, bed)
         };
+        // Land at the walls of elements that are otherwise water: a strip the
+        // simplified coastline leaves in front of its walls
+        if opts.lower_wall_land {
+            let report = grid_bed.lower_wall_land(&grid, &ops, &grid_geom, WALL_LOW_WATER);
+            println!(
+                "  Wall land lowered in {} elements: {} nodes, by up to {:.1} m, {:.4} km³ of water added",
+                report.elements,
+                report.changed,
+                report.max_change,
+                report.volume / 1e9
+            );
+        }
         // Water one node wide is unresolved: make it shore
         let raised = grid_bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
         println!("  {raised} isolated wet nodes raised to the lowest of their neighbours");
@@ -648,6 +799,26 @@ impl Domain {
                 report.changed,
                 report.max_change,
                 describe(&grid_bed)
+            );
+        }
+        // 3D: no σ-level may cross the pycnocline between two nodes of one
+        // element (TODO P1.3), between the columns that are not thin (the
+        // shores are the wetting and drying's)
+        if let Some(bound) = opts.slopes_3d {
+            let thin = opts.thin_depth();
+            let report = grid_bed.smooth_element_slopes(&grid, &ops, &grid_geom, bound, thin);
+            println!(
+                "  Smoothed for 3D (within an element r_x0 ≤ {} below {:.1} m, columns ≥ {thin} m, \
+                 {} sweeps): {} elements over the bound (largest excess {:.1} m), {} nodes \
+                 changed by up to {:.1} m, volume kept; {} elements left over",
+                bound.r_max,
+                bound.free_depth,
+                report.sweeps,
+                report.elements_before,
+                report.excess_before,
+                report.changed,
+                report.max_change,
+                report.elements_after
             );
         }
         let has_water = |k: ElementIndex| grid_bed.element(k).iter().any(|&b| b < 0.0);
@@ -857,14 +1028,16 @@ impl Domain {
     /// does not cover, sample it at the open boundary and the relaxation
     /// band, and blend the bed to its depth across the band.
     #[cfg(feature = "netcdf")]
-    fn nesting(
-        &mut self,
-        opts: &Options,
-    ) -> Result<Option<OceanModelState>, Box<dyn std::error::Error>> {
+    fn nesting(&mut self, opts: &Options) -> Result<Option<Nested>, Box<dyn std::error::Error>> {
         let (Some(path), Some(projection)) = (&opts.norkyst, self.projection) else {
             return Ok(None);
         };
-        let reader = Arc::new(OceanModelReader::from_file(Path::new(path))?);
+        // A 3D tide also nests the parent's profiles
+        let reader = Arc::new(if opts.levels > 0 && opts.tide_3d {
+            OceanModelReader::from_file_with_profiles(Path::new(path))?
+        } else {
+            OceanModelReader::from_file(Path::new(path))?
+        });
         println!("  NorKyst: {}", reader.summary());
         // NorKyst's ζ is not referenced to mean sea level: its 30-day mean
         // along the Frøya boundary is −0.28 m (−0.26 m at Mausund, where the
@@ -907,7 +1080,7 @@ impl Domain {
         }
         let clock = ModelClock::parse(&opts.start)?;
         let parent = OceanModelState::new(
-            reader,
+            reader.clone(),
             &self.mesh,
             &self.ops,
             &projection,
@@ -929,21 +1102,34 @@ impl Domain {
         }
         if opts.blend_bed && opts.band_km > 0.0 {
             let bathymetry = Arc::get_mut(&mut self.bathymetry).expect("bed not shared yet");
-            let blended = parent.blend_bathymetry(bathymetry, &self.ops, &self.geom);
-            println!("  Bed blended to NorKyst's at {blended} nodes of the band");
+            // Not at shores that dry at low water: NorKyst's grid has none
+            let blended =
+                parent.blend_bathymetry(bathymetry, &self.ops, &self.geom, -WALL_LOW_WATER);
+            println!(
+                "  Bed blended to NorKyst's at {blended} nodes of the band (shores \
+                 shallower than {} m kept)",
+                -WALL_LOW_WATER
+            );
         }
-        Ok(Some(parent))
+        Ok(Some((parent, reader)))
     }
 
     #[cfg(not(feature = "netcdf"))]
-    fn nesting(
-        &mut self,
-        _opts: &Options,
-    ) -> Result<Option<OceanModelState>, Box<dyn std::error::Error>> {
+    fn nesting(&mut self, _opts: &Options) -> Result<Option<Nested>, Box<dyn std::error::Error>> {
         Ok(None)
     }
 
     fn builder<BC: SWEBoundaryCondition2D>(&self, bc: BC) -> SWEPhysics2DBuilder<BC> {
+        self.builder_without_friction(bc)
+            .with_implicit_friction(ManningFriction2D::new(G, MANNING_N))
+    }
+
+    /// The 2D module without its bed friction: the 3D model's, whose bottom
+    /// drag's depth mean replaces it.
+    fn builder_without_friction<BC: SWEBoundaryCondition2D>(
+        &self,
+        bc: BC,
+    ) -> SWEPhysics2DBuilder<BC> {
         PhysicsBuilder::swe_2d(
             self.mesh.clone(),
             self.ops.clone(),
@@ -954,7 +1140,6 @@ impl Domain {
         .with_bathymetry(self.bathymetry.clone())
         .with_limiter(StandardLimiter2D::Positivity(WetDryConfig::DEFAULT_H_DRY))
         .with_wet_dry(WetDryConfig::default())
-        .with_implicit_friction(ManningFriction2D::new(G, MANNING_N))
         .with_source(CoriolisSource2D::f_plane(F_CORIOLIS))
     }
 
@@ -1236,11 +1421,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     domain.print_summary();
-    let parent = domain.nesting(&opts)?;
+    let (parent, parent_reader) = match domain.nesting(&opts)? {
+        Some((parent, reader)) => (Some(parent), Some(reader)),
+        None => (None, None),
+    };
     domain.close_uncovered_open_faces(&opts)?;
     if opts.waves > 0 {
         wave_cost(&domain, &opts);
         return Ok(());
+    }
+    if opts.levels > 0 && opts.tide_3d {
+        return tidal_run_3d(&domain, &opts, parent, parent_reader);
+    }
+    if opts.restart_hours > 0.0 || opts.resume.is_some() {
+        return Err("restart_hours= and resume= are for the 3D tide (levels=N tide3d=1)".into());
     }
     if opts.levels > 0 {
         cost_3d(&domain, &opts);
@@ -1274,22 +1468,52 @@ fn lake_at_rest(domain: &Domain, hours: f64) {
     );
 }
 
-fn tidal_run(
+/// What a tidal run is forced and validated with, in 2D and 3D alike.
+struct TideSetup {
+    t_end: f64,
+    clock: ModelClock,
+    stations: Vec<Station>,
+    station_atlas: Option<TidalAtlas>,
+    /// The open boundary's condition, and a description of it
+    open: Box<dyn SWEBoundaryCondition2D>,
+    forcing: String,
+    /// The nesting's relaxation band of the depth mean
+    band: Option<NestingRelaxation2D>,
+    /// The weather model's source term for the 2D module: wind and pressure
+    /// in 2D, the pressure alone in 3D
+    weather: Option<GriddedAtmosphere2D>,
+    /// In 3D, the weather model's wind stress on the columns
+    wind_3d: Option<GriddedWindStress>,
+}
+
+/// The stations, the clock and the open boundary of a tidal run (the parent
+/// model's, its tides corrected to the gauge, or the atlas's), and its band
+/// and weather.
+fn tide_setup(
     domain: &Domain,
     opts: &Options,
     parent: Option<OceanModelState>,
-) -> Result<(), Box<dyn std::error::Error>> {
+    three_d: bool,
+) -> Result<TideSetup, Box<dyn std::error::Error>> {
     let t_end = opts.hours * 3600.0;
-    let wall = Reflective2D::new();
     let station_atlas = Path::new(&opts.station_atlas);
     let station_atlas = station_atlas
         .exists()
         .then(|| TidalAtlas::read(station_atlas))
         .transpose()?;
-    let mut stations = domain.stations(&opts.gauges, &opts.currents, station_atlas.as_ref());
+    let stations = domain.stations(&opts.gauges, &opts.currents, station_atlas.as_ref());
     let clock = ModelClock::parse(&opts.start)?;
     println!("  Clock: t = 0 at {} UTC", clock.format(0.0));
     let weather = weather(domain, opts, &clock, t_end)?;
+    // A 3D model's columns take the wind, its 2D module the pressure
+    // (split before the level's clone shares the fields)
+    let (weather, wind_3d) = match weather {
+        Some(atmosphere) if three_d => {
+            let (pressure, wind) = atmosphere.split_for_3d();
+            (Some(pressure), Some(wind))
+        }
+        other => (other, None),
+    };
     let level = match &weather {
         Some(gridded) => Some(Level::Gridded(gridded.clone())),
         None => opts.wind.then(|| Level::Uniform(pressure())),
@@ -1318,6 +1542,36 @@ fn tidal_run(
         parent,
         level,
     )?;
+    Ok(TideSetup {
+        t_end,
+        clock,
+        stations,
+        station_atlas,
+        open,
+        forcing,
+        band,
+        weather,
+        wind_3d,
+    })
+}
+
+fn tidal_run(
+    domain: &Domain,
+    opts: &Options,
+    parent: Option<OceanModelState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let TideSetup {
+        t_end,
+        clock,
+        mut stations,
+        station_atlas,
+        open,
+        forcing,
+        band,
+        weather,
+        ..
+    } = tide_setup(domain, opts, parent, false)?;
+    let wall = Reflective2D::new();
     let bc = MultiBoundaryCondition2D::new(&wall).with_open(open.as_ref());
 
     let mut builder = domain.builder(bc);
@@ -1406,27 +1660,9 @@ fn tidal_run(
                 path.display(),
                 every as f64 * base_minutes
             );
-            // The stations in mesh coordinates, for the viewer
-            let station_lines: Vec<String> = domain
-                .projection
-                .as_ref()
-                .map(|projection| {
-                    stations
-                        .iter()
-                        .map(|s| {
-                            let (x, y) = projection.geo_to_xy(s.latitude, s.longitude);
-                            format!("{},{x:.1},{y:.1}", s.name)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let title = match domain.projection {
-                // The date is the header's clock
-                Some(_) => "Frøya–Smøla–Hitra",
-                None => "Synthetic basin with an island and a beach",
-            };
-            let mut metadata = vec![("title", title), ("source", "froya_real_data")];
-            metadata.extend(station_lines.iter().map(|s| ("station", s.as_str())));
+            let metadata = snapshot_metadata(domain, &stations, "");
+            let metadata: Vec<(&str, &str)> =
+                metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
             Some(SnapshotWriter::create(
                 path,
                 &domain.mesh,
@@ -1534,8 +1770,55 @@ fn tidal_run(
             stats.speedup()
         );
     }
+    report_stations(&stations, &output_dir, opts, &clock, station_atlas.as_ref())?;
+    if let Some(e) = result.error {
+        return Err(e.into());
+    }
+    println!("Visualize with ParaView: {}/*.vtu", output_dir.display());
+    Ok(())
+}
+
+/// The snapshot file's metadata: the title (with `suffix`), the stations in
+/// mesh coordinates and the mesh's local projection, for the viewer.
+fn snapshot_metadata(
+    domain: &Domain,
+    stations: &[Station],
+    suffix: &str,
+) -> Vec<(&'static str, String)> {
+    let title = match domain.projection {
+        // The date is the header's clock
+        Some(_) => "Frøya–Smøla–Hitra",
+        None => "Synthetic basin with an island and a beach",
+    };
+    let mut metadata = vec![
+        ("title", format!("{title}{suffix}")),
+        ("source", "froya_real_data".to_string()),
+    ];
+    if let Some(projection) = &domain.projection {
+        for s in stations {
+            let (x, y) = projection.geo_to_xy(s.latitude, s.longitude);
+            metadata.push(("station", format!("{},{x:.1},{y:.1}", s.name)));
+        }
+        // The mesh's local projection, for the viewer's land around the domain
+        metadata.push((
+            "projection",
+            format!("local,{},{}", projection.ref_lat(), projection.ref_lon()),
+        ));
+    }
+    metadata
+}
+
+/// Every station's record to `output_dir`, and its comparison with its gauge
+/// and NorKyst after the spin-up.
+fn report_stations(
+    stations: &[Station],
+    output_dir: &Path,
+    opts: &Options,
+    clock: &ModelClock,
+    station_atlas: Option<&TidalAtlas>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let analysis_start = clock.unix(opts.spinup_hours * 3600.0);
-    for s in &stations {
+    for s in stations {
         let slug = slug(&s.name);
         let path = output_dir.join(format!("station_{slug}.txt"));
         let series = TimeSeries::new(&s.times, &s.eta).with_name(s.name.clone());
@@ -1565,7 +1848,6 @@ fn tidal_run(
         };
         println!("  sampled {sampled}, {:.1} m deep", s.depth);
         let atlas_point = station_atlas
-            .as_ref()
             .and_then(|a| a.nearest(s.longitude, s.latitude))
             .filter(|&(_, d)| d <= STATION_MAX_OFFSET);
         if let Some((p, d)) = atlas_point {
@@ -1583,10 +1865,840 @@ fn tidal_run(
             println!("  no current comparison: {e}");
         }
     }
+    Ok(())
+}
+
+/// The domain's mean profile of T and S (°C, psu) in `z` (m), on a 1 m
+/// grid: a horizontally uniform stratification for the references of the PGF,
+/// the tracer limiter and the open faces.
+///
+/// At each height the mean of the columns that reach it, interpolated between
+/// their layer centres, then made statically stable: adjacent heights where
+/// the density decreases downwards are pooled into their weighted mean
+/// (pool-adjacent-violators on `density(T, S)`, which is linear in T and S,
+/// so a pool's density is its mean's). The columns that reach a height change
+/// with depth (below 100 m only the deep holes), and that mean alone was
+/// inverted in places: as a reference, and with `uniform` as the state, its
+/// overturning drove a bed jet of 0.26 m/s within ten minutes in a 120 m hole
+/// at Mausund (TODO P1.3). Taking every column at every height instead
+/// (extended below its bed) is stable but puts the shallow columns' bottom
+/// water in the deep holes: 10.1 °C at 100 m where the holes have 8.3 °C.
+#[derive(Clone)]
+struct MeanProfile {
+    /// Height of the lowest grid point (m)
+    z0: f64,
+    temp: Vec<f64>,
+    salt: Vec<f64>,
+}
+
+impl MeanProfile {
+    fn of(
+        state: &dg_rs::solver::state::Solution3D,
+        bed: &[f64],
+        sigma: &dg_rs::vertical::SigmaGrid,
+        use_column: impl Fn(usize) -> bool,
+        density: impl Fn(f64, f64) -> f64,
+    ) -> Option<Self> {
+        let nl = state.n_levels;
+        let deepest = bed.iter().copied().fold(0.0, f64::min);
+        let n = (-deepest).ceil() as usize + 1;
+        let z0 = -((n - 1) as f64);
+        let (mut sum_t, mut sum_s, mut count) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+        for (idx, &b) in bed.iter().enumerate() {
+            if b >= 0.0 || !use_column(idx) {
+                continue;
+            }
+            // The layer centres at mean sea level, from the bed up
+            let z = |l: usize| sigma.sigma_rho()[l] * -b;
+            let (t, sal) = (
+                &state.temp[idx * nl..(idx + 1) * nl],
+                &state.salt[idx * nl..(idx + 1) * nl],
+            );
+            let mut l = 0;
+            for i in 0..n {
+                let zi = z0 + i as f64;
+                // Within the column: its bed to the surface
+                if zi < b {
+                    continue;
+                }
+                while l + 1 < nl && z(l + 1) <= zi {
+                    l += 1;
+                }
+                let (value_t, value_s) = if zi <= z(0) {
+                    (t[0], sal[0])
+                } else if l + 1 >= nl {
+                    (t[nl - 1], sal[nl - 1])
+                } else {
+                    let w = (zi - z(l)) / (z(l + 1) - z(l));
+                    (
+                        t[l] + w * (t[l + 1] - t[l]),
+                        sal[l] + w * (sal[l + 1] - sal[l]),
+                    )
+                };
+                sum_t[i] += value_t;
+                sum_s[i] += value_s;
+                count[i] += 1.0;
+            }
+        }
+        if count.iter().all(|&c| c == 0.0) {
+            return None;
+        }
+        // Pools from the surface down: (Σ T, Σ S, weight, heights)
+        let mut pools: Vec<(f64, f64, f64, usize)> = Vec::new();
+        for i in (0..n).rev() {
+            if count[i] == 0.0 {
+                // Below every column: the pool above extends
+                if let Some(last) = pools.last_mut() {
+                    last.3 += 1;
+                }
+                continue;
+            }
+            pools.push((sum_t[i], sum_s[i], count[i], 1));
+            while pools.len() >= 2 {
+                let rho = |p: &(f64, f64, f64, usize)| density(p.0 / p.2, p.1 / p.2);
+                let (lower, upper) = (pools[pools.len() - 1], pools[pools.len() - 2]);
+                if rho(&lower) >= rho(&upper) {
+                    break;
+                }
+                pools.pop();
+                let merged = pools.last_mut().expect("two pools");
+                *merged = (
+                    merged.0 + lower.0,
+                    merged.1 + lower.1,
+                    merged.2 + lower.2,
+                    merged.3 + lower.3,
+                );
+            }
+        }
+        // Back to heights, from the bottom up
+        let (mut temp, mut salt) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        for &(t, s, w, len) in pools.iter().rev() {
+            temp.extend(std::iter::repeat_n(t / w, len));
+            salt.extend(std::iter::repeat_n(s / w, len));
+        }
+        // Heights above the top layer centre of every column take the top
+        let (t_top, s_top) = (*temp.last()?, *salt.last()?);
+        temp.resize(n, t_top);
+        salt.resize(n, s_top);
+        Some(Self { z0, temp, salt })
+    }
+
+    /// T and S at height `z`, linear between grid points and held beyond them.
+    fn at(&self, z: f64) -> (f64, f64) {
+        let x = (z - self.z0).clamp(0.0, (self.temp.len() - 1) as f64);
+        let i = (x.floor() as usize).min(self.temp.len().saturating_sub(2));
+        let w = (x - i as f64).clamp(0.0, 1.0);
+        let j = (i + 1).min(self.temp.len() - 1);
+        (
+            self.temp[i] + w * (self.temp[j] - self.temp[i]),
+            self.salt[i] + w * (self.salt[j] - self.salt[i]),
+        )
+    }
+}
+
+/// The tide in 3D (`levels=N tide3d=1`, TODO P1.3): see the module docs.
+fn tidal_run_3d(
+    domain: &Domain,
+    opts: &Options,
+    parent: Option<OceanModelState>,
+    parent_reader: Option<Arc<OceanModelReader>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use dg_rs::boundary::{
+        ColumnContext3D, DeepReference, Nesting3D, NestingBand3D, OceanColumnsOptions,
+        OceanModelColumns, ParentColumn, ParentColumns3D, ReferenceColumns,
+    };
+    // e-folding depth of the parent's bottom anomaly below its bed (m)
+    const DEEP_DECAY: f64 = 10.0;
+    use dg_rs::io::Restart3D;
+    use dg_rs::physics::{
+        BottomDrag3D, EquationOfState, Forcing, GlsMixing, Hydrostatic3D,
+        ImplicitVerticalAdvection, LinearEOS, TimeStepLimit, VerticalMixing,
+    };
+    use dg_rs::simulation::{RunContext3D, Simulation3D};
+    use dg_rs::solver::state::Solution3D;
+    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
+    use dg_rs::source::SpongeProfile;
+    use dg_rs::time::ModeSplitIntegrator;
+    use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
+
+    const RHO0: f64 = 1025.0;
+    let TideSetup {
+        t_end,
+        clock,
+        mut stations,
+        station_atlas,
+        open,
+        forcing,
+        band,
+        weather,
+        wind_3d,
+    } = tide_setup(domain, opts, parent, true)?;
+    // `debug_3d=rest`: walls all round, no band and no nesting: the
+    // stratification at rest, as `levels=N` alone runs it
+    let rest = opts.debug_3d.split(',').any(|f| f == "rest");
+    let wall = Reflective2D::new();
+    let bc = if rest {
+        MultiBoundaryCondition2D::new(&wall)
+    } else {
+        MultiBoundaryCondition2D::new(&wall).with_open(open.as_ref())
+    };
+    let mut builder = domain.builder_without_friction(bc);
+    if let Some(band) = band.filter(|_| !rest) {
+        builder = builder.with_source(band);
+    }
+    // The pressure gradient, a depth-uniform force, on the 2D module; the
+    // wind stress on the columns (below)
+    if let Some(weather) = weather {
+        builder = builder.with_source(weather);
+    } else if opts.wind {
+        builder = builder.with_source(pressure());
+    }
+    let swe = builder.build();
+
+    // The water at rest at mean sea level, stratified as the parent model at
+    // the start where it has profiles, else as the summer pycnocline
+    let nl = opts.levels;
+    let sigma = Arc::new(SigmaGrid::new(
+        nl,
+        SongHaidvogelStretching::new(5.0, 0.4, 10.0),
+    ));
+    let eos = LinearEOS::default();
+    let (ne, nn) = (domain.mesh.n_elements, domain.ops.n_nodes);
+    let bed = &domain.bathymetry.data;
+    let mut state = Solution3D::new(ne, nn, nl);
+    // The parent's columns, with the tracers below its bed relaxing to
+    // `deep` if given (`DeepReference`)
+    let parent_columns = |deep: Option<DeepReference>| -> Option<Arc<dyn ParentColumns3D>> {
+        match (&parent_reader, domain.projection) {
+            (Some(reader), Some(projection)) if reader.has_tracer_profiles() => {
+                let columns = OceanModelColumns::new(
+                    reader.clone(),
+                    &domain.mesh,
+                    &domain.ops,
+                    projection,
+                    clock,
+                    OceanColumnsOptions::default(),
+                );
+                Some(Arc::new(match deep {
+                    Some(deep) => columns.with_deep_reference(deep),
+                    None => columns,
+                }))
+            }
+            _ => None,
+        }
+    };
+    let mut columns = parent_columns(None);
+    let summer = |z: f64| -> (f64, f64) {
+        let step = 0.5 * (1.0 + ((z + 15.0) / 4.0).tanh());
+        (
+            eos.t0 + 4.0 * step + 0.002 * z.min(0.0),
+            eos.s0 - 1.5 * step,
+        )
+    };
+    // `debug_3d=` switches for diagnosing the 3D tide: `nonest` (the open
+    // faces relax to the state at rest, not the parent), `constant` (constant
+    // mixing instead of GLS), `nolimiter`, `uniform` (the parent's mean
+    // profile everywhere: no horizontal density gradients), `flat` (no
+    // stratification), `held` (the parent's tracers held below its bed),
+    // `still` (no initial shear from the parent), `explicit` (no implicit
+    // part of the vertical advection)
+    let dbg = |flag: &str| opts.debug_3d.split(',').any(|f| f == flag);
+    let mut covered = vec![false; ne * nn];
+    // The parent's columns at every wet node at the start
+    let sample = |columns: &Option<Arc<dyn ParentColumns3D>>,
+                  state: &mut Solution3D,
+                  covered: &mut [bool]| {
+        let (mut u, mut v, mut t_col, mut s_col) =
+            (vec![0.0; nl], vec![0.0; nl], vec![0.0; nl], vec![0.0; nl]);
+        for idx in 0..ne * nn {
+            let eta = bed[idx].max(0.0);
+            state.eta.data[idx] = eta;
+            covered[idx] = false;
+            let Some(columns) = columns.as_ref().filter(|_| bed[idx] < 0.0) else {
+                continue;
+            };
+            let (k, i) = (idx / nn, idx % nn);
+            let [x, y] = domain.mesh.reference_to_physical(
+                ElementIndex::new(k),
+                domain.ops.nodes_r[i],
+                domain.ops.nodes_s[i],
+            );
+            let ctx = ColumnContext3D {
+                time: 0.0,
+                node: idx,
+                position: (x, y),
+                bed: bed[idx],
+                eta,
+            };
+            let out = ParentColumn {
+                u: &mut u,
+                v: &mut v,
+                temp: &mut t_col,
+                salt: &mut s_col,
+            };
+            if columns.column(&ctx, &sigma, out) {
+                let column = idx * nl..(idx + 1) * nl;
+                state.u[column.clone()].copy_from_slice(&u);
+                state.v[column.clone()].copy_from_slice(&v);
+                state.temp[column.clone()].copy_from_slice(&t_col);
+                state.salt[column].copy_from_slice(&s_col);
+                covered[idx] = true;
+            }
+        }
+    };
+    sample(&columns, &mut state, &mut covered);
+    let n_covered = covered.iter().filter(|&&c| c).count();
+    // The mean profile of the parent's columns, else the summer pycnocline's
+    let mean = if n_covered > 0 {
+        MeanProfile::of(
+            &state,
+            bed,
+            &sigma,
+            |idx| covered[idx],
+            |t, s| eos.compute_density(t, s, 0.0),
+        )
+    } else {
+        None
+    };
+    // Sampled again with the tracers below the parent's bed relaxing to the
+    // mean profile: held, its bottom water ran down the deep holes' walls
+    if let Some(mean) = mean.clone().filter(|_| !dbg("held")) {
+        columns = parent_columns(Some(DeepReference {
+            profile: Arc::new(move |d| mean.at(-d)),
+            decay: DEEP_DECAY,
+        }));
+        sample(&columns, &mut state, &mut covered);
+    }
+    if dbg("uniform") || dbg("flat") {
+        covered.fill(false);
+    }
+    let profile = |z: f64| {
+        if dbg("flat") {
+            (eos.t0, eos.s0)
+        } else {
+            mean.as_ref().map_or_else(|| summer(z), |m| m.at(z))
+        }
+    };
+    for idx in (0..ne * nn).filter(|&idx| !covered[idx]) {
+        let eta = state.eta.data[idx];
+        for (l, &s) in sigma.sigma_rho().iter().enumerate() {
+            let z = eta + s * (eta - bed[idx]);
+            (state.temp[idx * nl + l], state.salt[idx * nl + l]) = profile(z);
+        }
+    }
+    // The velocity: the parent's shear about the 2D module's depth mean,
+    // zero at the start (the tide ramps up from rest), where the parent
+    // covers a column at least the thin depth deep; else at rest
+    // (`debug_3d=still`: at rest everywhere, the parent's density field
+    // adjusting without its currents)
+    let mut n_sheared = 0;
+    for idx in 0..ne * nn {
+        let column = idx * nl..(idx + 1) * nl;
+        let sheared =
+            covered[idx] && state.eta.data[idx] - bed[idx] >= opts.thin_depth() && !dbg("still");
+        for field in [&mut state.u, &mut state.v] {
+            let values = &mut field[column.clone()];
+            let mean = if sheared {
+                sigma.depth_average(values)
+            } else {
+                0.0
+            };
+            values
+                .iter_mut()
+                .for_each(|x| *x = if sheared { *x - mean } else { 0.0 });
+        }
+        n_sheared += usize::from(sheared);
+    }
+    let largest_shear = state
+        .u
+        .iter()
+        .zip(&state.v)
+        .map(|(u, v)| u.hypot(*v))
+        .fold(0.0, f64::max);
+    let (t_lo, t_hi) = state
+        .temp
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &t| {
+            (a.min(t), b.max(t))
+        });
+    let (s_lo, s_hi) = state
+        .salt
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(a, b), &t| {
+            (a.min(t), b.max(t))
+        });
+    println!(
+        "\n3D model: {ne} elements × {nn} nodes × {nl} levels = {:.2} M points, P{}",
+        (ne * nn * nl) as f64 / 1e6,
+        domain.ops.order
+    );
+    match &columns {
+        Some(_) => println!(
+            "  Initial T, S from NorKyst at {n_covered} of {} wet nodes (the others its mean \
+             profile): T {t_lo:.2}–{t_hi:.2} °C, S {s_lo:.2}–{s_hi:.2}; its shear about a \
+             depth mean at rest at {n_sheared} nodes (largest {largest_shear:.2} m/s)",
+            bed.iter().filter(|&&b| b < 0.0).count()
+        ),
+        None => println!(
+            "  Initial T, S: the summer pycnocline (no NorKyst profiles): T {t_lo:.2}–{t_hi:.2} °C"
+        ),
+    }
+    let (t_top, s_top) = profile(-0.5);
+    let (t_30, s_30) = profile(-30.0);
+    let (t_100, s_100) = profile(-100.0);
+    println!(
+        "  Mean profile: {t_top:.2} °C, {s_top:.2} at 0.5 m; {t_30:.2} °C, {s_30:.2} at 30 m; \
+         {t_100:.2} °C, {s_100:.2} at 100 m"
+    );
+
+    // The open faces relax to the parent's columns, or to the state at rest
+    let band_3d = NestingBand3D {
+        width: 1000.0 * opts.band_km,
+        profile: SpongeProfile::default(),
+        velocity_timescale: Some(60.0 * opts.band_minutes),
+        tracer_timescale: Some(60.0 * opts.band_minutes),
+    };
+    let relaxed_to: Arc<dyn ParentColumns3D> = match &columns {
+        Some(columns) if !dbg("nonest") => columns.clone(),
+        _ => Arc::new(ReferenceColumns::from_state(&state)),
+    };
+    let nesting = Nesting3D::new(
+        relaxed_to,
+        &domain.mesh,
+        &domain.ops,
+        nl,
+        &[BoundaryTag::Open],
+        &band_3d,
+    )
+    .ok();
+    println!(
+        "  Open faces: {} over a {} km band, {} min",
+        match (&nesting, &columns) {
+            (None, _) => "none",
+            (Some(_), Some(_)) if !dbg("nonest") => "nested in NorKyst's u, v, T, S",
+            (Some(_), _) => "relaxed to the stratification at rest",
+        },
+        opts.band_km,
+        opts.band_minutes
+    );
+
+    let deepest = bed.iter().copied().fold(0.0, f64::min);
+    let limiter = TracerLimiter3DConfig {
+        limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+        ..TracerLimiter3DConfig::default()
+    }
+    .with_reference_profile(TracerReferenceProfile::from_fn(
+        deepest - 1.0,
+        1.0,
+        4001,
+        profile,
+    ));
+    let mut physics = Hydrostatic3D::new(
+        domain.mesh.clone(),
+        domain.ops.clone(),
+        domain.geom.clone(),
+        sigma.clone(),
+        domain.bathymetry.clone(),
+        Arc::new(CoriolisSource2D::f_plane(F_CORIOLIS)),
+        eos,
+        if dbg("constant") {
+            Box::new(dg_rs::physics::ConstantMixing::new(1e-3, 0.0))
+                as Box<dyn VerticalMixing + Send + Sync>
+        } else {
+            Box::new(GlsMixing::k_epsilon())
+        },
+        swe,
+        Forcing {
+            // The `wind` option's uniform stress (with `met=` the columns'
+            // own, below)
+            surface_stress: if wind_3d.is_none() && opts.wind {
+                // From WIND_DIRECTION (meteorological), as `from_direction`
+                let from = WIND_DIRECTION.to_radians();
+                let (u_10, v_10) = (-WIND_SPEED * from.sin(), -WIND_SPEED * from.cos());
+                let (tau_x, tau_y) = WindStress2D::constant(u_10, v_10)
+                    .with_drag(DragCoefficient::LargePond)
+                    .compute_stress(u_10, v_10);
+                [tau_x, tau_y]
+            } else {
+                [0.0, 0.0]
+            },
+            bottom_stress: [0.0, 0.0],
+            surface_buoyancy_flux: 0.0,
+        },
+        G,
+        RHO0,
+    )
+    .with_bottom_drag(BottomDrag3D::log_layer(0.003))
+    .with_min_column_depth(opts.thin_depth())
+    .with_smagorinsky_viscosity(0.1)
+    .with_tracer_limiter(if dbg("nolimiter") {
+        TracerLimiter3DConfig::none()
+    } else {
+        limiter
+    });
+    if let Some(nesting) = nesting.filter(|_| !rest) {
+        physics = physics.with_nesting(nesting);
+    }
+    if let Some(wind) = wind_3d {
+        physics = physics.with_surface_stress(wind);
+    }
+    // The vertical advection beyond an explicit Courant number implicitly:
+    // the columns just deeper than the thin depth set the step otherwise
+    if !dbg("explicit") {
+        physics = physics.with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
+    }
+    physics.update_density(&mut state);
+    // The PGF about the mean profile (Mellor et al. 1998)
+    let physics = physics.with_reference_profile(&state, |z| {
+        let (t, s) = profile(z);
+        eos.compute_density(t, s, z)
+    });
+
+    let output_dir = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| Path::new("output").join(format!("{}_3d", domain.name)));
+    fs::create_dir_all(&output_dir)?;
+    println!(
+        "\nTides in 3D: {forcing}, {:.2} h{} → {}",
+        opts.hours,
+        if !opts.met.is_empty() {
+            ", gridded wind and pressure"
+        } else if opts.wind {
+            ", wind and pressure"
+        } else {
+            ""
+        },
+        output_dir.display()
+    );
+    // A resumed run (`resume=`): the physics above is built from the initial
+    // state as the restarted run's was (the PGF's and the band's references
+    // are of it); the state, the time and the records continue the file's
+    let restart = match &opts.resume {
+        Some(path) => {
+            let restart = Restart3D::read(path)?;
+            println!(
+                "  Resuming from {} at {:.2} h (written by: {})",
+                path.display(),
+                restart.time / 3600.0,
+                restart.metadata("command").unwrap_or("?")
+            );
+            for (j, station) in stations.iter_mut().enumerate() {
+                if restart.metadata(&format!("station.{j}")) != Some(station.name.as_str()) {
+                    return Err(format!(
+                        "station {j} is {}, the restart's {:?}",
+                        station.name,
+                        restart.metadata(&format!("station.{j}"))
+                    )
+                    .into());
+                }
+                let record = |field: &str| {
+                    restart
+                        .extra(&format!("station.{j}.{field}"))
+                        .map(<[f64]>::to_vec)
+                        .ok_or(format!("the restart has no station.{j}.{field}"))
+                };
+                station.times = record("times")?;
+                station.eta = record("eta")?;
+                station.u_east = record("u_east")?;
+                station.v_north = record("v_north")?;
+            }
+            if restart
+                .metadata(&format!("station.{}", stations.len()))
+                .is_some()
+            {
+                return Err("the restart has more stations than this run".into());
+            }
+            Some(restart)
+        }
+        None => None,
+    };
+    let t_start = restart.as_ref().map_or(0.0, |r| r.time);
+    let snapshot_minutes = (opts.snapshot_minutes > 0.0).then_some(opts.snapshot_minutes);
+    let base_minutes = if stations.is_empty() {
+        opts.output_minutes
+            .min(snapshot_minutes.unwrap_or(f64::INFINITY))
+    } else {
+        opts.station_minutes
+    };
+    let every = |minutes: f64| (minutes / base_minutes).round().max(1.0) as usize;
+    let (interval, output_every) = (base_minutes * 60.0, every(opts.output_minutes));
+    let snapshot_every = snapshot_minutes.map(every);
+    let snapshot_path = output_dir.join(format!("{}.dgsnap", domain.name));
+    let mut snapshot = match snapshot_every {
+        // A resumed run continues its file, without the frames the stopped
+        // run wrote after the restart
+        Some(every) if restart.is_some() && snapshot_path.exists() => {
+            println!(
+                "  Snapshot file: {} every {} min, continued after {:.2} h",
+                snapshot_path.display(),
+                every as f64 * base_minutes,
+                t_start / 3600.0
+            );
+            Some(SnapshotWriter::append(&snapshot_path, t_start, 0.0)?)
+        }
+        Some(every) => {
+            let path = snapshot_path.clone();
+            println!(
+                "  Snapshot file: {} every {} min",
+                path.display(),
+                every as f64 * base_minutes
+            );
+            let metadata = snapshot_metadata(domain, &stations, " in 3D");
+            let metadata: Vec<(&str, &str)> =
+                metadata.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            Some(SnapshotWriter::create_3d(
+                path,
+                &domain.mesh,
+                &domain.ops,
+                bed,
+                &sigma,
+                Some(&clock),
+                &metadata,
+            )?)
+        }
+        None => None,
+    };
+    println!(
+        "  time  |  η range (m)     | max |ū| (m/s) at (x, y km; h m) | max |u| (m/s), level at (x, y km; h m, element) | T range (°C)  | wall"
+    );
+
+    let mut q = domain.at_rest();
+    let barotropic = |s: &Solution3D, q: &mut SWESolution2D| {
+        for k in ElementIndex::iter(ne) {
+            for i in 0..nn {
+                let idx = k.as_usize() * nn + i;
+                let h = (s.eta.data[idx] - bed[idx]).max(0.0);
+                q.set_state(
+                    k,
+                    i,
+                    SWEState2D::new(h, h * s.ubar.data[idx], h * s.vbar.data[idx]),
+                );
+            }
+        }
+    };
+    // The callbacks so far and the next sample time, continued by a resumed
+    // run (its first callback repeats the restart's time, already sampled)
+    let (n_callbacks_done, next_sample_at) = match &restart {
+        Some(restart) => match restart.extra("driver.counters") {
+            Some(&[n, next]) => (n as usize, next),
+            _ => return Err("the restart has no driver.counters".into()),
+        },
+        None => (0, 0.0),
+    };
+    let mut n_callbacks = n_callbacks_done;
+    let mut write_error = None;
+    let start = Instant::now();
+    // Called every step: the steps between the samples, and their range
+    let (mut last_t, mut next_sample) = (f64::NAN, next_sample_at);
+    let (mut steps, mut dt_lo, mut since) = (0usize, f64::INFINITY, t_start);
+    // What set the shortest step of the interval
+    let mut binding: Option<(&str, TimeStepLimit)> = None;
+    // A restart every `restart_hours`, at the first progress line at or after
+    // each multiple (`resume=` continues from it)
+    let restart_path = output_dir.join(format!("{}.restart", domain.name));
+    let restart_interval = 3600.0 * opts.restart_hours;
+    let mut next_restart = if restart_interval > 0.0 {
+        println!(
+            "  Restart file: {} every {} h",
+            restart_path.display(),
+            opts.restart_hours
+        );
+        ((t_start / restart_interval).floor() + 1.0) * restart_interval
+    } else {
+        f64::INFINITY
+    };
+    let command = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
+    let callback =
+        |s: &Solution3D,
+         t: f64,
+         run: &RunContext3D<LinearEOS, Box<dyn VerticalMixing + Send + Sync>, _>| {
+            let physics = run.physics;
+            if last_t.is_finite() {
+                steps += 1;
+                if t - last_t < dt_lo {
+                    dt_lo = t - last_t;
+                    binding = physics.last_time_step_limits().map(|limits| {
+                        let mut bounds = vec![
+                            ("advection and internal waves", limits.advection),
+                            ("Coriolis", limits.coriolis),
+                            ("viscosity", limits.viscosity),
+                        ];
+                        if physics.implicit_vertical_advection.is_none() {
+                            bounds.push(("vertical advection", limits.vertical));
+                        }
+                        bounds
+                            .into_iter()
+                            .min_by(|a, b| a.1.dt.total_cmp(&b.1.dt))
+                            .expect("bounds")
+                    });
+                }
+            }
+            last_t = t;
+            if t < next_sample - 1e-6 {
+                return;
+            }
+            while next_sample <= t + 1e-6 {
+                next_sample += interval;
+            }
+            barotropic(s, &mut q);
+            for station in &mut stations {
+                station.sample(&q, &domain.bathymetry, clock.unix(t));
+            }
+            n_callbacks += 1;
+            if let (Some(writer), Some(every)) = (snapshot.as_mut(), snapshot_every)
+                && (n_callbacks - 1) % every == 0
+                && let Err(e) = writer.write_solution_3d(t, s)
+            {
+                write_error.get_or_insert(e.to_string());
+            }
+            if (n_callbacks - 1) % output_every != 0 {
+                return;
+            }
+            // What set the shortest step, and the vertical bound now
+            let element_place = |k: usize| {
+                let (mut x, mut y, mut depth) = (0.0, 0.0, 0.0);
+                for i in 0..nn {
+                    let [px, py] = domain.mesh.reference_to_physical(
+                        ElementIndex::new(k),
+                        domain.ops.nodes_r[i],
+                        domain.ops.nodes_s[i],
+                    );
+                    x += px / nn as f64;
+                    y += py / nn as f64;
+                    depth += (s.eta.data[k * nn + i] - bed[k * nn + i]) / nn as f64;
+                }
+                (x / 1e3, y / 1e3, depth)
+            };
+            if steps > 0 {
+                let set_by = match binding {
+                    Some((name, limit)) if limit.element < ne => {
+                        let (x, y, d) = element_place(limit.element);
+                        format!(
+                            "; the shortest set by {name} in element {} at ({x:.1}, {y:.1}) km, {d:.1} m mean depth",
+                            limit.element
+                        )
+                    }
+                    _ => String::new(),
+                };
+                let vertical = physics
+                    .last_time_step_limits()
+                    .map_or(f64::NAN, |l| l.vertical.dt);
+                let implicit = if physics.implicit_vertical_advection.is_some() {
+                    let stats = physics.take_implicit_advection_stats();
+                    format!(
+                        "; implicit vertical advection in up to {} columns, outflow Courant number ≤ {:.2}",
+                        stats.columns, stats.largest_courant
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "         steps {steps}: dt {dt_lo:.2}–{:.2} s{set_by}; |Ω|/H_z bound now {vertical:.2} s{implicit}",
+                    (t - since) / steps as f64,
+                );
+            }
+            binding = None;
+            (steps, dt_lo, since) = (0, f64::INFINITY, t);
+            let stats = domain.stats(&q);
+            let (x, y, h) = stats.fastest;
+            // The fastest layer of a column at least the thin depth deep
+            let (mut fastest, mut level, mut column) = (0.0_f64, 0, 0);
+            let (mut t_lo, mut t_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for (idx, &b) in bed.iter().enumerate() {
+                if s.eta.data[idx] - b < opts.thin_depth() {
+                    continue;
+                }
+                for l in 0..nl {
+                    let j = idx * nl + l;
+                    let speed = s.u[j].hypot(s.v[j]);
+                    if speed.is_nan() || speed > fastest {
+                        (fastest, level, column) = (speed, l, idx);
+                    }
+                    t_lo = t_lo.min(s.temp[j]);
+                    t_hi = t_hi.max(s.temp[j]);
+                }
+            }
+            let [fx, fy] = domain.mesh.reference_to_physical(
+                ElementIndex::new(column / nn),
+                domain.ops.nodes_r[column % nn],
+                domain.ops.nodes_s[column % nn],
+            );
+            println!(
+                "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {fastest:5.2}, level {level:2} at ({:6.1}, {:6.1}; {:5.1} m, element {}) | {t_lo:5.2}–{t_hi:5.2} | {:.0} s",
+                t / 3600.0,
+                stats.eta.0,
+                stats.eta.1,
+                stats.speed,
+                x / 1e3,
+                y / 1e3,
+                fx / 1e3,
+                fy / 1e3,
+                s.eta.data[column] - bed[column],
+                column / nn,
+                start.elapsed().as_secs_f64()
+            );
+            if t >= next_restart - 1e-6 {
+                let mut restart = run.restart(s, t);
+                restart.set_metadata("command", command.as_str());
+                for (j, station) in stations.iter().enumerate() {
+                    restart.set_metadata(&format!("station.{j}"), station.name.as_str());
+                    for (field, values) in [
+                        ("times", &station.times),
+                        ("eta", &station.eta),
+                        ("u_east", &station.u_east),
+                        ("v_north", &station.v_north),
+                    ] {
+                        restart.set_extra(&format!("station.{j}.{field}"), values.clone());
+                    }
+                }
+                restart.set_extra("driver.counters", vec![n_callbacks as f64, next_sample]);
+                match restart.write(&restart_path) {
+                    Ok(()) => println!(
+                        "         restart at {:.2} h → {}",
+                        t / 3600.0,
+                        restart_path.display()
+                    ),
+                    // A long run goes on without it
+                    Err(e) => println!("         WARNING: no restart at {:.2} h: {e}", t / 3600.0),
+                }
+                while next_restart <= t + 1e-6 {
+                    next_restart += restart_interval;
+                }
+            }
+        };
+    let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
+    if let Some(dt) = opts.dt_3d {
+        sim = sim.with_dt_max(dt);
+    }
+    if let Some(restart) = restart {
+        sim.resume(&restart)?;
+        state = restart.state;
+    }
+    let result = sim.run_with_context_callback(&mut state, t_start, t_end, callback);
+    if let Some(e) = write_error {
+        return Err(e.into());
+    }
+    let steps = result.n_steps.max(1);
+    let wall = start.elapsed().as_secs_f64();
+    let run_time = result.final_time - t_start;
+    println!(
+        "\n{} after {:.2} h: {} steps (mean dt {:.2} s, {:.2}–{:.2} s), {:.1} s wall ({:.0} ms/step, {:.0} s per model hour), {} barotropic substeps",
+        if result.success { "Done" } else { "FAILED" },
+        result.final_time / 3600.0,
+        result.n_steps,
+        run_time / steps as f64,
+        result.dt_min,
+        result.dt_max,
+        wall,
+        1e3 * wall / steps as f64,
+        3600.0 * wall / run_time.max(1.0),
+        sim.integrator().last_substeps()
+    );
+    report_stations(&stations, &output_dir, opts, &clock, station_atlas.as_ref())?;
     if let Some(e) = result.error {
         return Err(e.into());
     }
-    println!("Visualize with ParaView: {}/*.vtu", output_dir.display());
     Ok(())
 }
 
@@ -1825,12 +2937,58 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         BottomDrag3D, ConstantMixing, Forcing, GlsMixing, Hydrostatic3D, LinearEOS, VerticalMixing,
     };
     use dg_rs::solver::state::Solution3D;
-    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
+    use dg_rs::solver::{TracerLimiter3DConfig, TracerLimiterType3D, TracerReferenceProfile};
     use dg_rs::time::ModeSplitIntegrator;
     use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching};
 
-    type Physics3D = Hydrostatic3D<LinearEOS, Box<dyn VerticalMixing + Send + Sync>, Reflective2D>;
     const RHO0: f64 = 1025.0;
+    // `debug_3d=around=K:R`: only the elements within R m of element K
+    // (centres), walls around, to reproduce a local growth quickly
+    let around = opts.debug_3d.split(',').find_map(|f| {
+        let (k, r) = f.strip_prefix("around=")?.split_once(':')?;
+        Some((k.parse::<usize>().ok()?, r.parse::<f64>().ok()?))
+    });
+    let patch;
+    let domain = match around {
+        None => domain,
+        Some((k, radius)) => {
+            let centre = |e: ElementIndex| domain.mesh.reference_to_physical(e, 0.0, 0.0);
+            let [x0, y0] = centre(ElementIndex::new(k));
+            let (mesh, kept) = domain.mesh.retain_elements(
+                |e| {
+                    let [x, y] = centre(e);
+                    (x - x0).hypot(y - y0) <= radius
+                },
+                BoundaryTag::Wall,
+            );
+            let geom = GeometricFactors2D::compute(&mesh, &domain.ops);
+            let bathymetry = domain.bathymetry.select_elements(&kept);
+            println!(
+                "  Patch of {} elements within {radius} m of element {k} (now element {})",
+                kept.len(),
+                kept.iter()
+                    .position(|&e| e == k)
+                    .expect("the element is in its patch")
+            );
+            // `debug_3d=export=PATH`: the patch as a text fixture for tests
+            if let Some(path) = opts
+                .debug_3d
+                .split(',')
+                .find_map(|f| f.strip_prefix("export="))
+            {
+                write_patch_fixture(path, &mesh, &bathymetry, k, radius);
+            }
+            patch = Domain {
+                name: domain.name,
+                mesh: Arc::new(mesh),
+                ops: domain.ops.clone(),
+                geom: Arc::new(geom),
+                bathymetry: Arc::new(bathymetry),
+                projection: domain.projection,
+            };
+            &patch
+        }
+    };
     let nl = opts.levels;
     let sigma = Arc::new(SigmaGrid::new(
         nl,
@@ -1852,6 +3010,30 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     .build();
     let eos = LinearEOS::default();
     let dbg = |flag: &str| opts.debug_3d.split(',').any(|f| f == flag);
+    // `debug_3d=key=value`
+    let dbg_value = |key: &str| {
+        opts.debug_3d
+            .split(',')
+            .find_map(|f| f.strip_prefix(key)?.strip_prefix('='))
+            .map(str::to_string)
+    };
+    // The temperature gradient below the pycnocline (`deep=`, °C/m)
+    let deep_gradient: f64 = dbg_value("deep").map_or(0.002, |v| v.parse().expect("deep="));
+    // The summer stratification, horizontally uniform: T 4 °C warmer and S
+    // 1.5 psu fresher above ≈ 15 m (`linear`: 0.02 °C/m; `uniform`: none)
+    let profile = |z: f64| -> (f64, f64) {
+        if dbg("uniform") {
+            (eos.t0, eos.s0)
+        } else if dbg("linear") {
+            (eos.t0 + 0.02 * z, eos.s0)
+        } else {
+            let step = 0.5 * (1.0 + ((z + 15.0) / 4.0).tanh());
+            (
+                eos.t0 + 4.0 * step + deep_gradient * z.min(0.0),
+                eos.s0 - 1.5 * step,
+            )
+        }
+    };
     let physics: Physics3D = Hydrostatic3D::new(
         domain.mesh.clone(),
         domain.ops.clone(),
@@ -1861,7 +3043,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         Arc::new(CoriolisSource2D::f_plane(F_CORIOLIS)),
         eos,
         if opts.debug_3d.split(',').any(|f| f == "constant") {
-            Box::new(ConstantMixing::new(1e-3, 1e-5)) as Box<dyn VerticalMixing + Send + Sync>
+            Box::new(ConstantMixing::new(1e-3, 0.0)) as Box<dyn VerticalMixing + Send + Sync>
         } else {
             Box::new(GlsMixing::k_epsilon())
         },
@@ -1875,10 +3057,50 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         RHO0,
     )
     .with_bottom_drag(BottomDrag3D::log_layer(0.003))
+    .with_min_column_depth(opts.thin_depth())
     .with_smagorinsky_viscosity(0.1)
-    .with_tracer_limiter(TracerLimiter3DConfig {
-        limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
-        ..TracerLimiter3DConfig::default()
+    // `tadv=none|centred`: the turbulence's advection (LimitedAkima by default)
+    .with_turbulence_advection(match dbg_value("tadv").as_deref() {
+        Some("none") => None,
+        Some("centred") => Some(dg_rs::solver::rhs::VerticalAdvection::Centred),
+        Some(other) => panic!("tadv={other}"),
+        None => Some(dg_rs::solver::rhs::VerticalAdvection::LimitedAkima),
+    })
+    .with_horizontal_viscosity(
+        opts.debug_3d
+            .split(',')
+            .find_map(|f| f.strip_prefix("nu=").and_then(|v| v.parse().ok()))
+            .unwrap_or(0.0),
+    )
+    .with_vertical_advection({
+        use dg_rs::solver::rhs::VerticalAdvection;
+        match dbg_value("vadv").as_deref() {
+            _ if dbg("vcentred") => VerticalAdvection::Centred,
+            Some("centred") => VerticalAdvection::Centred,
+            Some("akima") => VerticalAdvection::Akima,
+            Some("tvd") => VerticalAdvection::Tvd,
+            Some("upwind") => VerticalAdvection::Upwind,
+            Some("hermite") => VerticalAdvection::HermiteMean,
+            Some(other) => panic!("vadv={other}"),
+            None => VerticalAdvection::default(),
+        }
+    })
+    .with_tracer_limiter(if dbg("nolimiter") {
+        TracerLimiter3DConfig::none()
+    } else {
+        // The stratification as the limiter's reference: without it the
+        // limiter clips a curved profile where σ-levels cross it steeply
+        let config = TracerLimiter3DConfig {
+            limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+            ..TracerLimiter3DConfig::default()
+        };
+        let deepest = domain.bathymetry.data.iter().copied().fold(0.0, f64::min);
+        config.with_reference_profile(TracerReferenceProfile::from_fn(
+            deepest - 1.0,
+            1.0,
+            4001,
+            profile,
+        ))
     });
 
     let (ne, nn) = (domain.mesh.n_elements, domain.ops.n_nodes);
@@ -1889,21 +3111,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         state.eta.data[idx] = eta;
         for (l, &s) in sigma.sigma_rho().iter().enumerate() {
             let z = eta + s * (eta - bed);
-            let step = if dbg("uniform") || dbg("linear") {
-                0.0
-            } else {
-                0.5 * (1.0 + ((z + 15.0) / 4.0).tanh())
-            };
-            state.temp[idx * nl + l] = eos.t0
-                + 4.0 * step
-                + if dbg("uniform") {
-                    0.0
-                } else if dbg("linear") {
-                    0.02 * z
-                } else {
-                    0.002 * z.min(0.0)
-                };
-            state.salt[idx * nl + l] = eos.s0 - 1.5 * step;
+            (state.temp[idx * nl + l], state.salt[idx * nl + l]) = profile(z);
         }
     }
     physics.update_density(&mut state);
@@ -1987,27 +3195,73 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         times[2]
     };
 
-    let physics = if dbg("nolimiter") {
-        physics.with_tracer_limiter(TracerLimiter3DConfig::none())
-    } else {
+    // The stratification's profile as the PGF's reference, exact at rest
+    // (`balanced`: the state as the balanced reference, which leaves the
+    // constant-depth form's error at rest, 1.7e-4 m/s² at cliff shores;
+    // `unbalanced`: none, the σ-pairs' error, 2.2e-2 m/s²)
+    let physics = if dbg("unbalanced") {
         physics
-    };
-    let physics = if dbg("balanced") {
+    } else if dbg("balanced") {
         physics.with_balanced_reference(&state)
     } else {
+        use dg_rs::physics::EquationOfState;
+        physics.with_reference_profile(&state, |z| {
+            let (t, s) = profile(z);
+            eos.compute_density(t, s, z)
+        })
+    };
+    // The vertical tracer advection about the state at rest, as
+    // `Simulation3D` does (`noref`: the plain scheme)
+    let physics = if dbg("noref") {
         physics
+    } else {
+        physics.with_vertical_reference(&state)
     };
     let mut integrator = ModeSplitIntegrator::new();
-    let dt = opts.dt_3d.unwrap_or(dt_rest);
     let mut t = 0.0;
-    let mut timed_step = |state: &mut Solution3D, t: &mut f64| {
+    // The step of `dt_3d=`, or as `Simulation3D` takes it, every step
+    let mut timed_step = |state: &mut Solution3D, t: &mut f64| -> f64 {
+        let dt = opts.dt_3d.unwrap_or_else(|| physics.compute_dt(state, cfl));
         physics.update_density(state);
         integrator.step(state, &physics, dt, *t);
         physics.post_process(state);
         *t += dt;
+        dt
     };
+    let init = state.clone();
+    let dump = dbg_value("dump");
+    if let Some(prefix) = &dump {
+        write_mode_geometry(prefix, domain, &sigma, &state);
+        write_mode_dump(&format!("{prefix}.init.bin"), &state);
+    }
     for _ in 0..2 {
         timed_step(&mut state, &mut t);
+    }
+    // `seed=PREFIX:AMP`: add the perturbation PREFIX.end.bin − PREFIX.init.bin
+    // of an earlier run, scaled to a largest speed of AMP m/s
+    if let Some(seed) = dbg_value("seed") {
+        let (prefix, amp) = seed.rsplit_once(':').expect("seed=PREFIX:AMP");
+        let amp: f64 = amp.parse().expect("seed amplitude");
+        let a = read_mode_dump(&format!("{prefix}.init.bin"), &state);
+        let b = read_mode_dump(&format!("{prefix}.end.bin"), &state);
+        let speed = (0..state.u.len())
+            .map(|i| (b.u[i] - a.u[i]).hypot(b.v[i] - a.v[i]))
+            .fold(0.0, f64::max);
+        let scale = amp / speed;
+        let add = |x: &mut [f64], b: &[f64], a: &[f64]| {
+            for ((x, b), a) in x.iter_mut().zip(b).zip(a) {
+                *x += scale * (b - a);
+            }
+        };
+        add(&mut state.u, &b.u, &a.u);
+        add(&mut state.v, &b.v, &a.v);
+        add(&mut state.temp, &b.temp, &a.temp);
+        add(&mut state.salt, &b.salt, &a.salt);
+        add(&mut state.eta.data, &b.eta.data, &a.eta.data);
+        add(&mut state.ubar.data, &b.ubar.data, &a.ubar.data);
+        add(&mut state.vbar.data, &b.vbar.data, &a.vbar.data);
+        physics.update_density(&mut state);
+        println!("  Seeded with {prefix}'s perturbation at {amp:.1e} m/s (scale {scale:.3e})");
     }
     if dbg("trace") {
         let mut rhs = state.clone();
@@ -2031,8 +3285,44 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 )
                 .collect::<Vec<_>>()
         );
+        let every =
+            dbg_value("every").map_or((opts.steps_3d / 24).max(1), |v| v.parse().expect("every="));
+        let gap: usize = dbg_value("gap").map_or(opts.steps_3d / 8, |v| v.parse().expect("gap="));
         for n in 0..opts.steps_3d {
-            timed_step(&mut state, &mut t);
+            let dt = timed_step(&mut state, &mut t);
+            if let Some(prefix) = &dump
+                && n + 1 + gap == opts.steps_3d
+            {
+                write_mode_dump(&format!("{prefix}.prev.bin"), &state);
+            }
+            if n % every != 0 && n + 1 != opts.steps_3d {
+                continue;
+            }
+            // The perturbation about the initial state: kinetic energy
+            // ½ Σ m H_z |u|² (per unit density), and its tracers and η
+            let (mut ke, mut d_t, mut d_s, mut d_eta) = (0.0, 0.0_f64, 0.0_f64, 0.0_f64);
+            for k in 0..ne {
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let depth = state.eta.data[idx] - domain.bathymetry.data[idx];
+                    d_eta = d_eta.max((state.eta.data[idx] - init.eta.data[idx]).abs());
+                    if depth <= 0.0 {
+                        continue;
+                    }
+                    let m = domain.geom.node_mass(k, i);
+                    for l in 0..nl {
+                        let j = idx * nl + l;
+                        let hz = sigma.d_sigma()[l] * depth;
+                        ke += 0.5 * m * hz * (state.u[j].powi(2) + state.v[j].powi(2));
+                        d_t = d_t.max((state.temp[j] - init.temp[j]).abs());
+                        d_s = d_s.max((state.salt[j] - init.salt[j]).abs());
+                    }
+                }
+            }
+            println!(
+                "  pert t {:.4} h: KE {ke:.4e}; max |dT| {d_t:.3e} |dS| {d_s:.3e} |deta| {d_eta:.3e}",
+                t / 3600.0
+            );
             let (mut best, mut at) = (0.0_f64, 0);
             for (i, (u, v)) in state.u.iter().zip(&state.v).enumerate() {
                 let s = u.hypot(*v);
@@ -2052,8 +3342,9 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 domain.ops.nodes_s[node],
             );
             println!(
-                "  step {n}: largest {best:.2e} m/s at element {k} node {node} level {} ({:.1}, {:.1}) km; \
-                 depths {:?}; affine {}",
+                "  step {n} (t {:.2} h, dt {dt:.2} s): largest {best:.2e} m/s at element {k} node \
+                 {node} level {} ({:.1}, {:.1}) km; depths {:?}; affine {}",
+                t / 3600.0,
                 at % nl,
                 x / 1e3,
                 y / 1e3,
@@ -2064,12 +3355,40 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 domain.geom.element_is_affine(k)
             );
         }
+        // The ten fastest elements at the end: how far a growing mode reaches
+        let mut elements: Vec<(f64, usize, usize, usize)> = (0..state.n_elements)
+            .map(|k| {
+                (0..nn * nl)
+                    .map(|j| {
+                        let i = k * nn * nl + j;
+                        (state.u[i].hypot(state.v[i]), k, j / nl, j % nl)
+                    })
+                    .fold((0.0, k, 0, 0), |a, b| if b.0 > a.0 { b } else { a })
+            })
+            .collect();
+        elements.sort_by(|a, b| b.0.total_cmp(&a.0));
+        if let Some(prefix) = &dump {
+            write_mode_dump(&format!("{prefix}.end.bin"), &state);
+        }
+        println!("  Fastest elements at the end:");
+        for &(speed, k, node, level) in elements.iter().take(10) {
+            let depths: Vec<f64> = (0..nn)
+                .map(|i| {
+                    let d = state.eta.data[k * nn + i] - domain.bathymetry.data[k * nn + i];
+                    (d * 10.0).round() / 10.0
+                })
+                .collect();
+            println!(
+                "    {speed:.2e} m/s element {k} node {node} level {level}; depths {depths:?}"
+            );
+        }
         return;
     }
     let mut times = Vec::with_capacity(opts.steps_3d);
+    let mut dt = dt_rest;
     for _ in 0..opts.steps_3d {
         let start = Instant::now();
-        timed_step(&mut state, &mut t);
+        dt = timed_step(&mut state, &mut t);
         times.push(start.elapsed().as_secs_f64());
     }
     times.sort_by(f64::total_cmp);
@@ -2103,6 +3422,135 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         .map(|(u, v)| u.hypot(*v))
         .fold(0.0, |m: f64, s| if s.is_nan() || s > m { s } else { m });
     println!("  after {t:.0} s at rest: largest layer speed {speed:.2e} m/s");
+}
+
+/// Write `state`'s η, ū, v̄ and per-level u, v, T, S, ρ as little-endian
+/// f64 after a header of (elements, nodes, levels) as u64 (`debug_3d=dump=`).
+fn write_mode_dump(path: &str, state: &dg_rs::solver::state::Solution3D) {
+    let mut bytes = Vec::new();
+    for n in [state.n_elements, state.n_nodes, state.n_levels] {
+        bytes.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    for field in [
+        &state.eta.data,
+        &state.ubar.data,
+        &state.vbar.data,
+        &state.u,
+        &state.v,
+        &state.temp,
+        &state.salt,
+        &state.rho,
+    ] {
+        for x in field.iter() {
+            bytes.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    fs::write(path, bytes).expect("write the mode dump");
+}
+
+/// Read a dump of [`write_mode_dump`] into a copy of `like`.
+fn read_mode_dump(
+    path: &str,
+    like: &dg_rs::solver::state::Solution3D,
+) -> dg_rs::solver::state::Solution3D {
+    let bytes = fs::read(path).expect("read the mode dump");
+    let mut words = bytes
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&c| u64::from_le_bytes(c));
+    let header: Vec<usize> = (0..3).map(|_| words.next().unwrap() as usize).collect();
+    assert_eq!(
+        header,
+        [like.n_elements, like.n_nodes, like.n_levels],
+        "dump {path} is for another domain"
+    );
+    let mut out = like.clone();
+    for field in [
+        &mut out.eta.data,
+        &mut out.ubar.data,
+        &mut out.vbar.data,
+        &mut out.u,
+        &mut out.v,
+        &mut out.temp,
+        &mut out.salt,
+        &mut out.rho,
+    ] {
+        for x in field.iter_mut() {
+            *x = f64::from_bits(words.next().expect("dump too short"));
+        }
+    }
+    out
+}
+
+/// The nodes' x, y (m), bed (m), mass weights, and the σ of the layer
+/// centres and the layers' Δσ, for analysing mode dumps (`PREFIX.geom.bin`:
+/// a header of (elements, nodes, levels) as u64, then f64).
+fn write_mode_geometry(
+    prefix: &str,
+    domain: &Domain,
+    sigma: &dg_rs::vertical::SigmaGrid,
+    state: &dg_rs::solver::state::Solution3D,
+) {
+    let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
+    let mut bytes = Vec::new();
+    for n in [ne, nn, nl] {
+        bytes.extend_from_slice(&(n as u64).to_le_bytes());
+    }
+    let mut push = |x: f64| bytes.extend_from_slice(&x.to_le_bytes());
+    let points: Vec<[f64; 2]> = (0..ne * nn)
+        .map(|idx| {
+            domain.mesh.reference_to_physical(
+                ElementIndex::new(idx / nn),
+                domain.ops.nodes_r[idx % nn],
+                domain.ops.nodes_s[idx % nn],
+            )
+        })
+        .collect();
+    points.iter().for_each(|p| push(p[0]));
+    points.iter().for_each(|p| push(p[1]));
+    domain.bathymetry.data.iter().for_each(|&b| push(b));
+    (0..ne * nn).for_each(|idx| push(domain.geom.node_mass(idx / nn, idx % nn)));
+    sigma.sigma_rho().iter().for_each(|&s| push(s));
+    sigma.d_sigma().iter().for_each(|&s| push(s));
+    fs::write(format!("{prefix}.geom.bin"), bytes).expect("write the mode geometry");
+}
+
+/// Write a patch of the domain (`debug_3d=around=K:R,export=PATH`) as a text
+/// fixture: the vertices (m, relative to the first), the quadrilaterals, and
+/// per element node its bed elevation and the bed's gradient (all faces
+/// walls). Read by the 3D tests (`tests/data/`).
+fn write_patch_fixture(
+    path: &str,
+    mesh: &dg_rs::mesh::Mesh2D,
+    bathymetry: &Bathymetry2D,
+    element: usize,
+    radius: f64,
+) {
+    use std::fmt::Write as _;
+    let [x0, y0] = mesh.vertices[0];
+    let mut text = format!(
+        "# dg-rs patch fixture: the elements of froya_coast.msh within {radius} m of element \
+         {element}, bed smoothed for 3D (slopes3d), walls around\n"
+    );
+    writeln!(text, "vertices {}", mesh.vertices.len()).unwrap();
+    for &[x, y] in &mesh.vertices {
+        writeln!(text, "{} {}", x - x0, y - y0).unwrap();
+    }
+    writeln!(text, "quads {}", mesh.elements.len()).unwrap();
+    for quad in &mesh.elements {
+        writeln!(text, "{} {} {} {}", quad[0], quad[1], quad[2], quad[3]).unwrap();
+    }
+    writeln!(text, "bed {}", bathymetry.n_nodes).unwrap();
+    for idx in 0..bathymetry.data.len() {
+        writeln!(
+            text,
+            "{} {} {}",
+            bathymetry.data[idx], bathymetry.gradient_x[idx], bathymetry.gradient_y[idx]
+        )
+        .unwrap();
+    }
+    fs::write(path, text).expect("write the patch fixture");
 }
 
 /// Lower-case ASCII file-name form of a station name.
@@ -2461,6 +3909,10 @@ fn weather(
 }
 
 type OpenBoundary = (Box<dyn SWEBoundaryCondition2D>, String);
+
+/// The parent model of `norkyst=` at the open boundary, and its reader (with
+/// the profiles for a 3D tide).
+type Nested = (OceanModelState, Arc<OceanModelReader>);
 
 /// What the boundary atlas is corrected with: the first gauge with a
 /// whole-record fit, and NorKyst at it (the nearest `station_atlas` point

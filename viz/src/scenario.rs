@@ -109,6 +109,9 @@ pub struct Scenario {
     /// (m, mesh coordinates)
     pub farm: [f64; 2],
     pub close_up: CloseUp,
+    /// Named points the number keys frame as the close-up does (m, mesh
+    /// coordinates): the stations of a run, the farm sites, `--place`s
+    pub places: Vec<(String, [f64; 2])>,
     pub forcing: Forcing,
     /// The 3D model, for a scenario run in 3D
     pub three_d: Option<ThreeD>,
@@ -116,6 +119,9 @@ pub struct Scenario {
     pub periodic: Option<[f64; 2]>,
     /// UTC of model time 0, for a scenario with a date (its tides, its daylight)
     pub clock: Option<ModelClock>,
+    /// Mesh coordinates to longitude/latitude, for a scenario on a real coast: places
+    /// the elevation model's land around it ([`crate::terrain`])
+    pub projection: Option<LocalProjection>,
 }
 
 impl Scenario {
@@ -136,6 +142,7 @@ impl Scenario {
                 NetCage::circular([FARM[0] + 40.0, FARM[1]], 25.0, 20.0, 0.25),
             ],
             farm: FARM,
+            places: Vec::new(),
             close_up: CloseUp {
                 distance: 420.0,
                 yaw: 0.7,
@@ -152,6 +159,7 @@ impl Scenario {
             three_d: None,
             periodic: None,
             clock: None,
+            projection: None,
             mesh,
             ops,
             geom,
@@ -199,7 +207,9 @@ impl Scenario {
             // Periodic along the channel only
             periodic: Some([LX, f64::INFINITY]),
             clock: Some(clock),
+            projection: None,
             farm: FARM,
+            places: Vec::new(),
             // Low, from the second cage's side, so the section stands behind the cages
             close_up: CloseUp {
                 distance: 800.0,
@@ -301,10 +311,10 @@ impl Scenario {
         let geom = GeometricFactors2D::compute(&mesh, &ops);
         let (x, y) = projection.geo_to_xy(MAUSUND.0, MAUSUND.1);
         Ok(Self {
-            // ASCII: Bevy's default font has no ø
-            name: "Froya-Smola-Hitra: NorKyst-800 tides from 2025-06-15".into(),
+            name: "Frøya–Smøla–Hitra: NorKyst-800 tides from 2025-06-15".into(),
             cages: Vec::new(),
             farm: [x, y],
+            places: vec![("Mausund".into(), [x, y])],
             close_up: CloseUp {
                 distance: 6_000.0,
                 yaw: 0.7,
@@ -322,6 +332,7 @@ impl Scenario {
             three_d: None,
             periodic: None,
             clock: Some(clock),
+            projection: Some(projection),
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
             geom: Arc::new(geom),
@@ -332,8 +343,10 @@ impl Scenario {
     /// The domain of a snapshot file's header, for a replay: its mesh and bed, a
     /// close-up at its point of interest (`point_of_interest=x,y`, else its first
     /// `station=name,x,y`, else the domain's centre) framed for the domain's size,
+    /// every station a place the number keys frame,
     /// the cages (`cage=x,y,radius,net_depth,drag_per_length`) and the periods of a
-    /// periodic mesh (`periodic=x,y`). A 3D file's σ-grid makes it a 3D scenario, with
+    /// periodic mesh (`periodic=x,y`), and the projection of a mesh on a real coast
+    /// (`projection=local,lat,lon`: [`LocalProjection`] about that point). A 3D file's σ-grid makes it a 3D scenario, with
     /// its section at `section=x0,y0,x1,y1` (else along x through the point of
     /// interest). It runs nothing, so its forcing and 3D physics are none.
     pub fn from_snapshot(header: SnapshotHeader) -> Self {
@@ -357,7 +370,21 @@ impl Scenario {
             .and_then(|p| point(&format!("_,{p}")))
             .or_else(|| header.metadata("station").and_then(point))
             .unwrap_or([0.5 * (lo[0] + hi[0]), 0.5 * (lo[1] + hi[1])]);
-        let name = ascii(header.metadata("title").unwrap_or("Snapshot file"));
+        let name = header
+            .metadata("title")
+            .unwrap_or("Snapshot file")
+            .to_string();
+        // Every station, by its name
+        let places = header
+            .metadata
+            .iter()
+            .filter(|(k, _)| k == "station")
+            .filter_map(|(_, v)| {
+                let at = point(v)?;
+                let name = v.rsplitn(3, ',').nth(2)?.trim();
+                Some((name.to_string(), at))
+            })
+            .collect();
         let numbers = |s: &str| -> Option<Vec<f64>> {
             s.split(',').map(|c| c.trim().parse::<f64>().ok()).collect()
         };
@@ -377,6 +404,7 @@ impl Scenario {
                 _ => None,
             })
             .collect();
+        let projection = header.metadata("projection").and_then(parse_projection);
         let periodic = header
             .metadata("periodic")
             .and_then(numbers)
@@ -422,6 +450,7 @@ impl Scenario {
             name,
             cages,
             farm,
+            places,
             close_up: CloseUp {
                 distance: (extent / 10.0) as f32,
                 yaw,
@@ -438,6 +467,7 @@ impl Scenario {
             three_d,
             periodic,
             clock: header.clock,
+            projection,
             mesh: Arc::new(mesh),
             ops: Arc::new(ops),
             geom: Arc::new(geom),
@@ -458,22 +488,43 @@ impl Scenario {
     }
 }
 
-/// `text` in ASCII, for Bevy's default font: Norwegian letters spelt out, dashes
-/// plain, anything else dropped.
-pub fn ascii(text: &str) -> String {
-    text.chars()
-        .flat_map(|c| -> Vec<char> {
-            match c {
-                'ø' => vec!['o'],
-                'Ø' => vec!['O'],
-                'å' => vec!['a'],
-                'Å' => vec!['A'],
-                'æ' => vec!['a', 'e'],
-                'Æ' => vec!['A', 'e'],
-                '–' | '—' => vec!['-'],
-                c if c.is_ascii() => vec![c],
-                _ => vec![],
-            }
-        })
-        .collect()
+/// A projection as snapshot files write it: `local,lat,lon`, a [`LocalProjection`]
+/// about that point (degrees).
+pub fn parse_projection(text: &str) -> Option<LocalProjection> {
+    match text
+        .split(',')
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["local", lat, lon] => Some(LocalProjection::new(lat.parse().ok()?, lon.parse().ok()?)),
+        _ => None,
+    }
+}
+
+/// `projection` as [`parse_projection`] reads it.
+pub fn format_projection(projection: &LocalProjection) -> String {
+    format!("local,{},{}", projection.ref_lat(), projection.ref_lon())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_projection_reads_back_as_written() {
+        let projection = LocalProjection::new(63.8, 8.675);
+        let read = parse_projection(&format_projection(&projection)).unwrap();
+        assert_eq!(
+            (read.ref_lat(), read.ref_lon()),
+            (projection.ref_lat(), projection.ref_lon())
+        );
+        // The same point maps to the same mesh coordinates
+        assert_eq!(
+            read.geo_to_xy(63.87, 8.68),
+            projection.geo_to_xy(63.87, 8.68)
+        );
+        assert!(parse_projection("utm,33").is_none());
+        assert!(parse_projection("local,63.8").is_none());
+    }
 }

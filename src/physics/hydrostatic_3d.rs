@@ -67,19 +67,23 @@ use crate::physics::SWEPhysics2D;
 use crate::physics::bottom_drag::BottomDrag3D;
 use crate::physics::cage_drag::{for_each_caged_node, layer_coefficient};
 use crate::physics::eos::EquationOfState;
+use crate::physics::implicit_advection::{
+    ImplicitVerticalAdvection, apply_implicit_vertical_advection,
+};
 use crate::physics::surface_stress::SurfaceStress3D;
 use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
 use crate::physics::vertical_diffusion::{SurfaceFields, apply_vertical_diffusion};
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
-use crate::solver::core::blocks::{for_each_block, reduce_blocks};
+use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks};
+use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
     BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
     HorizontalViscosity3D, LayerTransport, MetricForm, MomentumAdvectionForm, PressureGradientForm,
     Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
     apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
     apply_tracer_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
-    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
+    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d, w_cell_thicknesses,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
@@ -165,10 +169,17 @@ where
     /// Rivers, as volume sources with their own tracers (see
     /// [`Self::with_rivers`]).
     pub rivers: Option<Arc<RiverSources>>,
+    /// The adaptive implicit part of the vertical advection, if any (see
+    /// [`Self::with_implicit_vertical_advection`]).
+    pub implicit_vertical_advection: Option<ImplicitVerticalAdvection>,
     /// Warns once about stratified open boundaries without nesting.
     open_boundary_check: Once,
     /// Layer transports (and their Ω) of the last 3D stage.
     transport_scratch: Mutex<LayerTransport>,
+    /// The implicit part of `Ω` of the last 3D stage, and its statistics.
+    implicit_split: Mutex<ImplicitSplit>,
+    /// The bounds of the last [`Self::compute_dt`].
+    last_time_step_limits: Mutex<Option<TimeStepLimits>>,
     /// Buffers of the turbulence's advection (allocated on first use).
     w_transport_scratch: Mutex<Option<TurbulenceScratch>>,
     /// Buffers of the slow forcing (allocated on the first step).
@@ -181,6 +192,89 @@ where
     /// `[τ_x, τ_y]` of `surface_stress` on every column (allocated on first
     /// use).
     surface_stress_scratch: Mutex<[Vec<f64>; 2]>,
+    /// The stratification about which the vertical tracer advection
+    /// reconstructs, if any (see [`Self::with_vertical_reference`]).
+    vertical_reference: Option<VerticalReference>,
+    /// Whether [`Self::ensure_vertical_reference`] takes a stratified initial
+    /// state as the reference (the default; see
+    /// [`Self::without_vertical_reference`]).
+    automatic_vertical_reference: bool,
+}
+
+/// The implicit part of `Ω` of [`Hydrostatic3D`]'s last 3D stage (see
+/// [`Hydrostatic3D::with_implicit_vertical_advection`]).
+#[derive(Default)]
+struct ImplicitSplit {
+    /// `Ω_i` at the σ-surfaces, `[element][node][n_levels + 1]`.
+    omega: Vec<f64>,
+    /// Columns of the last stage with an implicit part.
+    columns: usize,
+    /// σ-thicknesses of the w-cells.
+    d_sigma_w: Vec<f64>,
+    /// Statistics since the last [`Hydrostatic3D::take_implicit_advection_stats`].
+    stats: ImplicitAdvectionStats,
+}
+
+/// How much of the vertical advection was implicit (see
+/// [`Hydrostatic3D::take_implicit_advection_stats`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ImplicitAdvectionStats {
+    /// Most columns with an implicit part in one 3D stage.
+    pub columns: usize,
+    /// Largest outflow Courant number `Δt Σ Ω_out / H_z` of a layer.
+    pub largest_courant: f64,
+}
+
+/// One bound of [`Hydrostatic3D`]'s time step and the element that sets
+/// it (see [`Hydrostatic3D::time_step_limits`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimeStepLimit {
+    /// The longest step the bound allows (s; infinite if nothing bounds it).
+    pub dt: f64,
+    /// The element with that step.
+    pub element: usize,
+}
+
+impl TimeStepLimit {
+    /// No bound.
+    pub const NONE: Self = Self {
+        dt: f64::INFINITY,
+        element: usize::MAX,
+    };
+
+    /// The shorter of the two (the lower element on a tie: exact, so a
+    /// reduction does not depend on its grouping).
+    fn min(self, other: Self) -> Self {
+        if (other.dt, other.element) < (self.dt, self.element) {
+            other
+        } else {
+            self
+        }
+    }
+}
+
+/// The bounds of [`Hydrostatic3D::compute_dt`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TimeStepLimits {
+    /// Horizontal advection and internal waves.
+    pub advection: TimeStepLimit,
+    /// Vertical advection, `|Ω|Δt/H_z ≤ 1` (not applied with
+    /// [`Hydrostatic3D::with_implicit_vertical_advection`]).
+    pub vertical: TimeStepLimit,
+    /// Coriolis, `|f|Δt ≤ 1`.
+    pub coriolis: TimeStepLimit,
+    /// Horizontal viscosity.
+    pub viscosity: TimeStepLimit,
+}
+
+/// The temperature and salinity about which [`Hydrostatic3D`]'s vertical
+/// tracer advection reconstructs (see [`Hydrostatic3D::with_vertical_reference`]),
+/// per node and level, and how it follows the state.
+struct VerticalReference {
+    /// `[temperature, salinity]`, `[element][node][level]`.
+    fields: Mutex<[Vec<f64>; 2]>,
+    /// The time scale (s) of the relaxation towards the state, if any.
+    timescale: Option<f64>,
 }
 
 impl<EOS, MIX, BC> Hydrostatic3D<EOS, MIX, BC>
@@ -199,11 +293,13 @@ where
         coriolis: Arc<CoriolisSource2D>,
         eos: EOS,
         mixing: MIX,
-        swe_physics: SWEPhysics2D<BC>,
+        mut swe_physics: SWEPhysics2D<BC>,
         forcing: Forcing,
         g: f64,
         rho0: f64,
     ) -> Self {
+        // The 2D wet/dry kernel's subcells where the layers take them
+        swe_physics.subcell_depth = Some(Self::DEFAULT_MIN_COLUMN_DEPTH);
         let transport_scratch = Mutex::new(
             LayerTransport::new(mesh.n_elements, &ops, sigma.n_levels())
                 .with_metric(MetricForm::of(swe_physics.formulation)),
@@ -241,14 +337,230 @@ where
             horizontal_viscosity: HorizontalViscosity3D::default(),
             nesting: None,
             rivers: None,
+            implicit_vertical_advection: None,
             open_boundary_check: Once::new(),
             transport_scratch,
+            implicit_split: Mutex::new(ImplicitSplit::default()),
+            last_time_step_limits: Mutex::new(None),
             w_transport_scratch: Mutex::new(None),
             slow_forcing_scratch: Mutex::new(None),
             masked_scratch: Mutex::new(None),
             viscosity_scratch: Mutex::new(None),
             surface_stress_scratch: Mutex::new([Vec::new(), Vec::new()]),
+            vertical_reference: None,
+            automatic_vertical_reference: true,
         }
+    }
+
+    /// Reconstruct the tracers at the σ-surfaces about `state`'s temperature
+    /// and salinity, its stratification (at rest, or a parent model's): the
+    /// vertical scheme ([`Self::with_vertical_advection`]) keeps its limiting
+    /// for departures from it, while the stratification itself is advected
+    /// with the centred value (see
+    /// [`crate::solver::rhs::apply_tracer_transport_3d_about`]).
+    ///
+    /// Use it for stratified runs: about a stratified rest state, a
+    /// dissipative or higher-order vertical scheme mixes the background at a
+    /// rate set by a perturbation's own vertical flow, which feeds the
+    /// perturbation. On the Frøya coastline mesh at rest that grew with an
+    /// e-folding of 35 min for the default `LimitedAkima` (26 min upwind,
+    /// 50 min Akima) at terrace edges beside shore elements; centred, or any
+    /// scheme about the reference, holds round-off (TODO P1.3,
+    /// `docs/stratified-rest-over-steep-beds.md`).
+    ///
+    /// The reference is per node and level, so it follows the σ-levels as a
+    /// tide stretches the columns. A uniform tracer stays uniform whatever
+    /// the reference, and a column stratified like it at a fraction of its
+    /// strength is still advected centred. Refresh it with
+    /// [`Self::set_vertical_reference`], or let it follow the state with
+    /// [`Self::with_vertical_reference_timescale`].
+    ///
+    /// It is the default: [`crate::simulation::Simulation3D`] takes a
+    /// stratified initial state as the reference when none was given
+    /// ([`Self::ensure_vertical_reference`]; opt out with
+    /// [`Self::without_vertical_reference`]). Loops that step the model
+    /// themselves call this, or [`Self::ensure_vertical_reference`].
+    pub fn with_vertical_reference(mut self, state: &Solution3D) -> Self {
+        self.vertical_reference = Some(VerticalReference {
+            fields: Mutex::new([state.temp.clone(), state.salt.clone()]),
+            timescale: None,
+        });
+        self
+    }
+
+    /// [`Self::with_vertical_reference`] of a horizontally uniform profile
+    /// `profile(z) = (T, S)`, sampled at the levels of `state` (its `η`).
+    pub fn with_vertical_reference_profile(
+        self,
+        state: &Solution3D,
+        profile: impl Fn(f64) -> (f64, f64),
+    ) -> Self {
+        let mut reference = state.clone();
+        let nl = state.n_levels;
+        for (idx, (temp, salt)) in reference
+            .temp
+            .chunks_exact_mut(nl)
+            .zip(reference.salt.chunks_exact_mut(nl))
+            .enumerate()
+        {
+            let eta = state.eta.data[idx];
+            let depth = eta - self.bathymetry.data[idx];
+            for (l, &s) in self.sigma.sigma_rho().iter().enumerate() {
+                (temp[l], salt[l]) = profile(eta + s * depth);
+            }
+        }
+        self.with_vertical_reference(&reference)
+    }
+
+    /// Relax the reference of [`Self::with_vertical_reference`] towards the
+    /// state with the time scale `timescale` (s) at every
+    /// [`Self::relax_vertical_reference`] (each step of [`crate::simulation::Simulation3D`]),
+    /// so that it follows a stratification that changes slowly (mixing,
+    /// rivers, a parent model) while departures faster than `timescale`
+    /// are still limited. A day or more keeps the tide's departures.
+    ///
+    /// # Panics
+    /// Without a reference, or if `timescale` is not positive.
+    pub fn with_vertical_reference_timescale(mut self, timescale: f64) -> Self {
+        assert!(
+            timescale > 0.0,
+            "the reference's time scale must be positive, got {timescale}"
+        );
+        self.vertical_reference
+            .as_mut()
+            .expect("with_vertical_reference_timescale needs with_vertical_reference first")
+            .timescale = Some(timescale);
+        self
+    }
+
+    /// The plain vertical scheme, without a reference, and no automatic one
+    /// from [`Self::ensure_vertical_reference`].
+    pub fn without_vertical_reference(mut self) -> Self {
+        self.vertical_reference = None;
+        self.automatic_vertical_reference = false;
+        self
+    }
+
+    /// Take `state`'s temperature and salinity as the reference of
+    /// [`Self::with_vertical_reference`] if none is set, the state is
+    /// stratified (a column's T or S varies by more than 1e-9) and
+    /// [`Self::without_vertical_reference`] did not opt out.
+    /// [`crate::simulation::Simulation3D`] calls it with its initial state.
+    /// The first call decides: a later one (a run continued by another
+    /// `run` call, whose state may have stratified since) takes no reference
+    /// mid-run.
+    pub fn ensure_vertical_reference(&mut self, state: &Solution3D) {
+        if self.vertical_reference.is_some() || !self.automatic_vertical_reference {
+            return;
+        }
+        self.automatic_vertical_reference = false;
+        let nl = state.n_levels;
+        let stratified = [&state.temp, &state.salt].iter().any(|field| {
+            field.chunks_exact(nl).any(|column| {
+                let (lo, hi) = column
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &c| {
+                        (lo.min(c), hi.max(c))
+                    });
+                hi - lo > 1e-9
+            })
+        });
+        if stratified {
+            self.set_vertical_reference(state);
+        }
+    }
+
+    /// Replace the reference of [`Self::with_vertical_reference`] by
+    /// `state`'s temperature and salinity (none set: sets one).
+    pub fn set_vertical_reference(&mut self, state: &Solution3D) {
+        match &self.vertical_reference {
+            Some(reference) => {
+                let mut fields = reference
+                    .fields
+                    .lock()
+                    .expect("Failed to lock the vertical reference");
+                fields[0].copy_from_slice(&state.temp);
+                fields[1].copy_from_slice(&state.salt);
+            }
+            None => {
+                self.vertical_reference = Some(VerticalReference {
+                    fields: Mutex::new([state.temp.clone(), state.salt.clone()]),
+                    timescale: None,
+                });
+            }
+        }
+    }
+
+    /// Continue a run's reference (from [`Self::vertical_reference`] of the
+    /// run being resumed, `[temperature, salinity]` per node and level):
+    /// its fields replace this physics' (keeping the relaxation time scale
+    /// it was built with), and `None`, a run without one, removes any
+    /// reference and the automatic one of [`Self::ensure_vertical_reference`].
+    ///
+    /// # Panics
+    /// If the fields do not have the size of the reference's.
+    pub fn restore_vertical_reference(&mut self, reference: Option<[Vec<f64>; 2]>) {
+        let Some(fields) = reference else {
+            self.vertical_reference = None;
+            self.automatic_vertical_reference = false;
+            return;
+        };
+        let n = self.mesh.n_elements * self.ops.n_nodes * self.sigma.n_levels();
+        assert!(
+            fields.iter().all(|field| field.len() == n),
+            "the vertical reference has {} and {} values, expected {n}",
+            fields[0].len(),
+            fields[1].len()
+        );
+        match &mut self.vertical_reference {
+            Some(reference) => {
+                *reference
+                    .fields
+                    .get_mut()
+                    .expect("Failed to lock the vertical reference") = fields;
+            }
+            None => {
+                self.vertical_reference = Some(VerticalReference {
+                    fields: Mutex::new(fields),
+                    timescale: None,
+                });
+            }
+        }
+        self.automatic_vertical_reference = false;
+    }
+
+    /// Relax the reference towards `state` over a step `dt` (s):
+    /// `C_ref += (1 − e^{−dt/τ})(C − C_ref)` with the time scale of
+    /// [`Self::with_vertical_reference_timescale`]; nothing without one.
+    pub fn relax_vertical_reference(&self, state: &Solution3D, dt: f64) {
+        let Some(VerticalReference {
+            fields,
+            timescale: Some(timescale),
+        }) = &self.vertical_reference
+        else {
+            return;
+        };
+        let weight = 1.0 - (-dt / timescale).exp();
+        let mut fields = fields
+            .lock()
+            .expect("Failed to lock the vertical reference");
+        for (reference, field) in fields.iter_mut().zip([&state.temp, &state.salt]) {
+            for (r, &c) in reference.iter_mut().zip(field.iter()) {
+                *r += weight * (c - *r);
+            }
+        }
+    }
+
+    /// The reference's temperature and salinity, if any (see
+    /// [`Self::with_vertical_reference`]).
+    pub fn vertical_reference(&self) -> Option<[Vec<f64>; 2]> {
+        self.vertical_reference.as_ref().map(|reference| {
+            reference
+                .fields
+                .lock()
+                .expect("Failed to lock the vertical reference")
+                .clone()
+        })
     }
 
     /// Rivers as volume sources (see [`crate::source::river`]). The mode
@@ -285,21 +597,30 @@ where
     ///   their momentum tendency is zero, and they get no vertical diffusion;
     /// - the surface and bottom stresses do not reach the depth mean through
     ///   them (masked in G);
-    /// - they exert and feel no baroclinic pressure difference;
+    /// - they exert and feel no baroclinic pressure difference, and exchange
+    ///   no baroclinic transport (only their share of the barotropic flux);
+    /// - an element with a thin column moves its layers, tracers and momentum
+    ///   through the GLL subcell interfaces of the 2D `WetDry` kernel, which
+    ///   this sets to take its subcells in the same elements
+    ///   (`SWEPhysics2D::subcell_depth`): the layers then carry exactly the
+    ///   water the 2D pass moved node by node, a dry bank blocked by its
+    ///   hydrostatic reconstruction (see
+    ///   [`crate::solver::rhs::LayerTransport::compute`]).
     ///
-    /// (The tracers need no threshold: the mode splitter carries them as
-    /// element means per level wherever the 2D pass balanced an element only
-    /// as a whole, see [`crate::solver::rhs::from_inventory`].)
+    /// Where the pass still kept an element's balance only as a whole (it
+    /// switched to the subcells during the step, or the positivity limiter
+    /// changed it), the mode splitter carries its tracers as element means
+    /// per level ([`crate::solver::rhs::from_inventory`]).
     ///
     /// Everything else stays 3D, including the wet nodes of shoreline
-    /// elements. The 2D module's own wetting and drying (`WetDry`) is
-    /// unaffected.
+    /// elements.
     pub fn with_min_column_depth(mut self, depth: f64) -> Self {
         assert!(
             depth > 0.0,
             "minimum column depth must be positive, got {depth}"
         );
         self.min_column_depth = depth;
+        self.swe_physics.subcell_depth = Some(depth);
         self
     }
 
@@ -353,6 +674,36 @@ where
         self
     }
 
+    /// Balance a horizontally uniform reference density `profile(z)`
+    /// (kg/m³) exactly: a fluid resting in it feels no pressure gradient
+    /// force at all (Mellor et al. 1998's subtraction of a reference
+    /// profile; [`BalancedReference::from_profile`]), at the levels of
+    /// `state`'s `η`. Prefer it to [`Self::with_balanced_reference`] where
+    /// the stratification starts horizontally uniform, or has a typical
+    /// profile: over cliff coasts the constant-depth form's own error at rest
+    /// is not small. No effect with [`PressureGradientForm::ConstantDepth`].
+    pub fn with_reference_profile(
+        mut self,
+        state: &Solution3D,
+        profile: impl Fn(f64) -> f64,
+    ) -> Self {
+        self.balanced_reference = Some(Arc::new(BalancedReference::from_profile(
+            state,
+            &self.mesh,
+            &self.bathymetry,
+            &self.sigma,
+            &self.ops,
+            &self.geom,
+            self.g,
+            self.rho0,
+            self.rho0,
+            self.min_column_depth,
+            self.metric_form(),
+            profile,
+        )));
+        self
+    }
+
     /// Replace the balanced reference state (see
     /// [`Self::with_balanced_reference`]).
     pub fn set_balanced_reference(&mut self, state: &Solution3D) {
@@ -399,6 +750,99 @@ where
     pub fn with_turbulence_advection(mut self, scheme: Option<VerticalAdvection>) -> Self {
         self.turbulence_advection = scheme;
         self
+    }
+
+    /// Advect the part of the vertical flux `Ω` beyond an explicit Courant
+    /// number implicitly (first-order upwind, backward Euler, after every
+    /// 3D stage), and drop the vertical bound `|Ω|Δt/H_z ≤ 1` from
+    /// [`Self::compute_dt`]: see [`crate::physics::implicit_advection`].
+    ///
+    /// Columns below `split.courant_min` are advected as without it, bit for
+    /// bit. It lifts the step where thin layers carry fast vertical flow: the
+    /// columns just deeper than the thin depth on a flooding shore
+    /// ([`Self::with_min_column_depth`]), which held the Frøya tide in 3D at
+    /// 0.9–2.2 s (TODO P1.3).
+    pub fn with_implicit_vertical_advection(mut self, split: ImplicitVerticalAdvection) -> Self {
+        self.implicit_vertical_advection = Some(split);
+        self
+    }
+
+    /// The most columns with an implicit part in one 3D stage, and the
+    /// largest outflow Courant number of a layer, since the last call (see
+    /// [`Self::with_implicit_vertical_advection`]).
+    pub fn take_implicit_advection_stats(&self) -> ImplicitAdvectionStats {
+        std::mem::take(
+            &mut self
+                .implicit_split
+                .lock()
+                .expect("Failed to lock implicit_split")
+                .stats,
+        )
+    }
+
+    /// Split `transport.omega` of `state` into the explicit part, left in
+    /// `transport`, and the implicit part for a step `dt`, kept for
+    /// [`ModeSplitPhysics::implicit_vertical_advection`]. Thin columns keep
+    /// theirs explicit.
+    fn split_vertical_velocity(
+        &self,
+        split: &ImplicitVerticalAdvection,
+        state: &Solution3D,
+        transport: &mut LayerTransport,
+        dt: f64,
+    ) {
+        let (ne, nn, nl) = (state.n_elements, state.n_nodes, state.n_levels);
+        let mut guard = self
+            .implicit_split
+            .lock()
+            .expect("Failed to lock implicit_split");
+        let ImplicitSplit {
+            omega: implicit,
+            columns,
+            d_sigma_w,
+            stats,
+        } = &mut *guard;
+        implicit.resize(transport.omega.len(), 0.0);
+        let d_sigma = self.sigma.d_sigma();
+        if d_sigma_w.len() != nl + 1 {
+            d_sigma_w.resize(nl + 1, 0.0);
+            w_cell_thicknesses(d_sigma, d_sigma_w);
+        }
+        let (count, courant) = reduce_blocks(
+            ne,
+            [&mut transport.omega[..], &mut implicit[..]],
+            || Pooled::take(|t: &Vec<f64>| t.len() == nl, || vec![0.0; nl]),
+            |thickness, k, [omega_k, implicit_k]| {
+                let (mut count, mut largest) = (0, 0.0_f64);
+                for i in 0..nn {
+                    let idx = k * nn + i;
+                    let column = i * (nl + 1)..(i + 1) * (nl + 1);
+                    let depth = state.eta.data[idx] - self.bathymetry.data[idx];
+                    let implicit = &mut implicit_k[column.clone()];
+                    if depth < self.min_column_depth {
+                        implicit.fill(0.0);
+                        continue;
+                    }
+                    for (h, &ds) in thickness.iter_mut().zip(d_sigma) {
+                        *h = layer_thickness_of(depth, ds);
+                    }
+                    let omega = &mut omega_k[column];
+                    largest = largest.max(split.split_column(omega, thickness, dt, implicit));
+                    if implicit.iter().any(|&w| w != 0.0) {
+                        count += 1;
+                        for (w, &w_i) in omega.iter_mut().zip(implicit.iter()) {
+                            *w -= w_i;
+                        }
+                    }
+                }
+                (count, largest)
+            },
+            || (0, 0.0),
+            |a, b| (a.0 + b.0, a.1.max(b.1)),
+        );
+        *columns = count;
+        stats.columns = stats.columns.max(count);
+        stats.largest_courant = stats.largest_courant.max(courant);
     }
 
     /// Quadratic bottom drag `τ_b/ρ₀ = C_d|u_b|u_b` of the bottom-layer
@@ -741,6 +1185,8 @@ where
                 PressureGradientForm::ConstantDepth => None,
             },
             metric: self.metric_form(),
+            // The vertical reference is locked where the transport needs it
+            tracer_reference: [None, None],
         }
     }
 
@@ -823,9 +1269,25 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &exterior,
+                self.min_column_depth,
             );
+            // The stages advect with the explicit part of Ω; the rest is
+            // the implicit relaxation's
+            if let Some(split) = &self.implicit_vertical_advection {
+                self.split_vertical_velocity(split, state, transport, barotropic.dt);
+            }
+            let reference = self.vertical_reference.as_ref().map(|reference| {
+                reference
+                    .fields
+                    .lock()
+                    .expect("Failed to lock the vertical reference")
+            });
             let config = Rhs3DConfig {
                 exterior,
+                tracer_reference: match &reference {
+                    Some(fields) => [Some(fields[0].as_slice()), Some(fields[1].as_slice())],
+                    None => [None, None],
+                },
                 ..self.rhs_config()
             };
             compute_transport_rhs_3d(rhs, state, transport, &config);
@@ -985,7 +1447,8 @@ where
     ///   counted as zero, and at least [`Self::MIN_INTERNAL_WAVE_SPEED`];
     /// - vertical advection, `|Ω| Δt/H_z ≤ 1` on every layer (`Ω` from the
     ///   last `post_process`; the limit of upwind, below Akima's ≈ 1.2,
-    ///   see [`VerticalAdvection`]);
+    ///   see [`VerticalAdvection`]), unless the excess is advected implicitly
+    ///   ([`Self::with_implicit_vertical_advection`]);
     /// - Coriolis, `|f| Δt ≤ 1` (SSP-RK3 is stable on the imaginary axis up
     ///   to √3);
     /// - the horizontal viscosity, by the BR1 spectral radius.
@@ -993,9 +1456,40 @@ where
     /// Thin columns are left to the 2D module (a domain of thin columns
     /// only gets 1 s).
     pub fn compute_dt(&self, state: &Solution3D, cfl: f64) -> f64 {
+        let limits = self.time_step_limits(state, cfl);
+        let mut dt = limits
+            .advection
+            .dt
+            .min(limits.coriolis.dt)
+            .min(limits.viscosity.dt);
+        if self.implicit_vertical_advection.is_none() {
+            dt = dt.min(limits.vertical.dt);
+        }
+        *self
+            .last_time_step_limits
+            .lock()
+            .expect("Failed to lock last_time_step_limits") = Some(limits);
+        if dt == f64::INFINITY { 1.0 } else { dt }
+    }
+
+    /// The bounds of the last [`Self::compute_dt`] (see
+    /// [`Self::time_step_limits`]), if any.
+    pub fn last_time_step_limits(&self) -> Option<TimeStepLimits> {
+        *self
+            .last_time_step_limits
+            .lock()
+            .expect("Failed to lock last_time_step_limits")
+    }
+
+    /// Each bound of [`Self::compute_dt`] at Courant number `cfl`, and the
+    /// element that sets it: horizontal advection and internal waves,
+    /// vertical advection (reported also where it is implicit, when
+    /// [`Self::compute_dt`] does not apply it), Coriolis, and the horizontal
+    /// viscosity. A bound nothing sets is infinite.
+    pub fn time_step_limits(&self, state: &Solution3D, cfl: f64) -> TimeStepLimits {
         let (nn, nl) = (state.n_nodes, state.n_levels);
         let (sigma_rho, d_sigma) = (self.sigma.sigma_rho(), self.sigma.d_sigma());
-        let mut min_dt = reduce_blocks::<f64, _, _, 0>(
+        let [advection, vertical, coriolis] = reduce_blocks::<f64, _, _, 0>(
             self.mesh.n_elements,
             [],
             || (),
@@ -1034,39 +1528,35 @@ where
                     let inverse_length = 0.5 * (rx.hypot(ry) + sx.hypot(sy));
                     wave_rate = wave_rate.max((speed + c1) * inverse_length);
                 }
-                let mut dt = f64::INFINITY;
-                if wave_rate > 0.0 {
-                    dt = dt.min(cfl / wave_rate / (self.ops.order as f64 + 1.0).powi(2));
-                }
-                if vertical_rate > 0.0 {
-                    dt = dt.min(1.0 / vertical_rate);
-                }
                 let f = self
                     .mesh
                     .element_vertices(ElementIndex::new(k))
                     .iter()
                     .map(|&[_, y]| self.coriolis.f_at(y).abs())
                     .fold(0.0, f64::max);
-                if f > 0.0 {
-                    dt = dt.min(1.0 / f);
-                }
-                dt
+                let bound = |dt: f64| TimeStepLimit { dt, element: k };
+                [
+                    bound(cfl / wave_rate / (self.ops.order as f64 + 1.0).powi(2)),
+                    bound(1.0 / vertical_rate),
+                    bound(1.0 / f),
+                ]
             },
-            || f64::INFINITY,
-            f64::min,
+            || [TimeStepLimit::NONE; 3],
+            |a, b| [0, 1, 2].map(|j| a[j].min(b[j])),
         );
 
         // The horizontal viscosity, explicit in the SSP-RK3 stages: BR1
         // couples an element to its face neighbours' gradients, so each
         // element is bounded by the largest ν of its own and theirs
+        let mut viscosity = TimeStepLimit::NONE;
         if !self.horizontal_viscosity.is_zero() {
-            let mut largest = vec![0.0; self.mesh.n_elements];
             let mut guard = self
                 .viscosity_scratch
                 .lock()
                 .expect("Failed to lock viscosity_scratch");
             let scratch = guard
                 .get_or_insert_with(|| ViscosityScratch3D::new(self.mesh.n_elements, &self.ops));
+            let mut largest = vec![0.0; self.mesh.n_elements];
             largest_horizontal_viscosity_3d(
                 &mut largest,
                 state,
@@ -1085,7 +1575,7 @@ where
                     .filter_map(|face| self.mesh.neighbor(ElementIndex::new(k), face))
                     .map(|nb| largest[nb.element])
                     .fold(largest[k], f64::max);
-                min_dt = min_dt.min(element_dt_viscous_swe_2d(
+                let dt = element_dt_viscous_swe_2d(
                     &self.mesh,
                     &self.ops,
                     &self.geom,
@@ -1093,11 +1583,16 @@ where
                     self.ops.order,
                     cfl,
                     k,
-                ));
+                );
+                viscosity = viscosity.min(TimeStepLimit { dt, element: k });
             }
         }
-
-        if min_dt == f64::INFINITY { 1.0 } else { min_dt }
+        TimeStepLimits {
+            advection,
+            vertical,
+            coriolis,
+            viscosity,
+        }
     }
 
     pub fn post_process(&self, state: &mut Solution3D) {
@@ -1130,6 +1625,7 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &Exterior3D::default(),
+                self.min_column_depth,
             );
         });
         let nl = state.n_levels;
@@ -1227,6 +1723,7 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &Exterior3D::default(),
+                self.min_column_depth,
             );
             advection_u.fill(0.0);
             advection_v.fill(0.0);
@@ -1260,6 +1757,7 @@ where
                 &self.bathymetry,
                 &self.boundaries,
                 &Exterior3D::default(),
+                self.min_column_depth,
             );
             bar_rhs.u.fill(0.0);
             bar_rhs.v.fill(0.0);
@@ -1388,6 +1886,31 @@ where
             });
         }
         true
+    }
+
+    /// The implicit part of `Ω` of the last [`Self::transport_rhs_into`],
+    /// if any ([`Self::with_implicit_vertical_advection`]).
+    fn implicit_vertical_advection(&self, stage: &mut Solution3D, dt: f64, element_means: &[bool]) {
+        if self.implicit_vertical_advection.is_none() {
+            return;
+        }
+        let split = self
+            .implicit_split
+            .lock()
+            .expect("Failed to lock implicit_split");
+        if split.columns == 0 {
+            return;
+        }
+        apply_implicit_vertical_advection(
+            stage,
+            &split.omega,
+            self.sigma.d_sigma(),
+            &split.d_sigma_w,
+            &self.bathymetry,
+            &self.geom,
+            element_means,
+            dt,
+        );
     }
 
     /// The vertical diffusion with the surface stress at the middle of the

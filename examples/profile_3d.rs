@@ -230,6 +230,9 @@ fn main() {
         }
     }
     physics.update_density(&mut state);
+    // The vertical tracer advection about the initial stratification, as
+    // `Simulation3D` does
+    let physics = physics.with_vertical_reference(&state);
 
     println!(
         "profile_3d: {} elements × {nn} nodes × {nl} levels = {} 3D points, P{order}, dt {dt} s, \

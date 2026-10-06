@@ -18,6 +18,7 @@ use crate::flux::{SWEFluxType2D, compute_flux_swe_2d};
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::core::disjoint::{DisjointChunks, all_distinct};
+use crate::solver::rhs::subcells::subcell_interfaces;
 use crate::solver::{SWESolution2D, SWEState2D};
 use crate::source::swe_2d::viscosity::HorizontalViscosity2D;
 use crate::source::{ElementSources, HydrostaticReconstruction2D, SourceTerm2D};
@@ -635,7 +636,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     ///
     /// `face_mass`, if given (`4 · n_face_nodes` values), receives the mass
     /// component of `F*` at every face node of the element, along its outward
-    /// normal (see [`compute_rhs_swe_2d_face_mass_into`]).
+    /// normal (see [`compute_rhs_swe_2d_face_mass_into`]), and `subcell_mass`,
+    /// if given, the mass flux through every subcell interface (NaN where the
+    /// element has no subcells; see [`compute_rhs_swe_2d_mass_fluxes_into`]).
     fn element(
         &self,
         k: usize,
@@ -643,6 +646,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         faces: &[SWEState2D],
         out: [&mut [f64]; 3],
         face_mass: Option<&mut [f64]>,
+        subcell_mass: Option<&mut [f64]>,
     ) {
         let k_idx = ElementIndex::new(k);
         let [out_h, out_hu, out_hv] = out;
@@ -655,8 +659,14 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                 faces,
                 [out_h, out_hu, out_hv],
                 face_mass,
+                subcell_mass,
             ),
-            None => self.collocated_terms(k_idx, ws, [out_h, out_hu, out_hv], face_mass),
+            None => {
+                if let Some(mass) = subcell_mass {
+                    mass.fill(f64::NAN);
+                }
+                self.collocated_terms(k_idx, ws, [out_h, out_hu, out_hv], face_mass)
+            }
         }
 
         // 3–4. Source terms
@@ -915,7 +925,7 @@ pub fn compute_rhs_swe_2d_into<BC: SWEBoundaryCondition2D>(
     time: f64,
     out: &mut SWESolution2D,
 ) {
-    rhs_serial(q, mesh, ops, geom, config, time, out, None);
+    rhs_serial(q, mesh, ops, geom, config, time, out, None, None);
 }
 
 /// [`compute_rhs_swe_2d_into`] that also writes the numerical mass flux of
@@ -941,7 +951,43 @@ pub fn compute_rhs_swe_2d_face_mass_into<BC: SWEBoundaryCondition2D>(
     out: &mut SWESolution2D,
     face_mass: &mut [f64],
 ) {
-    rhs_serial(q, mesh, ops, geom, config, time, out, Some(face_mass));
+    rhs_serial(q, mesh, ops, geom, config, time, out, Some(face_mass), None);
+}
+
+/// [`compute_rhs_swe_2d_face_mass_into`] that also writes the mass flux
+/// through every subcell interface into `subcell_mass`
+/// ([`subcell_mass_len`] values; layout `k · n_sub + slot`, `n_sub =`
+/// [`crate::solver::rhs::subcells::subcell_interfaces`], slots as in
+/// [`crate::solver::rhs::subcells`]).
+///
+/// In `WetDry` elements whose volume term is the subcell finite-volume
+/// update, the face and subcell mass fluxes give the mass tendency node by
+/// node: `J_i dh_i/dt = −Σ_dir (F̂_{a+½} − F̂_{a−½})/w_a` with the end
+/// interfaces replaced by the face flux `F*` (the 3D layers rely on it). In
+/// every other element all its slots are NaN.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_rhs_swe_2d_mass_fluxes_into<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+    face_mass: &mut [f64],
+    subcell_mass: &mut [f64],
+) {
+    rhs_serial(
+        q,
+        mesh,
+        ops,
+        geom,
+        config,
+        time,
+        out,
+        Some(face_mass),
+        Some(subcell_mass),
+    );
 }
 
 /// Length of the face mass flux buffer of
@@ -949,6 +995,12 @@ pub fn compute_rhs_swe_2d_face_mass_into<BC: SWEBoundaryCondition2D>(
 /// element.
 pub fn face_mass_len(mesh: &Mesh2D, ops: &DGOperators2D) -> usize {
     mesh.n_elements * 4 * ops.n_face_nodes
+}
+
+/// Length of the subcell mass flux buffer of
+/// [`compute_rhs_swe_2d_mass_fluxes_into`].
+pub fn subcell_mass_len(mesh: &Mesh2D, ops: &DGOperators2D) -> usize {
+    mesh.n_elements * subcell_interfaces(ops.n_1d)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -961,6 +1013,7 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
     time: f64,
     out: &mut SWESolution2D,
     face_mass: Option<&mut [f64]>,
+    subcell_mass: Option<&mut [f64]>,
 ) {
     check_rhs_output(out, mesh, ops);
     let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
@@ -976,6 +1029,14 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
         );
         fm.chunks_exact_mut(per_element)
     });
+    let mut subcell_mass = subcell_mass.map(|sm| {
+        assert_eq!(
+            sm.len(),
+            subcell_mass_len(mesh, ops),
+            "subcell mass flux buffer length"
+        );
+        sm.chunks_exact_mut(subcell_interfaces(ops.n_1d))
+    });
     let viscous = viscous_all(q, mesh, ops, geom, config, time, false);
     let [out_h, out_hu, out_hv] = &mut out.data;
     let mut ws = WorkspaceGuard::take(ops);
@@ -986,7 +1047,8 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
         .enumerate()
     {
         let fm = face_mass.as_mut().and_then(Iterator::next);
-        kernel.element(k, &mut ws, &faces, [h, &mut *hu, &mut *hv], fm);
+        let sm = subcell_mass.as_mut().and_then(Iterator::next);
+        kernel.element(k, &mut ws, &faces, [h, &mut *hu, &mut *hv], fm, sm);
         if let Some((term, grads)) = &viscous {
             term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
         }
@@ -1306,7 +1368,7 @@ pub fn compute_rhs_swe_2d_parallel_into<BC: SWEBoundaryCondition2D + Sync>(
     time: f64,
     out: &mut SWESolution2D,
 ) {
-    rhs_parallel(q, mesh, ops, geom, config, time, out, None);
+    rhs_parallel(q, mesh, ops, geom, config, time, out, None, None);
 }
 
 /// Parallel version of [`compute_rhs_swe_2d_face_mass_into`] (identical
@@ -1323,9 +1385,38 @@ pub fn compute_rhs_swe_2d_parallel_face_mass_into<BC: SWEBoundaryCondition2D + S
     out: &mut SWESolution2D,
     face_mass: &mut [f64],
 ) {
-    rhs_parallel(q, mesh, ops, geom, config, time, out, Some(face_mass));
+    rhs_parallel(q, mesh, ops, geom, config, time, out, Some(face_mass), None);
 }
 
+/// Parallel version of [`compute_rhs_swe_2d_mass_fluxes_into`] (identical
+/// result).
+#[cfg(feature = "parallel")]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_rhs_swe_2d_parallel_mass_fluxes_into<BC: SWEBoundaryCondition2D + Sync>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    time: f64,
+    out: &mut SWESolution2D,
+    face_mass: &mut [f64],
+    subcell_mass: &mut [f64],
+) {
+    rhs_parallel(
+        q,
+        mesh,
+        ops,
+        geom,
+        config,
+        time,
+        out,
+        Some(face_mass),
+        Some(subcell_mass),
+    );
+}
+
+/// `subcell_mass` is only taken together with `face_mass`.
 #[cfg(feature = "parallel")]
 #[allow(clippy::too_many_arguments)]
 fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
@@ -1337,6 +1428,7 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     time: f64,
     out: &mut SWESolution2D,
     face_mass: Option<&mut [f64]>,
+    subcell_mass: Option<&mut [f64]>,
 ) {
     use rayon::prelude::*;
 
@@ -1350,8 +1442,9 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     let element = |ws: &mut WorkspaceGuard,
                    k: usize,
                    [h, hu, hv]: [&mut [f64]; 3],
-                   fm: Option<&mut [f64]>| {
-        kernel.element(k, ws, faces, [h, &mut *hu, &mut *hv], fm);
+                   fm: Option<&mut [f64]>,
+                   sm: Option<&mut [f64]>| {
+        kernel.element(k, ws, faces, [h, &mut *hu, &mut *hv], fm, sm);
         if let Some((term, grads)) = &viscous {
             term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
         }
@@ -1362,23 +1455,43 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
         .zip(out_hu.par_chunks_exact_mut(n))
         .zip(out_hv.par_chunks_exact_mut(n))
         .enumerate();
-    match face_mass {
-        Some(face_mass) => {
+    assert!(
+        face_mass.is_some() || subcell_mass.is_none(),
+        "subcell mass fluxes come with the face mass fluxes"
+    );
+    match (face_mass, subcell_mass) {
+        (Some(face_mass), subcell_mass) => {
             assert_eq!(
                 face_mass.len(),
                 face_mass_len(mesh, ops),
                 "face mass flux buffer length"
             );
-            elements
-                .zip(face_mass.par_chunks_exact_mut(4 * ops.n_face_nodes))
-                .for_each_init(
+            let elements = elements.zip(face_mass.par_chunks_exact_mut(4 * ops.n_face_nodes));
+            match subcell_mass {
+                Some(subcell_mass) => {
+                    assert_eq!(
+                        subcell_mass.len(),
+                        subcell_mass_len(mesh, ops),
+                        "subcell mass flux buffer length"
+                    );
+                    elements
+                        .zip(subcell_mass.par_chunks_exact_mut(subcell_interfaces(ops.n_1d)))
+                        .for_each_init(
+                            || WorkspaceGuard::take(ops),
+                            |ws, (((k, ((h, hu), hv)), fm), sm)| {
+                                element(ws, k, [h, hu, hv], Some(fm), Some(sm))
+                            },
+                        );
+                }
+                None => elements.for_each_init(
                     || WorkspaceGuard::take(ops),
-                    |ws, ((k, ((h, hu), hv)), fm)| element(ws, k, [h, hu, hv], Some(fm)),
-                );
+                    |ws, ((k, ((h, hu), hv)), fm)| element(ws, k, [h, hu, hv], Some(fm), None),
+                ),
+            }
         }
-        None => elements.for_each_init(
+        (None, _) => elements.for_each_init(
             || WorkspaceGuard::take(ops),
-            |ws, (k, ((h, hu), hv))| element(ws, k, [h, hu, hv], None),
+            |ws, (k, ((h, hu), hv))| element(ws, k, [h, hu, hv], None, None),
         ),
     }
 }
@@ -1603,6 +1716,7 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
             ws,
             faces,
             [&mut *h, &mut *hu, &mut *hv],
+            None,
             None,
         );
         if let Some((term, grads)) = &viscous {
@@ -2000,7 +2114,9 @@ mod tests {
         config: &SWE2DRhsConfig<BC>,
         time: f64,
     ) {
-        use super::super::diffusion_2d::{compute_br1_diffusion_rhs_2d, compute_br1_gradient_2d};
+        use super::super::diffusion_2d::{
+            DiffusionScratch, br1_diffusion_element, compute_br1_gradient_2d,
+        };
 
         let visc = config.viscosity.expect("viscosity");
         let n_nodes = ops.n_nodes;
@@ -2055,8 +2171,33 @@ mod tests {
                 }
             }
         }
-        let diff_u = compute_br1_diffusion_rhs_2d(&u, &coeff, &grad_u, mesh, ops, geom);
-        let diff_v = compute_br1_diffusion_rhs_2d(&v, &coeff, &grad_v, mesh, ops, geom);
+        // Both components at once: a wall (every face of `Reflective2D`)
+        // mirrors the velocity and passes the normal stress only
+        let (mut diff_u, mut diff_v) = (vec![0.0; total_nodes], vec![0.0; total_nodes]);
+        let mut scratch = DiffusionScratch::<2>::new(n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            let rows = k.as_usize() * n_nodes..(k.as_usize() + 1) * n_nodes;
+            br1_diffusion_element(
+                k,
+                mesh,
+                ops,
+                geom,
+                |j, node| {
+                    let flat = j.as_usize() * n_nodes + node;
+                    let c = coeff[flat].max(0.0);
+                    [
+                        (c * grad_u[flat].dx, c * grad_u[flat].dy),
+                        (c * grad_v[flat].dx, c * grad_v[flat].dy),
+                    ]
+                },
+                |_, _, _, (nx, ny), [fu, fv]| {
+                    let normal = nx * fu + ny * fv;
+                    [nx * normal, ny * normal]
+                },
+                &mut scratch,
+                [&mut diff_u[rows.clone()], &mut diff_v[rows]],
+            );
+        }
         for flat in 0..total_nodes {
             rhs.data[1][flat] += diff_u[flat];
             rhs.data[2][flat] += diff_v[flat];
@@ -2145,6 +2286,139 @@ mod tests {
                         visc
                     );
                 }
+            }
+        }
+    }
+
+    /// The subcell mass flux output (3D wetting and drying, TODO P1.3):
+    /// in every `WetDry` element that takes the subcells, the subcell and face
+    /// mass fluxes give the mass tendency node by node through
+    /// `subcell_divergence_element`, the operator the 3D layers use; every
+    /// other element's slots are NaN. On rectangles and on general
+    /// quadrilaterals (the telescoped interface metrics), serial and
+    /// parallel, and the RHS is unchanged.
+    #[test]
+    fn subcell_mass_fluxes_give_the_wet_dry_mass_tendency_node_by_node() {
+        use crate::solver::rhs::subcell_divergence_element;
+        use crate::solver::rhs::subcells::subcell_interfaces;
+        let tau = 2.0 * std::f64::consts::PI;
+        let distorted = || {
+            let mut mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 4, 4);
+            for v in &mut mesh.vertices {
+                let [x, y] = *v;
+                let bump = (tau * x).sin() * (tau * y).sin();
+                *v = [x + 0.06 * bump, y - 0.04 * bump];
+            }
+            mesh
+        };
+        for (name, mesh) in [
+            (
+                "rectangles",
+                Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 4, 4),
+            ),
+            ("distorted", distorted()),
+        ] {
+            for order in [1, 2, 3] {
+                let ops = DGOperators2D::new(order);
+                let geom = GeometricFactors2D::compute(&mesh, &ops);
+                let equation = ShallowWater2D::new(G);
+                let bc = Reflective2D::new();
+                let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+                    -1.0 + 2.0 * x + 0.2 * y
+                });
+                let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                for k in ElementIndex::iter(mesh.n_elements) {
+                    for i in 0..ops.n_nodes {
+                        let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                        let eta = 0.2 + 0.05 * (tau * x).sin();
+                        let h = (eta - bathymetry.get(k, i)).max(0.0);
+                        let (u, v) = (0.2 * (0.5 * tau * y).cos(), 0.1 * (0.5 * tau * x).sin());
+                        q.set_state(k, i, SWEState2D::new(h, h * u, h * v));
+                    }
+                }
+                let config = SWE2DRhsConfig::new(&equation, &bc)
+                    .with_coriolis(false)
+                    .with_formulation(SWEFormulation2D::WetDry)
+                    .with_bathymetry(&bathymetry)
+                    .with_subcell_depth(0.1)
+                    .with_flux_type(SWEFluxType2D::HLL);
+                let plain = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
+                let mut rhs = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                let mut face_mass = vec![f64::NAN; face_mass_len(&mesh, &ops)];
+                let mut subcell_mass = vec![0.0; subcell_mass_len(&mesh, &ops)];
+                compute_rhs_swe_2d_mass_fluxes_into(
+                    &q,
+                    &mesh,
+                    &ops,
+                    &geom,
+                    &config,
+                    0.0,
+                    &mut rhs,
+                    &mut face_mass,
+                    &mut subcell_mass,
+                );
+                assert_eq!(rhs.data, plain.data, "{name} N = {order}: the RHS changed");
+
+                #[cfg(feature = "parallel")]
+                {
+                    let mut rhs_par = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                    let mut face_par = vec![f64::NAN; face_mass.len()];
+                    let mut sub_par = vec![0.0; subcell_mass.len()];
+                    compute_rhs_swe_2d_parallel_mass_fluxes_into(
+                        &q,
+                        &mesh,
+                        &ops,
+                        &geom,
+                        &config,
+                        0.0,
+                        &mut rhs_par,
+                        &mut face_par,
+                        &mut sub_par,
+                    );
+                    assert_eq!(rhs_par.data, rhs.data);
+                    assert_eq!(face_par, face_mass);
+                    let same = sub_par
+                        .iter()
+                        .zip(&subcell_mass)
+                        .all(|(a, b)| a == b || (a.is_nan() && b.is_nan()));
+                    assert!(same, "{name} N = {order}: parallel subcell fluxes");
+                }
+
+                let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
+                let n_sub = subcell_interfaces(ops.n_1d);
+                let (mut subcell_elements, mut largest) = (0, 0.0_f64);
+                let mut div = vec![0.0; nn];
+                for k in 0..mesh.n_elements {
+                    let slots = &subcell_mass[k * n_sub..(k + 1) * n_sub];
+                    let shallow = (0..nn).any(|i| q.data[0][k * nn + i] < 0.1);
+                    if !shallow {
+                        assert!(slots.iter().all(|f| f.is_nan()), "{name}: element {k}");
+                        continue;
+                    }
+                    assert!(slots.iter().all(|f| f.is_finite()), "{name}: element {k}");
+                    subcell_elements += 1;
+                    let nodes = k * nn..(k + 1) * nn;
+                    subcell_divergence_element(
+                        &ops,
+                        &geom,
+                        k,
+                        &q.data[1][nodes.clone()],
+                        &q.data[2][nodes.clone()],
+                        slots,
+                        &face_mass[k * 4 * nfn..(k + 1) * 4 * nfn],
+                        &mut div,
+                    );
+                    let dh = &rhs.data[0][nodes];
+                    let scale = div.iter().chain(dh).fold(1e-3_f64, |m, x| m.max(x.abs()));
+                    for (d, r) in div.iter().zip(dh) {
+                        largest = largest.max((d + r).abs() / scale);
+                    }
+                }
+                assert!(subcell_elements >= 4, "{name} N = {order}: test regime");
+                assert!(
+                    largest < 1e-12,
+                    "{name} N = {order}: dh/dt + div = {largest:.2e}"
+                );
             }
         }
     }

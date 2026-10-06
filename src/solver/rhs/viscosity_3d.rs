@@ -33,9 +33,12 @@
 //!
 //! The face flux is central and single-valued, so interior faces conserve
 //! the layer momentum. Walls mirror the velocity (free slip on the normal
-//! component, as the 2D module's reflective ghost state); open faces
-//! extrapolate it (zero gradient). Boundary faces take the interior flux, as
-//! in the 2D module. Thin columns (`min_column_depth`) carry no shear and,
+//! component, as the 2D module's reflective ghost state) and pass only the
+//! normal stress; open faces extrapolate it (zero gradient) and pass no
+//! viscous flux. Each pair keeps the operator dissipative (see
+//! `diffusion_2d::br1_diffusion_element`): with the interior flux at walls,
+//! as before, ν = 10 m²/s grew with an e-folding of 1.5 min at a coastline
+//! corner of the Frøya mesh (TODO P1.3). Thin columns (`min_column_depth`) carry no shear and,
 //! for the strain, no mean flow (the films' velocity is the 2D module's, as
 //! in the 3D advection): they enter their neighbours' gradients at rest and
 //! get no tendency.
@@ -372,6 +375,16 @@ pub fn apply_horizontal_viscosity_3d(
                         let node = layer[j.as_usize() * nn + node];
                         node.gradient
                             .map(|g| (node.coefficient * g.dx, node.coefficient * g.dy))
+                    },
+                    // The fluxes that match the gradients' exterior states:
+                    // at a wall (mirrored velocity) the normal stress only,
+                    // at an open face (extrapolated) none
+                    |k, face, _fi, (nx, ny), [fu, fv]| match boundaries.exterior(mesh, k, face) {
+                        FaceExterior::Wall => {
+                            let normal = nx * fu + ny * fv;
+                            [nx * normal, ny * normal]
+                        }
+                        _ => [0.0; 2],
                     },
                     diffusion,
                     [out_u, out_v],
@@ -739,6 +752,103 @@ mod tests {
             assert!(
                 largest < 1e-14,
                 "{viscosity:?}: tendency {largest:e} without shear"
+            );
+        }
+    }
+
+    /// The viscosity as a matrix on the wet columns of a 3 × 3 basin of
+    /// distorted P2 elements with wavy walls over a sloping bed, with `boundaries`: the
+    /// largest real part of its eigenvalues (1/s).
+    fn largest_growth_rate(boundaries: &Boundaries3D, nu: f64) -> f64 {
+        let mut mesh = Mesh2D::uniform_rectangle(0.0, 300.0, 0.0, 300.0, 3, 3);
+        let tau = std::f64::consts::TAU;
+        for v in &mut mesh.vertices {
+            let [x, y] = *v;
+            let bump = (tau * x / 300.0).sin() * (tau * y / 300.0).sin();
+            // Interior vertices moved, and wavy walls: faces meet at angles
+            *v = [
+                x + 25.0 * bump + 12.0 * (tau * y / 300.0).sin(),
+                y - 18.0 * bump + 9.0 * (tau * x / 300.0).cos(),
+            ];
+        }
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let bathymetry =
+            Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| -20.0 - 0.05 * x - 0.02 * y);
+        let nl = 3;
+        let sigma = SigmaGrid::new(nl, UniformStretching);
+        let nn = ops.n_nodes;
+        let state = Solution3D::new(mesh.n_elements, nn, nl);
+        let unknowns: Vec<(usize, usize)> = (0..2)
+            .flat_map(|c| (0..state.u.len()).map(move |j| (c, j)))
+            .collect();
+        let n = unknowns.len();
+        let mut scratch = ViscosityScratch3D::new(mesh.n_elements, &ops);
+        let mut matrix = faer::Mat::<f64>::zeros(n, n);
+        let mut column = state.clone();
+        let (mut rhs_u, mut rhs_v) = (vec![0.0; state.u.len()], vec![0.0; state.u.len()]);
+        for (j, &(c, at)) in unknowns.iter().enumerate() {
+            column.u.fill(0.0);
+            column.v.fill(0.0);
+            if c == 0 {
+                column.u[at] = 1.0;
+            } else {
+                column.v[at] = 1.0;
+            }
+            rhs_u.fill(0.0);
+            rhs_v.fill(0.0);
+            apply_horizontal_viscosity_3d(
+                &mut rhs_u,
+                &mut rhs_v,
+                &column,
+                HorizontalViscosity3D::constant(nu),
+                &mesh,
+                &ops,
+                &geom,
+                &bathymetry,
+                &sigma,
+                boundaries,
+                0.1,
+                &mut scratch,
+            );
+            for (i, &(ci, row)) in unknowns.iter().enumerate() {
+                matrix[(i, j)] = if ci == 0 { rhs_u[row] } else { rhs_v[row] };
+            }
+        }
+        matrix
+            .eigenvalues()
+            .expect("eigenvalues")
+            .iter()
+            .map(|e| e.re)
+            .fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// Regression (TODO P1.3): the viscosity is dissipative next to walls
+    /// and open faces on distorted elements. Each boundary's flux matches
+    /// the exterior state of the gradient: at a wall, which mirrors the
+    /// velocity, only the normal stress; at an open face, which extrapolates
+    /// it, none. With the interior flux at every boundary (before) the
+    /// operator had eigenvalues with positive real parts, and ν = 10 m²/s
+    /// blew up at a coastline corner of the Frøya mesh with an e-folding of
+    /// 1.5 min, at any time step.
+    #[test]
+    fn shear_viscosity_is_dissipative_at_walls_and_open_faces() {
+        let nu = 10.0;
+        // The operator's scale: ν/Δx² over ≈ 50 m nodes
+        let scale = nu / 50.0_f64.powi(2);
+        for (name, boundaries) in [
+            ("walls", Boundaries3D::default()),
+            ("open", Boundaries3D::with_walls([])),
+        ] {
+            let boundaries = Boundaries3D {
+                untagged_are_walls: name == "walls",
+                ..boundaries
+            };
+            let rate = largest_growth_rate(&boundaries, nu);
+            println!("{name}: largest real part {rate:.3e} /s");
+            assert!(
+                rate < 1e-10 * scale,
+                "{name}: an eigenvalue with real part {rate:.3e} /s (scale {scale:.1e})"
             );
         }
     }

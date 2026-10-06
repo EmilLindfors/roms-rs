@@ -233,6 +233,24 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> ViscousTerm<'a, 'c, BC> {
                     (coeff * gv.dx, coeff * gv.dy),
                 ]
             },
+            // The fluxes that match the gradients' exterior states (see
+            // `br1_diffusion_element`): a wall mirrors the velocity, so it
+            // passes the normal stress only; other boundaries prescribe an
+            // exterior state and take the interior flux
+            |k, face, _fi, (nx, ny), [fu, fv]| {
+                let tag = self.mesh.boundary_tag(k, face);
+                let wall = self
+                    .config
+                    .bc
+                    .is_wall(tag)
+                    .unwrap_or(matches!(tag, None | Some(crate::mesh::BoundaryTag::Wall)));
+                if wall {
+                    let normal = nx * fu + ny * fv;
+                    [nx * normal, ny * normal]
+                } else {
+                    [fu, fv]
+                }
+            },
             diffusion,
             [diff_u, diff_v],
         );

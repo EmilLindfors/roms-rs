@@ -14,7 +14,7 @@
 use faer::Mat;
 use faer::linalg::solvers::Solve;
 
-use crate::mesh::Mesh2D;
+use crate::mesh::{BoundaryTag, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::polynomial::{gauss_legendre_nodes_weights, legendre, mode_degrees};
 use crate::types::ElementIndex;
@@ -161,6 +161,50 @@ impl NodeGraph {
         depth
     }
 
+    /// Every pair of distinct global nodes of one element, each pair once.
+    fn element_pairs(&self, n_elements: usize, n_nodes: usize) -> Vec<[usize; 2]> {
+        let mut pairs = Vec::with_capacity(n_elements * n_nodes * (n_nodes - 1) / 2);
+        for k in 0..n_elements {
+            let nodes = &self.global[k * n_nodes..(k + 1) * n_nodes];
+            for (i, &p) in nodes.iter().enumerate() {
+                for &q in &nodes[i + 1..] {
+                    if p != q {
+                        pairs.push([p.min(q), p.max(q)]);
+                    }
+                }
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
+
+    /// Every element's excess over `bound` (m), from the global nodes'
+    /// `depth`: its deepest node beside its shallowest, over the nodes at
+    /// least `min_depth` deep (zero with fewer than two of them).
+    fn element_excess<'a>(
+        &'a self,
+        n_nodes: usize,
+        depth: &'a [f64],
+        bound: ElementSlopeBound,
+        min_depth: f64,
+    ) -> impl Iterator<Item = f64> + 'a {
+        self.global.chunks(n_nodes).map(move |nodes| {
+            let (shallow, deep) = nodes
+                .iter()
+                .map(|&g| depth[g])
+                .filter(|&d| d >= min_depth)
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(s, d), h| {
+                    (s.min(h), d.max(h))
+                });
+            if shallow.is_finite() {
+                bound.excess(shallow, deep)
+            } else {
+                0.0
+            }
+        })
+    }
+
     /// A node of every global node (`k·n_nodes + i`).
     fn representatives(&self) -> Vec<usize> {
         let mut node = vec![usize::MAX; self.area.len()];
@@ -197,6 +241,115 @@ pub struct Rx0Smoothing {
     /// Largest change of the bed (m)
     pub max_change: f64,
     /// Sweeps over the constrained pairs
+    pub sweeps: usize,
+}
+
+/// What [`Bathymetry2D::lower_wall_land`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WallLandLowering {
+    /// Elements whose wall nodes were lowered
+    pub elements: usize,
+    /// Global nodes (sets of coincident nodes) whose bed changed
+    pub changed: usize,
+    /// Largest change of the bed (m)
+    pub max_change: f64,
+    /// Still water added below `level`, `Σ w J ΔB` over the changed nodes (m³)
+    pub volume: f64,
+}
+
+/// How much the still-water depth may change within one element for the 3D
+/// model's stratified rest state to be stable
+/// ([`Bathymetry2D::smooth_element_slopes`]).
+///
+/// Within an element the deepest node may be at most `max(free_depth,
+/// R·h_s)` deep beside its shallowest node `h_s`, with
+/// `R = (1 + r_max)/(1 − r_max)`: a slope factor r_x0 ≤ `r_max` between
+/// any two nodes of the element, except that water shallower than
+/// `free_depth` is never constrained.
+///
+/// # Why
+///
+/// The σ-pairs pressure gradient and the split-form advection keep a
+/// stratified fluid at rest stable while no σ-level crosses the pycnocline
+/// between two nodes of one element (TODO P1.3; the analysis is in
+/// `docs/stratified-rest-over-steep-beds.md`). Calibrated on x–z slices
+/// (1 km P2 elements, 20 levels, the bed stepping inside one element) under a
+/// 2 kg/m³ pycnocline between 11 and 19 m: steps from 60, 100 and 150 m
+/// hold at a depth ratio of 1.5 (r_x0 = 0.2) and grow at 1.67–2.3
+/// (e-folding 27 h down to 3 h); from 30 m, 45 m holds and 55 m grows
+/// (10 h). In shallow water the depth ratio does not matter: steps from
+/// 0.5–5 m of water to 21–40 m hold, to 60 m grow (2 h). The slices allowed a
+/// free depth of 1.5 times the pycnocline's bottom, but in 2D shallow–deep
+/// pairs below it grew (the Frøya coastline mesh: 2.6 m beside 28.5 m inside
+/// one element, e-folding 43 min), so [`Self::for_pycnocline`] takes the
+/// pycnocline's bottom itself. Steps to land need no bound: a thin
+/// column exchanges no baroclinic transport, and its element moves the
+/// layers on the 2D wet/dry kernel's subcells (land beside 300 m holds at
+/// 1e-10 m/s for a day once the wet pairs are smoothed; see
+/// [`Bathymetry2D::smooth_element_slopes`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ElementSlopeBound {
+    /// Largest slope factor r_x0 between two nodes of one element whose
+    /// deeper node is deeper than `free_depth` (ROMS practice is 0.2 between
+    /// neighbours; 0.15 within an element, see [`Self::for_pycnocline`]).
+    pub r_max: f64,
+    /// Depth (m, positive) above which the element's depth range is free.
+    pub free_depth: f64,
+}
+
+impl ElementSlopeBound {
+    /// The calibrated bound for a pycnocline whose bottom is `bottom` m
+    /// deep: r_x0 ≤ 0.15 and a free depth of `bottom`.
+    ///
+    /// The x–z slices hold at r_x0 0.2, but on the Frøya coastline mesh an
+    /// element at that bound (33.6 m nodes and one 50.4 m corner) grew with
+    /// an e-folding of 36 min; at 0.15 a patch around it holds round-off for
+    /// 12 h. With a free depth of 1.5 × `bottom` (28.5 m), shallow–deep pairs
+    /// below it grew (e-folding 43 min). At `bottom` the full coastline mesh
+    /// at rest holds 8.4e-9 m/s for 11.7 h with constant mixing, with the
+    /// 3D model's vertical reference (`Hydrostatic3D::with_vertical_reference`),
+    /// and levels off at 2.8e-3 m/s with GLS (TODO P1.3). The 2D tide at
+    /// Mausund on that bed: centred RMSE 2.8 cm against the gauge's
+    /// prediction, 4.0 cm against the observations.
+    pub fn for_pycnocline(bottom: f64) -> Self {
+        Self {
+            r_max: 0.15,
+            free_depth: bottom,
+        }
+    }
+
+    /// Depth ratio `R = (1 + r_max)/(1 − r_max)` of the slope factor bound.
+    fn ratio(&self) -> f64 {
+        (1.0 + self.r_max) / (1.0 - self.r_max)
+    }
+
+    /// The deepest depth allowed in an element whose shallowest node is
+    /// `shallow` m deep (zero or less on land).
+    pub fn deepest_beside(&self, shallow: f64) -> f64 {
+        self.free_depth.max(self.ratio() * shallow)
+    }
+
+    /// How much deeper than allowed `deep` is beside `shallow` (m, zero
+    /// when within the bound).
+    pub fn excess(&self, shallow: f64, deep: f64) -> f64 {
+        (deep - self.deepest_beside(shallow)).max(0.0)
+    }
+}
+
+/// What [`Bathymetry2D::smooth_element_slopes`] did.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ElementSlopeSmoothing {
+    /// Elements over the bound before and after
+    pub elements_before: usize,
+    pub elements_after: usize,
+    /// Largest excess depth before and after (m)
+    pub excess_before: f64,
+    pub excess_after: f64,
+    /// Global nodes (sets of coincident nodes) whose bed changed
+    pub changed: usize,
+    /// Largest change of the bed (m)
+    pub max_change: f64,
+    /// Sweeps over the element pairs
     pub sweeps: usize,
 }
 
@@ -577,6 +730,125 @@ impl Bathymetry2D {
         raised
     }
 
+    /// Lower the land at the walls of elements that are otherwise water: in
+    /// every element with a [`BoundaryTag::Wall`] face whose nodes off its
+    /// walls are all below `level`, a wall node at or above `level` takes
+    /// the bed of its inward neighbour across the wall (or, where that is a
+    /// wall node too, the element's shallowest node off its walls).
+    /// Coincident nodes move together, to the shallowest such value over the
+    /// elements that lower them; the gradients are recomputed.
+    ///
+    /// A coastline-fitted mesh puts its walls on the coast, but the coast it
+    /// fits is simplified to the element size, so the bed at the walls is
+    /// the elevation model's on either side of the real coastline: on the
+    /// Frøya mesh (`data/froya_coast.msh`, ≈ 100 m faces) two thirds of the
+    /// wall nodes are land, by 2 m in the median. An element of water whose
+    /// wall nodes stand on such land is partly dry at every water level
+    /// (1016 of its 12,101 elements at mean sea level): it carries the
+    /// `WetDry` subcells, the steep dry–wet pair that sets the shoreline
+    /// time step, and no baroclinic pressure in 3D, for a strip of land a
+    /// fraction of a node spacing wide that the mesh puts outside its coast
+    /// anyway. Lowered, the wall stands in the water in front of it.
+    ///
+    /// Take `level` below the lowest water: an element that dries off its
+    /// walls at low tide gains nothing, and lowering its wall only widens a
+    /// flat (at 0 m on the Mausund mesh, +3–4 m wall nodes of a sound
+    /// 0.2–3 m deep went to −0.5 m, and its current rose from 2.4 to
+    /// 3.0 m/s). Elements with nodes off their walls at or above `level` are
+    /// shores the mesh resolves and are left alone: a node shared with one
+    /// stays unless that element is below `level` everywhere else, so a
+    /// lowered corner never stands as a lone deep node in a shore. The
+    /// lowered nodes only join water their element already connects, so no
+    /// sound opens.
+    pub fn lower_wall_land(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        level: f64,
+    ) -> WallLandLowering {
+        let (n, n_1d) = (self.n_nodes, ops.n_1d);
+        let mut on_wall = vec![false; self.data.len()];
+        let mut wall_faces: Vec<Vec<usize>> = vec![Vec::new(); mesh.n_elements];
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for face in 0..4 {
+                if mesh.boundary_tag(k, face) == Some(BoundaryTag::Wall) {
+                    wall_faces[k.as_usize()].push(face);
+                    for &i in &ops.face_nodes[face] {
+                        on_wall[k.as_usize() * n + i] = true;
+                    }
+                }
+            }
+        }
+        // One step into the element from a node of each face
+        let inward = [n_1d as isize, -1, -(n_1d as isize), 1];
+        let group = coincident_nodes(mesh, ops);
+        let mut target = vec![f64::NEG_INFINITY; self.data.len()];
+        let mut qualifies = vec![false; mesh.n_elements];
+        for (k, faces) in wall_faces.iter().enumerate() {
+            let bed = &self.data[k * n..][..n];
+            let shallowest = (0..n)
+                .filter(|&i| !on_wall[k * n + i])
+                .map(|i| bed[i])
+                .fold(f64::NEG_INFINITY, f64::max);
+            let land = faces
+                .iter()
+                .any(|&f| ops.face_nodes[f].iter().any(|&i| bed[i] >= level));
+            if !(land && shallowest.is_finite() && shallowest < level) {
+                continue;
+            }
+            qualifies[k] = true;
+            for &f in faces {
+                for &i in &ops.face_nodes[f] {
+                    if bed[i] < level {
+                        continue;
+                    }
+                    let j = i.checked_add_signed(inward[f]).expect("inward node");
+                    let value = if on_wall[k * n + j] {
+                        shallowest
+                    } else {
+                        bed[j]
+                    };
+                    let g = group[k * n + i];
+                    target[g] = target[g].max(value);
+                }
+            }
+        }
+        // A node shared with a shore the mesh resolves stays
+        let mut accepted = vec![true; self.data.len()];
+        for node in 0..self.data.len() {
+            let (g, k) = (group[node], node / n);
+            if target[g].is_finite() && !qualifies[k] {
+                let dry = (0..n).any(|i| group[k * n + i] != g && self.data[k * n + i] >= level);
+                if dry {
+                    accepted[g] = false;
+                }
+            }
+        }
+        let mut report = WallLandLowering::default();
+        let mut changed = vec![false; self.data.len()];
+        let mut lowered = vec![false; mesh.n_elements];
+        for node in 0..self.data.len() {
+            let g = group[node];
+            let (old, new) = (self.data[node], target[g]);
+            if new.is_finite() && accepted[g] && old > new {
+                report.max_change = report.max_change.max(old - new);
+                report.volume += geom.mass[node] * ((-new).max(0.0) - (-old).max(0.0));
+                self.data[node] = new;
+                lowered[node / n] |= qualifies[node / n];
+                if !changed[g] {
+                    changed[g] = true;
+                    report.changed += 1;
+                }
+            }
+        }
+        report.elements = lowered.iter().filter(|&&l| l).count();
+        if report.changed > 0 {
+            self.compute_gradients(ops, geom);
+        }
+        report
+    }
+
     /// The largest slope factor r_x0 = |h₁ − h₂| / (h₁ + h₂) between
     /// neighbouring nodes along the elements' grid lines, over the pairs
     /// whose still-water depths h = −B are both at least `min_depth`, or
@@ -704,6 +976,138 @@ impl Bathymetry2D {
         Rx0Smoothing {
             before,
             after: largest(&depth),
+            changed,
+            max_change,
+            sweeps,
+        }
+    }
+
+    /// How much deeper than `bound` allows each element's deepest node is
+    /// beside its shallowest (m, zero within the bound), over the nodes at
+    /// least `min_depth` deep, from the still-water depths h = −B (coincident
+    /// nodes count with their mass-weighted mean, as
+    /// [`Self::smooth_element_slopes`] sees them).
+    pub fn element_slope_excess(
+        &self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bound: ElementSlopeBound,
+        min_depth: f64,
+    ) -> Vec<f64> {
+        let graph = NodeGraph::new(mesh, ops, geom);
+        let depth = graph.depths(&self.data, geom);
+        graph
+            .element_excess(ops.n_nodes, &depth, bound, min_depth)
+            .collect()
+    }
+
+    /// Smooth the bed until every element is within `bound`
+    /// ([`ElementSlopeBound`]: the deepest node at most `max(free_depth,
+    /// R·h_s)` beside the shallowest `h_s`) over its nodes at least
+    /// `min_depth` deep, keeping the volume `Σ w J B`, and recompute the
+    /// gradients.
+    ///
+    /// For the 3D model: a σ-level that crosses the pycnocline between two
+    /// nodes of one element makes the stratified rest state unstable (TODO
+    /// P1.3). Every pair of nodes of an element over the bound, deeper `h_d`
+    /// and shallower `h_s` with node masses `A_d`, `A_s`, moves the least
+    /// volume from the shallow node's water column to the deep one's that
+    /// brings it within the bound (as [`Self::smooth_rx0`]'s "PlusMinus"):
+    /// the smaller of `(h_d − free_depth) A_d` (the deep node at the free
+    /// depth) and `(h_d − R h_s)/(1/A_d + R/A_s)` (the pair at the ratio).
+    /// Sweeps run until the largest excess is within 1e-6 of the free depth
+    /// (at most [`Self::MAX_RX0_SWEEPS`]).
+    ///
+    /// Pairs with a node shallower than `min_depth` are left alone, and those
+    /// nodes never move, so the coastline stays. For the 3D model take its
+    /// thin-column depth (`Hydrostatic3D::min_column_depth`): a thin column
+    /// exchanges no baroclinic transport, and an element with one moves its
+    /// layers on the 2D wet/dry kernel's subcells, which keep a stratified
+    /// shore at rest without bounding its slope. Coincident nodes move
+    /// together; no node crosses `min_depth` (the shallower node of a pair
+    /// only deepens, the deeper one stays below the free depth).
+    ///
+    /// # Panics
+    /// If `bound.r_max` is not in (0, 1), or `min_depth` is not positive and
+    /// below `bound.free_depth`.
+    pub fn smooth_element_slopes(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        bound: ElementSlopeBound,
+        min_depth: f64,
+    ) -> ElementSlopeSmoothing {
+        assert!(
+            bound.r_max > 0.0 && bound.r_max < 1.0,
+            "r_max must lie in (0, 1), got {}",
+            bound.r_max
+        );
+        assert!(
+            min_depth > 0.0 && min_depth < bound.free_depth,
+            "min_depth must lie in (0, free_depth = {}), got {min_depth}",
+            bound.free_depth
+        );
+        let graph = NodeGraph::new(mesh, ops, geom);
+        let original = graph.depths(&self.data, geom);
+        let mut depth = original.clone();
+        let pairs: Vec<[usize; 2]> = graph
+            .element_pairs(mesh.n_elements, ops.n_nodes)
+            .into_iter()
+            .filter(|&[a, b]| depth[a] >= min_depth && depth[b] >= min_depth)
+            .collect();
+        let ordered = |depth: &[f64], [a, b]: [usize; 2]| {
+            if depth[a] >= depth[b] { (a, b) } else { (b, a) }
+        };
+        let tolerance = 1e-6 * bound.free_depth;
+        // Elements over the bound (beyond round-off) and the largest excess
+        let survey = |depth: &[f64]| {
+            graph
+                .element_excess(ops.n_nodes, depth, bound, min_depth)
+                .fold((0, 0.0_f64), |(n, largest), e| {
+                    (n + usize::from(e > tolerance), largest.max(e))
+                })
+        };
+        let (elements_before, excess_before) = survey(&depth);
+        let area = &graph.area;
+        let ratio = bound.ratio();
+        let mut sweeps = 0;
+        while sweeps < Self::MAX_RX0_SWEEPS && survey(&depth).1 > tolerance {
+            for &pair in &pairs {
+                let (d, s) = ordered(&depth, pair);
+                if bound.excess(depth[s], depth[d]) <= tolerance {
+                    continue;
+                }
+                let to_free_depth = (depth[d] - bound.free_depth) * area[d];
+                let to_ratio = (depth[d] - ratio * depth[s]) / (1.0 / area[d] + ratio / area[s]);
+                let volume = to_free_depth.min(to_ratio);
+                depth[d] -= volume / area[d];
+                depth[s] += volume / area[s];
+            }
+            sweeps += 1;
+        }
+        let (elements_after, excess_after) = survey(&depth);
+
+        let mut changed = 0;
+        let mut max_change: f64 = 0.0;
+        for (&new, &old) in depth.iter().zip(&original) {
+            if new != old {
+                changed += 1;
+                max_change = max_change.max((new - old).abs());
+            }
+        }
+        if changed > 0 {
+            for (b, &g) in self.data.iter_mut().zip(&graph.global) {
+                *b -= depth[g] - original[g];
+            }
+            self.compute_gradients(ops, geom);
+        }
+        ElementSlopeSmoothing {
+            elements_before,
+            elements_after,
+            excess_before,
+            excess_after,
             changed,
             max_change,
             sweeps,
@@ -1566,6 +1970,97 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_wall_land() {
+        // 3 × 2 unit squares, P2, walls on the west, north and east, open to
+        // the south. Water deepening eastward, land (+3 m) along the north
+        // wall and the open south side, and a dry node inside the north-east
+        // element: a shore the mesh resolves
+        let mut mesh =
+            Mesh2D::uniform_rectangle_with_bc(0.0, 3.0, 0.0, 2.0, 3, 2, BoundaryTag::Wall);
+        for e in 0..mesh.edges.len() {
+            let edge = &mesh.edges[e];
+            if edge.right.is_none() {
+                let (k, face) = (ElementIndex::new(edge.left.element), edge.left.face);
+                let (r, s) = [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)][face];
+                let [_, y] = mesh.reference_to_physical(k, r, s);
+                if y < 1e-9 {
+                    mesh.edges[e].boundary_tag = Some(BoundaryTag::Open);
+                }
+            }
+        }
+        let (mesh, ops, geom) = setup(mesh, 2);
+        let at = |x: f64, y: f64, p: [f64; 2]| (x - p[0]).abs() < 1e-9 && (y - p[1]).abs() < 1e-9;
+        let water = |x: f64, y: f64| -10.0 + y - x;
+        let bed = |x: f64, y: f64| {
+            if y > 2.0 - 1e-9 || y < 1e-9 || at(x, y, [2.5, 1.5]) {
+                3.0
+            } else {
+                water(x, y)
+            }
+        };
+        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+
+        // Below a lowest water of −12 m the north row is a flat: it stays
+        let mut flat = bathy.clone();
+        assert_eq!(flat.lower_wall_land(&mesh, &ops, &geom, -12.0).changed, 0);
+        assert_eq!(flat.data, bathy.data);
+
+        let report = bathy.lower_wall_land(&mesh, &ops, &geom, 0.0);
+
+        // North-west: the corner's inward neighbours are wall nodes, so it
+        // takes the element's shallowest node off the walls, (0.5, 1.5);
+        // the other north nodes take the node below them; (1, 2) and (2, 2)
+        // take the shallower of their two elements' (the same node). The
+        // north-east element is a shore and keeps its land, and its corner
+        // (2, 2) with it, though the north-middle element would lower it. The
+        // open side is not a wall
+        let expected = |x: f64, y: f64| {
+            if y > 2.0 - 1e-9 && x < 2.0 - 1e-9 {
+                if x < 1e-9 {
+                    water(0.5, 1.5)
+                } else {
+                    water(x, 1.5)
+                }
+            } else {
+                bed(x, y)
+            }
+        };
+        for e in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                assert_eq!(bathy.get(e, i), expected(x, y), "({x}, {y})");
+            }
+        }
+        assert_eq!(report.elements, 2);
+        assert_eq!(report.changed, 4);
+        assert_eq!(report.max_change, 3.0 - water(1.5, 1.5));
+        let reference = Bathymetry2D::from_function(&mesh, &ops, &geom, expected);
+        let added: f64 = (0..bathy.data.len())
+            .map(|m| {
+                geom.mass[m] * (reference.data[m].min(0.0) - bed_at(&mesh, &ops, m, bed).min(0.0))
+            })
+            .sum::<f64>()
+            .abs();
+        assert!(
+            (report.volume - added).abs() < 1e-12 * added,
+            "{} {added}",
+            report.volume
+        );
+        assert_eq!(bathy.gradient_x, reference.gradient_x);
+        assert_eq!(bathy.gradient_y, reference.gradient_y);
+
+        // Nothing left: the north-east element is a resolved shore
+        assert_eq!(bathy.lower_wall_land(&mesh, &ops, &geom, 0.0).changed, 0);
+    }
+
+    /// `f` at node `m` (`k·n_nodes + i`).
+    fn bed_at(mesh: &Mesh2D, ops: &DGOperators2D, m: usize, f: impl Fn(f64, f64) -> f64) -> f64 {
+        let (k, i) = (ElementIndex::new(m / ops.n_nodes), m % ops.n_nodes);
+        let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+        f(x, y)
+    }
+
+    #[test]
     fn test_select_elements_follows_retain_elements() {
         let (mesh, ops, geom) = setup(distorted_mesh(3), 2);
         let bed = |x: f64, y: f64| x - 0.5 + 0.1 * y;
@@ -1628,6 +2123,88 @@ mod tests {
 
     fn volume(bathy: &Bathymetry2D, geom: &GeometricFactors2D) -> f64 {
         bathy.data.iter().zip(&geom.mass).map(|(b, m)| b * m).sum()
+    }
+
+    #[test]
+    fn test_element_slope_bound() {
+        let bound = ElementSlopeBound::for_pycnocline(19.0);
+        assert_eq!(bound.free_depth, 19.0);
+        // Shallow water and land: free down to the pycnocline's bottom
+        for shallow in [-3.0, 0.0, 5.0, 14.0] {
+            assert_eq!(bound.deepest_beside(shallow), 19.0);
+        }
+        // Deeper: r_x0 = 0.15, a depth ratio of 1.15/0.85
+        let ratio = 1.15 / 0.85;
+        assert!((bound.deepest_beside(30.0) - 30.0 * ratio).abs() < 1e-12);
+        assert!((bound.excess(30.0, 50.0) - (50.0 - 30.0 * ratio)).abs() < 1e-12);
+        assert_eq!(bound.excess(30.0, 40.0), 0.0);
+        assert_eq!(bound.excess(0.0, 18.0), 0.0);
+        assert!((bound.excess(0.0, 40.0) - 21.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_smooth_element_slopes_bounds_every_element_and_keeps_the_volume_and_the_shore() {
+        let bound = ElementSlopeBound::for_pycnocline(19.0);
+        let min_depth = 3.0;
+        for order in 1..=3 {
+            let (mesh, ops, geom, mut bathy) = shoal_bed(order);
+            let original = bathy.clone();
+            let excess = bathy.element_slope_excess(&mesh, &ops, &geom, bound, min_depth);
+            let report = bathy.smooth_element_slopes(&mesh, &ops, &geom, bound, min_depth);
+            let tolerance = 1e-6 * bound.free_depth;
+            assert_eq!(
+                report.elements_before,
+                excess.iter().filter(|&&e| e > tolerance).count()
+            );
+            assert_eq!(
+                report.excess_before,
+                excess.iter().copied().fold(0.0, f64::max)
+            );
+            // The shoal (6 m among 40 m); the shore (1 m beside 40 m) is
+            // left to the wetting and drying
+            assert!(report.elements_before >= 4, "N = {order}: {report:?}");
+            assert!(report.excess_before > 5.0, "N = {order}: {report:?}");
+            let after = bathy.element_slope_excess(&mesh, &ops, &geom, bound, min_depth);
+            let largest = after.iter().copied().fold(0.0, f64::max);
+            assert!(largest <= tolerance, "N = {order}: {largest}");
+            assert!((largest - report.excess_after).abs() < 1e-12);
+            assert_eq!(report.elements_after, 0, "N = {order}: {report:?}");
+            // The shore never moves, and no node crosses `min_depth`
+            for (node, (&b, &b0)) in bathy.data.iter().zip(&original.data).enumerate() {
+                if b0 > -min_depth {
+                    assert_eq!(b, b0, "N = {order}: node {node}");
+                } else {
+                    assert!(-b >= min_depth, "N = {order}: node {node} {b0} → {b}");
+                }
+            }
+            // The volume is kept, the bed stays continuous
+            let (v0, v1) = (volume(&original, &geom), volume(&bathy, &geom));
+            assert!(
+                (v1 - v0).abs() < 1e-13 * v0.abs(),
+                "N = {order}: {v0} vs {v1}"
+            );
+            assert_continuous(&bathy, &mesh, &ops, order);
+            let mut fresh = bathy.clone();
+            fresh.compute_gradients(&ops, &geom);
+            assert_eq!(fresh.gradient_x, bathy.gradient_x);
+            // A second pass has nothing to do
+            let again = bathy.smooth_element_slopes(&mesh, &ops, &geom, bound, min_depth);
+            assert_eq!(again.elements_before, 0, "N = {order}: {again:?}");
+            assert_eq!(again.changed, 0, "N = {order}: {again:?}");
+        }
+    }
+
+    #[test]
+    fn test_smooth_element_slopes_leaves_a_bed_within_the_bound_alone() {
+        // 20 → 28 m over 4 elements: within the depth ratio everywhere
+        let bound = ElementSlopeBound::for_pycnocline(19.0);
+        let (mesh, ops, geom) = setup(distorted_mesh(4), 2);
+        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| -20.0 - 8.0 * x);
+        let original = bathy.clone();
+        let report = bathy.smooth_element_slopes(&mesh, &ops, &geom, bound, 3.0);
+        assert_eq!(report.elements_before, 0);
+        assert_eq!(report.changed, 0);
+        assert_eq!(bathy.data, original.data);
     }
 
     #[test]

@@ -11,9 +11,13 @@
 # Resolution: the service has two levels. At cells of about 42 m and coarser it
 # serves the 50 m model, land and sea interpolated together. Finer requests
 # get the 1 m level, which has depths only inside surveyed projects and the
-# flat water surface (0) elsewhere, so this script refuses cells < 50 m
-# (measured 2026-09-26: square cells of 40 m get the 1 m level, 42 m the 50 m
-# model).
+# flat water surface (0) elsewhere (measured 2026-09-26: square cells of 40 m
+# get the 1 m level, 42 m the 50 m model). So cells of 50 m and up give the
+# 50 m model, for the solver; cells of 40 m and below give the 1 m level, with a
+# warning: it is land detail for the viewer, layered over the 50 m model
+# (`dg-viz --terrain coarse.tif,fine.tif`), not a bed (`froya_real_data` rejects
+# it). Around the Kattholmen farm it is 17 % lidar land and 83 % flat 0.
+# Cells between 40 and 50 m are refused: which level they get is not known.
 # One request is at most 3840 x 2160 pixels.
 #
 # Vertical datum: land heights are NN2000 (within 2-24 cm of mean sea level
@@ -24,13 +28,15 @@
 # Usage:
 #   ./scripts/kartverket_topobathy.sh <min_lon> <min_lat> <max_lon> <max_lat> [cell_m=50] [out]
 #
-# Example (the Frøya-Smøla-Hitra domain at about 50 m, 1 request):
+# Examples (the Frøya-Smøla-Hitra domain at about 50 m, 1 request; the land
+# around the Kattholmen farm at 2 m, 1500 x 1350 pixels):
 #   ./scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif
+#   ./scripts/kartverket_topobathy.sh 8.648 63.8575 8.710 63.8845 2 data/kattholmen_topobathy_2m.tif
 
 set -euo pipefail
 
 if [ $# -lt 4 ]; then
-    sed -n '2,29p' "$0"
+    sed -n '2,35p' "$0"
     exit 1
 fi
 
@@ -44,7 +50,8 @@ OUT="${6:-data/topobathy_${MIN_LON}_${MIN_LAT}_${MAX_LON}_${MAX_LAT}.tif}"
 # Width and height in pixels for square-ish cells of CELL metres at the
 # central latitude, and a check against the service limits
 read -r WIDTH HEIGHT < <(awk -v a="$MIN_LON" -v b="$MIN_LAT" -v c="$MAX_LON" -v d="$MAX_LAT" -v cell="$CELL" 'BEGIN {
-    if (cell < 50) { print "cell must be >= 50 m: finer requests (below ~42 m) return the 1 m level, flat 0 over unsurveyed sea" > "/dev/stderr"; exit 1 }
+    if (cell > 40 && cell < 50) { print "cells between 40 and 50 m may get either level: use >= 50 m (the 50 m model) or <= 40 m (the 1 m level)" > "/dev/stderr"; exit 1 }
+    if (cell <= 40) { print "cells <= 40 m get the 1 m level: lidar land and surveyed depths, a flat 0 over unsurveyed sea (land detail for the viewer, not a bed)" > "/dev/stderr" }
     pi = atan2(0, -1); lat = (b + d) / 2 * pi / 180
     w = int((c - a) * 111320 * cos(lat) / cell + 0.5); h = int((d - b) * 111320 / cell + 0.5)
     if (w < 1 || h < 1) { print "empty box" > "/dev/stderr"; exit 1 }

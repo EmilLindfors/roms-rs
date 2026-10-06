@@ -90,6 +90,7 @@ use crate::flux::{
 };
 use crate::mesh::Mesh2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
+use crate::solver::rhs::subcells::{subcell_slot, telescoped_interfaces};
 use crate::solver::{SWESolution2D, SWEState2D};
 use crate::source::HydrostaticReconstruction2D;
 use crate::types::ElementIndex;
@@ -398,7 +399,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// (`[h, hu, hv]`, `n_nodes` values each), with interior-face fluxes from
     /// `faces` (filled by [`Self::edge_fluxes`]). Source terms are not
     /// included. `face_mass`, if given, receives the mass component of `F*` at
-    /// every face node (outward normal, `face · n_face_nodes + fi`).
+    /// every face node (outward normal, `face · n_face_nodes + fi`), and
+    /// `subcell_mass`, if given, the mass flux through every subcell interface
+    /// ([`crate::solver::rhs::subcells`]), or NaN in all of them if the element
+    /// takes the flux-differencing volume term.
     pub(super) fn element_rhs(
         &self,
         k: ElementIndex,
@@ -406,6 +410,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         faces: &[SWEState2D],
         out: [&mut [f64]; 3],
         mut face_mass: Option<&mut [f64]>,
+        mut subcell_mass: Option<&mut [f64]>,
     ) {
         let ops = self.ops;
         let n1 = ops.n_1d;
@@ -428,6 +433,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             .is_some_and(|(depth, _)| ws.nodes.iter().any(|n| n.h < depth));
         if subcells {
             self.outer_nodes(k, ws);
+        } else if let Some(mass) = subcell_mass.as_deref_mut() {
+            mass.fill(f64::NAN);
         }
         // A parallelogram has a constant metric: take it from the dense
         // per-element geometry and skip the pair averages (the Cartesian
@@ -451,7 +458,11 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             }
             if subcells {
                 let ends = [ws.outer[3 * n1 + rev], ws.outer[n1 + fwd]];
-                self.line_subcells(ws, r_line, ends, affine, g);
+                let first = subcell_slot(n1, 0, line, 0);
+                let mass = subcell_mass
+                    .as_deref_mut()
+                    .map(|m| &mut m[first..first + n1 - 1]);
+                self.line_subcells(ws, r_line, ends, affine, g, mass);
             } else if affine {
                 self.line_volume::<true>(ws, r_line, affine_r, g);
             } else {
@@ -467,7 +478,11 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             }
             if subcells {
                 let ends = [ws.outer[fwd], ws.outer[2 * n1 + rev]];
-                self.line_subcells(ws, s_line, ends, affine, g);
+                let first = subcell_slot(n1, 1, line, 0);
+                let mass = subcell_mass
+                    .as_deref_mut()
+                    .map(|m| &mut m[first..first + n1 - 1]);
+                self.line_subcells(ws, s_line, ends, affine, g, mass);
             } else if affine {
                 self.line_volume::<true>(ws, s_line, affine_s, g);
             } else {
@@ -700,7 +715,12 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// [`SplitFormWorkspace::outer`]); an end subcell without one (physical
     /// boundary) keeps its node state. `affine`: the metric is constant (every
     /// interface metric is `Ja`).
+    ///
+    /// `mass`, if given (`n₁ − 1` values), receives the mass flux `F̂_h`
+    /// through each interface of the line, from node `a` to `a + 1`
+    /// ([`crate::solver::rhs::subcells`]).
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn line_subcells(
         &self,
         ws: &mut SplitFormWorkspace,
@@ -708,31 +728,16 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         ends: [Option<(SWENodeState2D, f64)>; 2],
         affine: bool,
         g: f64,
+        mut mass: Option<&mut [f64]>,
     ) {
         let n1 = self.ops.n_1d;
         let w = &self.ops.weights_1d;
         let xi = &self.ops.nodes_1d;
-        let d1 = &self.ops.dr_1d_row_major;
         // Subcells run only in the wet/dry formulation, which sets h_dry
         let h_dry = self.subcells.map_or(0.0, |(_, h_dry)| h_dry);
 
-        // Interface metrics, m_{a,a+1} = m_{a−1,a} + Σ_{c≠a} 2 w_a D_ac {{Ja}}_ac
-        // from zero (the telescoping sum of the flux-differencing term)
-        if affine {
-            ws.interfaces[..=n1].fill(ws.metric[0]);
-        } else {
-            ws.interfaces[0] = ws.metric[0];
-            let mut m = (0.0, 0.0);
-            for a in 0..n1 - 1 {
-                for c in (0..n1).filter(|&c| c != a) {
-                    let q2 = 2.0 * w[a] * d1[a * n1 + c];
-                    m.0 += q2 * 0.5 * (ws.metric[a].0 + ws.metric[c].0);
-                    m.1 += q2 * 0.5 * (ws.metric[a].1 + ws.metric[c].1);
-                }
-                ws.interfaces[a + 1] = m;
-            }
-            ws.interfaces[n1] = ws.metric[n1 - 1];
-        }
+        // Interface metrics (the telescoping sum of the flux-differencing term)
+        telescoped_interfaces(self.ops, &ws.metric, affine, &mut ws.interfaces);
 
         let (first, last) = (idx(0), idx(n1 - 1));
         let (q_first, q_last) = (ws.nodes[first], ws.nodes[last]);
@@ -772,6 +777,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             let (ia, ib) = (idx(a), idx(a + 1));
             let m = ws.interfaces[a + 1];
             let (f_a, f_b) = self.hydrostatic_hll(&ws.faces[a].1, &ws.faces[a + 1].0, m, g);
+            if let Some(mass) = mass.as_deref_mut() {
+                mass[a] = f_a.h;
+            }
             ws.rhs[ia] = ws.rhs[ia] - (1.0 / w[a]) * f_a;
             ws.rhs[ib] = ws.rhs[ib] + (1.0 / w[a + 1]) * f_b;
         }

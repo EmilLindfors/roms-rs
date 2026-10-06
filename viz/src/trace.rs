@@ -1,11 +1,13 @@
-//! A time series of the surface at the close-up point (top right; G hides it): the
+//! A time series of the surface at the point of interest (top right; G hides it): the
 //! model's η there over the whole run, the tide gauge's observations against it when
 //! `--gauge` gives them, and a marker at the shown time. Over a 15-day replay it shows
 //! the spring–neap cycle and where the model departs from the gauge.
 //!
 //! The model's η is sampled from every snapshot as it arrives, by the element
 //! polynomial ([`Probe`]), so the trace grows while the solver runs or the frames are
-//! read. A gauge often lies in a shoreline element, which the mesh may not resolve
+//! read. A snapshot file read on demand holds only the frames around the shown time:
+//! its reading thread samples every frame at the probe instead
+//! ([`crate::playback::Playback::series`]), so the trace has all of them. A gauge often lies in a shoreline element, which the mesh may not resolve
 //! (a perched pocket, or dry); as `examples/froya_real_data.rs` does, the trace then
 //! samples the nearest node of an element whose every node is at least
 //! [`MIN_DEPTH`] deep, and its title says how far away.
@@ -23,6 +25,7 @@ use dg_rs::types::ElementIndex;
 
 use crate::field::Probe;
 use crate::playback::Playback;
+use crate::plot::Canvas;
 use crate::scenario::Scenario;
 
 /// Depth (m) of every node of an element the trace may sample in.
@@ -49,28 +52,29 @@ pub struct Trace {
 }
 
 impl Trace {
-    /// η at the scenario's close-up point (or the nearest submerged node) over the
-    /// model times `span`, and the gauge's record `gauge` (Unix times, η) if any,
-    /// placed on `clock`.
+    /// η at `at` (m, mesh coordinates: the scenario's point of interest, or the
+    /// nearest submerged node) over the model times `span`, and the gauge's record
+    /// `gauge` (Unix times, η) if any, placed on `clock`.
     pub fn new(
         scenario: &Scenario,
         locator: &PointLocator2D,
+        at: [f64; 2],
         span: [f64; 2],
         gauge: Option<(String, Vec<(f64, f64)>)>,
         clock: Option<ModelClock>,
     ) -> Self {
-        let (point, offset, depth) = submerged_point(scenario, scenario.farm);
+        let (point, offset, depth) = submerged_point(scenario, at);
         let probe = Probe::at(locator, scenario, point);
         let gauge_name = gauge.as_ref().map(|(name, _)| name.clone());
         let gauge: Vec<(f64, f32)> = match (gauge, clock) {
             (Some((_, record)), Some(clock)) => record
                 .into_iter()
                 .map(|(unix, eta)| (clock.model_time(unix), eta as f32))
-                .filter(|&(t, eta)| t >= span[0] && t <= span[1] && eta.is_finite())
+                .filter(|&(t, eta)| t >= span[0] && eta.is_finite())
                 .collect(),
             _ => Vec::new(),
         };
-        let place = gauge_name.as_deref().unwrap_or("the close-up point");
+        let place = gauge_name.as_deref().unwrap_or("the point of interest");
         let mut title = if offset > 1.0 {
             format!("surface at {place} (m), sampled {offset:.0} m away in {depth:.1} m")
         } else {
@@ -89,6 +93,11 @@ impl Trace {
             title,
             dirty: true,
         }
+    }
+
+    /// Where the trace samples the model, if inside the mesh.
+    pub fn probe(&self) -> Option<&Probe> {
+        self.probe.as_ref()
     }
 }
 
@@ -253,6 +262,21 @@ fn spawn(mut commands: Commands, mut images: ResMut<Assets<Image>>) {
 
 /// Samples the snapshots that arrived since the last one sampled.
 fn sample(playback: Res<Playback>, mut trace: ResMut<Trace>) {
+    if playback.on_demand.is_some() {
+        if trace.model.len() < playback.series.len() {
+            let new = trace.model.len();
+            trace.model.extend_from_slice(&playback.series[new..]);
+            trace.dirty = true;
+        }
+        // A file a run is still writing: the plot grows with it
+        if let Some(newest) = playback.newest()
+            && newest > trace.span[1]
+        {
+            trace.span[1] = newest;
+            trace.dirty = true;
+        }
+        return;
+    }
     let Some(probe) = trace.probe.clone() else {
         return;
     };
@@ -282,39 +306,37 @@ fn draw(
     }
     *since = 0.0;
     trace.dirty = false;
+    // The gauge within the plot's span (a file still being written widens it)
+    let [t0, t1] = trace.span;
+    let gauge = &trace.gauge[..trace.gauge.partition_point(|g| g.0 <= t1)];
     let (lo, hi) = trace
         .model
         .iter()
-        .chain(&trace.gauge)
+        .chain(gauge)
         .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &(_, z)| {
             (lo.min(z), hi.max(z))
         });
     let (lo, hi) = if lo < hi { (lo, hi) } else { (-1.0, 1.0) };
     let pad = 0.08 * (hi - lo);
     let (lo, hi) = (lo - pad, hi + pad);
-    let [t0, t1] = trace.span;
     let to_px = |&(t, z): &(f64, f32)| {
         (
             ((t - t0) / (t1 - t0).max(1e-9)) as f32 * (WIDTH - 1) as f32,
             (hi - z) / (hi - lo) * (HEIGHT - 1) as f32,
         )
     };
-    let mut rgba = vec![0u8; 4 * WIDTH * HEIGHT];
+    let mut canvas = Canvas::new(WIDTH, HEIGHT);
     // Mean sea level
     if lo < 0.0 && hi > 0.0 {
         let y = (hi / (hi - lo) * (HEIGHT - 1) as f32) as usize;
-        for x in (0..WIDTH).step_by(6) {
-            for dx in 0..3 {
-                stamp(&mut rgba, x + dx, y, [150, 150, 150], 0.6);
-            }
-        }
+        canvas.dashed_row(y, [0, WIDTH], [150, 150, 150], 0.6);
     }
     // A break in a record (missing observations) is not drawn across
-    let gap = 3.0 * (t1 - t0) / trace.gauge.len().max(2) as f64;
-    polyline(&mut rgba, &trace.gauge, gap, &to_px, GAUGE, 4.0);
-    polyline(&mut rgba, &trace.model, f64::INFINITY, &to_px, MODEL, 1.5);
+    let gap = 3.0 * (t1 - t0) / gauge.len().max(2) as f64;
+    polyline(&mut canvas, gauge, gap, &to_px, GAUGE, 4.0);
+    polyline(&mut canvas, &trace.model, f64::INFINITY, &to_px, MODEL, 1.5);
     if let Some(mut image) = images.get_mut(&plot.0) {
-        image.data = Some(rgba);
+        image.data = Some(canvas.rgba);
     }
 
     let date = |t: f64| match &clock {
@@ -336,62 +358,25 @@ fn draw(
     }
 }
 
-/// Blend `colour` at `alpha` into pixel (x, y).
-fn stamp(rgba: &mut [u8], x: usize, y: usize, colour: [u8; 3], alpha: f32) {
-    if x >= WIDTH || y >= HEIGHT {
-        return;
-    }
-    let p = 4 * (y * WIDTH + x);
-    let a = rgba[p + 3] as f32 / 255.0;
-    let out = alpha + a * (1.0 - alpha);
-    for c in 0..3 {
-        let blended =
-            (colour[c] as f32 * alpha + rgba[p + c] as f32 * a * (1.0 - alpha)) / out.max(1e-6);
-        rgba[p + c] = blended.round() as u8;
-    }
-    rgba[p + 3] = (out * 255.0).round() as u8;
-}
-
 /// The series as straight segments `width` pixels wide, broken where samples are
 /// more than `gap` seconds apart.
 fn polyline(
-    rgba: &mut [u8],
+    canvas: &mut Canvas,
     series: &[(f64, f32)],
     gap: f64,
     to_px: &impl Fn(&(f64, f32)) -> (f32, f32),
     colour: [u8; 3],
     width: f32,
 ) {
-    let r = 0.5 * width;
-    let mut dot = |x: f32, y: f32| {
-        let (x0, x1) = ((x - r).floor() as i64, (x + r).ceil() as i64);
-        let (y0, y1) = ((y - r).floor() as i64, (y + r).ceil() as i64);
-        for py in y0.max(0)..=y1 {
-            for px in x0.max(0)..=x1 {
-                let d = ((px as f32 - x).powi(2) + (py as f32 - y).powi(2)).sqrt();
-                let alpha = (r + 0.5 - d).clamp(0.0, 1.0);
-                if alpha > 0.0 {
-                    stamp(rgba, px as usize, py as usize, colour, alpha);
-                }
-            }
-        }
-    };
     for pair in series.windows(2) {
         if pair[1].0 - pair[0].0 > gap {
             continue;
         }
-        let ((xa, ya), (xb, yb)) = (to_px(&pair[0]), to_px(&pair[1]));
-        let steps = ((xb - xa).abs().max((yb - ya).abs()) / (0.5 * r))
-            .ceil()
-            .max(1.0) as usize;
-        for s in 0..steps {
-            let f = s as f32 / steps as f32;
-            dot(xa + f * (xb - xa), ya + f * (yb - ya));
-        }
+        canvas.segment(to_px(&pair[0]), to_px(&pair[1]), colour, width);
     }
     if let Some(last) = series.last() {
         let (x, y) = to_px(last);
-        dot(x, y);
+        canvas.dot(x, y, colour, width);
     }
 }
 

@@ -8,7 +8,8 @@
 //!
 //! Lines are drawn as flat ribbons a few pixels wide: 1-pixel lines vanish under the
 //! translucent water at high resolution. The width follows the camera's distance, and
-//! the ribbons are rebuilt when it changes by a fifth. B (key) toggles them.
+//! the ribbons are rebuilt when it changes by a fifth. B (key) toggles them; the photo
+//! view ([`crate::photo`]) hides them.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::visibility::NoFrustumCulling;
@@ -17,6 +18,7 @@ use bevy::prelude::*;
 
 use crate::camera::OrbitCamera;
 use crate::field::{Frame, Nodes};
+use crate::photo::Photo;
 use crate::surface::nice_ceil;
 
 pub struct ContoursPlugin;
@@ -193,16 +195,18 @@ fn rebuild(
 
 fn toggle(
     keys: Res<ButtonInput<KeyCode>>,
+    photo: Res<Photo>,
     contours: Option<ResMut<Contours>>,
     mut lines: Query<&mut Visibility, With<ContourLines>>,
 ) {
     let Some(mut contours) = contours else { return };
-    if !keys.just_pressed(KeyCode::KeyB) {
+    if keys.just_pressed(KeyCode::KeyB) {
+        contours.on = !contours.on;
+    } else if !photo.is_changed() {
         return;
     }
-    contours.on = !contours.on;
     for mut visibility in &mut lines {
-        *visibility = if contours.on {
+        *visibility = if contours.on && !photo.on {
             Visibility::Inherited
         } else {
             Visibility::Hidden

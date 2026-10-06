@@ -36,7 +36,9 @@
 //! (`Hydrostatic3D::with_balanced_reference`), `nu`/`kappa` vertical
 //! viscosity and diffusivity, `nuh` or `cs` horizontal viscosity (constant
 //! or Smagorinsky), `vadv`/`madv` the tracers' and the momentum's vertical
-//! advection, `mform` the momentum's horizontal advection (`split`, the
+//! advection (`vref=0`: without the initial stratification as the vertical
+//! reference, `Hydrostatic3D::with_vertical_reference`, the default as in
+//! `Simulation3D`), `mform` the momentum's horizontal advection (`split`, the
 //! default, or `conservative`), `kuzmin=1` the horizontal Kuzmin tracer limiter (`kuzmin=2`
 //! with the initial stratification as its reference profile; `relax` its
 //! bounds' relaxation, default 1), `report` the interval of the printed
@@ -221,6 +223,9 @@ fn main() {
     physics.update_density(&mut state);
     if balanced != 0 {
         physics.set_balanced_reference(&state);
+    }
+    if arg("vref", 1usize) != 0 {
+        physics.set_vertical_reference(&state);
     }
 
     // Steepness: the largest r_x0 between neighbouring nodes of an element

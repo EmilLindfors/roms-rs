@@ -104,6 +104,11 @@ pub struct SWEPhysics2D<BC: SWEBoundaryCondition2D> {
     pub formulation: SWEFormulation2D,
     /// Wetting/drying treatment, if enabled
     pub wet_dry: Option<WetDryConfig>,
+    /// `WetDry` only: elements with a node shallower than this (m) take the
+    /// subcell finite volumes (default `h_dry`). The 3D model sets it to its
+    /// thin-column depth, so that its layers move through the same subcells
+    /// ([`crate::physics::Hydrostatic3D::with_min_column_depth`]).
+    pub subcell_depth: Option<f64>,
     /// Bottom friction applied point-implicitly, if any
     pub friction: Option<Arc<dyn BottomFriction2D>>,
     /// Net-cage drag applied point-implicitly, if any
@@ -165,6 +170,8 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
             .wet_dry
             .as_ref()
             .map_or(WetDryConfig::DEFAULT_H_DRY, |config| config.h_dry.meters());
+        // (Its subcell cap takes elements with a node within 100 h_dry, 0.1 m
+        // by default: a 3D model's subcell depth, see `subcell_depth`)
         self.has_wetting_drying()
             .then(|| PositivityBound::new(self.order, scheme, h_dry))
     }
@@ -285,6 +292,9 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2D<BC> {
         }
         if let Some(ref wet_dry) = self.wet_dry {
             config = config.with_dry_threshold(wet_dry.h_dry.meters());
+        }
+        if let Some(depth) = self.subcell_depth {
+            config = config.with_subcell_depth(depth);
         }
         if let Some(ref viscosity) = self.viscosity {
             config = config.with_viscosity(viscosity.as_ref());
@@ -567,23 +577,32 @@ where
     SWEPhysics2D<BC>: PhysicsModule<SWESolution2D>,
 {
     /// [`PhysicsModule::compute_rhs_into`] that also writes the numerical mass
-    /// flux of every element face (layout of
-    /// [`crate::solver::compute_rhs_swe_2d_face_mass_into`]).
-    fn compute_rhs_face_mass_into(
+    /// flux of every element face and subcell interface (layouts of
+    /// [`crate::solver::compute_rhs_swe_2d_mass_fluxes_into`]).
+    fn compute_rhs_mass_fluxes_into(
         &self,
         state: &SWESolution2D,
         time: f64,
         out: &mut SWESolution2D,
         face_mass: &mut [f64],
+        subcell_mass: &mut [f64],
     ) {
         #[cfg(not(feature = "parallel"))]
-        use crate::solver::compute_rhs_swe_2d_face_mass_into as rhs_into;
+        use crate::solver::compute_rhs_swe_2d_mass_fluxes_into as rhs_into;
         #[cfg(feature = "parallel")]
-        use crate::solver::compute_rhs_swe_2d_parallel_face_mass_into as rhs_into;
+        use crate::solver::compute_rhs_swe_2d_parallel_mass_fluxes_into as rhs_into;
 
         let config = self.rhs_config();
         rhs_into(
-            state, &self.mesh, &self.ops, &self.geom, &config, time, out, face_mass,
+            state,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &config,
+            time,
+            out,
+            face_mass,
+            subcell_mass,
         );
     }
 
@@ -855,6 +874,7 @@ impl<BC: SWEBoundaryCondition2D> SWEPhysics2DBuilder<BC> {
             well_balanced: self.well_balanced,
             formulation,
             wet_dry: self.wet_dry,
+            subcell_depth: None,
             friction: self.friction,
             cages: self.cages,
             viscosity: self.viscosity,

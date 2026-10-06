@@ -39,7 +39,9 @@ use crate::solver::SWEState2D;
 /// `boundary_tag` in the context and dispatches to the appropriate BC.
 ///
 /// If no tag is present or no specific BC is registered for that tag,
-/// the default BC is used.
+/// the default BC is used. It holds references only, so a copy is cheap (the
+/// 3D model's barotropic module takes its boundary condition by value).
+#[derive(Clone)]
 pub struct MultiBoundaryCondition2D<'a> {
     /// Default BC for untagged or unknown boundaries
     default_bc: &'a dyn SWEBoundaryCondition2D,
