@@ -307,6 +307,8 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **A fast test tier for pull requests (`.config/nextest.toml`).** Pull requests run nextest's `pr` profile, every test but 25 slow gates: long simulations, convergence ladders and statistical particle runs, each 15 s or more in CI. Pushes to main and manual runs (`workflow_dispatch`) run the whole suite. In the run before this, those gates were 70 % of the test time, and the test job took 12–14 min. Locally the fast tier is 1589 tests in 39 s (`cargo nextest run --profile pr --cargo-profile ci --no-default-features --features parallel,simd`).
+  - **Three wave gates made cheaper, with the numbers they check unchanged.** `refraction_follows_snells_law` runs on a 1 × 20 mesh: the solution is uniform along x, and 4 × 40 gave the same departures to 0.002°. It took 240 s in CI; locally 197 → 2.9 s. `shoaling_keeps_the_action_flux` uses 40 × 1 elements and 4 direction bins, since normal incidence turns no wave out of its bin: 9.8 → 0.55 s, c_g N still constant to 2e-14. `a_following_current_shifts_the_frequency_doppler` uses 4 direction bins: 19 → 9.6 s, and the mean σ is now 0.54 % off σ + kU = σ₀ against 0.53 % before.
 - **Stratified 3D runs take the vertical reference and the 19 m free depth by default (TODO P1.3).**
   - `Simulation3D` takes a stratified initial state as the vertical tracer advection's reference (`Hydrostatic3D::ensure_vertical_reference`) when none was given. Opt out with `Hydrostatic3D::without_vertical_reference`. Unmixed runs are unchanged.
   - `froya_real_data levels=N`, `seamount_3d` and `profile_3d` step the model themselves and set it too (`debug_3d=noref`, `vref=0` for the plain scheme).

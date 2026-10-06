@@ -158,7 +158,8 @@ fn refraction_keeps_the_total_action() {
 fn shoaling_keeps_the_action_flux() {
     const L: f64 = 2000.0;
     let depth = |x: f64| 20.0 - 17.0 * x / L;
-    let grid = SpectralGrid::new(0.1, 0.15, 3, 36);
+    // Normal incidence turns no wave out of its bin, so the fewest bins do
+    let grid = SpectralGrid::new(0.1, 0.15, 3, 4);
     let i = 1;
     let mut e = vec![0.0; grid.n_components()];
     e[grid.component(i, 0)] = 1.0;
@@ -169,7 +170,7 @@ fn shoaling_keeps_the_action_flux() {
             0.0,
             200.0,
             40,
-            2,
+            1,
             [
                 BoundaryTag::Wall,
                 BoundaryTag::Open,
@@ -210,7 +211,9 @@ fn refraction_follows_snells_law() {
     let depth = |y: f64| 20.0 - 16.0 * y / LY;
     let mut errors = Vec::new();
     for n_dir in [36, 72, 144] {
-        let mut mesh = Mesh2D::channel_periodic_x(0.0, LX, 0.0, LY, 4, 40);
+        // Uniform along x: one element across; 20 along the shelf (4 × 40
+        // gives the same departures to 0.002°, at 30× the cost)
+        let mut mesh = Mesh2D::channel_periodic_x(0.0, LX, 0.0, LY, 1, 20);
         for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
             edge.boundary_tag = Some(BoundaryTag::Open);
         }
@@ -347,13 +350,17 @@ fn a_spread_sea_refracts_to_the_exact_steady_state() {
 /// A following current accelerating from 0 to 0.6 m/s over deep water stretches
 /// the waves: the absolute frequency `σ + k U` is conserved, so the intrinsic
 /// frequency falls as `σ + σ² U/g = σ_0`. One frequency bin comes in, a spike,
-/// so the schemes are first order here (0.34 % upwind, 0.53 % MUSCL): see
+/// so the schemes are first order here (0.34 % upwind, 0.53 % MUSCL with 8
+/// direction bins; 0.54 % MUSCL with the test's 4, whose wider bins the current
+/// turns a little less energy across): see
 /// [`a_spread_sea_on_a_current_has_the_exact_doppler_shift`] for a resolved
 /// spectrum.
 #[test]
 fn a_following_current_shifts_the_frequency_doppler() {
     const L: f64 = 2000.0;
-    let grid = SpectralGrid::new(0.15, 0.35, 41, 8);
+    // One direction bin carries the sea and no current gradient turns it:
+    // the fewest bins do
+    let grid = SpectralGrid::new(0.15, 0.35, 41, 4);
     let i0 = (0..grid.n_freq())
         .min_by(|&a, &b| {
             let d = |i: usize| (grid.sigma[i] / TAU - 0.3).abs();

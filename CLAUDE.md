@@ -175,6 +175,9 @@ cargo test --features parallel
 # Run the tests the way CI does (opt-level 1, ~15x faster than the unoptimized suite)
 cargo test --profile ci
 
+# The fast tier that pull requests run (all but the slow gates in .config/nextest.toml)
+cargo nextest run --profile pr --cargo-profile ci --no-default-features --features parallel,simd
+
 # Windows default-feature build with native HDF5/netCDF-C
 conda activate roms-rs
 cargo check
