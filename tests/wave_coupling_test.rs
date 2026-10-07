@@ -18,7 +18,8 @@ use dg_rs::source::{
 use dg_rs::time::SSPRK3;
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{
-    SourceTerms, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, wavenumber,
+    SourceTerms, SpectralGrid, WaveCoupling2D, WaveModel2D, WaveSolution, WaveWorkspace,
+    group_velocity, wavenumber,
 };
 
 const G: f64 = 9.81;
@@ -48,24 +49,55 @@ impl SourceTerm2D for LinearDamping {
 /// element size.
 #[test]
 fn shoaling_waves_set_the_water_down() {
+    let (range, worst, speed) = shoaling_set_down(None);
+    assert!(range > 0.01, "a set-down of {range} m");
+    assert!(speed < 5e-5, "not at rest: {speed} m/s");
+    assert!(worst < 0.01 * range, "η off the formula by {worst:e} m");
+}
+
+/// The same basin with the waves on a mesh of their own (TODO F.4 cost), coupled
+/// by `WaveCoupling2D`: the radiation stress interpolated onto the
+/// circulation's 50 m P2 nodes and differentiated there. The wave meshes have
+/// 7 and 14 elements of 286 and 143 m, whose faces fall inside the
+/// circulation's elements.
+///
+/// The wave state is exact shoaling at its own nodes (to 1e-12); what departs
+/// is its polynomial between them, which the force differentiates. The
+/// set-down is off the formula by 5.2 / 2.2 % of its range at 7 / 14 P1
+/// elements (0.88 % at 28; second order as the elements shrink, the error at
+/// the 3 m end where S curves most), and by 1.0 % at 7 P2 elements (0.40 % at
+/// 14, then the same-mesh 0.27 %). P2 on the coarser mesh is the better use
+/// of the nodes: 21 nodes along the basin against 28 for P1 at 14 elements.
+#[test]
+fn shoaling_waves_on_a_coarse_mesh_of_their_own_set_the_water_down() {
+    let departure = |nx: usize, order: usize| {
+        let (range, worst, speed) = shoaling_set_down(Some((nx, order)));
+        assert!(range > 0.01, "a set-down of {range} m");
+        assert!(speed < 1e-4, "not at rest: {speed} m/s");
+        worst / range
+    };
+    let p1 = [departure(7, 1), departure(14, 1)];
+    let p2 = departure(7, 2);
+    assert!(p1[0] < 0.06 && p1[1] < 0.025, "P1: {p1:?}");
+    assert!(p1[1] < 0.5 * p1[0], "P1 does not converge: {p1:?}");
+    assert!(p2 < 0.012, "P2: {p2}");
+}
+
+/// The shoaling basin at rest under the waves' force, with the waves on the
+/// circulation's mesh (`None`) or on `Some((nx, order))`, `nx` elements of
+/// their own: the set-down's range across the basin (m), the largest
+/// departure from the formula (m), and the largest current left (m/s).
+fn shoaling_set_down(wave_mesh: Option<(usize, usize)>) -> (f64, f64, f64) {
     const L: f64 = 2000.0;
     let depth = |x: f64| 20.0 - 17.0 * x / L;
-    let order = 2;
-    let mesh = Mesh2D::uniform_rectangle_with_sides(
-        0.0,
-        L,
-        0.0,
-        100.0,
-        40,
-        1,
-        [
-            BoundaryTag::Wall,
-            BoundaryTag::Open,
-            BoundaryTag::Wall,
-            BoundaryTag::Open,
-        ],
-    );
-    let ops = Arc::new(DGOperators2D::new(order));
+    let sides = [
+        BoundaryTag::Wall,
+        BoundaryTag::Open,
+        BoundaryTag::Wall,
+        BoundaryTag::Open,
+    ];
+    let mesh = Mesh2D::uniform_rectangle_with_sides(0.0, L, 0.0, 100.0, 40, 1, sides);
+    let ops = Arc::new(DGOperators2D::new(2));
     let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
     let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |x, _| {
         -depth(x)
@@ -77,14 +109,24 @@ fn shoaling_waves_set_the_water_down() {
     let mut e = vec![0.0; grid.n_components()];
     let c = grid.component(0, 0);
     e[c] = 1.0 / 8.0 / (grid.d_sigma[0] * grid.d_theta);
-    let waves = WaveModel2D::new(
-        mesh.clone(),
-        ops.clone(),
-        geom.clone(),
-        &bathymetry,
-        grid,
-        G,
-    )
+    let waves = match wave_mesh {
+        None => WaveModel2D::new(
+            mesh.clone(),
+            ops.clone(),
+            geom.clone(),
+            &bathymetry,
+            grid,
+            G,
+        ),
+        Some((nx, order)) => {
+            let wave_mesh = Mesh2D::uniform_rectangle_with_sides(0.0, L, 0.0, 100.0, nx, 1, sides);
+            let wave_ops = Arc::new(DGOperators2D::new(order));
+            let wave_geom = Arc::new(GeometricFactors2D::compute(&wave_mesh, &wave_ops));
+            let wave_bed =
+                Bathymetry2D::from_function(&wave_mesh, &wave_ops, &wave_geom, |x, _| -depth(x));
+            WaveModel2D::new(Arc::new(wave_mesh), wave_ops, wave_geom, &wave_bed, grid, G)
+        }
+    }
     .with_boundary_spectrum(&e);
     let mut n = waves.zero_state();
     let mut ws = WaveWorkspace::default();
@@ -94,8 +136,29 @@ fn shoaling_waves_set_the_water_down() {
         waves.step(&mut n, s as f64 * dt, dt, &mut ws);
     }
 
+    // The swell shoals with E c_g constant, exactly at the waves' nodes
+    let sigma = waves.grid.sigma[0];
+    let cg = |h: f64| group_velocity(sigma, wavenumber(sigma, h, G), h);
+    let shoaled = |x: f64| cg(depth(0.0)) / cg(depth(x)) / 8.0;
+    for (p, params) in waves.parameters(&n).iter().enumerate() {
+        let (k, i) = (
+            ElementIndex::new(p / waves.ops.n_nodes),
+            p % waves.ops.n_nodes,
+        );
+        let [x, _] =
+            waves
+                .mesh
+                .reference_to_physical(k, waves.ops.nodes_r[i], waves.ops.nodes_s[i]);
+        assert!((params.m0 / shoaled(x) - 1.0).abs() < 1e-12, "x = {x}");
+    }
+
     // The basin at rest under the waves' force
-    let force = WaveForce2D::new(&waves, &n).with_ramp(1200.0);
+    let coupling = WaveCoupling2D::new(&waves, mesh.clone(), ops.clone(), geom.clone());
+    let force = match wave_mesh {
+        None => WaveForce2D::new(&waves, &n),
+        Some(_) => coupling.force(&waves, &n),
+    }
+    .with_ramp(1200.0);
     let physics = PhysicsBuilder::swe_2d(
         mesh.clone(),
         ops.clone(),
@@ -118,7 +181,6 @@ fn shoaling_waves_set_the_water_down() {
     assert!(result.success, "{result:?}");
 
     // η against the formula, both relative to the offshore end
-    let params = waves.parameters(&n);
     let mut samples: Vec<(f64, f64, f64)> = Vec::new(); // (x, η, formula)
     for k in ElementIndex::iter(mesh.n_elements) {
         for i in 0..nn {
@@ -127,7 +189,7 @@ fn shoaling_waves_set_the_water_down() {
             let h = depth(x);
             let eta = q.h_data()[p] + bathymetry.get(k, i);
             let kw = wavenumber(waves.grid.sigma[0], h, G);
-            let formula = -params[p].m0 * kw / (2.0 * kw * h).sinh();
+            let formula = -shoaled(x) * kw / (2.0 * kw * h).sinh();
             samples.push((x, eta, formula));
         }
     }
@@ -148,14 +210,16 @@ fn shoaling_waves_set_the_water_down() {
         .map(|(hu, h)| (hu / h).abs())
         .fold(0.0f64, f64::max);
     println!(
-        "set-down across the basin {:.2} cm; largest departure {:.2e} m ({:.2} %); |u| ≤ {speed:.1e} m/s",
+        "waves on {}: set-down across the basin {:.2} cm; largest departure {:.2e} m ({:.2} %); |u| ≤ {speed:.1e} m/s",
+        wave_mesh.map_or("the same mesh".to_string(), |(nx, order)| format!(
+            "{nx} P{order} elements"
+        )),
         100.0 * range,
         worst,
         100.0 * worst / range
     );
-    assert!(range > 0.01, "a set-down of {range} m");
-    assert!(speed < 5e-5, "not at rest: {speed} m/s");
-    assert!(worst < 0.01 * range, "η off the formula by {worst:e} m");
+
+    (range, worst, speed)
 }
 
 /// A uniform body force `G` per unit mass along x.
@@ -297,17 +361,22 @@ impl Beach {
     }
 
     fn new() -> Self {
-        let width = Self::L / Self::NY as f64;
+        Self::with(Self::NY, 2)
+    }
+
+    /// The beach on `ny` elements of order `order` across it.
+    fn with(ny: usize, order: usize) -> Self {
+        let width = Self::L / ny as f64;
         let mesh = Mesh2D::channel_periodic_x_with_sides(
             0.0,
             width,
             0.0,
             Self::L,
             1,
-            Self::NY,
+            ny,
             [BoundaryTag::Open, BoundaryTag::Wall],
         );
-        let ops = Arc::new(DGOperators2D::new(2));
+        let ops = Arc::new(DGOperators2D::new(order));
         let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
         let bathymetry = Arc::new(Bathymetry2D::from_function(&mesh, &ops, &geom, |_, y| {
             -Self::depth(y)
@@ -547,6 +616,66 @@ fn breaking_waves_set_the_water_up_in_the_surf_zone() {
     }
     let change = (walls[2] / walls[1] - 1.0).abs();
     assert!(change < 5e-3, "the coupling has not converged: {walls:?}");
+}
+
+/// The surf zone with the waves on a mesh of their own, two-way coupled by
+/// `WaveCoupling2D` (TODO F.4 cost): the force interpolated onto the
+/// circulation's 25 m P2 elements, and the circulation's level back onto the
+/// waves' (`update_waves`), for two passes. On 7 P2 elements of 50 m the setup
+/// at the wall is 5.793 then 5.597 cm, against 5.806 and 5.604 cm with the
+/// waves on the circulation's own mesh (0.2 % and 0.1 % apart).
+#[test]
+fn breaking_waves_on_a_coarse_mesh_of_their_own_set_the_water_up() {
+    let beach = Beach::new();
+    let setup = |wave_beach: &Beach| -> Vec<f64> {
+        let mut waves = wave_beach.waves(std::f64::consts::FRAC_PI_2, None, 36);
+        let coupling = WaveCoupling2D::new(
+            &waves,
+            beach.mesh.clone(),
+            beach.ops.clone(),
+            beach.geom.clone(),
+        );
+        let mut n = waves.zero_state();
+        let mut q = beach.still_water();
+        let mut setups = Vec::new();
+        for pass in 0..2 {
+            Beach::settle(&waves, &mut n);
+            let force = coupling.force(&waves, &n);
+            let force = if pass == 0 {
+                force.with_ramp(300.0)
+            } else {
+                force
+            };
+            let physics = beach.physics().with_source(force).build();
+            let result = Simulation::new(physics, SSPRK3).run(&mut q, 0.0, 3000.0);
+            assert!(result.success, "{result:?}");
+            let eta = beach.eta(&q);
+            let balance = beach.balance(&vec![[0.0; 2]; eta.len()], &q);
+            setups.push(eta[balance.last().unwrap().0] - eta[balance[0].0]);
+            coupling.update_waves(&mut waves, &q, &beach.bathymetry);
+        }
+        setups
+    };
+    let same = setup(&beach);
+    let coarse = setup(&Beach::with(7, 2));
+    println!(
+        "setup at the wall: waves on the same mesh {:.3} → {:.3} cm, on 7 P2 elements {:.3} → {:.3} cm",
+        100.0 * same[0],
+        100.0 * same[1],
+        100.0 * coarse[0],
+        100.0 * coarse[1]
+    );
+    assert!(same[1] > 0.05, "{same:?}");
+    for pass in 0..2 {
+        assert!(
+            (coarse[pass] / same[pass] - 1.0).abs() < 0.01,
+            "pass {pass}: {coarse:?} against {same:?}"
+        );
+    }
+    assert!(
+        coarse[1] < coarse[0],
+        "the coupling lowers the setup: {coarse:?}"
+    );
 }
 
 /// The longshore force by Longuet-Higgins (1970) per node, from the waves'

@@ -47,13 +47,16 @@
 //!    pressure forcing).
 //!    Without an atlas: M2 of `M2_AMPLITUDE` in one phase along the boundary.
 //!    NorKyst-800 has too little N2 here (0.027 m at Mausund against 0.156 m
-//!    observed) and about twice the Q1, and its diurnals are off (K1 1.14×,
-//!    +8.6°; O1 0.95×, −17.3° at Mausund). The atlas is corrected with the
-//!    first gauge's whole-record fit (`TidalAtlas::infer`): `gauge_gains=K1,O1`
-//!    (the default) scales each by the gauge's constant over NorKyst's at the
-//!    gauge (`station_atlas=`), keeping NorKyst's spatial structure; then
-//!    `gauge_ratios=N2,Q1,P1` (the default) re-infers N2, Q1 and P1 from M2,
-//!    the corrected O1 and the corrected K1 with the gauge's ratios.
+//!    observed) and about twice the Q1, its diurnals are off (K1 1.14×,
+//!    +8.6°; O1 0.95×, −17.3° at Mausund) and its S2 is 1.065×. The atlas is
+//!    corrected with the first gauge's whole-record fit (`TidalAtlas::infer`):
+//!    `gauge_gains=K1,O1,S2` (the default) scales each by the gauge's
+//!    constant over NorKyst's at the gauge (`station_atlas=`), keeping
+//!    NorKyst's spatial structure; then `gauge_ratios=N2,Q1,P1,K2` (the
+//!    default) re-infers N2, Q1, P1 and K2 from M2 and the corrected O1, K1
+//!    and S2 with the gauge's ratios. Over 15 days at Mausund this takes S2
+//!    from 1.10× to 1.00× of the gauge (K2 is not separable from S2 in a
+//!    15-day fit, so the boundary's K2 matters as much as its S2).
 //! 5. **Validation.** Every `station_minutes` the surface and the
 //!    depth-averaged current (east/north) are sampled at the tide gauges
 //!    `gauges=` (files as written by `scripts/kartverket_gauge.sh`) and at
@@ -90,20 +93,27 @@
 //!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>] \
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [currents=<file,…>] \
 //!     [station_atlas=data/froya_station_tides.txt] \
-//!     [station_minutes=10] [spinup_hours=24] [gauge_gains=K1,O1] \
-//!     [gauge_ratios=N2,Q1,P1] [land_elevation=5] \
+//!     [station_minutes=10] [spinup_hours=24] [gauge_gains=K1,O1,S2] \
+//!     [gauge_ratios=N2,Q1,P1,K2] [land_elevation=5] \
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
+//!     [wave_mesh=NX,NY[,ORDER]] \
 //!     [levels=0] [tide3d=0] [restart_hours=0] [resume=<file>]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
 //! instead of the tidal run (`wave_grid=frequencies,directions`, refraction
 //! capped at `turning=` rad/s, or stepped implicitly with `implicit=1`): the
-//! step, what sets it, and the cost per model hour.
+//! step, what sets it, and the cost per model hour. With
+//! `wave_mesh=NX,NY[,ORDER]` the waves run on an NX × NY grid of their own (P1
+//! by default) over the same bed, and the coupling to the run's mesh
+//! (`WaveCoupling2D`) is built and each exchange timed. With `wave_mesh=NX,NY[,ORDER]`
+//! the waves run on an NX × NY grid of their own (P1 by default) over the same
+//! bed, and the coupling to the run's mesh (`WaveCoupling2D`) is built and each
+//! exchange timed.
 //!
 //! `levels=N tide3d=1` runs the tide in 3D instead (`tidal_run_3d`, TODO P1.3):
 //! the 2D run's open boundary (NorKyst nesting with `norkyst=`, else the atlas
@@ -333,6 +343,7 @@ const GAUGE_CONSTITUENTS: [&str; 15] = [
 ];
 
 /// Command-line options (`key=value`, or a bare flag)
+#[derive(Clone)]
 struct Options {
     nx: usize,
     ny: usize,
@@ -377,10 +388,10 @@ struct Options {
     station_minutes: f64,
     spinup_hours: f64,
     /// Atlas constituents scaled by the gauge's constants over NorKyst's at
-    /// the gauge (`gauge_gains=K1,O1`), before the ratio inference
+    /// the gauge (`gauge_gains=K1,O1,S2`), before the ratio inference
     gauge_gains: Vec<&'static str>,
     /// Atlas constituents re-inferred from their neighbour with the gauge's
-    /// ratio (`gauge_ratios=N2,Q1,P1`)
+    /// ratio (`gauge_ratios=N2,Q1,P1,K2`)
     gauge_ratios: Vec<&'static str>,
     land_elevation: f64,
     /// Elevation model with land heights (`dem=`, used if the file exists;
@@ -435,6 +446,10 @@ struct Options {
     turning: Option<f64>,
     /// Step refraction implicitly (`implicit=1`)
     implicit_refraction: bool,
+    /// The waves on a grid of their own (`wave_mesh=NX,NY[,ORDER]`, order 1
+    /// by default) instead of the run's mesh, coupled to it by
+    /// `WaveCoupling2D`
+    wave_mesh: Option<[usize; 3]>,
     /// Time the 3D model on the domain with this many σ-levels instead of
     /// the tidal run (`levels=N`; 0: off), for `steps_3d=` steps
     levels: usize,
@@ -548,6 +563,20 @@ impl Options {
                     _ => return Err(format!("wave_grid=frequencies,directions, not {text}")),
                 }
             },
+            wave_mesh: match args.get("wave_mesh") {
+                None => None,
+                Some(text) => {
+                    let parts: Vec<usize> = text
+                        .split(',')
+                        .map(|v| v.parse().map_err(|_| format!("bad wave_mesh={text}")))
+                        .collect::<Result<_, _>>()?;
+                    match parts[..] {
+                        [nx, ny] => Some([nx, ny, 1]),
+                        [nx, ny, order] => Some([nx, ny, order]),
+                        _ => return Err(format!("wave_mesh=NX,NY[,ORDER], not {text}")),
+                    }
+                }
+            },
             turning: args
                 .get("turning")
                 .map(|v| v.parse().map_err(|_| format!("bad turning={v}")))
@@ -644,8 +673,8 @@ impl Options {
                 .unwrap_or("data/froya_station_tides.txt".into()),
             station_minutes: get("station_minutes", 10.0)?,
             spinup_hours: get("spinup_hours", 24.0)?,
-            gauge_gains: constituents("gauge_gains", "K1,O1")?,
-            gauge_ratios: constituents("gauge_ratios", "N2,Q1,P1")?,
+            gauge_gains: constituents("gauge_gains", "K1,O1,S2")?,
+            gauge_ratios: constituents("gauge_ratios", "N2,Q1,P1,K2")?,
         };
         if opts.cfl.is_nan() {
             let scheme = opts.integrator.ssp_scheme().expect("an SSP integrator");
@@ -1427,7 +1456,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     domain.close_uncovered_open_faces(&opts)?;
     if opts.waves > 0 {
-        wave_cost(&domain, &opts);
+        let wave_domain = match opts.wave_mesh {
+            None => None,
+            Some([nx, ny, order]) => {
+                println!("The waves' own grid, {nx} × {ny} at P{order}...");
+                let mut wave_opts = opts.clone();
+                (wave_opts.mesh, wave_opts.nx, wave_opts.ny, wave_opts.order) =
+                    (None, nx, ny, order);
+                let wave_domain =
+                    Domain::froya(&wave_opts)?.ok_or("wave_mesh= needs the Frøya data files")?;
+                wave_domain.print_summary();
+                Some(wave_domain)
+            }
+        };
+        wave_cost(wave_domain.as_ref().unwrap_or(&domain), &domain, &opts);
         return Ok(());
     }
     if opts.levels > 0 && opts.tide_3d {
@@ -2798,10 +2840,13 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
 /// the west-north-west through the open boundaries and, to start with, over the
 /// whole domain. The median wall time of N steps after a warm-up, split into the
 /// propagation and the sources, the step and what sets it, and the cost per
-/// model hour.
-fn wave_cost(domain: &Domain, opts: &Options) {
+/// model hour. With the waves on a grid of their own (`wave_mesh=`), also the
+/// coupling to the run's mesh `circulation` (`WaveCoupling2D`): its build and
+/// each exchange, from a circulation at rest.
+fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
     use dg_rs::waves::{
-        SourceTerms, SpectralGrid, WaveModel2D, WaveWorkspace, Wind, group_velocity, wavenumber,
+        SourceTerms, SpectralGrid, StokesDriftField, WaveCoupling2D, WaveModel2D, WaveWorkspace,
+        Wind, group_velocity, wavenumber,
     };
     let [nf, nd] = opts.wave_grid;
     let grid = SpectralGrid::new(0.04, 0.5, nf, nd);
@@ -2809,7 +2854,7 @@ fn wave_cost(domain: &Domain, opts: &Options) {
     // Travelling to the east-south-east
     let direction = (-15f64).to_radians();
     let sea = grid.jonswap(2.5, 10.0, 3.3, direction, 4.0);
-    let model = WaveModel2D::new(
+    let mut model = WaveModel2D::new(
         domain.mesh.clone(),
         domain.ops.clone(),
         domain.geom.clone(),
@@ -2921,6 +2966,85 @@ fn wave_cost(domain: &Domain, opts: &Options) {
         "  after {:.0} s: H_s ≤ {hs_max:.2} m, total action {:.3e}",
         t,
         model.total_action(&n)
+    );
+    if Arc::ptr_eq(&domain.mesh, &circulation.mesh) {
+        return;
+    }
+
+    // The coupling to the run's mesh: the circulation at rest
+    let start = Instant::now();
+    let coupling = WaveCoupling2D::new(
+        &model,
+        circulation.mesh.clone(),
+        circulation.ops.clone(),
+        circulation.geom.clone(),
+    );
+    let build = start.elapsed().as_secs_f64();
+    let (to_waves, to_circulation) = (coupling.to_waves(), coupling.to_circulation());
+    println!(
+        "\nCoupling to the run's mesh ({} elements, P{}, {} nodes): built in {:.0} ms",
+        circulation.mesh.n_elements,
+        circulation.ops.order,
+        to_circulation.n_target_points(),
+        1e3 * build
+    );
+    println!(
+        "  wave nodes outside the run's mesh: {} of {} (up to {:.0} m from it); run's nodes \
+         outside the waves': {} of {} (up to {:.0} m)",
+        to_waves.n_outside(),
+        to_waves.n_target_points(),
+        to_waves.largest_gap(),
+        to_circulation.n_outside(),
+        to_circulation.n_target_points(),
+        to_circulation.largest_gap()
+    );
+    let nn = circulation.ops.n_nodes;
+    let mut q = SWESolution2D::new(circulation.mesh.n_elements, nn);
+    for k in ElementIndex::iter(circulation.mesh.n_elements) {
+        for i in 0..nn {
+            let h = (-circulation.bathymetry.get(k, i)).max(0.0);
+            q.set_state(k, i, SWEState2D::new(h, 0.0, 0.0));
+        }
+    }
+    let time = |f: &mut dyn FnMut()| {
+        let mut times: Vec<f64> = (0..5)
+            .map(|_| {
+                let start = Instant::now();
+                f();
+                start.elapsed().as_secs_f64()
+            })
+            .collect();
+        median(&mut times)
+    };
+    let to_model = time(&mut || coupling.update_waves(&mut model, &q, &circulation.bathymetry));
+    let force = time(&mut || {
+        std::hint::black_box(coupling.force(&model, &n));
+    });
+    let bed = time(&mut || {
+        std::hint::black_box(coupling.bed_wave_stress(&model, &n, 1e-3));
+    });
+    let roughness = time(&mut || {
+        std::hint::black_box(coupling.surface_roughness(&model, &n, 0.6));
+    });
+    let stokes = time(&mut || {
+        std::hint::black_box(coupling.stokes_drift(&model, &n));
+    });
+    let stokes_own = time(&mut || {
+        std::hint::black_box(StokesDriftField::new(&model, &n));
+    });
+    let exchange = to_model + force + bed + roughness + stokes;
+    println!(
+        "  one exchange {:.0} ms ({:.1} wave steps): level and currents to the waves {:.0} ms, \
+         force {:.0} ms, bed stress {:.0} ms, roughness {:.0} ms, Stokes drift {:.0} ms (of it \
+         {:.0} ms on the waves' own mesh)",
+        1e3 * exchange,
+        exchange / step,
+        1e3 * to_model,
+        1e3 * force,
+        1e3 * bed,
+        1e3 * roughness,
+        1e3 * stokes,
+        1e3 * stokes_own
     );
 }
 

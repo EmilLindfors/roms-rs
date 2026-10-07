@@ -15,6 +15,7 @@
 //! the exact profile: `n_freq` exponentials per sample, whatever the number of
 //! directions. At a node this is [`WaveModel2D::stokes_drift`] to round-off.
 
+use crate::operators::MeshTransfer2D;
 use crate::types::ElementIndex;
 
 use super::model::WaveModel2D;
@@ -79,6 +80,50 @@ impl StokesDriftField {
             k: Vec::new(),
             bx: Vec::new(),
             by: Vec::new(),
+        }
+    }
+
+    /// The field on another mesh (`n_nodes` per element): the depth, and each
+    /// frequency's `k` and `b`, interpolated by `transfer` from this field's
+    /// nodes onto the other mesh's (the wave model on a coarse mesh, the
+    /// particles on the circulation's; [`super::WaveCoupling2D::stokes_drift`]).
+    /// The depth and `k` are kept positive where a higher-order basis
+    /// overshoots.
+    pub fn transferred(&self, transfer: &MeshTransfer2D, n_nodes: usize) -> Self {
+        assert_eq!(
+            transfer.n_source_points(),
+            self.n_points,
+            "a transfer from this field's mesh"
+        );
+        let np = transfer.n_target_points();
+        assert_eq!(np % n_nodes, 0, "{n_nodes} nodes per target element");
+        let rows = |field: &[f64], floor: Option<f64>| -> Vec<f64> {
+            let mut out = vec![0.0; self.n_freq * np];
+            for (source, target) in field
+                .chunks_exact(self.n_points)
+                .zip(out.chunks_exact_mut(np))
+            {
+                transfer.apply_into(source, target);
+                if let Some(floor) = floor {
+                    target.iter_mut().for_each(|x| *x = x.max(floor));
+                }
+            }
+            out
+        };
+        let depth_floor = self.depth.iter().cloned().fold(f64::INFINITY, f64::min);
+        let k_floor = self.k.iter().cloned().fold(f64::INFINITY, f64::min);
+        Self {
+            n_freq: self.n_freq,
+            n_points: np,
+            n_nodes,
+            depth: transfer
+                .apply(&self.depth)
+                .into_iter()
+                .map(|d| d.max(depth_floor))
+                .collect(),
+            k: rows(&self.k, Some(k_floor)),
+            bx: rows(&self.bx, None),
+            by: rows(&self.by, None),
         }
     }
 

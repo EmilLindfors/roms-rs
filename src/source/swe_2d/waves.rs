@@ -58,14 +58,6 @@ pub struct WaveForce2D {
 impl WaveForce2D {
     /// The force of the wave state `n` of `model`, on the model's mesh and order.
     pub fn new(model: &WaveModel2D, n: &WaveSolution) -> Self {
-        let positions = (0..model.mesh.n_elements)
-            .flat_map(|k| {
-                let (mesh, ops) = (&model.mesh, &model.ops);
-                (0..ops.n_nodes).map(move |i| {
-                    mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
-                })
-            })
-            .collect();
         Self::from_radiation_stress(
             &model.mesh,
             &model.ops,
@@ -73,7 +65,6 @@ impl WaveForce2D {
             &model.radiation_stress(n),
             model.g(),
         )
-        .with_positions(positions)
     }
 
     /// The force of the radiation stress `stress` (`[S_xx, S_xy, S_yy]/(ρg)`, m²,
@@ -94,18 +85,19 @@ impl WaveForce2D {
             .into_iter()
             .map(|[x, y]| [-g * x, -g * y])
             .collect();
+        let positions = ElementIndex::iter(mesh.n_elements)
+            .flat_map(|k| {
+                (0..ops.n_nodes)
+                    .map(move |i| mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]))
+            })
+            .collect();
         Self {
             n_nodes: ops.n_nodes,
             force,
-            positions: Vec::new(),
+            positions,
             ramp: None,
             h_min: 1e-6,
         }
-    }
-
-    fn with_positions(mut self, positions: Vec<[f64; 2]>) -> Self {
-        self.positions = positions;
-        self
     }
 
     /// Ramp the force up smoothly from 0 at t = 0 to full at `seconds` (the
@@ -129,8 +121,7 @@ impl WaveForce2D {
 
 impl SourceTerm2D for WaveForce2D {
     /// Per-node evaluation by position, a search over the nodes (slow; the RHS
-    /// kernels use [`SourceTerm2D::add_element`]). Zero away from a node, and
-    /// everywhere for a force built from a bare stress field (no positions).
+    /// kernels use [`SourceTerm2D::add_element`]). Zero away from a node.
     fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
         if ctx.state.h <= self.h_min {
             return SWEState2D::zero();
