@@ -47,13 +47,16 @@
 //!    pressure forcing).
 //!    Without an atlas: M2 of `M2_AMPLITUDE` in one phase along the boundary.
 //!    NorKyst-800 has too little N2 here (0.027 m at Mausund against 0.156 m
-//!    observed) and about twice the Q1, and its diurnals are off (K1 1.14×,
-//!    +8.6°; O1 0.95×, −17.3° at Mausund). The atlas is corrected with the
-//!    first gauge's whole-record fit (`TidalAtlas::infer`): `gauge_gains=K1,O1`
-//!    (the default) scales each by the gauge's constant over NorKyst's at the
-//!    gauge (`station_atlas=`), keeping NorKyst's spatial structure; then
-//!    `gauge_ratios=N2,Q1,P1` (the default) re-infers N2, Q1 and P1 from M2,
-//!    the corrected O1 and the corrected K1 with the gauge's ratios.
+//!    observed) and about twice the Q1, its diurnals are off (K1 1.14×,
+//!    +8.6°; O1 0.95×, −17.3° at Mausund) and its S2 is 1.065×. The atlas is
+//!    corrected with the first gauge's whole-record fit (`TidalAtlas::infer`):
+//!    `gauge_gains=K1,O1,S2` (the default) scales each by the gauge's
+//!    constant over NorKyst's at the gauge (`station_atlas=`), keeping
+//!    NorKyst's spatial structure; then `gauge_ratios=N2,Q1,P1,K2` (the
+//!    default) re-infers N2, Q1, P1 and K2 from M2 and the corrected O1, K1
+//!    and S2 with the gauge's ratios. Over 15 days at Mausund this takes S2
+//!    from 1.10× to 1.00× of the gauge (K2 is not separable from S2 in a
+//!    15-day fit, so the boundary's K2 matters as much as its S2).
 //! 5. **Validation.** Every `station_minutes` the surface and the
 //!    depth-averaged current (east/north) are sampled at the tide gauges
 //!    `gauges=` (files as written by `scripts/kartverket_gauge.sh`) and at
@@ -90,8 +93,8 @@
 //!     [start=2025-06-15T00:00:00Z] [tides=data/froya_boundary_tides.txt] [norkyst=<file>] \
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [currents=<file,…>] \
 //!     [station_atlas=data/froya_station_tides.txt] \
-//!     [station_minutes=10] [spinup_hours=24] [gauge_gains=K1,O1] \
-//!     [gauge_ratios=N2,Q1,P1] [land_elevation=5] \
+//!     [station_minutes=10] [spinup_hours=24] [gauge_gains=K1,O1,S2] \
+//!     [gauge_ratios=N2,Q1,P1,K2] [land_elevation=5] \
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
@@ -377,10 +380,10 @@ struct Options {
     station_minutes: f64,
     spinup_hours: f64,
     /// Atlas constituents scaled by the gauge's constants over NorKyst's at
-    /// the gauge (`gauge_gains=K1,O1`), before the ratio inference
+    /// the gauge (`gauge_gains=K1,O1,S2`), before the ratio inference
     gauge_gains: Vec<&'static str>,
     /// Atlas constituents re-inferred from their neighbour with the gauge's
-    /// ratio (`gauge_ratios=N2,Q1,P1`)
+    /// ratio (`gauge_ratios=N2,Q1,P1,K2`)
     gauge_ratios: Vec<&'static str>,
     land_elevation: f64,
     /// Elevation model with land heights (`dem=`, used if the file exists;
@@ -644,8 +647,8 @@ impl Options {
                 .unwrap_or("data/froya_station_tides.txt".into()),
             station_minutes: get("station_minutes", 10.0)?,
             spinup_hours: get("spinup_hours", 24.0)?,
-            gauge_gains: constituents("gauge_gains", "K1,O1")?,
-            gauge_ratios: constituents("gauge_ratios", "N2,Q1,P1")?,
+            gauge_gains: constituents("gauge_gains", "K1,O1,S2")?,
+            gauge_ratios: constituents("gauge_ratios", "N2,Q1,P1,K2")?,
         };
         if opts.cfl.is_nan() {
             let scheme = opts.integrator.ssp_scheme().expect("an SSP integrator");
