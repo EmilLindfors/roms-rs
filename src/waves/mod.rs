@@ -15,11 +15,14 @@
 //! - [`stokes`]: [`StokesDriftField`], the Stokes drift of a wave state at any
 //!   point and depth, for the particle trackers;
 //! - [`model`]: [`WaveModel2D`], the geographic DG propagation with refraction and
-//!   current-induced frequency shifting, and the step that combines them.
+//!   current-induced frequency shifting, and the step that combines them;
+//! - [`coupling`]: [`WaveCoupling2D`], the exchanges with a circulation on a mesh
+//!   and order of its own (level and currents to the waves; radiation stress,
+//!   bed stress, surface roughness and Stokes drift back).
 //!
-//! TODO F.4: the coupling to the circulation and the boundary spectra of a parent
-//! wave model follow.
+//! TODO F.4: the boundary spectra of a parent wave model follow.
 
+pub mod coupling;
 pub mod dispersion;
 pub mod model;
 pub mod nonlinear;
@@ -28,6 +31,7 @@ pub mod spectrum;
 pub mod state;
 pub mod stokes;
 
+pub use coupling::{DEFAULT_COUPLING_H_DRY, WaveCoupling2D};
 pub use dispersion::{dsigma_ddepth, group_velocity, group_velocity_ratio, wavenumber};
 pub use model::{DEFAULT_DEPTH_MIN, SpectralAdvection, WaveModel2D, WaveWorkspace};
 pub use nonlinear::{Quadruplets, shallow_water_factor};
