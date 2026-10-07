@@ -146,13 +146,54 @@ impl TracerLimiter3DConfig {
 }
 
 /// A horizontally uniform stratification `T(z)`, `S(z)`, linear between
-/// samples and constant beyond them: the reference of the horizontal Kuzmin
-/// limiter ([`TracerLimiter3DConfig::with_reference_profile`]).
+/// samples (or cubic, [`Self::from_smooth_fn`]) and constant beyond them:
+/// the reference of the horizontal Kuzmin limiter
+/// ([`TracerLimiter3DConfig::with_reference_profile`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TracerReferenceProfile {
     heights: Vec<f64>,
     temp: Vec<f64>,
     salt: Vec<f64>,
+    /// `dT/dz` and `dS/dz` at the samples, for cubic Hermite interpolation
+    slopes: Option<[Vec<f64>; 2]>,
+}
+
+/// One tracer of a [`TracerReferenceProfile`]: its samples, and their slopes
+/// if it is cubic.
+#[derive(Clone, Copy)]
+struct ProfileSamples<'a> {
+    heights: &'a [f64],
+    values: &'a [f64],
+    slopes: Option<&'a [f64]>,
+}
+
+impl ProfileSamples<'_> {
+    /// The profile at height `z`: linear, or cubic Hermite, between the
+    /// samples, constant beyond them.
+    fn at(&self, z: f64) -> f64 {
+        let (heights, values) = (self.heights, self.values);
+        let j = heights.partition_point(|&h| h < z);
+        if j == 0 {
+            return values[0];
+        }
+        if j == heights.len() {
+            return values[j - 1];
+        }
+        let h = heights[j] - heights[j - 1];
+        let t = (z - heights[j - 1]) / h;
+        let (f0, f1) = (values[j - 1], values[j]);
+        match self.slopes {
+            None => f0 + t * (f1 - f0),
+            Some(slopes) => {
+                let (m0, m1) = (h * slopes[j - 1], h * slopes[j]);
+                let (t2, t3) = (t * t, t * t * t);
+                (2.0 * t3 - 3.0 * t2 + 1.0) * f0
+                    + (t3 - 2.0 * t2 + t) * m0
+                    + (-2.0 * t3 + 3.0 * t2) * f1
+                    + (t3 - t2) * m1
+            }
+        }
+    }
 }
 
 impl TracerReferenceProfile {
@@ -175,6 +216,7 @@ impl TracerReferenceProfile {
             heights,
             temp,
             salt,
+            slopes: None,
         }
     }
 
@@ -197,20 +239,62 @@ impl TracerReferenceProfile {
         Self::new(heights, temp, salt)
     }
 
+    /// A smooth `profile(z) = (T, S)` sampled at `n` (≥ 2) heights evenly
+    /// from `z_bottom` to `z_top`, with its slopes there (fourth-order central
+    /// differences over a thousandth of the spacing), and interpolated as a cubic
+    /// Hermite between them: exact for a cubic, error ∝ spacing⁴.
+    ///
+    /// Prefer it to [`Self::from_fn`] for a smooth profile with a sharp
+    /// step. The limiter sees the reference's interpolation error as a
+    /// departure at rest, and the linear one's (∝ spacing²) drives a flow
+    /// over a sloping bed: a halocline of S 25 over 33, 3 m thick, sampled
+    /// every 4 cm, 4e-5 m/s within 10 min (`dg-viz`'s 3D fjord, TODO F.3).
+    /// For a piecewise-linear profile keep [`Self::from_fn`]: a cubic
+    /// overshoots at its kinks.
+    pub fn from_smooth_fn(
+        z_bottom: f64,
+        z_top: f64,
+        n: usize,
+        profile: impl Fn(f64) -> (f64, f64),
+    ) -> Self {
+        let mut reference = Self::from_fn(z_bottom, z_top, n, &profile);
+        let delta = 1e-3 * (z_top - z_bottom) / (n - 1) as f64;
+        let (temp_slope, salt_slope) = reference
+            .heights
+            .iter()
+            .map(|&z| {
+                // Fourth order, exact for a quintic
+                let [(t2, s2), (t1, s1), (t_1, s_1), (t_2, s_2)] =
+                    [2.0, 1.0, -1.0, -2.0].map(|j| profile(z + j * delta));
+                (
+                    (8.0 * (t1 - t_1) - (t2 - t_2)) / (12.0 * delta),
+                    (8.0 * (s1 - s_1) - (s2 - s_2)) / (12.0 * delta),
+                )
+            })
+            .unzip();
+        reference.slopes = Some([temp_slope, salt_slope]);
+        reference
+    }
+
     /// The temperature at height `z`.
     pub fn temperature(&self, z: f64) -> f64 {
-        interpolate_profile(&self.heights, &self.temp, z)
+        self.samples(TracerComponent::Temperature).at(z)
     }
 
     /// The salinity at height `z`.
     pub fn salinity(&self, z: f64) -> f64 {
-        interpolate_profile(&self.heights, &self.salt, z)
+        self.samples(TracerComponent::Salinity).at(z)
     }
 
-    fn values(&self, component: TracerComponent) -> &[f64] {
-        match component {
-            TracerComponent::Temperature => &self.temp,
-            TracerComponent::Salinity => &self.salt,
+    fn samples(&self, component: TracerComponent) -> ProfileSamples<'_> {
+        let (values, j) = match component {
+            TracerComponent::Temperature => (&self.temp, 0),
+            TracerComponent::Salinity => (&self.salt, 1),
+        };
+        ProfileSamples {
+            heights: &self.heights,
+            values,
+            slopes: self.slopes.as_ref().map(|slopes| &slopes[j][..]),
         }
     }
 }
@@ -336,9 +420,7 @@ pub fn apply_tracer_limiters_3d(
                 config
                     .reference
                     .as_deref()
-                    .map(|profile: &TracerReferenceProfile| {
-                        (&profile.heights[..], profile.values(component))
-                    })
+                    .map(|profile: &TracerReferenceProfile| profile.samples(component))
             };
             apply_horizontal_kuzmin_field(
                 &mut state.temp,
@@ -718,7 +800,7 @@ struct KuzminScratch {
 
 /// Horizontal Kuzmin limiting of `field`, layer by layer, against bounds
 /// taken at constant height, of its departure from a `reference`
-/// stratification (`(heights, values)`; none is zero).
+/// stratification (none is zero).
 ///
 /// On a sloping bed a σ-layer crosses the stratification, so a smooth `T(z)`
 /// varies along it, extremal where the bed is (the top of a seamount). The
@@ -760,7 +842,7 @@ struct KuzminScratch {
 #[allow(clippy::too_many_arguments)]
 fn apply_horizontal_kuzmin_field(
     field: &mut [f64],
-    reference: Option<(&[f64], &[f64])>,
+    reference: Option<ProfileSamples<'_>>,
     columns: &LayerColumns,
     heights: &[f64],
     mesh: &Mesh2D,
@@ -771,12 +853,8 @@ fn apply_horizontal_kuzmin_field(
     let (n_elements, n_nodes, n_levels) = (columns.n_elements, columns.n_nodes, columns.n_levels);
     // The reference at a node's layer centre
     let reference_at = |k: usize, i: usize, level: usize| {
-        reference.map_or(0.0, |(heights, values)| {
-            interpolate_profile(
-                heights,
-                values,
-                columns.centre_height(ElementIndex::new(k), i, level),
-            )
+        reference.map_or(0.0, |profile| {
+            profile.at(columns.centre_height(ElementIndex::new(k), i, level))
         })
     };
     let mut averages = Pooled::take(
@@ -1071,18 +1149,6 @@ fn relaxed_bounds(bound_min: f64, bound_max: f64, relaxation: f64, scale: f64) -
 
 /// `values` at `heights` (increasing) interpolated linearly to `z`, constant
 /// beyond the ends.
-fn interpolate_profile(heights: &[f64], values: &[f64], z: f64) -> f64 {
-    let j = heights.partition_point(|&h| h < z);
-    if j == 0 {
-        values[0]
-    } else if j == heights.len() {
-        values[j - 1]
-    } else {
-        let t = (z - heights[j - 1]) / (heights[j] - heights[j - 1]);
-        values[j - 1] + t * (values[j] - values[j - 1])
-    }
-}
-
 fn compute_theta(avg: f64, min_value: f64, max_value: f64, bound_min: f64, bound_max: f64) -> f64 {
     let mut theta: f64 = 1.0;
 
@@ -1376,5 +1442,52 @@ mod tests {
             (before - after).abs() < 1e-10,
             "inventory changed: before={before}, after={after}"
         );
+    }
+
+    /// The cubic reference reproduces a cubic profile, and is constant
+    /// beyond its samples.
+    #[test]
+    fn a_smooth_reference_is_exact_for_a_cubic() {
+        let profile = |z: f64| (0.01 * z * z * z - 0.3 * z + 8.0, 33.0 + 0.02 * z * z);
+        let reference = TracerReferenceProfile::from_smooth_fn(-20.0, 0.0, 7, profile);
+        for j in 0..=200 {
+            let z = -20.0 + 0.1 * j as f64;
+            let (t, s) = profile(z);
+            assert!(
+                (reference.temperature(z) - t).abs() < 1e-9,
+                "T at {z}: {} vs {t}",
+                reference.temperature(z)
+            );
+            assert!((reference.salinity(z) - s).abs() < 1e-9, "S at {z}");
+        }
+        assert_eq!(reference.temperature(-25.0), profile(-20.0).0);
+        assert_eq!(reference.salinity(3.0), profile(0.0).1);
+    }
+
+    /// Against a halocline (S 25 over 33, 3 m thick) the cubic reference's
+    /// error falls as spacing⁴, the linear one's as spacing²; at a 4 cm
+    /// spacing the cubic's is ≈ 10⁻⁸ of the step (the linear one's ≈ 10⁻⁴).
+    #[test]
+    fn a_smooth_reference_converges_at_fourth_order() {
+        let halocline = |z: f64| (10.0, 33.0 - 4.0 * (1.0 + ((z + 5.0) / 1.5).tanh()));
+        let error = |reference: &TracerReferenceProfile| {
+            (0..=20_000)
+                .map(|j| {
+                    let z = -20.0 + 1e-3 * j as f64;
+                    (reference.salinity(z) - halocline(z).1).abs()
+                })
+                .fold(0.0, f64::max)
+        };
+        let errors =
+            |build: fn(f64, f64, usize, &dyn Fn(f64) -> (f64, f64)) -> TracerReferenceProfile| {
+                [161, 321].map(|n| error(&build(-20.0, 0.0, n, &halocline)))
+            };
+        let cubic = errors(|a, b, n, f| TracerReferenceProfile::from_smooth_fn(a, b, n, f));
+        let linear = errors(|a, b, n, f| TracerReferenceProfile::from_fn(a, b, n, f));
+        let order = |[coarse, fine]: [f64; 2]| (coarse / fine).log2();
+        assert!(order(cubic) > 3.8, "cubic: {cubic:?}");
+        assert!((order(linear) - 2.0).abs() < 0.1, "linear: {linear:?}");
+        // 321 samples over 20 m: 6.25 cm apart
+        assert!(cubic[1] < 1e-6 && linear[1] > 1e-4, "{cubic:?} {linear:?}");
     }
 }

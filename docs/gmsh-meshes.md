@@ -217,4 +217,8 @@ plus a quad-dominant version that the reader must reject.
 `scripts/gmsh_farm_mesh.py` builds `tests/data/gmsh/fjord_farm.msh`: the fjord
 arm above, in local metres, with ≈ 20 m quads at the farm growing to ≈ 450 m
 (`uv run scripts/gmsh_farm_mesh.py`). It is the benchmark for local time
-stepping (`MultirateSSPRK3`, `examples/local_time_stepping_farm.rs`).
+stepping (`MultirateSSPRK3`, `examples/local_time_stepping_farm.rs`). With
+`farm=40 out=tests/data/gmsh/fjord_farm_3d.msh` it builds the same fjord with
+40 m quads at the farm (2016 elements against 3584), the mesh the viewer's 3D
+fjord runs on (`dg-viz --scenario fjord3d`): the 3D model has no local time
+stepping, so the farm's quads set its one step.

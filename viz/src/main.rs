@@ -13,12 +13,12 @@
 //! Scenarios ([`scenario`]): the farm fjord of `examples/local_time_stepping_farm.rs`,
 //! Frøya–Smøla–Hitra on the coastline mesh with NorKyst-800 boundary tides, as
 //! `examples/froya_real_data.rs` runs it (its data files in `../data/`), or the
-//! stratified farm channel of `examples/farm_3d.rs` in 3D: there the water shows the
-//! depth-mean current or any σ-layer's, a vertical section along the flow through a
-//! cage shows the speed or temperature in the water column ([`layers`]), a sheet at
-//! the strongest stratification of every column shows the pycnocline, halocline or
-//! thermocline ([`stratification`]), and lice
-//! larvae, faeces and feed are tracked in 3D ([`cloud_3d`]).
+//! stratified farm channel of `examples/farm_3d.rs` or the farm fjord in 3D: there
+//! the water shows the depth-mean current or any σ-layer's, a vertical section along
+//! the flow through a cage shows the speed or temperature in the water column
+//! ([`layers`]), a sheet at the strongest stratification of every column shows the
+//! pycnocline, halocline or thermocline ([`stratification`]), and lice larvae, faeces
+//! and feed are tracked in 3D ([`cloud_3d`]).
 //!
 //! ```bash
 //! cd viz && cargo run --release -- [options]
@@ -30,14 +30,16 @@
 //! menu's window and ends).
 //!
 //! Options (defaults in brackets):
-//! - `--scenario fjord|froya|channel` [fjord, given any other option]. Frøya reads
+//! - `--scenario fjord|fjord3d|froya|channel` [fjord, given any other option]. Frøya reads
 //!   `../data/froya_coast.msh` (from `scripts/gmsh_coastline_mesh.py`),
 //!   `../data/froya_topobathy.tif` and `../data/froya_boundary_tides.txt`;
 //!   the close-up (F) is the Mausund tide gauge, and it has no cages or particles.
 //!   Its run is ≈ 30× faster than real time on 12 threads, so play it back at
 //!   `--rate 30` or below to keep up with the solver.
 //!   The channel runs in 3D, from rest with the tide ramped up over an hour; its
-//!   particles start at once, three kinds per cage.
+//!   particles start at once, three kinds per cage. `fjord3d` runs the fjord farm in
+//!   3D the same way: its M2 through the open boundary, a brackish surface layer and a
+//!   summer thermocline, T and S relaxing to them along the open boundary.
 //! - `--replay FILE|DIR` play back a run instead of running the solver ([`replay`]),
 //!   shown linear in time between its frames; the rate defaults to an hour per
 //!   second, and the status shows the run's UTC date when the run has a clock.
@@ -80,17 +82,18 @@
 //!   `../data/tide_gauges/mausund_obs.txt`) drawn against the model's surface at the
 //!   close-up point in the trace (top right, G; [`trace`]); it needs the run's clock,
 //!   so a replay's or a `--start`-dated run's
-//! - `--sigma N` σ-levels of a 3D run [16]; `--start TIME` the UTC instant of model
-//!   time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
+//! - `--sigma N` σ-levels of a 3D run [16; 12 for `fjord3d`]; `--start TIME` the UTC
+//!   instant of model time 0, for the larvae's daylight [2025-06-15T00:00:00Z]; `--lice
 //!   ladim|johnsen|passive` the larvae's behaviour (`dg_rs::particles::SalmonLice`)
 //!   [ladim]; `--section speed|temperature|off` what the section shows at the start
 //!   [speed]; `--sheet density|salinity|temperature|off` what the stratification
 //!   sheet follows at the start ([`stratification`]) [density]; `--layer
 //!   mean|surface|bed|N` the current the water shows at the start (N: σ-layer from the
 //!   bed, 0) [mean]
-//! - `--mesh PATH` Gmsh mesh [`../tests/data/gmsh/fjord_farm.msh`, or Frøya's]
-//! - `--order N` polynomial order [2]; `--levels N` local time stepping levels, 0 for
-//!   global SSP-RK3 [8]
+//! - `--mesh PATH` Gmsh mesh [`../tests/data/gmsh/fjord_farm.msh`; for `fjord3d`
+//!   `fjord_farm_3d.msh`, 40 m quads at the farm; or Frøya's]
+//! - `--order N` polynomial order [2; 1 for `fjord3d`]; `--levels N` local time
+//!   stepping levels, 0 for global SSP-RK3 (2D only) [8]
 //! - `--hours H` model hours to run [25]; `--interval S` model seconds between
 //!   snapshots [60]; `--threads N` solver threads [all but two cores]
 //! - `--memory MB` snapshots kept, oldest dropped first (a live run, or VTU frames)
@@ -191,7 +194,8 @@ struct Args {
     pin: Option<[f64; 2]>,
     origin: Option<String>,
     mesh: Option<PathBuf>,
-    order: usize,
+    /// `--order`, `--sigma`: else the scenario's defaults
+    order: Option<usize>,
     levels: usize,
     hours: f64,
     interval: f64,
@@ -207,7 +211,7 @@ struct Args {
     view: String,
     screenshot: Option<String>,
     at: Option<f64>,
-    sigma: usize,
+    sigma: Option<usize>,
     start: String,
     section: SectionShows,
     sheet: SheetShows,
@@ -231,7 +235,7 @@ impl Args {
             pin: None,
             origin: None,
             mesh: None,
-            order: 2,
+            order: None,
             levels: 8,
             hours: 25.0,
             interval: 60.0,
@@ -253,7 +257,7 @@ impl Args {
             view: "farm".into(),
             screenshot: None,
             at: None,
-            sigma: 16,
+            sigma: None,
             start: "2025-06-15T00:00:00Z".into(),
             section: SectionShows::Speed,
             sheet: SheetShows::Density,
@@ -286,7 +290,7 @@ impl Args {
                 "--origin" => args.origin = Some(value),
                 "--save-snapshot" => args.save_snapshot = Some(value.into()),
                 "--mesh" => args.mesh = Some(value.into()),
-                "--order" => args.order = num(&flag, &value)?,
+                "--order" => args.order = Some(num(&flag, &value)?),
                 "--levels" => args.levels = num(&flag, &value)?,
                 "--hours" => args.hours = num(&flag, &value)?,
                 "--interval" => args.interval = num(&flag, &value)?,
@@ -324,7 +328,7 @@ impl Args {
                         }
                     }
                 }
-                "--sigma" => args.sigma = num(&flag, &value)?,
+                "--sigma" => args.sigma = Some(num(&flag, &value)?),
                 "--start" => args.start = value,
                 "--section" => {
                     args.section = match value.as_str() {
@@ -481,13 +485,18 @@ fn main() -> AppExit {
             }
             .into()
         });
+        // The 3D fjord at P1 on 12 levels, ≈ 4× cheaper than P2 on 16
+        let (order, sigma) = match scenario_name.as_str() {
+            "fjord3d" => (args.order.unwrap_or(1), args.sigma.unwrap_or(12)),
+            _ => (args.order.unwrap_or(2), args.sigma.unwrap_or(16)),
+        };
         let built = match scenario_name.as_str() {
             "fjord" => {
                 let mesh = args
                     .mesh
                     .clone()
                     .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm.msh"));
-                Scenario::fjord_farm(&mesh, args.order)
+                Scenario::fjord_farm(&mesh, order)
             }
             "froya" => {
                 let data = repo.join("data");
@@ -503,16 +512,26 @@ fn main() -> AppExit {
                     &mesh,
                     &data.join("froya_topobathy.tif"),
                     &data.join("froya_boundary_tides.txt"),
-                    args.order,
+                    order,
                     args.hours * 3600.0,
                 )
             }
             "channel" => match ModelClock::parse(&args.start) {
-                Ok(clock) => Ok(Scenario::farm_channel(args.order, args.sigma, clock)),
+                Ok(clock) => Ok(Scenario::farm_channel(order, sigma, clock)),
+                Err(e) => Err(format!("--start {}: {e}", args.start).into()),
+            },
+            "fjord3d" => match ModelClock::parse(&args.start) {
+                Ok(clock) => {
+                    let mesh = args
+                        .mesh
+                        .clone()
+                        .unwrap_or_else(|| repo.join("tests/data/gmsh/fjord_farm_3d.msh"));
+                    Scenario::fjord_farm_3d(&mesh, order, sigma, clock)
+                }
                 Err(e) => Err(format!("--start {}: {e}", args.start).into()),
             },
             other => {
-                eprintln!("unknown scenario {other}: fjord, froya or channel");
+                eprintln!("unknown scenario {other}: fjord, fjord3d, froya or channel");
                 return AppExit::from_code(2);
             }
         };
@@ -737,7 +756,7 @@ fn main() -> AppExit {
         "{}: {} elements (P{}), {} nodes; {} + {} current arrows",
         scenario.name,
         scenario.mesh.n_elements,
-        args.order,
+        scenario.ops.order,
         nodes.len(),
         arrows.count().0,
         arrows.count().1

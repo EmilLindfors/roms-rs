@@ -2,8 +2,9 @@
 //!
 //! `dg-viz` without arguments (or with `--menu`) opens this window instead of a
 //! scenario. It lists the scenarios the viewer can run live (the fjord farm, Frøya,
-//! the 3D farm channel) and the saved runs found under `../output` (snapshot files,
-//! `*.dgsnap`, and folders of VTU frames, `froya_NNNN.vtu`), newest first, with the
+//! the 3D farm channel, the fjord farm in 3D) and the saved runs found under
+//! `../output` (snapshot files, `*.dgsnap`, and folders of VTU frames,
+//! `froya_NNNN.vtu`), newest first, with the
 //! common options: model hours, the starting view, the photo view, the Mausund
 //! gauge in the trace and saving the run as a snapshot file. A file or folder
 //! dropped on the window is replayed directly.
@@ -263,6 +264,15 @@ impl Menu {
                  larvae, faeces and feed",
                 None,
             ),
+            live(
+                "fjord3d",
+                "Fjord farm in 3D",
+                "The fjord's tide over a brackish layer and a thermocline: σ-layers, a \
+                 section along the fjord through the cages, larvae diving out of the \
+                 fresh water",
+                (!has("tests/data/gmsh/fjord_farm_3d.msh"))
+                    .then(|| "needs tests/data/gmsh/fjord_farm_3d.msh".into()),
+            ),
         ];
         Self {
             n_live: entries.len(),
@@ -335,7 +345,10 @@ impl Menu {
 
     fn gauge(&self) -> Option<PathBuf> {
         let path = self.repo.join(GAUGE);
-        let frøya = !matches!(self.entry().kind, Kind::Live("fjord" | "channel"));
+        let frøya = !matches!(
+            self.entry().kind,
+            Kind::Live("fjord" | "channel" | "fjord3d")
+        );
         (frøya && path.is_file()).then_some(path)
     }
 
@@ -1206,6 +1219,11 @@ mod tests {
         );
         assert_eq!(command.len(), 8);
 
+        // The fjord in 3D, after the channel; no gauge there either
+        menu.select(3);
+        assert_eq!(&menu.command()[..2], ["--scenario", "fjord3d"]);
+        assert!(menu.gauge().is_none());
+
         menu.entries.push(Entry {
             kind: Kind::Snapshot,
             title: "x/froya.dgsnap".into(),
@@ -1215,7 +1233,7 @@ mod tests {
             details: Some(String::new()),
             missing: None,
         });
-        menu.select(3);
+        menu.select(menu.entries.len() - 1);
         assert_eq!(&menu.command()[..2], ["--replay", "x/froya.dgsnap"]);
         assert!(!menu.choice(Choice::Hours).1, "a replay has its own hours");
         assert!(!menu.choice(Choice::Save).1, "a snapshot is saved already");
