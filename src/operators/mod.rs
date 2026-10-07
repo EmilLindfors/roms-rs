@@ -10,6 +10,7 @@ mod geometric;
 mod lift;
 mod mass;
 mod operators_2d;
+mod transfer;
 
 pub use differentiation::{differentiation_matrix, strong_differentiation_matrix};
 pub(crate) use geometric::bilinear_jacobian;
@@ -17,6 +18,7 @@ pub use geometric::{AffineMetric, ElementGeometry, GeometricFactors2D};
 pub use lift::lift_matrix;
 pub use mass::{mass_matrix, mass_matrix_inv};
 pub use operators_2d::{DGOperators2D, FACE_NORMALS};
+pub use transfer::MeshTransfer2D;
 
 use crate::basis::Vandermonde;
 use crate::polynomial::{gauss_lobatto_nodes, gauss_lobatto_weights};

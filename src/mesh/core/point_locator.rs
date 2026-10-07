@@ -219,6 +219,89 @@ impl<'a> PointLocator2D<'a> {
             .find_map(|&k| self.in_element(k, p))
     }
 
+    /// The point of the mesh closest to `p` and its distance from `p`: `p`
+    /// itself (distance 0) if it is inside, else the nearest point on the
+    /// faces of the elements around it. `None` for an empty mesh or a
+    /// non-finite `p`.
+    ///
+    /// The buckets are searched in square rings around `p`'s; an element not
+    /// yet tested lies in buckets of a later ring, at least `R` bucket widths
+    /// away after ring `R`, so the search stops once the best distance is
+    /// below that.
+    pub fn nearest(&self, p: [f64; 2]) -> Option<(MeshPoint, f64)> {
+        if self.mesh.n_elements == 0 || !p[0].is_finite() || !p[1].is_finite() {
+            return None;
+        }
+        if let Some(found) = self.locate(p) {
+            return Some((found, 0.0));
+        }
+        let (ci, cj) = self.bucket(p[0], p[1]);
+        let width = (1.0 / self.inv_cell[0]).min(1.0 / self.inv_cell[1]);
+        let mut best: Option<(MeshPoint, f64)> = None;
+        let rings = self.dims[0].max(self.dims[1]);
+        for ring in 0..=rings {
+            let (i0, i1) = (ci.saturating_sub(ring), (ci + ring).min(self.dims[0] - 1));
+            let (j0, j1) = (cj.saturating_sub(ring), (cj + ring).min(self.dims[1] - 1));
+            for j in j0..=j1 {
+                for i in i0..=i1 {
+                    // Only the ring itself: the inner buckets were tested
+                    if i.abs_diff(ci) != ring && j.abs_diff(cj) != ring {
+                        continue;
+                    }
+                    let b = j * self.dims[0] + i;
+                    for &k in &self.elements[self.offsets[b]..self.offsets[b + 1]] {
+                        let (point, distance) = self.nearest_in_element(k, p);
+                        if best.is_none_or(|(_, d)| distance < d) {
+                            best = Some((point, distance));
+                        }
+                    }
+                }
+            }
+            if best.is_some_and(|(_, d)| d <= ring as f64 * width) {
+                break;
+            }
+        }
+        best
+    }
+
+    /// The point of element `k` closest to `p`, which is outside it, and its
+    /// distance: the nearest point of its four straight faces, whose
+    /// reference coordinates are those of the face's parameter.
+    fn nearest_in_element(&self, k: ElementIndex, p: [f64; 2]) -> (MeshPoint, f64) {
+        let v = self.mesh.element_vertices(k);
+        let mut best = (
+            MeshPoint {
+                element: k,
+                r: 0.0,
+                s: 0.0,
+            },
+            f64::INFINITY,
+        );
+        for face in 0..4 {
+            let (a, b) = (v[face], v[(face + 1) % 4]);
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let length2 = dx * dx + dy * dy;
+            let t = if length2 > 0.0 {
+                (((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / length2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let distance = (a[0] + t * dx - p[0]).hypot(a[1] + t * dy - p[1]);
+            if distance < best.1 {
+                // Faces counter-clockwise from (−1, −1): s = −1, r = 1, s = 1, r = −1
+                let u = -1.0 + 2.0 * t;
+                let (r, s) = match face {
+                    0 => (u, -1.0),
+                    1 => (1.0, u),
+                    2 => (-u, 1.0),
+                    _ => (-1.0, -u),
+                };
+                best = (MeshPoint { element: k, r, s }, distance);
+            }
+        }
+        best
+    }
+
     /// `p` in element `k`, if it is there.
     pub fn in_element(&self, k: ElementIndex, p: [f64; 2]) -> Option<MeshPoint> {
         let vertices = self.mesh.element_vertices(k);
@@ -307,6 +390,55 @@ mod tests {
         ] {
             assert!(locator.locate(p).is_none(), "{p:?}");
         }
+    }
+
+    /// The nearest point agrees with a search over every face of every
+    /// element, for points around, inside and far from a mesh with a hole,
+    /// and maps to a point at the distance it reports.
+    #[test]
+    fn the_nearest_point_is_the_closest_of_all_faces() {
+        let full = distorted_mesh(9, 6);
+        let (mesh, _) = full.retain_elements(
+            |k| {
+                let [x, y] = full.reference_to_physical(k, 0.0, 0.0);
+                (x - 1.5).hypot(y) > 0.45
+            },
+            crate::mesh::BoundaryTag::Wall,
+        );
+        let locator = PointLocator2D::new(&mesh);
+        let brute = |p: [f64; 2]| {
+            ElementIndex::iter(mesh.n_elements)
+                .map(|k| {
+                    if locator.in_element(k, p).is_some() {
+                        0.0
+                    } else {
+                        locator.nearest_in_element(k, p).1
+                    }
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+        let mut outside = 0;
+        for i in 0..41 {
+            for j in 0..29 {
+                let p = [-1.0 + 0.125 * i as f64, -2.3 + 0.1625 * j as f64];
+                let (point, distance) = locator.nearest(p).expect("a point");
+                let expected = brute(p);
+                assert!(
+                    (distance - expected).abs() < 1e-12,
+                    "{p:?}: {distance} against {expected}"
+                );
+                let q = mesh.reference_to_physical(point.element, point.r, point.s);
+                assert!(
+                    ((q[0] - p[0]).hypot(q[1] - p[1]) - distance).abs() < 1e-12,
+                    "{p:?} maps to {q:?}"
+                );
+                outside += usize::from(distance > 0.0);
+            }
+        }
+        assert!(outside > 300, "{outside} points outside");
+        let (_, far) = locator.nearest([40.0, -30.0]).unwrap();
+        assert!((far - brute([40.0, -30.0])).abs() < 1e-12);
+        assert!(locator.nearest([f64::NAN, 0.0]).is_none());
     }
 
     /// Holes: points in elements removed by `retain_elements` are outside.

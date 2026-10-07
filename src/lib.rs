@@ -84,7 +84,7 @@ pub use boundary::{
 pub use boundary::{NestingOptions, NestingRelaxation2D, OceanModelState};
 pub use equations::Advection2D;
 pub use mesh::{BoundaryConfig, BoundaryTag, Mesh2D, Mesh2DBuilder};
-pub use operators::{DGOperators2D, GeometricFactors2D};
+pub use operators::{DGOperators2D, GeometricFactors2D, MeshTransfer2D};
 #[cfg(feature = "parallel")]
 pub use solver::compute_rhs_tracer_2d_parallel;
 pub use solver::{
