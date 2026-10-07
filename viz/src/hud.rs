@@ -24,7 +24,7 @@ use crate::surface::{BedScale, ColourBy, Colouring, SurfaceStyle, WaterOpacity};
 const KEYS: &str = "Space pause   [ ] rate   ← → seek   Home/End\n\
 C colour   T water   - = water opacity   B contours   L land   A arrows\n\
 P particles   F close-up   O overview   G gauge trace   H keys\n\
-R photo view   W wind speed   Shift+W wind direction\n\
+R photo view   W wind speed   Shift+W wind direction   M menu\n\
 drag orbit   right-drag pan   wheel zoom";
 /// The keys of a 3D run, added to [`KEYS`].
 const KEYS_3D: &str = ", . layer (depth mean, surface … bed)   V section   N stratification sheet";

@@ -24,12 +24,18 @@
 //! cd viz && cargo run --release -- [options]
 //! ```
 //!
+//! Without options (or with `--menu`) the viewer opens its start menu ([`menu`]): the
+//! scenarios to run and the saved runs under `../output` to replay, with the common
+//! options, and M in the viewer returns to it (`--menu --screenshot PATH` saves the
+//! menu's window and ends).
+//!
 //! Options (defaults in brackets):
-//! - `--scenario fjord|froya|channel` [fjord]. Frøya reads `../data/froya_coast.msh` (from
-//!   `scripts/gmsh_coastline_mesh.py`), `../data/froya_topobathy.tif` and
-//!   `../data/froya_boundary_tides.txt`; the close-up (F) is the Mausund tide gauge,
-//!   and it has no cages or particles. Its run is ≈ 30× faster than real time on 12
-//!   threads, so play it back at `--rate 30` or below to keep up with the solver.
+//! - `--scenario fjord|froya|channel` [fjord, given any other option]. Frøya reads
+//!   `../data/froya_coast.msh` (from `scripts/gmsh_coastline_mesh.py`),
+//!   `../data/froya_topobathy.tif` and `../data/froya_boundary_tides.txt`;
+//!   the close-up (F) is the Mausund tide gauge, and it has no cages or particles.
+//!   Its run is ≈ 30× faster than real time on 12 threads, so play it back at
+//!   `--rate 30` or below to keep up with the solver.
 //!   The channel runs in 3D, from rest with the tide ramped up over an hour; its
 //!   particles start at once, three kinds per cage.
 //! - `--replay FILE|DIR` play back a run instead of running the solver ([`replay`]),
@@ -126,6 +132,7 @@ mod field;
 mod hud;
 mod inspect;
 mod layers;
+mod menu;
 mod particles;
 mod photo;
 mod playback;
@@ -158,7 +165,6 @@ use contours::ContoursPlugin;
 use field::{Field, Frame, Nodes, Probe, ShownLayer};
 use hud::{HudPlugin, RunClock, Title};
 use layers::{LayersPlugin, Levels, Section, SectionShows};
-use stratification::{SheetShows, Stratification, StratificationPlugin};
 use particles::{Lice, ParticleConfig, ParticlesPlugin, Periodic};
 use photo::{Photo, PhotoPlugin};
 use playback::{Playback, PlaybackPlugin, SolverChannel, SolverState, Source};
@@ -166,6 +172,7 @@ use replay::Replay;
 use scenario::Scenario;
 use site::{SiteDrawing, SitePlugin, Sites};
 use solver::SolverConfig;
+use stratification::{SheetShows, Stratification, StratificationPlugin};
 use surface::{Colouring, SurfacePlugin, WaterOpacity};
 use terrain::{Terrain, TerrainPlugin};
 use trace::{Trace, TracePlugin};
@@ -361,7 +368,7 @@ impl Args {
                         return Err(bad());
                     }
                 }
-"--eye" => args.eye = Some(eye(&value)?),
+                "--eye" => args.eye = Some(eye(&value)?),
                 "--fetch" => args.photo.fetch = 1e3 * num::<f32>(&flag, &value)?,
                 "--view" => args.view = value,
                 "--screenshot" => args.screenshot = Some(value),
@@ -429,7 +436,24 @@ fn place(value: &str) -> Result<(String, [f64; 2]), String> {
     Ok((name.to_string(), [1e3 * x, 1e3 * y]))
 }
 
+/// Fira Mono in full in place of Bevy's default subset, which has no ø, æ, å.
+fn install_font(app: &mut App) {
+    app.world_mut()
+        .resource_mut::<Assets<Font>>()
+        .insert(AssetId::default(), Font::from_bytes(FONT.to_vec()))
+        .expect("the default font's handle");
+}
+
 fn main() -> AppExit {
+    let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
+    let given: Vec<String> = std::env::args().skip(1).collect();
+    match given.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        [] | ["--menu"] => return menu::run(repo, None, install_font),
+        ["--menu", "--screenshot", path] => {
+            return menu::run(repo, Some(path.into()), install_font);
+        }
+        _ => {}
+    }
     let args = match Args::parse() {
         Ok(args) => args,
         Err(e) => {
@@ -437,7 +461,6 @@ fn main() -> AppExit {
             return AppExit::from_code(2);
         }
     };
-    let repo = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/.."));
     // A snapshot file holds its own domain; VTU frames are of a Frøya run unless
     // told otherwise
     let snapshot_file = args.replay.as_deref().filter(|p| p.is_file());
@@ -756,9 +779,7 @@ fn main() -> AppExit {
         },
     };
     let start = match args.eye {
-        Some((at, height, bearing, tilt)) => {
-            photo::eye_view(&frame, at, height, bearing, tilt)
-        }
+        Some((at, height, bearing, tilt)) => photo::eye_view(&frame, at, height, bearing, tilt),
         None => match args.view.as_str() {
             "farm" => views.farm,
             "domain" => views.domain,
@@ -1007,6 +1028,7 @@ fn main() -> AppExit {
     })
     .add_systems(Update, field::interpolate)
     .add_systems(Update, capture.after(field::interpolate))
+    .add_systems(Update, back_to_menu)
     .add_systems(Last, playback::settle);
     if let Some(clock) = run_clock {
         app.insert_resource(RunClock(clock));
@@ -1023,12 +1045,27 @@ fn main() -> AppExit {
             .insert_resource(Stratification::new(args.sheet))
             .add_plugins((LayersPlugin, StratificationPlugin));
     }
-    // Fira Mono in full in place of Bevy's default subset, which has no ø, æ, å
-    app.world_mut()
-        .resource_mut::<Assets<Font>>()
-        .insert(AssetId::default(), Font::from_bytes(FONT.to_vec()))
-        .expect("the default font's handle");
+    install_font(&mut app);
     app.run()
+}
+
+/// M: back to the start menu. A viewer the menu started ends with
+/// [`menu::BACK_TO_MENU`] and the menu shows again; one started from the command
+/// line opens a menu and ends.
+fn back_to_menu(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
+    if !keys.just_pressed(KeyCode::KeyM) {
+        return;
+    }
+    if std::env::var_os(menu::MENU_ENV).is_some() {
+        exit.write(AppExit::from_code(menu::BACK_TO_MENU));
+        return;
+    }
+    match std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn()) {
+        Ok(_) => {
+            exit.write(AppExit::Success);
+        }
+        Err(e) => eprintln!("cannot open the menu: {e}"),
+    }
 }
 
 fn capture(
