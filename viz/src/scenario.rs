@@ -15,6 +15,11 @@
 //!   40 m deep, 2 °C warmer over the top 10 m, an M2 current of ≈ 0.5 m/s driven by a
 //!   depth-uniform body force, two 50 m cages with 20 m nets across the flow, GLS k-ε
 //!   mixing and a log-layer bottom drag.
+//! - [`Scenario::fjord_farm_3d`] is the fjord farm run by the 3D model: the same mesh,
+//!   bed and M2 tide (through the open boundary, driving the barotropic mode), a
+//!   brackish surface layer over the sill water and a summer thermocline
+//!   ([`fjord_profile`]), on surface-stretched σ-levels; T and S relax to that
+//!   stratification at rest in a band along the open boundary.
 
 use std::error::Error;
 use std::f64::consts::PI;
@@ -26,14 +31,14 @@ use dg_rs::io::{
     BedRaster, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry, LocalProjection,
     SnapshotHeader,
 };
-use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D, read_gmsh_mesh};
+use dg_rs::mesh::{Bathymetry2D, BoundaryTag, ElementSlopeBound, Mesh2D, read_gmsh_mesh};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::particles::ClearSkyLight;
 use dg_rs::solver::{SWESolution2D, SWEState2D};
 use dg_rs::source::{CageFootprint, NetCage};
 use dg_rs::time::ModelClock;
 use dg_rs::types::ElementIndex;
-use dg_rs::vertical::{SigmaGrid, UniformStretching};
+use dg_rs::vertical::{SigmaGrid, SongHaidvogelStretching, UniformStretching};
 
 pub const G: f64 = 9.81;
 
@@ -83,10 +88,14 @@ pub struct CloseUp {
 #[derive(Clone, Debug)]
 pub struct ThreeD {
     pub sigma: Arc<SigmaGrid>,
-    /// Temperature (°C) at rest at height z (m, negative below the surface)
-    pub temperature: fn(f64) -> f64,
-    /// Salinity at rest
-    pub salinity: f64,
+    /// Temperature (°C) and salinity at rest at height z (m, negative below the
+    /// surface), the same in every column
+    pub profile: fn(f64) -> (f64, f64),
+    /// Open faces: the width (m) of the band along them in which T and S relax to
+    /// the stratification at rest, and its time scale on the boundary (s)
+    pub open_band: (f64, f64),
+    /// The vertical mixing
+    pub mixing: Mixing,
     /// Bed roughness z₀ of the log-layer drag (m)
     pub roughness: f64,
     /// Horizontal viscosity: constant background (m²/s) and Smagorinsky coefficient
@@ -96,6 +105,17 @@ pub struct ThreeD {
     pub section: [[f64; 2]; 2],
     /// Surface light over the site, for the lice larvae
     pub light: ClearSkyLight,
+}
+
+/// The vertical mixing of a 3D model.
+#[derive(Clone, Copy, Debug)]
+pub enum Mixing {
+    /// GLS k-ε, with the bed's roughness
+    Gls,
+    /// Constant eddy viscosity and diffusivity (m²/s): with no diffusivity a
+    /// stratification at rest stays as it is, as the rest-state gates need
+    #[cfg_attr(not(test), expect(dead_code, reason = "the gates' mixing"))]
+    Constant { viscosity: f64, diffusivity: f64 },
 }
 
 pub struct Scenario {
@@ -167,6 +187,76 @@ impl Scenario {
         })
     }
 
+    /// The fjord farm (see [`Self::fjord_farm`]) run by the 3D model on `levels`
+    /// surface-stretched σ-levels, stratified as [`fjord_profile`], with the larvae's
+    /// light at Mausund on `clock`. The tide enters through the open boundary as in
+    /// 2D, for the barotropic mode; the bed's element slopes are bounded for the
+    /// pycnocline (`Bathymetry2D::smooth_element_slopes`), which the analytic fjord
+    /// bed is within already (r_x0 ≲ 0.05 everywhere), so it is a guard for other
+    /// meshes.
+    pub fn fjord_farm_3d(
+        mesh_path: &Path,
+        order: usize,
+        levels: usize,
+        clock: ModelClock,
+    ) -> Result<Self, Box<dyn Error>> {
+        /// Mausund, off Frøya (longitude, latitude): where the sun is
+        const SITE: [f64; 2] = [8.67, 63.87];
+        /// The bottom of the pycnocline of [`fjord_profile`] (m)
+        const PYCNOCLINE_BOTTOM: f64 = 20.0;
+        /// The 3D model's thin-column depth (`Hydrostatic3D::DEFAULT_MIN_COLUMN_DEPTH`,
+        /// m): shallower pairs need no bound
+        const THIN_COLUMN: f64 = 0.1;
+
+        let mut scenario = Self::fjord_farm(mesh_path, order)?;
+        let mut bed = Bathymetry2D::clone(&scenario.bathymetry);
+        let smoothed = bed.smooth_element_slopes(
+            &scenario.mesh,
+            &scenario.ops,
+            &scenario.geom,
+            ElementSlopeBound::for_pycnocline(PYCNOCLINE_BOTTOM),
+            THIN_COLUMN,
+        );
+        if smoothed.changed > 0 {
+            println!(
+                "The bed smoothed for the 3D model: {} elements over the slope bound, \
+                 {} nodes moved by up to {:.2} m",
+                smoothed.elements_before, smoothed.changed, smoothed.max_change
+            );
+        }
+        scenario.bathymetry = Arc::new(bed);
+        let farm = scenario.farm;
+        scenario.name = "Fjord farm, 3D: M2 0.8 m, brackish layer over sill water, \
+                         two 50 m cages"
+            .into();
+        scenario.three_d = Some(ThreeD {
+            // Refined at the surface for the brackish layer, as Frøya's 3D tide
+            sigma: Arc::new(SigmaGrid::new(
+                levels,
+                SongHaidvogelStretching::new(5.0, 0.4, 10.0),
+            )),
+            profile: fjord_profile,
+            // A band a sixth of the fjord's length
+            open_band: (2_000.0, 1_800.0),
+            mixing: Mixing::Gls,
+            roughness: 0.005,
+            viscosity: 1.0,
+            smagorinsky: 0.2,
+            // Along the fjord, the tide's direction, through both cages
+            section: [[farm[0] - 1_500.0, farm[1]], [farm[0] + 1_500.0, farm[1]]],
+            light: ClearSkyLight::new(clock, SITE[0], SITE[1]),
+        });
+        // Low, from the side, so that the section stands behind the cages
+        scenario.close_up = CloseUp {
+            distance: 900.0,
+            yaw: 2.6,
+            pitch: 0.28,
+            ..scenario.close_up
+        };
+        scenario.clock = Some(clock);
+        Ok(scenario)
+    }
+
     /// The stratified tidal channel of `examples/farm_3d.rs` (see the module docs) on
     /// `levels` σ-levels, with the larvae's light at Mausund on `clock`.
     pub fn farm_channel(order: usize, levels: usize, clock: ModelClock) -> Self {
@@ -192,8 +282,10 @@ impl Scenario {
             three_d: Some(ThreeD {
                 sigma: Arc::new(SigmaGrid::new(levels, UniformStretching)),
                 // 10 °C below, 12 °C above, a smooth step at 10 m
-                temperature: |z| 11.0 + (0.5 * (z + 10.0)).tanh(),
-                salinity: 35.0,
+                profile: |z| (11.0 + (0.5 * (z + 10.0)).tanh(), 35.0),
+                // Periodic: no open faces
+                open_band: (0.0, 0.0),
+                mixing: Mixing::Gls,
                 roughness: 0.005,
                 viscosity: 1.0,
                 smagorinsky: 0.2,
@@ -424,8 +516,9 @@ impl Scenario {
             ThreeD {
                 sigma: Arc::new(levels.sigma.clone()),
                 // A replay runs no model: these are not used
-                temperature: |_| 0.0,
-                salinity: 0.0,
+                profile: |_| (0.0, 0.0),
+                open_band: (0.0, 0.0),
+                mixing: Mixing::Gls,
                 roughness: 0.0,
                 viscosity: 0.0,
                 smagorinsky: 0.0,
@@ -488,6 +581,16 @@ impl Scenario {
     }
 }
 
+/// The fjord's stratification at rest, temperature (°C) and salinity at height `z`
+/// (m, negative below the surface): a brackish surface layer from river runoff, S 25
+/// at the surface over S 33 sill water, the step centred at 5 m and 3 m thick; and a
+/// summer thermocline, 14 °C over 8 °C, centred at 12 m and 8 m thick. Salinity sets
+/// most of the density step (≈ 6 kg/m³ against ≈ 1 for temperature).
+pub fn fjord_profile(z: f64) -> (f64, f64) {
+    let above = |centre: f64, thickness: f64| 0.5 * (1.0 + ((z + centre) / thickness).tanh());
+    (8.0 + 6.0 * above(12.0, 4.0), 33.0 - 8.0 * above(5.0, 1.5))
+}
+
 /// A projection as snapshot files write it: `local,lat,lon`, a [`LocalProjection`]
 /// about that point (degrees).
 pub fn parse_projection(text: &str) -> Option<LocalProjection> {
@@ -510,6 +613,29 @@ pub fn format_projection(projection: &LocalProjection) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Brackish over sill water, warm over cold, and salinity sets most of the
+    /// density step.
+    #[test]
+    fn the_fjord_is_brackish_over_sill_water() {
+        use dg_rs::physics::{EquationOfState, LinearEOS};
+        let close = |a: f64, b: f64| (a - b).abs() < 0.02;
+        let ((t_top, s_top), (t_sill, s_sill)) = (fjord_profile(0.0), fjord_profile(-40.0));
+        assert!(
+            close(s_top, 25.0) && close(s_sill, 33.0),
+            "{s_top}, {s_sill}"
+        );
+        assert!(
+            close(t_top, 14.0) && close(t_sill, 8.0),
+            "{t_top}, {t_sill}"
+        );
+        assert!(close(fjord_profile(-5.0).1, 29.0) && close(fjord_profile(-12.0).0, 11.0));
+        let eos = LinearEOS::default();
+        let rho = |t, s| eos.compute_density(t, s, 0.0);
+        let by_salt = rho(t_sill, s_sill) - rho(t_sill, s_top);
+        let by_heat = rho(t_sill, s_sill) - rho(t_top, s_sill);
+        assert!(by_salt > 5.0 * by_heat, "{by_salt} against {by_heat} kg/m³");
+    }
 
     #[test]
     fn a_projection_reads_back_as_written() {

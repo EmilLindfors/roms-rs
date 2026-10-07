@@ -19,27 +19,35 @@ use std::sync::Arc;
 
 use crate::replay::SnapshotSink;
 use dg_rs::boundary::{
-    CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D, SWEBoundaryCondition2D,
+    CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Nesting3D, NestingBand3D,
+    ReferenceColumns, Reflective2D, SWEBoundaryCondition2D,
 };
 use dg_rs::equations::ShallowWater2D;
+use dg_rs::mesh::BoundaryTag;
 use dg_rs::physics::{
-    BottomDrag3D, Forcing as Forcing3D, GlsMixing, Hydrostatic3D, LinearEOS, PhysicsBuilder,
+    BottomDrag3D, ConstantMixing, EquationOfState, Forcing as Forcing3D, GlsMixing, Hydrostatic3D,
+    ImplicitVerticalAdvection, LinearEOS, PhysicsBuilder, VerticalMixing,
 };
 use dg_rs::simulation::{Simulation, Simulation3D};
 use dg_rs::solver::state::Solution3D;
-use dg_rs::solver::{SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig};
+use dg_rs::solver::{
+    SWESolution2D, SWEState2D, StandardLimiter2D, TracerLimiter3DConfig, TracerLimiterType3D,
+    TracerReferenceProfile, WetDryConfig,
+};
 use dg_rs::source::{
     CageDrag2D, CoriolisSource2D, HorizontalViscosity2D, ManningFriction2D, SourceContext2D,
-    SourceTerm2D,
+    SourceTerm2D, SpongeProfile,
 };
 use dg_rs::time::{ModeSplitIntegrator, MultirateSSPRK3, SSPRK3};
 
 use crate::cloud_3d::Cloud3D;
 use crate::particles::{Cloud, ParticleConfig, ParticleSnapshot};
-use crate::scenario::{G, Scenario, Tide};
+use crate::scenario::{Forcing, G, Mixing, Scenario, Tide};
 
 /// Reference density of the 3D model (kg/m³).
 const RHO0: f64 = 1025.0;
+/// Spacing of the tracer limiter's reference profile's samples (m).
+const REFERENCE_SPACING: f64 = 0.02;
 /// Angular frequency of M2 (1/s).
 const M2: f64 = 2.0 * PI / 44_714.16;
 
@@ -69,6 +77,29 @@ impl SourceTerm2D for TidalForce {
 
     fn name(&self) -> &'static str {
         "tidal_force"
+    }
+}
+
+/// The condition at the open faces: a characteristic one with the tide (ramped up
+/// over `forcing.ramp`), or a wall where a body force drives the flow.
+fn open_boundary(forcing: &Forcing) -> Box<dyn SWEBoundaryCondition2D + Send + Sync> {
+    let ramp = (forcing.ramp > 0.0).then_some(forcing.ramp);
+    match &forcing.tide {
+        Tide::UniformM2(amplitude) => {
+            let tide = HarmonicTide::m2(*amplitude, 0.0);
+            Box::new(CharacteristicOBC::new(match ramp {
+                Some(r) => tide.with_ramp_up(r),
+                None => tide,
+            }))
+        }
+        Tide::Atlas(tides) => {
+            let tides = tides.clone();
+            Box::new(CharacteristicOBC::new(match ramp {
+                Some(r) => tides.with_ramp_up(r),
+                None => tides,
+            }))
+        }
+        Tide::BodyForceM2(_) => Box::new(Reflective2D::new()),
     }
 }
 
@@ -250,26 +281,11 @@ pub fn spawn(
                 .expect("solver thread pool");
             pool.install(|| {
                 let wall = Reflective2D::new();
-                let ramp = (forcing.ramp > 0.0).then_some(forcing.ramp);
                 let body_force = match forcing.tide {
                     Tide::BodyForceM2(current) => current,
                     _ => 0.0,
                 };
-                let sea: Box<dyn SWEBoundaryCondition2D + Send + Sync> = match forcing.tide {
-                    Tide::UniformM2(amplitude) => {
-                        let tide = HarmonicTide::m2(amplitude, 0.0);
-                        Box::new(CharacteristicOBC::new(match ramp {
-                            Some(r) => tide.with_ramp_up(r),
-                            None => tide,
-                        }))
-                    }
-                    Tide::Atlas(tides) => Box::new(CharacteristicOBC::new(match ramp {
-                        Some(r) => tides.with_ramp_up(r),
-                        None => tides,
-                    })),
-                    // A body force needs no open boundary
-                    Tide::BodyForceM2(_) => Box::new(Reflective2D::new()),
-                };
+                let sea = open_boundary(&forcing);
                 let physics = PhysicsBuilder::swe_2d(
                     mesh.clone(),
                     ops.clone(),
@@ -365,6 +381,10 @@ fn spawn_3d(
                     Tide::BodyForceM2(current) => current,
                     _ => 0.0,
                 };
+                // The tide through the open boundary drives the barotropic mode, as
+                // in 2D; a body force needs none
+                let wall = Reflective2D::new();
+                let sea = open_boundary(&forcing);
                 // The 2D module owns the depth mean's forcing, Coriolis and viscosity;
                 // friction and the cages are the 3D model's
                 let swe = PhysicsBuilder::swe_2d(
@@ -372,7 +392,7 @@ fn spawn_3d(
                     ops.clone(),
                     geom.clone(),
                     ShallowWater2D::new(G),
-                    Reflective2D::new(),
+                    MultiBoundaryCondition2D::new(&wall).with_open(sea.as_ref()),
                 )
                 .with_bathymetry(bathymetry.clone())
                 .with_source(TidalForce {
@@ -384,6 +404,25 @@ fn spawn_3d(
                 .build();
                 let eos = LinearEOS::default();
                 let z0 = three_d.roughness;
+                let profile = three_d.profile;
+                // The tracers' horizontal limiter bounds their departure from the
+                // stratification at rest, which a pycnocline crossing the σ-levels
+                // over a sloping bed would otherwise clip. Cubic between its samples:
+                // the limiter sees its interpolation error as a departure at rest,
+                // and a linear one's drove 4e-5 m/s within 10 min under the fjord's
+                // 3 m halocline at 4 cm (TODO F.3)
+                let deepest = bathymetry.data.iter().copied().fold(0.0, f64::min);
+                let (bottom, top) = (deepest - 1.0, 1.0);
+                let limiter = TracerLimiter3DConfig {
+                    limiter_type: TracerLimiterType3D::HorizontalKuzmin { relaxation: 1.0 },
+                    ..TracerLimiter3DConfig::default()
+                }
+                .with_reference_profile(TracerReferenceProfile::from_smooth_fn(
+                    bottom,
+                    top,
+                    ((top - bottom) / REFERENCE_SPACING).ceil() as usize + 1,
+                    profile,
+                ));
                 let physics = Hydrostatic3D::new(
                     mesh.clone(),
                     ops.clone(),
@@ -392,7 +431,14 @@ fn spawn_3d(
                     bathymetry.clone(),
                     Arc::new(CoriolisSource2D::f_plane(forcing.coriolis)),
                     eos,
-                    GlsMixing::k_epsilon().with_roughness(0.02, z0),
+                    match three_d.mixing {
+                        Mixing::Gls => Box::new(GlsMixing::k_epsilon().with_roughness(0.02, z0))
+                            as Box<dyn VerticalMixing + Send + Sync>,
+                        Mixing::Constant {
+                            viscosity,
+                            diffusivity,
+                        } => Box::new(ConstantMixing::new(viscosity, diffusivity)),
+                    },
                     swe,
                     Forcing3D {
                         surface_stress: [0.0, 0.0],
@@ -404,23 +450,61 @@ fn spawn_3d(
                 )
                 .with_bottom_drag(BottomDrag3D::log_layer(z0))
                 .with_horizontal_viscosity(three_d.viscosity)
-                .with_smagorinsky_viscosity(three_d.smagorinsky);
-                let physics = if config.drag {
+                .with_smagorinsky_viscosity(three_d.smagorinsky)
+                .with_tracer_limiter(limiter)
+                // Thin surface layers over the deep water would set the step
+                .with_implicit_vertical_advection(ImplicitVerticalAdvection::default());
+                let mut physics = if config.drag {
                     physics.with_cage_drag(CageDrag2D::new(&mesh, &ops, &cages))
                 } else {
                     physics
                 };
 
+                // At rest at mean sea level, stratified as the scenario's profile
                 let n_levels = three_d.sigma.n_levels();
                 let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, n_levels);
-                state.salt.fill(three_d.salinity);
-                for (k, column) in state.temp.chunks_exact_mut(n_levels).enumerate() {
+                for (k, (temp, salt)) in state
+                    .temp
+                    .chunks_exact_mut(n_levels)
+                    .zip(state.salt.chunks_exact_mut(n_levels))
+                    .enumerate()
+                {
                     let depth = -bathymetry.data[k];
-                    for (t, &s) in column.iter_mut().zip(three_d.sigma.sigma_rho()) {
-                        *t = (three_d.temperature)(s * depth);
+                    for ((t, s), &sigma) in temp.iter_mut().zip(salt).zip(three_d.sigma.sigma_rho())
+                    {
+                        (*t, *s) = profile(sigma * depth);
                     }
                 }
                 physics.update_density(&mut state);
+                // The open faces let internal waves out: T and S relax to the
+                // stratification at rest in a band along them (`Nesting3D`'s module
+                // docs: without it an open face is unstable to a stratified flow)
+                let (width, timescale) = three_d.open_band;
+                if width > 0.0 {
+                    let band = NestingBand3D {
+                        width,
+                        profile: SpongeProfile::default(),
+                        velocity_timescale: Some(timescale),
+                        tracer_timescale: Some(timescale),
+                    };
+                    match Nesting3D::new(
+                        Arc::new(ReferenceColumns::from_state(&state)),
+                        &mesh,
+                        &ops,
+                        n_levels,
+                        &[BoundaryTag::Open],
+                        &band,
+                    ) {
+                        Ok(nesting) => physics = physics.with_nesting(nesting),
+                        Err(e) => eprintln!("no relaxation band at the open faces: {e}"),
+                    }
+                }
+                // The baroclinic pressure gradient about the profile, exact at rest
+                // (Mellor et al. 1998)
+                let physics = physics.with_reference_profile(&state, |z| {
+                    let (t, s) = profile(z);
+                    eos.compute_density(t, s, z)
+                });
 
                 let started = Instant::now();
                 let mut save = Save::new(save);
@@ -467,4 +551,90 @@ fn spawn_3d(
         })
         .expect("spawn the solver thread");
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::particles::Lice;
+    use crate::scenario::Mixing;
+    use dg_rs::time::ModelClock;
+
+    /// The fjord farm in 3D on its own mesh, P1 on 8 σ-levels.
+    fn fjord_3d() -> Scenario {
+        let mesh = std::path::Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../tests/data/gmsh/fjord_farm_3d.msh"
+        ));
+        Scenario::fjord_farm_3d(mesh, 1, 8, ModelClock::default()).unwrap()
+    }
+
+    /// Run `scenario` for `hours` without cages or particles: the largest layer
+    /// speed (m/s) and |η| (m) over its snapshots.
+    fn run(scenario: &Scenario, hours: f64) -> (f64, f64) {
+        let config = SolverConfig {
+            t_end: hours * 3600.0,
+            interval: 600.0,
+            levels: 0,
+            threads: std::thread::available_parallelism().map_or(1, |n| n.get()),
+            drag: false,
+            particles: ParticleConfig {
+                per_release: 0,
+                release_every: 60.0,
+                kh: 0.0,
+                lice: Lice::Passive,
+            },
+        };
+        let (mut speed, mut eta) = (0.0_f64, 0.0_f64);
+        for message in spawn(scenario, config, None) {
+            match message {
+                SolverMessage::Snapshot(s) => {
+                    let layers = s.layers.as_ref().unwrap();
+                    for (u, v) in layers.u.iter().zip(&layers.v) {
+                        speed = speed.max(f64::from(u.hypot(*v)));
+                    }
+                    for e in &s.eta {
+                        eta = eta.max(f64::from(e.abs()));
+                    }
+                }
+                SolverMessage::Finished { error, .. } => {
+                    assert!(error.is_none(), "{error:?}");
+                    return (speed, eta);
+                }
+                _ => {}
+            }
+        }
+        panic!("the solver ended without finishing");
+    }
+
+    /// The stratified fjord at rest, with its open boundary and band in place but
+    /// no tide, stays at rest to round-off for an hour (3.6e-10 m/s): the PGF and
+    /// the tracer limiter both take the profile as their reference. Mixing is
+    /// constant without diffusion, so the stratification itself stays: with GLS
+    /// (or a constant 1e-6 m²/s, GLS's background) the halocline diffuses over the
+    /// sloping bed and drives 3.6e-5 m/s within the hour, a flow of the physics.
+    /// With the limiter's reference linear between samples 4 cm apart this was
+    /// 4e-5 m/s within 10 min (TODO F.3).
+    #[test]
+    fn the_stratified_fjord_stays_at_rest() {
+        let mut scenario = fjord_3d();
+        scenario.forcing.tide = Tide::UniformM2(0.0);
+        scenario.three_d.as_mut().unwrap().mixing = Mixing::Constant {
+            viscosity: 1e-3,
+            diffusivity: 0.0,
+        };
+        let (speed, eta) = run(&scenario, 1.0);
+        assert!(speed < 1e-8, "{speed:e} m/s");
+        assert!(eta < 1e-10, "{eta:e} m");
+    }
+
+    /// The tide comes in through the open boundary and drives the 3D fjord.
+    #[test]
+    fn the_tide_enters_the_3d_fjord() {
+        let mut scenario = fjord_3d();
+        scenario.forcing.ramp = 600.0;
+        let (speed, eta) = run(&scenario, 0.25);
+        assert!(eta > 0.5, "{eta} m");
+        assert!(speed > 0.02 && speed < 1.0, "{speed} m/s");
+    }
 }
