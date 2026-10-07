@@ -1453,7 +1453,11 @@ mod tests {
         for j in 0..=200 {
             let z = -20.0 + 0.1 * j as f64;
             let (t, s) = profile(z);
-            assert!((reference.temperature(z) - t).abs() < 1e-9, "T at {z}: {} vs {t}", reference.temperature(z));
+            assert!(
+                (reference.temperature(z) - t).abs() < 1e-9,
+                "T at {z}: {} vs {t}",
+                reference.temperature(z)
+            );
             assert!((reference.salinity(z) - s).abs() < 1e-9, "S at {z}");
         }
         assert_eq!(reference.temperature(-25.0), profile(-20.0).0);
@@ -1474,9 +1478,10 @@ mod tests {
                 })
                 .fold(0.0, f64::max)
         };
-        let errors = |build: fn(f64, f64, usize, &dyn Fn(f64) -> (f64, f64)) -> TracerReferenceProfile| {
-            [161, 321].map(|n| error(&build(-20.0, 0.0, n, &halocline)))
-        };
+        let errors =
+            |build: fn(f64, f64, usize, &dyn Fn(f64) -> (f64, f64)) -> TracerReferenceProfile| {
+                [161, 321].map(|n| error(&build(-20.0, 0.0, n, &halocline)))
+            };
         let cubic = errors(|a, b, n, f| TracerReferenceProfile::from_smooth_fn(a, b, n, f));
         let linear = errors(|a, b, n, f| TracerReferenceProfile::from_fn(a, b, n, f));
         let order = |[coarse, fine]: [f64; 2]| (coarse / fine).log2();
