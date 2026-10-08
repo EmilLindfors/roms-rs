@@ -26,7 +26,7 @@ use crate::time::SspScheme;
 use crate::types::ElementIndex;
 
 use super::diffusion_2d::ScalarGradient2D;
-use super::swe_2d_split_form::{SplitFormSWE2D, SplitFormWorkspace, VOLUME_BATCH};
+use super::swe_2d_split_form::{ELEMENT_CHUNK, SplitFormSWE2D, SplitFormWorkspace, VOLUME_BATCH};
 use super::swe_2d_viscosity::{ViscousScratch, ViscousTerm, ViscousWorkspace};
 #[cfg(feature = "simd")]
 use crate::solver::simd::{apply_diff_matrix, apply_lift, coriolis_source};
@@ -656,8 +656,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     /// if given, the mass flux through every subcell interface (NaN where the
     /// element has no subcells; see [`compute_rhs_swe_2d_mass_fluxes_into`]).
     ///
-    /// `volume`: the lane of the workspace's batch holding the element's
-    /// split-form volume term, from [`Self::volume_batch`].
+    /// `volume`: the slot of the workspace's batch holding the element's
+    /// split-form volume term, from [`Self::volume_chunk`].
     #[allow(clippy::too_many_arguments)]
     fn element(
         &self,
@@ -696,17 +696,17 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     }
 
     /// Split-form volume terms of the elements `ks` (at most
-    /// [`VOLUME_BATCH`]) at once, vectorised across them (`simd` feature),
-    /// into the workspace for the next [`Self::element`] calls: bit `l` of
-    /// the result is set if `ks[l]`'s is there (lane `l`).
-    fn volume_batch(&self, ks: &[usize], ws: &mut ElementWorkspace) -> u8 {
+    /// [`ELEMENT_CHUNK`]), vectorised across them (`simd` feature), into
+    /// the workspace for the next [`Self::element`] calls: bit `j` of the
+    /// result is set if `ks[j]`'s is there (slot `j`).
+    fn volume_chunk(&self, ks: &[usize], ws: &mut ElementWorkspace) -> u64 {
         self.split_form.as_ref().map_or(0, |split_form| {
-            split_form.volume_batch(ks, &mut ws.split_form)
+            split_form.volume_chunk(ks, &mut ws.split_form)
         })
     }
 
     /// [`Self::element`] for the consecutive elements `k0..` whose rows are
-    /// `out` (at most [`VOLUME_BATCH`] elements; `face_mass` and
+    /// `out` (at most [`ELEMENT_CHUNK`] elements; `face_mass` and
     /// `subcell_mass` likewise), their volume terms batched, then
     /// `after(k, ws, hu, hv)` for each.
     #[allow(clippy::too_many_arguments)]
@@ -722,8 +722,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     ) {
         let ops = self.ops;
         let n = ops.n_nodes;
-        let ks: [usize; VOLUME_BATCH] = std::array::from_fn(|l| k0 + l);
-        let volumes = self.volume_batch(&ks[..out_h.len() / n], ws);
+        let ks: [usize; ELEMENT_CHUNK] = std::array::from_fn(|l| k0 + l);
+        let volumes = self.volume_chunk(&ks[..out_h.len() / n], ws);
         let mut face_mass = face_mass.map(|fm| fm.chunks_exact_mut(4 * ops.n_face_nodes));
         let mut subcell_mass =
             subcell_mass.map(|sm| sm.chunks_exact_mut(subcell_interfaces(ops.n_1d)));
@@ -1088,14 +1088,14 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
     let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
     let mut faces = FaceFluxGuard::take();
     kernel.face_fluxes(&mut faces);
-    let rows = VOLUME_BATCH * ops.n_nodes;
+    let rows = ELEMENT_CHUNK * ops.n_nodes;
     let mut face_mass = face_mass.map(|fm| {
         assert_eq!(
             fm.len(),
             face_mass_len(mesh, ops),
             "face mass flux buffer length"
         );
-        fm.chunks_mut(VOLUME_BATCH * 4 * ops.n_face_nodes)
+        fm.chunks_mut(ELEMENT_CHUNK * 4 * ops.n_face_nodes)
     });
     let mut subcell_mass = subcell_mass.map(|sm| {
         assert_eq!(
@@ -1103,7 +1103,7 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
             subcell_mass_len(mesh, ops),
             "subcell mass flux buffer length"
         );
-        sm.chunks_mut(VOLUME_BATCH * subcell_interfaces(ops.n_1d))
+        sm.chunks_mut(ELEMENT_CHUNK * subcell_interfaces(ops.n_1d))
     });
     let viscous = viscous_all(q, mesh, ops, geom, config, time, false);
     let [out_h, out_hu, out_hv] = &mut out.data;
@@ -1117,7 +1117,7 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
         let fm = face_mass.as_mut().and_then(Iterator::next);
         let sm = subcell_mass.as_mut().and_then(Iterator::next);
         kernel.element_batch(
-            b * VOLUME_BATCH,
+            b * ELEMENT_CHUNK,
             &mut ws,
             &faces,
             [h, hu, hv],
@@ -1515,14 +1515,14 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     kernel.face_fluxes_parallel(&mut faces);
     let faces: &[SWEState2D] = &faces;
     let viscous = viscous_all(q, mesh, ops, geom, config, time, true);
-    // Batches of VOLUME_BATCH consecutive elements (the last one shorter)
+    // Chunks of ELEMENT_CHUNK consecutive elements (the last one shorter)
     let batch = |ws: &mut WorkspaceGuard,
                  b: usize,
                  [h, hu, hv]: [&mut [f64]; 3],
                  fm: Option<&mut [f64]>,
                  sm: Option<&mut [f64]>| {
         kernel.element_batch(
-            b * VOLUME_BATCH,
+            b * ELEMENT_CHUNK,
             ws,
             faces,
             [h, hu, hv],
@@ -1535,7 +1535,7 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
             },
         );
     };
-    let rows = VOLUME_BATCH * ops.n_nodes;
+    let rows = ELEMENT_CHUNK * ops.n_nodes;
     let [out_h, out_hu, out_hv] = &mut out.data;
     let batches = out_h
         .par_chunks_mut(rows)
@@ -1554,7 +1554,7 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
                 "face mass flux buffer length"
             );
             let batches =
-                batches.zip(face_mass.par_chunks_mut(VOLUME_BATCH * 4 * ops.n_face_nodes));
+                batches.zip(face_mass.par_chunks_mut(ELEMENT_CHUNK * 4 * ops.n_face_nodes));
             match subcell_mass {
                 Some(subcell_mass) => {
                     assert_eq!(
@@ -1565,7 +1565,7 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
                     batches
                         .zip(
                             subcell_mass
-                                .par_chunks_mut(VOLUME_BATCH * subcell_interfaces(ops.n_1d)),
+                                .par_chunks_mut(ELEMENT_CHUNK * subcell_interfaces(ops.n_1d)),
                         )
                         .for_each_init(
                             || WorkspaceGuard::take(ops),
@@ -1825,27 +1825,27 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
         }
         then(k, [h, hu, hv], extra);
     };
-    // The volume terms (independent of time) VOLUME_BATCH elements at a time
-    let batch = |ws: &mut WorkspaceGuard, ks: &[u32]| {
-        let mut lanes = [0; VOLUME_BATCH];
-        for (lane, &k) in lanes.iter_mut().zip(ks) {
-            *lane = k as usize;
+    // The volume terms (independent of time) ELEMENT_CHUNK elements at a time
+    let chunk = |ws: &mut WorkspaceGuard, ks: &[u32]| {
+        let mut slots = [0; ELEMENT_CHUNK];
+        for (slot, &k) in slots.iter_mut().zip(ks) {
+            *slot = k as usize;
         }
-        let volumes = faces_kernel.volume_batch(&lanes[..ks.len()], ws);
-        for (l, &k) in lanes[..ks.len()].iter().enumerate() {
-            element(ws, k, ((volumes >> l) & 1 == 1).then_some(l));
+        let volumes = faces_kernel.volume_chunk(&slots[..ks.len()], ws);
+        for (j, &k) in slots[..ks.len()].iter().enumerate() {
+            element(ws, k, ((volumes >> j) & 1 == 1).then_some(j));
         }
     };
     #[cfg(feature = "parallel")]
     if parallel {
         elements
-            .par_chunks(VOLUME_BATCH)
-            .for_each_init(|| WorkspaceGuard::take(ops), batch);
+            .par_chunks(ELEMENT_CHUNK)
+            .for_each_init(|| WorkspaceGuard::take(ops), chunk);
         return;
     }
     let mut ws = WorkspaceGuard::take(ops);
-    for ks in elements.chunks(VOLUME_BATCH) {
-        batch(&mut ws, ks);
+    for ks in elements.chunks(ELEMENT_CHUNK) {
+        chunk(&mut ws, ks);
     }
 }
 
