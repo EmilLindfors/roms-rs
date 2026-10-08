@@ -91,6 +91,11 @@ name = "split_form"
 path = "benches/split_form_bench.rs"
 harness = false
 
+[[bench]]
+name = "wave_step"
+path = "benches/wave_step_bench.rs"
+harness = false
+
 # Profiling profile: release optimizations with debug symbols for flamegraph
 [profile.profiling]
 inherits = "release"

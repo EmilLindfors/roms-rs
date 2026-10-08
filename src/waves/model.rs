@@ -81,6 +81,28 @@ use super::sources::{SourceTerms, Wind};
 use super::spectrum::{SpectralGrid, WaveParameters};
 use super::state::WaveSolution;
 
+#[path = "propagation.rs"]
+mod propagation;
+use propagation::{NodeMajor, from_node_major, to_node_major};
+#[cfg(feature = "simd")]
+#[path = "implicit_lanes.rs"]
+mod implicit_lanes;
+
+#[cfg(all(test, feature = "simd"))]
+static SCALAR_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the vector kernels run (`simd` feature; tests can turn them off
+/// to compare with the scalar ones, which give the same bits).
+#[cfg(feature = "simd")]
+#[inline]
+fn vector_kernels() -> bool {
+    #[cfg(all(test, feature = "simd"))]
+    if SCALAR_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    true
+}
+
 /// Default minimum depth (m): shallower water, and land, is taken this deep.
 pub const DEFAULT_DEPTH_MIN: f64 = 0.1;
 
@@ -177,9 +199,9 @@ impl WaveTimeStepLimits {
 /// Reusable storage of [`WaveModel2D::step`].
 #[derive(Default)]
 pub struct WaveWorkspace {
-    stages: StageWorkspace<WaveSolution>,
-    /// The state node-major (`[point][component]`), for the sources
-    node_major: Vec<f64>,
+    /// The state node-major (`[point][component]`) during a step
+    node: NodeMajor,
+    stages: StageWorkspace<NodeMajor>,
 }
 
 /// The spectral wave model (see the module docs).
@@ -643,217 +665,25 @@ impl WaveModel2D {
     }
 
     /// `out = −∇·((c_g e_θ + U) N) − ∂(c_θ N)/∂θ − ∂(c_σ N)/∂σ` for every
-    /// component (no sources).
+    /// component (no sources). The step evaluates it node-major
+    /// ([`propagation`]); this transposes in and out.
     pub fn propagation_rhs_into(&self, n: &WaveSolution, out: &mut WaveSolution) {
-        let np = self.n_points();
-        let nn = self.ops.n_nodes;
-        for_each_chunk(
-            &mut out.data,
-            np,
-            || vec![0.0; 2 * nn],
-            |scratch, c, out_c| {
-                self.geographic_rhs(n, c, out_c, scratch);
-                self.spectral_rhs(n, c, out_c);
-            },
-        );
-    }
-
-    /// The DG geographic term of component `c` into `out` (overwritten).
-    fn geographic_rhs(&self, n: &WaveSolution, c: usize, out: &mut [f64], scratch: &mut [f64]) {
-        let (ops, geom, mesh) = (&*self.ops, &*self.geom, &*self.mesh);
-        let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
-        let np = self.n_points();
-        let nd = self.grid.n_dir();
-        let (i, j) = (c / nd, c % nd);
-        let (cos, sin) = (self.grid.cos_theta[j], self.grid.sin_theta[j]);
-        let cg = &self.cg[i * np..(i + 1) * np];
-        let field = n.component(c);
-        let boundary = |p: usize| self.boundary.action(c, p);
-        let velocity = |p: usize| {
-            let [u, v] = self.current[p];
-            [cg[p] * cos + u, cg[p] * sin + v]
-        };
-        let (fr, fs) = scratch.split_at_mut(nn);
-        for k in 0..mesh.n_elements {
-            let base = k * nn;
-            // Volume: −J⁻¹ (D_r F̃_r + D_s F̃_s), F̃ the contravariant fluxes
-            for a in 0..nn {
-                let p = base + a;
-                let [vx, vy] = velocity(p);
-                let ((jrx, jry), (jsx, jsy)) = geom.contravariant(k, a);
-                fr[a] = (jrx * vx + jry * vy) * field[p];
-                fs[a] = (jsx * vx + jsy * vy) * field[p];
-            }
-            for a in 0..nn {
-                let (dr, ds) = (
-                    &ops.dr_row_major[a * nn..(a + 1) * nn],
-                    &ops.ds_row_major[a * nn..(a + 1) * nn],
-                );
-                let mut div = 0.0;
-                for b in 0..nn {
-                    div += dr[b] * fr[b] + ds[b] * fs[b];
-                }
-                out[base + a] = -div * geom.jacobian_inv(k, a);
-            }
-            // Faces: lift (F⁻·n − F*) with the upwind flux F*
-            let element = ElementIndex::new(k);
-            for face in 0..4 {
-                let neighbour = mesh.neighbor(element, face);
-                let open = neighbour.is_none()
-                    && mesh.boundary_tag(element, face) == Some(BoundaryTag::Open);
-                for fi in 0..nfn {
-                    let a = ops.face_nodes[face][fi];
-                    let p = base + a;
-                    let (nx, ny) = geom.normal(k, face, fi);
-                    let [vx, vy] = velocity(p);
-                    let un_in = vx * nx + vy * ny;
-                    let n_in = field[p];
-                    let flux = match neighbour {
-                        Some(nb) => {
-                            let q = nb.element * nn + ops.face_nodes[nb.face][nfn - 1 - fi];
-                            let [wx, wy] = velocity(q);
-                            let un_out = wx * nx + wy * ny;
-                            if un_in + un_out >= 0.0 {
-                                un_in * n_in
-                            } else {
-                                un_out * field[q]
-                            }
-                        }
-                        // Out through every boundary; in only through open ones
-                        None if un_in >= 0.0 => un_in * n_in,
-                        None if open => un_in * boundary(p),
-                        None => 0.0,
-                    };
-                    let jump = (un_in * n_in - flux) * geom.surface_jacobian(k, face, fi);
-                    let lift = &ops.lift_row_major[face];
-                    for b in 0..nn {
-                        let l = lift[b * nfn + fi];
-                        if l != 0.0 {
-                            out[base + b] += l * jump * geom.jacobian_inv(k, b);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /// Subtract the direction and frequency flux divergences of component `c`.
-    fn spectral_rhs(&self, n: &WaveSolution, c: usize, out: &mut [f64]) {
-        let (nf, nd) = (self.grid.n_freq(), self.grid.n_dir());
-        let (i, j) = (c / nd, c % nd);
-        let grid = &self.grid;
-        let second_order = self.spectral_advection == SpectralAdvection::VanLeer;
-        let here = n.component(c);
-        // Directions: periodic, faces at θ_j ± Δθ/2; the bins two away for the
-        // reconstruction
-        let dir = |offset: isize| {
-            let jj = (j as isize + offset).rem_euclid(nd as isize) as usize;
-            n.component(i * nd + jj)
-        };
-        let (below, above) = (dir(-1), dir(1));
-        let (below2, above2) = (second_order.then(|| dir(-2)), second_order.then(|| dir(2)));
-        let (theta_lo, theta_hi) = (
-            grid.theta[j] - 0.5 * grid.d_theta,
-            grid.theta[j] + 0.5 * grid.d_theta,
-        );
-        let inv_dtheta = 1.0 / grid.d_theta;
-        // Frequencies: faces between bins; nothing enters at the ends
-        let freq = |offset: isize| {
-            let ii = i as isize + offset;
-            (0..nf as isize)
-                .contains(&ii)
-                .then(|| n.component(ii as usize * nd + j))
-        };
-        let (lower, upper) = (freq(-1), freq(1));
-        let (lower2, upper2) = (
-            freq(-2).filter(|_| second_order),
-            freq(2).filter(|_| second_order),
-        );
-        let inv_dsigma = 1.0 / grid.d_sigma[i];
-        let theta = grid.theta[j];
-        let at = |field: Option<&[f64]>, p: usize| field.map(|f| f[p]);
-        let explicit_refraction = !self.implicit_refraction;
-        for (p, out) in out.iter_mut().enumerate() {
-            if explicit_refraction {
-                let f_hi = face_flux(
-                    self.c_theta(i, theta_hi, p),
-                    at(below2.is_some().then_some(below), p),
-                    here[p],
-                    above[p],
-                    at(above2, p),
-                );
-                let f_lo = face_flux(
-                    self.c_theta(i, theta_lo, p),
-                    at(below2, p),
-                    below[p],
-                    here[p],
-                    at(above2.is_some().then_some(above), p),
-                );
-                *out -= (f_hi - f_lo) * inv_dtheta;
-            }
-            if self.implicit_frequency_shift {
-                continue;
-            }
-            let cs = self.c_sigma(i, theta, p);
-            let g_hi = match upper {
-                Some(up) => face_flux(
-                    0.5 * (cs + self.c_sigma(i + 1, theta, p)),
-                    at(lower.filter(|_| second_order), p),
-                    here[p],
-                    up[p],
-                    at(upper2, p),
-                ),
-                None => cs.max(0.0) * here[p],
-            };
-            let g_lo = match lower {
-                Some(lo) => face_flux(
-                    0.5 * (cs + self.c_sigma(i - 1, theta, p)),
-                    at(lower2, p),
-                    lo[p],
-                    here[p],
-                    at(upper.filter(|_| second_order), p),
-                ),
-                None => cs.min(0.0) * here[p],
-            };
-            *out -= (g_hi - g_lo) * inv_dsigma;
-        }
+        let (np, nc) = (self.n_points(), self.grid.n_components());
+        let (mut node, mut rhs) = (Vec::new(), vec![0.0; np * nc]);
+        to_node_major(&n.data, np, nc, &mut node);
+        self.propagation_rhs_node_major(&node, &mut rhs);
+        from_node_major(&rhs, np, nc, &mut out.data);
     }
 
     /// Scale every component in every element towards its mean so that no node is
     /// negative (Zhang & Shu 2010): the mean, and so the total action, is kept; an
     /// element whose mean is negative is zeroed.
     pub fn limit_positivity(&self, n: &mut WaveSolution) {
-        let (nn, np) = (self.ops.n_nodes, self.n_points());
-        let geom = &*self.geom;
-        let weights = &self.ops.weights;
-        for_each_chunk(
-            &mut n.data,
-            np,
-            || (),
-            |_, _, field| {
-                for (k, values) in field.chunks_exact_mut(nn).enumerate() {
-                    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-                    if min >= 0.0 {
-                        continue;
-                    }
-                    let (mut mass, mut area) = (0.0, 0.0);
-                    for (a, &x) in values.iter().enumerate() {
-                        let w = weights[a] * geom.jacobian(k, a);
-                        mass += w * x;
-                        area += w;
-                    }
-                    let mean = mass / area;
-                    if mean <= 0.0 {
-                        values.fill(0.0);
-                        continue;
-                    }
-                    let theta = mean / (mean - min);
-                    values
-                        .iter_mut()
-                        .for_each(|x| *x = (mean + theta * (*x - mean)).max(0.0));
-                }
-            },
-        );
+        let (np, nc) = (self.n_points(), self.grid.n_components());
+        let mut node = Vec::new();
+        to_node_major(&n.data, np, nc, &mut node);
+        self.limit_positivity_node_major(&mut node);
+        from_node_major(&node, np, nc, &mut n.data);
     }
 
     /// Advance `n` from `t` by `dt`: SSP-RK3 propagation (positivity limited every
@@ -868,15 +698,21 @@ impl WaveModel2D {
             half(self.implicit_refraction),
             half(self.implicit_frequency_shift),
         );
+        // The whole step node-major: one transpose in, one out
+        let (np, nc) = (self.n_points(), self.grid.n_components());
+        to_node_major(&n.data, np, nc, &mut ws.node.data);
         if refraction.is_some() || shift.is_some() {
-            self.node_pass(n, ws, NodePass::before_stages(refraction, shift));
+            self.node_pass_node_major(
+                &mut ws.node.data,
+                NodePass::before_stages(refraction, shift),
+            );
         }
         SSPRK3.step_with_workspace(
-            n,
+            &mut ws.node,
             dt,
             t,
-            |s, _, out| self.propagation_rhs_into(s, out),
-            |s| self.limit_positivity(s),
+            |s, _, out| self.propagation_rhs_node_major(&s.data, &mut out.data),
+            |s| self.limit_positivity_node_major(&mut s.data),
             &mut ws.stages,
         );
         let sources = self.sources.any().then_some(dt);
@@ -887,8 +723,9 @@ impl WaveModel2D {
                 sources,
                 shift_first: false,
             };
-            self.node_pass(n, ws, pass);
+            self.node_pass_node_major(&mut ws.node.data, pass);
         }
+        from_node_major(&ws.node.data, np, nc, &mut n.data);
     }
 
     /// The sources over `dt` at every node.
@@ -928,6 +765,14 @@ impl WaveModel2D {
     /// At every node, on its spectrum, what `pass` gives: implicit refraction
     /// and frequency shifting (in its order), then the sources.
     fn node_pass(&self, n: &mut WaveSolution, ws: &mut WaveWorkspace, pass: NodePass) {
+        let (np, nc) = (self.n_points(), self.grid.n_components());
+        to_node_major(&n.data, np, nc, &mut ws.node.data);
+        self.node_pass_node_major(&mut ws.node.data, pass);
+        from_node_major(&ws.node.data, np, nc, &mut n.data);
+    }
+
+    /// [`Self::node_pass`] on the node-major state `node_major`.
+    fn node_pass_node_major(&self, node_major: &mut [f64], pass: NodePass) {
         let NodePass {
             refraction,
             shift,
@@ -940,20 +785,8 @@ impl WaveModel2D {
             self.grid.n_freq(),
         );
         let nd = self.grid.n_dir();
-        ws.node_major.resize(np * nc, 0.0);
-        let data = &n.data;
         for_each_chunk(
-            &mut ws.node_major,
-            nc,
-            || (),
-            |_, p, spectrum| {
-                for (c, x) in spectrum.iter_mut().enumerate() {
-                    *x = data[c * np + p];
-                }
-            },
-        );
-        for_each_chunk(
-            &mut ws.node_major,
+            node_major,
             nc,
             || {
                 (
@@ -972,6 +805,12 @@ impl WaveModel2D {
                 let rates = &*rates;
                 let mut shift_now = |spectrum: &mut [f64]| {
                     if let Some(dt) = shift {
+                        #[cfg(feature = "simd")]
+                        if vector_kernels()
+                            && self.shift_lanes(p, spectrum, dt, rates.advection, &rates.strain)
+                        {
+                            return;
+                        }
                         for j in 0..nd {
                             for (i, x) in column.iter_mut().enumerate() {
                                 *x = spectrum[i * nd + j];
@@ -988,8 +827,15 @@ impl WaveModel2D {
                     shift_now(spectrum);
                 }
                 if let Some(dt) = refraction {
-                    for (i, row) in spectrum.chunks_exact_mut(nd).enumerate() {
-                        self.refract_implicitly(i, p, row, dt, &rates.turning, cyclic);
+                    #[cfg(feature = "simd")]
+                    let done =
+                        vector_kernels() && self.refract_lanes(p, spectrum, dt, &rates.turning);
+                    #[cfg(not(feature = "simd"))]
+                    let done = false;
+                    if !done {
+                        for (i, row) in spectrum.chunks_exact_mut(nd).enumerate() {
+                            self.refract_implicitly(i, p, row, dt, &rates.turning, cyclic);
+                        }
                     }
                 }
                 if !shift_first {
@@ -1010,17 +856,6 @@ impl WaveModel2D {
                         a,
                         b,
                     );
-                }
-            },
-        );
-        let node_major = &ws.node_major;
-        for_each_chunk(
-            &mut n.data,
-            np,
-            || (),
-            |_, c, field| {
-                for (p, x) in field.iter_mut().enumerate() {
-                    *x = node_major[p * nc + c];
                 }
             },
         );
@@ -1741,5 +1576,98 @@ mod tests {
             "the stronger wind grows more"
         );
         assert_eq!(model.wind_at(0).u10, model.wind_at(nn).u10);
+    }
+
+    /// The vector kernels (`simd`: the geographic term with directions as
+    /// lanes, the implicit refraction and frequency shift with systems as
+    /// lanes) give the scalar kernels' bits, over whole steps: P1 and P2,
+    /// implicit and explicit spectral advection, van Leer and upwind, with a
+    /// sheared current over a shoaling, banked bed (all rates nonzero), wind
+    /// and sources, open and absorbing boundaries, and a direction count that
+    /// leaves a short last vector.
+    #[test]
+    #[cfg(feature = "simd")]
+    fn the_vector_kernels_give_the_scalar_bits() {
+        use std::f64::consts::PI;
+        use std::sync::atomic::Ordering;
+
+        use crate::mesh::Bathymetry2D;
+        use crate::waves::sources::{SourceTerms, Wind};
+
+        let g = 9.81;
+        let (lx, ly) = (12_000.0, 9_000.0);
+        for order in [1, 2] {
+            for (implicit, scheme) in [
+                (true, SpectralAdvection::VanLeer),
+                (true, SpectralAdvection::Upwind),
+                (false, SpectralAdvection::VanLeer),
+            ] {
+                let mut mesh =
+                    Mesh2D::uniform_rectangle_with_bc(0.0, lx, 0.0, ly, 6, 5, BoundaryTag::Open);
+                for e in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
+                    let (a, b) = e.vertices;
+                    if mesh.vertices[a][1] > ly - 1.0 && mesh.vertices[b][1] > ly - 1.0 {
+                        e.boundary_tag = Some(BoundaryTag::Wall);
+                    }
+                }
+                let ops = DGOperators2D::new(order);
+                let geom = GeometricFactors2D::compute(&mesh, &ops);
+                let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+                    let s = 60.0 - 55.0 * x / lx;
+                    -(s - 0.4 * s * (2.0 * PI * y / 4000.0).sin() * (2.0 * PI * x / 5000.0).cos())
+                        .max(1.0)
+                });
+                let grid = SpectralGrid::new(0.05, 0.5, 10, 12);
+                let sea = grid.jonswap(2.0, 8.0, 3.3, 0.4, 4.0);
+                let mut model = WaveModel2D::new(
+                    Arc::new(mesh),
+                    Arc::new(ops),
+                    Arc::new(geom),
+                    &bathymetry,
+                    grid,
+                    g,
+                )
+                .with_sources(SourceTerms::swan_defaults(g))
+                .with_boundary_spectrum(&sea)
+                .with_wind(Wind {
+                    u10: 12.0,
+                    direction: 0.4,
+                })
+                .with_spectral_advection(scheme)
+                .with_implicit_refraction(implicit)
+                .with_implicit_frequency_shift(implicit);
+                let (mesh, ops) = (model.mesh.clone(), model.ops.clone());
+                let n = mesh.n_elements * ops.n_nodes;
+                let (mut u, mut v) = (vec![0.0; n], vec![0.0; n]);
+                for k in ElementIndex::iter(mesh.n_elements) {
+                    for a in 0..ops.n_nodes {
+                        let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[a], ops.nodes_s[a]);
+                        let p = k.as_usize() * ops.n_nodes + a;
+                        u[p] = 0.6 * (2.0 * PI * y / ly).sin();
+                        v[p] = 0.3 * (2.0 * PI * x / lx).cos();
+                    }
+                }
+                model.set_currents(&u, &v);
+                let mut start = model.uniform_state(&sea);
+                for (index, x) in start.data.iter_mut().enumerate() {
+                    *x *= 1.0 + 0.3 * (index as f64 * 0.618).sin();
+                }
+                let dt = model.compute_dt(0.5);
+                let run = |scalar: bool| {
+                    SCALAR_ONLY.store(scalar, Ordering::Relaxed);
+                    let mut state = start.clone();
+                    let mut ws = WaveWorkspace::default();
+                    for step in 0..3 {
+                        model.step(&mut state, step as f64 * dt, dt, &mut ws);
+                    }
+                    SCALAR_ONLY.store(false, Ordering::Relaxed);
+                    state.data.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+                };
+                assert!(
+                    run(false) == run(true),
+                    "P{order}, implicit {implicit}, {scheme:?}"
+                );
+            }
+        }
     }
 }
