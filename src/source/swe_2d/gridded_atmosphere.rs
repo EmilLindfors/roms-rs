@@ -206,6 +206,83 @@ impl GriddedAtmosphere2D {
         })
     }
 
+    /// The same weather sampled at the nodes of another `mesh` in the same
+    /// coordinates (e.g. a wave model's), sharing the reader, projection and
+    /// clock, with this one's drag, ramp and switches.
+    ///
+    /// # Errors
+    /// If a node of `mesh` lies outside the weather grid.
+    pub fn on_mesh(&self, mesh: &Mesh2D, ops: &DGOperators2D) -> Result<Self, String> {
+        let inner = &self.inner;
+        let mut nodes = Vec::with_capacity(mesh.n_elements * ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                nodes.push(self.node_at((x, y)).ok_or_else(|| {
+                    let (lat, lon) = inner.projection.xy_to_geo(x, y);
+                    format!(
+                        "GriddedAtmosphere2D: mesh node at (x, y) = ({x:.0}, {y:.0}) m \
+                         (lat {lat:.4}, lon {lon:.4}) is outside the weather grid"
+                    )
+                })?);
+            }
+        }
+        Ok(Self {
+            inner: Arc::new(Inner {
+                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                reader: Arc::clone(&inner.reader),
+                projection: Arc::clone(&inner.projection),
+                clock: inner.clock,
+                nodes,
+                n_nodes: ops.n_nodes,
+                drag: inner.drag,
+                rho_air: inner.rho_air,
+                rho_water: inner.rho_water,
+                h_min: inner.h_min,
+                ramp: inner.ramp,
+                wind: inner.wind,
+                pressure: inner.pressure,
+                cache: RwLock::new(Vec::new()),
+            }),
+        })
+    }
+
+    /// The number of nodes sampled (elements × nodes per element).
+    pub fn n_points(&self) -> usize {
+        self.inner.nodes.len()
+    }
+
+    /// The weather model's 10 m wind (m/s, mesh axes) at every node at time
+    /// `t`, linear in time between its snapshots, whatever the switches and
+    /// not ramped: for a wave model, which starts from a sea of its own
+    /// rather than from rest. Zero if the reader has no wind.
+    ///
+    /// # Panics
+    /// If `wind` is not one per node, or `t` lies outside the weather file.
+    pub fn wind_into(&self, t: f64, wind: &mut [[f64; 2]]) {
+        let inner = &self.inner;
+        assert_eq!(wind.len(), inner.nodes.len(), "one wind per node");
+        if !inner.reader.has_wind() {
+            wind.fill([0.0; 2]);
+            return;
+        }
+        let time = self.time_stencil(t);
+        let nn = inner.n_nodes;
+        for_each_block(
+            inner.nodes.len() / nn,
+            [wind],
+            || (),
+            |_, k, [wind]| {
+                self.with_snapshots(&time, |snapshots| {
+                    for (i, w) in wind.iter_mut().enumerate() {
+                        let [u, v, ..] = Self::cached(snapshots, k * nn + i);
+                        *w = [u, v];
+                    }
+                });
+            },
+        );
+    }
+
     fn inner_mut(&mut self) -> &mut Inner {
         Arc::get_mut(&mut self.inner).expect("configure GriddedAtmosphere2D before cloning it")
     }
@@ -731,14 +808,15 @@ mod tests {
         assert!(tau_x.iter().chain(&tau_y).all(|&t| t == 0.0));
     }
 
-    /// A wind linear in mesh coordinates, which the bilinear stencils
-    /// reproduce: the columns' stress is `ρ_air C_d |U| U` of that wind at
-    /// every node, in the 3D model's `[element][node]` order (to the f32
-    /// storage of the snapshots).
-    #[test]
-    fn gridded_wind_stress_varies_from_node_to_node() {
-        let projection = LocalProjection::new(63.5, 8.5);
-        let wind = |x: f64, y: f64| (8.0 + 4.0 * x / 30e3, -2.0 + 3.0 * y / 30e3);
+    /// A wind linear in mesh coordinates (east, north), the bilinear stencils
+    /// reproduce it.
+    fn linear_wind(x: f64, y: f64) -> (f64, f64) {
+        (8.0 + 4.0 * x / 30e3, -2.0 + 3.0 * y / 30e3)
+    }
+
+    /// A weather grid over ±30 km around the projection origin with
+    /// `scale[i]` × [`linear_wind`] at T0 + i hours.
+    fn linear_wind_reader(projection: &LocalProjection, scale: [f64; 2]) -> Arc<AtmosphereReader> {
         let (lat0, lon0) = projection.xy_to_geo(-30_000.0, -30_000.0);
         let (lat1, lon1) = projection.xy_to_geo(30_000.0, 30_000.0);
         let n = 7;
@@ -751,19 +829,29 @@ mod tests {
         let grid = GeoGrid::regular(lon.clone(), lat.clone()).unwrap();
         let m = grid.len();
         let (mut u, mut v) = (Vec::new(), Vec::new());
-        for _ in 0..2 {
+        for scale in scale {
             for k in 0..m {
                 let (x, y) = projection.geo_to_xy(lat[k / n], lon[k % n]);
-                let (e, nn) = wind(x, y);
-                u.push(e as f32);
-                v.push(nn as f32);
+                let (e, nn) = linear_wind(x, y);
+                u.push((scale * e) as f32);
+                v.push((scale * nn) as f32);
             }
         }
-        let reader = Arc::new(
+        Arc::new(
             AtmosphereReader::new(grid, vec![T0, T0 + 3600.0])
                 .unwrap()
                 .with_wind(FieldSeries::new(m, u), FieldSeries::new(m, v)),
-        );
+        )
+    }
+
+    /// A wind linear in mesh coordinates, which the bilinear stencils
+    /// reproduce: the columns' stress is `ρ_air C_d |U| U` of that wind at
+    /// every node, in the 3D model's `[element][node]` order (to the f32
+    /// storage of the snapshots).
+    #[test]
+    fn gridded_wind_stress_varies_from_node_to_node() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let reader = linear_wind_reader(&projection, [1.0, 1.0]);
         let mesh = Mesh2D::uniform_rectangle(-20e3, 20e3, -15e3, 15e3, 4, 3);
         let ops = DGOperators2D::new(2);
         let (_, gridded) =
@@ -771,7 +859,7 @@ mod tests {
                 .unwrap()
                 .split_for_3d();
         let analytic = crate::physics::AnalyticSurfaceStress::new(&mesh, &ops, move |x, y, _| {
-            let (u, v) = wind(x, y);
+            let (u, v) = linear_wind(x, y);
             let speed = u.hypot(v);
             let stress = RHO_AIR * DragCoefficient::LargePond.compute(speed) * speed;
             [stress * u, stress * v]
@@ -790,6 +878,57 @@ mod tests {
         for (g, a) in gx.iter().zip(&ax).chain(gy.iter().zip(&ay)) {
             assert!((g - a).abs() < 1e-6 * a.abs() + 1e-12, "{g} vs {a}");
         }
+    }
+
+    /// The weather resampled on another mesh (a wave model's: coarser, another
+    /// order) gives the 10 m wind at its nodes, linear in time and not
+    /// ramped, as an atmosphere built on that mesh does; a mesh reaching
+    /// beyond the weather grid is an error.
+    #[test]
+    fn the_wind_on_another_mesh_is_the_weathers_at_its_nodes() {
+        let projection = LocalProjection::new(63.5, 8.5);
+        let reader = linear_wind_reader(&projection, [1.0, 2.0]);
+        let circulation = Mesh2D::uniform_rectangle(-20e3, 20e3, -15e3, 15e3, 4, 3);
+        let atmosphere = GriddedAtmosphere2D::new(
+            Arc::clone(&reader),
+            &circulation,
+            &DGOperators2D::new(2),
+            projection,
+            ModelClock::new(T0),
+        )
+        .unwrap()
+        .with_ramp_up(7200.0);
+        let waves = Mesh2D::uniform_rectangle(-25e3, 25e3, -20e3, 20e3, 3, 2);
+        let ops = DGOperators2D::new(1);
+        let resampled = atmosphere.on_mesh(&waves, &ops).unwrap();
+        let n = waves.n_elements * ops.n_nodes;
+        assert_eq!(resampled.n_points(), n);
+        let direct =
+            GriddedAtmosphere2D::new(reader, &waves, &ops, projection, ModelClock::new(T0))
+                .unwrap();
+        let (mut wind, mut expected) = (vec![[0.0; 2]; n], vec![[0.0; 2]; n]);
+        resampled.wind_into(1800.0, &mut wind);
+        direct.wind_into(1800.0, &mut expected);
+        assert_eq!(wind, expected);
+        for k in ElementIndex::iter(waves.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = waves.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+                let (u, v) = linear_wind(x, y);
+                let [wu, wv] = wind[k.as_usize() * ops.n_nodes + i];
+                assert!(
+                    (wu - 1.5 * u).abs() < 1e-5 * u.abs().max(1.0),
+                    "{wu} vs {}",
+                    1.5 * u
+                );
+                assert!(
+                    (wv - 1.5 * v).abs() < 1e-5 * v.abs().max(1.0),
+                    "{wv} vs {}",
+                    1.5 * v
+                );
+            }
+        }
+        let beyond = Mesh2D::uniform_rectangle(-40e3, 40e3, -10e3, 10e3, 2, 1);
+        assert!(atmosphere.on_mesh(&beyond, &ops).is_err());
     }
 
     /// Every atmosphere reads its own weather, also one allocated where a

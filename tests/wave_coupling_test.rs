@@ -7,16 +7,17 @@ use std::sync::Arc;
 
 use dg_rs::boundary::Reflective2D;
 use dg_rs::equations::ShallowWater2D;
+use dg_rs::io::{AtmosphereReader, CoordinateProjection, FieldSeries, GeoGrid, LocalProjection};
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
 use dg_rs::simulation::Simulation;
 use dg_rs::solver::{SWESolution2D, SWEState2D};
 use dg_rs::source::{
-    BottomFriction2D, ChezyFriction2D, SourceContext2D, SourceTerm2D, WaveCurrentFriction2D,
-    WaveForce2D,
+    BottomFriction2D, ChezyFriction2D, GriddedAtmosphere2D, SourceContext2D, SourceTerm2D,
+    WaveCurrentFriction2D, WaveForce2D,
 };
-use dg_rs::time::SSPRK3;
+use dg_rs::time::{ModelClock, SSPRK3};
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{
     CoupledWaves2D, SourceTerms, SpectralGrid, WaveCoupling2D, WaveModel2D, WaveSolution,
@@ -772,6 +773,113 @@ fn breaking_waves_coupled_in_time_set_the_water_up() {
     assert!(
         enhanced > n_total / 2,
         "{enhanced} of {n_total} nodes enhanced"
+    );
+}
+
+/// A weather model's wind on the coupled waves: sampled on the waves' own
+/// mesh ([`GriddedAtmosphere2D::on_mesh`] of the circulation's), it reaches
+/// every wave node at every wave step, not ramped (the circulation's forcing
+/// ramps up over a day here), and the wind sea grows where it blows: the
+/// alongshore wind rises from 2 m/s at the open sea to 20 m/s at the wall, and
+/// after two minutes the energy travelling with it is ≥ 10× larger at the wall
+/// than offshore.
+#[test]
+fn a_weather_models_wind_reaches_the_coupled_waves_per_node() {
+    const T0: f64 = 1_750_000_000.0;
+    let projection = LocalProjection::new(63.8, 8.7);
+    // Alongshore (east), rising across the beach (north)
+    let wind = |y: f64| 2.0 + 18.0 * y / Beach::L;
+    let n = 9;
+    let (lat0, lon0) = projection.xy_to_geo(-2e3, -2e3);
+    let (lat1, lon1) = projection.xy_to_geo(2e3, 2e3);
+    let lon: Vec<f64> = (0..n)
+        .map(|i| lon0 + (lon1 - lon0) * i as f64 / (n - 1) as f64)
+        .collect();
+    let lat: Vec<f64> = (0..n)
+        .map(|j| lat0 + (lat1 - lat0) * j as f64 / (n - 1) as f64)
+        .collect();
+    let grid = GeoGrid::regular(lon.clone(), lat.clone()).unwrap();
+    let m = grid.len();
+    let east: Vec<f32> = (0..2 * m)
+        .map(|k| wind(projection.geo_to_xy(lat[k % m / n], lon[k % n]).1) as f32)
+        .collect();
+    let reader = AtmosphereReader::new(grid, vec![T0, T0 + 3600.0])
+        .unwrap()
+        .with_wind(
+            FieldSeries::new(m, east),
+            FieldSeries::new(m, vec![0.0; 2 * m]),
+        );
+
+    let beach = Beach::new();
+    let wave_beach = Beach::with(7, 2);
+    let physics = beach.physics().build();
+    let atmosphere = GriddedAtmosphere2D::new(
+        Arc::new(reader),
+        &beach.mesh,
+        &beach.ops,
+        projection,
+        ModelClock::new(T0),
+    )
+    .unwrap()
+    .with_ramp_up(86_400.0);
+    let on_waves = atmosphere
+        .on_mesh(&wave_beach.mesh, &wave_beach.ops)
+        .unwrap();
+    // Calm, no swell: the wind's sea alone
+    let mut model = wave_beach.waves(std::f64::consts::FRAC_PI_2, None, 36);
+    model.sources = SourceTerms::swan_defaults(G).with_breaking(None);
+    model.set_boundary_spectra(&vec![
+        0.0;
+        model.open_boundary_points().len()
+            * model.grid.n_components()
+    ]);
+    let n_waves = model.zero_state();
+    let mut waves = CoupledWaves2D::new(model, n_waves, &physics, 0.0)
+        .with_ramp(300.0)
+        .with_gridded_wind(on_waves);
+    let mut q = beach.still_water();
+    let mut sim = Simulation::new(physics, SSPRK3);
+    let interval = 60.0;
+    let result = sim.run_with_exchange(
+        &mut q,
+        0.0,
+        2.0 * interval,
+        interval,
+        |physics, q, t, t_next| waves.exchange(physics, q, t, t_next),
+        |_, _| {},
+    );
+    assert!(result.success, "{result:?}");
+
+    let (model, state) = (waves.model(), waves.state());
+    let ys = wave_beach.ys();
+    let mut e = vec![0.0; model.grid.n_components()];
+    let mut along = |p: usize| {
+        model.energy_spectrum_into(state, p, &mut e);
+        (0..model.grid.n_freq())
+            .map(|i| e[model.grid.component(i, 0)])
+            .sum::<f64>()
+    };
+    let (sea, wall) = (
+        (0..ys.len())
+            .min_by(|&a, &b| ys[a].total_cmp(&ys[b]))
+            .unwrap(),
+        (0..ys.len())
+            .max_by(|&a, &b| ys[a].total_cmp(&ys[b]))
+            .unwrap(),
+    );
+    for (p, &y) in ys.iter().enumerate() {
+        let w = model.wind_at(p);
+        assert!(
+            (w.u10 - wind(y)).abs() < 1e-4 * wind(y) && w.direction.abs() < 1e-4,
+            "node {p} at y = {y:.1} m: {w:?} against {} m/s along x",
+            wind(y)
+        );
+    }
+    let (at_sea, at_wall) = (along(sea), along(wall));
+    println!("energy along the wind: {at_sea:.3e} at the open sea, {at_wall:.3e} at the wall");
+    assert!(
+        at_wall > 10.0 * at_sea && at_sea > 0.0,
+        "{at_sea} {at_wall}"
     );
 }
 
