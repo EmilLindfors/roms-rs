@@ -55,7 +55,8 @@ use crate::operators::{DGOperators2D, GeometricFactors2D, MeshTransfer2D};
 use crate::physics::SWEPhysics2D;
 use crate::solver::SWESolution2D;
 use crate::source::{
-    BottomFriction2D, SourceTerm2D, SourceTerms2D, WaveCurrentFriction2D, WaveForce2D,
+    BottomFriction2D, GriddedAtmosphere2D, SourceTerm2D, SourceTerms2D, WaveCurrentFriction2D,
+    WaveForce2D,
 };
 
 use super::boundary::{BoundarySpectra, WindSeries};
@@ -329,7 +330,15 @@ pub struct CoupledWaves2D {
     /// every wave step's midpoint
     boundary: Option<BoundarySpectra>,
     boundary_buffer: Vec<f64>,
-    wind: Option<WindSeries>,
+    wind: Option<WaveWind>,
+}
+
+/// Where the waves of a [`CoupledWaves2D`] take their wind from.
+enum WaveWind {
+    /// A parent model's, the same everywhere
+    Series(WindSeries),
+    /// A weather model's per wave node, and the nodes' winds
+    Gridded(GriddedAtmosphere2D, Vec<[f64; 2]>),
 }
 
 /// Work counts of a [`CoupledWaves2D`].
@@ -460,7 +469,21 @@ impl CoupledWaves2D {
 
     /// Take the wind from a parent model's series, at every wave step.
     pub fn with_wind(mut self, wind: WindSeries) -> Self {
-        self.wind = Some(wind);
+        self.wind = Some(WaveWind::Series(wind));
+        self
+    }
+
+    /// Take the wind per node from a weather model sampled on the wave
+    /// model's mesh (e.g. the circulation's
+    /// [`GriddedAtmosphere2D::on_mesh`] of the wave mesh), at every wave
+    /// step: its 10 m wind, not ramped ([`GriddedAtmosphere2D::wind_into`]).
+    ///
+    /// # Panics
+    /// If `atmosphere` is sampled on another mesh than the wave model's.
+    pub fn with_gridded_wind(mut self, atmosphere: GriddedAtmosphere2D) -> Self {
+        let n = self.model.n_points();
+        assert_eq!(atmosphere.n_points(), n, "a weather model on another mesh");
+        self.wind = Some(WaveWind::Gridded(atmosphere, vec![[0.0; 2]; n]));
         self
     }
 
@@ -521,8 +544,13 @@ impl CoupledWaves2D {
                 boundary.at_into(middle, &mut self.boundary_buffer);
                 self.model.set_boundary_spectra(&self.boundary_buffer);
             }
-            if let Some(wind) = &self.wind {
-                self.model.set_wind(wind.at(middle));
+            match &mut self.wind {
+                Some(WaveWind::Series(series)) => self.model.set_wind(series.at(middle)),
+                Some(WaveWind::Gridded(atmosphere, winds)) => {
+                    atmosphere.wind_into(middle, winds);
+                    self.model.set_winds(winds);
+                }
+                None => {}
             }
             self.model
                 .step(&mut self.state, start, dt, &mut self.workspace);

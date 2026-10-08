@@ -121,7 +121,9 @@
 //! ramped up over `ramp_hours`. On the run's mesh, or on `wave_mesh=`. The
 //! sea `wave_sea=HS,TP,FROM` (JONSWAP, H_s in m, T_p in s, coming from FROM
 //! degrees) comes in through the open boundaries and fills the domain at the
-//! start; `wind` also blows on the waves (`met=` does not reach them yet).
+//! start. The wind of `met=` blows on the waves too, per wave node and not
+//! ramped (`GriddedAtmosphere2D::on_mesh`, `CoupledWaves2D::with_gridded_wind`);
+//! without it, the uniform `wind`.
 //! Every output interval a line of the waves (the largest H_s, the mean over
 //! water ≥ 3 m deep, the largest force, the mean wave step and its cost, and
 //! what sets the step where) comes before the tide's. Use `implicit=1`: the
@@ -136,7 +138,7 @@
 //! points, regridded onto the waves' grid and linear in time, at every wave
 //! step (`waves::BoundarySpectra`); the waves start from the boundary's mean
 //! spectrum everywhere and take the parent's wind (the mean of its points',
-//! `waves::WindSeries`). The run's clock (`start=`) must fall in the file's
+//! `waves::WindSeries`), unless `met=` gives them the weather's. The run's clock (`start=`) must fall in the file's
 //! times. Every output interval our H_s at the parent's points is printed
 //! against the parent's, and at the end the bias and RMSE after twice
 //! `ramp_hours`, with the series in `<output>/wave_points.txt`. For a
@@ -1688,6 +1690,8 @@ fn tidal_run(
     if let Some(band) = band {
         builder = builder.with_source(band);
     }
+    // The waves sample the weather on their own mesh
+    let wave_weather = weather.clone();
     if let Some(weather) = weather {
         builder = builder.with_source(weather);
     } else if opts.wind {
@@ -1705,7 +1709,8 @@ fn tidal_run(
     }
     let (mut waves, mut wave_points) = match wave_domain {
         Some(wave_domain) => {
-            let (waves, points) = coupled_waves(wave_domain, &physics, opts, &clock)?;
+            let (waves, points) =
+                coupled_waves(wave_domain, &physics, wave_weather.as_ref(), opts, &clock)?;
             (Some(waves), points)
         }
         None => (None, None),
@@ -2023,16 +2028,21 @@ fn wave_model(domain: &Domain, opts: &Options, wind: Option<Wind>) -> (WaveModel
 /// its wind, the mean of the boundary's spectra everywhere to start with
 /// (and its points for comparison); else the sea of `wave_sea=` at the
 /// boundary and everywhere, under the uniform wind of `wind` (none
-/// otherwise; the gridded `met=` wind does not reach the waves yet).
+/// otherwise). The `weather` of `met=`, if any, gives the wind instead: per
+/// wave node, not ramped.
 fn coupled_waves<BC: SWEBoundaryCondition2D>(
     domain: &Domain,
     physics: &SWEPhysics2D<BC>,
+    weather: Option<&GriddedAtmosphere2D>,
     opts: &Options,
     clock: &ModelClock,
 ) -> Result<(CoupledWaves2D, Option<WavePoints>), Box<dyn std::error::Error>> {
+    let weather = weather
+        .map(|w| w.on_mesh(&domain.mesh, &domain.ops))
+        .transpose()?;
     // Blowing from WIND_DIRECTION (clockwise from north) is blowing to
     // 90° − (WIND_DIRECTION + 180°) counter-clockwise from east
-    let wind = opts.wind.then(|| Wind {
+    let wind = (opts.wind && weather.is_none()).then(|| Wind {
         u10: WIND_SPEED,
         direction: (-90.0 - WIND_DIRECTION).to_radians(),
     });
@@ -2040,7 +2050,7 @@ fn coupled_waves<BC: SWEBoundaryCondition2D>(
         Some(path) => Some(parent_waves(domain, opts, clock, path)?),
         None => None,
     };
-    let (mut model, sea) = wave_model(domain, opts, wind);
+    let (model, sea) = wave_model(domain, opts, wind);
     let header = format!(
         "\nWaves with the tide, exchanging every {} min: {} elements (P{}), {} nodes, {} × {} \
          components",
@@ -2072,21 +2082,20 @@ fn coupled_waves<BC: SWEBoundaryCondition2D>(
                 opts.wave_neighbours,
                 boundary.n_targets(),
                 start.hs,
-                if parent.wind.is_some() {
-                    ", the parent's wind"
-                } else {
-                    ", no wind"
+                match (&weather, &parent.wind) {
+                    (Some(_), _) => ", the weather's wind (met=) per node",
+                    (None, Some(_)) => ", the parent's wind",
+                    (None, None) => ", no wind",
                 }
             );
             let state = model.uniform_state(&mean);
-            if let Some(series) = &parent.wind {
-                model.set_wind(series.at(0.0));
-            }
             let mut waves = CoupledWaves2D::new(model, state, physics, 0.0)
                 .with_ramp(3600.0 * opts.ramp_hours.max(1e-3))
                 .with_boundary(boundary);
-            if let Some(series) = parent.wind.clone() {
-                waves = waves.with_wind(series);
+            match (weather, parent.wind.clone()) {
+                (Some(weather), _) => waves = waves.with_gridded_wind(weather),
+                (None, Some(series)) => waves = waves.with_wind(series),
+                (None, None) => {}
             }
             (waves, Some(parent.points))
         }
@@ -2095,16 +2104,17 @@ fn coupled_waves<BC: SWEBoundaryCondition2D>(
             let [hs, tp, from] = opts.wave_sea;
             println!(
                 "{header}; JONSWAP H_s {hs} m, T_p {tp} s from {from}°{}",
-                match wind {
-                    Some(_) => format!(", wind {WIND_SPEED} m/s from {WIND_DIRECTION}°"),
-                    None if !opts.met.is_empty() => {
-                        ", no wind (met= does not reach the waves)".into()
-                    }
-                    None => ", no wind".into(),
+                match (&weather, wind) {
+                    (Some(_), _) => ", the weather's wind (met=) per node".into(),
+                    (None, Some(_)) => format!(", wind {WIND_SPEED} m/s from {WIND_DIRECTION}°"),
+                    (None, None) => ", no wind".into(),
                 }
             );
-            let waves = CoupledWaves2D::new(model, state, physics, 0.0)
+            let mut waves = CoupledWaves2D::new(model, state, physics, 0.0)
                 .with_ramp(3600.0 * opts.ramp_hours.max(1e-3));
+            if let Some(weather) = weather {
+                waves = waves.with_gridded_wind(weather);
+            }
             (waves, None)
         }
     };

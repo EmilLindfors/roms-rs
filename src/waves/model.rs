@@ -189,7 +189,10 @@ pub struct WaveModel2D {
     pub geom: Arc<GeometricFactors2D>,
     pub grid: SpectralGrid,
     pub sources: SourceTerms,
-    pub wind: Wind,
+    /// The wind where `winds` has none
+    wind: Wind,
+    /// The wind per node (empty: `wind` everywhere)
+    winds: Vec<Wind>,
     g: f64,
     depth_min: f64,
     /// Bed elevation B per node (m)
@@ -233,6 +236,7 @@ impl WaveModel2D {
         let mut model = Self {
             sources: SourceTerms::none(g),
             wind: Wind::default(),
+            winds: Vec::new(),
             g,
             depth_min: DEFAULT_DEPTH_MIN,
             bed: bathymetry.data.clone(),
@@ -264,18 +268,42 @@ impl WaveModel2D {
 
     /// A uniform wind over the domain.
     pub fn with_wind(mut self, wind: Wind) -> Self {
-        self.wind = wind;
+        self.set_wind(wind);
         self
     }
 
-    /// Replace the uniform wind (e.g. a parent model's, as it changes).
+    /// Replace the wind by a uniform one (e.g. a parent model's, as it
+    /// changes).
     pub fn set_wind(&mut self, wind: Wind) {
         self.wind = wind;
+        self.winds.clear();
     }
 
-    /// The uniform wind.
+    /// Replace the wind by one per node: the 10 m wind vectors `[u, v]` (m/s,
+    /// mesh axes), e.g. a weather model's from
+    /// [`GriddedAtmosphere2D::wind_into`](crate::source::GriddedAtmosphere2D::wind_into)
+    /// on this model's mesh.
+    ///
+    /// # Panics
+    /// If `wind` is not one per node.
+    pub fn set_winds(&mut self, wind: &[[f64; 2]]) {
+        assert_eq!(wind.len(), self.n_points(), "one wind per node");
+        self.winds.clear();
+        self.winds.extend(wind.iter().map(|&[u, v]| Wind {
+            u10: u.hypot(v),
+            direction: v.atan2(u),
+        }));
+    }
+
+    /// The uniform wind (what [`Self::set_wind`] set; see [`Self::wind_at`]).
     pub fn wind(&self) -> Wind {
         self.wind
+    }
+
+    /// The wind at node `p`.
+    #[inline]
+    pub fn wind_at(&self, p: usize) -> Wind {
+        self.winds.get(p).copied().unwrap_or(self.wind)
     }
 
     /// The variance density `e[c]` (m²/(rad/s)/rad) of the waves entering through
@@ -939,7 +967,7 @@ impl WaveModel2D {
                         spectrum,
                         k,
                         self.depth[p],
-                        self.wind,
+                        self.wind_at(p),
                         dt,
                         e,
                         a,
@@ -1546,5 +1574,60 @@ mod tests {
             }
         }
         assert!(shifted > 1e-3, "nothing shifted ({shifted})");
+    }
+
+    /// A wind per node: from calm, one step's sea at each node is the one
+    /// a uniform wind of that node's grows (the propagation of a calm sea is
+    /// calm, so the sources alone act), bit for bit; and a uniform wind set
+    /// afterwards replaces the per-node ones.
+    #[test]
+    fn each_node_grows_the_sea_of_its_own_wind() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 200.0, 0.0, 100.0, 2, 1);
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |_, _| -50.0);
+        let grid = SpectralGrid::new(0.08, 0.5, 12, 12);
+        let mut model = WaveModel2D::new(Arc::new(mesh), ops, geom, &bathymetry, grid, 9.81)
+            .with_sources(SourceTerms::swan_defaults(9.81));
+        let (left, right) = ([10.4, 6.0], [-3.0, -5.2]);
+        let winds: Vec<[f64; 2]> = (0..model.n_points())
+            .map(|p| if p < model.ops.n_nodes { left } else { right })
+            .collect();
+        let uniform = |[u, v]: [f64; 2]| Wind {
+            u10: u.hypot(v),
+            direction: v.atan2(u),
+        };
+        let mut ws = WaveWorkspace::default();
+        let mut grown = |model: &WaveModel2D| {
+            let mut n = model.zero_state();
+            model.step(&mut n, 0.0, 60.0, &mut ws);
+            n
+        };
+        model.set_winds(&winds);
+        let per_node = grown(&model);
+        model.set_wind(uniform(left));
+        let by_left = grown(&model);
+        model.set_wind(uniform(right));
+        let by_right = grown(&model);
+        let nn = model.ops.n_nodes;
+        for c in 0..model.grid.n_components() {
+            let (a, l, r) = (
+                per_node.component(c),
+                by_left.component(c),
+                by_right.component(c),
+            );
+            assert_eq!(a[..nn], l[..nn], "component {c}");
+            assert_eq!(a[nn..], r[nn..], "component {c}");
+        }
+        let m0 = |n: &WaveSolution, p: usize| {
+            let mut e = vec![0.0; model.grid.n_components()];
+            model.energy_spectrum_into(n, p, &mut e);
+            model.grid.parameters(&e).m0
+        };
+        assert!(
+            m0(&per_node, 0) > 1.5 * m0(&per_node, nn),
+            "the stronger wind grows more"
+        );
+        assert_eq!(model.wind_at(0).u10, model.wind_at(nn).u10);
     }
 }
