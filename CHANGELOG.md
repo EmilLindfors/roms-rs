@@ -407,6 +407,20 @@ All notable changes to this project should be documented in this file.
 
 ### Performance
 
+- **The spectral wave model's step 2× faster on one thread, 1.4× at Frøya, bit for bit (TODO F.4).**
+  - **Node-major throughout.** `WaveModel2D::step` keeps the state node-major (`[point][component]`) for the whole step: one transpose in and one out, where it used to transpose around each node pass (4 → 2).
+  - **The geographic propagation** (`waves/propagation.rs`) runs 8 directions of a frequency per vector (fearless_simd): they share the group velocity, the current and the element geometry.
+  - **The implicit refraction and frequency shift** (`waves/implicit_lanes.rs`) solve 8 systems per vector: 8 frequencies of a node for the cyclic refraction systems, 8 directions for the shift's. The early returns, van Leer, the Zalesak donor and Sherman–Morrison are selects.
+  - **Bit for bit.** Gate `the_vector_kernels_give_the_scalar_bits` covers P1/P2, implicit and explicit, van Leer and upwind, with currents, wind, sources, and open and absorbing boundaries. A checksum of four steps of six configurations matched the code before the change, with and without `simd`.
+  - **Measured.** New `benches/wave_step_bench.rs`: a 60 × 45 km P1 grid, 25 × 36 components, implicit refraction and shift, sources and a current.
+
+    | Run | before | after |
+    |---|---|---|
+    | step, 1 thread | 1.22 s | 0.61 s |
+    | step, 24 threads | 188 ms | 127 ms |
+    | Frøya wave grid (`waves=20 wave_mesh=60,45 implicit=1`, 24 threads) | 151–161 ms per step, 77–83 s per model hour | 113 ms per step, 58 s per model hour |
+
+  - **API.** The public `propagation_rhs_into` and `limit_positivity` keep their component-major interface by transposing in and out (the step no longer calls them).
 - **The shoreline subcells vectorised too: the Frøya coastline RHS is 1.7× faster, bit for bit (TODO P2.2).** The `WetDry` kernel's second-order subcell finite volumes now run 8 elements per vector as well:
   - **What is batched:** the limited reconstruction, the dry-node rule for `η`, the subcell hydrostatic HLLs, the bed and metric balance terms, and boundary lines without an outer neighbour.
   - **Why 64-element chunks:** with 8 consecutive elements per batch, a 30–40 % share of shoreline elements would fill few lanes. The drivers therefore sort chunks of 64 elements (`ELEMENT_CHUNK`) into flux-differencing and subcell elements, and each kind fills its lanes.
