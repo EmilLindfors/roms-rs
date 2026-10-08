@@ -43,6 +43,16 @@
 //! the whole step at every node ([`super::SourceTerms::integrate`]), split
 //! first-order in time from the propagation.
 //!
+//! The propagation's own time error is small next to the sources' (measured on
+//! a young wind sea: 8e-5 of H_s after an hour at the geographic step, against
+//! 1e-2 with SWAN's sources). [`WaveModel2D::with_substeps`] runs the sources
+//! (and the implicit refraction and shifting) once per several propagation
+//! steps, between their halves. With SWAN's frozen rates and per-step limiter
+//! that costs accuracy, and frozen rates without the limiter blow up at long
+//! steps; WAM's integration ([`super::SourceIntegration::Implicit`] with
+//! [`super::GrowthLimiter::Rate`]) keeps the growth curves at an outer step of
+//! minutes.
+//!
 //! On steep slopes refraction turns the waves fast, and its explicit Courant
 //! limit `|c_θ| Δt ≤ Δθ` sets a step far below the geographic one (100× at
 //! Frøya). [`WaveModel2D::with_implicit_refraction`] takes the direction
@@ -73,13 +83,13 @@ use std::sync::Arc;
 
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D};
-use crate::time::{SSPRK3, StageWorkspace, TimeIntegrator};
+use crate::time::{StageWorkspace, StandardIntegrator, TimeIntegrator};
 use crate::types::ElementIndex;
 
 use super::dispersion::{dsigma_ddepth, group_velocity, wavenumber};
 #[cfg(feature = "simd")]
 use super::nonlinear::LANES;
-use super::sources::{SourceScratch, SourceTerms, Wind};
+use super::sources::{Nodes, SourceScratch, SourceTerms, Wind};
 use super::spectrum::{SpectralGrid, WaveParameters};
 use super::state::WaveSolution;
 
@@ -241,6 +251,10 @@ pub struct WaveModel2D {
     implicit_refraction: bool,
     /// Frequency shifting stepped implicitly around the Runge–Kutta stages
     implicit_frequency_shift: bool,
+    /// The Runge–Kutta method of the propagation
+    time_integrator: StandardIntegrator,
+    /// Propagation steps per step (the node passes run once per step)
+    substeps: usize,
 }
 
 impl WaveModel2D {
@@ -276,6 +290,8 @@ impl WaveModel2D {
             spectral_advection: SpectralAdvection::default(),
             implicit_refraction: false,
             implicit_frequency_shift: false,
+            time_integrator: StandardIntegrator::SSPRK3,
+            substeps: 1,
             mesh,
             ops,
             geom,
@@ -287,6 +303,25 @@ impl WaveModel2D {
 
     pub fn with_sources(mut self, sources: SourceTerms) -> Self {
         self.sources = sources;
+        self
+    }
+
+    /// The Runge–Kutta method of the propagation (default SSP-RK3).
+    /// [`StandardIntegrator::SSPRK43`] has twice SSP-RK3's SSP coefficient,
+    /// so its positivity scaling holds at twice the CFL number, for 4 stages
+    /// against 3.
+    pub fn with_time_integrator(mut self, integrator: StandardIntegrator) -> Self {
+        self.time_integrator = integrator;
+        self
+    }
+
+    /// Run the propagation in `substeps` equal steps within each step, and
+    /// the node passes (implicit refraction and frequency shifting, the
+    /// sources) once per step, around them (default 1). [`Self::compute_dt`]
+    /// gives `substeps` times the propagation's step.
+    pub fn with_substeps(mut self, substeps: usize) -> Self {
+        assert!(substeps >= 1, "at least one propagation step per step");
+        self.substeps = substeps;
         self
     }
 
@@ -597,7 +632,7 @@ impl WaveModel2D {
     /// half of that for MUSCL (van Leer's reconstruction is TVD, so positive, for
     /// Courant numbers ≤ ½).
     pub fn compute_dt(&self, cfl: f64) -> f64 {
-        self.time_step_limits(cfl).dt()
+        self.time_step_limits(cfl).dt() * self.substeps as f64
     }
 
     /// Each bound of [`Self::compute_dt`] and the node that sets it: what
@@ -688,10 +723,15 @@ impl WaveModel2D {
         from_node_major(&node, np, nc, &mut n.data);
     }
 
-    /// Advance `n` from `t` by `dt`: SSP-RK3 propagation (positivity limited every
-    /// stage), then the sources over the step. Implicit refraction and
-    /// frequency shifting take half the step before the stages and half after
-    /// (Strang), so their splitting error is second order in the step.
+    /// Advance `n` from `t` by `dt`: the propagation by the Runge–Kutta method
+    /// of [`Self::with_time_integrator`] (positivity limited every stage) and
+    /// the sources over the step. Implicit refraction and frequency shifting
+    /// take half the step before the propagation and half after (Strang).
+    ///
+    /// In one propagation step the sources follow it. With
+    /// [`Self::with_substeps`] (`m ≥ 2`) they sit between the first `⌊m/2⌋`
+    /// propagation steps and the rest, so for even `m` the step is symmetric
+    /// (Strang), and its splitting second order in the step.
     pub fn step(&self, n: &mut WaveSolution, t: f64, dt: f64, ws: &mut WaveWorkspace) {
         // Strang: half of the implicit spectral advection on each side of the
         // stages
@@ -700,6 +740,13 @@ impl WaveModel2D {
             half(self.implicit_refraction),
             half(self.implicit_frequency_shift),
         );
+        let sources = self.sources.any().then_some(dt);
+        let substeps = self.substeps;
+        // The sources between the halves of the propagation, or after it
+        let (middle, after) = match substeps {
+            1 => (None, sources),
+            _ => (sources, None),
+        };
         // The whole step node-major: one transpose in, one out
         let (np, nc) = (self.n_points(), self.grid.n_components());
         to_node_major(&n.data, np, nc, &mut ws.node.data);
@@ -709,20 +756,29 @@ impl WaveModel2D {
                 NodePass::before_stages(refraction, shift),
             );
         }
-        SSPRK3.step_with_workspace(
-            &mut ws.node,
-            dt,
-            t,
-            |s, _, out| self.propagation_rhs_node_major(&s.data, &mut out.data),
-            |s| self.limit_positivity_node_major(&mut s.data),
-            &mut ws.stages,
-        );
-        let sources = self.sources.any().then_some(dt);
-        if refraction.is_some() || shift.is_some() || sources.is_some() {
+        let h = dt / substeps as f64;
+        for m in 0..substeps {
+            if let (Some(dt), true) = (middle, m == substeps / 2) {
+                let pass = NodePass {
+                    sources: Some(dt),
+                    ..NodePass::default()
+                };
+                self.node_pass_node_major(&mut ws.node.data, pass);
+            }
+            self.time_integrator.step_with_workspace(
+                &mut ws.node,
+                h,
+                t + m as f64 * h,
+                |s, _, out| self.propagation_rhs_node_major(&s.data, &mut out.data),
+                |s| self.limit_positivity_node_major(&mut s.data),
+                &mut ws.stages,
+            );
+        }
+        if refraction.is_some() || shift.is_some() || after.is_some() {
             let pass = NodePass {
                 refraction,
                 shift,
-                sources,
+                sources: after,
                 shift_first: false,
             };
             self.node_pass_node_major(&mut ws.node.data, pass);
@@ -802,6 +858,8 @@ impl WaveModel2D {
             || {
                 (
                     vec![0.0; tile * nf],
+                    Vec::with_capacity(tile),
+                    Vec::with_capacity(tile),
                     SourceScratch::new(nc),
                     CyclicScratch::new(nd),
                     CyclicScratch::new(nf),
@@ -809,7 +867,7 @@ impl WaveModel2D {
                     NodeRates::new(&self.grid),
                 )
             },
-            |(k, scratch, cyclic, banded, column, rates), chunk, nodes| {
+            |(k, depths, winds, scratch, cyclic, banded, column, rates), chunk, nodes| {
                 let first = chunk * tile;
                 for (q, spectrum) in nodes.chunks_exact_mut(nc).enumerate() {
                     let p = first + q;
@@ -860,51 +918,22 @@ impl WaveModel2D {
                     if !shift_first {
                         shift_now(spectrum);
                     }
-                    if let (Some(dt), 1) = (sources, tile) {
-                        for (i, k) in k.iter_mut().enumerate() {
-                            *k = self.k[i * np + p];
-                        }
-                        let SourceScratch { e, a, b, .. } = scratch;
-                        self.sources.integrate(
-                            &self.grid,
-                            spectrum,
-                            k,
-                            self.depth[p],
-                            self.wind_at(p),
-                            dt,
-                            e,
-                            a,
-                            b,
-                        );
-                    }
                 }
-                // The sources at all the chunk's nodes at once
-                #[cfg(feature = "simd")]
-                if let (Some(dt), LANES) = (sources, tile) {
+                // The sources at all the chunk's nodes (at once in the DIA's lanes)
+                if let Some(dt) = sources {
                     let width = nodes.len() / nc;
                     for q in 0..width {
                         for (i, k) in k[q * nf..(q + 1) * nf].iter_mut().enumerate() {
                             *k = self.k[i * np + first + q];
                         }
                     }
-                    let depths: [f64; LANES] =
-                        std::array::from_fn(|q| self.depth.get(first + q).copied().unwrap_or(0.0));
-                    let winds: [Wind; LANES] = std::array::from_fn(|q| {
-                        if q < width {
-                            self.wind_at(first + q)
-                        } else {
-                            Wind::default()
-                        }
-                    });
-                    self.sources.integrate_lanes(
-                        &self.grid,
-                        nodes,
-                        k,
-                        &depths[..width],
-                        &winds[..width],
-                        dt,
-                        scratch,
-                    );
+                    depths.clear();
+                    depths.extend((first..first + width).map(|p| self.depth[p]));
+                    winds.clear();
+                    winds.extend((first..first + width).map(|p| self.wind_at(p)));
+                    let at = Nodes { k, depths, winds };
+                    self.sources
+                        .integrate_at(&self.grid, nodes, at, dt, scratch, tile > 1);
                 }
             },
         );

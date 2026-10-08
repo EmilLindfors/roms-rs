@@ -6,6 +6,28 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Long wave steps: WAM's source integration and propagation substeps, 3× faster waves at Frøya (TODO F.4 Cost).** All off by default; today's results are unchanged bit for bit.
+  - **What limited the step.** Measured on a young 15 m/s sea with swell, relative H_s error after an hour against a converged run:
+    - The propagation's own time error is negligible: 8e-5 at the 7 s step without sources.
+    - SWAN's source integration has frozen rates (first order) and Ris's limiter, which caps the growth per step. Its error is 1.1e-2 at 7 s and 3.8e-2 at 28 s. Without the limiter it blows up at a 28 s step.
+  - **`SourceIntegration::Implicit`** makes the DIA implicit in each component's own energy, as WAM does (ECMWF IFS Part VII §5.2; ecWAM's `implsch.F90`).
+    - It is the exponential update with the rate `B_local + min(Λ_nl, 0)`.
+    - `Λ_nl` is the DIA's diagonal derivative, new as `Quadruplets::source_and_diagonal`, and computed in the 8-node lanes too.
+  - **`GrowthLimiter::Rate`** is Hersbach & Janssen's (1999) limiter, proportional to the step: `ΔF ≤ C g ũ* f⁻⁴ f_c Δt`, with C = 5·10⁻⁷ (ecWAM's).
+    - It replaces `limiter: Option<f64>` by `Option<GrowthLimiter>`; `PerStep(γ)` is Ris's limiter, as before.
+    - With both, the result no longer depends on the step: the same from 7 to 109 s, and stable at 164 s.
+  - **`WaveModel2D::with_substeps(n)`** runs the sources and the implicit refraction and shifting once per n propagation steps, with the sources between the two halves. `compute_dt` gives the outer step. Also `with_time_integrator` and `SourceIntegration::Midpoint` (second order at a node), which turned out to matter little here.
+  - **Growth curves.**
+    - Fetch-limited: within the Kahma & Calkoen gate's bounds at a 145 s outer step, and within 1.8 % of the 18 s curve. SWAN's scheme moves 9 % between the same steps.
+    - Duration-limited: the same as SWAN's scheme by 6 h, and to 0.15 % at 96 h. The first hours grow more slowly (E* 4.7e-5 against 8.1e-5 at 30 min), which is Hersbach & Janssen's limiter acting as physics.
+    - Gates: `implicit_sources_keep_the_fetch_curve_at_long_steps`, `implicit_sources_grow_a_sea_whatever_the_step`, `the_diagonal_is_the_transfers_derivative`, `the_midpoint_rule_is_second_order`.
+  - **Frøya** (`froya_real_data … wave_mesh=60,45 implicit=1`, the new options `wave_sources=wam wave_substeps=N wave_cfl=`), wall time per model hour at 24 threads:
+    - 58 s today;
+    - 39 s with WAM's sources and 4 substeps;
+    - 19 s with CFL 1.0 as well (a 56 s outer step), 3× faster.
+    - Over 6.3 h, CFL 1.0 and 0.5 at the same outer step agree to 1.5e-4 in total action.
+    - Against the 7 s step over the same 6.3 h, the total action changes by 0.3 % with the new sources and by 0.5 % more with the 56 s step. The largest H_s, at a focusing point, falls from 3.96 to 3.79 m, so the long steps stay opt-in until that is understood (TODO F.4).
+  - `examples/wave_growth.rs` takes `integration=`, `limiter=ris|rate[:C]|none` and `substeps=`.
 - **The weather's wind on the waves, per node (`WaveModel2D::set_winds`, `GriddedAtmosphere2D::on_mesh` / `wind_into`, `CoupledWaves2D::with_gridded_wind`; TODO F.4 forcing).** Until now the waves took one wind for the whole domain: the parent wave model's (the mean of its points') or a constant.
   - **`WaveModel2D::set_winds`** takes one 10 m wind vector per node (mesh axes); `set_wind` sets a uniform one again, and `wind_at(p)` gives a node's. The `wind` field is now private (`wind()` reads it).
   - **`GriddedAtmosphere2D::on_mesh`** samples the same weather (reader, projection, clock, drag, ramp) at the nodes of another mesh, a wave model's. **`wind_into`** gives the 10 m wind at every node, linear in time between the snapshots and not ramped, since the waves start from a sea of their own.
