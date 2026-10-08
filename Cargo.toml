@@ -9,7 +9,7 @@ license = "MIT"
 default = ["parallel", "simd", "netcdf", "mimalloc"]
 parallel = ["rayon"]
 netcdf = ["dep:netcdf", "dep:chrono"]
-simd = ["pulp"]
+simd = ["dep:fearless_simd"]
 
 # Native reader for norkyst-client grid parquet (validation ingest).
 # Off by default: pulls the arrow/parquet dependency tree.
@@ -32,7 +32,7 @@ thiserror = "2.0"
 rayon = { version = "1.10", optional = true }
 netcdf = { version = "0.10", optional = true }
 chrono = { version = "0.4", optional = true }
-pulp = { version = "0.18", optional = true }
+fearless_simd = { version = "1.1", optional = true }
 burn = { version = "0.20", optional = true, default-features = false }
 burn-ndarray = { version = "0.20", optional = true }
 # Disable fusion feature to support f64 precision (fusion only supports f32)
@@ -84,6 +84,11 @@ harness = false
 [[bench]]
 name = "source_term_bench"
 path = "benches/source_term_bench.rs"
+harness = false
+
+[[bench]]
+name = "split_form"
+path = "benches/split_form_bench.rs"
 harness = false
 
 # Profiling profile: release optimizations with debug symbols for flamegraph

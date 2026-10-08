@@ -97,6 +97,15 @@ use crate::types::ElementIndex;
 
 use super::swe_2d::{SWE2DRhsConfig, SWEFormulation2D};
 
+#[cfg(feature = "simd")]
+#[path = "swe_2d_split_form_batch.rs"]
+mod batch;
+
+/// Elements per [`SplitFormSWE2D::volume_batch`]: with the `simd` feature
+/// the volume terms of fully wet elements are evaluated this many at a time,
+/// one element per SIMD lane.
+pub(super) const VOLUME_BATCH: usize = 8;
+
 /// Limited slope of one variable at node `ξ` of a subcell spanning
 /// `[x_l, x_r]`, from the values at the neighbouring nodes `ξ_m < ξ < ξ_p`:
 /// the central slope, capped so that the face values `q + σ(x − ξ)` stay
@@ -216,6 +225,10 @@ pub(super) struct SplitFormWorkspace {
     /// neighbour element on the GLL line through it, and its distance from
     /// the face in this element's reference coordinate (`None` at boundaries)
     outer: Vec<Option<(SWENodeState2D, f64)>>,
+    /// Volume terms (times J) of a batch of elements, lane `l` from
+    /// `l · n_nodes` ([`SplitFormSWE2D::volume_batch`])
+    #[cfg_attr(not(feature = "simd"), allow(dead_code))]
+    batch: Vec<SWEState2D>,
 }
 
 impl SplitFormWorkspace {
@@ -236,6 +249,7 @@ impl SplitFormWorkspace {
             interfaces: padded(n_1d + 1, (0.0, 0.0)),
             faces: padded(n_1d, Default::default()),
             outer: padded(4 * n_1d, None),
+            batch: padded(VOLUME_BATCH * n_nodes, SWEState2D::zero()),
         }
     }
 }
@@ -302,6 +316,26 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
                 config.equation.h_min.meters(),
             ),
         })
+    }
+
+    /// Without the `simd` feature no volume term is batched: every element
+    /// evaluates its own in [`Self::element_rhs`].
+    #[cfg(not(feature = "simd"))]
+    pub(super) fn volume_batch(&self, _ks: &[usize], _ws: &mut SplitFormWorkspace) -> u8 {
+        0
+    }
+
+    /// [`Self::edge_fluxes`] of up to [`VOLUME_BATCH`] edges, `slots[i]` for
+    /// `edges[i]`: vectorised across the edges with the `simd` feature
+    /// (`WetDry`, P1–P4; the same result bit for bit), else one by one.
+    pub(super) fn edge_fluxes_batch(&self, edges: &[usize], slots: &mut [&mut [SWEState2D]]) {
+        #[cfg(feature = "simd")]
+        if self.edge_fluxes_simd(edges, slots) {
+            return;
+        }
+        for (&e, slot) in edges.iter().zip(slots) {
+            self.edge_fluxes(e, slot);
+        }
     }
 
     #[inline]
@@ -403,6 +437,11 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// `subcell_mass`, if given, the mass flux through every subcell interface
     /// ([`crate::solver::rhs::subcells`]), or NaN in all of them if the element
     /// takes the flux-differencing volume term.
+    ///
+    /// `volume`: the lane of `ws.batch` holding this element's volume term,
+    /// if [`Self::volume_batch`] computed it (then only the surface terms are
+    /// evaluated here; the result is the same bit for bit).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn element_rhs(
         &self,
         k: ElementIndex,
@@ -411,6 +450,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         out: [&mut [f64]; 3],
         mut face_mass: Option<&mut [f64]>,
         mut subcell_mass: Option<&mut [f64]>,
+        volume: Option<usize>,
     ) {
         let ops = self.ops;
         let n1 = ops.n_1d;
@@ -421,7 +461,13 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
 
         for i in 0..ops.n_nodes {
             ws.nodes[i] = SWENodeState2D::new(&self.q.get_state(k, i), self.bed(k, i), h_min);
-            ws.rhs[i] = SWEState2D::zero();
+        }
+        match volume {
+            Some(lane) => {
+                let n = ops.n_nodes;
+                ws.rhs.copy_from_slice(&ws.batch[lane * n..(lane + 1) * n]);
+            }
+            None => ws.rhs.fill(SWEState2D::zero()),
         }
 
         // 1. Volume term (times J), line by line (node ordering i = j·n1 + a,
@@ -431,6 +477,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let subcells = self
             .subcells
             .is_some_and(|(depth, _)| ws.nodes.iter().any(|n| n.h < depth));
+        debug_assert!(!(subcells && volume.is_some()), "batched a subcell element");
         if subcells {
             self.outer_nodes(k, ws);
         } else if let Some(mass) = subcell_mass.as_deref_mut() {
@@ -442,7 +489,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let element = self.geom.element_geometry(ki);
         let affine = element.affine;
         let (affine_r, affine_s) = element.metric.contravariant();
-        for line in 0..n1 {
+        // A batched volume term is already in `ws.rhs`
+        let lines = if volume.is_some() { 0 } else { n1 };
+        for line in 0..lines {
             let r_line = |a: usize| line * n1 + a;
             let s_line = |j: usize| j * n1 + line;
             // Line ends on faces 3/1 (r-lines) and 0/2 (s-lines); faces 2
@@ -1505,6 +1554,124 @@ mod tests {
             let serial = compute_rhs_swe_2d(&q, &mesh, &ops, &geom, &config, 0.0);
             let parallel = compute_rhs_swe_2d_parallel(&q, &mesh, &ops, &geom, &config, 0.0);
             assert_eq!(serial.data, parallel.data, "periodic={periodic}, WetDry");
+        }
+    }
+
+    /// Every value of a solution as bits (NaN and the sign of zero included)
+    #[cfg(feature = "simd")]
+    fn bits(q: &SWESolution2D) -> Vec<u64> {
+        q.data.iter().flatten().map(|x| x.to_bits()).collect()
+    }
+
+    /// The volume terms batched across elements and the face fluxes across
+    /// edges (one per SIMD lane) give every element's RHS bit for bit:
+    /// P1–P5 (P5 is not batched), on
+    /// parallelograms, general quadrilaterals and a mesh of both (mixed
+    /// batches), with and without bathymetry, with shoreline subcells in
+    /// some lanes, and 35 elements (a short last batch). Also through the
+    /// subset RHS of local time stepping, whose batches are arbitrary lists.
+    #[test]
+    #[cfg(feature = "simd")]
+    fn test_batched_kernels_are_bit_for_bit() {
+        use super::batch::UNBATCHED;
+        use crate::solver::rhs::swe_2d::compute_rhs_swe_2d_subset_then;
+
+        let equation = ShallowWater2D::new(G);
+        let bc = Reflective2D::new();
+        let unbatched = |f: &dyn Fn() -> SWESolution2D| {
+            UNBATCHED.with(|u| u.set(true));
+            let q = f();
+            UNBATCHED.with(|u| u.set(false));
+            q
+        };
+        let tau = 2.0 * std::f64::consts::PI / L;
+        for order in 1..=5 {
+            // 0: parallelograms, 1: all distorted, 2: distorted for x > L/2
+            for distortion in 0..3 {
+                let mut mesh = Mesh2D::uniform_rectangle(0.0, L, 0.0, 0.5 * L, 7, 5);
+                if distortion > 0 {
+                    let a = 0.03 * L;
+                    for v in &mut mesh.vertices {
+                        let [x, y] = *v;
+                        if distortion == 1 || x > 0.5 * L {
+                            let (sx, sy) = ((tau * x).sin(), (2.0 * tau * y).sin());
+                            *v = [x + a * sx * sy, y - 0.7 * a * sx * sy];
+                        }
+                    }
+                }
+                let ops = DGOperators2D::new(order);
+                let geom = GeometricFactors2D::compute(&mesh, &ops);
+                if order > 1 {
+                    assert_eq!(
+                        geom.is_affine(),
+                        distortion == 0,
+                        "P{order}, distortion {distortion}"
+                    );
+                }
+                let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+                    -1.0 + 1.5 * (tau * x).cos() * (tau * y).cos()
+                });
+                let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+                for b in bathymetry.data.iter_mut() {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    *b += 0.4 * ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
+                }
+                bathymetry.compute_gradients(&ops, &geom);
+                let q = shoreline_state(&mesh, &ops, &bathymetry, 1.0);
+                let deep = state(&mesh, &ops, &bathymetry, 1.0);
+
+                for (formulation, q, with_bed) in [
+                    (SWEFormulation2D::WetDry, &q, true),
+                    (SWEFormulation2D::EntropyStable, &deep, true),
+                    (SWEFormulation2D::EntropyConservative, &deep, false),
+                ] {
+                    let mut config = SWE2DRhsConfig::new(&equation, &bc)
+                        .with_coriolis(false)
+                        .with_formulation(formulation);
+                    if with_bed {
+                        config = config.with_bathymetry(&bathymetry);
+                    }
+                    let case = format!("P{order}, distortion {distortion}, {formulation:?}");
+                    let batched = compute_rhs_swe_2d(q, &mesh, &ops, &geom, &config, 0.0);
+                    let reference =
+                        unbatched(&|| compute_rhs_swe_2d(q, &mesh, &ops, &geom, &config, 0.0));
+                    assert!(bits(&batched) == bits(&reference), "{case}");
+
+                    // Subset RHS over a scrambled list of most elements
+                    let elements: Vec<u32> = (0..mesh.n_elements as u32)
+                        .map(|k| (k * 11) % mesh.n_elements as u32)
+                        .filter(|k| k % 5 != 2)
+                        .collect();
+                    let mut subset = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                    compute_rhs_swe_2d_subset_then(
+                        q,
+                        &mesh,
+                        &ops,
+                        &geom,
+                        &config,
+                        &elements,
+                        &|_| 0.0,
+                        &mut subset,
+                        None,
+                        &|_, _, _| {},
+                    );
+                    let n = ops.n_nodes;
+                    for &k in &elements {
+                        let rows = k as usize * n..(k as usize + 1) * n;
+                        for (a, b) in subset.data.iter().zip(&reference.data) {
+                            assert!(
+                                a[rows.clone()]
+                                    .iter()
+                                    .zip(&b[rows.clone()])
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "{case}, subset element {k}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 }

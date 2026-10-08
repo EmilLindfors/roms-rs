@@ -206,7 +206,7 @@ The `dg-rs` codebase is impressively comprehensive for a 2D solver. Here is what
 - [x] Physical depth conversion
 
 #### Performance
-- [x] SIMD-optimized kernels (via `pulp` crate)
+- [x] SIMD-optimized kernels (via `fearless_simd`; `pulp` when this report was written)
 - [x] Parallel RHS computation (via `rayon`)
 - [x] GPU acceleration via Burn framework (CUDA, WGPU, NdArray backends)
 - [x] Structure-of-arrays (SoA) memory layout for hot paths

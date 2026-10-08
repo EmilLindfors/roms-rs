@@ -61,7 +61,7 @@ Measured with criterion on WSL2 Linux (Intel CPU), release build.
 | P5 | 36 | 13.0 ns | 9.3 ns | **1.4x** |
 
 **Notes**:
-- Uses pulp SIMD intrinsics with automatic AVX2/SSE4 detection
+- Measured with pulp 0.18; the kernel uses fearless_simd since 2026-10-08 (runtime AVX-512/AVX2/SSE4.2 detection)
 - Simple FMA operations vectorize well
 - Scalar tail handling for non-aligned sizes
 
@@ -117,7 +117,8 @@ cargo bench --features simd -- combine_derivatives
    - Automatic serial/parallel selection (threshold: 1000 elements)
 
 2. **SIMD** ✓
-   - `pulp` crate for portable SIMD with runtime detection (AVX-512/AVX2/SSE4)
+   - `fearless_simd` (feature `simd`) with runtime detection (AVX-512/AVX2/SSE4.2/NEON); `pulp` until 2026-10-08
+   - The split-form (`WetDry`) kernel's volume term and face fluxes run 8 elements/edges per vector, one per lane, bit for bit (`benches/split_form_bench.rs`: −26 % serial RHS on parallelograms, −33 % on general quadrilaterals, P2)
    - `faer` GEMV for optimized matrix-vector products
    - SoA (Structure of Arrays) data layout for SIMD kernels
    - 1.2-1.8x speedup on volume term (P4+ polynomial orders)

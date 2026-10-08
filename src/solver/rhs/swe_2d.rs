@@ -26,7 +26,7 @@ use crate::time::SspScheme;
 use crate::types::ElementIndex;
 
 use super::diffusion_2d::ScalarGradient2D;
-use super::swe_2d_split_form::{SplitFormSWE2D, SplitFormWorkspace};
+use super::swe_2d_split_form::{SplitFormSWE2D, SplitFormWorkspace, VOLUME_BATCH};
 use super::swe_2d_viscosity::{ViscousScratch, ViscousTerm, ViscousWorkspace};
 #[cfg(feature = "simd")]
 use crate::solver::simd::{apply_diff_matrix, apply_lift, coriolis_source};
@@ -567,6 +567,22 @@ fn viscous_gradients_all<BC: SWEBoundaryCondition2D>(
     }
 }
 
+/// The face fluxes of the consecutive edges `e0..` whose slots are `batch`
+/// (`per_edge` values each, at most [`VOLUME_BATCH`] edges), batched.
+fn edge_batch<BC: SWEBoundaryCondition2D>(
+    split_form: &SplitFormSWE2D<BC>,
+    e0: usize,
+    batch: &mut [SWEState2D],
+    per_edge: usize,
+) {
+    let count = batch.len() / per_edge;
+    let edges: [usize; VOLUME_BATCH] = std::array::from_fn(|l| e0 + l);
+    let mut chunks = batch.chunks_exact_mut(per_edge);
+    let mut slots: [&mut [SWEState2D]; VOLUME_BATCH] =
+        std::array::from_fn(|_| chunks.next().unwrap_or_default());
+    split_form.edge_fluxes_batch(&edges[..count], &mut slots[..count]);
+}
+
 /// One 2D SWE RHS evaluation. `element` is the only place the per-element
 /// terms are computed; the serial and parallel drivers just iterate over it.
 struct SWE2DRhsKernel<'a, 'c, BC: SWEBoundaryCondition2D> {
@@ -609,8 +625,8 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         };
         faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
         let per_edge = 2 * self.ops.n_face_nodes;
-        for (e, slots) in faces.chunks_exact_mut(per_edge).enumerate() {
-            split_form.edge_fluxes(e, slots);
+        for (b, batch) in faces.chunks_mut(VOLUME_BATCH * per_edge).enumerate() {
+            edge_batch(split_form, b * VOLUME_BATCH, batch, per_edge);
         }
     }
 
@@ -626,9 +642,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         faces.resize(split_form.face_buffer_len(), SWEState2D::zero());
         let per_edge = 2 * self.ops.n_face_nodes;
         faces
-            .par_chunks_exact_mut(per_edge)
+            .par_chunks_mut(VOLUME_BATCH * per_edge)
             .enumerate()
-            .for_each(|(e, slots)| split_form.edge_fluxes(e, slots));
+            .for_each(|(b, batch)| edge_batch(split_form, b * VOLUME_BATCH, batch, per_edge));
     }
 
     /// Volume, surface and source terms of element `k`, written (not added)
@@ -639,6 +655,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     /// normal (see [`compute_rhs_swe_2d_face_mass_into`]), and `subcell_mass`,
     /// if given, the mass flux through every subcell interface (NaN where the
     /// element has no subcells; see [`compute_rhs_swe_2d_mass_fluxes_into`]).
+    ///
+    /// `volume`: the lane of the workspace's batch holding the element's
+    /// split-form volume term, from [`Self::volume_batch`].
+    #[allow(clippy::too_many_arguments)]
     fn element(
         &self,
         k: usize,
@@ -647,6 +667,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
         out: [&mut [f64]; 3],
         face_mass: Option<&mut [f64]>,
         subcell_mass: Option<&mut [f64]>,
+        volume: Option<usize>,
     ) {
         let k_idx = ElementIndex::new(k);
         let [out_h, out_hu, out_hv] = out;
@@ -660,6 +681,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
                 [out_h, out_hu, out_hv],
                 face_mass,
                 subcell_mass,
+                volume,
             ),
             None => {
                 if let Some(mass) = subcell_mass {
@@ -671,6 +693,53 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
 
         // 3–4. Source terms
         self.source_terms(k_idx, ws, [out_h, out_hu, out_hv]);
+    }
+
+    /// Split-form volume terms of the elements `ks` (at most
+    /// [`VOLUME_BATCH`]) at once, vectorised across them (`simd` feature),
+    /// into the workspace for the next [`Self::element`] calls: bit `l` of
+    /// the result is set if `ks[l]`'s is there (lane `l`).
+    fn volume_batch(&self, ks: &[usize], ws: &mut ElementWorkspace) -> u8 {
+        self.split_form.as_ref().map_or(0, |split_form| {
+            split_form.volume_batch(ks, &mut ws.split_form)
+        })
+    }
+
+    /// [`Self::element`] for the consecutive elements `k0..` whose rows are
+    /// `out` (at most [`VOLUME_BATCH`] elements; `face_mass` and
+    /// `subcell_mass` likewise), their volume terms batched, then
+    /// `after(k, ws, hu, hv)` for each.
+    #[allow(clippy::too_many_arguments)]
+    fn element_batch(
+        &self,
+        k0: usize,
+        ws: &mut ElementWorkspace,
+        faces: &[SWEState2D],
+        [out_h, out_hu, out_hv]: [&mut [f64]; 3],
+        face_mass: Option<&mut [f64]>,
+        subcell_mass: Option<&mut [f64]>,
+        after: impl Fn(usize, &mut ElementWorkspace, &mut [f64], &mut [f64]),
+    ) {
+        let ops = self.ops;
+        let n = ops.n_nodes;
+        let ks: [usize; VOLUME_BATCH] = std::array::from_fn(|l| k0 + l);
+        let volumes = self.volume_batch(&ks[..out_h.len() / n], ws);
+        let mut face_mass = face_mass.map(|fm| fm.chunks_exact_mut(4 * ops.n_face_nodes));
+        let mut subcell_mass =
+            subcell_mass.map(|sm| sm.chunks_exact_mut(subcell_interfaces(ops.n_1d)));
+        for (l, ((h, hu), hv)) in out_h
+            .chunks_exact_mut(n)
+            .zip(out_hu.chunks_exact_mut(n))
+            .zip(out_hv.chunks_exact_mut(n))
+            .enumerate()
+        {
+            let k = k0 + l;
+            let fm = face_mass.as_mut().and_then(Iterator::next);
+            let sm = subcell_mass.as_mut().and_then(Iterator::next);
+            let volume = ((volumes >> l) & 1 == 1).then_some(l);
+            self.element(k, ws, faces, [h, &mut *hu, &mut *hv], fm, sm, volume);
+            after(k, ws, hu, hv);
+        }
     }
 
     /// Collocated nodal DG volume and surface terms in conservative
@@ -1019,15 +1088,14 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
     let kernel = SWE2DRhsKernel::new(q, mesh, ops, geom, config, time);
     let mut faces = FaceFluxGuard::take();
     kernel.face_fluxes(&mut faces);
-    let n = ops.n_nodes;
-    let per_element = 4 * ops.n_face_nodes;
+    let rows = VOLUME_BATCH * ops.n_nodes;
     let mut face_mass = face_mass.map(|fm| {
         assert_eq!(
             fm.len(),
             face_mass_len(mesh, ops),
             "face mass flux buffer length"
         );
-        fm.chunks_exact_mut(per_element)
+        fm.chunks_mut(VOLUME_BATCH * 4 * ops.n_face_nodes)
     });
     let mut subcell_mass = subcell_mass.map(|sm| {
         assert_eq!(
@@ -1035,23 +1103,32 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
             subcell_mass_len(mesh, ops),
             "subcell mass flux buffer length"
         );
-        sm.chunks_exact_mut(subcell_interfaces(ops.n_1d))
+        sm.chunks_mut(VOLUME_BATCH * subcell_interfaces(ops.n_1d))
     });
     let viscous = viscous_all(q, mesh, ops, geom, config, time, false);
     let [out_h, out_hu, out_hv] = &mut out.data;
     let mut ws = WorkspaceGuard::take(ops);
-    for (k, ((h, hu), hv)) in out_h
-        .chunks_exact_mut(n)
-        .zip(out_hu.chunks_exact_mut(n))
-        .zip(out_hv.chunks_exact_mut(n))
+    for (b, ((h, hu), hv)) in out_h
+        .chunks_mut(rows)
+        .zip(out_hu.chunks_mut(rows))
+        .zip(out_hv.chunks_mut(rows))
         .enumerate()
     {
         let fm = face_mass.as_mut().and_then(Iterator::next);
         let sm = subcell_mass.as_mut().and_then(Iterator::next);
-        kernel.element(k, &mut ws, &faces, [h, &mut *hu, &mut *hv], fm, sm);
-        if let Some((term, grads)) = &viscous {
-            term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
-        }
+        kernel.element_batch(
+            b * VOLUME_BATCH,
+            &mut ws,
+            &faces,
+            [h, hu, hv],
+            fm,
+            sm,
+            |k, ws, hu, hv| {
+                if let Some((term, grads)) = &viscous {
+                    term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
+                }
+            },
+        );
     }
 }
 
@@ -1437,23 +1514,33 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     let mut faces = FaceFluxGuard::take();
     kernel.face_fluxes_parallel(&mut faces);
     let faces: &[SWEState2D] = &faces;
-    let n = ops.n_nodes;
     let viscous = viscous_all(q, mesh, ops, geom, config, time, true);
-    let element = |ws: &mut WorkspaceGuard,
-                   k: usize,
-                   [h, hu, hv]: [&mut [f64]; 3],
-                   fm: Option<&mut [f64]>,
-                   sm: Option<&mut [f64]>| {
-        kernel.element(k, ws, faces, [h, &mut *hu, &mut *hv], fm, sm);
-        if let Some((term, grads)) = &viscous {
-            term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
-        }
+    // Batches of VOLUME_BATCH consecutive elements (the last one shorter)
+    let batch = |ws: &mut WorkspaceGuard,
+                 b: usize,
+                 [h, hu, hv]: [&mut [f64]; 3],
+                 fm: Option<&mut [f64]>,
+                 sm: Option<&mut [f64]>| {
+        kernel.element_batch(
+            b * VOLUME_BATCH,
+            ws,
+            faces,
+            [h, hu, hv],
+            fm,
+            sm,
+            |k, ws, hu, hv| {
+                if let Some((term, grads)) = &viscous {
+                    term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
+                }
+            },
+        );
     };
+    let rows = VOLUME_BATCH * ops.n_nodes;
     let [out_h, out_hu, out_hv] = &mut out.data;
-    let elements = out_h
-        .par_chunks_exact_mut(n)
-        .zip(out_hu.par_chunks_exact_mut(n))
-        .zip(out_hv.par_chunks_exact_mut(n))
+    let batches = out_h
+        .par_chunks_mut(rows)
+        .zip(out_hu.par_chunks_mut(rows))
+        .zip(out_hv.par_chunks_mut(rows))
         .enumerate();
     assert!(
         face_mass.is_some() || subcell_mass.is_none(),
@@ -1466,7 +1553,8 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
                 face_mass_len(mesh, ops),
                 "face mass flux buffer length"
             );
-            let elements = elements.zip(face_mass.par_chunks_exact_mut(4 * ops.n_face_nodes));
+            let batches =
+                batches.zip(face_mass.par_chunks_mut(VOLUME_BATCH * 4 * ops.n_face_nodes));
             match subcell_mass {
                 Some(subcell_mass) => {
                     assert_eq!(
@@ -1474,24 +1562,27 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
                         subcell_mass_len(mesh, ops),
                         "subcell mass flux buffer length"
                     );
-                    elements
-                        .zip(subcell_mass.par_chunks_exact_mut(subcell_interfaces(ops.n_1d)))
+                    batches
+                        .zip(
+                            subcell_mass
+                                .par_chunks_mut(VOLUME_BATCH * subcell_interfaces(ops.n_1d)),
+                        )
                         .for_each_init(
                             || WorkspaceGuard::take(ops),
-                            |ws, (((k, ((h, hu), hv)), fm), sm)| {
-                                element(ws, k, [h, hu, hv], Some(fm), Some(sm))
+                            |ws, (((b, ((h, hu), hv)), fm), sm)| {
+                                batch(ws, b, [h, hu, hv], Some(fm), Some(sm))
                             },
                         );
                 }
-                None => elements.for_each_init(
+                None => batches.for_each_init(
                     || WorkspaceGuard::take(ops),
-                    |ws, ((k, ((h, hu), hv)), fm)| element(ws, k, [h, hu, hv], Some(fm), None),
+                    |ws, ((b, ((h, hu), hv)), fm)| batch(ws, b, [h, hu, hv], Some(fm), None),
                 ),
             }
         }
-        (None, _) => elements.for_each_init(
+        (None, _) => batches.for_each_init(
             || WorkspaceGuard::take(ops),
-            |ws, (k, ((h, hu), hv))| element(ws, k, [h, hu, hv], None, None),
+            |ws, (b, ((h, hu), hv))| batch(ws, b, [h, hu, hv], None, None),
         ),
     }
 }
@@ -1635,17 +1726,27 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
             let edges = &scratch.list;
             let per_edge = 2 * ops.n_face_nodes;
             let slots = DisjointChunks::new(&mut faces[..], per_edge);
-            // SAFETY: `edges` is distinct, so each edge's slots once
-            let edge =
-                |&e: &u32| split_form.edge_fluxes(e as usize, unsafe { slots.chunk(e as usize) });
+            let batch = |batch: &[u32]| {
+                let mut edges = [0; VOLUME_BATCH];
+                for (edge, &e) in edges.iter_mut().zip(batch) {
+                    *edge = e as usize;
+                }
+                let mut edge_slots = edges.map(|_| -> &mut [SWEState2D] { &mut [] });
+                for (slot, &e) in edge_slots.iter_mut().zip(batch) {
+                    // SAFETY: `edges` is distinct, so each edge's slots once
+                    *slot = unsafe { slots.chunk(e as usize) };
+                }
+                let n = batch.len();
+                split_form.edge_fluxes_batch(&edges[..n], &mut edge_slots[..n]);
+            };
             #[cfg(feature = "parallel")]
             if parallel {
-                edges.par_iter().for_each(edge);
+                edges.par_chunks(VOLUME_BATCH).for_each(batch);
             } else {
-                edges.iter().for_each(edge);
+                edges.chunks(VOLUME_BATCH).for_each(batch);
             }
             #[cfg(not(feature = "parallel"))]
-            edges.iter().for_each(edge);
+            edges.chunks(VOLUME_BATCH).for_each(batch);
             SUBSET_EDGES.with(|cell| *cell.borrow_mut() = scratch);
         }
         None => faces.clear(),
@@ -1704,8 +1805,7 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
             DisjointChunks::new(hv, n),
         ]
     });
-    let element = |ws: &mut WorkspaceGuard, &k: &u32| {
-        let k = k as usize;
+    let element = |ws: &mut WorkspaceGuard, k: usize, volume: Option<usize>| {
         // SAFETY: the elements are distinct, so each element's rows once
         let [h, hu, hv] = out_rows.each_ref().map(|rows| unsafe { rows.chunk(k) });
         let extra = extra_rows
@@ -1718,22 +1818,34 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
             [&mut *h, &mut *hu, &mut *hv],
             None,
             None,
+            volume,
         );
         if let Some((term, grads)) = &viscous {
             term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
         }
         then(k, [h, hu, hv], extra);
     };
+    // The volume terms (independent of time) VOLUME_BATCH elements at a time
+    let batch = |ws: &mut WorkspaceGuard, ks: &[u32]| {
+        let mut lanes = [0; VOLUME_BATCH];
+        for (lane, &k) in lanes.iter_mut().zip(ks) {
+            *lane = k as usize;
+        }
+        let volumes = faces_kernel.volume_batch(&lanes[..ks.len()], ws);
+        for (l, &k) in lanes[..ks.len()].iter().enumerate() {
+            element(ws, k, ((volumes >> l) & 1 == 1).then_some(l));
+        }
+    };
     #[cfg(feature = "parallel")]
     if parallel {
         elements
-            .par_iter()
-            .for_each_init(|| WorkspaceGuard::take(ops), element);
+            .par_chunks(VOLUME_BATCH)
+            .for_each_init(|| WorkspaceGuard::take(ops), batch);
         return;
     }
     let mut ws = WorkspaceGuard::take(ops);
-    for k in elements {
-        element(&mut ws, k);
+    for ks in elements.chunks(VOLUME_BATCH) {
+        batch(&mut ws, ks);
     }
 }
 

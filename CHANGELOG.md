@@ -346,6 +346,7 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **Dependency: `fearless_simd` 1.1 replaces `pulp` 0.18 behind the `simd` feature.** The two pulp kernels (`coriolis_source`, `combine_derivatives` in `solver/simd/kernels.rs`) are ported unchanged in behaviour. faer still brings its own `pulp` 0.21. fearless_simd needs Rust 1.89 or later.
 - **Frøya's boundary S2 is calibrated to the gauge by default (TODO P3.1).** `froya_real_data` now defaults to `gauge_gains=K1,O1,S2 gauge_ratios=N2,Q1,P1,K2`: the atlas's S2 is scaled by the gauge over NorKyst at Mausund (× 0.939, +0.1°), and K2 is re-inferred from the corrected S2 with the gauge's ratio. Nesting follows through `nest_tides=corrected`. The 15-day confirmation run (2026-10-06) had S2 at 0.998×, +2.9° at Mausund (was 1.103×, +1.8°) and RSS |ΔZ| 3.37 cm against the gauge (was 4.15). `gauge_gains=K1,O1 gauge_ratios=N2,Q1,P1` gives the previous behaviour.
 - **A fast test tier for pull requests (`.config/nextest.toml`).** Pull requests run nextest's `pr` profile, every test but 25 slow gates: long simulations, convergence ladders and statistical particle runs, each 15 s or more in CI. Pushes to main and manual runs (`workflow_dispatch`) run the whole suite. In the run before this, those gates were 70 % of the test time, and the test job took 12–14 min. Locally the fast tier is 1589 tests in 39 s (`cargo nextest run --profile pr --cargo-profile ci --no-default-features --features parallel,simd`).
   - **Three wave gates made cheaper, with the numbers they check unchanged.** `refraction_follows_snells_law` runs on a 1 × 20 mesh: the solution is uniform along x, and 4 × 40 gave the same departures to 0.002°. It took 240 s in CI; locally 197 → 2.9 s. `shoaling_keeps_the_action_flux` uses 40 × 1 elements and 4 direction bins, since normal incidence turns no wave out of its bin: 9.8 → 0.55 s, c_g N still constant to 2e-14. `a_following_current_shifts_the_frequency_doppler` uses 4 direction bins: 19 → 9.6 s, and the mean σ is now 0.54 % off σ + kU = σ₀ against 0.53 % before.
@@ -406,6 +407,22 @@ All notable changes to this project should be documented in this file.
 
 ### Performance
 
+- **The split-form 2D kernel vectorised across elements with fearless_simd, bit for bit (TODO P2.2).** The `simd` feature now pulls `fearless_simd` 1.1 instead of `pulp` 0.18. fearless_simd runs at the CPU's best level (AVX-512 here, else AVX2, SSE4.2 or NEON, detected at run time).
+  - **Lanes are elements.** A P1–P4 element's GLL lines are 2–5 nodes long, too short for an 8-wide vector, but every element runs the same arithmetic. `solver/rhs/swe_2d_split_form_batch.rs` therefore evaluates two things 8 at a time, one per lane:
+    - the flux-differencing volume term of 8 consecutive elements (`line_volume`);
+    - the `WetDry` hydrostatic HLL of 8 consecutive edges (`edge_fluxes`), with its branches (dry sides, upwind speeds) as selects.
+  - **What stays scalar.** Elements that take the shoreline subcells and boundary edges stay on the scalar path. Parallelograms and general quadrilaterals share a batch. The serial, parallel and local-time-stepping (subset) drivers all go through it.
+  - **Bit for bit.** Every lane does the scalar operations in the scalar order, with no fused multiply-add. Gate `test_batched_kernels_are_bit_for_bit` covers P1–P5 (P5 is not batched) on parallelogram, distorted and mixed meshes, with and without bathymetry, with shorelines, a short last batch and scrambled subset lists.
+  - **`benches/split_form_bench.rs` (new).** The `WetDry` RHS on 128² P2 elements, with ≈ 3 % subcell elements, pinned to a Zen 5 core:
+
+    | Run | Parallelograms | General quadrilaterals |
+    |---|---|---|
+    | serial | 5.20 → 3.80 ms (−27 %) | 6.59 → 4.44 ms (−33 %) |
+    | parallel | 0.79 → 0.61 ms | 1.14 → 0.83 ms |
+
+  - **Built without `target-cpu=native`** (as `viz/` builds the crate), the gain is the same: 5.78 → 3.81 ms. No closure touches a vector type between `dispatch!` and the vector operations. An earlier version with closures in the gathers ran 6 % slower than scalar code in that build.
+  - **Frøya** (`froya_real_data profile=40`, CPUs 0–7): the 500 m grid RHS 4.62 → 3.43 ms on 1 thread (−26 %), 1.13 → 0.84 ms on 8 threads (−25 %).
+  - **On a shoreline-heavy mesh it helps less.** On the coastline mesh the RHS goes 9.95 → 9.71 ms on 1 thread and 2.35 → 2.01 ms on 8 threads. There 38.5 % of the elements take the subcells, which are not batched yet (TODO P2.2).
 - **The wave model's node passes, 1.4× faster at Frøya, bit for bit (TODO F.4 cost).** Measured on the 1 km P1 wave grid (25 × 36 components, 24 threads, `froya_real_data waves=20 wave_mesh=60,45 implicit=1`): the step 198 → 141 ms, 101 → 72 s of wall time per model hour. The total action after 22 steps is the same to all 17 digits.
   - **The DIA, 3.5× (`Quadruplets::source`).** At Frøya it was 26 % of the step, not the ≈ 10 % of the fetch gate: 116 ns per component, every gather and scatter bounds-checking, wrapping the direction with an integer remainder and continuing into the tail on the spot. The spectrum, extended by the rows the stencil reaches, and the landings' direction bins are now tabulated once per node in per-thread scratch: 43.5 → 12.5 ms. Gate `the_tables_give_the_direct_transfer` keeps the old transfer as the reference, bit for bit.
   - **Implicit refraction, 1.8×.** Its periodic neighbours took ≈ 8 integer remainders per bin; branches now (28.4 → 18.6 ms per half-step). The Sherman–Morrison solve's two Thomas sweeps share one elimination (`thomas_pair`, → 15.8 ms). `c_θ` and `c_σ` are split into a frequency's factor and terms of the node and direction, computed once per node (`NodeRates`).

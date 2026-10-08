@@ -1,0 +1,122 @@
+//! The production 2D SWE RHS: the `WetDry` split form (Wintermeyer et al.
+//! 2017 flux differencing, hydrostatic HLL faces, subcells at shorelines).
+//!
+//! Run with: `cargo bench --bench split_form --no-default-features --features parallel,simd`
+//!
+//! A periodic 128 × 128 P2 mesh (16,384 elements, 147k nodes) over a bed with
+//! islands (≈ 3 % of the elements take the subcells), η = 0.3 m with a
+//! current. `affine` keeps the uniform parallelograms; `curved` moves the
+//! vertices so every element is a general quadrilateral, as on a Gmsh
+//! coastline mesh. Serial and parallel full RHS evaluations.
+
+use std::f64::consts::PI;
+
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use dg_rs::boundary::Reflective2D;
+use dg_rs::equations::ShallowWater2D;
+use dg_rs::mesh::{Bathymetry2D, Mesh2D};
+use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
+use dg_rs::solver::{
+    SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, SWEState2D, compute_rhs_swe_2d_into,
+};
+use dg_rs::types::ElementIndex;
+
+const G: f64 = 9.81;
+const L: f64 = 20_000.0;
+const N: usize = 128;
+const ORDER: usize = 2;
+
+struct Case {
+    mesh: Mesh2D,
+    ops: DGOperators2D,
+    geom: GeometricFactors2D,
+    bathymetry: Bathymetry2D,
+    q: SWESolution2D,
+}
+
+fn case(curved: bool) -> Case {
+    let mut mesh = Mesh2D::uniform_periodic(0.0, L, 0.0, L, N, N);
+    let tau = 2.0 * PI / L;
+    if curved {
+        // About 10 % of an element's size: general quadrilaterals everywhere
+        let a = 0.1 * L / N as f64;
+        for v in &mut mesh.vertices {
+            let [x, y] = *v;
+            let (sx, sy) = ((9.0 * tau * x).sin(), (7.0 * tau * y).sin());
+            *v = [x + a * sx * sy, y - 0.7 * a * sx * sy];
+        }
+    }
+    let ops = DGOperators2D::new(ORDER);
+    let geom = GeometricFactors2D::compute(&mesh, &ops);
+    // Deep channels with a few islands reaching above η = 0.3
+    let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
+        -15.0 + 17.0 * (3.0 * tau * x).cos() * (2.0 * tau * y).cos()
+    });
+    let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+    for k in ElementIndex::iter(mesh.n_elements) {
+        for i in 0..ops.n_nodes {
+            let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
+            let h = (0.3 - bathymetry.get(k, i)).max(0.0);
+            let (u, v) = if h > 0.0 {
+                (0.5 * (tau * y).cos(), 0.3 * (tau * x).sin())
+            } else {
+                (0.0, 0.0)
+            };
+            q.set_state(k, i, SWEState2D::from_primitives(h, u, v));
+        }
+    }
+    Case {
+        mesh,
+        ops,
+        geom,
+        bathymetry,
+        q,
+    }
+}
+
+fn bench_split_form(c: &mut Criterion) {
+    let equation = ShallowWater2D::new(G);
+    let bc = Reflective2D::new();
+    let mut group = c.benchmark_group("split_form_wet_dry_p2");
+    group.sample_size(30);
+    for curved in [false, true] {
+        let Case {
+            mesh,
+            ops,
+            geom,
+            bathymetry,
+            q,
+        } = case(curved);
+        let config = SWE2DRhsConfig::new(&equation, &bc)
+            .with_coriolis(false)
+            .with_formulation(SWEFormulation2D::WetDry)
+            .with_bathymetry(&bathymetry)
+            .with_dry_threshold(1e-3);
+        let mut out = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        let name = if curved { "curved" } else { "affine" };
+        group.throughput(Throughput::Elements((mesh.n_elements * ops.n_nodes) as u64));
+        group.bench_function(BenchmarkId::new("serial", name), |b| {
+            b.iter(|| {
+                compute_rhs_swe_2d_into(black_box(&q), &mesh, &ops, &geom, &config, 0.0, &mut out)
+            })
+        });
+        #[cfg(feature = "parallel")]
+        group.bench_function(BenchmarkId::new("parallel", name), |b| {
+            b.iter(|| {
+                dg_rs::solver::compute_rhs_swe_2d_parallel_into(
+                    black_box(&q),
+                    &mesh,
+                    &ops,
+                    &geom,
+                    &config,
+                    0.0,
+                    &mut out,
+                )
+            })
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_split_form);
+criterion_main!(benches);

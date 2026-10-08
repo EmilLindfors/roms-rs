@@ -7,25 +7,12 @@
 //! - **LIFT application**: Surface integral contribution via LIFT matrix
 //! - **Source terms**: Coriolis and friction computations
 //!
-//! All kernels use the `pulp` crate for portable SIMD with runtime feature detection.
-//! The code automatically selects the best available SIMD instruction set
-//! (AVX-512, AVX2, SSE4.1, or scalar fallback).
-//!
-//! # Usage
-//!
-//! ```ignore
-//! use pulp::Arch;
-//! use dg_rs::solver::simd_kernels::apply_diff_matrix;
-//!
-//! let arch = Arch::new();
-//! arch.dispatch(|| {
-//!     apply_diff_matrix(arch, &dr, &flux_h, &flux_hu, &flux_hv,
-//!                       &mut out_h, &mut out_hu, &mut out_hv, n_nodes);
-//! });
-//! ```
+//! The SIMD kernels use `fearless_simd` with runtime feature detection
+//! ([`fearless_simd::Level::new`]): AVX-512, AVX2, SSE4.2 or NEON at the
+//! native vector width, else a scalar fallback.
 
 #[cfg(feature = "simd")]
-use pulp::{Arch, Simd, WithSimd};
+use fearless_simd::{Level, dispatch};
 
 // ============================================================================
 // Scalar reference implementations (always available)
@@ -236,13 +223,11 @@ pub fn combine_derivatives_scalar(
 
 #[cfg(feature = "simd")]
 mod simd_impl {
-    use super::*;
+    use fearless_simd::prelude::*;
 
-    /// Apply Coriolis source term with SIMD.
-    ///
-    /// Uses pulp's width-agnostic SIMD API.
-    #[inline]
-    pub fn coriolis_source_simd_inner<S: Simd>(
+    /// Coriolis source `S_hu += f hv`, `S_hv −= f hu` at the native width.
+    #[inline(always)]
+    pub fn coriolis_source_simd<S: Simd>(
         simd: S,
         hu: &[f64],
         hv: &[f64],
@@ -250,170 +235,57 @@ mod simd_impl {
         out_hv: &mut [f64],
         f: f64,
     ) {
-        let f_splat = simd.f64s_splat(f);
-        let neg_f_splat = simd.f64s_splat(-f);
-
-        // Get SIMD-aligned chunks
-        let (hu_head, hu_tail) = S::f64s_as_simd(hu);
-        let (hv_head, hv_tail) = S::f64s_as_simd(hv);
-        let (out_hu_head, out_hu_tail) = S::f64s_as_mut_simd(out_hu);
-        let (out_hv_head, out_hv_tail) = S::f64s_as_mut_simd(out_hv);
-
-        // Process SIMD chunks
-        for (((hu_v, hv_v), out_hu_v), out_hv_v) in hu_head
-            .iter()
-            .zip(hv_head.iter())
-            .zip(out_hu_head.iter_mut())
-            .zip(out_hv_head.iter_mut())
-        {
-            // S_hu += f * hv
-            *out_hu_v = simd.f64s_mul_add(f_splat, *hv_v, *out_hu_v);
-            // S_hv += -f * hu
-            *out_hv_v = simd.f64s_mul_add(neg_f_splat, *hu_v, *out_hv_v);
+        let lanes = S::f64s::LEN;
+        let f_splat = S::f64s::splat(simd, f);
+        let neg_f_splat = S::f64s::splat(simd, -f);
+        let n = hu.len().min(hv.len()).min(out_hu.len()).min(out_hv.len());
+        let head = n - n % lanes;
+        for i in (0..head).step_by(lanes) {
+            let hu_v = S::f64s::from_slice(simd, &hu[i..i + lanes]);
+            let hv_v = S::f64s::from_slice(simd, &hv[i..i + lanes]);
+            let o_hu = S::f64s::from_slice(simd, &out_hu[i..i + lanes]);
+            let o_hv = S::f64s::from_slice(simd, &out_hv[i..i + lanes]);
+            f_splat
+                .mul_add(hv_v, o_hu)
+                .store_slice(&mut out_hu[i..i + lanes]);
+            neg_f_splat
+                .mul_add(hu_v, o_hv)
+                .store_slice(&mut out_hv[i..i + lanes]);
         }
-
-        // Scalar tail
-        for ((hu_val, hv_val), (out_hu_val, out_hv_val)) in hu_tail
-            .iter()
-            .zip(hv_tail.iter())
-            .zip(out_hu_tail.iter_mut().zip(out_hv_tail.iter_mut()))
-        {
-            *out_hu_val += f * hv_val;
-            *out_hv_val += -f * hu_val;
+        for i in head..n {
+            out_hu[i] += f * hv[i];
+            out_hv[i] += -f * hu[i];
         }
     }
 
-    /// Combine derivatives with geometric factors using SIMD.
-    #[inline]
-    pub fn combine_derivatives_simd_inner<S: Simd>(
+    /// `out = −(dfx_dr rx + dfx_ds sx + dfy_dr ry + dfy_ds sy)` for one
+    /// variable at the native width.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn combine_derivatives_simd<S: Simd>(
         simd: S,
-        dfx_dr_h: &[f64],
-        dfx_dr_hu: &[f64],
-        dfx_dr_hv: &[f64],
-        dfx_ds_h: &[f64],
-        dfx_ds_hu: &[f64],
-        dfx_ds_hv: &[f64],
-        dfy_dr_h: &[f64],
-        dfy_dr_hu: &[f64],
-        dfy_dr_hv: &[f64],
-        dfy_ds_h: &[f64],
-        dfy_ds_hu: &[f64],
-        dfy_ds_hv: &[f64],
-        out_h: &mut [f64],
-        out_hu: &mut [f64],
-        out_hv: &mut [f64],
-        rx: f64,
-        sx: f64,
-        ry: f64,
-        sy: f64,
+        dfx_dr: &[f64],
+        dfx_ds: &[f64],
+        dfy_dr: &[f64],
+        dfy_ds: &[f64],
+        out: &mut [f64],
+        (rx, sx, ry, sy): (f64, f64, f64, f64),
     ) {
-        let rx_v = simd.f64s_splat(rx);
-        let sx_v = simd.f64s_splat(sx);
-        let ry_v = simd.f64s_splat(ry);
-        let sy_v = simd.f64s_splat(sy);
-        let neg_one = simd.f64s_splat(-1.0);
-
-        // Process h variable
-        {
-            let (dfx_dr_head, dfx_dr_tail) = S::f64s_as_simd(dfx_dr_h);
-            let (dfx_ds_head, dfx_ds_tail) = S::f64s_as_simd(dfx_ds_h);
-            let (dfy_dr_head, dfy_dr_tail) = S::f64s_as_simd(dfy_dr_h);
-            let (dfy_ds_head, dfy_ds_tail) = S::f64s_as_simd(dfy_ds_h);
-            let (out_head, out_tail) = S::f64s_as_mut_simd(out_h);
-
-            for ((((dfx_dr, dfx_ds), dfy_dr), dfy_ds), out) in dfx_dr_head
-                .iter()
-                .zip(dfx_ds_head.iter())
-                .zip(dfy_dr_head.iter())
-                .zip(dfy_ds_head.iter())
-                .zip(out_head.iter_mut())
-            {
-                let mut div = simd.f64s_mul(*dfx_dr, rx_v);
-                div = simd.f64s_mul_add(*dfx_ds, sx_v, div);
-                div = simd.f64s_mul_add(*dfy_dr, ry_v, div);
-                div = simd.f64s_mul_add(*dfy_ds, sy_v, div);
-                *out = simd.f64s_mul(neg_one, div);
-            }
-
-            // Scalar tail
-            for ((((dfx_dr, dfx_ds), dfy_dr), dfy_ds), out) in dfx_dr_tail
-                .iter()
-                .zip(dfx_ds_tail.iter())
-                .zip(dfy_dr_tail.iter())
-                .zip(dfy_ds_tail.iter())
-                .zip(out_tail.iter_mut())
-            {
-                let div = dfx_dr * rx + dfx_ds * sx + dfy_dr * ry + dfy_ds * sy;
-                *out = -div;
-            }
+        let lanes = S::f64s::LEN;
+        let (rx_v, sx_v) = (S::f64s::splat(simd, rx), S::f64s::splat(simd, sx));
+        let (ry_v, sy_v) = (S::f64s::splat(simd, ry), S::f64s::splat(simd, sy));
+        let n = out.len();
+        let head = n - n % lanes;
+        for i in (0..head).step_by(lanes) {
+            let load = |a: &[f64]| S::f64s::from_slice(simd, &a[i..i + lanes]);
+            let mut div = load(dfx_dr) * rx_v;
+            div = load(dfx_ds).mul_add(sx_v, div);
+            div = load(dfy_dr).mul_add(ry_v, div);
+            div = load(dfy_ds).mul_add(sy_v, div);
+            (-div).store_slice(&mut out[i..i + lanes]);
         }
-
-        // Process hu variable
-        {
-            let (dfx_dr_head, dfx_dr_tail) = S::f64s_as_simd(dfx_dr_hu);
-            let (dfx_ds_head, dfx_ds_tail) = S::f64s_as_simd(dfx_ds_hu);
-            let (dfy_dr_head, dfy_dr_tail) = S::f64s_as_simd(dfy_dr_hu);
-            let (dfy_ds_head, dfy_ds_tail) = S::f64s_as_simd(dfy_ds_hu);
-            let (out_head, out_tail) = S::f64s_as_mut_simd(out_hu);
-
-            for ((((dfx_dr, dfx_ds), dfy_dr), dfy_ds), out) in dfx_dr_head
-                .iter()
-                .zip(dfx_ds_head.iter())
-                .zip(dfy_dr_head.iter())
-                .zip(dfy_ds_head.iter())
-                .zip(out_head.iter_mut())
-            {
-                let mut div = simd.f64s_mul(*dfx_dr, rx_v);
-                div = simd.f64s_mul_add(*dfx_ds, sx_v, div);
-                div = simd.f64s_mul_add(*dfy_dr, ry_v, div);
-                div = simd.f64s_mul_add(*dfy_ds, sy_v, div);
-                *out = simd.f64s_mul(neg_one, div);
-            }
-
-            for ((((dfx_dr, dfx_ds), dfy_dr), dfy_ds), out) in dfx_dr_tail
-                .iter()
-                .zip(dfx_ds_tail.iter())
-                .zip(dfy_dr_tail.iter())
-                .zip(dfy_ds_tail.iter())
-                .zip(out_tail.iter_mut())
-            {
-                let div = dfx_dr * rx + dfx_ds * sx + dfy_dr * ry + dfy_ds * sy;
-                *out = -div;
-            }
-        }
-
-        // Process hv variable
-        {
-            let (dfx_dr_head, dfx_dr_tail) = S::f64s_as_simd(dfx_dr_hv);
-            let (dfx_ds_head, dfx_ds_tail) = S::f64s_as_simd(dfx_ds_hv);
-            let (dfy_dr_head, dfy_dr_tail) = S::f64s_as_simd(dfy_dr_hv);
-            let (dfy_ds_head, dfy_ds_tail) = S::f64s_as_simd(dfy_ds_hv);
-            let (out_head, out_tail) = S::f64s_as_mut_simd(out_hv);
-
-            for ((((dfx_dr, dfx_ds), dfy_dr), dfy_ds), out) in dfx_dr_head
-                .iter()
-                .zip(dfx_ds_head.iter())
-                .zip(dfy_dr_head.iter())
-                .zip(dfy_ds_head.iter())
-                .zip(out_head.iter_mut())
-            {
-                let mut div = simd.f64s_mul(*dfx_dr, rx_v);
-                div = simd.f64s_mul_add(*dfx_ds, sx_v, div);
-                div = simd.f64s_mul_add(*dfy_dr, ry_v, div);
-                div = simd.f64s_mul_add(*dfy_ds, sy_v, div);
-                *out = simd.f64s_mul(neg_one, div);
-            }
-
-            for ((((dfx_dr, dfx_ds), dfy_dr), dfy_ds), out) in dfx_dr_tail
-                .iter()
-                .zip(dfx_ds_tail.iter())
-                .zip(dfy_dr_tail.iter())
-                .zip(dfy_ds_tail.iter())
-                .zip(out_tail.iter_mut())
-            {
-                let div = dfx_dr * rx + dfx_ds * sx + dfy_dr * ry + dfy_ds * sy;
-                *out = -div;
-            }
+        for i in head..n {
+            out[i] = -(dfx_dr[i] * rx + dfx_ds[i] * sx + dfy_dr[i] * ry + dfy_ds[i] * sy);
         }
     }
 }
@@ -526,38 +398,7 @@ pub fn coriolis_source(
     n_nodes: usize,
 ) {
     let _ = n_nodes; // Used for consistency with scalar API
-
-    struct Impl<'a> {
-        hu: &'a [f64],
-        hv: &'a [f64],
-        out_hu: &'a mut [f64],
-        out_hv: &'a mut [f64],
-        f: f64,
-    }
-
-    impl WithSimd for Impl<'_> {
-        type Output = ();
-
-        #[inline(always)]
-        fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
-            simd_impl::coriolis_source_simd_inner(
-                simd,
-                self.hu,
-                self.hv,
-                self.out_hu,
-                self.out_hv,
-                self.f,
-            );
-        }
-    }
-
-    Arch::new().dispatch(Impl {
-        hu,
-        hv,
-        out_hu,
-        out_hv,
-        f,
-    });
+    dispatch!(Level::new(), simd => simd_impl::coriolis_source_simd(simd, hu, hv, out_hu, out_hv, f));
 }
 
 /// Combine derivatives with geometric factors using automatic SIMD dispatch.
@@ -586,79 +427,11 @@ pub fn combine_derivatives(
     n_nodes: usize,
 ) {
     let _ = n_nodes; // Used for consistency with scalar API
-
-    struct Impl<'a> {
-        dfx_dr_h: &'a [f64],
-        dfx_dr_hu: &'a [f64],
-        dfx_dr_hv: &'a [f64],
-        dfx_ds_h: &'a [f64],
-        dfx_ds_hu: &'a [f64],
-        dfx_ds_hv: &'a [f64],
-        dfy_dr_h: &'a [f64],
-        dfy_dr_hu: &'a [f64],
-        dfy_dr_hv: &'a [f64],
-        dfy_ds_h: &'a [f64],
-        dfy_ds_hu: &'a [f64],
-        dfy_ds_hv: &'a [f64],
-        out_h: &'a mut [f64],
-        out_hu: &'a mut [f64],
-        out_hv: &'a mut [f64],
-        rx: f64,
-        sx: f64,
-        ry: f64,
-        sy: f64,
-    }
-
-    impl WithSimd for Impl<'_> {
-        type Output = ();
-
-        #[inline(always)]
-        fn with_simd<S: Simd>(self, simd: S) -> Self::Output {
-            simd_impl::combine_derivatives_simd_inner(
-                simd,
-                self.dfx_dr_h,
-                self.dfx_dr_hu,
-                self.dfx_dr_hv,
-                self.dfx_ds_h,
-                self.dfx_ds_hu,
-                self.dfx_ds_hv,
-                self.dfy_dr_h,
-                self.dfy_dr_hu,
-                self.dfy_dr_hv,
-                self.dfy_ds_h,
-                self.dfy_ds_hu,
-                self.dfy_ds_hv,
-                self.out_h,
-                self.out_hu,
-                self.out_hv,
-                self.rx,
-                self.sx,
-                self.ry,
-                self.sy,
-            );
-        }
-    }
-
-    Arch::new().dispatch(Impl {
-        dfx_dr_h,
-        dfx_dr_hu,
-        dfx_dr_hv,
-        dfx_ds_h,
-        dfx_ds_hu,
-        dfx_ds_hv,
-        dfy_dr_h,
-        dfy_dr_hu,
-        dfy_dr_hv,
-        dfy_ds_h,
-        dfy_ds_hu,
-        dfy_ds_hv,
-        out_h,
-        out_hu,
-        out_hv,
-        rx,
-        sx,
-        ry,
-        sy,
+    let metric = (rx, sx, ry, sy);
+    dispatch!(Level::new(), simd => {
+        simd_impl::combine_derivatives_simd(simd, dfx_dr_h, dfx_ds_h, dfy_dr_h, dfy_ds_h, out_h, metric);
+        simd_impl::combine_derivatives_simd(simd, dfx_dr_hu, dfx_ds_hu, dfy_dr_hu, dfy_ds_hu, out_hu, metric);
+        simd_impl::combine_derivatives_simd(simd, dfx_dr_hv, dfx_ds_hv, dfy_dr_hv, dfy_ds_hv, out_hv, metric);
     });
 }
 
