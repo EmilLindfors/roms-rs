@@ -398,6 +398,13 @@ All notable changes to this project should be documented in this file.
 
 - **Lock exchange gate (TODO P4.6).** `a_lock_exchange_runs_at_the_gravity_current_speed`: an 8 km × 20 m channel with ΔT = 5 °C, run at P1. Both fronts move at Fr = 0.483 (0.473 at 62 m), a little below Benjamin's ½, and T stays in range. At P2 the run needs horizontal viscosity (TODO P4.5): the interface's hydrostatic shear instability blows it up after ≈ 1500 s. (Since added, see above.)
 
+### Performance
+
+- **The wave model's node passes, 1.4× faster at Frøya, bit for bit (TODO F.4 cost).** Measured on the 1 km P1 wave grid (25 × 36 components, 24 threads, `froya_real_data waves=20 wave_mesh=60,45 implicit=1`): the step 198 → 141 ms, 101 → 72 s of wall time per model hour. The total action after 22 steps is the same to all 17 digits.
+  - **The DIA, 3.5× (`Quadruplets::source`).** At Frøya it was 26 % of the step, not the ≈ 10 % of the fetch gate: 116 ns per component, every gather and scatter bounds-checking, wrapping the direction with an integer remainder and continuing into the tail on the spot. The spectrum, extended by the rows the stencil reaches, and the landings' direction bins are now tabulated once per node in per-thread scratch: 43.5 → 12.5 ms. Gate `the_tables_give_the_direct_transfer` keeps the old transfer as the reference, bit for bit.
+  - **Implicit refraction, 1.8×.** Its periodic neighbours took ≈ 8 integer remainders per bin; branches now (28.4 → 18.6 ms per half-step). The Sherman–Morrison solve's two Thomas sweeps share one elimination (`thomas_pair`, → 15.8 ms). `c_θ` and `c_σ` are split into a frequency's factor and terms of the node and direction, computed once per node (`NodeRates`).
+  - `froya_real_data waves=N` also prints the sources' DIA share and a half-step of each implicit pass alone.
+
 ### Fixed
 
 - **Nesting started with a step at the open boundary, and its bed blend made cliffs at shores (`boundary::OceanModelState`; TODO P1.5).** The reference level (NorKyst's datum shift, +0.27 m at Mausund) was added after the ramp, so it stood at the boundary from t = 0 and flooded in as a bore; it ramps with ζ now. `blend_bathymetry` blended every wet node to the parent's smooth bed, deepening a 0.4 m shore node to 32 m (3.9 m/s within three minutes); it takes a `shore_depth` and keeps every element with a node shallower than it (`froya_real_data`: 2 m). Gates: `the_reference_level_ramps_with_the_parent`, `blending_leaves_the_shores_alone`.

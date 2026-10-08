@@ -3498,6 +3498,24 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         model.apply_sources(&mut scratch, dt, &mut ws);
         sources.push(start.elapsed().as_secs_f64());
     }
+    // The parts of a step that run node by node, each alone (with its own
+    // transposes to node-major and back)
+    let timed = |f: &mut dyn FnMut(&mut dg_rs::waves::WaveSolution)| {
+        let mut times = Vec::with_capacity(opts.waves);
+        for _ in 0..opts.waves {
+            let mut scratch = n.clone();
+            let start = Instant::now();
+            f(&mut scratch);
+            times.push(start.elapsed().as_secs_f64());
+        }
+        1e3 * median(&mut times)
+    };
+    let refraction = timed(&mut |s| model.apply_implicit_refraction(s, 0.5 * dt, &mut ws));
+    let shift = timed(&mut |s| model.apply_implicit_frequency_shift(s, 0.5 * dt, &mut ws));
+    let with_dia = model.sources.clone();
+    model.sources.quadruplets = None;
+    let without_dia = timed(&mut |s| model.apply_sources(s, dt, &mut ws));
+    model.sources = with_dia;
     let (step, source) = (median(&mut steps), median(&mut sources));
     let per_hour = 3600.0 / dt * step;
     println!(
@@ -3513,6 +3531,12 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         "  {:.0} ns per component and node per step ({:.1} ns of it propagation, three RK stages)",
         1e9 * step / (np * n_components) as f64,
         1e9 * (step - source) / (np * n_components) as f64,
+    );
+    println!(
+        "  alone, with their transposes: the sources {:.1} ms ({:.1} ms of it the DIA); a half-step \
+         of implicit refraction {refraction:.1} ms, of frequency shifting {shift:.1} ms",
+        1e3 * source,
+        1e3 * source - without_dia,
     );
     println!(
         "  {per_hour:.0} s of wall time per model hour ({:.2}× real time)",

@@ -480,13 +480,29 @@ impl WaveModel2D {
     /// Turning rate `c_θ` (rad/s) of frequency `i` in direction `theta` at node `p`.
     #[inline]
     fn c_theta(&self, i: usize, theta: f64, p: usize) -> f64 {
-        let ip = i * self.n_points() + p;
-        let (sn, cs) = theta.sin_cos();
+        let [depth, current] = self.turning_terms(theta.sin_cos(), p);
+        self.turning_rate(i, p, depth, current)
+    }
+
+    /// The parts of `c_θ` at node `p` that do not depend on the frequency,
+    /// in the direction of `(sin θ, cos θ)`: the depth gradient across the
+    /// ray and the current's turning, `c_θ = −(∂σ/∂d / k) depth − current`.
+    #[inline]
+    fn turning_terms(&self, (sn, cs): (f64, f64), p: usize) -> [f64; 2] {
         let [dx, dy] = self.depth_grad[p];
         let [ux, uy, vx, vy] = self.current_grad[p];
-        let depth_term = self.sigma_d[ip] / self.k[ip] * (-sn * dx + cs * dy);
-        let current_term = cs * (-sn * ux + cs * uy) + sn * (-sn * vx + cs * vy);
-        let c = -depth_term - current_term;
+        [
+            -sn * dx + cs * dy,
+            cs * (-sn * ux + cs * uy) + sn * (-sn * vx + cs * vy),
+        ]
+    }
+
+    /// `c_θ` of frequency `i` at node `p` from its [`Self::turning_terms`].
+    #[inline]
+    fn turning_rate(&self, i: usize, p: usize, depth: f64, current: f64) -> f64 {
+        let ip = i * self.n_points() + p;
+        let depth_term = self.sigma_d[ip] / self.k[ip] * depth;
+        let c = -depth_term - current;
         match self.turning_limit {
             Some(limit) => c.clamp(-limit, limit),
             None => c,
@@ -496,14 +512,31 @@ impl WaveModel2D {
     /// Frequency shift `c_σ` (rad/s²) of frequency `i` in direction `theta` at node `p`.
     #[inline]
     fn c_sigma(&self, i: usize, theta: f64, p: usize) -> f64 {
-        let ip = i * self.n_points() + p;
-        let (sn, cs) = theta.sin_cos();
+        let strain = self.strain_term(theta.sin_cos(), p);
+        self.shift_rate(i, p, self.advection_term(p), strain)
+    }
+
+    /// The current along the depth gradient `U·∇d` at node `p`.
+    #[inline]
+    fn advection_term(&self, p: usize) -> f64 {
         let [dx, dy] = self.depth_grad[p];
         let [u, v] = self.current[p];
+        u * dx + v * dy
+    }
+
+    /// The current's strain along the ray in the direction of `(sin θ,
+    /// cos θ)` at node `p`.
+    #[inline]
+    fn strain_term(&self, (sn, cs): (f64, f64), p: usize) -> f64 {
         let [ux, uy, vx, vy] = self.current_grad[p];
-        let advected = self.sigma_d[ip] * (u * dx + v * dy);
-        let strain = cs * (cs * ux + sn * uy) + sn * (cs * vx + sn * vy);
-        advected - self.cg[ip] * self.k[ip] * strain
+        cs * (cs * ux + sn * uy) + sn * (cs * vx + sn * vy)
+    }
+
+    /// `c_σ = ∂σ/∂d U·∇d − c_g k strain` of frequency `i` at node `p`.
+    #[inline]
+    fn shift_rate(&self, i: usize, p: usize, advection: f64, strain: f64) -> f64 {
+        let ip = i * self.n_points() + p;
+        self.sigma_d[ip] * advection - self.cg[ip] * self.k[ip] * strain
     }
 
     /// The largest stable step (s) for Courant number `cfl` (≤ 1 for SSP-RK3): DG
@@ -903,16 +936,20 @@ impl WaveModel2D {
                     CyclicScratch::new(nd),
                     CyclicScratch::new(nf),
                     vec![0.0; nf],
+                    NodeRates::new(&self.grid),
                 )
             },
-            |(k, e, a, b, cyclic, banded, column), p, spectrum| {
+            |(k, e, a, b, cyclic, banded, column, rates), p, spectrum| {
+                rates.fill(self, p, refraction.is_some(), shift.is_some());
+                let rates = &*rates;
                 let mut shift_now = |spectrum: &mut [f64]| {
                     if let Some(dt) = shift {
                         for j in 0..nd {
                             for (i, x) in column.iter_mut().enumerate() {
                                 *x = spectrum[i * nd + j];
                             }
-                            self.shift_implicitly(j, p, column, dt, banded);
+                            let strain = rates.strain[j];
+                            self.shift_implicitly(p, column, dt, rates.advection, strain, banded);
                             for (i, x) in column.iter().enumerate() {
                                 spectrum[i * nd + j] = *x;
                             }
@@ -924,7 +961,7 @@ impl WaveModel2D {
                 }
                 if let Some(dt) = refraction {
                     for (i, row) in spectrum.chunks_exact_mut(nd).enumerate() {
-                        self.refract_implicitly(i, p, row, dt, cyclic);
+                        self.refract_implicitly(i, p, row, dt, &rates.turning, cyclic);
                     }
                 }
                 if !shift_first {
@@ -971,37 +1008,41 @@ impl WaveModel2D {
     /// ```
     ///
     /// with `λ = Δt/Δθ`: a cyclic tridiagonal M-matrix whose columns sum to one.
+    /// `turning` holds the node's [`Self::turning_terms`] at the faces.
     fn refract_implicitly(
         &self,
         i: usize,
         p: usize,
         row: &mut [f64],
         dt: f64,
+        turning: &[[f64; 2]],
         s: &mut CyclicScratch,
     ) {
         let nd = row.len();
-        let (dtheta, lambda) = (self.grid.d_theta, dt / self.grid.d_theta);
+        let lambda = dt / self.grid.d_theta;
         // The turning rate at the face above each bin
-        for (j, c) in s.faces.iter_mut().enumerate() {
-            *c = self.c_theta(i, self.grid.theta[j] + 0.5 * dtheta, p);
+        for (c, &[depth, current]) in s.faces.iter_mut().zip(turning) {
+            *c = self.turning_rate(i, p, depth, current);
         }
         if s.faces.iter().all(|&c| c == 0.0) {
             return;
         }
+        // The periodic neighbours (a branch, not a remainder: an integer
+        // division per access was most of this kernel's cost)
+        let previous = |j: usize| if j == 0 { nd - 1 } else { j - 1 };
+        let next = |j: usize| if j + 1 == nd { 0 } else { j + 1 };
         for j in 0..nd {
-            let (above, below) = (s.faces[j], s.faces[(j + nd - 1) % nd]);
+            let (above, below) = (s.faces[j], s.faces[previous(j)]);
             s.diagonal[j] = 1.0 + lambda * (above.max(0.0) - below.min(0.0));
             s.upper[j] = lambda * above.min(0.0);
             s.lower[j] = -lambda * below.max(0.0);
         }
         if self.spectral_advection == SpectralAdvection::VanLeer {
             // Deferred correction: MUSCL's flux less upwind's, of the state now
-            let at = |j: usize, offset: isize| {
-                row[(j as isize + offset).rem_euclid(nd as isize) as usize]
-            };
             for j in 0..nd {
-                let (c, left, right) = (s.faces[j], at(j, 0), at(j, 1));
-                let muscl = face_flux(c, Some(at(j, -1)), left, right, Some(at(j, 2)));
+                let (c, left, right) = (s.faces[j], row[j], row[next(j)]);
+                let (far_left, far_right) = (row[previous(j)], row[next(next(j))]);
+                let muscl = face_flux(c, Some(far_left), left, right, Some(far_right));
                 s.correction[j] = muscl - (c.max(0.0) * left + c.min(0.0) * right);
             }
             // Limit each face's correction by its donor (Zalesak 1979): what
@@ -1009,17 +1050,17 @@ impl WaveModel2D {
             // the right-hand side stays non-negative, and as fluxes they keep
             // the action
             for j in 0..nd {
-                let below = s.correction[(j + nd - 1) % nd];
+                let below = s.correction[previous(j)];
                 let taken = lambda * (s.correction[j].max(0.0) + (-below).max(0.0));
                 s.divergence[j] = if taken > row[j] { row[j] / taken } else { 1.0 };
             }
             for j in 0..nd {
                 let c = s.correction[j];
-                let donor = if c >= 0.0 { j } else { (j + 1) % nd };
+                let donor = if c >= 0.0 { j } else { next(j) };
                 s.correction[j] = c * s.divergence[donor];
             }
             for j in 0..nd {
-                let d = lambda * (s.correction[j] - s.correction[(j + nd - 1) % nd]);
+                let d = lambda * (s.correction[j] - s.correction[previous(j)]);
                 row[j] = (row[j] - d).max(0.0);
             }
         }
@@ -1038,20 +1079,22 @@ impl WaveModel2D {
     /// ```
     ///
     /// a tridiagonal M-matrix. With MUSCL, the deferred correction of
-    /// [`Self::refract_implicitly`] on the faces between the bins.
+    /// [`Self::refract_implicitly`] on the faces between the bins. `advection`
+    /// and `strain` are the node's [`Self::advection_term`] and the
+    /// direction's [`Self::strain_term`].
     fn shift_implicitly(
         &self,
-        j: usize,
         p: usize,
         column: &mut [f64],
         dt: f64,
+        advection: f64,
+        strain: f64,
         s: &mut CyclicScratch,
     ) {
         let nf = column.len();
-        let theta = self.grid.theta[j];
         // c_σ of each bin, then the faces above each bin but the last
         for (i, c) in s.bins.iter_mut().enumerate() {
-            *c = self.c_sigma(i, theta, p);
+            *c = self.shift_rate(i, p, advection, strain);
         }
         if s.bins.iter().all(|&c| c == 0.0) {
             return;
@@ -1244,6 +1287,56 @@ impl NodePass {
     }
 }
 
+/// What the implicit spectral advection at one node needs of each direction,
+/// for all frequencies: `c_θ` and `c_σ` separate into a frequency's factors
+/// (`∂σ/∂d / k`, `c_g k`) and terms of the node and the direction, which are
+/// computed once per node instead of once per frequency, and the sines and
+/// cosines of the directions once per pass.
+struct NodeRates {
+    /// `(sin, cos)` of the direction faces `θ_j + Δθ/2` and of the bins `θ_j`
+    face_angles: Vec<(f64, f64)>,
+    bin_angles: Vec<(f64, f64)>,
+    /// [`WaveModel2D::turning_terms`] at each face
+    turning: Vec<[f64; 2]>,
+    /// [`WaveModel2D::strain_term`] at each bin
+    strain: Vec<f64>,
+    /// [`WaveModel2D::advection_term`]
+    advection: f64,
+}
+
+impl NodeRates {
+    fn new(grid: &SpectralGrid) -> Self {
+        let nd = grid.n_dir();
+        Self {
+            face_angles: grid
+                .theta
+                .iter()
+                .map(|&t| (t + 0.5 * grid.d_theta).sin_cos())
+                .collect(),
+            bin_angles: grid.theta.iter().map(|t| t.sin_cos()).collect(),
+            turning: vec![[0.0; 2]; nd],
+            strain: vec![0.0; nd],
+            advection: 0.0,
+        }
+    }
+
+    /// The terms of `model` at node `p` for refraction and for frequency
+    /// shifting, as asked.
+    fn fill(&mut self, model: &WaveModel2D, p: usize, refraction: bool, shift: bool) {
+        if refraction {
+            for (t, &angle) in self.turning.iter_mut().zip(&self.face_angles) {
+                *t = model.turning_terms(angle, p);
+            }
+        }
+        if shift {
+            for (s, &angle) in self.strain.iter_mut().zip(&self.bin_angles) {
+                *s = model.strain_term(angle, p);
+            }
+            self.advection = model.advection_term(p);
+        }
+    }
+}
+
 /// Storage of the implicit refraction at one node: the turning rates at the
 /// faces, a cyclic tridiagonal system over the directions and its solve.
 struct CyclicScratch {
@@ -1307,6 +1400,33 @@ fn thomas(
     }
 }
 
+/// [`thomas`] for two right-hand sides at once: one elimination, its
+/// reciprocals shared, the same operations on each (so each solution is
+/// [`thomas`]'s bit for bit).
+fn thomas_pair(
+    lower: &[f64],
+    diagonal: &[f64],
+    upper: &[f64],
+    [ra, rb]: [&[f64]; 2],
+    [xa, xb]: [&mut [f64]; 2],
+    c_prime: &mut [f64],
+) {
+    let n = diagonal.len();
+    c_prime[0] = upper[0] / diagonal[0];
+    xa[0] = ra[0] / diagonal[0];
+    xb[0] = rb[0] / diagonal[0];
+    for j in 1..n {
+        let m = 1.0 / (diagonal[j] - lower[j] * c_prime[j - 1]);
+        c_prime[j] = upper[j] * m;
+        xa[j] = (ra[j] - lower[j] * xa[j - 1]) * m;
+        xb[j] = (rb[j] - lower[j] * xb[j - 1]) * m;
+    }
+    for j in (0..n - 1).rev() {
+        xa[j] -= c_prime[j] * xa[j + 1];
+        xb[j] -= c_prime[j] * xb[j + 1];
+    }
+}
+
 /// Solve the cyclic tridiagonal system of `s` (`lower[0]` couples to
 /// `x[n−1]`, `upper[n−1]` to `x[0]`) for the right-hand side `rhs`, in place:
 /// the Thomas algorithm on the system without its corners, corrected by
@@ -1331,23 +1451,15 @@ fn solve_cyclic_tridiagonal(rhs: &mut [f64], s: &mut CyclicScratch) {
     s.modified.copy_from_slice(&s.diagonal);
     s.modified[0] -= gamma;
     s.modified[n - 1] -= alpha * beta / gamma;
-    thomas(
-        &s.lower,
-        &s.modified,
-        &s.upper,
-        rhs,
-        &mut s.x,
-        &mut s.c_prime,
-    );
     s.u.fill(0.0);
     s.u[0] = gamma;
     s.u[n - 1] = alpha;
-    thomas(
+    thomas_pair(
         &s.lower,
         &s.modified,
         &s.upper,
-        &s.u,
-        &mut s.z,
+        [rhs, &s.u],
+        [&mut s.x, &mut s.z],
         &mut s.c_prime,
     );
     let fact = (s.x[0] + beta * s.x[n - 1] / gamma) / (1.0 + s.z[0] + beta * s.z[n - 1] / gamma);

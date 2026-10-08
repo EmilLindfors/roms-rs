@@ -155,7 +155,183 @@ impl Quadruplets {
             2.0 * (1.0 - lam * lam).powi(-4),
         );
         let constant = scale * self.c_nl4 * TAU * TAU / g.powi(4);
-        // E at frequency bin `i` (above the grid: the tail) and direction bin `j`
+        DIA_SCRATCH.with_borrow_mut(|scratch| {
+            // E with the rows the stencil reaches below the grid (zero) and
+            // above it (the tail), and each direction landing's bins on the
+            // circle: plain loads in the loops below (bounds, wrapping and the
+            // tail at every access were most of the DIA's cost)
+            let (lo, hi) = (
+                st.plus.offset.min(st.minus.offset).min(0),
+                (nf + st.plus.offset.max(st.minus.offset) + 1).max(nf),
+            );
+            let ext = &mut scratch.extended;
+            ext.clear();
+            for i in lo..hi {
+                for j in 0..nd {
+                    ext.push(if i < 0 {
+                        0.0
+                    } else if i < nf {
+                        e[(i * nd + j) as usize]
+                    } else {
+                        match tail {
+                            Some(p) => {
+                                e[((nf - 1) * nd + j) as usize]
+                                    * gamma.powf(-p * (i - nf + 1) as f64)
+                            }
+                            None => 0.0,
+                        }
+                    });
+                }
+            }
+            let landings = [
+                st.dir_plus[0],
+                st.dir_plus[1],
+                st.dir_minus[0],
+                st.dir_minus[1],
+            ];
+            let bins = &mut scratch.bins;
+            bins.clear();
+            for d in landings {
+                for b in 0..2 {
+                    bins.extend((0..nd).map(|j| (j + d.offset + b).rem_euclid(nd) as usize));
+                }
+            }
+            let (ext, bins) = (&*ext, &*bins);
+            let nd_u = nd as usize;
+            // The bins of landing `l` (0, 1: σ₊ and its mirror; 2, 3: σ₋) at
+            // offset `b` from direction `j`
+            let bin = |l: usize, b: usize, j: usize| bins[(2 * l + b) * nd_u + j];
+            let gather = |i: isize, j: usize, f: Landing, l: usize, d: Landing| -> f64 {
+                let mut sum = 0.0;
+                for (a, wf) in f.weights.iter().enumerate() {
+                    let row = (i + f.offset + a as isize - lo) as usize * nd_u;
+                    for (b, wd) in d.weights.iter().enumerate() {
+                        sum += wf * wd * ext[row + bin(l, b, j)];
+                    }
+                }
+                sum
+            };
+            let scatter = |s: &mut [f64],
+                           i: isize,
+                           j: usize,
+                           f: Landing,
+                           l: usize,
+                           d: Landing,
+                           vol: [f64; 2],
+                           r: f64| {
+                for (a, (wf, vol)) in f.weights.iter().zip(vol).enumerate() {
+                    let ib = i + f.offset + a as isize;
+                    if !(0..nf).contains(&ib) {
+                        continue;
+                    }
+                    let gain = r * wf * vol;
+                    let row = ib as usize * nd_u;
+                    for (b, wd) in d.weights.iter().enumerate() {
+                        s[row + bin(l, b, j)] += gain * wd;
+                    }
+                }
+            };
+            for i in 0..nf {
+                let factor = constant * (grid.sigma[i as usize] / TAU).powi(11);
+                for j in 0..nd_u {
+                    let ec = e[i as usize * nd_u + j];
+                    if ec <= 0.0 {
+                        continue;
+                    }
+                    for m in 0..2 {
+                        let (dp, dm) = (st.dir_plus[m], st.dir_minus[m]);
+                        let ep = gather(i, j, st.plus, m, dp);
+                        let em = gather(i, j, st.minus, 2 + m, dm);
+                        let r =
+                            factor * ec * (ec * (ep * w_plus + em * w_minus) - w_both * ep * em);
+                        s[i as usize * nd_u + j] -= 2.0 * r;
+                        scatter(s, i, j, st.plus, m, dp, st.volume_plus, r);
+                        scatter(s, i, j, st.minus, 2 + m, dm, st.volume_minus, r);
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Per-thread storage of [`Quadruplets::source`]: the spectrum extended by
+/// the rows its stencil reaches, and the direction landings' bins.
+#[derive(Default)]
+struct DiaScratch {
+    extended: Vec<f64>,
+    bins: Vec<usize>,
+}
+
+thread_local! {
+    static DIA_SCRATCH: std::cell::RefCell<DiaScratch> =
+        std::cell::RefCell::new(DiaScratch::default());
+}
+
+/// The finite-depth scaling `R(k_p d)` of the DIA, `k_p d` floored at 0.5.
+pub fn shallow_water_factor(kp_d: f64) -> f64 {
+    let x = kp_d.max(0.5);
+    1.0 + 5.5 / x * (1.0 - 5.0 / 6.0 * x) * (-1.25 * x).exp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const G: f64 = 9.81;
+
+    /// A JONSWAP sea with the ends of the grid emptied, so that every quadruplet
+    /// with energy lands inside the grid.
+    fn confined(grid: &SpectralGrid, tp: f64) -> Vec<f64> {
+        let mut e = grid.jonswap(2.0, tp, 3.3, 0.4, 2.0);
+        let (nf, nd) = (grid.n_freq(), grid.n_dir());
+        for i in (0..5).chain(nf - 5..nf) {
+            e[i * nd..(i + 1) * nd].fill(0.0);
+        }
+        e
+    }
+
+    #[test]
+    fn the_angles_close_the_deep_water_resonance() {
+        let q = Quadruplets::default();
+        let (tp, tm) = q.angles();
+        assert!(
+            (tp.to_degrees() + 11.48).abs() < 5e-3,
+            "{}",
+            tp.to_degrees()
+        );
+        assert!(
+            (tm.to_degrees() - 33.56).abs() < 5e-3,
+            "{}",
+            tm.to_degrees()
+        );
+        // 2k = k₊ + k₋ in both components
+        let (a, b) = (1.25f64.powi(2), 0.75f64.powi(2));
+        assert!((a * tp.cos() + b * tm.cos() - 2.0).abs() < 1e-14);
+        assert!((a * tp.sin() + b * tm.sin()).abs() < 1e-14);
+    }
+
+    /// The transfer as it was computed before the stencil's tables (every
+    /// access bounds-checked, wrapped and continued into the tail on the
+    /// spot): the reference of `the_tables_give_the_direct_transfer`.
+    fn direct_source(
+        q: &Quadruplets,
+        grid: &SpectralGrid,
+        e: &[f64],
+        tail: Option<f64>,
+        scale: f64,
+        s: &mut [f64],
+    ) {
+        let (nf, nd) = (grid.n_freq() as isize, grid.n_dir() as isize);
+        s.fill(0.0);
+        let st = q.stencil(grid);
+        let gamma = grid.frequency_ratio();
+        let lam = q.lambda;
+        let (w_plus, w_minus, w_both) = (
+            (1.0 + lam).powi(-4),
+            (1.0 - lam).powi(-4),
+            2.0 * (1.0 - lam * lam).powi(-4),
+        );
+        let constant = scale * q.c_nl4 * TAU * TAU / G.powi(4);
         let at = |i: isize, j: isize| -> f64 {
             let j = j.rem_euclid(nd);
             if i < 0 {
@@ -213,49 +389,25 @@ impl Quadruplets {
             }
         }
     }
-}
 
-/// The finite-depth scaling `R(k_p d)` of the DIA, `k_p d` floored at 0.5.
-pub fn shallow_water_factor(kp_d: f64) -> f64 {
-    let x = kp_d.max(0.5);
-    1.0 + 5.5 / x * (1.0 - 5.0 / 6.0 * x) * (-1.25 * x).exp()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const G: f64 = 9.81;
-
-    /// A JONSWAP sea with the ends of the grid emptied, so that every quadruplet
-    /// with energy lands inside the grid.
-    fn confined(grid: &SpectralGrid, tp: f64) -> Vec<f64> {
-        let mut e = grid.jonswap(2.0, tp, 3.3, 0.4, 2.0);
-        let (nf, nd) = (grid.n_freq(), grid.n_dir());
-        for i in (0..5).chain(nf - 5..nf) {
-            e[i * nd..(i + 1) * nd].fill(0.0);
-        }
-        e
-    }
-
+    /// The transfer through the stencil's tables (the extended spectrum, the
+    /// landings' bins) is the direct one bit for bit: with and without the
+    /// tail, energy at the grid's ends, and directions so few that the
+    /// landings wrap around the circle by more than a bin.
     #[test]
-    fn the_angles_close_the_deep_water_resonance() {
-        let q = Quadruplets::default();
-        let (tp, tm) = q.angles();
-        assert!(
-            (tp.to_degrees() + 11.48).abs() < 5e-3,
-            "{}",
-            tp.to_degrees()
-        );
-        assert!(
-            (tm.to_degrees() - 33.56).abs() < 5e-3,
-            "{}",
-            tm.to_degrees()
-        );
-        // 2k = k₊ + k₋ in both components
-        let (a, b) = (1.25f64.powi(2), 0.75f64.powi(2));
-        assert!((a * tp.cos() + b * tm.cos() - 2.0).abs() < 1e-14);
-        assert!((a * tp.sin() + b * tm.sin()).abs() < 1e-14);
+    fn the_tables_give_the_direct_transfer() {
+        for (n_freq, n_dir, tail) in [(25, 36, Some(4.0)), (30, 24, None), (12, 6, Some(5.0))] {
+            let grid = SpectralGrid::new(0.04, 0.5, n_freq, n_dir);
+            let e = grid.jonswap(3.0, 4.0, 3.3, 1.0, 2.0);
+            // Energy in the top row, which the tail continues
+            assert!(e[(n_freq - 1) * n_dir..].iter().any(|&x| x > 0.0));
+            let q = Quadruplets::default();
+            let (mut fast, mut direct) = (vec![0.0; e.len()], vec![0.0; e.len()]);
+            q.source(&grid, &e, tail, G, 1.3, &mut fast);
+            direct_source(&q, &grid, &e, tail, 1.3, &mut direct);
+            assert!(direct.iter().any(|&x| x != 0.0));
+            assert_eq!(fast, direct, "{n_freq}×{n_dir}, tail {tail:?}");
+        }
     }
 
     #[test]
