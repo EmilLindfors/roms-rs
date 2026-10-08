@@ -18,10 +18,15 @@
 //!   current-induced frequency shifting, and the step that combines them;
 //! - [`coupling`]: [`WaveCoupling2D`], the exchanges with a circulation on a mesh
 //!   and order of its own (level and currents to the waves; radiation stress,
-//!   bed stress, surface roughness and Stokes drift back).
-//!
-//! TODO F.4: the boundary spectra of a parent wave model follow.
+//!   bed stress, surface roughness and Stokes drift back), and
+//!   [`CoupledWaves2D`], the waves run alongside a circulation, exchanging
+//!   every coupling interval.
+//! - [`boundary`]: [`BoundarySpectra`], a parent wave model's point spectra
+//!   (e.g. MET Norway's WAM 800 m, read by `io::WaveSpectraFile`) regridded
+//!   onto the model's grid and interpolated onto its open boundary in space
+//!   and time, and [`WindSeries`], the parent's wind.
 
+pub mod boundary;
 pub mod coupling;
 pub mod dispersion;
 pub mod model;
@@ -31,9 +36,16 @@ pub mod spectrum;
 pub mod state;
 pub mod stokes;
 
-pub use coupling::{DEFAULT_COUPLING_H_DRY, WaveCoupling2D};
+pub use boundary::{BoundarySpectra, PointSpectra, WindSeries, regrid_spectrum};
+pub use coupling::{
+    CoupledWaves2D, CoupledWavesStats, DEFAULT_BED_ROUGHNESS, DEFAULT_COUPLING_H_DRY,
+    WaveCoupling2D,
+};
 pub use dispersion::{dsigma_ddepth, group_velocity, group_velocity_ratio, wavenumber};
-pub use model::{DEFAULT_DEPTH_MIN, SpectralAdvection, WaveModel2D, WaveWorkspace};
+pub use model::{
+    DEFAULT_DEPTH_MIN, SpectralAdvection, WaveModel2D, WaveTimeStepLimit, WaveTimeStepLimits,
+    WaveWorkspace,
+};
 pub use nonlinear::{Quadruplets, shallow_water_factor};
 pub use sources::{DEFAULT_LIMITER, DEFAULT_TAIL_POWER, SourceTerms, Wind, breaking_fraction};
 pub use spectrum::{SpectralGrid, WaveParameters, wrap_angle};

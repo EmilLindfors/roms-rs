@@ -425,90 +425,17 @@ fn a_following_current_shifts_the_frequency_doppler() {
 #[test]
 fn a_spread_sea_on_a_current_has_the_exact_doppler_shift() {
     const L: f64 = 500.0;
-    let (centre, width) = (TAU * 0.3, TAU * 0.04);
-    let incoming = |s: f64, theta: f64| {
-        let c = (theta - PI / 2.0).cos();
-        let spread = if c > 0.0 { c.powi(8) } else { 0.0 };
-        (-((s - centre) / width).powi(2)).exp() * spread
-    };
     let current = |y: f64| 0.6 * y / L;
-    // The exact mean σ at y, by the midpoint rule over (σ, θ)
-    let exact_mean = |y: f64| {
-        let v = current(y);
-        let (lo, hi, n_s, n_t) = (TAU * 0.08, TAU * 0.6, 400, 720);
-        let (mut num, mut den) = (0.0, 0.0);
-        for a in 0..n_s {
-            let s = lo + (hi - lo) * (a as f64 + 0.5) / n_s as f64;
-            let k = s * s / G;
-            for b in 0..n_t {
-                let theta = TAU * (b as f64 + 0.5) / n_t as f64;
-                let (kx, ky) = (k * theta.cos(), k * theta.sin());
-                if ky <= 0.0 {
-                    continue;
-                }
-                let s0 = s + ky * v;
-                let k0 = s0 * s0 / G;
-                if k0 <= kx.abs() {
-                    continue;
-                }
-                let theta0 = (k0 * k0 - kx * kx).sqrt().atan2(kx);
-                let w = incoming(s0, theta0) * (s / s0).powi(3);
-                num += s * w;
-                den += w;
-            }
-        }
-        num / den
-    };
     let errors = |scheme: SpectralAdvection| -> Vec<f64> {
-        let mut errors = Vec::new();
-        for (n_freq, n_dir) in [(13, 12), (25, 24), (49, 48)] {
-            let mut mesh = Mesh2D::channel_periodic_x(0.0, 100.0, 0.0, L, 1, 5);
-            for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
-                edge.boundary_tag = Some(BoundaryTag::Open);
-            }
-            let grid = SpectralGrid::new(0.15, 0.5, n_freq, n_dir);
-            let mut e = vec![0.0; grid.n_components()];
-            for i in 0..n_freq {
-                for j in 0..n_dir {
-                    // Variance density E = σ N of the incoming action
-                    let s = grid.sigma[i];
-                    e[grid.component(i, j)] = s * incoming(s, grid.theta[j]);
-                }
-            }
-            let mut m = model(mesh, 2, |_, _| -1000.0, grid)
-                .with_boundary_spectrum(&e)
-                .with_spectral_advection(scheme);
-            let xy = nodes(&m);
-            let v: Vec<f64> = xy.iter().map(|p| current(p[1])).collect();
-            m.set_currents(&vec![0.0; v.len()], &v);
-            let mut n = m.zero_state();
-            // Steady for every direction 30° or more off the coast
-            let slowest = G / (2.0 * TAU * 0.5) * 0.5;
-            run(&m, &mut n, 3.0 * L / slowest, 0.5);
-            let (nd, mut worst) = (m.grid.n_dir(), 0.0f64);
-            let mut exact_at: Vec<(f64, f64)> = Vec::new();
-            for p in (0..m.n_points()).filter(|&p| xy[p][1] > 50.0) {
-                let (mut num, mut den) = (0.0, 0.0);
-                for c in 0..m.grid.n_components() {
-                    let i = c / nd;
-                    let w = n.component(c)[p] * m.grid.d_sigma[i];
-                    num += m.grid.sigma[i] * w;
-                    den += w;
-                }
-                let y = xy[p][1];
-                let exact = match exact_at.iter().find(|(yy, _)| (yy - y).abs() < 1e-9) {
-                    Some(&(_, e)) => e,
-                    None => {
-                        let e = exact_mean(y);
-                        exact_at.push((y, e));
-                        e
-                    }
-                };
-                worst = worst.max((num / den / exact - 1.0).abs());
-            }
-            errors.push(worst);
-        }
-        errors
+        [(13, 12), (25, 24), (49, 48)]
+            .into_iter()
+            .map(|(n_freq, n_dir)| {
+                let m = spread_sea_on_a_current(n_freq, n_dir, current, |m| {
+                    m.with_spectral_advection(scheme)
+                });
+                spread_sea_doppler_error(&m, current, 0.5, 50.0).0
+            })
+            .collect()
     };
     let rates = |e: &[f64]| -> Vec<f64> { e.windows(2).map(|w| (w[0] / w[1]).log2()).collect() };
     let (muscl, upwind) = (
@@ -533,6 +460,160 @@ fn a_spread_sea_on_a_current_has_the_exact_doppler_shift() {
     assert!(
         muscl[1] < 0.25 * upwind[1],
         "MUSCL {muscl:?} against upwind {upwind:?}"
+    );
+}
+
+/// The incoming action density of the spread sea on a current: Gaussian in σ
+/// about 0.3 Hz, cos⁸ about +y.
+fn spread_sea(s: f64, theta: f64) -> f64 {
+    let (centre, width) = (TAU * 0.3, TAU * 0.04);
+    let c = (theta - PI / 2.0).cos();
+    let spread = if c > 0.0 { c.powi(8) } else { 0.0 };
+    (-((s - centre) / width).powi(2)).exp() * spread
+}
+
+/// The exact steady mean σ of [`spread_sea`] in deep water where the current
+/// along +y is `v`, by the midpoint rule over (σ, θ): along a ray `k_x` and
+/// `ω = σ + k_y V` are constant, and so is `N c_g/k`, so the spectrum is
+/// `N₀(σ₀, θ₀)(σ/σ₀)³` with `σ₀ = ω`, `k₀ cos θ₀ = k cos θ`. It depends on the
+/// local current only.
+fn spread_sea_mean_frequency(v: f64) -> f64 {
+    let (lo, hi, n_s, n_t) = (TAU * 0.08, TAU * 0.6, 400, 720);
+    let (mut num, mut den) = (0.0, 0.0);
+    for a in 0..n_s {
+        let s = lo + (hi - lo) * (a as f64 + 0.5) / n_s as f64;
+        let k = s * s / G;
+        for b in 0..n_t {
+            let theta = TAU * (b as f64 + 0.5) / n_t as f64;
+            let (kx, ky) = (k * theta.cos(), k * theta.sin());
+            if ky <= 0.0 {
+                continue;
+            }
+            let s0 = s + ky * v;
+            let k0 = s0 * s0 / G;
+            if k0 <= kx.abs() {
+                continue;
+            }
+            let theta0 = (k0 * k0 - kx * kx).sqrt().atan2(kx);
+            let w = spread_sea(s0, theta0) * (s / s0).powi(3);
+            num += s * w;
+            den += w;
+        }
+    }
+    num / den
+}
+
+/// The model of the spread sea entering from y = 0 over 500 m of deep water
+/// (five P2 elements of 100 m along y, periodic in x) on the current
+/// `current(y)` along +y, on `n_freq` frequencies (0.15–0.5 Hz) and `n_dir`
+/// directions, configured by `configure`.
+fn spread_sea_on_a_current(
+    n_freq: usize,
+    n_dir: usize,
+    current: impl Fn(f64) -> f64,
+    configure: impl FnOnce(WaveModel2D) -> WaveModel2D,
+) -> WaveModel2D {
+    let mut mesh = Mesh2D::channel_periodic_x(0.0, 100.0, 0.0, 500.0, 1, 5);
+    for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
+        edge.boundary_tag = Some(BoundaryTag::Open);
+    }
+    let grid = SpectralGrid::new(0.15, 0.5, n_freq, n_dir);
+    let mut e = vec![0.0; grid.n_components()];
+    for i in 0..n_freq {
+        for j in 0..n_dir {
+            // Variance density E = σ N of the incoming action
+            let s = grid.sigma[i];
+            e[grid.component(i, j)] = s * spread_sea(s, grid.theta[j]);
+        }
+    }
+    let mut m = configure(model(mesh, 2, |_, _| -1000.0, grid).with_boundary_spectrum(&e));
+    let v: Vec<f64> = nodes(&m).iter().map(|p| current(p[1])).collect();
+    m.set_currents(&vec![0.0; v.len()], &v);
+    m
+}
+
+/// Run `m` of [`spread_sea_on_a_current`] to steady at Courant number `cfl`
+/// and return the largest relative error of the mean σ beyond y = 50 m
+/// against [`spread_sea_mean_frequency`], and the step.
+fn spread_sea_doppler_error(
+    m: &WaveModel2D,
+    current: impl Fn(f64) -> f64,
+    cfl: f64,
+    from_y: f64,
+) -> (f64, f64) {
+    let xy = nodes(m);
+    let mut n = m.zero_state();
+    // Steady for every direction 30° or more off the coast
+    let slowest = G / (2.0 * TAU * 0.5) * 0.5;
+    run(m, &mut n, 3.0 * 500.0 / slowest, cfl);
+    let (nd, mut worst) = (m.grid.n_dir(), 0.0f64);
+    let mut exact_at: Vec<(f64, f64)> = Vec::new();
+    for p in (0..m.n_points()).filter(|&p| xy[p][1] > from_y) {
+        let (mut num, mut den) = (0.0, 0.0);
+        for c in 0..m.grid.n_components() {
+            let i = c / nd;
+            let w = n.component(c)[p] * m.grid.d_sigma[i];
+            num += m.grid.sigma[i] * w;
+            den += w;
+        }
+        let y = xy[p][1];
+        let exact = match exact_at.iter().find(|(yy, _)| (yy - y).abs() < 1e-9) {
+            Some(&(_, e)) => e,
+            None => {
+                let e = spread_sea_mean_frequency(current(y));
+                exact_at.push((y, e));
+                e
+            }
+        };
+        worst = worst.max((num / den / exact - 1.0).abs());
+    }
+    (worst, m.compute_dt(cfl))
+}
+
+/// The spread sea of [`a_spread_sea_on_a_current_has_the_exact_doppler_shift`]
+/// on a following current that rises from 0 to 2 m/s within one 100 m element
+/// (`2 clamp((y − 100)/100)`, exact at P2), on 49 frequencies: frequency
+/// shifting limits the explicit MUSCL step to 0.63 s, against the geographic
+/// 1.39 s. Implicit frequency shifting runs at the geographic step. Beyond the
+/// ramp (y > 250 m; inside it the error is the ramp's spatial resolution, 3.5 %
+/// for every scheme) the mean σ is off the exact steady state by 2.1e-3,
+/// against explicit MUSCL's 3.7e-3: the deferred correction makes the fixed
+/// point MUSCL's. Without it, 1.4e-2, as explicit upwind's 1.3e-2.
+#[test]
+fn implicit_frequency_shifting_steps_past_the_shifting_limit() {
+    let current = |y: f64| 2.0 * ((y - 100.0) / 100.0).clamp(0.0, 1.0);
+    let (n_freq, n_dir) = (49, 24);
+    let solve = |scheme: SpectralAdvection, implicit: bool, cfl: f64| {
+        let m = spread_sea_on_a_current(n_freq, n_dir, current, |m| {
+            m.with_spectral_advection(scheme)
+                .with_implicit_frequency_shift(implicit)
+        });
+        let limits = m.time_step_limits(cfl);
+        let (error, dt) = spread_sea_doppler_error(&m, current, cfl, 250.0);
+        (error, dt, limits.propagation.dt)
+    };
+    let (muscl, dt_muscl, geographic) = solve(SpectralAdvection::VanLeer, false, 0.5);
+    let (upwind, dt_upwind, _) = solve(SpectralAdvection::Upwind, false, 0.5);
+    let (implicit, dt_implicit, _) = solve(SpectralAdvection::VanLeer, true, 0.5);
+    let (implicit_upwind, _, _) = solve(SpectralAdvection::Upwind, true, 0.5);
+    println!(
+        "a current rising 2 m/s within 100 m, mean σ off the exact steady state beyond it: \
+         explicit MUSCL {muscl:.2e} at Δt {dt_muscl:.3} s, explicit upwind {upwind:.2e} at \
+         {dt_upwind:.3} s (geographic {geographic:.3} s); implicit {implicit:.2e} at \
+         {dt_implicit:.3} s, without the correction {implicit_upwind:.2e}"
+    );
+    assert!(
+        dt_implicit > 1.5 * dt_muscl,
+        "implicit Δt {dt_implicit} against explicit {dt_muscl}"
+    );
+    assert!((dt_implicit / geographic - 1.0).abs() < 1e-12);
+    assert!(
+        implicit < 1.3 * muscl,
+        "implicit {implicit:e} against MUSCL's {muscl:e}"
+    );
+    assert!(
+        implicit_upwind > 3.0 * implicit,
+        "the correction does nothing: {implicit_upwind:e} against {implicit:e}"
     );
 }
 
@@ -758,4 +839,72 @@ fn implicit_refraction_steps_past_the_turning_limit() {
         (implicit_upwind / upwind - 1.0).abs() < 0.2,
         "implicit upwind {implicit_upwind}° against explicit {upwind}°"
     );
+}
+
+/// A boundary spectrum that changes along the open face
+/// (`WaveModel2D::set_boundary_spectra`, one per node): one component
+/// travelling straight in from y = 0 over deep water, its density rising
+/// linearly along x, reaches the steady state `N(x, y) = N_b(x)` downstream,
+/// exact at P2: 9e-15 after eight crossings (1.4e-6 after four, the
+/// transient). The same spectrum at every node is the uniform boundary bit
+/// for bit.
+#[test]
+fn a_boundary_spectrum_varying_along_the_face_is_carried_straight_in() {
+    const LX: f64 = 400.0;
+    const LY: f64 = 600.0;
+    let mesh = || {
+        Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            LX,
+            0.0,
+            LY,
+            4,
+            3,
+            [
+                BoundaryTag::Open,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+            ],
+        )
+    };
+    let grid = SpectralGrid::new(0.1, 0.15, 2, 8);
+    let (i, j) = (0, 2);
+    assert!((grid.theta[j] - PI / 2.0).abs() < 1e-12);
+    let c = grid.component(i, j);
+    let nc = grid.n_components();
+    let mut m = model(mesh(), 2, |_, _| -1000.0, grid.clone());
+    let xy = nodes(&m);
+    let points = m.open_boundary_points();
+    assert!(points.iter().all(|&p| xy[p][1].abs() < 1e-9));
+    assert_eq!(
+        points.len(),
+        4 * 3,
+        "the nodes of four P2 faces (DG: per element)"
+    );
+    let profile = |x: f64| 1.0 + x / LX;
+    let mut e = vec![0.0; points.len() * nc];
+    for (s, &p) in points.iter().enumerate() {
+        e[s * nc + c] = profile(xy[p][0]);
+    }
+    m.set_boundary_spectra(&e);
+    let sigma = m.grid.sigma[i];
+    let cg = group_velocity(sigma, wavenumber(sigma, 1000.0, G), 1000.0);
+    let mut n = m.zero_state();
+    run(&m, &mut n, 8.0 * LY / cg, 0.5);
+    let worst = (0..m.n_points())
+        .map(|p| (n.component(c)[p] * sigma / profile(xy[p][0]) - 1.0).abs())
+        .fold(0.0, f64::max);
+    println!("largest relative departure from the boundary's profile: {worst:.2e}");
+    assert!(worst < 1e-12, "departs by {worst:e}");
+
+    // A constant spectrum per node is the uniform boundary
+    let uniform: Vec<f64> = (0..nc).map(|k| if k == c { 2.0 } else { 0.0 }).collect();
+    let m_uniform = model(mesh(), 2, |_, _| -1000.0, grid.clone()).with_boundary_spectrum(&uniform);
+    let mut m_nodal = model(mesh(), 2, |_, _| -1000.0, grid);
+    m_nodal.set_boundary_spectra(&uniform.repeat(points.len()));
+    let (mut a, mut b) = (m_uniform.zero_state(), m_nodal.zero_state());
+    run(&m_uniform, &mut a, 0.5 * LY / cg, 0.5);
+    run(&m_nodal, &mut b, 0.5 * LY / cg, 0.5);
+    assert_eq!(a.component(c), b.component(c));
 }

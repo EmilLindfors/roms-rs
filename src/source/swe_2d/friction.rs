@@ -74,6 +74,19 @@ pub trait BottomFriction2D: Send + Sync {
     }
 }
 
+/// A shared law, such as [`crate::physics::SWEPhysics2D::friction`], wrapped
+/// by another (e.g. [`crate::source::WaveCurrentFriction2D`]).
+impl<F: BottomFriction2D + ?Sized> BottomFriction2D for std::sync::Arc<F> {
+    #[inline]
+    fn damping_rate(&self, node: usize, h: f64, speed: f64) -> f64 {
+        (**self).damping_rate(node, h, speed)
+    }
+
+    fn n_total_nodes(&self) -> Option<usize> {
+        (**self).n_total_nodes()
+    }
+}
+
 /// Manning bottom friction source term for 2D shallow water equations.
 ///
 /// S = (0, -g n² |u| u / h^{1/3}, -g n² |u| v / h^{1/3})

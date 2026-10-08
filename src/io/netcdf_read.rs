@@ -72,7 +72,7 @@ fn default_integer_fill(int_type: netcdf::types::IntType) -> Option<f64> {
 ///
 /// Reading by the declared type matters: asking the library for `i16` first
 /// makes it convert unpacked floats to integers (0.37 m of SSH became 0).
-fn read_values(var: &Variable, extents: Vec<Extent>) -> Result<Vec<f64>, NetCDFError> {
+pub(crate) fn read_values(var: &Variable, extents: Vec<Extent>) -> Result<Vec<f64>, NetCDFError> {
     let packed_integer = match var.vartype() {
         netcdf::types::NcVariableType::Int(int_type) => Some(int_type),
         netcdf::types::NcVariableType::Float(_) => None,
@@ -143,7 +143,7 @@ fn read_grid(
 /// non-increasing values is an error: raw values in an unknown unit silently
 /// mis-time the forcing. A file without a time variable is one
 /// time-invariant snapshot.
-fn read_time(file: &netcdf::File) -> Result<(Vec<f64>, Option<String>), NetCDFError> {
+pub(crate) fn read_time(file: &netcdf::File) -> Result<(Vec<f64>, Option<String>), NetCDFError> {
     for name in ["time", "ocean_time", "Time", "valid_time"] {
         let Some(var) = file.variable(name) else {
             continue;

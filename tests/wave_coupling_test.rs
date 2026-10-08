@@ -13,13 +13,14 @@ use dg_rs::physics::{PhysicsBuilder, SWEPhysics2DBuilder};
 use dg_rs::simulation::Simulation;
 use dg_rs::solver::{SWESolution2D, SWEState2D};
 use dg_rs::source::{
-    ChezyFriction2D, SourceContext2D, SourceTerm2D, WaveCurrentFriction2D, WaveForce2D,
+    BottomFriction2D, ChezyFriction2D, SourceContext2D, SourceTerm2D, WaveCurrentFriction2D,
+    WaveForce2D,
 };
 use dg_rs::time::SSPRK3;
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{
-    SourceTerms, SpectralGrid, WaveCoupling2D, WaveModel2D, WaveSolution, WaveWorkspace,
-    group_velocity, wavenumber,
+    CoupledWaves2D, SourceTerms, SpectralGrid, WaveCoupling2D, WaveModel2D, WaveSolution,
+    WaveWorkspace, group_velocity, wavenumber,
 };
 
 const G: f64 = 9.81;
@@ -467,6 +468,13 @@ impl Beach {
             .collect()
     }
 
+    /// The level at the wall above the level at the open sea (m).
+    fn setup(&self, q: &SWESolution2D) -> f64 {
+        let eta = self.eta(q);
+        let balance = self.balance(&vec![[0.0; 2]; eta.len()], q);
+        eta[balance.last().unwrap().0] - eta[balance[0].0]
+    }
+
     /// y of every node.
     fn ys(&self) -> Vec<f64> {
         ElementIndex::iter(self.mesh.n_elements)
@@ -627,37 +635,8 @@ fn breaking_waves_set_the_water_up_in_the_surf_zone() {
 #[test]
 fn breaking_waves_on_a_coarse_mesh_of_their_own_set_the_water_up() {
     let beach = Beach::new();
-    let setup = |wave_beach: &Beach| -> Vec<f64> {
-        let mut waves = wave_beach.waves(std::f64::consts::FRAC_PI_2, None, 36);
-        let coupling = WaveCoupling2D::new(
-            &waves,
-            beach.mesh.clone(),
-            beach.ops.clone(),
-            beach.geom.clone(),
-        );
-        let mut n = waves.zero_state();
-        let mut q = beach.still_water();
-        let mut setups = Vec::new();
-        for pass in 0..2 {
-            Beach::settle(&waves, &mut n);
-            let force = coupling.force(&waves, &n);
-            let force = if pass == 0 {
-                force.with_ramp(300.0)
-            } else {
-                force
-            };
-            let physics = beach.physics().with_source(force).build();
-            let result = Simulation::new(physics, SSPRK3).run(&mut q, 0.0, 3000.0);
-            assert!(result.success, "{result:?}");
-            let eta = beach.eta(&q);
-            let balance = beach.balance(&vec![[0.0; 2]; eta.len()], &q);
-            setups.push(eta[balance.last().unwrap().0] - eta[balance[0].0]);
-            coupling.update_waves(&mut waves, &q, &beach.bathymetry);
-        }
-        setups
-    };
-    let same = setup(&beach);
-    let coarse = setup(&Beach::with(7, 2));
+    let same = setups_by_passes(&beach, &beach, 2);
+    let coarse = setups_by_passes(&beach, &Beach::with(7, 2), 2);
     println!(
         "setup at the wall: waves on the same mesh {:.3} → {:.3} cm, on 7 P2 elements {:.3} → {:.3} cm",
         100.0 * same[0],
@@ -675,6 +654,124 @@ fn breaking_waves_on_a_coarse_mesh_of_their_own_set_the_water_up() {
     assert!(
         coarse[1] < coarse[0],
         "the coupling lowers the setup: {coarse:?}"
+    );
+}
+
+/// The setup at the wall of `beach` after each of `passes` passes of the
+/// waves on `wave_beach` (settled on the last level) and the circulation
+/// (settled under their force), coupled by `WaveCoupling2D`.
+fn setups_by_passes(beach: &Beach, wave_beach: &Beach, passes: usize) -> Vec<f64> {
+    let mut waves = wave_beach.waves(std::f64::consts::FRAC_PI_2, None, 36);
+    let coupling = WaveCoupling2D::new(
+        &waves,
+        beach.mesh.clone(),
+        beach.ops.clone(),
+        beach.geom.clone(),
+    );
+    let mut n = waves.zero_state();
+    let mut q = beach.still_water();
+    let mut setups = Vec::new();
+    for pass in 0..passes {
+        Beach::settle(&waves, &mut n);
+        let force = coupling.force(&waves, &n);
+        let force = if pass == 0 {
+            force.with_ramp(300.0)
+        } else {
+            force
+        };
+        let physics = beach.physics().with_source(force).build();
+        let result = Simulation::new(physics, SSPRK3).run(&mut q, 0.0, 3000.0);
+        assert!(result.success, "{result:?}");
+        setups.push(beach.setup(&q));
+        coupling.update_waves(&mut waves, &q, &beach.bathymetry);
+    }
+    setups
+}
+
+/// The surf zone with the waves and the circulation running together
+/// (`CoupledWaves2D` through `Simulation::run_with_exchange`, exchanging every
+/// 30 s), the waves on 7 P2 elements of 50 m and the circulation on 14 of
+/// 25 m, from still water and no waves: the swell comes in from the open
+/// sea, the force ramps up over 300 s and is linear in time across each
+/// interval. After half an hour the setup at the wall is 5.6051 cm (5.6076
+/// cm at 15 minutes, 5.6051 cm still after an hour), the fixed point of the
+/// coupling by passes (waves to steady on the level, circulation to steady
+/// under the force, repeated: 5.793, 5.597, 5.6049, 5.6045 cm) to 1.0e-4 of
+/// it, about as far as the passes have converged; the beach is at rest
+/// (2.6e-4 m/s).
+///
+/// The circulation's Chézy friction becomes the wave-enhanced one at the
+/// first exchange; at rest it changes nothing.
+#[test]
+fn breaking_waves_coupled_in_time_set_the_water_up() {
+    let beach = Beach::new();
+    let wave_beach = Beach::with(7, 2);
+    let passes = setups_by_passes(&beach, &wave_beach, 4);
+
+    let model = wave_beach.waves(std::f64::consts::FRAC_PI_2, None, 36);
+    let n = model.zero_state();
+    let cd = 2.5e-3;
+    let physics = beach
+        .physics()
+        .with_implicit_friction(ChezyFriction2D::new(cd))
+        .build();
+    let mut waves = CoupledWaves2D::new(model, n, &physics, 0.0).with_ramp(300.0);
+    let (interval, t_end) = (30.0, 1800.0);
+    let mut sim = Simulation::new(physics, SSPRK3).with_callback_interval(interval);
+    let mut q = beach.still_water();
+    let mut setups = Vec::new();
+    let result = sim.run_with_exchange(
+        &mut q,
+        0.0,
+        t_end,
+        interval,
+        |physics, q, t, t_next| waves.exchange(physics, q, t, t_next),
+        |q, _| setups.push(beach.setup(q)),
+    );
+    assert!(result.success, "{result:?}");
+    let stats = waves.stats();
+    assert_eq!(stats.exchanges, 60);
+    assert_eq!(waves.time(), t_end);
+
+    let setup = beach.setup(&q);
+    let speed = q
+        .hv_data()
+        .iter()
+        .zip(q.h_data())
+        .map(|(hv, h)| (hv / h).abs())
+        .fold(0.0f64, f64::max);
+    // Half way, for how settled it is
+    let half = setups[setups.len() / 2];
+    println!(
+        "setup at the wall coupled in time {:.4} cm (half way {:.4} cm), by passes \
+         {:?} cm; |v| ≤ {speed:.1e} m/s; {} wave steps in {} exchanges",
+        100.0 * setup,
+        100.0 * half,
+        passes.iter().map(|s| 100.0 * s).collect::<Vec<_>>(),
+        stats.wave_steps,
+        stats.exchanges
+    );
+    let fixed_point = passes[passes.len() - 1];
+    assert!(
+        (passes[passes.len() - 2] / fixed_point - 1.0).abs() < 1e-3,
+        "the passes have not converged: {passes:?}"
+    );
+    assert!(
+        (setup / fixed_point - 1.0).abs() < 3e-4,
+        "coupled in time {setup} m, by passes {fixed_point} m"
+    );
+    assert!(speed < 1e-3, "not at rest: {speed} m/s");
+
+    // The friction is the enhanced Chézy, per node, and stronger under waves
+    let friction = sim.physics().friction.as_ref().expect("the friction");
+    let n_total = beach.mesh.n_elements * beach.ops.n_nodes;
+    assert_eq!(friction.n_total_nodes(), Some(n_total));
+    let enhanced = (0..n_total)
+        .filter(|&p| friction.damping_rate(p, 2.0, 0.2) > 1.01 * cd * 0.2 / 2.0)
+        .count();
+    assert!(
+        enhanced > n_total / 2,
+        "{enhanced} of {n_total} nodes enhanced"
     );
 }
 

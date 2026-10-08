@@ -30,9 +30,12 @@
 //! [`WaveModel2D::set_currents`]; the wavenumber, group velocity and `∂σ/∂d` of
 //! every frequency at every node are kept with them.
 //!
-//! Boundaries: open faces let waves out and bring in the boundary spectrum
-//! ([`WaveModel2D::with_boundary_spectrum`]); every other face absorbs (nothing
-//! comes in), as SWAN's default coast.
+//! Boundaries: open faces let waves out and bring in the boundary spectrum,
+//! one for the whole boundary ([`WaveModel2D::with_boundary_spectrum`]) or one
+//! per node of the open faces, changed as often as wanted
+//! ([`WaveModel2D::set_boundary_spectra`], e.g. a parent wave model's through
+//! [`super::BoundarySpectra`]); every other face absorbs (nothing comes in),
+//! as SWAN's default coast.
 //!
 //! A step ([`WaveModel2D::step`]) is SSP-RK3 for the propagation, with a
 //! positivity-preserving scaling of each component in each element towards its
@@ -55,6 +58,16 @@
 //! right-hand side negative (it sums to zero over the circle, so the action is
 //! still kept). With [`SpectralAdvection::Upwind`] the steady state is the
 //! explicit upwind scheme's (first order).
+//!
+//! Frequency shifting has the same trouble where currents cross steep, shallow
+//! beds: `∂σ/∂d U·∇d` grows as the depth shrinks, and on a tidal flat it set
+//! a step of 0.6 s against the geographic 7 s at Frøya.
+//! [`WaveModel2D::with_implicit_frequency_shift`] steps it the same way, per
+//! node and direction over the frequencies: first-order upwind, backward
+//! Euler, a tridiagonal M-matrix (not periodic: action leaves through the
+//! ends of the grid, none comes in), whose columns weighted by `Δσ` sum to
+//! one but for the ends' outflow; and the same donor-limited MUSCL deferred
+//! correction on the faces between the bins.
 
 use std::sync::Arc;
 
@@ -80,6 +93,85 @@ pub enum SpectralAdvection {
     /// second order where the spectrum is smooth, TVD for Courant numbers ≤ ½
     #[default]
     VanLeer,
+}
+
+/// The action density entering through the open faces.
+#[derive(Clone, Debug)]
+enum Boundary {
+    /// Nothing enters
+    None,
+    /// The same spectrum everywhere, per component
+    Uniform(Vec<f64>),
+    /// One spectrum per open-boundary node: `slot[p]` is node `p`'s index in
+    /// `points` (`u32::MAX` off the boundary), `action[c · n + slot]`
+    Nodal {
+        points: Vec<usize>,
+        slot: Vec<u32>,
+        action: Vec<f64>,
+    },
+}
+
+impl Boundary {
+    /// The action density of component `c` entering at node `p`.
+    #[inline]
+    fn action(&self, c: usize, p: usize) -> f64 {
+        match self {
+            Boundary::None => 0.0,
+            Boundary::Uniform(action) => action[c],
+            Boundary::Nodal {
+                points,
+                slot,
+                action,
+            } => match slot[p] {
+                u32::MAX => 0.0,
+                s => action[c * points.len() + s as usize],
+            },
+        }
+    }
+}
+
+/// One bound of the wave step ([`WaveModel2D::time_step_limits`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaveTimeStepLimit {
+    /// The largest stable step (s) of this term; infinite if it is absent
+    pub dt: f64,
+    /// The node that sets it
+    pub point: usize,
+    /// The frequency bin that sets it
+    pub frequency: usize,
+}
+
+/// The bounds of the wave step at a CFL number ([`WaveModel2D::compute_dt`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WaveTimeStepLimits {
+    /// Geographic propagation `c_g e_θ + U`
+    pub propagation: WaveTimeStepLimit,
+    /// Explicit refraction `c_θ` (infinite with implicit refraction)
+    pub refraction: WaveTimeStepLimit,
+    /// Frequency shifting `c_σ` by currents
+    pub frequency_shift: WaveTimeStepLimit,
+}
+
+impl WaveTimeStepLimits {
+    /// The step: the smallest bound.
+    pub fn dt(&self) -> f64 {
+        self.propagation
+            .dt
+            .min(self.refraction.dt)
+            .min(self.frequency_shift.dt)
+    }
+
+    /// The bound that sets the step, and its name.
+    pub fn binding(&self) -> (&'static str, WaveTimeStepLimit) {
+        [
+            ("propagation", self.propagation),
+            ("refraction", self.refraction),
+            ("frequency shift", self.frequency_shift),
+        ]
+        .into_iter()
+        .min_by(|a, b| a.1.dt.total_cmp(&b.1.dt))
+        .expect("three bounds")
+    }
 }
 
 /// Reusable storage of [`WaveModel2D::step`].
@@ -113,13 +205,15 @@ pub struct WaveModel2D {
     k: Vec<f64>,
     cg: Vec<f64>,
     sigma_d: Vec<f64>,
-    /// Action density entering through open faces, per component
-    boundary: Option<Vec<f64>>,
+    /// Action density entering through open faces
+    boundary: Boundary,
     /// Largest turning rate |c_θ| (rad/s) refraction may have, or none
     turning_limit: Option<f64>,
     spectral_advection: SpectralAdvection,
-    /// Refraction stepped implicitly after the Runge–Kutta stages
+    /// Refraction stepped implicitly around the Runge–Kutta stages
     implicit_refraction: bool,
+    /// Frequency shifting stepped implicitly around the Runge–Kutta stages
+    implicit_frequency_shift: bool,
 }
 
 impl WaveModel2D {
@@ -149,10 +243,11 @@ impl WaveModel2D {
             k: vec![0.0; n_freq * n_points],
             cg: vec![0.0; n_freq * n_points],
             sigma_d: vec![0.0; n_freq * n_points],
-            boundary: None,
+            boundary: Boundary::None,
             turning_limit: None,
             spectral_advection: SpectralAdvection::default(),
             implicit_refraction: false,
+            implicit_frequency_shift: false,
             mesh,
             ops,
             geom,
@@ -173,18 +268,85 @@ impl WaveModel2D {
         self
     }
 
+    /// Replace the uniform wind (e.g. a parent model's, as it changes).
+    pub fn set_wind(&mut self, wind: Wind) {
+        self.wind = wind;
+    }
+
+    /// The uniform wind.
+    pub fn wind(&self) -> Wind {
+        self.wind
+    }
+
     /// The variance density `e[c]` (m²/(rad/s)/rad) of the waves entering through
     /// open faces.
     pub fn with_boundary_spectrum(mut self, e: &[f64]) -> Self {
         assert_eq!(e.len(), self.grid.n_components());
         let nd = self.grid.n_dir();
-        self.boundary = Some(
+        self.boundary = Boundary::Uniform(
             e.iter()
                 .enumerate()
                 .map(|(c, e)| e / self.grid.sigma[c / nd])
                 .collect(),
         );
         self
+    }
+
+    /// The nodes on open faces, ascending: where [`Self::set_boundary_spectra`]
+    /// takes a spectrum each.
+    pub fn open_boundary_points(&self) -> Vec<usize> {
+        let (nn, mesh, ops) = (self.ops.n_nodes, &*self.mesh, &*self.ops);
+        let mut points: Vec<usize> = ElementIndex::iter(mesh.n_elements)
+            .flat_map(|k| {
+                (0..4)
+                    .filter(move |&face| {
+                        mesh.neighbor(k, face).is_none()
+                            && mesh.boundary_tag(k, face) == Some(BoundaryTag::Open)
+                    })
+                    .flat_map(move |face| {
+                        ops.face_nodes[face]
+                            .iter()
+                            .map(move |&a| k.as_usize() * nn + a)
+                    })
+            })
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+        points
+    }
+
+    /// One variance density spectrum (m²/(rad/s)/rad, `[component]`) per node
+    /// of [`Self::open_boundary_points`], in its order (`e` is
+    /// `[point][component]`): what enters through the open faces from now on.
+    pub fn set_boundary_spectra(&mut self, e: &[f64]) {
+        let (nc, nd) = (self.grid.n_components(), self.grid.n_dir());
+        if !matches!(self.boundary, Boundary::Nodal { .. }) {
+            let points = self.open_boundary_points();
+            let mut slot = vec![u32::MAX; self.n_points()];
+            for (s, &p) in points.iter().enumerate() {
+                slot[p] = s as u32;
+            }
+            self.boundary = Boundary::Nodal {
+                action: vec![0.0; nc * points.len()],
+                points,
+                slot,
+            };
+        }
+        let Boundary::Nodal { points, action, .. } = &mut self.boundary else {
+            unreachable!()
+        };
+        let n_slots = points.len();
+        assert_eq!(
+            e.len(),
+            n_slots * nc,
+            "one spectrum per open-boundary point"
+        );
+        // In place: a run sets them every step
+        for (s, spectrum) in e.chunks_exact(nc).enumerate() {
+            for (c, &x) in spectrum.iter().enumerate() {
+                action[c * n_slots + s] = x / self.grid.sigma[c / nd];
+            }
+        }
     }
 
     /// Water shallower than `depth` (m) is taken this deep.
@@ -218,8 +380,15 @@ impl WaveModel2D {
         self
     }
 
+    /// Step frequency shifting implicitly (see the module docs): the step is
+    /// no longer limited by `c_σ`. Off by default.
+    pub fn with_implicit_frequency_shift(mut self, on: bool) -> Self {
+        self.implicit_frequency_shift = on;
+        self
+    }
+
     /// The scheme of the direction and frequency advection (van Leer's MUSCL by
-    /// default). With implicit refraction it applies to the frequencies only.
+    /// default), explicit or as the deferred correction of the implicit steps.
     pub fn with_spectral_advection(mut self, scheme: SpectralAdvection) -> Self {
         self.spectral_advection = scheme;
         self
@@ -255,6 +424,11 @@ impl WaveModel2D {
     /// Depth per node (m), floored at the minimum depth.
     pub fn depth(&self) -> &[f64] {
         &self.depth
+    }
+
+    /// Current per node (m/s, mesh x and y).
+    pub fn current(&self) -> &[[f64; 2]] {
+        &self.current
     }
 
     /// Wavenumber of frequency `i` at node `p` (rad/m).
@@ -338,21 +512,45 @@ impl WaveModel2D {
     /// half of that for MUSCL (van Leer's reconstruction is TVD, so positive, for
     /// Courant numbers ≤ ½).
     pub fn compute_dt(&self, cfl: f64) -> f64 {
+        self.time_step_limits(cfl).dt()
+    }
+
+    /// Each bound of [`Self::compute_dt`] and the node that sets it: what
+    /// limits the step (e.g. frequency shifting by strong tidal currents).
+    pub fn time_step_limits(&self, cfl: f64) -> WaveTimeStepLimits {
         let (n_nodes, n_points) = (self.ops.n_nodes, self.n_points());
         let order_factor = (2 * self.ops.order + 1) as f64;
-        let mut dt = f64::INFINITY;
+        let none = WaveTimeStepLimit {
+            dt: f64::INFINITY,
+            point: 0,
+            frequency: 0,
+        };
+        let mut limits = WaveTimeStepLimits {
+            propagation: none,
+            refraction: none,
+            frequency_shift: none,
+        };
+        let tighten = |limit: &mut WaveTimeStepLimit, dt: f64, point: usize, frequency: usize| {
+            if dt < limit.dt {
+                *limit = WaveTimeStepLimit {
+                    dt,
+                    point,
+                    frequency,
+                };
+            }
+        };
         for k in 0..self.mesh.n_elements {
             let h = self.geom.element_size(k);
-            let mut speed: f64 = 0.0;
             for p in k * n_nodes..(k + 1) * n_nodes {
                 let [u, v] = self.current[p];
-                let cg_max = (0..self.grid.n_freq())
-                    .map(|i| self.cg[i * n_points + p])
-                    .fold(0.0, f64::max);
-                speed = speed.max(cg_max + u.hypot(v));
-            }
-            if speed > 0.0 {
-                dt = dt.min(cfl * h / (order_factor * speed));
+                let (i, cg_max) = (0..self.grid.n_freq())
+                    .map(|i| (i, self.cg[i * n_points + p]))
+                    .fold((0, 0.0), |a, b| if b.1 > a.1 { b } else { a });
+                let speed = cg_max + u.hypot(v);
+                if speed > 0.0 {
+                    let dt = cfl * h / (order_factor * speed);
+                    tighten(&mut limits.propagation, dt, p, i);
+                }
             }
         }
         let (dtheta, nd) = (self.grid.d_theta, self.grid.n_dir());
@@ -367,17 +565,20 @@ impl WaveModel2D {
                         let theta = self.grid.theta[j] + 0.5 * dtheta;
                         let ct = self.c_theta(i, theta, p).abs();
                         if ct > 0.0 {
-                            dt = dt.min(cfl * dtheta / ct);
+                            tighten(&mut limits.refraction, cfl * dtheta / ct, p, i);
                         }
                     }
-                    let cs = self.c_sigma(i, self.grid.theta[j], p).abs();
-                    if cs > 0.0 {
-                        dt = dt.min(cfl * self.grid.d_sigma[i] / cs);
+                    if !self.implicit_frequency_shift {
+                        let cs = self.c_sigma(i, self.grid.theta[j], p).abs();
+                        if cs > 0.0 {
+                            let dt = cfl * self.grid.d_sigma[i] / cs;
+                            tighten(&mut limits.frequency_shift, dt, p, i);
+                        }
                     }
                 }
             }
         }
-        dt
+        limits
     }
 
     /// `out = −∇·((c_g e_θ + U) N) − ∂(c_θ N)/∂θ − ∂(c_σ N)/∂σ` for every
@@ -406,7 +607,7 @@ impl WaveModel2D {
         let (cos, sin) = (self.grid.cos_theta[j], self.grid.sin_theta[j]);
         let cg = &self.cg[i * np..(i + 1) * np];
         let field = n.component(c);
-        let boundary = self.boundary.as_ref().map_or(0.0, |b| b[c]);
+        let boundary = |p: usize| self.boundary.action(c, p);
         let velocity = |p: usize| {
             let [u, v] = self.current[p];
             [cg[p] * cos + u, cg[p] * sin + v]
@@ -459,7 +660,7 @@ impl WaveModel2D {
                         }
                         // Out through every boundary; in only through open ones
                         None if un_in >= 0.0 => un_in * n_in,
-                        None if open => un_in * boundary,
+                        None if open => un_in * boundary(p),
                         None => 0.0,
                     };
                     let jump = (un_in * n_in - flux) * geom.surface_jacobian(k, face, fi);
@@ -529,6 +730,9 @@ impl WaveModel2D {
                 );
                 *out -= (f_hi - f_lo) * inv_dtheta;
             }
+            if self.implicit_frequency_shift {
+                continue;
+            }
             let cs = self.c_sigma(i, theta, p);
             let g_hi = match upper {
                 Some(up) => face_flux(
@@ -592,14 +796,19 @@ impl WaveModel2D {
     }
 
     /// Advance `n` from `t` by `dt`: SSP-RK3 propagation (positivity limited every
-    /// stage), then the sources over the step. Implicit refraction takes half the
-    /// step before the stages and half after (Strang), so its splitting error is
-    /// second order in the step.
+    /// stage), then the sources over the step. Implicit refraction and
+    /// frequency shifting take half the step before the stages and half after
+    /// (Strang), so their splitting error is second order in the step.
     pub fn step(&self, n: &mut WaveSolution, t: f64, dt: f64, ws: &mut WaveWorkspace) {
-        // Strang: half of the implicit refraction on each side of the stages
-        let refraction = self.implicit_refraction.then_some(0.5 * dt);
-        if let Some(half) = refraction {
-            self.node_pass(n, ws, Some(half), None);
+        // Strang: half of the implicit spectral advection on each side of the
+        // stages
+        let half = |on: bool| on.then_some(0.5 * dt);
+        let (refraction, shift) = (
+            half(self.implicit_refraction),
+            half(self.implicit_frequency_shift),
+        );
+        if refraction.is_some() || shift.is_some() {
+            self.node_pass(n, ws, NodePass::before_stages(refraction, shift));
         }
         SSPRK3.step_with_workspace(
             n,
@@ -610,31 +819,60 @@ impl WaveModel2D {
             &mut ws.stages,
         );
         let sources = self.sources.any().then_some(dt);
-        if refraction.is_some() || sources.is_some() {
-            self.node_pass(n, ws, refraction, sources);
+        if refraction.is_some() || shift.is_some() || sources.is_some() {
+            let pass = NodePass {
+                refraction,
+                shift,
+                sources,
+                shift_first: false,
+            };
+            self.node_pass(n, ws, pass);
         }
     }
 
     /// The sources over `dt` at every node.
     pub fn apply_sources(&self, n: &mut WaveSolution, dt: f64, ws: &mut WaveWorkspace) {
-        self.node_pass(n, ws, None, Some(dt));
+        let pass = NodePass {
+            sources: Some(dt),
+            ..NodePass::default()
+        };
+        self.node_pass(n, ws, pass);
     }
 
     /// Implicit refraction over `dt` at every node (see the module docs),
     /// whether or not the model steps it so.
     pub fn apply_implicit_refraction(&self, n: &mut WaveSolution, dt: f64, ws: &mut WaveWorkspace) {
-        self.node_pass(n, ws, Some(dt), None);
+        let pass = NodePass {
+            refraction: Some(dt),
+            ..NodePass::default()
+        };
+        self.node_pass(n, ws, pass);
     }
 
-    /// At every node, on its spectrum: implicit refraction over the first
-    /// interval, then the sources over the second, each if given.
-    fn node_pass(
+    /// Implicit frequency shifting over `dt` at every node (see the module
+    /// docs), whether or not the model steps it so.
+    pub fn apply_implicit_frequency_shift(
         &self,
         n: &mut WaveSolution,
+        dt: f64,
         ws: &mut WaveWorkspace,
-        refraction: Option<f64>,
-        sources: Option<f64>,
     ) {
+        let pass = NodePass {
+            shift: Some(dt),
+            ..NodePass::default()
+        };
+        self.node_pass(n, ws, pass);
+    }
+
+    /// At every node, on its spectrum, what `pass` gives: implicit refraction
+    /// and frequency shifting (in its order), then the sources.
+    fn node_pass(&self, n: &mut WaveSolution, ws: &mut WaveWorkspace, pass: NodePass) {
+        let NodePass {
+            refraction,
+            shift,
+            sources,
+            shift_first,
+        } = pass;
         let (np, nc, nf) = (
             self.n_points(),
             self.grid.n_components(),
@@ -663,13 +901,34 @@ impl WaveModel2D {
                     vec![0.0; nc],
                     vec![0.0; nc],
                     CyclicScratch::new(nd),
+                    CyclicScratch::new(nf),
+                    vec![0.0; nf],
                 )
             },
-            |(k, e, a, b, cyclic), p, spectrum| {
+            |(k, e, a, b, cyclic, banded, column), p, spectrum| {
+                let mut shift_now = |spectrum: &mut [f64]| {
+                    if let Some(dt) = shift {
+                        for j in 0..nd {
+                            for (i, x) in column.iter_mut().enumerate() {
+                                *x = spectrum[i * nd + j];
+                            }
+                            self.shift_implicitly(j, p, column, dt, banded);
+                            for (i, x) in column.iter().enumerate() {
+                                spectrum[i * nd + j] = *x;
+                            }
+                        }
+                    }
+                };
+                if shift_first {
+                    shift_now(spectrum);
+                }
                 if let Some(dt) = refraction {
                     for (i, row) in spectrum.chunks_exact_mut(nd).enumerate() {
                         self.refract_implicitly(i, p, row, dt, cyclic);
                     }
+                }
+                if !shift_first {
+                    shift_now(spectrum);
                 }
                 if let Some(dt) = sources {
                     for (i, k) in k.iter_mut().enumerate() {
@@ -765,6 +1024,85 @@ impl WaveModel2D {
             }
         }
         solve_cyclic_tridiagonal(row, s);
+    }
+
+    /// Backward Euler over `dt` for the frequency advection of direction `j`
+    /// at node `p`, on its action densities over the frequencies `column`:
+    /// first-order upwind fluxes `c⁺ N_i + c⁻ N_{i+1}` through the faces
+    /// between the bins (the speed the mean of the two bins'), and through
+    /// the ends of the grid outflow only (`c⁻ N_0` below, `c⁺ N_{nf−1}`
+    /// above, as the explicit scheme), so
+    ///
+    /// ```text
+    /// N_i + λ_i (F_{i+½} − F_{i−½}) = N*_i,   λ_i = Δt/Δσ_i
+    /// ```
+    ///
+    /// a tridiagonal M-matrix. With MUSCL, the deferred correction of
+    /// [`Self::refract_implicitly`] on the faces between the bins.
+    fn shift_implicitly(
+        &self,
+        j: usize,
+        p: usize,
+        column: &mut [f64],
+        dt: f64,
+        s: &mut CyclicScratch,
+    ) {
+        let nf = column.len();
+        let theta = self.grid.theta[j];
+        // c_σ of each bin, then the faces above each bin but the last
+        for (i, c) in s.bins.iter_mut().enumerate() {
+            *c = self.c_sigma(i, theta, p);
+        }
+        if s.bins.iter().all(|&c| c == 0.0) {
+            return;
+        }
+        for i in 0..nf - 1 {
+            s.faces[i] = 0.5 * (s.bins[i] + s.bins[i + 1]);
+        }
+        // Outflow only through the ends
+        let (bottom, top) = (s.bins[0].min(0.0), s.bins[nf - 1].max(0.0));
+        s.faces[nf - 1] = top;
+        for i in 0..nf {
+            let lambda = dt / self.grid.d_sigma[i];
+            let above = s.faces[i];
+            let below = if i > 0 { s.faces[i - 1] } else { bottom };
+            s.diagonal[i] = 1.0 + lambda * (above.max(0.0) - below.min(0.0));
+            s.upper[i] = if i + 1 < nf {
+                lambda * above.min(0.0)
+            } else {
+                0.0
+            };
+            s.lower[i] = if i > 0 { -lambda * below.max(0.0) } else { 0.0 };
+        }
+        if self.spectral_advection == SpectralAdvection::VanLeer {
+            // Deferred correction on the faces between the bins (first order at
+            // the ends, as the explicit scheme)
+            s.correction[nf - 1] = 0.0;
+            for i in 0..nf - 1 {
+                let (c, left, right) = (s.faces[i], column[i], column[i + 1]);
+                let far_left = (i > 0).then(|| column[i - 1]);
+                let far_right = (i + 2 < nf).then(|| column[i + 2]);
+                let muscl = face_flux(c, far_left, left, right, far_right);
+                s.correction[i] = muscl - (c.max(0.0) * left + c.min(0.0) * right);
+            }
+            // Each face limited by its donor (Zalesak 1979)
+            for (i, (&x, &d_sigma)) in column.iter().zip(&self.grid.d_sigma).enumerate() {
+                let below = if i > 0 { s.correction[i - 1] } else { 0.0 };
+                let taken = dt / d_sigma * (s.correction[i].max(0.0) + (-below).max(0.0));
+                s.divergence[i] = if taken > x { x / taken } else { 1.0 };
+            }
+            for i in 0..nf - 1 {
+                let c = s.correction[i];
+                let donor = if c >= 0.0 { i } else { i + 1 };
+                s.correction[i] = c * s.divergence[donor];
+            }
+            for (i, (x, &d_sigma)) in column.iter_mut().zip(&self.grid.d_sigma).enumerate() {
+                let below = if i > 0 { s.correction[i - 1] } else { 0.0 };
+                let d = dt / d_sigma * (s.correction[i] - below);
+                *x = (*x - d).max(0.0);
+            }
+        }
+        solve_cyclic_tridiagonal(column, s);
     }
 
     /// The variance density `E = σ N` at node `p` into `e`.
@@ -882,10 +1220,36 @@ fn face_flux(
     }
 }
 
+/// What [`WaveModel2D::node_pass`] does at every node: implicit refraction
+/// and frequency shifting over their intervals, the shift first or last, then
+/// the sources.
+#[derive(Clone, Copy, Debug, Default)]
+struct NodePass {
+    refraction: Option<f64>,
+    shift: Option<f64>,
+    sources: Option<f64>,
+    shift_first: bool,
+}
+
+impl NodePass {
+    /// The half-steps before the stages: the reverse order of those after
+    /// them (frequency shift, then refraction), for a symmetric splitting.
+    fn before_stages(refraction: Option<f64>, shift: Option<f64>) -> Self {
+        Self {
+            refraction,
+            shift,
+            sources: None,
+            shift_first: true,
+        }
+    }
+}
+
 /// Storage of the implicit refraction at one node: the turning rates at the
 /// faces, a cyclic tridiagonal system over the directions and its solve.
 struct CyclicScratch {
     faces: Vec<f64>,
+    /// The frequency shift of each bin (frequency columns only)
+    bins: Vec<f64>,
     /// MUSCL's flux less upwind's through each face, then its divergence
     correction: Vec<f64>,
     divergence: Vec<f64>,
@@ -904,6 +1268,7 @@ impl CyclicScratch {
     fn new(n: usize) -> Self {
         Self {
             faces: vec![0.0; n],
+            bins: vec![0.0; n],
             correction: vec![0.0; n],
             divergence: vec![0.0; n],
             lower: vec![0.0; n],
@@ -1112,5 +1477,74 @@ mod tests {
             }
         }
         assert!(turned > 1e-3, "nothing turned ({turned})");
+    }
+
+    /// Implicit frequency shifting at 10⁴ × the explicit step, by a current
+    /// over a sloping bed (both terms of `c_σ`): every node's spectrum stays
+    /// non-negative, and each direction's action `Σ Δσ_i N_i` changes by
+    /// exactly what flows out through the ends of the grid in the backward
+    /// Euler step (`Δt (c⁺_top N_top − c⁻_bottom N_0)` of the new state; the
+    /// MUSCL correction moves action between bins only), to round-off.
+    #[test]
+    fn implicit_frequency_shifting_keeps_the_action_at_any_step() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 200.0, 0.0, 200.0, 2, 2);
+        let ops = Arc::new(DGOperators2D::new(2));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bathymetry =
+            Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| -(1.0 + 0.02 * y + 0.01 * x));
+        let grid = SpectralGrid::new(0.06, 0.5, 12, 18);
+        let mut model = WaveModel2D::new(Arc::new(mesh), ops, geom, &bathymetry, grid, 9.81)
+            .with_implicit_frequency_shift(true);
+        let np = model.n_points();
+        let xy: Vec<[f64; 2]> = (0..model.mesh.n_elements)
+            .flat_map(|k| {
+                let (mesh, ops) = (&model.mesh, &model.ops);
+                (0..ops.n_nodes).map(move |i| {
+                    mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
+                })
+            })
+            .collect();
+        let u: Vec<f64> = xy.iter().map(|p| 0.3 + 1e-3 * p[1]).collect();
+        let v: Vec<f64> = xy.iter().map(|p| -0.2 + 2e-3 * p[0]).collect();
+        model.set_currents(&u, &v);
+        let e = model.grid.jonswap(0.5, 4.0, 3.3, 0.3, 2.0);
+        let mut n = model.uniform_state(&e);
+        let before = n.clone();
+        // The explicit scheme's bound
+        model.implicit_frequency_shift = false;
+        let explicit = model.time_step_limits(1.0).frequency_shift.dt;
+        model.implicit_frequency_shift = true;
+        let dt = 1e4 * explicit;
+        let mut ws = WaveWorkspace::default();
+        model.apply_implicit_frequency_shift(&mut n, dt, &mut ws);
+        let (nf, nd) = (model.grid.n_freq(), model.grid.n_dir());
+        let mut shifted = 0.0f64;
+        for p in 0..np {
+            for j in 0..nd {
+                let theta = model.grid.theta[j];
+                let action = |s: &WaveSolution| -> f64 {
+                    (0..nf)
+                        .map(|i| model.grid.d_sigma[i] * s.component(i * nd + j)[p])
+                        .sum()
+                };
+                let (bottom, top) = (
+                    model.c_sigma(0, theta, p).min(0.0),
+                    model.c_sigma(nf - 1, theta, p).max(0.0),
+                );
+                let outflow =
+                    dt * (top * n.component((nf - 1) * nd + j)[p] - bottom * n.component(j)[p]);
+                let (a, b) = (action(&before), action(&n));
+                assert!(
+                    (a - b - outflow).abs() <= 1e-12 * a,
+                    "node {p}, direction {j}: {a} → {b}, outflow {outflow}"
+                );
+                for i in 0..nf {
+                    let c = i * nd + j;
+                    assert!(n.component(c)[p] >= 0.0);
+                    shifted = shifted.max((n.component(c)[p] - before.component(c)[p]).abs());
+                }
+            }
+        }
+        assert!(shifted > 1e-3, "nothing shifted ({shifted})");
     }
 }
