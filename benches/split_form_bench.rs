@@ -7,7 +7,9 @@
 //! islands (≈ 3 % of the elements take the subcells), η = 0.3 m with a
 //! current. `affine` keeps the uniform parallelograms; `curved` moves the
 //! vertices so every element is a general quadrilateral, as on a Gmsh
-//! coastline mesh. Serial and parallel full RHS evaluations.
+//! coastline mesh. `shoreline` is `curved` over tidal flats where 33 % of
+//! the elements take the subcells (none of them dry), close to the Frøya
+//! coastline mesh (38.5 %). Serial and parallel full RHS evaluations.
 
 use std::f64::consts::PI;
 
@@ -34,7 +36,7 @@ struct Case {
     q: SWESolution2D,
 }
 
-fn case(curved: bool) -> Case {
+fn case(curved: bool, shoreline: bool) -> Case {
     let mut mesh = Mesh2D::uniform_periodic(0.0, L, 0.0, L, N, N);
     let tau = 2.0 * PI / L;
     if curved {
@@ -48,9 +50,14 @@ fn case(curved: bool) -> Case {
     }
     let ops = DGOperators2D::new(ORDER);
     let geom = GeometricFactors2D::compute(&mesh, &ops);
-    // Deep channels with a few islands reaching above η = 0.3
     let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, |x, y| {
-        -15.0 + 17.0 * (3.0 * tau * x).cos() * (2.0 * tau * y).cos()
+        if shoreline {
+            // Shoals a few elements across, their tops above η = 0.3
+            -0.4 + (24.0 * tau * x).cos() * (20.0 * tau * y).cos()
+        } else {
+            // Deep channels with a few islands reaching above η = 0.3
+            -15.0 + 17.0 * (3.0 * tau * x).cos() * (2.0 * tau * y).cos()
+        }
     });
     let mut q = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
     for k in ElementIndex::iter(mesh.n_elements) {
@@ -79,21 +86,24 @@ fn bench_split_form(c: &mut Criterion) {
     let bc = Reflective2D::new();
     let mut group = c.benchmark_group("split_form_wet_dry_p2");
     group.sample_size(30);
-    for curved in [false, true] {
+    for (name, curved, shoreline) in [
+        ("affine", false, false),
+        ("curved", true, false),
+        ("shoreline", true, true),
+    ] {
         let Case {
             mesh,
             ops,
             geom,
             bathymetry,
             q,
-        } = case(curved);
+        } = case(curved, shoreline);
         let config = SWE2DRhsConfig::new(&equation, &bc)
             .with_coriolis(false)
             .with_formulation(SWEFormulation2D::WetDry)
             .with_bathymetry(&bathymetry)
             .with_dry_threshold(1e-3);
         let mut out = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
-        let name = if curved { "curved" } else { "affine" };
         group.throughput(Throughput::Elements((mesh.n_elements * ops.n_nodes) as u64));
         group.bench_function(BenchmarkId::new("serial", name), |b| {
             b.iter(|| {

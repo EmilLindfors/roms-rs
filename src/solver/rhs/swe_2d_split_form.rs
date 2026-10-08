@@ -101,10 +101,14 @@ use super::swe_2d::{SWE2DRhsConfig, SWEFormulation2D};
 #[path = "swe_2d_split_form_batch.rs"]
 mod batch;
 
-/// Elements per [`SplitFormSWE2D::volume_batch`]: with the `simd` feature
-/// the volume terms of fully wet elements are evaluated this many at a time,
-/// one element per SIMD lane.
+/// SIMD lanes (`simd` feature): volume terms and face fluxes are evaluated
+/// this many elements or edges at a time, one per lane.
 pub(super) const VOLUME_BATCH: usize = 8;
+
+/// Elements per [`SplitFormSWE2D::volume_chunk`]: sorted into the
+/// flux-differencing and the subcell kind before they are batched, so both
+/// kinds fill their lanes.
+pub(super) const ELEMENT_CHUNK: usize = 64;
 
 /// Limited slope of one variable at node `ξ` of a subcell spanning
 /// `[x_l, x_r]`, from the values at the neighbouring nodes `ξ_m < ξ < ξ_p`:
@@ -225,10 +229,14 @@ pub(super) struct SplitFormWorkspace {
     /// neighbour element on the GLL line through it, and its distance from
     /// the face in this element's reference coordinate (`None` at boundaries)
     outer: Vec<Option<(SWENodeState2D, f64)>>,
-    /// Volume terms (times J) of a batch of elements, lane `l` from
-    /// `l · n_nodes` ([`SplitFormSWE2D::volume_batch`])
+    /// Volume terms (times J) of a chunk of elements, element `j` of the
+    /// chunk from `j · n_nodes` ([`SplitFormSWE2D::volume_chunk`])
     #[cfg_attr(not(feature = "simd"), allow(dead_code))]
     batch: Vec<SWEState2D>,
+    /// Subcell interface mass fluxes of the chunk's subcell elements,
+    /// element `j` from `j · subcell_interfaces(n_1d)`
+    #[cfg_attr(not(feature = "simd"), allow(dead_code))]
+    batch_mass: Vec<f64>,
 }
 
 impl SplitFormWorkspace {
@@ -249,7 +257,8 @@ impl SplitFormWorkspace {
             interfaces: padded(n_1d + 1, (0.0, 0.0)),
             faces: padded(n_1d, Default::default()),
             outer: padded(4 * n_1d, None),
-            batch: padded(VOLUME_BATCH * n_nodes, SWEState2D::zero()),
+            batch: padded(ELEMENT_CHUNK * n_nodes, SWEState2D::zero()),
+            batch_mass: padded(ELEMENT_CHUNK * 2 * n_1d * n_1d.saturating_sub(1), 0.0),
         }
     }
 }
@@ -321,7 +330,7 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// Without the `simd` feature no volume term is batched: every element
     /// evaluates its own in [`Self::element_rhs`].
     #[cfg(not(feature = "simd"))]
-    pub(super) fn volume_batch(&self, _ks: &[usize], _ws: &mut SplitFormWorkspace) -> u8 {
+    pub(super) fn volume_chunk(&self, _ks: &[usize], _ws: &mut SplitFormWorkspace) -> u64 {
         0
     }
 
@@ -438,9 +447,10 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// ([`crate::solver::rhs::subcells`]), or NaN in all of them if the element
     /// takes the flux-differencing volume term.
     ///
-    /// `volume`: the lane of `ws.batch` holding this element's volume term,
-    /// if [`Self::volume_batch`] computed it (then only the surface terms are
-    /// evaluated here; the result is the same bit for bit).
+    /// `volume`: the slot of `ws.batch` holding this element's volume term
+    /// (and, for a subcell element, of `ws.batch_mass` holding its subcell
+    /// mass fluxes), if [`Self::volume_chunk`] computed it. Then only the
+    /// surface terms are evaluated here; the result is the same bit for bit.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn element_rhs(
         &self,
@@ -463,9 +473,9 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
             ws.nodes[i] = SWENodeState2D::new(&self.q.get_state(k, i), self.bed(k, i), h_min);
         }
         match volume {
-            Some(lane) => {
+            Some(slot) => {
                 let n = ops.n_nodes;
-                ws.rhs.copy_from_slice(&ws.batch[lane * n..(lane + 1) * n]);
+                ws.rhs.copy_from_slice(&ws.batch[slot * n..(slot + 1) * n]);
             }
             None => ws.rhs.fill(SWEState2D::zero()),
         }
@@ -477,11 +487,14 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         let subcells = self
             .subcells
             .is_some_and(|(depth, _)| ws.nodes.iter().any(|n| n.h < depth));
-        debug_assert!(!(subcells && volume.is_some()), "batched a subcell element");
-        if subcells {
-            self.outer_nodes(k, ws);
-        } else if let Some(mass) = subcell_mass.as_deref_mut() {
-            mass.fill(f64::NAN);
+        match (subcells, volume, subcell_mass.as_deref_mut()) {
+            (true, None, _) => self.outer_nodes(k, ws),
+            (true, Some(slot), Some(mass)) => {
+                let len = mass.len();
+                mass.copy_from_slice(&ws.batch_mass[slot * len..(slot + 1) * len]);
+            }
+            (false, _, Some(mass)) => mass.fill(f64::NAN),
+            _ => {}
         }
         // A parallelogram has a constant metric: take it from the dense
         // per-element geometry and skip the pair averages (the Cartesian
@@ -859,6 +872,19 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
 
     /// Fill [`SplitFormWorkspace::outer`] for element `k`.
     fn outer_nodes(&self, k: ElementIndex, ws: &mut SplitFormWorkspace) {
+        let n1 = self.ops.n_1d;
+        for face in 0..4 {
+            for fi in 0..n1 {
+                ws.outer[face * n1 + fi] = self.outer_node(k, face, fi);
+            }
+        }
+    }
+
+    /// The outer node of face node `fi` of `face` (see
+    /// [`SplitFormWorkspace::outer`]): the neighbour's first interior node on
+    /// the GLL line through it and its distance from the face in this
+    /// element's reference coordinate, or `None` at a boundary.
+    fn outer_node(&self, k: ElementIndex, face: usize, fi: usize) -> Option<(SWENodeState2D, f64)> {
         let ops = self.ops;
         let n1 = ops.n_1d;
         let h_min = self.config.equation.h_min.meters();
@@ -872,31 +898,26 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
                 self.geom.jacobian(e, node) / self.geom.surface_jacobian(e, f, fi)
             }
         };
-        for face in 0..4 {
-            let neighbor = self.mesh.neighbor(k, face);
-            for fi in 0..n1 {
-                ws.outer[face * n1 + fi] = neighbor.map(|nb| {
-                    let nb_k = ElementIndex::new(nb.element);
-                    let nb_node = ops.face_nodes[nb.face][n1 - 1 - fi];
-                    // One node into the neighbour, normal to its face
-                    let inner = match nb.face {
-                        0 => nb_node + n1,
-                        1 => nb_node - 1,
-                        2 => nb_node - n1,
-                        _ => nb_node + 1,
-                    };
-                    let own_node = ops.face_nodes[face][fi];
-                    let distance = (ops.nodes_1d[1] - ops.nodes_1d[0])
-                        * height(nb.element, nb.face, n1 - 1 - fi, nb_node)
-                        / height(k.as_usize(), face, fi, own_node);
-                    let state = self.q.get_state(nb_k, inner);
-                    (
-                        SWENodeState2D::new(&state, self.bed(nb_k, inner), h_min),
-                        distance,
-                    )
-                });
-            }
-        }
+        self.mesh.neighbor(k, face).map(|nb| {
+            let nb_k = ElementIndex::new(nb.element);
+            let nb_node = ops.face_nodes[nb.face][n1 - 1 - fi];
+            // One node into the neighbour, normal to its face
+            let inner = match nb.face {
+                0 => nb_node + n1,
+                1 => nb_node - 1,
+                2 => nb_node - n1,
+                _ => nb_node + 1,
+            };
+            let own_node = ops.face_nodes[face][fi];
+            let distance = (ops.nodes_1d[1] - ops.nodes_1d[0])
+                * height(nb.element, nb.face, n1 - 1 - fi, nb_node)
+                / height(k.as_usize(), face, fi, own_node);
+            let state = self.q.get_state(nb_k, inner);
+            (
+                SWENodeState2D::new(&state, self.bed(nb_k, inner), h_min),
+                distance,
+            )
+        })
     }
 
     /// Boundary state from the configured boundary condition.
@@ -1569,12 +1590,18 @@ mod tests {
     /// parallelograms, general quadrilaterals and a mesh of both (mixed
     /// batches), with and without bathymetry, with shoreline subcells in
     /// some lanes, and 35 elements (a short last batch). Also through the
-    /// subset RHS of local time stepping, whose batches are arbitrary lists.
+    /// subset RHS of local time stepping, whose batches are arbitrary lists,
+    /// and the face and subcell mass fluxes, serial and parallel.
     #[test]
     #[cfg(feature = "simd")]
     fn test_batched_kernels_are_bit_for_bit() {
         use super::batch::UNBATCHED;
-        use crate::solver::rhs::swe_2d::compute_rhs_swe_2d_subset_then;
+        #[cfg(feature = "parallel")]
+        use crate::solver::rhs::swe_2d::compute_rhs_swe_2d_parallel_mass_fluxes_into;
+        use crate::solver::rhs::swe_2d::{
+            compute_rhs_swe_2d_mass_fluxes_into, compute_rhs_swe_2d_subset_then, face_mass_len,
+            subcell_mass_len,
+        };
 
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
@@ -1638,6 +1665,53 @@ mod tests {
                     let reference =
                         unbatched(&|| compute_rhs_swe_2d(q, &mesh, &ops, &geom, &config, 0.0));
                     assert!(bits(&batched) == bits(&reference), "{case}");
+
+                    // The face and subcell mass fluxes (from the batch of the
+                    // subcell elements), serial and parallel
+                    let mass_fluxes = |parallel: bool| {
+                        let mut rhs = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                        let mut face = vec![0.0; face_mass_len(&mesh, &ops)];
+                        let mut subcell = vec![0.0; subcell_mass_len(&mesh, &ops)];
+                        if parallel {
+                            #[cfg(feature = "parallel")]
+                            compute_rhs_swe_2d_parallel_mass_fluxes_into(
+                                q,
+                                &mesh,
+                                &ops,
+                                &geom,
+                                &config,
+                                0.0,
+                                &mut rhs,
+                                &mut face,
+                                &mut subcell,
+                            );
+                        } else {
+                            compute_rhs_swe_2d_mass_fluxes_into(
+                                q,
+                                &mesh,
+                                &ops,
+                                &geom,
+                                &config,
+                                0.0,
+                                &mut rhs,
+                                &mut face,
+                                &mut subcell,
+                            );
+                        }
+                        let mut all = bits(&rhs);
+                        all.extend(face.iter().chain(&subcell).map(|x| x.to_bits()));
+                        all
+                    };
+                    UNBATCHED.with(|u| u.set(true));
+                    let reference_fluxes = mass_fluxes(false);
+                    UNBATCHED.with(|u| u.set(false));
+                    assert!(
+                        mass_fluxes(false) == reference_fluxes,
+                        "{case}, mass fluxes"
+                    );
+                    if cfg!(feature = "parallel") {
+                        assert!(mass_fluxes(true) == reference_fluxes, "{case}, parallel");
+                    }
 
                     // Subset RHS over a scrambled list of most elements
                     let elements: Vec<u32> = (0..mesh.n_elements as u32)

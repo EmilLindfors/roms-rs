@@ -407,6 +407,13 @@ All notable changes to this project should be documented in this file.
 
 ### Performance
 
+- **The shoreline subcells vectorised too: the Frøya coastline RHS is 1.7× faster, bit for bit (TODO P2.2).** The `WetDry` kernel's second-order subcell finite volumes now run 8 elements per vector as well:
+  - **What is batched:** the limited reconstruction, the dry-node rule for `η`, the subcell hydrostatic HLLs, the bed and metric balance terms, and boundary lines without an outer neighbour.
+  - **Why 64-element chunks:** with 8 consecutive elements per batch, a 30–40 % share of shoreline elements would fill few lanes. The drivers therefore sort chunks of 64 elements (`ELEMENT_CHUNK`) into flux-differencing and subcell elements, and each kind fills its lanes.
+  - **Bit for bit:** `test_batched_kernels_are_bit_for_bit` now also compares the face and subcell mass fluxes, serial and parallel.
+  - **Measured:**
+    - `benches/split_form_bench.rs` has a new `shoreline` case: general quadrilaterals over shoals, 33 % subcell elements, none dry. Serial 8.88 → 5.88 ms, parallel 1.34 → 1.06 ms. The other cases are unchanged within noise.
+    - Frøya coastline mesh (`profile=40`, CPUs 0–7, 38.5 % subcell elements): RHS 9.82 → 5.91 ms on 1 thread and 2.02 → 1.32 ms on 8, against the previous release of the batching. Against the scalar kernel it is 9.95 → 5.91 ms.
 - **The split-form 2D kernel vectorised across elements with fearless_simd, bit for bit (TODO P2.2).** The `simd` feature now pulls `fearless_simd` 1.1 instead of `pulp` 0.18. fearless_simd runs at the CPU's best level (AVX-512 here, else AVX2, SSE4.2 or NEON, detected at run time).
   - **Lanes are elements.** A P1–P4 element's GLL lines are 2–5 nodes long, too short for an 8-wide vector, but every element runs the same arithmetic. `solver/rhs/swe_2d_split_form_batch.rs` therefore evaluates two things 8 at a time, one per lane:
     - the flux-differencing volume term of 8 consecutive elements (`line_volume`);
@@ -422,7 +429,7 @@ All notable changes to this project should be documented in this file.
 
   - **Built without `target-cpu=native`** (as `viz/` builds the crate), the gain is the same: 5.78 → 3.81 ms. No closure touches a vector type between `dispatch!` and the vector operations. An earlier version with closures in the gathers ran 6 % slower than scalar code in that build.
   - **Frøya** (`froya_real_data profile=40`, CPUs 0–7): the 500 m grid RHS 4.62 → 3.43 ms on 1 thread (−26 %), 1.13 → 0.84 ms on 8 threads (−25 %).
-  - **On a shoreline-heavy mesh it helps less.** On the coastline mesh the RHS goes 9.95 → 9.71 ms on 1 thread and 2.35 → 2.01 ms on 8 threads. There 38.5 % of the elements take the subcells, which are not batched yet (TODO P2.2).
+  - **On a shoreline-heavy mesh it helps less.** On the coastline mesh the RHS goes 9.95 → 9.71 ms on 1 thread and 2.35 → 2.01 ms on 8 threads. There 38.5 % of the elements take the subcells, which this change did not batch (they are batched since, see above).
 - **The wave model's node passes, 1.4× faster at Frøya, bit for bit (TODO F.4 cost).** Measured on the 1 km P1 wave grid (25 × 36 components, 24 threads, `froya_real_data waves=20 wave_mesh=60,45 implicit=1`): the step 198 → 141 ms, 101 → 72 s of wall time per model hour. The total action after 22 steps is the same to all 17 digits.
   - **The DIA, 3.5× (`Quadruplets::source`).** At Frøya it was 26 % of the step, not the ≈ 10 % of the fetch gate: 116 ns per component, every gather and scatter bounds-checking, wrapping the direction with an integer remainder and continuing into the tail on the spot. The spectrum, extended by the rows the stencil reaches, and the landings' direction bins are now tabulated once per node in per-thread scratch: 43.5 → 12.5 ms. Gate `the_tables_give_the_direct_transfer` keeps the old transfer as the reference, bit for bit.
   - **Implicit refraction, 1.8×.** Its periodic neighbours took ≈ 8 integer remainders per bin; branches now (28.4 → 18.6 ms per half-step). The Sherman–Morrison solve's two Thomas sweeps share one elimination (`thomas_pair`, → 15.8 ms). `c_θ` and `c_σ` are split into a frequency's factor and terms of the node and direction, computed once per node (`NodeRates`).
