@@ -75,7 +75,7 @@ src/
 │   │                 # 3D RHS assembly (momentum / transport parts)
 │   ├── limiters/     # Zhang-Shu positivity, Kuzmin/TVB slope limiters
 │   ├── algorithms/   # Wetting/drying, tridiagonal (Thomas) solve
-│   ├── simd/         # pulp kernels + batched faer paths (parallel feature)
+│   ├── simd/         # fearless_simd kernels of the Standard kernel + batched faer paths
 │   ├── diagnostics/  # Runtime diagnostics (2D conservation); 3D potential
 │   │                 # and reference potential energy (PotentialEnergy3D:
 │   │                 # spurious mixing, Ilıcak et al. 2012)
