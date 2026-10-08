@@ -488,6 +488,27 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Wave substeps keep refraction and breaking on the short step (`WaveModel2D::with_substeps`; TODO F.4 Cost).** The long wave steps of the previous entry ran implicit refraction, frequency shifting and every source once per outer step. Compared node by node at Frøya (H_s after 6 h against the 7 s step; WAM's sources), that lost accuracy where those terms are fast:
+  - **The focusing on the steep coast.** The backward Euler half-steps of 28 s smeared it: the largest H_s was 3.81 m against 3.96 m, and H_s was 1.7 % RMS off in water deeper than 10 m.
+  - **The surf zone.** Breaking once per outer step left up to a minute of incoming energy undissipated: +45 % (60 % RMS) in water under 1 m deep, 10 % RMS at 1–3 m.
+  - **Now** each propagation substep has its own halves of implicit refraction and shifting and is followed by depth-induced breaking over it. The other sources (wind, whitecapping, the DIA, friction) still run once per outer step. One step (`substeps = 1`) is unchanged bit for bit.
+  - **Frøya** (`froya_real_data mesh=data/froya_coast.msh waves=5 wave_mesh=60,45 implicit=1 wave_sources=wam wave_hours=6`; H_s RMS against the 7 s step by depth: under 1 m, 1–3 m, 3–10 m, over 10 m):
+
+    | Step | s per model hour | < 1 m | 1–3 m | 3–10 m | > 10 m | largest H_s |
+    |---|---|---|---|---|---|---|
+    | 3.5 s (convergence check) | 119 | 4.4 % | 2.2 % | 0.5 % | 0.16 % | 3.96 m |
+    | 7 s (reference) | 60 | | | | | 3.96 m |
+    | 14 s, one step (`wave_cfl=1.0`) | 30 | 7.8 % | 5.2 % | 1.1 % | 0.33 % | 3.92 m |
+    | 28 s, 2 substeps | 26 | 8.2 % | 3.2 % | 0.8 % | 0.34 % | 3.95 m |
+    | 56 s, 4 substeps | 24 | 16 % | 5.8 % | 1.1 % | 0.40 % | 3.95 m |
+    | 56 s, 4 substeps, before | 21 | 61 % | 10 % | 3.9 % | 1.7 % | 3.81 m |
+
+    With the slower node passes the long step saves less than measured before (24 s per model hour, not 19), and a 14–28 s step is as accurate below 1 m as the 7 s run is against a 3.5 s one.
+  - **At the Kattholmen farm** (site 14042 near Mausund; the 12 wave nodes within 885 m, 2–29 m deep, H_s 0.6–1.0 m), the 56 s step is now 0.37 % RMS off the 7 s run in H_s, 0.46 % in T_m01 and 0.23° in direction. That is as close as the 28 s step (0.36 %) and the 3.5 s check (0.32 %). Before, it was 1.5 %, 2.1 % and 1.2°. SWAN's sources at 7 s differ from WAM's by 2.6 %.
+  - **The rest under 1 m** at 56 s (+8 % bias) comes from the sources still on the outer step: all sources on a 14 s step give −5 %. The model is for farm sites, so this band matters only as far as it feeds the circulation.
+  - Gate: `substeps_keep_the_surf_zone_and_the_refraction_of_a_single_step`. A spread swell refracts and breaks on a shelf from 10 to 0.5 m; at 8 substeps the steady H_s under 3 m stays within 0.53 % of single steps, and the mean direction within 0.001°. The old scheme fails it with 17 % and 0.26°.
+  - `froya_real_data`'s wave cost mode (`waves=N`) takes `wave_hours=` (run on to a model time), writes `<output>/wave_nodes.txt` (each node's position, depth, H_s, T_m01, direction and spread), and compares it with an earlier run's (`wave_reference=`).
+
 - **Nesting started with a step at the open boundary, and its bed blend made cliffs at shores (`boundary::OceanModelState`; TODO P1.5).** The reference level (NorKyst's datum shift, +0.27 m at Mausund) was added after the ramp, so it stood at the boundary from t = 0 and flooded in as a bore; it ramps with ζ now. `blend_bathymetry` blended every wet node to the parent's smooth bed, deepening a 0.4 m shore node to 32 m (3.9 m/s within three minutes); it takes a `shore_depth` and keeps every element with a node shallower than it (`froya_real_data`: 2 m). Gates: `the_reference_level_ramps_with_the_parent`, `blending_leaves_the_shores_alone`.
 
 - **The viewer's memory budget counts the bytes held (`viz/src/playback.rs`; TODO F.3).** It counted snapshots of the newest one's size, so with particles (snapshots growing as they are released) it kept more than `--memory` early on and dropped old ones late.

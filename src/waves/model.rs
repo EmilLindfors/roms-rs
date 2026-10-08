@@ -46,8 +46,10 @@
 //! The propagation's own time error is small next to the sources' (measured on
 //! a young wind sea: 8e-5 of H_s after an hour at the geographic step, against
 //! 1e-2 with SWAN's sources). [`WaveModel2D::with_substeps`] runs the sources
-//! (and the implicit refraction and shifting) once per several propagation
-//! steps, between their halves. With SWAN's frozen rates and per-step limiter
+//! once per several propagation steps, between their halves; the implicit
+//! refraction and shifting and depth-induced breaking, which are fast on steep
+//! coasts and in the surf zone, stay with each propagation step. With SWAN's
+//! frozen rates and per-step limiter
 //! that costs accuracy, and frozen rates without the limiter blow up at long
 //! steps; WAM's integration ([`super::SourceIntegration::Implicit`] with
 //! [`super::GrowthLimiter::Rate`]) keeps the growth curves at an outer step of
@@ -79,6 +81,7 @@
 //! one but for the ends' outflow; and the same donor-limited MUSCL deferred
 //! correction on the faces between the bins.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use crate::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
@@ -253,7 +256,8 @@ pub struct WaveModel2D {
     implicit_frequency_shift: bool,
     /// The Runge–Kutta method of the propagation
     time_integrator: StandardIntegrator,
-    /// Propagation steps per step (the node passes run once per step)
+    /// Propagation steps per step, each with its implicit refraction,
+    /// shifting and breaking; the other sources run once per step
     substeps: usize,
 }
 
@@ -315,10 +319,20 @@ impl WaveModel2D {
         self
     }
 
-    /// Run the propagation in `substeps` equal steps within each step, and
-    /// the node passes (implicit refraction and frequency shifting, the
-    /// sources) once per step, around them (default 1). [`Self::compute_dt`]
-    /// gives `substeps` times the propagation's step.
+    /// Run the propagation in `substeps` equal steps within each step, each
+    /// with its implicit refraction and frequency shifting around it and
+    /// depth-induced breaking after it, and the other sources once per step
+    /// (default 1). [`Self::compute_dt`] gives `substeps` times the
+    /// propagation's step.
+    ///
+    /// Refraction and breaking stay on the short step because the long one
+    /// costs accuracy where they are fast (measured at Frøya, a 56 s step of
+    /// 4 substeps against a 7 s step, H_s after 6 h): with refraction once
+    /// per step, the backward Euler half-steps of 28 s smeared the focusing
+    /// on the steep coast (the largest H_s 3.81 m against 3.96 m, 1.7 % RMS
+    /// in water over 10 m deep); with breaking once per step, the surf zone
+    /// kept up to a minute of incoming energy undissipated (+45 % in water
+    /// under 1 m).
     pub fn with_substeps(mut self, substeps: usize) -> Self {
         assert!(substeps >= 1, "at least one propagation step per step");
         self.substeps = substeps;
@@ -729,41 +743,35 @@ impl WaveModel2D {
     /// take half the step before the propagation and half after (Strang).
     ///
     /// In one propagation step the sources follow it. With
-    /// [`Self::with_substeps`] (`m ≥ 2`) they sit between the first `⌊m/2⌋`
+    /// [`Self::with_substeps`] (`m ≥ 2`) each propagation step has its own
+    /// halves of implicit refraction and shifting and is followed by
+    /// breaking over it, and the other sources sit between the first `⌊m/2⌋`
     /// propagation steps and the rest, so for even `m` the step is symmetric
     /// (Strang), and its splitting second order in the step.
     pub fn step(&self, n: &mut WaveSolution, t: f64, dt: f64, ws: &mut WaveWorkspace) {
-        // Strang: half of the implicit spectral advection on each side of the
-        // stages
-        let half = |on: bool| on.then_some(0.5 * dt);
+        let substeps = self.substeps;
+        let h = dt / substeps as f64;
+        // Strang: half of the implicit spectral advection on each side of
+        // each propagation step's stages
+        let half = |on: bool| on.then_some(0.5 * h);
         let (refraction, shift) = (
             half(self.implicit_refraction),
             half(self.implicit_frequency_shift),
         );
         let sources = self.sources.any().then_some(dt);
-        let substeps = self.substeps;
-        // The sources between the halves of the propagation, or after it
-        let (middle, after) = match substeps {
-            1 => (None, sources),
-            _ => (sources, None),
-        };
+        // With substeps breaking follows every propagation step, and the
+        // other sources the first `⌊m/2⌋`; in one step all follow it
+        let breaking = (substeps > 1 && self.sources.breaking.is_some()).then_some(h);
+        let with_sources = (substeps / 2).max(1) - 1;
         // The whole step node-major: one transpose in, one out
         let (np, nc) = (self.n_points(), self.grid.n_components());
         to_node_major(&n.data, np, nc, &mut ws.node.data);
-        if refraction.is_some() || shift.is_some() {
-            self.node_pass_node_major(
-                &mut ws.node.data,
-                NodePass::before_stages(refraction, shift),
-            );
-        }
-        let h = dt / substeps as f64;
         for m in 0..substeps {
-            if let (Some(dt), true) = (middle, m == substeps / 2) {
-                let pass = NodePass {
-                    sources: Some(dt),
-                    ..NodePass::default()
-                };
-                self.node_pass_node_major(&mut ws.node.data, pass);
+            if refraction.is_some() || shift.is_some() {
+                self.node_pass_node_major(
+                    &mut ws.node.data,
+                    NodePass::before_stages(refraction, shift),
+                );
             }
             self.time_integrator.step_with_workspace(
                 &mut ws.node,
@@ -773,15 +781,17 @@ impl WaveModel2D {
                 |s| self.limit_positivity_node_major(&mut s.data),
                 &mut ws.stages,
             );
-        }
-        if refraction.is_some() || shift.is_some() || after.is_some() {
-            let pass = NodePass {
-                refraction,
-                shift,
-                sources: after,
-                shift_first: false,
-            };
-            self.node_pass_node_major(&mut ws.node.data, pass);
+            let sources = sources.filter(|_| m == with_sources);
+            if refraction.is_some() || shift.is_some() || sources.is_some() || breaking.is_some() {
+                let pass = NodePass {
+                    refraction,
+                    shift,
+                    sources,
+                    breaking,
+                    shift_first: false,
+                };
+                self.node_pass_node_major(&mut ws.node.data, pass);
+            }
         }
         from_node_major(&ws.node.data, np, nc, &mut n.data);
     }
@@ -835,8 +845,22 @@ impl WaveModel2D {
             refraction,
             shift,
             sources,
+            breaking,
             shift_first,
         } = pass;
+        // With breaking over an interval of its own, the other sources
+        // without it
+        let terms = match breaking {
+            Some(_) => Cow::Owned(self.sources.clone().with_breaking(None)),
+            None => Cow::Borrowed(&self.sources),
+        };
+        let sources = sources.filter(|_| terms.any());
+        let breaking = breaking.map(|h| {
+            let terms = SourceTerms::none(self.sources.g)
+                .with_breaking(self.sources.breaking)
+                .with_integration(self.sources.integration);
+            (terms, h)
+        });
         let (np, nc, nf) = (
             self.n_points(),
             self.grid.n_components(),
@@ -845,7 +869,7 @@ impl WaveModel2D {
         let nd = self.grid.n_dir();
         // Nodes per chunk: the DIA's lanes take `LANES` at once
         #[cfg(feature = "simd")]
-        let tile = if sources.is_some() && self.sources.quadruplets.is_some() && vector_kernels() {
+        let tile = if sources.is_some() && terms.quadruplets.is_some() && vector_kernels() {
             LANES
         } else {
             1
@@ -919,8 +943,9 @@ impl WaveModel2D {
                         shift_now(spectrum);
                     }
                 }
-                // The sources at all the chunk's nodes (at once in the DIA's lanes)
-                if let Some(dt) = sources {
+                // The sources at all the chunk's nodes (at once in the DIA's
+                // lanes), then breaking over its own interval
+                if sources.is_some() || breaking.is_some() {
                     let width = nodes.len() / nc;
                     for q in 0..width {
                         for (i, k) in k[q * nf..(q + 1) * nf].iter_mut().enumerate() {
@@ -931,9 +956,14 @@ impl WaveModel2D {
                     depths.extend((first..first + width).map(|p| self.depth[p]));
                     winds.clear();
                     winds.extend((first..first + width).map(|p| self.wind_at(p)));
-                    let at = Nodes { k, depths, winds };
-                    self.sources
-                        .integrate_at(&self.grid, nodes, at, dt, scratch, tile > 1);
+                    if let Some(dt) = sources {
+                        let at = Nodes { k, depths, winds };
+                        terms.integrate_at(&self.grid, nodes, at, dt, scratch, tile > 1);
+                    }
+                    if let Some((terms, h)) = &breaking {
+                        let at = Nodes { k, depths, winds };
+                        terms.integrate_at(&self.grid, nodes, at, *h, scratch, false);
+                    }
                 }
             },
         );
@@ -1212,6 +1242,9 @@ struct NodePass {
     refraction: Option<f64>,
     shift: Option<f64>,
     sources: Option<f64>,
+    /// Depth-induced breaking over this interval, after the other sources
+    /// (which then leave it out), instead of with them
+    breaking: Option<f64>,
     shift_first: bool,
 }
 
@@ -1223,6 +1256,7 @@ impl NodePass {
             refraction,
             shift,
             sources: None,
+            breaking: None,
             shift_first: true,
         }
     }
