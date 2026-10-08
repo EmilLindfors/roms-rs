@@ -100,7 +100,8 @@
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
-//!     [wave_sources=swan|wam] [wave_substeps=1] [wave_cfl=0.5] \
+//!     [wave_sources=swan|wam] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
+//!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [levels=0] [tide3d=0] [restart_hours=0] [resume=<file>]
 //! ```
@@ -112,7 +113,11 @@
 //! model hour. With
 //! `wave_mesh=NX,NY[,ORDER]` the waves run on an NX × NY grid of their own (P1
 //! by default) over the same bed, and the coupling to the run's mesh
-//! (`WaveCoupling2D`) is built and each exchange timed.
+//! (`WaveCoupling2D`) is built and each exchange timed. `wave_hours=H` runs on
+//! after the timed steps to H model hours; the sea at every node is then
+//! written to `<output>/wave_nodes.txt`, and `wave_reference=<file>` compares
+//! it node by node with an earlier run's (H_s by depth, T_m01, the mean
+//! direction): how a step or a scheme changes the sea.
 //!
 //! `wave_coupling=MINUTES` runs the waves with the 2D tide, two-way coupled
 //! every MINUTES (`CoupledWaves2D`, `Simulation::run_with_exchange`; a
@@ -135,9 +140,9 @@
 //! DIA's diagonal, with Hersbach & Janssen's growth limiter proportional to
 //! the step (`SourceIntegration::Implicit`, `GrowthLimiter::Rate`), in place
 //! of SWAN's frozen rates and per-step limiter. Its sources tolerate long
-//! steps, so `wave_substeps=N` runs them (and implicit refraction and
-//! shifting) once per N propagation steps, and `wave_cfl=` sets the
-//! propagation's CFL number (0.5).
+//! steps, so `wave_substeps=N` runs them once per N propagation steps (each
+//! with its own implicit refraction, shifting and breaking), and `wave_cfl=`
+//! sets the propagation's CFL number (0.5).
 //!
 //! `wave_spectra=<file>` takes the sea from a parent wave model instead:
 //! MET Norway's MyWave WAM 800 m spectra at its points
@@ -500,6 +505,12 @@ struct Options {
     wave_substeps: usize,
     /// The waves' propagation CFL number (`wave_cfl=`)
     wave_cfl: f64,
+    /// With `waves=N`, run on after the N timed steps to this many model
+    /// hours, the last step landing on it (`wave_hours=`; 0: off)
+    wave_hours: f64,
+    /// With `waves=N`, compare the sea at every node with an earlier run's
+    /// `wave_nodes.txt` (`wave_reference=<file>`)
+    wave_reference: Option<PathBuf>,
     /// The waves on a grid of their own (`wave_mesh=NX,NY[,ORDER]`, order 1
     /// by default) instead of the run's mesh, coupled to it by
     /// `WaveCoupling2D`
@@ -657,6 +668,8 @@ impl Options {
             },
             wave_substeps: get("wave_substeps", 1.0)? as usize,
             wave_cfl: get("wave_cfl", 0.5)?,
+            wave_hours: get("wave_hours", 0.0)?,
+            wave_reference: args.get("wave_reference").map(PathBuf::from),
             wave_coupling: get("wave_coupling", 0.0)?,
             wave_spectra: args.get("wave_spectra").map(PathBuf::from),
             wave_neighbours: get("wave_neighbours", 2.0)? as usize,
@@ -3584,6 +3597,21 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         "  {per_hour:.0} s of wall time per model hour ({:.2}× real time)",
         3600.0 / per_hour
     );
+    // On to `wave_hours`, the last step landing on it
+    let end = 3600.0 * opts.wave_hours;
+    if end > t {
+        let start = Instant::now();
+        while t < end {
+            let h = dt.min(end - t);
+            model.step(&mut n, t, h, &mut ws);
+            t = if end - t <= dt { end } else { t + dt };
+        }
+        println!(
+            "  on to {:.2} h in {:.0} s of wall time",
+            opts.wave_hours,
+            start.elapsed().as_secs_f64()
+        );
+    }
     let params = model.parameters(&n);
     let hs_max = params.iter().map(|p| p.hs).fold(0.0, f64::max);
     println!(
@@ -3591,6 +3619,18 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         t,
         model.total_action(&n)
     );
+    let output_dir = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| Path::new("output").join(circulation.name));
+    if let Err(e) = write_wave_nodes(domain, &model, &params, t, &output_dir) {
+        eprintln!("  could not write the waves at the nodes: {e}");
+    }
+    if let Some(path) = &opts.wave_reference
+        && let Err(e) = compare_wave_nodes(domain, &params, path)
+    {
+        eprintln!("  could not compare with {}: {e}", path.display());
+    }
     if Arc::ptr_eq(&domain.mesh, &circulation.mesh) {
         return;
     }
@@ -3670,6 +3710,200 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         1e3 * stokes,
         1e3 * stokes_own
     );
+}
+
+/// Each wave node's position (m), depth (m) and sea at time `t` (s), to
+/// `<output_dir>/wave_nodes.txt`: the reference for a later run's
+/// `wave_reference=`.
+fn write_wave_nodes(
+    domain: &Domain,
+    model: &WaveModel2D,
+    params: &[dg_rs::waves::WaveParameters],
+    t: f64,
+    output_dir: &Path,
+) -> std::io::Result<()> {
+    use std::fmt::Write as _;
+    fs::create_dir_all(output_dir)?;
+    let path = output_dir.join("wave_nodes.txt");
+    let mut text = format!(
+        "# The waves at every node after {t:.1} s\n# x (m), y (m), depth (m), H_s (m), T_m01 (s), \
+         mean direction (deg, travelling to, counter-clockwise from east), spread (deg)\n"
+    );
+    for (p, (xy, w)) in wave_node_positions(domain).zip(params).enumerate() {
+        let _ = writeln!(
+            text,
+            "{:.3} {:.3} {:.4} {:.6} {:.5} {:.4} {:.4}",
+            xy[0],
+            xy[1],
+            model.depth()[p],
+            w.hs,
+            w.tm01,
+            w.direction.to_degrees(),
+            w.spread.to_degrees()
+        );
+    }
+    fs::write(&path, text)?;
+    println!("  the waves at the nodes → {}", path.display());
+    Ok(())
+}
+
+/// The wave nodes' positions (m), in the model's node order.
+fn wave_node_positions(domain: &Domain) -> impl Iterator<Item = [f64; 2]> + '_ {
+    let (mesh, ops) = (&domain.mesh, &domain.ops);
+    (0..mesh.n_elements).flat_map(move |k| {
+        (0..ops.n_nodes).map(move |i| {
+            mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
+        })
+    })
+}
+
+/// This run's sea against an earlier run's `wave_nodes.txt` on the same
+/// nodes (`wave_reference=`): H_s node by node (bias, RMS, the share of
+/// nodes off by more than 2, 5 and 10 %, the largest difference and where,
+/// by depth), T_m01 and the mean direction.
+fn compare_wave_nodes(
+    domain: &Domain,
+    params: &[dg_rs::waves::WaveParameters],
+    path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // x, y, depth, H_s, T_m01, direction (deg)
+    let reference: Vec<[f64; 6]> = fs::read_to_string(path)?
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .map(|line| {
+            let v: Vec<f64> = line
+                .split_whitespace()
+                .map(str::parse)
+                .collect::<Result<_, _>>()?;
+            Ok::<_, std::num::ParseFloatError>([v[0], v[1], v[2], v[3], v[4], v[5]])
+        })
+        .collect::<Result<_, _>>()?;
+    if reference.len() != params.len() {
+        return Err(format!("{} nodes there, {} here", reference.len(), params.len()).into());
+    }
+    for (xy, r) in wave_node_positions(domain).zip(&reference) {
+        if (xy[0] - r[0]).abs() > 0.01 || (xy[1] - r[1]).abs() > 0.01 {
+            return Err(format!("node at ({:.0}, {:.0}) m differs", r[0], r[1]).into());
+        }
+    }
+    // The nodes with a sea worth comparing
+    const HS_MIN: f64 = 0.1;
+    let nodes: Vec<usize> = (0..params.len())
+        .filter(|&p| reference[p][3] >= HS_MIN)
+        .collect();
+    let max_at = |hs: &dyn Fn(usize) -> f64| {
+        (0..params.len())
+            .max_by(|&a, &b| hs(a).total_cmp(&hs(b)))
+            .unwrap()
+    };
+    let (here, there) = (max_at(&|p| params[p].hs), max_at(&|p| reference[p][3]));
+    println!(
+        "\nAgainst {} ({} of {} nodes with H_s ≥ {HS_MIN} m there):",
+        path.display(),
+        nodes.len(),
+        params.len()
+    );
+    for (name, p) in [("here", here), ("there", there)] {
+        println!(
+            "  largest H_s {name}: {:.3} m here, {:.3} m there, at ({:.1}, {:.1}) km, {:.1} m deep",
+            params[p].hs,
+            reference[p][3],
+            reference[p][0] / 1e3,
+            reference[p][1] / 1e3,
+            reference[p][2]
+        );
+    }
+    let summary = |label: &str, nodes: &[usize]| {
+        if nodes.is_empty() {
+            return;
+        }
+        let n = nodes.len() as f64;
+        let diff = |p: usize| params[p].hs - reference[p][3];
+        let relative = |p: usize| diff(p) / reference[p][3];
+        let bias = nodes.iter().map(|&p| diff(p)).sum::<f64>() / n;
+        let rms = (nodes.iter().map(|&p| diff(p).powi(2)).sum::<f64>() / n).sqrt();
+        let rms_relative = (nodes.iter().map(|&p| relative(p).powi(2)).sum::<f64>() / n).sqrt();
+        let share = |bound: f64| {
+            100.0 * nodes.iter().filter(|&&p| relative(p).abs() > bound).count() as f64 / n
+        };
+        println!(
+            "  {label:>12} {:>6} nodes: ΔH_s bias {bias:+.4} m, RMS {rms:.4} m ({:.2} %), off by \
+             > 2 / 5 / 10 %: {:.2} / {:.2} / {:.2} % of the nodes",
+            nodes.len(),
+            100.0 * rms_relative,
+            share(0.02),
+            share(0.05),
+            share(0.10)
+        );
+    };
+    summary("all", &nodes);
+    for (low, high) in [
+        (0.0, 10.0),
+        (10.0, 30.0),
+        (30.0, 100.0),
+        (100.0, f64::INFINITY),
+    ] {
+        let band: Vec<usize> = nodes
+            .iter()
+            .copied()
+            .filter(|&p| (low..high).contains(&reference[p][2]))
+            .collect();
+        summary(&format!("{low:.0}–{high:.0} m"), &band);
+    }
+    let worst = |key: &dyn Fn(usize) -> f64| {
+        nodes
+            .iter()
+            .copied()
+            .max_by(|&a, &b| key(a).total_cmp(&key(b)))
+    };
+    let largest = [
+        ("in m", worst(&|p| (params[p].hs - reference[p][3]).abs())),
+        (
+            "relative",
+            worst(&|p| ((params[p].hs - reference[p][3]) / reference[p][3]).abs()),
+        ),
+    ];
+    for (name, p) in largest {
+        let Some(p) = p else { continue };
+        println!(
+            "  largest difference {name}: {:.3} m here against {:.3} m there ({:+.1} %), at \
+             ({:.1}, {:.1}) km, {:.1} m deep",
+            params[p].hs,
+            reference[p][3],
+            100.0 * (params[p].hs / reference[p][3] - 1.0),
+            reference[p][0] / 1e3,
+            reference[p][1] / 1e3,
+            reference[p][2]
+        );
+    }
+    // Periods and directions where the sea is more than a ripple
+    let seas: Vec<usize> = nodes
+        .iter()
+        .copied()
+        .filter(|&p| reference[p][3] >= 0.5)
+        .collect();
+    if !seas.is_empty() {
+        let n = seas.len() as f64;
+        let period = (seas
+            .iter()
+            .map(|&p| (params[p].tm01 / reference[p][4] - 1.0).powi(2))
+            .sum::<f64>()
+            / n)
+            .sqrt();
+        let turn = |p: usize| {
+            let d = params[p].direction.to_degrees() - reference[p][5];
+            (d + 180.0).rem_euclid(360.0) - 180.0
+        };
+        let direction = (seas.iter().map(|&p| turn(p).powi(2)).sum::<f64>() / n).sqrt();
+        let largest_turn = seas.iter().map(|&p| turn(p).abs()).fold(0.0, f64::max);
+        println!(
+            "  where H_s ≥ 0.5 m ({} nodes): T_m01 RMS {:.2} %, mean direction RMS {direction:.2}° \
+             (largest {largest_turn:.1}°)",
+            seas.len(),
+            100.0 * period
+        );
+    }
+    Ok(())
 }
 
 /// The cost of the 3D model on this domain (`levels=N`, TODO P1.3): the
