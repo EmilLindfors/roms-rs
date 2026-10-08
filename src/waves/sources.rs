@@ -40,7 +40,13 @@
 //! Ris's (1997) limiter, as SWAN's, caps the growth of `N` over a step at a
 //! fraction γ = 0.1 of the Phillips level, `ΔN ≤ γ α_PM/(2σk³c_g)` (`α_PM` =
 //! 0.0081); losses are not limited (they are stable, and the surf zone needs them
-//! whole).
+//! whole). A cap per step makes the growth depend on the step, so
+//! [`GrowthLimiter::Rate`] caps it per unit time instead, as WAM since cycle 4
+//! (Hersbach & Janssen 1999; ECMWF IFS Part VII §5.2):
+//! `ΔF ≤ C g ũ* f⁻⁴ f_c Δt` in `F(f, θ)`, `C = 5·10⁻⁷` (ecWAM's), `f_c` the mean frequency
+//! `σ̃/2π`, `ũ* = max(u*, g f*_PM/f_c)` with `f*_PM = 5.6·10⁻³` (without wind
+//! the floor of a fully developed sea at `f_c`). It suits
+//! [`SourceIntegration::Implicit`], whose steps are long.
 
 use std::f64::consts::{PI, TAU};
 
@@ -59,6 +65,28 @@ pub const DEFAULT_TAIL_POWER: f64 = 4.0;
 
 /// SWAN's fraction γ of the Phillips level in Ris's limiter.
 pub const DEFAULT_LIMITER: f64 = 0.1;
+
+/// The coefficient `C` of [`GrowthLimiter::Rate`]: ecWAM's present `COEF4`
+/// (Hersbach & Janssen 1999 and ECMWF's IFS Cy33r1 documentation have
+/// 3·10⁻⁷). With the Komen terms it keeps the fetch-limited growth within
+/// 8 % of Ris's limiter's (`examples/wave_growth.rs`), 3·10⁻⁷ within 22 %.
+pub const DEFAULT_RATE_LIMITER: f64 = 5.0e-7;
+
+/// The dimensionless Pierson–Moskowitz peak frequency `f_PM u*/g` of the floor
+/// of `ũ*` in [`GrowthLimiter::Rate`].
+const PM_PEAK: f64 = 5.6e-3;
+
+/// How the sources' growth of the action density over a step is limited
+/// (losses never are).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum GrowthLimiter {
+    /// Ris's (SWAN's): at most a fraction γ of the Phillips level per step,
+    /// `ΔN ≤ γ α_PM/(2σk³c_g)`, whatever the step
+    PerStep(f64),
+    /// Hersbach & Janssen's (WAM's): at most `C g ũ* f⁻⁴ f_c Δt` of `F(f, θ)`,
+    /// proportional to the step (see the module docs)
+    Rate(f64),
+}
 
 /// Phillips' constant α_PM of the equilibrium range (Pierson & Moskowitz 1964).
 const PHILLIPS: f64 = 0.0081;
@@ -103,9 +131,69 @@ pub struct SourceTerms {
     pub quadruplets: Option<Quadruplets>,
     /// Power `p` of the diagnostic `σ^(−p)` tail, or no tail
     pub tail: Option<f64>,
-    /// Ris's limiter: the largest growth of `N` over a step, as a fraction γ of
-    /// the Phillips level `α_PM/(2σk³c_g)`, or none
-    pub limiter: Option<f64>,
+    /// The limit on the growth of `N` over a step, or none
+    pub limiter: Option<GrowthLimiter>,
+    /// How [`Self::integrate`] advances the action over a step
+    pub integration: SourceIntegration,
+}
+
+/// How [`SourceTerms::integrate`] advances the action over a step: with the
+/// exponential update `N ← N e^{BΔt} + (A/σ)(e^{BΔt} − 1)/B` (exact for
+/// constant `A`, `B`), with the rates `A`, `B` of
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SourceIntegration {
+    /// the state at the start of the step: first order in the step, since
+    /// the rates depend on the spectrum
+    #[default]
+    FrozenRates,
+    /// the state half a step on, predicted with the rates of the start (the
+    /// exponential midpoint rule): second order, for twice the rates' cost
+    Midpoint,
+    /// the start, with the DIA implicit in each component's own energy: its
+    /// transfer linearised about the start by its diagonal derivative `Λ`
+    /// ([`Quadruplets::source_and_diagonal`]), `Λ` joining the rate `B`
+    /// where it is negative (WAM's scheme, ECMWF IFS Part VII §5.2,
+    /// Hersbach & Janssen 1999, with the exponential update in place of
+    /// implicit Euler). The high-frequency transfer, which the explicit
+    /// gains overshoot at long steps, relaxes to its equilibrium instead.
+    Implicit,
+}
+
+/// The nodes of [`SourceTerms::integrate_at`]: node `l` has the
+/// wavenumbers `k[l n_σ..(l + 1) n_σ]`, the depth `depths[l]` and the wind
+/// `winds[l]`.
+#[derive(Clone, Copy)]
+pub(crate) struct Nodes<'a> {
+    pub k: &'a [f64],
+    pub depths: &'a [f64],
+    pub winds: &'a [Wind],
+}
+
+impl Nodes<'_> {
+    fn node(&self, l: usize, n_freq: usize) -> (&[f64], f64, Wind) {
+        (
+            &self.k[l * n_freq..(l + 1) * n_freq],
+            self.depths[l],
+            self.winds[l],
+        )
+    }
+}
+
+/// Whether [`SourceTerms::rates_at`] runs the DIA at its nodes at once, with
+/// the storage of its interleaved spectra and transfers.
+enum Lanes<'a> {
+    None,
+    /// The interleaved spectra, transfers and diagonals
+    #[cfg(feature = "simd")]
+    Dia(&'a mut Vec<f64>, &'a mut Vec<f64>, &'a mut Vec<f64>),
+    #[cfg(not(feature = "simd"))]
+    #[allow(dead_code)]
+    Never(std::marker::PhantomData<&'a ()>),
+}
+
+thread_local! {
+    /// The midpoint's predictor in [`SourceTerms::integrate`]
+    static PREDICTOR: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl SourceTerms {
@@ -120,6 +208,7 @@ impl SourceTerms {
             quadruplets: None,
             tail: None,
             limiter: None,
+            integration: SourceIntegration::FrozenRates,
         }
     }
 
@@ -135,7 +224,8 @@ impl SourceTerms {
             breaking: Some((1.0, 0.73)),
             quadruplets: Some(Quadruplets::default()),
             tail: Some(DEFAULT_TAIL_POWER),
-            limiter: Some(DEFAULT_LIMITER),
+            limiter: Some(GrowthLimiter::PerStep(DEFAULT_LIMITER)),
+            integration: SourceIntegration::FrozenRates,
         }
     }
 
@@ -171,9 +261,15 @@ impl SourceTerms {
         self
     }
 
-    /// Ris's growth limiter with fraction `gamma` of the Phillips level, or none.
-    pub fn with_limiter(mut self, gamma: Option<f64>) -> Self {
-        self.limiter = gamma;
+    /// How [`Self::integrate`] advances the action over a step.
+    pub fn with_integration(mut self, integration: SourceIntegration) -> Self {
+        self.integration = integration;
+        self
+    }
+
+    /// The limit on the growth over a step, or none.
+    pub fn with_limiter(mut self, limiter: Option<GrowthLimiter>) -> Self {
+        self.limiter = limiter;
         self
     }
 
@@ -207,8 +303,14 @@ impl SourceTerms {
         // First, while `b` is free: the DIA's transfer, split into gains and losses
         if let (Some(quadruplets), Some(means)) = (self.quadruplets, means) {
             let scale = quadruplet_scale(means, depth);
-            quadruplets.source(grid, e, self.tail, self.g, scale, b);
-            split_transfer(e, a, b);
+            if self.integration == SourceIntegration::Implicit {
+                // The transfer into `b`, its diagonal into `a`
+                quadruplets.source_and_diagonal(grid, e, self.tail, self.g, scale, b, a);
+                linearise_transfer(e, a, b);
+            } else {
+                quadruplets.source(grid, e, self.tail, self.g, scale, b);
+                split_transfer(e, a, b);
+            }
         }
         self.add_local_rates(grid, e, k, depth, wind, means, a, b);
     }
@@ -287,9 +389,9 @@ impl SourceTerms {
         }
     }
 
-    /// Advance the action density `n` (one node's spectrum) over `dt` with the rates
-    /// of its present state frozen: `N ← N e^{BΔt} + (A/σ)(e^{BΔt} − 1)/B`.
-    /// `e`, `a`, `b` are scratch (one value per component).
+    /// Advance the action density `n` (one node's spectrum) over `dt` by
+    /// [`Self::integration`]. `e`, `a`, `b` are scratch (one value per
+    /// component).
     #[allow(clippy::too_many_arguments)]
     pub fn integrate(
         &self,
@@ -303,73 +405,169 @@ impl SourceTerms {
         a: &mut [f64],
         b: &mut [f64],
     ) {
-        variance(grid, n, e);
-        self.rates(grid, e, k, depth, wind, a, b);
-        self.advance(grid, n, k, depth, wind, dt, e, a, b);
+        PREDICTOR.with_borrow_mut(|predictor| {
+            let nodes = Nodes {
+                k,
+                depths: &[depth],
+                winds: &[wind],
+            };
+            self.integrate_nodes(grid, n, nodes, dt, e, a, b, predictor, Lanes::None);
+        });
     }
 
-    /// [`Self::integrate`] at the [`LANES`] nodes (or fewer) whose spectra
-    /// lie one after the other in `spectra`, the DIA's transfer at all of
-    /// them at once ([`Quadruplets::source_lanes`]), bit for bit as
-    /// [`Self::integrate`] at each. Node `l` has the wavenumbers
-    /// `k[l n_σ..(l + 1) n_σ]`, the depth `depths[l]` and the wind
-    /// `winds[l]`.
-    #[cfg(feature = "simd")]
+    /// [`Self::integrate`] at the nodes (at most [`LANES`] with `lanes`)
+    /// whose spectra lie one after the other in `spectra`, with the DIA's
+    /// transfer at all of them at once if `lanes` ([`Quadruplets::source_lanes`],
+    /// bit for bit as at each alone).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn integrate_lanes(
+    pub(crate) fn integrate_at(
         &self,
         grid: &SpectralGrid,
         spectra: &mut [f64],
-        k: &[f64],
-        depths: &[f64],
-        winds: &[Wind],
+        nodes: Nodes,
         dt: f64,
         scratch: &mut SourceScratch,
+        lanes: bool,
     ) {
-        let (nf, nc) = (grid.n_freq(), grid.n_components());
-        let k = |l: usize| &k[l * nf..(l + 1) * nf];
         let SourceScratch {
             e,
             a,
             b,
+            predictor,
+            #[cfg(feature = "simd")]
             e_lanes,
+            #[cfg(feature = "simd")]
             s_lanes,
+            #[cfg(feature = "simd")]
+            d_lanes,
         } = scratch;
-        let Some(quadruplets) = self.quadruplets else {
-            for (l, n) in spectra.chunks_exact_mut(nc).enumerate() {
-                self.integrate(grid, n, k(l), depths[l], winds[l], dt, e, a, b);
-            }
-            return;
+        a.resize(spectra.len(), 0.0);
+        b.resize(spectra.len(), 0.0);
+        #[cfg(feature = "simd")]
+        let lanes = if lanes {
+            Lanes::Dia(e_lanes, s_lanes, d_lanes)
+        } else {
+            Lanes::None
         };
-        // The nodes' variance densities interleaved, empty lanes beyond them
-        e_lanes.clear();
-        e_lanes.resize(nc * LANES, 0.0);
-        s_lanes.resize(nc * LANES, 0.0);
-        let mut means = [None; LANES];
-        let mut scales = [1.0; LANES];
-        for (l, n) in spectra.chunks_exact(nc).enumerate() {
-            variance(grid, n, e);
-            means[l] = Means::of(grid, e, k(l));
-            if let Some(means) = means[l] {
-                scales[l] = quadruplet_scale(means, depths[l]);
+        #[cfg(not(feature = "simd"))]
+        let lanes = {
+            let _ = lanes;
+            Lanes::None
+        };
+        self.integrate_nodes(grid, spectra, nodes, dt, e, a, b, predictor, lanes);
+    }
+
+    /// The step of [`Self::integrate`] at the nodes of `spectra`; `a`, `b`
+    /// hold their rates (one after the other, as `spectra`), `predictor` the
+    /// midpoint's half step.
+    #[allow(clippy::too_many_arguments)]
+    fn integrate_nodes(
+        &self,
+        grid: &SpectralGrid,
+        spectra: &mut [f64],
+        nodes: Nodes,
+        dt: f64,
+        e: &mut [f64],
+        a: &mut [f64],
+        b: &mut [f64],
+        predictor: &mut Vec<f64>,
+        mut lanes: Lanes,
+    ) {
+        let nc = grid.n_components();
+        let advance = |spectra: &mut [f64], dt: f64, e: &mut [f64], a: &[f64], b: &[f64]| {
+            for (l, n) in spectra.chunks_exact_mut(nc).enumerate() {
+                let (k, depth, wind) = nodes.node(l, grid.n_freq());
+                let rows = l * nc..(l + 1) * nc;
+                self.advance(grid, n, k, depth, wind, dt, e, &a[rows.clone()], &b[rows]);
             }
-            for (c, x) in e.iter().enumerate() {
-                e_lanes[c * LANES + l] = *x;
+        };
+        match self.integration {
+            SourceIntegration::FrozenRates | SourceIntegration::Implicit => {
+                self.rates_at(grid, spectra, nodes, e, a, b, &mut lanes);
+                advance(spectra, dt, e, a, b);
+            }
+            SourceIntegration::Midpoint => {
+                predictor.clear();
+                predictor.extend_from_slice(spectra);
+                self.rates_at(grid, spectra, nodes, e, a, b, &mut lanes);
+                advance(predictor, 0.5 * dt, e, a, b);
+                self.rates_at(grid, predictor, nodes, e, a, b, &mut lanes);
+                advance(spectra, dt, e, a, b);
             }
         }
-        quadruplets.source_lanes(grid, e_lanes, self.tail, self.g, scales, s_lanes);
-        for (l, n) in spectra.chunks_exact_mut(nc).enumerate() {
-            variance(grid, n, e);
-            a.fill(0.0);
-            b.fill(0.0);
-            if means[l].is_some() {
-                for (c, b) in b.iter_mut().enumerate() {
-                    *b = s_lanes[c * LANES + l];
+    }
+
+    /// [`Self::rates`] of the action densities `spectra` (one node's after
+    /// another) into `a`, `b` (the same layout); `e` is scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn rates_at(
+        &self,
+        grid: &SpectralGrid,
+        spectra: &[f64],
+        nodes: Nodes,
+        e: &mut [f64],
+        a: &mut [f64],
+        b: &mut [f64],
+        lanes: &mut Lanes,
+    ) {
+        let (nf, nc) = (grid.n_freq(), grid.n_components());
+        #[cfg(feature = "simd")]
+        if let (Lanes::Dia(e_lanes, s_lanes, d_lanes), Some(quadruplets)) =
+            (lanes, self.quadruplets)
+        {
+            let implicit = self.integration == SourceIntegration::Implicit;
+            // The nodes' variance densities interleaved, empty lanes beyond them
+            e_lanes.clear();
+            e_lanes.resize(nc * LANES, 0.0);
+            s_lanes.resize(nc * LANES, 0.0);
+            let mut means = [None; LANES];
+            let mut scales = [1.0; LANES];
+            for (l, n) in spectra.chunks_exact(nc).enumerate() {
+                let (k, depth, _) = nodes.node(l, nf);
+                variance(grid, n, e);
+                means[l] = Means::of(grid, e, k);
+                if let Some(means) = means[l] {
+                    scales[l] = quadruplet_scale(means, depth);
                 }
-                split_transfer(e, a, b);
+                for (c, x) in e.iter().enumerate() {
+                    e_lanes[c * LANES + l] = *x;
+                }
             }
-            self.add_local_rates(grid, e, k(l), depths[l], winds[l], means[l], a, b);
-            self.advance(grid, n, k(l), depths[l], winds[l], dt, e, a, b);
+            let diag = implicit.then(|| {
+                d_lanes.resize(nc * LANES, 0.0);
+                &mut d_lanes[..]
+            });
+            quadruplets.source_lanes(grid, e_lanes, self.tail, self.g, scales, s_lanes, diag);
+            for (l, n) in spectra.chunks_exact(nc).enumerate() {
+                let (k, depth, wind) = nodes.node(l, nf);
+                let (a, b) = (&mut a[l * nc..(l + 1) * nc], &mut b[l * nc..(l + 1) * nc]);
+                variance(grid, n, e);
+                a.fill(0.0);
+                b.fill(0.0);
+                if means[l].is_some() {
+                    for (c, b) in b.iter_mut().enumerate() {
+                        *b = s_lanes[c * LANES + l];
+                    }
+                    if implicit {
+                        for (c, a) in a.iter_mut().enumerate() {
+                            *a = d_lanes[c * LANES + l];
+                        }
+                        linearise_transfer(e, a, b);
+                    } else {
+                        split_transfer(e, a, b);
+                    }
+                }
+                self.add_local_rates(grid, e, k, depth, wind, means[l], a, b);
+            }
+            return;
+        }
+        #[cfg(not(feature = "simd"))]
+        let _ = lanes;
+        for (l, n) in spectra.chunks_exact(nc).enumerate() {
+            let (k, depth, wind) = nodes.node(l, nf);
+            let (a, b) = (&mut a[l * nc..(l + 1) * nc], &mut b[l * nc..(l + 1) * nc]);
+            variance(grid, n, e);
+            self.rates(grid, e, k, depth, wind, a, b);
         }
     }
 
@@ -389,6 +587,19 @@ impl SourceTerms {
         b: &[f64],
     ) {
         let nd = grid.n_dir();
+        // Hersbach & Janssen's limit: `C g ũ* f_c Δt` (the factor of
+        // `f⁻⁴` in `F`), from the state at the start
+        let rate_limit = match self.limiter {
+            Some(GrowthLimiter::Rate(coefficient)) => {
+                variance(grid, n, e);
+                Means::of(grid, e, k).map(|means| {
+                    let f_c = means.sigma / TAU;
+                    let floor = self.g * PM_PEAK / f_c;
+                    coefficient * self.g * wind.friction_velocity().max(floor) * f_c * dt
+                })
+            }
+            _ => None,
+        };
         // The exponentials first (in `e`, free until the tail), so that the
         // loop around them is free of calls
         let growths = &mut *e;
@@ -396,10 +607,17 @@ impl SourceTerms {
             *growth = (b * dt).exp();
         }
         for (i, (&sigma, &ki)) in grid.sigma.iter().zip(k).enumerate() {
-            // Ris's limit on the growth over a step, or none
-            let max_growth = self.limiter.map_or(f64::INFINITY, |gamma| {
-                gamma * PHILLIPS / (2.0 * sigma * ki.powi(3) * group_velocity(sigma, ki, depth))
-            });
+            // The limit on the growth of N over the step, or none
+            let max_growth = match self.limiter {
+                Some(GrowthLimiter::PerStep(gamma)) => {
+                    gamma * PHILLIPS / (2.0 * sigma * ki.powi(3) * group_velocity(sigma, ki, depth))
+                }
+                // ΔF(f) per 2πσ: N = E/σ, E(σ) = F(f)/2π
+                Some(GrowthLimiter::Rate(_)) => rate_limit.map_or(f64::INFINITY, |limit| {
+                    limit * (sigma / TAU).powi(-4) / (TAU * sigma)
+                }),
+                None => f64::INFINITY,
+            };
             let row = i * nd..(i + 1) * nd;
             let rows = n[row.clone()]
                 .iter_mut()
@@ -486,18 +704,32 @@ fn split_transfer(e: &[f64], a: &mut [f64], b: &mut [f64]) {
     }
 }
 
-/// Per-worker storage of [`SourceTerms::integrate`] (one node's variance
-/// density, input and rates) and `integrate_lanes` (also the interleaved
-/// spectra and transfers of the DIA's lanes).
+/// The DIA's transfer `s` (in `b`) of `e`, linearised about it by its
+/// diagonal `Λ` (in `a`) where that is negative: the rate `B = min(Λ, 0)`
+/// and the input `A = s − B e` (`A + B E` is `s` at `E = e`).
+fn linearise_transfer(e: &[f64], a: &mut [f64], b: &mut [f64]) {
+    for ((a, b), &e) in a.iter_mut().zip(b.iter_mut()).zip(e) {
+        let (s, rate) = (*b, a.min(0.0));
+        *a = s - rate * e;
+        *b = rate;
+    }
+}
+
+/// Per-worker storage of [`SourceTerms::integrate_at`]: one node's
+/// variance density, the nodes' input and rates, the midpoint's predictor,
+/// and the interleaved spectra and transfers of the DIA's lanes.
 #[derive(Default)]
 pub(crate) struct SourceScratch {
-    pub e: Vec<f64>,
-    pub a: Vec<f64>,
-    pub b: Vec<f64>,
+    e: Vec<f64>,
+    a: Vec<f64>,
+    b: Vec<f64>,
+    predictor: Vec<f64>,
     #[cfg(feature = "simd")]
     e_lanes: Vec<f64>,
     #[cfg(feature = "simd")]
     s_lanes: Vec<f64>,
+    #[cfg(feature = "simd")]
+    d_lanes: Vec<f64>,
 }
 
 impl SourceScratch {
@@ -507,10 +739,13 @@ impl SourceScratch {
             e: vec![0.0; n_components],
             a: vec![0.0; n_components],
             b: vec![0.0; n_components],
+            predictor: Vec::new(),
             #[cfg(feature = "simd")]
             e_lanes: Vec::new(),
             #[cfg(feature = "simd")]
             s_lanes: Vec::new(),
+            #[cfg(feature = "simd")]
+            d_lanes: Vec::new(),
         }
     }
 }
@@ -680,6 +915,64 @@ mod tests {
             );
             // Nothing against the wind
             assert_eq!(n[grid.component(i, grid.n_dir() / 2)], 0.0);
+        }
+    }
+
+    /// The exponential midpoint converges at second order in the step and
+    /// the frozen rates at first: a young sea under SWAN's sources (wind,
+    /// whitecapping, the DIA, friction) for 10 minutes at one node, against
+    /// the midpoint at a step of 1.875 s.
+    #[test]
+    fn the_midpoint_rule_is_second_order() {
+        let grid = SpectralGrid::new(0.05, 0.6, 24, 18);
+        let depth = 30.0;
+        let k: Vec<f64> = grid
+            .sigma
+            .iter()
+            .map(|&s| wavenumber(s, depth, G))
+            .collect();
+        let wind = Wind {
+            u10: 15.0,
+            direction: 0.0,
+        };
+        // No limiter: it caps the growth per step, whatever the step
+        let sources = SourceTerms::swan_defaults(G).with_limiter(None);
+        let e0 = grid.jonswap(0.8, 4.0, 3.3, 0.0, 2.0);
+        let n0: Vec<f64> = (0..e0.len())
+            .map(|c| e0[c] / grid.sigma[c / grid.n_dir()])
+            .collect();
+        let m = n0.len();
+        let run = |integration: SourceIntegration, dt: f64| {
+            let sources = sources.clone().with_integration(integration);
+            let (mut e, mut a, mut b) = (vec![0.0; m], vec![0.0; m], vec![0.0; m]);
+            let mut n = n0.clone();
+            for _ in 0..(600.0 / dt).round() as usize {
+                sources.integrate(&grid, &mut n, &k, depth, wind, dt, &mut e, &mut a, &mut b);
+            }
+            let e: Vec<f64> = (0..m)
+                .map(|c| n[c] * grid.sigma[c / grid.n_dir()])
+                .collect();
+            grid.moment(&e, 0)
+        };
+        let reference = run(SourceIntegration::Midpoint, 1.875);
+        // The sea grows: the sources act
+        let m0 = grid.moment(&e0, 0);
+        assert!(reference > 1.5 * m0, "m0 {m0} → {reference}");
+        for (integration, order) in [
+            (SourceIntegration::FrozenRates, 1.0),
+            (SourceIntegration::Midpoint, 2.0),
+        ] {
+            let errors: Vec<f64> = [60.0, 30.0, 15.0]
+                .iter()
+                .map(|&dt| (run(integration, dt) - reference).abs() / reference)
+                .collect();
+            for pair in errors.windows(2) {
+                let rate = (pair[0] / pair[1]).log2();
+                assert!(
+                    (rate - order).abs() < 0.25,
+                    "{integration:?}: errors {errors:?}, rate {rate:.2}"
+                );
+            }
         }
     }
 

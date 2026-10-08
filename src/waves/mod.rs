@@ -47,7 +47,10 @@ pub use model::{
     WaveWorkspace,
 };
 pub use nonlinear::{Quadruplets, shallow_water_factor};
-pub use sources::{DEFAULT_LIMITER, DEFAULT_TAIL_POWER, SourceTerms, Wind, breaking_fraction};
+pub use sources::{
+    DEFAULT_LIMITER, DEFAULT_RATE_LIMITER, DEFAULT_TAIL_POWER, GrowthLimiter, SourceIntegration,
+    SourceTerms, Wind, breaking_fraction,
+};
 pub use spectrum::{SpectralGrid, WaveParameters, wrap_angle};
 pub use state::WaveSolution;
 pub use stokes::StokesDriftField;

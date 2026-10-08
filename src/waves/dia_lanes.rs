@@ -21,8 +21,10 @@ pub(crate) const LANES: usize = 8;
 impl Quadruplets {
     /// [`Self::source`] at [`LANES`] nodes at once: `e[c · LANES + l]` is
     /// node `l`'s variance density, `scales[l]` its finite-depth factor, and
-    /// `s` (overwritten) its transfer in the same layout.
+    /// `s` (overwritten) its transfer in the same layout; with `diag`, also
+    /// [`Self::source_and_diagonal`]'s diagonal.
     #[inline(never)] // keeps its frame out of rayon's recursive split frames
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn source_lanes(
         &self,
         grid: &SpectralGrid,
@@ -31,11 +33,16 @@ impl Quadruplets {
         g: f64,
         scales: [f64; LANES],
         s: &mut [f64],
+        mut diag: Option<&mut [f64]>,
     ) {
         let nc = grid.n_components();
         assert_eq!(e.len(), nc * LANES);
         assert_eq!(s.len(), nc * LANES);
         s.fill(0.0);
+        if let Some(diag) = diag.as_deref_mut() {
+            assert_eq!(diag.len(), nc * LANES);
+            diag.fill(0.0);
+        }
         let constants = scales.map(|scale| scale * self.c_nl4 * TAU * TAU / g.powi(4));
         DIA_SCRATCH.with_borrow_mut(|scratch| {
             let DiaScratch {
@@ -49,11 +56,13 @@ impl Quadruplets {
             // One bounds check per vector: the lanes as arrays
             let (e, ext) = (e.as_chunks().0, extended_lanes.as_chunks().0);
             let s = s.as_chunks_mut().0;
-            dispatch!(level, simd => self.transfer_lanes(simd, t, e, ext, constants, s));
+            let diag = diag.map(|diag| diag.as_chunks_mut().0);
+            dispatch!(level, simd => self.transfer_lanes(simd, t, e, ext, constants, s, diag));
         });
     }
 
     /// The loops of [`Self::source`], lane by lane.
+    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn transfer_lanes<S: Simd>(
         &self,
@@ -63,6 +72,7 @@ impl Quadruplets {
         ext: &[[f64; LANES]],
         constants: [f64; LANES],
         s: &mut [[f64; LANES]],
+        mut diag: Option<&mut [[f64; LANES]]>,
     ) {
         let (nf, nd) = (t.sigma.len(), t.n_dir);
         let st = &t.stencil;
@@ -109,6 +119,30 @@ impl Quadruplets {
                 }
             }
         };
+        let scatter_diagonal = |diag: &mut [[f64; LANES]],
+                                i: usize,
+                                j: usize,
+                                f: Landing,
+                                l: usize,
+                                d: Landing,
+                                vol: [f64; 2],
+                                dr: f64x8<S>| {
+            for (a, (wf, vol)) in f.weights.iter().zip(vol).enumerate() {
+                let Some(ib) = t.target(i, f, a) else {
+                    continue;
+                };
+                let wf = f64x8::<S>::splat(simd, *wf);
+                let gain = dr * wf * wf * f64x8::<S>::splat(simd, vol);
+                let row = ib * nd;
+                for (b, wd) in d.weights.iter().enumerate() {
+                    add(
+                        diag,
+                        row + t.bin(l, b, j),
+                        gain * f64x8::<S>::splat(simd, wd * wd),
+                    );
+                }
+            }
+        };
         for i in 0..nf {
             let factor = constants * f64x8::<S>::splat(simd, t.sigma11[i]);
             for j in 0..nd {
@@ -128,6 +162,19 @@ impl Quadruplets {
                     add(s, c, -(two * r));
                     scatter(s, i, j, st.plus, m, dp, st.volume_plus, r);
                     scatter(s, i, j, st.minus, 2 + m, dm, st.volume_minus, r);
+                    if let Some(diag) = diag.as_deref_mut() {
+                        // ∂r/∂e, ∂r/∂e₊, ∂r/∂e₋, zero where skipped
+                        let (sum, both) = (ep * w_plus + em * w_minus, w_both * ep * em);
+                        let dr = active.select(factor * (two * ec * sum - both), zero);
+                        let dr_plus = factor * ec * (ec * w_plus - w_both * em);
+                        let dr_minus = factor * ec * (ec * w_minus - w_both * ep);
+                        let (dr_plus, dr_minus) =
+                            (active.select(dr_plus, zero), active.select(dr_minus, zero));
+                        add(diag, c, -(two * dr));
+                        let (vp, vm) = (st.volume_plus, st.volume_minus);
+                        scatter_diagonal(diag, i, j, st.plus, m, dp, vp, dr_plus);
+                        scatter_diagonal(diag, i, j, st.minus, 2 + m, dm, vm, dr_minus);
+                    }
                 }
             }
         }

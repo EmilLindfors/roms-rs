@@ -100,6 +100,7 @@
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
+//!     [wave_sources=swan|wam] [wave_substeps=1] [wave_cfl=0.5] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [levels=0] [tide3d=0] [restart_hours=0] [resume=<file>]
 //! ```
@@ -129,6 +130,14 @@
 //! what sets the step where) comes before the tide's. Use `implicit=1`: the
 //! tide's currents over the shallows otherwise set the waves' step by
 //! frequency shifting (0.6 s against the geographic 7 s at 1 km).
+//!
+//! `wave_sources=wam` integrates the sources as WAM does: implicit in the
+//! DIA's diagonal, with Hersbach & Janssen's growth limiter proportional to
+//! the step (`SourceIntegration::Implicit`, `GrowthLimiter::Rate`), in place
+//! of SWAN's frozen rates and per-step limiter. Its sources tolerate long
+//! steps, so `wave_substeps=N` runs them (and implicit refraction and
+//! shifting) once per N propagation steps, and `wave_cfl=` sets the
+//! propagation's CFL number (0.5).
 //!
 //! `wave_spectra=<file>` takes the sea from a parent wave model instead:
 //! MET Norway's MyWave WAM 800 m spectra at its points
@@ -316,7 +325,8 @@ use dg_rs::types::Depth;
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{BoundarySpectra, PointSpectra, WindSeries};
 use dg_rs::waves::{
-    CoupledWaves2D, CoupledWavesStats, SourceTerms, SpectralGrid, WaveModel2D, Wind,
+    CoupledWaves2D, CoupledWavesStats, DEFAULT_RATE_LIMITER, GrowthLimiter, SourceIntegration,
+    SourceTerms, SpectralGrid, WaveModel2D, Wind,
 };
 
 /// Gravitational acceleration (m/s²)
@@ -484,6 +494,12 @@ struct Options {
     turning: Option<f64>,
     /// Step refraction and frequency shifting implicitly (`implicit=1`)
     implicit_refraction: bool,
+    /// WAM's integration of the sources (`wave_sources=wam`) instead of SWAN's
+    wave_wam_sources: bool,
+    /// Propagation steps per wave step (`wave_substeps=`)
+    wave_substeps: usize,
+    /// The waves' propagation CFL number (`wave_cfl=`)
+    wave_cfl: f64,
     /// The waves on a grid of their own (`wave_mesh=NX,NY[,ORDER]`, order 1
     /// by default) instead of the run's mesh, coupled to it by
     /// `WaveCoupling2D`
@@ -634,6 +650,13 @@ impl Options {
                 .map(|v| v.parse().map_err(|_| format!("bad turning={v}")))
                 .transpose()?,
             implicit_refraction: get("implicit", 0.0)? != 0.0,
+            wave_wam_sources: match args.get("wave_sources").map(String::as_str) {
+                None | Some("swan") => false,
+                Some("wam") => true,
+                Some(other) => return Err(format!("wave_sources=swan|wam, not {other}")),
+            },
+            wave_substeps: get("wave_substeps", 1.0)? as usize,
+            wave_cfl: get("wave_cfl", 0.5)?,
             wave_coupling: get("wave_coupling", 0.0)?,
             wave_spectra: args.get("wave_spectra").map(PathBuf::from),
             wave_neighbours: get("wave_neighbours", 2.0)? as usize,
@@ -2011,11 +2034,18 @@ fn wave_model(domain: &Domain, opts: &Options, wind: Option<Wind>) -> (WaveModel
         grid,
         G,
     )
-    .with_sources(SourceTerms::swan_defaults(G))
+    .with_sources(if opts.wave_wam_sources {
+        SourceTerms::swan_defaults(G)
+            .with_integration(SourceIntegration::Implicit)
+            .with_limiter(Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)))
+    } else {
+        SourceTerms::swan_defaults(G)
+    })
     .with_boundary_spectrum(&sea)
     .with_turning_limit(opts.turning)
     .with_implicit_refraction(opts.implicit_refraction)
-    .with_implicit_frequency_shift(opts.implicit_refraction);
+    .with_implicit_frequency_shift(opts.implicit_refraction)
+    .with_substeps(opts.wave_substeps.max(1));
     if let Some(wind) = wind {
         model = model.with_wind(wind);
     }
@@ -2091,6 +2121,7 @@ fn coupled_waves<BC: SWEBoundaryCondition2D>(
             let state = model.uniform_state(&mean);
             let mut waves = CoupledWaves2D::new(model, state, physics, 0.0)
                 .with_ramp(3600.0 * opts.ramp_hours.max(1e-3))
+                .with_cfl(opts.wave_cfl)
                 .with_boundary(boundary);
             match (weather, parent.wind.clone()) {
                 (Some(weather), _) => waves = waves.with_gridded_wind(weather),
@@ -2111,7 +2142,8 @@ fn coupled_waves<BC: SWEBoundaryCondition2D>(
                 }
             );
             let mut waves = CoupledWaves2D::new(model, state, physics, 0.0)
-                .with_ramp(3600.0 * opts.ramp_hours.max(1e-3));
+                .with_ramp(3600.0 * opts.ramp_hours.max(1e-3))
+                .with_cfl(opts.wave_cfl);
             if let Some(weather) = weather {
                 waves = waves.with_gridded_wind(weather);
             }
@@ -3448,7 +3480,7 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
     );
 
     // The step, and the part of it the geographic propagation alone allows
-    let cfl = 0.5;
+    let cfl = opts.wave_cfl;
     let dt = model.compute_dt(cfl);
     let sigma_min = model.grid.sigma[0];
     let nn = domain.ops.n_nodes;

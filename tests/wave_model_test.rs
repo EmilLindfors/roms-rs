@@ -13,8 +13,8 @@ use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::types::ElementIndex;
 use dg_rs::waves::{
-    SourceTerms, SpectralAdvection, SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind,
-    group_velocity, wavenumber,
+    DEFAULT_RATE_LIMITER, GrowthLimiter, SourceIntegration, SourceTerms, SpectralAdvection,
+    SpectralGrid, WaveModel2D, WaveSolution, WaveWorkspace, Wind, group_velocity, wavenumber,
 };
 
 const G: f64 = 9.81;
@@ -641,6 +641,14 @@ fn deep_water_sources() -> SourceTerms {
 /// elements, 36 directions, a 2 Hz grid or no tail move it by ≤ 4.5 %.
 #[test]
 fn fetch_limited_growth_follows_kahma_and_calkoen() {
+    let curve = fetch_curve(deep_water_sources(), 1);
+    assert_follows_kahma_and_calkoen(&curve);
+}
+
+/// The fetch-limited strip of [`fetch_limited_growth_follows_kahma_and_calkoen`]
+/// with `sources` and `substeps` propagation steps per step, run to the steady
+/// state: `(X*, E*, f_p*)` at the nodes from X* = 10³ to 1.25·10⁴.
+fn fetch_curve(sources: SourceTerms, substeps: usize) -> Vec<(f64, f64, f64)> {
     const LENGTH: f64 = 120e3;
     let u10 = 10.0;
     let mut mesh = Mesh2D::channel_periodic_x(0.0, 1000.0, 0.0, LENGTH, 1, 30);
@@ -660,8 +668,9 @@ fn fetch_limited_growth_follows_kahma_and_calkoen() {
         |_, _| -1000.0,
         SpectralGrid::new(0.06, 1.0, 25, 24),
     )
-    .with_sources(deep_water_sources())
-    .with_wind(wind);
+    .with_sources(sources)
+    .with_wind(wind)
+    .with_substeps(substeps);
     let mut n = m.zero_state();
     run(&m, &mut n, 10.0 * 3600.0, 0.5);
     let xy = nodes(&m);
@@ -677,7 +686,12 @@ fn fetch_limited_growth_follows_kahma_and_calkoen() {
         curve.push((x, es, fs));
     }
     curve.sort_by(|a, b| a.0.total_cmp(&b.0));
-    for &(x, es, fs) in &curve {
+    curve
+}
+
+/// The bounds of [`fetch_limited_growth_follows_kahma_and_calkoen`].
+fn assert_follows_kahma_and_calkoen(curve: &[(f64, f64, f64)]) {
+    for &(x, es, fs) in curve {
         let (e_kc, f_kc) = (5.2e-7 * x.powf(0.9), 2.18 * x.powf(-0.27));
         println!(
             "X* {x:7.0}: E* {es:.3e} ({:.2}× KC92), f_p* {fs:.4} ({:.2}× KC92)",
@@ -699,6 +713,40 @@ fn fetch_limited_growth_follows_kahma_and_calkoen() {
     println!("E* ∝ X*^{exponent:.2}");
     assert!(curve.windows(2).all(|w| w[1].1 > w[0].1));
     assert!((0.5..1.0).contains(&exponent), "E* ∝ X*^{exponent}");
+}
+
+/// The sources implicit in the DIA with Hersbach & Janssen's rate limiter
+/// (WAM's integration) at long steps. The fetch-limited strip of
+/// [`fetch_limited_growth_follows_kahma_and_calkoen`] meets the same bounds
+/// with the sources once per 8 propagation steps (an outer step of 145 s),
+/// and its curve is that of one propagation step per step (18 s) to 1.8 % in
+/// E* (at the shortest fetches; ≤ 0.2 % beyond X* = 5000) and 0.5 % in f_p*.
+/// With frozen rates and Ris's limiter, which caps the growth per step, the
+/// shortest fetch's E* drops 9 % between the two steps (1.17 → 1.06× KC92).
+#[test]
+fn implicit_sources_keep_the_fetch_curve_at_long_steps() {
+    let sources = deep_water_sources()
+        .with_integration(SourceIntegration::Implicit)
+        .with_limiter(Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)));
+    let (short, long) = (fetch_curve(sources.clone(), 1), fetch_curve(sources, 8));
+    assert_follows_kahma_and_calkoen(&long);
+    for (a, b) in short.iter().zip(&long) {
+        assert_eq!(a.0, b.0);
+        assert!(
+            (b.1 / a.1 - 1.0).abs() < 0.025,
+            "X* {:.0}: E* {:e} against {:e}",
+            a.0,
+            b.1,
+            a.1
+        );
+        assert!(
+            (b.2 / a.2 - 1.0).abs() < 0.01,
+            "X* {:.0}: f_p* {} against {}",
+            a.0,
+            b.2,
+            a.2
+        );
+    }
 }
 
 /// Duration-limited growth at one node: a 10 m/s wind over a calm deep sea, the
@@ -743,6 +791,72 @@ fn duration_limited_growth_approaches_pierson_moskowitz() {
     assert!(history.windows(2).all(|w| w[1].1 <= w[0].1 * (1.0 + 1e-9)));
     assert!((0.75..1.0).contains(&(es / 3.64e-3)), "E* {es:e}");
     assert!((fs / 0.13 - 1.0).abs() < 0.1, "f_p* {fs}");
+}
+
+/// Duration-limited growth with the sources implicit in the DIA and Hersbach &
+/// Janssen's rate limiter: the sea at 96 h is within the bounds of
+/// [`duration_limited_growth_approaches_pierson_moskowitz`], and steps of 300
+/// and 900 s give the sea of 60 s steps to 2.2 % in E* at 6 h (young, where
+/// the limiter acts; f_p* to 3.5 %, the peak moving a bin) and to 0.15 % at
+/// 96 h. With frozen rates and Ris's limiter E* at 6 h drops 8 % from 60 to
+/// 300 s steps.
+#[test]
+fn implicit_sources_grow_a_sea_whatever_the_step() {
+    let grid = SpectralGrid::new(0.06, 1.0, 30, 24);
+    let (u10, depth) = (10.0, 1000.0);
+    let wind = Wind {
+        u10,
+        direction: 0.0,
+    };
+    let sources = deep_water_sources()
+        .with_integration(SourceIntegration::Implicit)
+        .with_limiter(Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)));
+    let k: Vec<f64> = grid
+        .sigma
+        .iter()
+        .map(|&s| wavenumber(s, depth, G))
+        .collect();
+    let (nc, nd) = (grid.n_components(), grid.n_dir());
+    let grow = |dt: f64| -> [(f64, f64); 2] {
+        let mut n = vec![0.0; nc];
+        let (mut e, mut a, mut b) = (vec![0.0; nc], vec![0.0; nc], vec![0.0; nc]);
+        let mut at = [(0.0, 0.0); 2];
+        for step in 1..=(96.0 * 3600.0 / dt) as usize {
+            sources.integrate(&grid, &mut n, &k, depth, wind, dt, &mut e, &mut a, &mut b);
+            let t = step as f64 * dt;
+            for (slot, hours) in at.iter_mut().zip([6.0, 96.0]) {
+                if t == hours * 3600.0 {
+                    let e: Vec<f64> = (0..nc).map(|c| n[c] * grid.sigma[c / nd]).collect();
+                    *slot = dimensionless(&grid, &e, u10);
+                }
+            }
+        }
+        at
+    };
+    let reference = grow(60.0);
+    let (es, fs) = reference[1];
+    println!(
+        "after 96 h: E* {es:.3e} ({:.2}× PM), f_p* {fs:.4}",
+        es / 3.64e-3
+    );
+    assert!((0.75..1.0).contains(&(es / 3.64e-3)), "E* {es:e}");
+    assert!((fs / 0.13 - 1.0).abs() < 0.1, "f_p* {fs}");
+    for dt in [300.0, 900.0] {
+        for (hours, (a, b)) in [6, 96].iter().zip(reference.iter().zip(grow(dt))) {
+            assert!(
+                (b.0 / a.0 - 1.0).abs() < if *hours == 6 { 0.03 } else { 0.005 },
+                "{dt} s, {hours} h: E* {:e} against {:e}",
+                b.0,
+                a.0
+            );
+            assert!(
+                (b.1 / a.1 - 1.0).abs() < if *hours == 6 { 0.05 } else { 0.005 },
+                "{dt} s, {hours} h: f_p* {} against {}",
+                b.1,
+                a.1
+            );
+        }
+    }
 }
 
 /// The spread sea of [`a_spread_sea_refracts_to_the_exact_steady_state`] on a

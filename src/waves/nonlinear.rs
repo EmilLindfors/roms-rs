@@ -150,8 +150,46 @@ impl Quadruplets {
         scale: f64,
         s: &mut [f64],
     ) {
+        self.source_into(grid, e, tail, g, scale, s, None);
+    }
+
+    /// [`Self::source`] and its diagonal derivative `diag[c] = ∂s[c]/∂e[c]`
+    /// (1/s, overwritten): the rate at which each component's transfer
+    /// changes with its own energy, from the quadruplets it starts and those
+    /// it receives from (bins above the grid, read from the tail, count as
+    /// constant). Exact for grids whose frequency ratio is below `1 + λ`;
+    /// on coarser ones a landing reaches the component's own row, whose
+    /// share in its own gather the diagonal leaves out.
+    #[allow(clippy::too_many_arguments)]
+    pub fn source_and_diagonal(
+        &self,
+        grid: &SpectralGrid,
+        e: &[f64],
+        tail: Option<f64>,
+        g: f64,
+        scale: f64,
+        s: &mut [f64],
+        diag: &mut [f64],
+    ) {
+        self.source_into(grid, e, tail, g, scale, s, Some(diag));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn source_into(
+        &self,
+        grid: &SpectralGrid,
+        e: &[f64],
+        tail: Option<f64>,
+        g: f64,
+        scale: f64,
+        s: &mut [f64],
+        mut diag: Option<&mut [f64]>,
+    ) {
         let (nf, nd) = (grid.n_freq(), grid.n_dir());
         s.fill(0.0);
+        if let Some(diag) = diag.as_deref_mut() {
+            diag.fill(0.0);
+        }
         let (w_plus, w_minus, w_both) = self.weights();
         let constant = scale * self.c_nl4 * TAU * TAU / g.powi(4);
         DIA_SCRATCH.with_borrow_mut(|scratch| {
@@ -195,6 +233,27 @@ impl Quadruplets {
                     }
                 }
             };
+            // The diagonal of a landing's gain, `vol ω² ∂r/∂e±` with `ω`
+            // its gather weight
+            let scatter_diagonal = |diag: &mut [f64],
+                                    i: usize,
+                                    j: usize,
+                                    f: Landing,
+                                    l: usize,
+                                    d: Landing,
+                                    vol: [f64; 2],
+                                    dr: f64| {
+                for (a, (wf, vol)) in f.weights.iter().zip(vol).enumerate() {
+                    let Some(ib) = t.target(i, f, a) else {
+                        continue;
+                    };
+                    let gain = dr * wf * wf * vol;
+                    let row = ib * nd;
+                    for (b, wd) in d.weights.iter().enumerate() {
+                        diag[row + t.bin(l, b, j)] += gain * (wd * wd);
+                    }
+                }
+            };
             for i in 0..nf {
                 let factor = constant * t.sigma11[i];
                 for j in 0..nd {
@@ -211,6 +270,17 @@ impl Quadruplets {
                         s[i * nd + j] -= 2.0 * r;
                         scatter(s, i, j, st.plus, m, dp, st.volume_plus, r);
                         scatter(s, i, j, st.minus, 2 + m, dm, st.volume_minus, r);
+                        if let Some(diag) = diag.as_deref_mut() {
+                            // ∂r/∂e, ∂r/∂e₊, ∂r/∂e₋
+                            let (sum, both) = (ep * w_plus + em * w_minus, w_both * ep * em);
+                            let dr = factor * (2.0 * ec * sum - both);
+                            let dr_plus = factor * ec * (ec * w_plus - w_both * em);
+                            let dr_minus = factor * ec * (ec * w_minus - w_both * ep);
+                            diag[i * nd + j] -= 2.0 * dr;
+                            let (vp, vm) = (st.volume_plus, st.volume_minus);
+                            scatter_diagonal(diag, i, j, st.plus, m, dp, vp, dr_plus);
+                            scatter_diagonal(diag, i, j, st.minus, 2 + m, dm, vm, dr_minus);
+                        }
                     }
                 }
             }
@@ -565,14 +635,64 @@ mod tests {
                 }
             }
             let mut lanes = vec![f64::NAN; nc * LANES];
-            q.source_lanes(&grid, &e, tail, G, scales, &mut lanes);
+            let mut diag_lanes = vec![f64::NAN; nc * LANES];
+            q.source_lanes(
+                &grid,
+                &e,
+                tail,
+                G,
+                scales,
+                &mut lanes,
+                Some(&mut diag_lanes),
+            );
             for (l, sea) in seas.iter().enumerate() {
-                let mut alone = vec![0.0; nc];
-                q.source(&grid, sea, tail, G, scales[l], &mut alone);
-                let lane: Vec<u64> = (0..nc).map(|c| lanes[c * LANES + l].to_bits()).collect();
-                let alone: Vec<u64> = alone.iter().map(|x| x.to_bits()).collect();
-                assert_eq!(lane, alone, "{n_freq}×{n_dir}, tail {tail:?}, lane {l}");
+                let (mut alone, mut diag) = (vec![0.0; nc], vec![0.0; nc]);
+                q.source_and_diagonal(&grid, sea, tail, G, scales[l], &mut alone, &mut diag);
+                let bits = |x: &[f64]| x.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                let lane = |x: &[f64]| (0..nc).map(|c| x[c * LANES + l]).collect::<Vec<_>>();
+                let at = format!("{n_freq}×{n_dir}, tail {tail:?}, lane {l}");
+                assert_eq!(bits(&lane(&lanes)), bits(&alone), "{at}");
+                assert_eq!(bits(&lane(&diag_lanes)), bits(&diag), "{at}: the diagonal");
             }
+        }
+    }
+
+    /// The diagonal derivative is the transfer's own, by central differences
+    /// of each component's energy (the transfer is a cubic in it, so the
+    /// difference is exact but for round-off), with and without the tail; the
+    /// transfer itself is `source`'s bit for bit.
+    #[test]
+    fn the_diagonal_is_the_transfers_derivative() {
+        // Few directions, so that the landings wrap around the circle; the
+        // frequencies closer than 1 + λ, so that no landing reaches the
+        // component's own row
+        for (n_freq, n_dir, tail) in [(25, 36, None), (24, 8, Some(5.0))] {
+            let grid = SpectralGrid::new(0.04, 0.5, n_freq, n_dir);
+            let q = Quadruplets::default();
+            // The top rows emptied: the tail continues them, which the
+            // diagonal leaves out
+            let mut e = grid.jonswap(3.0, 4.0, 3.3, 0.6, 2.0);
+            let nc = e.len();
+            e[(n_freq - 2) * n_dir..].fill(0.0);
+            let (mut s, mut diag, mut plain) = (vec![0.0; nc], vec![0.0; nc], vec![0.0; nc]);
+            q.source_and_diagonal(&grid, &e, tail, G, 1.3, &mut s, &mut diag);
+            q.source(&grid, &e, tail, G, 1.3, &mut plain);
+            assert_eq!(s, plain);
+            let scale = diag.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+            assert!(scale > 0.0);
+            let mut worst = 0.0f64;
+            for c in 0..(n_freq - 2) * n_dir {
+                let h = 1e-3 * e[c].max(1e-6 * e.iter().cloned().fold(0.0, f64::max));
+                let mut shifted = e.clone();
+                let (mut up, mut down) = (vec![0.0; nc], vec![0.0; nc]);
+                shifted[c] = e[c] + h;
+                q.source(&grid, &shifted, tail, G, 1.3, &mut up);
+                shifted[c] = e[c] - h;
+                q.source(&grid, &shifted, tail, G, 1.3, &mut down);
+                let difference = (up[c] - down[c]) / (2.0 * h);
+                worst = worst.max((difference - diag[c]).abs() / scale);
+            }
+            assert!(worst < 1e-6, "{n_freq}×{n_dir}: {worst:e} of the largest");
         }
     }
 

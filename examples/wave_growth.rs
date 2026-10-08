@@ -14,7 +14,10 @@
 //! ```
 //!
 //! Also `f_min=0.06 f_max=1 cfl=0.5`, `dt=10` (duration), `tail=0` for no tail and
-//! `dia=0` for no quadruplets. The gates are in `tests/wave_model_test.rs`.
+//! `dia=0` for no quadruplets. The sources' time integration:
+//! `integration=frozen|midpoint|implicit`, `limiter=ris|rate[:C]|none`, and
+//! `substeps=N` propagation steps per step (fetch). The gates are in
+//! `tests/wave_model_test.rs`.
 
 use std::collections::HashMap;
 use std::f64::consts::TAU;
@@ -23,7 +26,10 @@ use std::sync::Arc;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::types::ElementIndex;
-use dg_rs::waves::{SourceTerms, SpectralGrid, WaveModel2D, WaveWorkspace, Wind, wavenumber};
+use dg_rs::waves::{
+    DEFAULT_LIMITER, DEFAULT_RATE_LIMITER, GrowthLimiter, SourceIntegration, SourceTerms,
+    SpectralGrid, WaveModel2D, WaveWorkspace, Wind, wavenumber,
+};
 
 const G: f64 = 9.81;
 const DEPTH: f64 = 1000.0;
@@ -55,6 +61,21 @@ fn main() {
     } else {
         sources.with_quadruplets(None)
     };
+    let text = |key: &str, default: &str| args.get(key).map_or(default.to_string(), String::clone);
+    let sources = sources
+        .with_integration(match text("integration", "frozen").as_str() {
+            "midpoint" => SourceIntegration::Midpoint,
+            "implicit" => SourceIntegration::Implicit,
+            _ => SourceIntegration::FrozenRates,
+        })
+        .with_limiter(match text("limiter", "ris").as_str() {
+            "none" => None,
+            rate if rate.starts_with("rate") => Some(GrowthLimiter::Rate(
+                rate.strip_prefix("rate:")
+                    .map_or(DEFAULT_RATE_LIMITER, |c| c.parse().expect("limiter=rate:C")),
+            )),
+            _ => Some(GrowthLimiter::PerStep(DEFAULT_LIMITER)),
+        });
     let wind = Wind {
         u10,
         direction: TAU / 4.0,
@@ -126,7 +147,8 @@ fn fetch(grid: &SpectralGrid, sources: SourceTerms, wind: Wind, num: &dyn Fn(&st
         G,
     )
     .with_sources(sources)
-    .with_wind(wind);
+    .with_wind(wind)
+    .with_substeps(num("substeps", 1.0) as usize);
     let mut n = model.zero_state();
     let mut ws = WaveWorkspace::default();
     let dt = model.compute_dt(cfl);
