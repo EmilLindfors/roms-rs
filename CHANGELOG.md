@@ -407,6 +407,21 @@ All notable changes to this project should be documented in this file.
 
 ### Performance
 
+- **The waves' quadruplet interactions (DIA) vectorised across nodes: 2.5× faster, bit for bit (TODO F.4).** The DIA was the largest part of the wave sources (127 of 247 ms on one thread in `wave_step_bench`).
+  - **Eight nodes per vector** (`waves/dia_lanes.rs`, `Quadruplets::source_lanes`). The DIA's stencil is the same at every node. With eight nodes' spectra interleaved (`[component][node]`), every gather and scatter of the transfer becomes one vector load or store. The node pass takes chunks of eight nodes when the DIA acts (`SourceTerms::integrate_lanes`). It runs the refraction and the shift node by node as before, then the sources of all eight together.
+  - **The DIA's tables are cached per thread** for the grid, λ and tail they belong to: the stencil, the landings' bins, the tail's factors and `(σ/2π)¹¹`. They were rebuilt at every node and step.
+  - **Smaller items.** The wind input's `cos(θ − θ_w)` is computed once per direction instead of at every frequency (−13 ms on one thread). The exponentials of the source update are taken in a pass of their own (−3 ms).
+  - **Bit for bit.** Gate `the_lanes_give_each_nodes_transfer`: eight different seas and depths, one lane empty, three grids, with and without the tail. `the_vector_kernels_give_the_scalar_bits` now also covers the tiled sources, including a partial last chunk. At Frøya the total action after 22 steps equals `main`'s to 18 digits.
+  - **Measured.** `wave_step_bench` has a new `sources_without_dia`.
+
+    | Run | before | after |
+    |---|---|---|
+    | the DIA, 1 thread | 127 ms | 47 ms |
+    | sources, 1 thread | 247 ms | 150 ms |
+    | step, 1 thread | 597 ms | 498 ms |
+    | step, 24 threads | 120 ms | 111 ms |
+    | Frøya wave grid (`waves=20 wave_mesh=60,45 implicit=1`, 24 threads) | 113 ms per step (DIA 12.7 ms), 58 s per model hour | 105 ms per step (DIA 5.2 ms), 54 s per model hour |
+
 - **The spectral wave model's step 2× faster on one thread, 1.4× at Frøya, bit for bit (TODO F.4).**
   - **Node-major throughout.** `WaveModel2D::step` keeps the state node-major (`[point][component]`) for the whole step: one transpose in and one out, where it used to transpose around each node pass (4 → 2).
   - **The geographic propagation** (`waves/propagation.rs`) runs 8 directions of a frequency per vector (fearless_simd): they share the group velocity, the current and the element geometry.

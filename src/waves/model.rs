@@ -77,7 +77,9 @@ use crate::time::{SSPRK3, StageWorkspace, TimeIntegrator};
 use crate::types::ElementIndex;
 
 use super::dispersion::{dsigma_ddepth, group_velocity, wavenumber};
-use super::sources::{SourceTerms, Wind};
+#[cfg(feature = "simd")]
+use super::nonlinear::LANES;
+use super::sources::{SourceScratch, SourceTerms, Wind};
 use super::spectrum::{SpectralGrid, WaveParameters};
 use super::state::WaveSolution;
 
@@ -785,76 +787,123 @@ impl WaveModel2D {
             self.grid.n_freq(),
         );
         let nd = self.grid.n_dir();
+        // Nodes per chunk: the DIA's lanes take `LANES` at once
+        #[cfg(feature = "simd")]
+        let tile = if sources.is_some() && self.sources.quadruplets.is_some() && vector_kernels() {
+            LANES
+        } else {
+            1
+        };
+        #[cfg(not(feature = "simd"))]
+        let tile = 1;
         for_each_chunk(
             node_major,
-            nc,
+            tile * nc,
             || {
                 (
-                    vec![0.0; nf],
-                    vec![0.0; nc],
-                    vec![0.0; nc],
-                    vec![0.0; nc],
+                    vec![0.0; tile * nf],
+                    SourceScratch::new(nc),
                     CyclicScratch::new(nd),
                     CyclicScratch::new(nf),
                     vec![0.0; nf],
                     NodeRates::new(&self.grid),
                 )
             },
-            |(k, e, a, b, cyclic, banded, column, rates), p, spectrum| {
-                rates.fill(self, p, refraction.is_some(), shift.is_some());
-                let rates = &*rates;
-                let mut shift_now = |spectrum: &mut [f64]| {
-                    if let Some(dt) = shift {
+            |(k, scratch, cyclic, banded, column, rates), chunk, nodes| {
+                let first = chunk * tile;
+                for (q, spectrum) in nodes.chunks_exact_mut(nc).enumerate() {
+                    let p = first + q;
+                    rates.fill(self, p, refraction.is_some(), shift.is_some());
+                    let rates = &*rates;
+                    let mut shift_now = |spectrum: &mut [f64]| {
+                        if let Some(dt) = shift {
+                            #[cfg(feature = "simd")]
+                            if vector_kernels()
+                                && self.shift_lanes(p, spectrum, dt, rates.advection, &rates.strain)
+                            {
+                                return;
+                            }
+                            for j in 0..nd {
+                                for (i, x) in column.iter_mut().enumerate() {
+                                    *x = spectrum[i * nd + j];
+                                }
+                                let strain = rates.strain[j];
+                                self.shift_implicitly(
+                                    p,
+                                    column,
+                                    dt,
+                                    rates.advection,
+                                    strain,
+                                    banded,
+                                );
+                                for (i, x) in column.iter().enumerate() {
+                                    spectrum[i * nd + j] = *x;
+                                }
+                            }
+                        }
+                    };
+                    if shift_first {
+                        shift_now(spectrum);
+                    }
+                    if let Some(dt) = refraction {
                         #[cfg(feature = "simd")]
-                        if vector_kernels()
-                            && self.shift_lanes(p, spectrum, dt, rates.advection, &rates.strain)
-                        {
-                            return;
-                        }
-                        for j in 0..nd {
-                            for (i, x) in column.iter_mut().enumerate() {
-                                *x = spectrum[i * nd + j];
-                            }
-                            let strain = rates.strain[j];
-                            self.shift_implicitly(p, column, dt, rates.advection, strain, banded);
-                            for (i, x) in column.iter().enumerate() {
-                                spectrum[i * nd + j] = *x;
+                        let done =
+                            vector_kernels() && self.refract_lanes(p, spectrum, dt, &rates.turning);
+                        #[cfg(not(feature = "simd"))]
+                        let done = false;
+                        if !done {
+                            for (i, row) in spectrum.chunks_exact_mut(nd).enumerate() {
+                                self.refract_implicitly(i, p, row, dt, &rates.turning, cyclic);
                             }
                         }
                     }
-                };
-                if shift_first {
-                    shift_now(spectrum);
+                    if !shift_first {
+                        shift_now(spectrum);
+                    }
+                    if let (Some(dt), 1) = (sources, tile) {
+                        for (i, k) in k.iter_mut().enumerate() {
+                            *k = self.k[i * np + p];
+                        }
+                        let SourceScratch { e, a, b, .. } = scratch;
+                        self.sources.integrate(
+                            &self.grid,
+                            spectrum,
+                            k,
+                            self.depth[p],
+                            self.wind_at(p),
+                            dt,
+                            e,
+                            a,
+                            b,
+                        );
+                    }
                 }
-                if let Some(dt) = refraction {
-                    #[cfg(feature = "simd")]
-                    let done =
-                        vector_kernels() && self.refract_lanes(p, spectrum, dt, &rates.turning);
-                    #[cfg(not(feature = "simd"))]
-                    let done = false;
-                    if !done {
-                        for (i, row) in spectrum.chunks_exact_mut(nd).enumerate() {
-                            self.refract_implicitly(i, p, row, dt, &rates.turning, cyclic);
+                // The sources at all the chunk's nodes at once
+                #[cfg(feature = "simd")]
+                if let (Some(dt), LANES) = (sources, tile) {
+                    let width = nodes.len() / nc;
+                    for q in 0..width {
+                        for (i, k) in k[q * nf..(q + 1) * nf].iter_mut().enumerate() {
+                            *k = self.k[i * np + first + q];
                         }
                     }
-                }
-                if !shift_first {
-                    shift_now(spectrum);
-                }
-                if let Some(dt) = sources {
-                    for (i, k) in k.iter_mut().enumerate() {
-                        *k = self.k[i * np + p];
-                    }
-                    self.sources.integrate(
+                    let depths: [f64; LANES] =
+                        std::array::from_fn(|q| self.depth.get(first + q).copied().unwrap_or(0.0));
+                    let winds: [Wind; LANES] = std::array::from_fn(|q| {
+                        if q < width {
+                            self.wind_at(first + q)
+                        } else {
+                            Wind::default()
+                        }
+                    });
+                    self.sources.integrate_lanes(
                         &self.grid,
-                        spectrum,
+                        nodes,
                         k,
-                        self.depth[p],
-                        self.wind_at(p),
+                        &depths[..width],
+                        &winds[..width],
                         dt,
-                        e,
-                        a,
-                        b,
+                        scratch,
                     );
                 }
             },
