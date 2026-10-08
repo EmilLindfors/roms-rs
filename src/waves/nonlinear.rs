@@ -32,6 +32,12 @@ use std::f64::consts::TAU;
 
 use super::spectrum::SpectralGrid;
 
+#[cfg(feature = "simd")]
+#[path = "dia_lanes.rs"]
+mod lanes;
+#[cfg(feature = "simd")]
+pub(crate) use lanes::LANES;
+
 /// Coefficients of the DIA.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Quadruplets {
@@ -144,75 +150,34 @@ impl Quadruplets {
         scale: f64,
         s: &mut [f64],
     ) {
-        let (nf, nd) = (grid.n_freq() as isize, grid.n_dir() as isize);
+        let (nf, nd) = (grid.n_freq(), grid.n_dir());
         s.fill(0.0);
-        let st = self.stencil(grid);
-        let gamma = grid.frequency_ratio();
-        let lam = self.lambda;
-        let (w_plus, w_minus, w_both) = (
-            (1.0 + lam).powi(-4),
-            (1.0 - lam).powi(-4),
-            2.0 * (1.0 - lam * lam).powi(-4),
-        );
+        let (w_plus, w_minus, w_both) = self.weights();
         let constant = scale * self.c_nl4 * TAU * TAU / g.powi(4);
         DIA_SCRATCH.with_borrow_mut(|scratch| {
+            let DiaScratch {
+                tables, extended, ..
+            } = scratch;
+            let t = Tables::cached(tables, self, grid, tail);
+            let st = &t.stencil;
             // E with the rows the stencil reaches below the grid (zero) and
-            // above it (the tail), and each direction landing's bins on the
-            // circle: plain loads in the loops below (bounds, wrapping and the
-            // tail at every access were most of the DIA's cost)
-            let (lo, hi) = (
-                st.plus.offset.min(st.minus.offset).min(0),
-                (nf + st.plus.offset.max(st.minus.offset) + 1).max(nf),
-            );
-            let ext = &mut scratch.extended;
-            ext.clear();
-            for i in lo..hi {
-                for j in 0..nd {
-                    ext.push(if i < 0 {
-                        0.0
-                    } else if i < nf {
-                        e[(i * nd + j) as usize]
-                    } else {
-                        match tail {
-                            Some(p) => {
-                                e[((nf - 1) * nd + j) as usize]
-                                    * gamma.powf(-p * (i - nf + 1) as f64)
-                            }
-                            None => 0.0,
-                        }
-                    });
-                }
-            }
-            let landings = [
-                st.dir_plus[0],
-                st.dir_plus[1],
-                st.dir_minus[0],
-                st.dir_minus[1],
-            ];
-            let bins = &mut scratch.bins;
-            bins.clear();
-            for d in landings {
-                for b in 0..2 {
-                    bins.extend((0..nd).map(|j| (j + d.offset + b).rem_euclid(nd) as usize));
-                }
-            }
-            let (ext, bins) = (&*ext, &*bins);
-            let nd_u = nd as usize;
-            // The bins of landing `l` (0, 1: σ₊ and its mirror; 2, 3: σ₋) at
-            // offset `b` from direction `j`
-            let bin = |l: usize, b: usize, j: usize| bins[(2 * l + b) * nd_u + j];
-            let gather = |i: isize, j: usize, f: Landing, l: usize, d: Landing| -> f64 {
+            // above it (the tail): plain loads in the loops below (bounds,
+            // wrapping and the tail at every access were most of the DIA's
+            // cost)
+            t.extend(e, 1, extended);
+            let ext = &*extended;
+            let gather = |i: usize, j: usize, f: Landing, l: usize, d: Landing| -> f64 {
                 let mut sum = 0.0;
                 for (a, wf) in f.weights.iter().enumerate() {
-                    let row = (i + f.offset + a as isize - lo) as usize * nd_u;
+                    let row = t.row(i, f, a) * nd;
                     for (b, wd) in d.weights.iter().enumerate() {
-                        sum += wf * wd * ext[row + bin(l, b, j)];
+                        sum += wf * wd * ext[row + t.bin(l, b, j)];
                     }
                 }
                 sum
             };
             let scatter = |s: &mut [f64],
-                           i: isize,
+                           i: usize,
                            j: usize,
                            f: Landing,
                            l: usize,
@@ -220,21 +185,20 @@ impl Quadruplets {
                            vol: [f64; 2],
                            r: f64| {
                 for (a, (wf, vol)) in f.weights.iter().zip(vol).enumerate() {
-                    let ib = i + f.offset + a as isize;
-                    if !(0..nf).contains(&ib) {
+                    let Some(ib) = t.target(i, f, a) else {
                         continue;
-                    }
+                    };
                     let gain = r * wf * vol;
-                    let row = ib as usize * nd_u;
+                    let row = ib * nd;
                     for (b, wd) in d.weights.iter().enumerate() {
-                        s[row + bin(l, b, j)] += gain * wd;
+                        s[row + t.bin(l, b, j)] += gain * wd;
                     }
                 }
             };
             for i in 0..nf {
-                let factor = constant * (grid.sigma[i as usize] / TAU).powi(11);
-                for j in 0..nd_u {
-                    let ec = e[i as usize * nd_u + j];
+                let factor = constant * t.sigma11[i];
+                for j in 0..nd {
+                    let ec = e[i * nd + j];
                     if ec <= 0.0 {
                         continue;
                     }
@@ -244,7 +208,7 @@ impl Quadruplets {
                         let em = gather(i, j, st.minus, 2 + m, dm);
                         let r =
                             factor * ec * (ec * (ep * w_plus + em * w_minus) - w_both * ep * em);
-                        s[i as usize * nd_u + j] -= 2.0 * r;
+                        s[i * nd + j] -= 2.0 * r;
                         scatter(s, i, j, st.plus, m, dp, st.volume_plus, r);
                         scatter(s, i, j, st.minus, 2 + m, dm, st.volume_minus, r);
                     }
@@ -252,14 +216,168 @@ impl Quadruplets {
             }
         });
     }
+
+    /// The weights `((1 + λ)⁻⁴, (1 − λ)⁻⁴, 2 (1 − λ²)⁻⁴)` of the transfer's
+    /// three products.
+    fn weights(&self) -> (f64, f64, f64) {
+        let lam = self.lambda;
+        (
+            (1.0 + lam).powi(-4),
+            (1.0 - lam).powi(-4),
+            2.0 * (1.0 - lam * lam).powi(-4),
+        )
+    }
 }
 
-/// Per-thread storage of [`Quadruplets::source`]: the spectrum extended by
-/// the rows its stencil reaches, and the direction landings' bins.
+/// What the transfer needs of the grid besides the spectrum, the same at
+/// every node: the stencil, the rows of the extended spectrum, the tail's
+/// factors above the grid, each direction landing's bins on the circle and
+/// `(σ/2π)¹¹`. Built once per thread for the grid, the λ and the tail it
+/// belongs to ([`Tables::cached`]).
+struct Tables {
+    /// What the tables were built for: λ, the tail, `Δθ`, `n_θ` and the
+    /// frequencies
+    lambda: f64,
+    tail: Option<f64>,
+    d_theta: f64,
+    n_dir: usize,
+    sigma: Vec<f64>,
+    stencil: Stencil,
+    /// The extended spectrum's rows are the frequencies `lo..hi`
+    lo: isize,
+    hi: isize,
+    /// The tail's factor `γ^(−p (i − n_σ + 1))` of each row `i ≥ n_σ`, or
+    /// none (zero above the grid)
+    tail_factors: Option<Vec<f64>>,
+    /// The bins of landing `l` (0, 1: σ₊ and its mirror; 2, 3: σ₋) at offset
+    /// `b` from direction `j`: `bins[(2l + b) n_θ + j]`
+    bins: Vec<usize>,
+    /// `(σ_i/2π)¹¹`
+    sigma11: Vec<f64>,
+}
+
+impl Tables {
+    /// The tables in `slot`, rebuilt first unless they belong to this grid,
+    /// λ and tail.
+    fn cached<'a>(
+        slot: &'a mut Option<Tables>,
+        quadruplets: &Quadruplets,
+        grid: &SpectralGrid,
+        tail: Option<f64>,
+    ) -> &'a Tables {
+        let fits = |t: &Tables| {
+            t.lambda == quadruplets.lambda
+                && t.tail == tail
+                && t.d_theta == grid.d_theta
+                && t.n_dir == grid.n_dir()
+                && t.sigma == grid.sigma
+        };
+        if !slot.as_ref().is_some_and(fits) {
+            *slot = Some(Self::new(quadruplets, grid, tail));
+        }
+        slot.as_ref().expect("built above")
+    }
+
+    fn new(quadruplets: &Quadruplets, grid: &SpectralGrid, tail: Option<f64>) -> Self {
+        let (nf, nd) = (grid.n_freq() as isize, grid.n_dir() as isize);
+        let stencil = quadruplets.stencil(grid);
+        let gamma = grid.frequency_ratio();
+        let (lo, hi) = (
+            stencil.plus.offset.min(stencil.minus.offset).min(0),
+            (nf + stencil.plus.offset.max(stencil.minus.offset) + 1).max(nf),
+        );
+        let tail_factors = tail.map(|p| {
+            (nf..hi)
+                .map(|i| gamma.powf(-p * (i - nf + 1) as f64))
+                .collect()
+        });
+        let landings = [
+            stencil.dir_plus[0],
+            stencil.dir_plus[1],
+            stencil.dir_minus[0],
+            stencil.dir_minus[1],
+        ];
+        let mut bins = Vec::with_capacity(8 * nd as usize);
+        for d in landings {
+            for b in 0..2 {
+                bins.extend((0..nd).map(|j| (j + d.offset + b).rem_euclid(nd) as usize));
+            }
+        }
+        Self {
+            lambda: quadruplets.lambda,
+            tail,
+            d_theta: grid.d_theta,
+            n_dir: grid.n_dir(),
+            sigma: grid.sigma.clone(),
+            stencil,
+            lo,
+            hi,
+            tail_factors,
+            bins,
+            sigma11: grid.sigma.iter().map(|s| (s / TAU).powi(11)).collect(),
+        }
+    }
+
+    /// `e` extended by the rows the stencil reaches (in `extended`, rows
+    /// `lo..hi`): zero below the grid, the tail (or zero) above it. `e` holds
+    /// `lanes` spectra interleaved (`e[c · lanes + l]`), and so does
+    /// `extended`.
+    fn extend(&self, e: &[f64], lanes: usize, extended: &mut Vec<f64>) {
+        let width = self.n_dir * lanes;
+        let nf = self.sigma.len() as isize;
+        extended.clear();
+        for i in self.lo..self.hi {
+            if i < 0 {
+                extended.extend(std::iter::repeat_n(0.0, width));
+            } else if i < nf {
+                let row = i as usize * width;
+                extended.extend_from_slice(&e[row..row + width]);
+            } else {
+                let top = &e[(nf as usize - 1) * width..nf as usize * width];
+                match &self.tail_factors {
+                    Some(factors) => {
+                        let factor = factors[(i - nf) as usize];
+                        extended.extend(top.iter().map(|x| x * factor));
+                    }
+                    None => extended.extend(std::iter::repeat_n(0.0, width)),
+                }
+            }
+        }
+    }
+
+    /// The extended spectrum's row of frequency `i`'s landing `f` at offset
+    /// `a`.
+    #[inline(always)]
+    fn row(&self, i: usize, f: Landing, a: usize) -> usize {
+        (i as isize + f.offset + a as isize - self.lo) as usize
+    }
+
+    /// The grid's row of frequency `i`'s landing `f` at offset `a`, or none
+    /// off the grid.
+    #[inline(always)]
+    fn target(&self, i: usize, f: Landing, a: usize) -> Option<usize> {
+        let ib = i as isize + f.offset + a as isize;
+        (0..self.sigma.len() as isize)
+            .contains(&ib)
+            .then_some(ib as usize)
+    }
+
+    /// The bin of direction landing `l` at offset `b` from direction `j`.
+    #[inline(always)]
+    fn bin(&self, l: usize, b: usize, j: usize) -> usize {
+        self.bins[(2 * l + b) * self.n_dir + j]
+    }
+}
+
+/// Per-thread storage of [`Quadruplets::source`]: the tables, the spectrum
+/// extended by the rows its stencil reaches, and the vector kernel's tiles.
 #[derive(Default)]
 struct DiaScratch {
+    tables: Option<Tables>,
     extended: Vec<f64>,
-    bins: Vec<usize>,
+    /// The extended spectra of [`Quadruplets::source_lanes`], interleaved
+    #[cfg(feature = "simd")]
+    extended_lanes: Vec<f64>,
 }
 
 thread_local! {
@@ -407,6 +525,54 @@ mod tests {
             direct_source(&q, &grid, &e, tail, 1.3, &mut direct);
             assert!(direct.iter().any(|&x| x != 0.0));
             assert_eq!(fast, direct, "{n_freq}×{n_dir}, tail {tail:?}");
+        }
+    }
+
+    /// The transfer at [`LANES`] nodes at once is each node's own bit for
+    /// bit: different seas and depths per lane, an empty lane, and the grids
+    /// of `the_tables_give_the_direct_transfer`.
+    #[cfg(feature = "simd")]
+    #[test]
+    fn the_lanes_give_each_nodes_transfer() {
+        for (n_freq, n_dir, tail) in [(25, 36, Some(4.0)), (30, 24, None), (12, 6, Some(5.0))] {
+            let grid = SpectralGrid::new(0.04, 0.5, n_freq, n_dir);
+            let nc = grid.n_components();
+            let q = Quadruplets::default();
+            let seas: Vec<Vec<f64>> = (0..LANES)
+                .map(|l| match l {
+                    3 => vec![0.0; nc],
+                    _ => {
+                        let mut e = grid.jonswap(
+                            1.0 + 0.4 * l as f64,
+                            3.0 + l as f64,
+                            3.3,
+                            0.3 * l as f64,
+                            2.0,
+                        );
+                        // Some empty components among full ones
+                        for c in (l..nc).step_by(7) {
+                            e[c] = 0.0;
+                        }
+                        e
+                    }
+                })
+                .collect();
+            let scales: [f64; LANES] = std::array::from_fn(|l| 1.0 + 0.37 * l as f64);
+            let mut e = vec![0.0; nc * LANES];
+            for (l, sea) in seas.iter().enumerate() {
+                for (c, x) in sea.iter().enumerate() {
+                    e[c * LANES + l] = *x;
+                }
+            }
+            let mut lanes = vec![f64::NAN; nc * LANES];
+            q.source_lanes(&grid, &e, tail, G, scales, &mut lanes);
+            for (l, sea) in seas.iter().enumerate() {
+                let mut alone = vec![0.0; nc];
+                q.source(&grid, sea, tail, G, scales[l], &mut alone);
+                let lane: Vec<u64> = (0..nc).map(|c| lanes[c * LANES + l].to_bits()).collect();
+                let alone: Vec<u64> = alone.iter().map(|x| x.to_bits()).collect();
+                assert_eq!(lane, alone, "{n_freq}×{n_dir}, tail {tail:?}, lane {l}");
+            }
         }
     }
 

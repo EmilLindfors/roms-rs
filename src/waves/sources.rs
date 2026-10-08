@@ -45,6 +45,8 @@
 use std::f64::consts::{PI, TAU};
 
 use super::dispersion::group_velocity;
+#[cfg(feature = "simd")]
+use super::nonlinear::LANES;
 use super::nonlinear::{Quadruplets, shallow_water_factor};
 use super::spectrum::SpectralGrid;
 
@@ -60,6 +62,10 @@ pub const DEFAULT_LIMITER: f64 = 0.1;
 
 /// Phillips' constant α_PM of the equilibrium range (Pierson & Moskowitz 1964).
 const PHILLIPS: f64 = 0.0081;
+
+/// Directions whose wind-input cosines [`SourceTerms::rates`] tabulates on the
+/// stack; it computes those of any further directions at every frequency.
+const MAX_DIRECTIONS: usize = 72;
 
 /// Wind at a node: speed at 10 m (m/s) and the direction it blows *to* (rad,
 /// counter-clockwise from mesh +x).
@@ -195,33 +201,49 @@ impl SourceTerms {
         a: &mut [f64],
         b: &mut [f64],
     ) {
-        let (nf, nd) = (grid.n_freq(), grid.n_dir());
         a.fill(0.0);
         b.fill(0.0);
-        let g = self.g;
         let means = Means::of(grid, e, k);
-
         // First, while `b` is free: the DIA's transfer, split into gains and losses
         if let (Some(quadruplets), Some(means)) = (self.quadruplets, means) {
-            let scale = shallow_water_factor(0.75 * means.k * depth);
-            quadruplets.source(grid, e, self.tail, g, scale, b);
-            for ((a, b), &e) in a.iter_mut().zip(b.iter_mut()).zip(e) {
-                let s = std::mem::take(b);
-                if s >= 0.0 || e <= 0.0 {
-                    *a = s;
-                } else {
-                    *b = s / e;
-                }
-            }
+            let scale = quadruplet_scale(means, depth);
+            quadruplets.source(grid, e, self.tail, self.g, scale, b);
+            split_transfer(e, a, b);
         }
+        self.add_local_rates(grid, e, k, depth, wind, means, a, b);
+    }
+
+    /// The terms of [`Self::rates`] besides the DIA, added to `a` and `b`;
+    /// `means` are `e`'s.
+    #[allow(clippy::too_many_arguments)]
+    fn add_local_rates(
+        &self,
+        grid: &SpectralGrid,
+        e: &[f64],
+        k: &[f64],
+        depth: f64,
+        wind: Wind,
+        means: Option<Means>,
+        a: &mut [f64],
+        b: &mut [f64],
+    ) {
+        let (nf, nd) = (grid.n_freq(), grid.n_dir());
+        let g = self.g;
         if self.wind && wind.u10 > 0.0 {
             let us = wind.friction_velocity();
             let sigma_pm = TAU * 0.13 * g / (28.0 * us);
+            // cos(θ − θ_w) once per direction (on the stack up to
+            // `MAX_DIRECTIONS`), not at every frequency
+            let mut table = [0.0; MAX_DIRECTIONS];
+            let cosine = |j: usize| (grid.theta[j] - wind.direction).cos();
+            for (j, cos) in table.iter_mut().enumerate().take(nd) {
+                *cos = cosine(j);
+            }
             for (i, &ki) in k.iter().enumerate().take(nf) {
                 let (s, c) = (grid.sigma[i], grid.sigma[i] / ki);
                 let filter = (-(s / sigma_pm).powi(-4)).exp();
                 for j in 0..nd {
-                    let cos = (grid.theta[j] - wind.direction).cos();
+                    let cos = table.get(j).copied().unwrap_or_else(|| cosine(j));
                     let comp = i * nd + j;
                     b[comp] +=
                         (0.25 * RHO_AIR / RHO_WATER * (28.0 * us / c * cos - 1.0)).max(0.0) * s;
@@ -281,27 +303,119 @@ impl SourceTerms {
         a: &mut [f64],
         b: &mut [f64],
     ) {
-        let nd = grid.n_dir();
-        for (c, (e, n)) in e.iter_mut().zip(n.iter()).enumerate() {
-            *e = grid.sigma[c / nd] * n;
-        }
+        variance(grid, n, e);
         self.rates(grid, e, k, depth, wind, a, b);
+        self.advance(grid, n, k, depth, wind, dt, e, a, b);
+    }
+
+    /// [`Self::integrate`] at the [`LANES`] nodes (or fewer) whose spectra
+    /// lie one after the other in `spectra`, the DIA's transfer at all of
+    /// them at once ([`Quadruplets::source_lanes`]), bit for bit as
+    /// [`Self::integrate`] at each. Node `l` has the wavenumbers
+    /// `k[l n_σ..(l + 1) n_σ]`, the depth `depths[l]` and the wind
+    /// `winds[l]`.
+    #[cfg(feature = "simd")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn integrate_lanes(
+        &self,
+        grid: &SpectralGrid,
+        spectra: &mut [f64],
+        k: &[f64],
+        depths: &[f64],
+        winds: &[Wind],
+        dt: f64,
+        scratch: &mut SourceScratch,
+    ) {
+        let (nf, nc) = (grid.n_freq(), grid.n_components());
+        let k = |l: usize| &k[l * nf..(l + 1) * nf];
+        let SourceScratch {
+            e,
+            a,
+            b,
+            e_lanes,
+            s_lanes,
+        } = scratch;
+        let Some(quadruplets) = self.quadruplets else {
+            for (l, n) in spectra.chunks_exact_mut(nc).enumerate() {
+                self.integrate(grid, n, k(l), depths[l], winds[l], dt, e, a, b);
+            }
+            return;
+        };
+        // The nodes' variance densities interleaved, empty lanes beyond them
+        e_lanes.clear();
+        e_lanes.resize(nc * LANES, 0.0);
+        s_lanes.resize(nc * LANES, 0.0);
+        let mut means = [None; LANES];
+        let mut scales = [1.0; LANES];
+        for (l, n) in spectra.chunks_exact(nc).enumerate() {
+            variance(grid, n, e);
+            means[l] = Means::of(grid, e, k(l));
+            if let Some(means) = means[l] {
+                scales[l] = quadruplet_scale(means, depths[l]);
+            }
+            for (c, x) in e.iter().enumerate() {
+                e_lanes[c * LANES + l] = *x;
+            }
+        }
+        quadruplets.source_lanes(grid, e_lanes, self.tail, self.g, scales, s_lanes);
+        for (l, n) in spectra.chunks_exact_mut(nc).enumerate() {
+            variance(grid, n, e);
+            a.fill(0.0);
+            b.fill(0.0);
+            if means[l].is_some() {
+                for (c, b) in b.iter_mut().enumerate() {
+                    *b = s_lanes[c * LANES + l];
+                }
+                split_transfer(e, a, b);
+            }
+            self.add_local_rates(grid, e, k(l), depths[l], winds[l], means[l], a, b);
+            self.advance(grid, n, k(l), depths[l], winds[l], dt, e, a, b);
+        }
+    }
+
+    /// The update of [`Self::integrate`] from the rates `a`, `b` of `n`, then
+    /// the tail. `e` is scratch.
+    #[allow(clippy::too_many_arguments)]
+    fn advance(
+        &self,
+        grid: &SpectralGrid,
+        n: &mut [f64],
+        k: &[f64],
+        depth: f64,
+        wind: Wind,
+        dt: f64,
+        e: &mut [f64],
+        a: &[f64],
+        b: &[f64],
+    ) {
+        let nd = grid.n_dir();
+        // The exponentials first (in `e`, free until the tail), so that the
+        // loop around them is free of calls
+        let growths = &mut *e;
+        for (growth, b) in growths.iter_mut().zip(b) {
+            *growth = (b * dt).exp();
+        }
         for (i, (&sigma, &ki)) in grid.sigma.iter().zip(k).enumerate() {
             // Ris's limit on the growth over a step, or none
             let max_growth = self.limiter.map_or(f64::INFINITY, |gamma| {
                 gamma * PHILLIPS / (2.0 * sigma * ki.powi(3) * group_velocity(sigma, ki, depth))
             });
-            for c in i * nd..(i + 1) * nd {
-                let x = b[c] * dt;
-                let growth = x.exp();
+            let row = i * nd..(i + 1) * nd;
+            let rows = n[row.clone()]
+                .iter_mut()
+                .zip(&growths[row.clone()])
+                .zip(&a[row.clone()])
+                .zip(&b[row]);
+            for (((n, &growth), &a), &b) in rows {
+                let x = b * dt;
                 // (e^x − 1)/x → 1 as x → 0
                 let phi = if x.abs() < 1e-8 {
                     1.0 + 0.5 * x
                 } else {
                     (growth - 1.0) / x
                 };
-                let next = n[c] * growth + a[c] / sigma * dt * phi;
-                n[c] = next.min(n[c] + max_growth).max(0.0);
+                let next = *n * growth + a / sigma * dt * phi;
+                *n = next.min(*n + max_growth).max(0.0);
             }
         }
         if let Some(power) = self.tail {
@@ -322,9 +436,7 @@ impl SourceTerms {
         e: &mut [f64],
     ) {
         let nd = grid.n_dir();
-        for (c, (e, n)) in e.iter_mut().zip(n.iter()).enumerate() {
-            *e = grid.sigma[c / nd] * n;
-        }
+        variance(grid, n, e);
         let Some(means) = Means::of(grid, e, k) else {
             return;
         };
@@ -342,6 +454,63 @@ impl SourceTerms {
             for j in 0..nd {
                 n[i * nd + j] = e[ic * nd + j] * ratio;
             }
+        }
+    }
+}
+
+/// `e = σ N`: the variance density of the action density `n`.
+fn variance(grid: &SpectralGrid, n: &[f64], e: &mut [f64]) {
+    let nd = grid.n_dir();
+    for (c, (e, n)) in e.iter_mut().zip(n).enumerate() {
+        *e = grid.sigma[c / nd] * n;
+    }
+}
+
+/// The DIA's finite-depth factor at a node of depth `depth` with the
+/// spectrum's `means`: `R(0.75 k̃ d)`.
+fn quadruplet_scale(means: Means, depth: f64) -> f64 {
+    shallow_water_factor(0.75 * means.k * depth)
+}
+
+/// Split the DIA's transfer in `b` (of the variance density `e`) into the
+/// gains, which join the linear input `a`, and the losses, which stay in `b`
+/// as the rate `S_nl/E`.
+fn split_transfer(e: &[f64], a: &mut [f64], b: &mut [f64]) {
+    for ((a, b), &e) in a.iter_mut().zip(b.iter_mut()).zip(e) {
+        let s = std::mem::take(b);
+        if s >= 0.0 || e <= 0.0 {
+            *a = s;
+        } else {
+            *b = s / e;
+        }
+    }
+}
+
+/// Per-worker storage of [`SourceTerms::integrate`] (one node's variance
+/// density, input and rates) and `integrate_lanes` (also the interleaved
+/// spectra and transfers of the DIA's lanes).
+#[derive(Default)]
+pub(crate) struct SourceScratch {
+    pub e: Vec<f64>,
+    pub a: Vec<f64>,
+    pub b: Vec<f64>,
+    #[cfg(feature = "simd")]
+    e_lanes: Vec<f64>,
+    #[cfg(feature = "simd")]
+    s_lanes: Vec<f64>,
+}
+
+impl SourceScratch {
+    /// Storage for `n_components` components.
+    pub fn new(n_components: usize) -> Self {
+        Self {
+            e: vec![0.0; n_components],
+            a: vec![0.0; n_components],
+            b: vec![0.0; n_components],
+            #[cfg(feature = "simd")]
+            e_lanes: Vec::new(),
+            #[cfg(feature = "simd")]
+            s_lanes: Vec::new(),
         }
     }
 }

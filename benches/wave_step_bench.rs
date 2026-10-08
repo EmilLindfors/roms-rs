@@ -12,7 +12,8 @@
 //!
 //! `step` is the production path (node-major throughout); the node passes
 //! alone (`sources`, `implicit_*`) include the transposes of the public
-//! `apply_*` functions.
+//! `apply_*` functions. `sources_without_dia` leaves out the quadruplets, so
+//! the DIA's share is `sources` less it.
 
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -27,7 +28,7 @@ const G: f64 = 9.81;
 const LX: f64 = 60_000.0;
 const LY: f64 = 45_000.0;
 
-fn model() -> (WaveModel2D, WaveSolution) {
+fn build(sources: SourceTerms) -> (WaveModel2D, WaveSolution) {
     let mesh = Mesh2D::uniform_rectangle_with_bc(0.0, LX, 0.0, LY, 60, 45, BoundaryTag::Open);
     let ops = DGOperators2D::new(1);
     let geom = GeometricFactors2D::compute(&mesh, &ops);
@@ -47,7 +48,7 @@ fn model() -> (WaveModel2D, WaveSolution) {
         grid,
         G,
     )
-    .with_sources(SourceTerms::swan_defaults(G))
+    .with_sources(sources)
     .with_boundary_spectrum(&sea)
     .with_wind(Wind {
         u10: 15.0,
@@ -73,7 +74,7 @@ fn model() -> (WaveModel2D, WaveSolution) {
 }
 
 fn bench_wave_step(c: &mut Criterion) {
-    let (model, state) = model();
+    let (model, state) = build(SourceTerms::swan_defaults(G));
     let dt = model.compute_dt(0.5);
     let mut group = c.benchmark_group("wave_step_p1");
     group.sample_size(10);
@@ -87,6 +88,12 @@ fn bench_wave_step(c: &mut Criterion) {
     let mut n = state.clone();
     group.bench_function("sources", |b| {
         b.iter(|| model.apply_sources(black_box(&mut n), dt, &mut ws))
+    });
+    // The sources less the DIA: the DIA's share is the difference
+    let (without_dia, _) = build(SourceTerms::swan_defaults(G).with_quadruplets(None));
+    let mut n = state.clone();
+    group.bench_function("sources_without_dia", |b| {
+        b.iter(|| without_dia.apply_sources(black_box(&mut n), dt, &mut ws))
     });
     let mut n = state.clone();
     group.bench_function("implicit_refraction", |b| {
