@@ -100,20 +100,48 @@
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
-//!     [wave_mesh=NX,NY[,ORDER]] \
+//!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [levels=0] [tide3d=0] [restart_hours=0] [resume=<file>]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
 //! instead of the tidal run (`wave_grid=frequencies,directions`, refraction
-//! capped at `turning=` rad/s, or stepped implicitly with `implicit=1`): the
-//! step, what sets it, and the cost per model hour. With
+//! capped at `turning=` rad/s, or refraction and frequency shifting stepped
+//! implicitly with `implicit=1`): the step, what sets it, and the cost per
+//! model hour. With
 //! `wave_mesh=NX,NY[,ORDER]` the waves run on an NX × NY grid of their own (P1
 //! by default) over the same bed, and the coupling to the run's mesh
-//! (`WaveCoupling2D`) is built and each exchange timed. With `wave_mesh=NX,NY[,ORDER]`
-//! the waves run on an NX × NY grid of their own (P1 by default) over the same
-//! bed, and the coupling to the run's mesh (`WaveCoupling2D`) is built and each
-//! exchange timed.
+//! (`WaveCoupling2D`) is built and each exchange timed.
+//!
+//! `wave_coupling=MINUTES` runs the waves with the 2D tide, two-way coupled
+//! every MINUTES (`CoupledWaves2D`, `Simulation::run_with_exchange`; a
+//! multiple of `station_minutes`): the waves take the tide's level and
+//! current, and give it their radiation-stress force (linear in time across
+//! each interval) and Soulsby's enhancement of its Manning friction, both
+//! ramped up over `ramp_hours`. On the run's mesh, or on `wave_mesh=`. The
+//! sea `wave_sea=HS,TP,FROM` (JONSWAP, H_s in m, T_p in s, coming from FROM
+//! degrees) comes in through the open boundaries and fills the domain at the
+//! start; `wind` also blows on the waves (`met=` does not reach them yet).
+//! Every output interval a line of the waves (the largest H_s, the mean over
+//! water ≥ 3 m deep, the largest force, the mean wave step and its cost, and
+//! what sets the step where) comes before the tide's. Use `implicit=1`: the
+//! tide's currents over the shallows otherwise set the waves' step by
+//! frequency shifting (0.6 s against the geographic 7 s at 1 km).
+//!
+//! `wave_spectra=<file>` takes the sea from a parent wave model instead:
+//! MET Norway's MyWave WAM 800 m spectra at its points
+//! (`examples/met_wave_subset.rs` fetches the latest forecast's points
+//! around the domain; `io::WaveSpectraFile`). Each open-boundary node of the
+//! waves takes the inverse-distance mean of its `wave_neighbours` nearest
+//! points, regridded onto the waves' grid and linear in time, at every wave
+//! step (`waves::BoundarySpectra`); the waves start from the boundary's mean
+//! spectrum everywhere and take the parent's wind (the mean of its points',
+//! `waves::WindSeries`). The run's clock (`start=`) must fall in the file's
+//! times. Every output interval our H_s at the parent's points is printed
+//! against the parent's, and at the end the bias and RMSE after twice
+//! `ramp_hours`, with the series in `<output>/wave_points.txt`. For a
+//! storm with its weather, fetch MET Nordic for the same days
+//! (`met_forcing_subset`) and pass it as `met=`.
 //!
 //! `levels=N tide3d=1` runs the tide in 3D instead (`tidal_run_3d`, TODO P1.3):
 //! the 2D run's open boundary (NorKyst nesting with `norkyst=`, else the atlas
@@ -254,6 +282,8 @@ use dg_rs::boundary::{
 };
 use dg_rs::equations::ShallowWater2D;
 #[cfg(feature = "netcdf")]
+use dg_rs::io::WaveSpectraFile;
+#[cfg(feature = "netcdf")]
 use dg_rs::io::{AtmosphereReader, NetCDFMeshInfo, NetCDFWriter, NetCDFWriterConfig};
 use dg_rs::io::{
     BedRaster, CoastlineData, CoordinateProjection, GeoBoundingBox, GeoTiffBathymetry,
@@ -266,7 +296,7 @@ use dg_rs::mesh::{
 };
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::physics::{PhysicsBuilder, PhysicsModule, SWEPhysics2D, SWEPhysics2DBuilder};
-use dg_rs::simulation::Simulation;
+use dg_rs::simulation::{Simulation, SimulationResult};
 use dg_rs::solver::{
     LINEAR_CFL_SAFETY, Probe2D, SWESolution2D, SWEState2D, StandardLimiter2D, WetDryConfig,
     linear_cfl_swe_2d, positivity_cfl_swe_2d,
@@ -276,10 +306,16 @@ use dg_rs::source::{
     GriddedWindStress, ManningFriction2D, WindStress2D,
 };
 use dg_rs::tides::canonical_name;
-use dg_rs::time::{IntegratorInfo, ModelClock, Multirate, SSPRK3, SspScheme, StandardIntegrator};
+use dg_rs::time::{
+    IntegratorInfo, ModelClock, Multirate, SSPRK3, SspScheme, StandardIntegrator, TimeIntegrator,
+};
 #[cfg(feature = "netcdf")]
 use dg_rs::types::Depth;
 use dg_rs::types::ElementIndex;
+use dg_rs::waves::{BoundarySpectra, PointSpectra, WindSeries};
+use dg_rs::waves::{
+    CoupledWaves2D, CoupledWavesStats, SourceTerms, SpectralGrid, WaveModel2D, Wind,
+};
 
 /// Gravitational acceleration (m/s²)
 const G: f64 = 9.81;
@@ -444,12 +480,26 @@ struct Options {
     waves: usize,
     wave_grid: [usize; 2],
     turning: Option<f64>,
-    /// Step refraction implicitly (`implicit=1`)
+    /// Step refraction and frequency shifting implicitly (`implicit=1`)
     implicit_refraction: bool,
     /// The waves on a grid of their own (`wave_mesh=NX,NY[,ORDER]`, order 1
     /// by default) instead of the run's mesh, coupled to it by
     /// `WaveCoupling2D`
     wave_mesh: Option<[usize; 3]>,
+    /// Run the waves with the tide, two-way coupled every this many minutes
+    /// (`wave_coupling=`; 0: off)
+    wave_coupling: f64,
+    /// The sea at the open boundaries and, to start with, everywhere:
+    /// JONSWAP of H_s (m) and T_p (s) coming from (degrees, nautical)
+    /// (`wave_sea=HS,TP,FROM`)
+    wave_sea: [f64; 3],
+    /// A parent wave model's point spectra for the open boundary and its
+    /// wind for the waves, instead of `wave_sea` (`wave_spectra=<file>`,
+    /// from `met_wave_subset`)
+    wave_spectra: Option<PathBuf>,
+    /// Each open-boundary node takes the inverse-distance mean of this many
+    /// nearest parent points (`wave_neighbours=`)
+    wave_neighbours: usize,
     /// Time the 3D model on the domain with this many σ-levels instead of
     /// the tidal run (`levels=N`; 0: off), for `steps_3d=` steps
     levels: usize,
@@ -582,6 +632,20 @@ impl Options {
                 .map(|v| v.parse().map_err(|_| format!("bad turning={v}")))
                 .transpose()?,
             implicit_refraction: get("implicit", 0.0)? != 0.0,
+            wave_coupling: get("wave_coupling", 0.0)?,
+            wave_spectra: args.get("wave_spectra").map(PathBuf::from),
+            wave_neighbours: get("wave_neighbours", 2.0)? as usize,
+            wave_sea: {
+                let text = args.get("wave_sea").map_or("2.5,10,285", String::as_str);
+                let parts: Vec<f64> = text
+                    .split(',')
+                    .map(|v| v.parse().map_err(|_| format!("bad wave_sea={text}")))
+                    .collect::<Result<_, _>>()?;
+                match parts[..] {
+                    [hs, tp, from] => [hs, tp, from],
+                    _ => return Err(format!("wave_sea=HS,TP,FROM, not {text}")),
+                }
+            },
             lts: get("lts", 0.0)? as usize,
             cfl: get("cfl", f64::NAN)?,
             integrator: match args.get("rk").map_or("43", String::as_str) {
@@ -1455,20 +1519,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => (None, None),
     };
     domain.close_uncovered_open_faces(&opts)?;
+    let wave_domain = match opts.wave_mesh {
+        Some([nx, ny, order]) if opts.waves > 0 || opts.wave_coupling > 0.0 => {
+            println!("The waves' own grid, {nx} × {ny} at P{order}...");
+            let mut wave_opts = opts.clone();
+            (wave_opts.mesh, wave_opts.nx, wave_opts.ny, wave_opts.order) = (None, nx, ny, order);
+            let wave_domain =
+                Domain::froya(&wave_opts)?.ok_or("wave_mesh= needs the Frøya data files")?;
+            wave_domain.print_summary();
+            Some(wave_domain)
+        }
+        _ => None,
+    };
     if opts.waves > 0 {
-        let wave_domain = match opts.wave_mesh {
-            None => None,
-            Some([nx, ny, order]) => {
-                println!("The waves' own grid, {nx} × {ny} at P{order}...");
-                let mut wave_opts = opts.clone();
-                (wave_opts.mesh, wave_opts.nx, wave_opts.ny, wave_opts.order) =
-                    (None, nx, ny, order);
-                let wave_domain =
-                    Domain::froya(&wave_opts)?.ok_or("wave_mesh= needs the Frøya data files")?;
-                wave_domain.print_summary();
-                Some(wave_domain)
-            }
-        };
         wave_cost(wave_domain.as_ref().unwrap_or(&domain), &domain, &opts);
         return Ok(());
     }
@@ -1478,13 +1541,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if opts.restart_hours > 0.0 || opts.resume.is_some() {
         return Err("restart_hours= and resume= are for the 3D tide (levels=N tide3d=1)".into());
     }
+    if opts.wave_coupling > 0.0 && opts.levels > 0 {
+        return Err("wave_coupling= is for the 2D tide".into());
+    }
     if opts.levels > 0 {
         cost_3d(&domain, &opts);
         return Ok(());
     }
 
     lake_at_rest(&domain, opts.rest_hours);
-    tidal_run(&domain, &opts, parent)
+    let waves = (opts.wave_coupling > 0.0).then(|| wave_domain.as_ref().unwrap_or(&domain));
+    tidal_run(&domain, &opts, parent, waves)
 }
 
 /// Walls everywhere and no forcing: the largest spurious current and surface
@@ -1601,6 +1668,7 @@ fn tidal_run(
     domain: &Domain,
     opts: &Options,
     parent: Option<OceanModelState>,
+    wave_domain: Option<&Domain>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let TideSetup {
         t_end,
@@ -1635,6 +1703,13 @@ fn tidal_run(
         profile_phases(domain, &physics, opts.profile);
         return Ok(());
     }
+    let (mut waves, mut wave_points) = match wave_domain {
+        Some(wave_domain) => {
+            let (waves, points) = coupled_waves(wave_domain, &physics, opts, &clock)?;
+            (Some(waves), points)
+        }
+        None => (None, None),
+    };
 
     let output_dir = opts
         .output
@@ -1693,6 +1768,17 @@ fn tidal_run(
     };
     let every = |minutes: f64| (minutes / base_minutes).round().max(1.0) as usize;
     let (interval, output_every) = (base_minutes * 60.0, every(opts.output_minutes));
+    if waves.is_some() {
+        let ratio = opts.wave_coupling / base_minutes;
+        if ratio < 1.0 || (ratio - ratio.round()).abs() > 1e-9 * ratio {
+            return Err(format!(
+                "wave_coupling={} must be a multiple of the {base_minutes}-minute callback \
+                 interval (station_minutes=, or output_minutes= without stations)",
+                opts.wave_coupling
+            )
+            .into());
+        }
+    }
     let snapshot_every = snapshot_minutes.map(every);
     let mut snapshot = match snapshot_every {
         Some(every) => {
@@ -1777,18 +1863,31 @@ fn tidal_run(
         }
         frame += 1;
     };
+    // The waves' steps and wall time since the last line
+    let mut since = (0.0, CoupledWavesStats::default());
+    let mut report = |waves: &CoupledWaves2D, t: f64| {
+        report_waves(domain, waves, t, since);
+        if let Some(points) = wave_points.as_mut() {
+            points.report(waves, t);
+        }
+        since = (t, waves.stats());
+    };
+    let coupling = waves.as_mut().map(|waves| Coupling {
+        waves,
+        interval: 60.0 * opts.wave_coupling,
+        report_every: 60.0 * opts.output_minutes,
+        report: &mut report,
+    });
     let (result, clips) = if opts.lts > 0 {
         let sim = Simulation::new(physics, Multirate::with_base(opts.integrator, opts.lts))
             .with_cfl(opts.cfl)
             .with_callback_interval(interval);
-        let result = sim.run_with_callback(&mut q, 0.0, t_end, &mut callback);
-        (result, sim.physics().negative_depth_clips())
+        run_tide(sim, &mut q, t_end, coupling, &mut callback)
     } else {
         let sim = Simulation::new(physics, opts.integrator)
             .with_cfl(opts.cfl)
             .with_callback_interval(interval);
-        let result = sim.run_with_callback(&mut q, 0.0, t_end, &mut callback);
-        (result, sim.physics().negative_depth_clips())
+        run_tide(sim, &mut q, t_end, coupling, &mut callback)
     };
     if let Some(e) = write_error {
         return Err(e.into());
@@ -1812,12 +1911,487 @@ fn tidal_run(
             stats.speedup()
         );
     }
+    if let Some(waves) = &waves {
+        let stats = waves.stats();
+        let wall = start.elapsed().as_secs_f64();
+        println!(
+            "  Waves: {} exchanges every {} min, {} wave steps (mean {:.2} s); stepping {:.1} s \
+             ({:.0} % of the wall time), exchanges {:.1} s ({:.1} %)",
+            stats.exchanges,
+            opts.wave_coupling,
+            stats.wave_steps,
+            result.final_time / stats.wave_steps.max(1) as f64,
+            stats.stepping_time,
+            100.0 * stats.stepping_time / wall,
+            stats.exchange_time,
+            100.0 * stats.exchange_time / wall
+        );
+    }
+    if let Some(points) = &wave_points {
+        points.summarise(&output_dir, opts.ramp_hours.max(1.0) * 3600.0 * 2.0)?;
+    }
     report_stations(&stations, &output_dir, opts, &clock, station_atlas.as_ref())?;
     if let Some(e) = result.error {
         return Err(e.into());
     }
     println!("Visualize with ParaView: {}/*.vtu", output_dir.display());
     Ok(())
+}
+
+/// The waves of a tidal run with `wave_coupling=`: the model, its exchange
+/// interval (s), and the progress line every `report_every` seconds.
+struct Coupling<'a> {
+    waves: &'a mut CoupledWaves2D,
+    interval: f64,
+    report_every: f64,
+    report: &'a mut dyn FnMut(&CoupledWaves2D, f64),
+}
+
+/// Run the tide to `t_end`, with the waves of `coupling` exchanging every
+/// interval if any. Returns the result and the negative-depth clips.
+fn run_tide<BC, I>(
+    mut sim: Simulation<SWESolution2D, SWEPhysics2D<BC>, I>,
+    q: &mut SWESolution2D,
+    t_end: f64,
+    coupling: Option<Coupling<'_>>,
+    callback: impl FnMut(&SWESolution2D, f64),
+) -> (SimulationResult, usize)
+where
+    BC: SWEBoundaryCondition2D,
+    I: TimeIntegrator<SWESolution2D>,
+{
+    let result = match coupling {
+        None => sim.run_with_callback(q, 0.0, t_end, callback),
+        Some(Coupling {
+            waves,
+            interval,
+            report_every,
+            report,
+        }) => sim.run_with_exchange(
+            q,
+            0.0,
+            t_end,
+            interval,
+            |physics, q, t, t_next| {
+                waves.exchange(physics, q, t, t_next);
+                let k = (t_next / report_every).round();
+                if (t_next - k * report_every).abs() < 1e-6 * report_every {
+                    report(waves, t_next);
+                }
+            },
+            callback,
+        ),
+    };
+    let clips = sim.physics().negative_depth_clips();
+    (result, clips)
+}
+
+/// The spectral wave model on `domain` (TODO F.4): SWAN's default sources
+/// (Komen, the DIA, JONSWAP friction, Battjes–Janssen) on `wave_grid=`
+/// (0.04–0.5 Hz), refraction as `turning=` and `implicit=` say, under
+/// `wind`; and the JONSWAP sea of `wave_sea=` that comes in through the open
+/// boundaries.
+fn wave_model(domain: &Domain, opts: &Options, wind: Option<Wind>) -> (WaveModel2D, Vec<f64>) {
+    let [nf, nd] = opts.wave_grid;
+    let grid = SpectralGrid::new(0.04, 0.5, nf, nd);
+    let [hs, tp, from] = opts.wave_sea;
+    // Coming from `from` (clockwise from north) is travelling to 270° − from
+    // (counter-clockwise from east, the mesh's x)
+    let sea = grid.jonswap(hs, tp, 3.3, (270.0 - from).to_radians(), 4.0);
+    let mut model = WaveModel2D::new(
+        domain.mesh.clone(),
+        domain.ops.clone(),
+        domain.geom.clone(),
+        &domain.bathymetry,
+        grid,
+        G,
+    )
+    .with_sources(SourceTerms::swan_defaults(G))
+    .with_boundary_spectrum(&sea)
+    .with_turning_limit(opts.turning)
+    .with_implicit_refraction(opts.implicit_refraction)
+    .with_implicit_frequency_shift(opts.implicit_refraction);
+    if let Some(wind) = wind {
+        model = model.with_wind(wind);
+    }
+    (model, sea)
+}
+
+/// The waves of `wave_coupling=` on `domain`, coupled to the tide's
+/// `physics`, their force and bed stress ramped up over `ramp_hours`. With
+/// `wave_spectra=`, a parent wave model's spectra on the open boundary and
+/// its wind, the mean of the boundary's spectra everywhere to start with
+/// (and its points for comparison); else the sea of `wave_sea=` at the
+/// boundary and everywhere, under the uniform wind of `wind` (none
+/// otherwise; the gridded `met=` wind does not reach the waves yet).
+fn coupled_waves<BC: SWEBoundaryCondition2D>(
+    domain: &Domain,
+    physics: &SWEPhysics2D<BC>,
+    opts: &Options,
+    clock: &ModelClock,
+) -> Result<(CoupledWaves2D, Option<WavePoints>), Box<dyn std::error::Error>> {
+    // Blowing from WIND_DIRECTION (clockwise from north) is blowing to
+    // 90° − (WIND_DIRECTION + 180°) counter-clockwise from east
+    let wind = opts.wind.then(|| Wind {
+        u10: WIND_SPEED,
+        direction: (-90.0 - WIND_DIRECTION).to_radians(),
+    });
+    let parent = match &opts.wave_spectra {
+        Some(path) => Some(parent_waves(domain, opts, clock, path)?),
+        None => None,
+    };
+    let (mut model, sea) = wave_model(domain, opts, wind);
+    let header = format!(
+        "\nWaves with the tide, exchanging every {} min: {} elements (P{}), {} nodes, {} × {} \
+         components",
+        opts.wave_coupling,
+        domain.mesh.n_elements,
+        domain.ops.order,
+        model.n_points(),
+        opts.wave_grid[0],
+        opts.wave_grid[1],
+    );
+    let (waves, points) = match parent {
+        Some(parent) => {
+            let boundary =
+                BoundarySpectra::for_model(&model, &parent.spectra, opts.wave_neighbours);
+            // The boundary's mean spectrum everywhere at the start
+            let nc = model.grid.n_components();
+            let at_start = boundary.at(0.0);
+            let mut mean = vec![0.0; nc];
+            for spectrum in at_start.chunks_exact(nc) {
+                mean.iter_mut().zip(spectrum).for_each(|(m, x)| *m += x);
+            }
+            let n = boundary.n_targets().max(1) as f64;
+            mean.iter_mut().for_each(|m| *m /= n);
+            let start = model.grid.parameters(&mean);
+            println!(
+                "{header}; the boundary from {} parent points ({} nearest each, {} open-boundary \
+                 nodes), H_s {:.2} m at the start on average{}",
+                parent.spectra.positions.len(),
+                opts.wave_neighbours,
+                boundary.n_targets(),
+                start.hs,
+                if parent.wind.is_some() {
+                    ", the parent's wind"
+                } else {
+                    ", no wind"
+                }
+            );
+            let state = model.uniform_state(&mean);
+            if let Some(series) = &parent.wind {
+                model.set_wind(series.at(0.0));
+            }
+            let mut waves = CoupledWaves2D::new(model, state, physics, 0.0)
+                .with_ramp(3600.0 * opts.ramp_hours.max(1e-3))
+                .with_boundary(boundary);
+            if let Some(series) = parent.wind.clone() {
+                waves = waves.with_wind(series);
+            }
+            (waves, Some(parent.points))
+        }
+        None => {
+            let state = model.uniform_state(&sea);
+            let [hs, tp, from] = opts.wave_sea;
+            println!(
+                "{header}; JONSWAP H_s {hs} m, T_p {tp} s from {from}°{}",
+                match wind {
+                    Some(_) => format!(", wind {WIND_SPEED} m/s from {WIND_DIRECTION}°"),
+                    None if !opts.met.is_empty() => {
+                        ", no wind (met= does not reach the waves)".into()
+                    }
+                    None => ", no wind".into(),
+                }
+            );
+            let waves = CoupledWaves2D::new(model, state, physics, 0.0)
+                .with_ramp(3600.0 * opts.ramp_hours.max(1e-3));
+            (waves, None)
+        }
+    };
+
+    let (to_waves, to_circulation) = (
+        waves.coupling().to_waves(),
+        waves.coupling().to_circulation(),
+    );
+    println!(
+        "  wave nodes outside the run's mesh: {} of {} (up to {:.0} m from it); run's nodes \
+         outside the waves': {} of {} (up to {:.0} m)",
+        to_waves.n_outside(),
+        to_waves.n_target_points(),
+        to_waves.largest_gap(),
+        to_circulation.n_outside(),
+        to_circulation.n_target_points(),
+        to_circulation.largest_gap()
+    );
+    Ok((waves, points))
+}
+
+/// A parent wave model's spectra (`wave_spectra=`) for a wave mesh: on its
+/// coordinates and the run's clock, its wind, and its points for comparison.
+struct ParentWaves {
+    spectra: PointSpectra,
+    wind: Option<WindSeries>,
+    points: WavePoints,
+}
+
+/// Read `path` (`io::WaveSpectraFile`, e.g. from `met_wave_subset`) for the
+/// waves on `domain` under `clock`.
+#[cfg(feature = "netcdf")]
+fn parent_waves(
+    domain: &Domain,
+    opts: &Options,
+    clock: &ModelClock,
+    path: &Path,
+) -> Result<ParentWaves, Box<dyn std::error::Error>> {
+    let projection = domain
+        .projection
+        .ok_or("wave_spectra= needs a georeferenced domain (the Frøya data)")?;
+    let file = WaveSpectraFile::from_file(path)?;
+    let model_time = |unix: f64| clock.model_time(unix);
+    let (first, last) = (
+        model_time(file.times[0]),
+        model_time(file.times[file.times.len() - 1]),
+    );
+    println!(
+        "  Wave spectra {}: {} points, {} → {} UTC{}",
+        path.display(),
+        file.n_points(),
+        clock.format(first),
+        clock.format(last),
+        file.forecast_reference_time
+            .map_or(String::new(), |t| format!(
+                " (forecast from {} UTC)",
+                clock.format(model_time(t))
+            ))
+    );
+    if first > 0.0 || last < 3600.0 * opts.hours {
+        println!(
+            "  warning: the run (0 → {:.1} h) reaches beyond the spectra ({:.1} → {:.1} h); \
+             the boundary is held at the ends",
+            opts.hours,
+            first / 3600.0,
+            last / 3600.0
+        );
+    }
+    // Geographic east in the mesh axes, at the projection's centre
+    let (ex, ey) = east_axis(&projection, projection.ref_lat(), projection.ref_lon());
+    let east = ey.atan2(ex);
+    let position = |lon: f64, lat: f64| {
+        let (x, y) = projection.geo_to_xy(lat, lon);
+        [x, y]
+    };
+    let spectra = file.point_spectra(position, model_time, east);
+    let wind = file.wind_series(&[], model_time, east);
+    let locator = PointLocator2D::new(&domain.mesh);
+    let mut located = Vec::new();
+    let mut labels = Vec::new();
+    for (p, &[x, y]) in spectra.positions.iter().enumerate() {
+        let label = format!("{:.2}°E {:.2}°N", file.longitude[p], file.latitude[p]);
+        let found = locator.locate([x, y]).map(|point| {
+            (
+                point.element.as_usize(),
+                domain.ops.interpolation_weights(point.r, point.s),
+            )
+        });
+        println!(
+            "    {label} at ({:6.1}, {:6.1}) km{}",
+            x / 1e3,
+            y / 1e3,
+            if found.is_none() {
+                ", outside the wave mesh"
+            } else {
+                ""
+            }
+        );
+        labels.push(label);
+        located.push(found);
+    }
+    let points = WavePoints {
+        labels,
+        located,
+        times: spectra.times.clone(),
+        hs: file.hs.clone(),
+        series: vec![Vec::new(); spectra.positions.len()],
+    };
+    Ok(ParentWaves {
+        spectra,
+        wind,
+        points,
+    })
+}
+
+#[cfg(not(feature = "netcdf"))]
+fn parent_waves(
+    _domain: &Domain,
+    _opts: &Options,
+    _clock: &ModelClock,
+    _path: &Path,
+) -> Result<ParentWaves, Box<dyn std::error::Error>> {
+    Err("wave_spectra= needs the netcdf feature".into())
+}
+
+/// The parent wave model's points: our H_s there against the parent's.
+struct WavePoints {
+    labels: Vec<String>,
+    /// The wave element of each point and the basis weights there (none
+    /// outside the wave mesh)
+    located: Vec<Option<(usize, Vec<f64>)>>,
+    /// The parent's times (s of model time) and H_s, `[time][point]`
+    times: Vec<f64>,
+    hs: Option<Vec<f64>>,
+    /// Per point: (t, ours, the parent's)
+    series: Vec<Vec<[f64; 3]>>,
+}
+
+impl WavePoints {
+    /// The parent's H_s at point `p` and time `t`, linear in time.
+    fn parent_hs(&self, p: usize, t: f64) -> f64 {
+        let Some(hs) = &self.hs else {
+            return f64::NAN;
+        };
+        let (np, times) = (self.labels.len(), &self.times);
+        let upper = times.partition_point(|&x| x <= t).clamp(1, times.len() - 1);
+        if times.len() == 1 {
+            return hs[p];
+        }
+        let (a, b) = (upper - 1, upper);
+        let w = ((t - times[a]) / (times[b] - times[a])).clamp(0.0, 1.0);
+        (1.0 - w) * hs[a * np + p] + w * hs[b * np + p]
+    }
+
+    /// Our H_s and the parent's at every point at `t`: a progress line, and
+    /// the series.
+    fn report(&mut self, waves: &CoupledWaves2D, t: f64) {
+        let model = waves.model();
+        let params = model.parameters(waves.state());
+        let nn = model.ops.n_nodes;
+        let mut line = String::from("    H_s ours/parent:");
+        for p in 0..self.labels.len() {
+            let parent = self.parent_hs(p, t);
+            let ours = self.located[p].as_ref().map_or(f64::NAN, |(k, w)| {
+                w.iter()
+                    .enumerate()
+                    .map(|(i, w)| w * params[k * nn + i].hs)
+                    .sum()
+            });
+            self.series[p].push([t, ours, parent]);
+            line += &format!(" {} {ours:.2}/{parent:.2} m;", self.labels[p]);
+        }
+        println!("{}", line.trim_end_matches(';'));
+    }
+
+    /// Bias and RMSE of our H_s against the parent's at every point from
+    /// `after` (s) on, and the series into `<dir>/wave_points.txt`.
+    fn summarise(&self, dir: &Path, after: f64) -> std::io::Result<()> {
+        println!(
+            "\nH_s against the parent wave model at its points, from hour {:.0}:",
+            after / 3600.0
+        );
+        for (label, series) in self.labels.iter().zip(&self.series) {
+            let pairs: Vec<(f64, f64)> = series
+                .iter()
+                .filter(|s| s[0] >= after && s[1].is_finite() && s[2].is_finite())
+                .map(|s| (s[1], s[2]))
+                .collect();
+            if pairs.is_empty() {
+                println!("  {label}: no comparison");
+                continue;
+            }
+            let n = pairs.len() as f64;
+            let bias = pairs.iter().map(|(a, b)| a - b).sum::<f64>() / n;
+            let rmse = (pairs.iter().map(|(a, b)| (a - b).powi(2)).sum::<f64>() / n).sqrt();
+            let mean = pairs.iter().map(|(_, b)| b).sum::<f64>() / n;
+            println!(
+                "  {label}: parent mean {mean:.2} m, ours {:.2} m; bias {bias:+.2} m, RMSE {rmse:.2} m \
+                 ({:.0} % of the mean) over {} samples",
+                mean + bias,
+                100.0 * rmse / mean,
+                pairs.len()
+            );
+        }
+        let mut text = String::from(
+            "# H_s (m) at the parent wave model's points: t (s), then ours and the parent's per point\n# points:",
+        );
+        for label in &self.labels {
+            text += &format!(" {label};");
+        }
+        text.push('\n');
+        let rows = self.series.first().map_or(0, Vec::len);
+        for r in 0..rows {
+            text += &format!("{:.0}", self.series[0][r][0]);
+            for series in &self.series {
+                text += &format!(" {:.4} {:.4}", series[r][1], series[r][2]);
+            }
+            text.push('\n');
+        }
+        fs::write(dir.join("wave_points.txt"), text)
+    }
+}
+
+/// The progress line of the waves at `t`: the largest H_s and where, the
+/// mean over wave nodes at least 3 m deep, and the largest force on the tide
+/// and where.
+fn report_waves(
+    domain: &Domain,
+    waves: &CoupledWaves2D,
+    t: f64,
+    (t_last, last): (f64, CoupledWavesStats),
+) {
+    let model = waves.model();
+    let stats = waves.stats();
+    let params = model.parameters(waves.state());
+    let node = |mesh: &Mesh2D, ops: &DGOperators2D, p: usize| {
+        let (k, i) = (p / ops.n_nodes, p % ops.n_nodes);
+        mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
+    };
+    let largest = |values: &mut dyn Iterator<Item = f64>| {
+        values.enumerate().fold(
+            (0, 0.0),
+            |best, (p, v)| if v > best.1 { (p, v) } else { best },
+        )
+    };
+    let (highest, hs_max) = largest(&mut params.iter().map(|p| p.hs));
+    let deep: Vec<f64> = params
+        .iter()
+        .zip(model.depth())
+        .filter(|&(_, &d)| d >= 3.0)
+        .map(|(p, _)| p.hs)
+        .collect();
+    let hs_mean = deep.iter().sum::<f64>() / deep.len().max(1) as f64;
+    let [x, y] = node(&model.mesh, &model.ops, highest);
+    let force = waves.force().unwrap_or(&[]);
+    let (strongest, f_max) = largest(&mut force.iter().map(|f| f[0].hypot(f[1])));
+    let [fx, fy] = node(&domain.mesh, &domain.ops, strongest);
+    println!(
+        "  waves at {:6.2} h: H_s ≤ {hs_max:.2} m at ({:6.1}, {:6.1} km), mean {hs_mean:.2} m where \
+         ≥ 3 m deep; force ≤ {:.2e} m²/s² at ({:6.1}, {:6.1} km); step {:.2} s, {:.0} s wall per model hour",
+        t / 3600.0,
+        x / 1e3,
+        y / 1e3,
+        f_max,
+        fx / 1e3,
+        fy / 1e3,
+        (t - t_last) / (stats.wave_steps - last.wave_steps).max(1) as f64,
+        3600.0
+            * (stats.stepping_time + stats.exchange_time - last.stepping_time - last.exchange_time)
+            / (t - t_last)
+    );
+    // What sets the step in the last exchange's level and currents
+    let limits = model.time_step_limits(waves.cfl());
+    let (name, limit) = limits.binding();
+    let [x, y] = node(&model.mesh, &model.ops, limit.point);
+    let [u, v] = model.current()[limit.point];
+    println!(
+        "    step {:.2} s set by {name} at ({:6.1}, {:6.1} km; {:.1} m deep, current {:.2} m/s, \
+         {:.3} Hz); propagation alone {:.2} s",
+        limit.dt,
+        x / 1e3,
+        y / 1e3,
+        model.depth()[limit.point],
+        u.hypot(v),
+        model.grid.sigma[limit.frequency] / std::f64::consts::TAU,
+        limits.propagation.dt
+    );
 }
 
 /// The snapshot file's metadata: the title (with `suffix`), the stations in
@@ -2836,40 +3410,24 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
 
 /// The cost of the spectral wave model on this domain (`waves=N`, TODO F.4):
 /// SWAN's default sources (Komen, the DIA, JONSWAP friction, Battjes–Janssen)
-/// under a 10 m/s wind to the east, a JONSWAP sea of H_s 2.5 m and T_p 10 s from
-/// the west-north-west through the open boundaries and, to start with, over the
-/// whole domain. The median wall time of N steps after a warm-up, split into the
+/// under a 10 m/s wind to the east, the JONSWAP sea of `wave_sea=` (by
+/// default H_s 2.5 m and T_p 10 s from the west-north-west) through the open
+/// boundaries and, to start with, over the whole domain. The median wall time of N steps after a warm-up, split into the
 /// propagation and the sources, the step and what sets it, and the cost per
 /// model hour. With the waves on a grid of their own (`wave_mesh=`), also the
 /// coupling to the run's mesh `circulation` (`WaveCoupling2D`): its build and
 /// each exchange, from a circulation at rest.
 fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
     use dg_rs::waves::{
-        SourceTerms, SpectralGrid, StokesDriftField, WaveCoupling2D, WaveModel2D, WaveWorkspace,
-        Wind, group_velocity, wavenumber,
+        StokesDriftField, WaveCoupling2D, WaveWorkspace, group_velocity, wavenumber,
     };
     let [nf, nd] = opts.wave_grid;
-    let grid = SpectralGrid::new(0.04, 0.5, nf, nd);
-    let n_components = grid.n_components();
-    // Travelling to the east-south-east
-    let direction = (-15f64).to_radians();
-    let sea = grid.jonswap(2.5, 10.0, 3.3, direction, 4.0);
-    let mut model = WaveModel2D::new(
-        domain.mesh.clone(),
-        domain.ops.clone(),
-        domain.geom.clone(),
-        &domain.bathymetry,
-        grid,
-        G,
-    )
-    .with_sources(SourceTerms::swan_defaults(G))
-    .with_wind(Wind {
+    let wind = Wind {
         u10: 10.0,
         direction: 0.0,
-    })
-    .with_boundary_spectrum(&sea)
-    .with_turning_limit(opts.turning)
-    .with_implicit_refraction(opts.implicit_refraction);
+    };
+    let (mut model, sea) = wave_model(domain, opts, Some(wind));
+    let n_components = model.grid.n_components();
     let np = model.n_points();
     println!(
         "\nSpectral wave model: {} elements, {np} nodes (P{}), {nf} frequencies (0.04–0.5 Hz) × \

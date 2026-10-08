@@ -104,6 +104,8 @@ mod snapshot;
 mod tide_gauge_reader;
 mod timeseries_reader;
 mod vtk;
+#[cfg(feature = "netcdf")]
+mod wave_spectra;
 mod z_levels;
 
 pub use adcp_reader::{ADCPFile, ADCPFileError, read_adcp_file, write_adcp_file};
@@ -156,4 +158,6 @@ pub use timeseries_reader::{
     read_timeseries_file,
 };
 pub use vtk::{VtkError, write_vtk_coupled, write_vtk_series, write_vtk_swe};
+#[cfg(feature = "netcdf")]
+pub use wave_spectra::WaveSpectraFile;
 pub use z_levels::{depth_average_z, s_level_weights, weighted_mean};

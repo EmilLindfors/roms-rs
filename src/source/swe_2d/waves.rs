@@ -53,6 +53,17 @@ pub struct WaveForce2D {
     positions: Vec<[f64; 2]>,
     ramp: Option<f64>,
     h_min: f64,
+    /// Linear in time from `force` toward another force ([`Self::between`])
+    toward: Option<Toward>,
+}
+
+/// The second end of a force linear in time: `force` at `t1`, the first end's
+/// at `t0`.
+#[derive(Clone, Debug)]
+struct Toward {
+    t0: f64,
+    t1: f64,
+    force: Vec<[f64; 2]>,
 }
 
 impl WaveForce2D {
@@ -97,6 +108,53 @@ impl WaveForce2D {
             positions,
             ramp: None,
             h_min: 1e-6,
+            toward: None,
+        }
+    }
+
+    /// The force linear in time from `f0` at `t0` to `f1` at `t1 > t0`, and
+    /// constant beyond them, as a coupling gives the circulation between two
+    /// exchanges with the waves ([`crate::waves::CoupledWaves2D`]): no jump at
+    /// an exchange to ring the basin. The ramp and `h_min` are `f0`'s.
+    pub fn between(t0: f64, f0: WaveForce2D, t1: f64, f1: &WaveForce2D) -> Self {
+        assert!(t1 > t0, "wave forces must be in time order: {t0} → {t1}");
+        assert_eq!(
+            f0.force.len(),
+            f1.force.len(),
+            "wave forces on different meshes"
+        );
+        Self {
+            toward: Some(Toward {
+                t0,
+                t1,
+                force: f1.force.clone(),
+            }),
+            ..f0
+        }
+    }
+
+    /// The weights of the force's two ends at time `t`, with the ramp.
+    fn weights(&self, t: f64) -> (f64, f64) {
+        let ramp = tidal_ramp(t, self.ramp);
+        match &self.toward {
+            None => (ramp, 0.0),
+            Some(toward) => {
+                let a = ((t - toward.t0) / (toward.t1 - toward.t0)).clamp(0.0, 1.0);
+                (ramp * (1.0 - a), ramp * a)
+            }
+        }
+    }
+
+    /// The force at node `p` with the weights of [`Self::weights`].
+    #[inline]
+    fn at(&self, p: usize, (w0, w1): (f64, f64)) -> [f64; 2] {
+        let [fx, fy] = self.force[p];
+        match &self.toward {
+            None => [w0 * fx, w0 * fy],
+            Some(toward) => {
+                let [gx, gy] = toward.force[p];
+                [w0 * fx + w1 * gx, w0 * fy + w1 * gy]
+            }
         }
     }
 
@@ -113,7 +171,8 @@ impl WaveForce2D {
         self
     }
 
-    /// `−g ∇·(S/ρg)` per node (m²/s²).
+    /// `−g ∇·(S/ρg)` per node (m²/s²), unramped; of a force [`Self::between`]
+    /// two, the first.
     pub fn force(&self) -> &[[f64; 2]] {
         &self.force
     }
@@ -135,8 +194,8 @@ impl SourceTerm2D for WaveForce2D {
         else {
             return SWEState2D::zero();
         };
-        let ramp = tidal_ramp(ctx.time, self.ramp);
-        SWEState2D::new(0.0, ramp * self.force[p][0], ramp * self.force[p][1])
+        let [fx, fy] = self.at(p, self.weights(ctx.time));
+        SWEState2D::new(0.0, fx, fy)
     }
 
     fn add_element(
@@ -146,14 +205,14 @@ impl SourceTerm2D for WaveForce2D {
         hu: &mut [f64],
         hv: &mut [f64],
     ) {
-        let ramp = tidal_ramp(element.time, self.ramp);
+        let weights = self.weights(element.time);
         let base = element.element.as_usize() * self.n_nodes;
         let depths = element.solution.element_h(element.element);
         for (i, &h) in depths.iter().enumerate() {
             if h > self.h_min {
-                let [fx, fy] = self.force[base + i];
-                hu[i] += ramp * fx;
-                hv[i] += ramp * fy;
+                let [fx, fy] = self.at(base + i, weights);
+                hu[i] += fx;
+                hv[i] += fy;
             }
         }
     }
@@ -352,6 +411,75 @@ mod tests {
             assert!((hu[i] - 0.5 * f[0]).abs() < 1e-15 && (hv[i] - 0.5 * f[1]).abs() < 1e-15);
         }
         assert!(h.iter().all(|&x| x == 0.0));
+    }
+
+    /// Between two exchanges the force is linear in time from the first wave
+    /// state's to the second's, ramped, and constant beyond them.
+    #[test]
+    fn a_force_between_two_exchanges_is_linear_in_time() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 300.0, 0.0, 200.0, 3, 2);
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let g = 9.81;
+        let n_total = mesh.n_elements * ops.n_nodes;
+        let xs: Vec<f64> = ElementIndex::iter(mesh.n_elements)
+            .flat_map(|k| {
+                let (mesh, ops) = (&mesh, &ops);
+                (0..ops.n_nodes)
+                    .map(move |i| mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i])[0])
+            })
+            .collect();
+        // S_xx linear in x: uniform forces −g·a
+        let uniform = |a: f64| {
+            let stress: Vec<[f64; 3]> = xs.iter().map(|x| [a * x, 0.0, 0.0]).collect();
+            WaveForce2D::from_radiation_stress(&mesh, &ops, &geom, &stress, g)
+        };
+        let force = WaveForce2D::between(
+            600.0,
+            uniform(1e-4).with_ramp(1200.0),
+            1200.0,
+            &uniform(3e-4),
+        );
+        let mut q = crate::solver::SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        for k in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                q.set_state(k, i, SWEState2D::new(5.0, 0.0, 0.0));
+            }
+        }
+        let n = ops.n_nodes;
+        let k = ElementIndex::new(4);
+        // The first state's before 600 s, the second's after 1200 s
+        for (t, a) in [
+            (0.0, 1e-4),
+            (300.0, 1e-4),
+            (600.0, 1e-4),
+            (900.0, 2e-4),
+            (1200.0, 3e-4),
+            (5000.0, 3e-4),
+        ] {
+            let expected = tidal_ramp(t, Some(1200.0)) * a;
+            let element = ElementSources {
+                element: k,
+                time: t,
+                solution: &q,
+                mesh: &mesh,
+                ops: &ops,
+                bathymetry: None,
+                g,
+                h_min: 1e-6,
+            };
+            let (mut h, mut hu, mut hv) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
+            force.add_element(&element, &mut h, &mut hu, &mut hv);
+            for i in 0..n {
+                assert!(
+                    (hu[i] + g * expected).abs() < 1e-13 && hv[i].abs() < 1e-13,
+                    "t = {t}: {} against {}",
+                    hu[i],
+                    -g * expected
+                );
+            }
+        }
+        assert_eq!(force.force().len(), n_total);
     }
 
     /// The force is in flux form: for a stress that jumps between every pair

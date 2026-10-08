@@ -129,6 +129,11 @@ impl MeshTransfer2D {
         self.outside.binary_search(&(p as u32)).is_ok()
     }
 
+    /// The source element whose polynomial target node `p` evaluates.
+    pub fn source_element(&self, p: usize) -> usize {
+        self.elements[p] as usize
+    }
+
     /// The largest distance from a target node outside the source mesh to
     /// the nearest point of it (0 if every node is inside).
     pub fn largest_gap(&self) -> f64 {

@@ -29,20 +29,52 @@
 //!
 //! On the same mesh and order every transfer is the identity (to round-off),
 //! so the coupling reproduces the same-mesh one.
+//!
+//! [`CoupledWaves2D`] runs the waves alongside a running circulation
+//! ([`crate::simulation::Simulation::run_with_exchange`]), exchanging every
+//! coupling interval `[t, t + Δ]`, as COAWST's couplers do but in turn:
+//!
+//! 1. the waves take the circulation's level and current at `t`;
+//! 2. the waves step to `t + Δ` (their own step, landing on `t + Δ`);
+//! 3. the circulation steps to `t + Δ` under the force linear in time from
+//!    the waves' at `t` to theirs at `t + Δ` ([`WaveForce2D::between`]), so
+//!    the force is continuous in time and an exchange does not ring the
+//!    basin, and on its bed friction enhanced by the mean of the waves' bed
+//!    stress at the two ends ([`crate::source::WaveCurrentFriction2D`]).
+//!
+//! The waves see the circulation lagged by up to Δ (the level and current
+//! change over a tide, Δ is minutes); the circulation sees the waves without
+//! a lag.
 
 use std::sync::Arc;
+use std::time::Instant;
 
+use crate::boundary::{SWEBoundaryCondition2D, tidal_ramp};
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::{DGOperators2D, GeometricFactors2D, MeshTransfer2D};
+use crate::physics::SWEPhysics2D;
 use crate::solver::SWESolution2D;
-use crate::source::WaveForce2D;
+use crate::source::{
+    BottomFriction2D, SourceTerm2D, SourceTerms2D, WaveCurrentFriction2D, WaveForce2D,
+};
 
-use super::model::WaveModel2D;
+use super::boundary::{BoundarySpectra, WindSeries};
+use super::model::{WaveModel2D, WaveWorkspace};
 use super::state::WaveSolution;
 use super::stokes::StokesDriftField;
 
 /// Default depth (m) below which a circulation node is dry for the coupling.
 pub const DEFAULT_COUPLING_H_DRY: f64 = 1e-3;
+
+/// Battjes–Janssen's breaker index γ (the largest wave `H_m = γ d`, SWAN's
+/// default) with which [`WaveCoupling2D::depth_limited_force`] caps the
+/// radiation stress at the circulation's own depth.
+pub const DEFAULT_BREAKER_INDEX: f64 = 0.73;
+
+/// Default bed roughness length z₀ (m) of the waves' bed stress in
+/// [`CoupledWaves2D`] ([`WaveModel2D::bed_wave_stress`]): 1 mm, a rippled
+/// sand or gravel bed (a Manning n of 0.025 is z₀ ≈ 2 mm in 10 m of water).
+pub const DEFAULT_BED_ROUGHNESS: f64 = 1e-3;
 
 /// The exchanges between a wave model and a circulation on different meshes
 /// (see the module docs).
@@ -132,16 +164,36 @@ impl WaveCoupling2D {
     /// waves' nodes: the interpolated transport over the interpolated depth,
     /// 0 where that depth is below `h_dry` and at wave nodes outside the
     /// circulation's mesh (the circulation knows nothing of the flow there).
+    ///
+    /// The speed is at most the largest of the source element's wet nodes
+    /// (`h > h_dry`). Near a shore the depth's polynomial can dip towards
+    /// `h_dry` between nodes where the transport's does not, and the ratio
+    /// blew up: 75 m/s at a wave node at Frøya, which set the waves' step.
+    /// Where both are affine the ratio is within its nodal values anyway.
     pub fn currents(&self, q: &SWESolution2D) -> (Vec<f64>, Vec<f64>) {
         let t = &self.to_waves;
+        let nn = self.ops.n_nodes;
         let n = t.n_target_points();
         let (mut u, mut v) = (vec![0.0; n], vec![0.0; n]);
+        let (hs, hus, hvs) = (q.h_data(), q.hu_data(), q.hv_data());
         for p in 0..n {
-            let h = t.value_at(p, q.h_data());
-            if h > self.h_dry && !t.is_outside(p) {
-                u[p] = t.value_at(p, q.hu_data()) / h;
-                v[p] = t.value_at(p, q.hv_data()) / h;
+            let h = t.value_at(p, hs);
+            if h <= self.h_dry || t.is_outside(p) {
+                continue;
             }
+            let (up, vp) = (t.value_at(p, hus) / h, t.value_at(p, hvs) / h);
+            let base = t.source_element(p) * nn;
+            let fastest = (base..base + nn)
+                .filter(|&i| hs[i] > self.h_dry)
+                .map(|i| hus[i].hypot(hvs[i]) / hs[i])
+                .fold(0.0, f64::max);
+            let speed = up.hypot(vp);
+            let scale = if speed > fastest {
+                fastest / speed
+            } else {
+                1.0
+            };
+            (u[p], v[p]) = (scale * up, scale * vp);
         }
         (u, v)
     }
@@ -180,6 +232,38 @@ impl WaveCoupling2D {
         )
     }
 
+    /// [`Self::force`] with the stress at each circulation node capped at
+    /// what a depth-limited wave on that node's own depth `h` (of the
+    /// circulation state `q`) carries: `tr S/ρg ≤ γ² h²/4`, the trace of a
+    /// shallow-water wave's `S = E (3/2, 1/2)` with `E = H²/8` and
+    /// `H = γ h` (`breaker_index` γ, Battjes–Janssen's `H_m`).
+    ///
+    /// Interpolated from a coarser wave mesh, the stress belongs to the
+    /// waves' depth there, and on a reef or a shore the circulation resolves
+    /// (0.3 m where the wave node has metres) it pushed a film of water no
+    /// such wave could stand in: in a storm at Frøya, 4.3 m/s and 136
+    /// negative-depth clips in a day. Where the waves themselves are depth
+    /// limited on the circulation's depth the cap does nothing.
+    pub fn depth_limited_force(
+        &self,
+        waves: &WaveModel2D,
+        n: &WaveSolution,
+        q: &SWESolution2D,
+        breaker_index: f64,
+    ) -> WaveForce2D {
+        let mut stress = self.radiation_stress(waves, n);
+        let cap = 0.25 * breaker_index * breaker_index;
+        for (s, &h) in stress.iter_mut().zip(q.h_data()) {
+            let trace = s[0] + s[2];
+            let largest = cap * h.max(0.0) * h.max(0.0);
+            if trace > largest {
+                let scale = largest / trace;
+                s.iter_mut().for_each(|x| *x *= scale);
+            }
+        }
+        WaveForce2D::from_radiation_stress(&self.mesh, &self.ops, &self.geom, &stress, waves.g())
+    }
+
     /// The waves' bed stress per ρ (m²/s²) on a bed of roughness length `z0`
     /// (m) at the circulation's nodes ([`WaveModel2D::bed_wave_stress`]), for
     /// [`crate::source::WaveCurrentFriction2D`].
@@ -204,6 +288,288 @@ impl WaveCoupling2D {
         let mut out = self.to_circulation.apply(field);
         out.iter_mut().for_each(|x| *x = x.max(0.0));
         out
+    }
+}
+
+/// A wave model running alongside a 2D circulation and exchanging with it
+/// every coupling interval (see the module docs): the level and the current
+/// to the waves, the radiation-stress force and the wave-enhanced bed
+/// friction back.
+///
+/// ```ignore
+/// let mut waves = CoupledWaves2D::new(model, state, &physics, 0.0).with_ramp(3600.0);
+/// let mut sim = Simulation::new(physics, SSPRK3);
+/// sim.run_with_exchange(
+///     &mut q, 0.0, t_end, 600.0,
+///     |physics, q, t, t_next| waves.exchange(physics, q, t, t_next),
+///     |q, t| { /* output */ },
+/// );
+/// ```
+pub struct CoupledWaves2D {
+    model: WaveModel2D,
+    state: WaveSolution,
+    coupling: WaveCoupling2D,
+    workspace: WaveWorkspace,
+    /// The circulation's bed, for its level
+    bathymetry: Arc<Bathymetry2D>,
+    /// The circulation's own source terms and bed friction, which the waves'
+    /// force is added to and their bed stress enhances
+    sources: Option<Arc<dyn SourceTerm2D>>,
+    friction: Option<Arc<dyn BottomFriction2D>>,
+    /// The waves' time
+    time: f64,
+    /// The force and bed stress of the wave state at `time` (none before the
+    /// first exchange)
+    last: Option<(WaveForce2D, Vec<f64>)>,
+    cfl: f64,
+    z0: f64,
+    ramp: Option<f64>,
+    stats: CoupledWavesStats,
+    /// A parent model's spectra on the open boundary and its wind, set at
+    /// every wave step's midpoint
+    boundary: Option<BoundarySpectra>,
+    boundary_buffer: Vec<f64>,
+    wind: Option<WindSeries>,
+}
+
+/// Work counts of a [`CoupledWaves2D`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoupledWavesStats {
+    /// Exchanges (coupling intervals) so far.
+    pub exchanges: usize,
+    /// Wave steps so far.
+    pub wave_steps: usize,
+    /// Wall time (s) of the wave steps.
+    pub stepping_time: f64,
+    /// Wall time (s) of the exchanges: the transfers, the force and the bed
+    /// stress.
+    pub exchange_time: f64,
+}
+
+impl CoupledWaves2D {
+    /// The waves `model` in the state `state` at time `t` (s), coupled to the
+    /// circulation `physics`: its mesh, order and bed, and its source terms
+    /// and bed friction as they are now (each exchange adds the waves' to
+    /// these).
+    ///
+    /// # Panics
+    /// If `physics` has no bathymetry.
+    pub fn new<BC: SWEBoundaryCondition2D>(
+        model: WaveModel2D,
+        state: WaveSolution,
+        physics: &SWEPhysics2D<BC>,
+        t: f64,
+    ) -> Self {
+        let bathymetry = physics
+            .bathymetry
+            .clone()
+            .expect("a coupled circulation needs its bathymetry");
+        let coupling = WaveCoupling2D::new(
+            &model,
+            physics.mesh.clone(),
+            physics.ops.clone(),
+            physics.geom.clone(),
+        );
+        Self {
+            model,
+            state,
+            coupling,
+            workspace: WaveWorkspace::default(),
+            bathymetry,
+            sources: physics.source.clone(),
+            friction: physics.friction.clone(),
+            time: t,
+            last: None,
+            cfl: 0.5,
+            z0: DEFAULT_BED_ROUGHNESS,
+            ramp: None,
+            stats: CoupledWavesStats::default(),
+            boundary: None,
+            boundary_buffer: Vec::new(),
+            wind: None,
+        }
+    }
+
+    /// The waves' CFL number ([`WaveModel2D::compute_dt`]; default 0.5).
+    pub fn with_cfl(mut self, cfl: f64) -> Self {
+        assert!(cfl > 0.0);
+        self.cfl = cfl;
+        self
+    }
+
+    /// The bed roughness length z₀ (m) of the waves' bed stress (default
+    /// [`DEFAULT_BED_ROUGHNESS`]).
+    pub fn with_bed_roughness(mut self, z0: f64) -> Self {
+        assert!(z0 > 0.0);
+        self.z0 = z0;
+        self
+    }
+
+    /// Ramp the force and the bed stress up from 0 at t = 0 to full at
+    /// `seconds` (the tidal ramp's `3τ² − 2τ³`), for waves started at once
+    /// over a circulation at rest.
+    pub fn with_ramp(mut self, seconds: f64) -> Self {
+        self.ramp = Some(seconds);
+        self
+    }
+
+    /// The wave model (its level and current are the last exchange's).
+    pub fn model(&self) -> &WaveModel2D {
+        &self.model
+    }
+
+    /// The wave state at [`Self::time`].
+    pub fn state(&self) -> &WaveSolution {
+        &self.state
+    }
+
+    /// The transfers between the meshes.
+    pub fn coupling(&self) -> &WaveCoupling2D {
+        &self.coupling
+    }
+
+    /// The waves' CFL number.
+    pub fn cfl(&self) -> f64 {
+        self.cfl
+    }
+
+    /// The waves' time (s).
+    pub fn time(&self) -> f64 {
+        self.time
+    }
+
+    /// The force of the wave state at [`Self::time`] on the circulation,
+    /// unramped (`−g ∇·(S/ρg)` per circulation node; none before the first
+    /// exchange).
+    pub fn force(&self) -> Option<&[[f64; 2]]> {
+        self.last.as_ref().map(|(force, _)| force.force())
+    }
+
+    /// Take the open boundary's spectra from a parent wave model
+    /// ([`BoundarySpectra::for_model`] on this model), at every wave step.
+    pub fn with_boundary(mut self, boundary: BoundarySpectra) -> Self {
+        assert_eq!(
+            boundary.n_targets(),
+            self.model.open_boundary_points().len(),
+            "boundary spectra for another model"
+        );
+        self.boundary_buffer = vec![0.0; boundary.n_targets() * self.model.grid.n_components()];
+        self.boundary = Some(boundary);
+        self
+    }
+
+    /// Take the wind from a parent model's series, at every wave step.
+    pub fn with_wind(mut self, wind: WindSeries) -> Self {
+        self.wind = Some(wind);
+        self
+    }
+
+    /// The parent's spectra on the open boundary, if any.
+    pub fn boundary(&self) -> Option<&BoundarySpectra> {
+        self.boundary.as_ref()
+    }
+
+    /// Work counts so far.
+    pub fn stats(&self) -> CoupledWavesStats {
+        self.stats
+    }
+
+    /// One coupling interval from `t` (the waves' time) to `t_next`: the
+    /// waves take the level and current of the circulation state `q` and step
+    /// to `t_next`; then `physics` gets its own source terms plus the force
+    /// linear in time between the waves' at `t` and at `t_next`, and its own
+    /// bed friction enhanced by the mean of their bed stresses (see the
+    /// module docs). The exchange of
+    /// [`crate::simulation::Simulation::run_with_exchange`].
+    ///
+    /// # Panics
+    /// If `t` is not the waves' time, or `t_next ≤ t`.
+    pub fn exchange<BC: SWEBoundaryCondition2D>(
+        &mut self,
+        physics: &mut SWEPhysics2D<BC>,
+        q: &SWESolution2D,
+        t: f64,
+        t_next: f64,
+    ) {
+        assert!(
+            (t - self.time).abs() <= 1e-9 * t.abs().max(1.0),
+            "the waves are at {} s, the circulation at {t} s",
+            self.time
+        );
+        assert!(t_next > t, "coupling interval {t} → {t_next}");
+        let start = Instant::now();
+        let (f0, b0) = match self.last.take() {
+            Some(last) => last,
+            None => self.forcing(q),
+        };
+        self.coupling
+            .update_waves(&mut self.model, q, &self.bathymetry);
+        let exchanged = start.elapsed().as_secs_f64();
+
+        // The waves' own steps, landing on t_next
+        let start = Instant::now();
+        let span = t_next - t;
+        let steps = (span / self.model.compute_dt(self.cfl) * (1.0 - 1e-9))
+            .ceil()
+            .max(1.0) as usize;
+        let dt = span / steps as f64;
+        for s in 0..steps {
+            let start = t + s as f64 * dt;
+            // The parent's boundary and wind at the step's midpoint
+            let middle = start + 0.5 * dt;
+            if let Some(boundary) = &self.boundary {
+                boundary.at_into(middle, &mut self.boundary_buffer);
+                self.model.set_boundary_spectra(&self.boundary_buffer);
+            }
+            if let Some(wind) = &self.wind {
+                self.model.set_wind(wind.at(middle));
+            }
+            self.model
+                .step(&mut self.state, start, dt, &mut self.workspace);
+        }
+        self.time = t_next;
+        let stepping = start.elapsed().as_secs_f64();
+
+        let start = Instant::now();
+        let (f1, b1) = self.forcing(q);
+        let force: Arc<dyn SourceTerm2D> = Arc::new(WaveForce2D::between(t, f0, t_next, &f1));
+        physics.source = Some(match &self.sources {
+            None => force,
+            Some(own) => Arc::new(SourceTerms2D::new(vec![own.clone(), force])),
+        });
+        if let Some(inner) = &self.friction {
+            let ramp = tidal_ramp(0.5 * (t + t_next), self.ramp);
+            let stress = b0
+                .iter()
+                .zip(&b1)
+                .map(|(a, b)| 0.5 * ramp * (a + b))
+                .collect();
+            physics.friction = Some(Arc::new(WaveCurrentFriction2D::new(inner.clone(), stress)));
+        }
+        self.last = Some((f1, b1));
+
+        self.stats.exchanges += 1;
+        self.stats.wave_steps += steps;
+        self.stats.stepping_time += stepping;
+        self.stats.exchange_time += exchanged + start.elapsed().as_secs_f64();
+    }
+
+    /// The force (ramped) and the bed stress (unramped; empty without a bed
+    /// friction to enhance) of the wave state on the circulation.
+    fn forcing(&self, q: &SWESolution2D) -> (WaveForce2D, Vec<f64>) {
+        let mut force =
+            self.coupling
+                .depth_limited_force(&self.model, &self.state, q, DEFAULT_BREAKER_INDEX);
+        if let Some(seconds) = self.ramp {
+            force = force.with_ramp(seconds);
+        }
+        let stress = match self.friction {
+            Some(_) => self
+                .coupling
+                .bed_wave_stress(&self.model, &self.state, self.z0),
+            None => Vec::new(),
+        };
+        (force, stress)
     }
 }
 
@@ -405,5 +771,116 @@ mod tests {
             }
         }
         assert!(outside > 0);
+    }
+
+    /// The depth-limited force is the plain one where the circulation is deep
+    /// enough for the waves, and on a film it holds at most the stress of a
+    /// wave `γ h` high: `tr S/ρg ≤ γ² h²/4` at every node.
+    #[test]
+    fn the_force_is_capped_by_the_circulations_own_depth() {
+        let c = circulation(5, 4, 2);
+        let waves = waves_on(&c, |x, _| -(4.0 + 0.02 * x));
+        let n = varied_sea(&waves);
+        let coupling = WaveCoupling2D::new(&waves, c.mesh.clone(), c.ops.clone(), c.geom.clone());
+        let nn = c.ops.n_nodes;
+        let mut q = SWESolution2D::new(c.mesh.n_elements, nn);
+        let set = |q: &mut SWESolution2D, h: &dyn Fn(usize) -> f64| {
+            for p in 0..c.mesh.n_elements * nn {
+                q.set_state(
+                    ElementIndex::new(p / nn),
+                    p % nn,
+                    SWEState2D::new(h(p), 0.0, 0.0),
+                );
+            }
+        };
+        // Deep: unchanged
+        set(&mut q, &|_| 10.0);
+        let plain = coupling.force(&waves, &n);
+        let limited = coupling.depth_limited_force(&waves, &n, &q, DEFAULT_BREAKER_INDEX);
+        assert_eq!(plain.force(), limited.force());
+        // A film of 5 cm on every node: the stress is capped, so is its force
+        set(&mut q, &|_| 0.05);
+        let film = coupling.depth_limited_force(&waves, &n, &q, DEFAULT_BREAKER_INDEX);
+        let largest = |f: &WaveForce2D| {
+            f.force()
+                .iter()
+                .map(|f| f[0].hypot(f[1]))
+                .fold(0.0, f64::max)
+        };
+        let stress = coupling.radiation_stress(&waves, &n);
+        let cap = 0.25 * DEFAULT_BREAKER_INDEX.powi(2) * 0.05f64.powi(2);
+        assert!(
+            stress.iter().all(|s| s[0] + s[2] > cap),
+            "the sea must exceed the cap"
+        );
+        // A uniform cap scales every node's stress to the same trace
+        assert!(
+            largest(&film) < 0.02 * largest(&plain),
+            "{} {}",
+            largest(&film),
+            largest(&plain)
+        );
+    }
+
+    /// Regression (Frøya, 2026-10-07): a P2 element wet at its sides and dry
+    /// in its middle (h 1, 5e-4, 1 m across it; the dry nodes carry no
+    /// transport, as the circulation's desingularization leaves them). Between
+    /// the nodes the depth's parabola dips to a few millimetres where the
+    /// transport's does not, and its ratio there reached 2.4 m/s at the wave
+    /// nodes, against nodal currents of at most 0.5 m/s. The current passed
+    /// to the waves is at most the element's fastest wet node.
+    #[test]
+    fn a_dip_in_the_depth_between_nodes_gives_no_spurious_current() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 600.0, 0.0, 200.0, 3, 1);
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let c = Circulation {
+            mesh: Arc::new(mesh),
+            ops: Arc::new(ops),
+            geom: Arc::new(geom),
+        };
+        let nn = c.ops.n_nodes;
+        let mut q = SWESolution2D::new(c.mesh.n_elements, nn);
+        for k in ElementIndex::iter(c.mesh.n_elements) {
+            for i in 0..nn {
+                let r = c.ops.nodes_r[i];
+                let (h, hu) = if r < -0.5 {
+                    (1.0, 0.5)
+                } else if r > 0.5 {
+                    (1.0, 0.3)
+                } else {
+                    (5e-4, 0.0)
+                };
+                q.set_state(k, i, SWEState2D::new(h, hu, 0.0));
+            }
+        }
+        let fine = circulation(97, 3, 1);
+        let mut moved = (*fine.mesh).clone();
+        moved.vertices.iter_mut().for_each(|v| v[0] -= 0.1 * v[1]);
+        let fine = Circulation {
+            geom: Arc::new(GeometricFactors2D::compute(&moved, &fine.ops)),
+            mesh: Arc::new(moved),
+            ops: fine.ops,
+        };
+        let waves = waves_on(&fine, |_, _| -1.0);
+        let coupling = WaveCoupling2D::new(&waves, c.mesh.clone(), c.ops.clone(), c.geom.clone());
+        let (u, v) = coupling.currents(&q);
+        let t = coupling.to_waves();
+        let mut ratio: f64 = 0.0;
+        for p in 0..u.len() {
+            let h = t.value_at(p, q.h_data());
+            if h > DEFAULT_COUPLING_H_DRY {
+                ratio = ratio.max((t.value_at(p, q.hu_data()) / h).abs());
+            }
+        }
+        let fastest = u
+            .iter()
+            .zip(&v)
+            .map(|(u, v)| u.hypot(*v))
+            .fold(0.0, f64::max);
+        println!("largest current to the waves {fastest:.3} m/s; the ratio alone {ratio:.2} m/s");
+        assert!(ratio > 1.0, "the dip does not bite: {ratio}");
+        assert!(fastest <= 0.5 + 1e-12, "{fastest} m/s");
+        assert!(u.iter().all(|u| u.is_finite()));
     }
 }

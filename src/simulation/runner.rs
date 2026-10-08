@@ -205,6 +205,12 @@ where
         &self.physics
     }
 
+    /// Get a mutable reference to the physics module, e.g. to replace a
+    /// forcing between runs (see [`Self::run_with_exchange`]).
+    pub fn physics_mut(&mut self) -> &mut P {
+        &mut self.physics
+    }
+
     /// Get a reference to the time integrator.
     pub fn integrator(&self) -> &I {
         &self.integrator
@@ -432,6 +438,105 @@ where
         result.local_time_stepping = multirate.map(|(_, stepper)| stepper.stats());
         result
     }
+
+    /// Run from `t_start` to `t_end` in coupling intervals of `interval`,
+    /// calling `exchange(physics, state, t, t_next)` at the start of each:
+    /// a coupling to another model (the spectral waves,
+    /// [`crate::waves::CoupledWaves2D`]) advances it over the interval and
+    /// gives this physics module its forcing for the interval. Each interval
+    /// is then a [`Self::run_with_callback`] that lands on `t_next`.
+    ///
+    /// `callback` is called as by [`Self::run_with_callback`] over the whole
+    /// run: once at `t_start`, then at `t_start + k·callback_interval`, so the
+    /// callback interval must divide `interval`. Without an exchange that
+    /// changes the physics the run is [`Self::run_with_callback`]'s, bit for
+    /// bit where the callback times are exact in floating point (otherwise
+    /// they may differ in the last bit). The result's wall time includes the
+    /// exchanges.
+    ///
+    /// # Panics
+    /// If `interval` is not positive, or not a multiple of the callback
+    /// interval.
+    pub fn run_with_exchange<E, F>(
+        &mut self,
+        state: &mut S,
+        t_start: f64,
+        t_end: f64,
+        interval: f64,
+        mut exchange: E,
+        mut callback: F,
+    ) -> SimulationResult
+    where
+        E: FnMut(&mut P, &S, f64, f64),
+        F: FnMut(&S, f64),
+    {
+        assert!(interval > 0.0, "coupling interval must be positive");
+        if let Some(c) = self.config.callback_interval {
+            let ratio = interval / c;
+            assert!(
+                ratio.round() >= 1.0 && (ratio - ratio.round()).abs() <= 1e-9 * ratio,
+                "the callback interval {c} must divide the coupling interval {interval}"
+            );
+        }
+        let start_wall = std::time::Instant::now();
+        let mut total: Option<SimulationResult> = None;
+        let mut t = t_start;
+        let mut k = 0_u64;
+        while t < t_end {
+            k += 1;
+            let mut t_next = t_start + k as f64 * interval;
+            if t_next + LANDING_SLACK * interval >= t_end {
+                t_next = t_end;
+            }
+            exchange(&mut self.physics, state, t, t_next);
+            // Every interval but the first starts where the last one called
+            // back already
+            let mut skip = total.is_some();
+            let result = self.run_with_callback(state, t, t_next, |s, time| {
+                if !std::mem::take(&mut skip) {
+                    callback(s, time);
+                }
+            });
+            t = result.final_time;
+            let success = result.success;
+            total = Some(match total {
+                None => result,
+                Some(total) => total.then(result),
+            });
+            if !success {
+                break;
+            }
+        }
+        let mut total =
+            total.unwrap_or_else(|| self.run_with_callback(state, t_start, t_end, &mut callback));
+        total.wall_time = start_wall.elapsed().as_secs_f64();
+        total
+    }
+}
+
+impl SimulationResult {
+    /// This run followed by `next`, which started where it ended.
+    fn then(self, next: SimulationResult) -> SimulationResult {
+        let local_time_stepping = match (self.local_time_stepping, next.local_time_stepping) {
+            (Some(a), Some(b)) => Some(MultirateStats {
+                steps: a.steps + b.steps,
+                element_evaluations: a.element_evaluations + b.element_evaluations,
+                global_evaluations: a.global_evaluations + b.global_evaluations,
+                finest_level: a.finest_level.max(b.finest_level),
+            }),
+            (a, b) => a.or(b),
+        };
+        SimulationResult {
+            final_time: next.final_time,
+            n_steps: self.n_steps + next.n_steps,
+            dt_min: self.dt_min.min(next.dt_min),
+            dt_max: self.dt_max.max(next.dt_max),
+            wall_time: self.wall_time + next.wall_time,
+            success: self.success && next.success,
+            error: self.error.or(next.error),
+            local_time_stepping,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -657,6 +762,60 @@ mod tests {
         let min_h = *physics.min_h_seen.lock().unwrap();
         assert!(min_h >= 0.0, "an RHS evaluation saw h = {min_h}");
         assert!(state.h_data().iter().all(|&h| h >= 0.0));
+    }
+
+    /// A run in coupling intervals whose exchange leaves the physics alone is
+    /// the single run bit for bit: the same states, steps and callback times;
+    /// the exchange sees each interval's start and end.
+    #[test]
+    fn a_run_in_coupling_intervals_is_the_single_run() {
+        let wave = || {
+            let (physics, mut state) = create_test_setup();
+            for (p, h) in state.h_data_mut().iter_mut().enumerate() {
+                *h += 0.1 * (0.7 * p as f64).sin();
+            }
+            (physics, state)
+        };
+        let (callback, interval, t_end) = (0.0625, 0.125, 0.5);
+
+        let (physics, mut single) = wave();
+        let sim = Simulation::new(physics, SSPRK3).with_callback_interval(callback);
+        let mut single_times = Vec::new();
+        let single_result = sim.run_with_callback(&mut single, 0.0, t_end, |_, t| {
+            single_times.push(t);
+        });
+
+        let (physics, mut coupled) = wave();
+        let mut sim = Simulation::new(physics, SSPRK3).with_callback_interval(callback);
+        let (mut times, mut exchanges) = (Vec::new(), Vec::new());
+        let result = sim.run_with_exchange(
+            &mut coupled,
+            0.0,
+            t_end,
+            interval,
+            |_, _, t, t_next| exchanges.push((t, t_next)),
+            |_, t| times.push(t),
+        );
+
+        assert!(result.success && single_result.success);
+        assert_eq!(result.final_time, t_end);
+        assert_eq!(result.n_steps, single_result.n_steps);
+        assert_eq!(times, single_times);
+        assert_eq!(
+            exchanges,
+            [(0.0, 0.125), (0.125, 0.25), (0.25, 0.375), (0.375, 0.5)]
+        );
+        assert_eq!(coupled.h_data(), single.h_data());
+        assert_eq!(coupled.hu_data(), single.hu_data());
+        assert_eq!(coupled.hv_data(), single.hv_data());
+    }
+
+    #[test]
+    #[should_panic(expected = "must divide the coupling interval")]
+    fn a_coupling_interval_is_a_multiple_of_the_callback_interval() {
+        let (physics, mut state) = create_test_setup();
+        let mut sim = Simulation::new(physics, SSPRK3).with_callback_interval(0.05);
+        sim.run_with_exchange(&mut state, 0.0, 0.2, 0.12, |_, _, _, _| {}, |_, _| {});
     }
 
     #[test]
