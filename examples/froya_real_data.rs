@@ -100,7 +100,7 @@
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
-//!     [wave_sources=swan|wam] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
+//!     [wave_sources=swan|wam] [wave_integration=] [wave_limiter=] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
 //!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
 //!     [levels=0] [tide3d=0] [restart_hours=0] [resume=<file>]
@@ -139,7 +139,8 @@
 //! `wave_sources=wam` integrates the sources as WAM does: implicit in the
 //! DIA's diagonal, with Hersbach & Janssen's growth limiter proportional to
 //! the step (`SourceIntegration::Implicit`, `GrowthLimiter::Rate`), in place
-//! of SWAN's frozen rates and per-step limiter. Its sources tolerate long
+//! of SWAN's frozen rates and per-step limiter; `wave_integration=frozen|implicit`
+//! and `wave_limiter=ris|rate` set either part alone. Its sources tolerate long
 //! steps, so `wave_substeps=N` runs them once per N propagation steps (each
 //! with its own implicit refraction, shifting and breaking), and `wave_cfl=`
 //! sets the propagation's CFL number (0.5).
@@ -499,8 +500,13 @@ struct Options {
     turning: Option<f64>,
     /// Step refraction and frequency shifting implicitly (`implicit=1`)
     implicit_refraction: bool,
-    /// WAM's integration of the sources (`wave_sources=wam`) instead of SWAN's
-    wave_wam_sources: bool,
+    /// The sources implicit in the DIA, WAM's integration
+    /// (`wave_integration=implicit`), instead of SWAN's frozen rates
+    /// (`frozen`); `wave_sources=wam` sets it with the limiter below
+    wave_implicit_sources: bool,
+    /// Hersbach & Janssen's growth limiter, proportional to the step
+    /// (`wave_limiter=rate`), instead of Ris's per step (`ris`)
+    wave_rate_limiter: bool,
     /// Propagation steps per wave step (`wave_substeps=`)
     wave_substeps: usize,
     /// The waves' propagation CFL number (`wave_cfl=`)
@@ -586,6 +592,12 @@ impl Options {
                 v.parse().map_err(|_| format!("bad {key}={v}"))
             })
         };
+        // WAM's integration of the sources: both parts below unless one is set
+        let wam_sources = match args.get("wave_sources").map(String::as_str) {
+            None | Some("swan") => false,
+            Some("wam") => true,
+            Some(other) => return Err(format!("wave_sources=swan|wam, not {other}")),
+        };
         let constituents = |key: &str, default: &str| -> Result<Vec<&'static str>, String> {
             args.get(key)
                 .map_or(default, String::as_str)
@@ -661,10 +673,19 @@ impl Options {
                 .map(|v| v.parse().map_err(|_| format!("bad turning={v}")))
                 .transpose()?,
             implicit_refraction: get("implicit", 0.0)? != 0.0,
-            wave_wam_sources: match args.get("wave_sources").map(String::as_str) {
-                None | Some("swan") => false,
-                Some("wam") => true,
-                Some(other) => return Err(format!("wave_sources=swan|wam, not {other}")),
+            wave_implicit_sources: match args.get("wave_integration").map(String::as_str) {
+                None => wam_sources,
+                Some("frozen") => false,
+                Some("implicit") => true,
+                Some(other) => {
+                    return Err(format!("wave_integration=frozen|implicit, not {other}"));
+                }
+            },
+            wave_rate_limiter: match args.get("wave_limiter").map(String::as_str) {
+                None => wam_sources,
+                Some("ris") => false,
+                Some("rate") => true,
+                Some(other) => return Err(format!("wave_limiter=ris|rate, not {other}")),
             },
             wave_substeps: get("wave_substeps", 1.0)? as usize,
             wave_cfl: get("wave_cfl", 0.5)?,
@@ -2047,12 +2068,18 @@ fn wave_model(domain: &Domain, opts: &Options, wind: Option<Wind>) -> (WaveModel
         grid,
         G,
     )
-    .with_sources(if opts.wave_wam_sources {
-        SourceTerms::swan_defaults(G)
-            .with_integration(SourceIntegration::Implicit)
-            .with_limiter(Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)))
-    } else {
-        SourceTerms::swan_defaults(G)
+    .with_sources({
+        let sources = SourceTerms::swan_defaults(G);
+        let sources = if opts.wave_implicit_sources {
+            sources.with_integration(SourceIntegration::Implicit)
+        } else {
+            sources
+        };
+        if opts.wave_rate_limiter {
+            sources.with_limiter(Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)))
+        } else {
+            sources
+        }
     })
     .with_boundary_spectrum(&sea)
     .with_turning_limit(opts.turning)
