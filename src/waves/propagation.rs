@@ -118,6 +118,8 @@ impl WaveModel2D {
             let neighbour = mesh.neighbor(element, face);
             let open =
                 neighbour.is_none() && mesh.boundary_tag(element, face) == Some(BoundaryTag::Open);
+            // A dry neighbour (absorbing land) is coast
+            let neighbour = neighbour.filter(|nb| !self.dry_element(nb.element));
             (0..nfn).map(move |fi| {
                 (
                     face * nfn + fi,
@@ -135,8 +137,12 @@ impl WaveModel2D {
     }
 
     /// The DG geographic term of element `k` for every component, into its
-    /// node-major rows `out` (overwritten).
+    /// node-major rows `out` (overwritten); zero in a dry element.
     fn geographic_element(&self, n: &[f64], k: usize, out: &mut [f64]) {
+        if self.dry_element(k) {
+            out.fill(0.0);
+            return;
+        }
         #[cfg(feature = "simd")]
         if super::vector_kernels() && self.geographic_element_simd(n, k, out) {
             return;

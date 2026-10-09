@@ -35,7 +35,10 @@
 //! per node of the open faces, changed as often as wanted
 //! ([`WaveModel2D::set_boundary_spectra`], e.g. a parent wave model's through
 //! [`super::BoundarySpectra`]); every other face absorbs (nothing comes in),
-//! as SWAN's default coast.
+//! as SWAN's default coast. Land inside the mesh is water of the minimum
+//! depth, or with [`WaveModel2D::with_absorbing_land`] absorbs like the
+//! coast: dry nodes lose their action every propagation step, and the faces
+//! of a wholly dry element are coast to its wet neighbours.
 //!
 //! A step ([`WaveModel2D::step`]) is SSP-RK3 for the propagation, with a
 //! positivity-preserving scaling of each component in each element towards its
@@ -236,6 +239,8 @@ pub struct WaveModel2D {
     depth_min: f64,
     /// Bed elevation B per node (m)
     bed: Vec<f64>,
+    /// Surface elevation per node (m), as set
+    water_level: Vec<f64>,
     /// Depth d per node (m, ≥ `depth_min`), its gradient
     depth: Vec<f64>,
     depth_grad: Vec<[f64; 2]>,
@@ -261,6 +266,12 @@ pub struct WaveModel2D {
     /// Propagation steps per step, each with its implicit refraction,
     /// shifting and breaking; the other sources run once per step
     substeps: usize,
+    /// Land absorbs the waves ([`Self::with_absorbing_land`])
+    absorbing_land: bool,
+    /// With absorbing land, the dry nodes (`η − B` below the minimum depth)
+    /// and the elements all of whose nodes are dry; empty without
+    dry_nodes: Vec<bool>,
+    dry_elements: Vec<bool>,
 }
 
 impl WaveModel2D {
@@ -284,6 +295,7 @@ impl WaveModel2D {
             g,
             depth_min: DEFAULT_DEPTH_MIN,
             bed: bathymetry.data.clone(),
+            water_level: vec![0.0; n_points],
             depth: vec![0.0; n_points],
             depth_grad: vec![[0.0; 2]; n_points],
             current: vec![[0.0; 2]; n_points],
@@ -298,6 +310,9 @@ impl WaveModel2D {
             implicit_frequency_shift: false,
             time_integrator: StandardIntegrator::SSPRK3,
             substeps: 1,
+            absorbing_land: false,
+            dry_nodes: Vec::new(),
+            dry_elements: Vec::new(),
             mesh,
             ops,
             geom,
@@ -456,14 +471,76 @@ impl WaveModel2D {
     pub fn with_depth_min(mut self, depth: f64) -> Self {
         assert!(depth > 0.0);
         self.depth_min = depth;
-        let eta: Vec<f64> = self
-            .depth
-            .iter()
-            .zip(&self.bed)
-            .map(|(d, b)| d + b)
-            .collect();
+        let eta = std::mem::take(&mut self.water_level);
         self.set_water_level(&eta);
         self
+    }
+
+    /// Let land absorb the waves (off by default): at the nodes where the
+    /// water is shallower than the minimum depth (dry nodes), the action is
+    /// removed after every propagation step; an element whose nodes are all
+    /// dry is not stepped, and its faces are coast to its wet neighbours
+    /// (waves leave through them, none come in). Which nodes are dry follows
+    /// [`Self::set_water_level`].
+    ///
+    /// Without it, land is water of the minimum depth: waves running onto it
+    /// slow to its group velocity and pile up until the sinks there (bottom
+    /// friction, breaking) remove them, so what reaches the land depends on
+    /// the floor and on the sinks' details.
+    pub fn with_absorbing_land(mut self, on: bool) -> Self {
+        self.absorbing_land = on;
+        self.update_dry_land();
+        self
+    }
+
+    /// The dry nodes and elements of [`Self::with_absorbing_land`] from the
+    /// water level `depth + B` (unfloored where it is above the floor).
+    fn update_dry_land(&mut self) {
+        self.dry_nodes.clear();
+        self.dry_elements.clear();
+        if !self.absorbing_land {
+            return;
+        }
+        let (depth_min, nn) = (self.depth_min, self.ops.n_nodes);
+        // `depth` is floored, so a node is dry where the floor applies; the
+        // floor itself (exactly `depth_min` of water) counts as dry
+        self.dry_nodes
+            .extend(self.depth.iter().map(|&d| d <= depth_min));
+        self.dry_elements.extend(
+            self.dry_nodes
+                .chunks_exact(nn)
+                .map(|e| e.iter().all(|&d| d)),
+        );
+    }
+
+    /// Whether node `p` is dry land that absorbs ([`Self::with_absorbing_land`]).
+    #[inline]
+    fn absorbs_at(&self, p: usize) -> bool {
+        self.dry_nodes.get(p).copied().unwrap_or(false)
+    }
+
+    /// Whether element `k` is dry land that is not stepped.
+    #[inline]
+    fn dry_element(&self, k: usize) -> bool {
+        self.dry_elements.get(k).copied().unwrap_or(false)
+    }
+
+    /// Remove the action at the dry nodes of the node-major state.
+    fn absorb_on_land(&self, node_major: &mut [f64]) {
+        if self.dry_nodes.is_empty() {
+            return;
+        }
+        let nc = self.grid.n_components();
+        for_each_chunk(
+            node_major,
+            nc,
+            || (),
+            |_, p, spectrum| {
+                if self.dry_nodes[p] {
+                    spectrum.fill(0.0);
+                }
+            },
+        );
     }
 
     /// Cap the refraction rate |c_θ| at `rate` (rad/s): on steep, shallow slopes
@@ -540,14 +617,18 @@ impl WaveModel2D {
     }
 
     /// Set the surface elevation η (m, per node): the depth `η − B` (floored), its
-    /// gradient and the wave kinematics follow.
+    /// gradient, the wave kinematics and, with [`Self::with_absorbing_land`],
+    /// the dry land follow.
     pub fn set_water_level(&mut self, eta: &[f64]) {
         let n_points = self.n_points();
         assert_eq!(eta.len(), n_points);
+        self.water_level.clear();
+        self.water_level.extend_from_slice(eta);
         for ((d, &eta), &bed) in self.depth.iter_mut().zip(eta).zip(&self.bed) {
             *d = (eta - bed).max(self.depth_min);
         }
         nodal_gradient(&self.ops, &self.geom, &self.depth, &mut self.depth_grad);
+        self.update_dry_land();
         let (g, grid, depth) = (self.g, &self.grid, &self.depth);
         let rows = self
             .k
@@ -677,7 +758,7 @@ impl WaveModel2D {
         };
         for k in 0..self.mesh.n_elements {
             let h = self.geom.element_size(k);
-            for p in k * n_nodes..(k + 1) * n_nodes {
+            for p in (k * n_nodes..(k + 1) * n_nodes).filter(|&p| !self.absorbs_at(p)) {
                 let [u, v] = self.current[p];
                 let (i, cg_max) = (0..self.grid.n_freq())
                     .map(|i| (i, self.cg[i * n_points + p]))
@@ -694,7 +775,7 @@ impl WaveModel2D {
             SpectralAdvection::Upwind => cfl,
             SpectralAdvection::VanLeer => 0.5 * cfl,
         };
-        for p in 0..n_points {
+        for p in (0..n_points).filter(|&p| !self.absorbs_at(p)) {
             for i in 0..self.grid.n_freq() {
                 for j in 0..nd {
                     if !self.implicit_refraction {
@@ -750,6 +831,9 @@ impl WaveModel2D {
     /// breaking over it, and the other sources sit between the first `⌊m/2⌋`
     /// propagation steps and the rest, so for even `m` the step is symmetric
     /// (Strang), and its splitting second order in the step.
+    ///
+    /// With [`Self::with_absorbing_land`] the dry nodes lose their action at
+    /// the start of the step and after every propagation step's passes.
     pub fn step(&self, n: &mut WaveSolution, t: f64, dt: f64, ws: &mut WaveWorkspace) {
         let substeps = self.substeps;
         let h = dt / substeps as f64;
@@ -771,6 +855,8 @@ impl WaveModel2D {
         // The whole step node-major: one transpose in, one out
         let (np, nc) = (self.n_points(), self.grid.n_components());
         to_node_major(&n.data, np, nc, &mut ws.node.data);
+        // Land that has fallen dry since the last step takes its waves
+        self.absorb_on_land(&mut ws.node.data);
         for m in 0..substeps {
             if refraction.is_some() || shift.is_some() {
                 self.node_pass_node_major(
@@ -797,6 +883,7 @@ impl WaveModel2D {
                 };
                 self.node_pass_node_major(&mut ws.node.data, pass);
             }
+            self.absorb_on_land(&mut ws.node.data);
         }
         from_node_major(&ws.node.data, np, nc, &mut n.data);
     }
@@ -900,6 +987,10 @@ impl WaveModel2D {
                 let first = chunk * tile;
                 for (q, spectrum) in nodes.chunks_exact_mut(nc).enumerate() {
                     let p = first + q;
+                    // Dry land's action goes after the pass (`absorb_on_land`)
+                    if self.absorbs_at(p) {
+                        continue;
+                    }
                     rates.fill(self, p, refraction.is_some(), shift.is_some());
                     let rates = &*rates;
                     let mut shift_now = |spectrum: &mut [f64]| {
@@ -950,8 +1041,9 @@ impl WaveModel2D {
                 }
                 // The sources at all the chunk's nodes (at once in the DIA's
                 // lanes), then breaking over its own interval
-                if sources.is_some() || breaking.is_some() {
-                    let width = nodes.len() / nc;
+                let width = nodes.len() / nc;
+                let on_land = (first..first + width).all(|p| self.absorbs_at(p));
+                if (sources.is_some() || breaking.is_some()) && !on_land {
                     for q in 0..width {
                         for (i, k) in k[q * nf..(q + 1) * nf].iter_mut().enumerate() {
                             *k = self.k[i * np + first + q];
@@ -1638,6 +1730,28 @@ mod tests {
             }
         }
         assert!(shifted > 1e-3, "nothing shifted ({shifted})");
+    }
+
+    /// A new minimum depth keeps the water level: land stays as dry as it
+    /// was (it took the floored depth for water, so land rose with the old
+    /// floor, η = 0.1 m + B).
+    #[test]
+    fn a_new_depth_floor_keeps_the_water_level() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 200.0, 0.0, 100.0, 2, 1);
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bed = |x: f64, _: f64| -5.0 + 0.04 * x;
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        let grid = SpectralGrid::new(0.08, 0.3, 4, 8);
+        let mut model = WaveModel2D::new(Arc::new(mesh), ops, geom, &bathymetry, grid, 9.81);
+        let eta = vec![0.5; model.n_points()];
+        model.set_water_level(&eta);
+        let model = model.with_depth_min(0.01).with_absorbing_land(true);
+        for (p, (&d, &b)) in model.depth().iter().zip(&bathymetry.data).enumerate() {
+            assert_eq!(d, (0.5 - b).max(0.01), "node {p}");
+            assert_eq!(model.absorbs_at(p), 0.5 - b <= 0.01, "node {p}");
+        }
+        assert!((0..model.n_points()).any(|p| model.absorbs_at(p)));
     }
 
     /// A wind per node: from calm, one step's sea at each node is the one
