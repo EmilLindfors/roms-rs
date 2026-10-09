@@ -145,6 +145,43 @@ impl Wind {
     }
 }
 
+/// What the sinks take from a node's spectrum per second
+/// ([`SourceTerms::dissipation`]).
+///
+/// The variances (m²/s) times ρg are the energy each sink gives the water
+/// (W/m²): whitecapping and breaking at the surface, friction at the bed.
+/// `force` is the momentum the waves lose with them, per ρ (m²/s²):
+///
+/// ```text
+/// F = g ∫∫ (k/σ) (cos θ, sin θ) D dσ dθ,
+/// ```
+///
+/// each component's momentum `E k/σ` per unit energy. It is the force of
+/// Dingemans et al. (1987) on the mean flow, SWAN's alternative to the
+/// radiation stress's divergence: Longuet-Higgins's (1970) longshore force on
+/// a uniform coast, and zero where the waves only shoal or refract. It drives
+/// the currents and sets the water up where the waves break, but does not
+/// set it down where they shoal: it leaves out the part of `−∇·S` from
+/// shoaling and refraction without loss, which is nearly a gradient.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Dissipation {
+    /// The variance (m²/s) whitecapping removes per second
+    pub whitecapping: f64,
+    /// The variance (m²/s) bottom friction removes per second
+    pub bottom_friction: f64,
+    /// The variance (m²/s) depth-induced breaking removes per second
+    pub breaking: f64,
+    /// The momentum all three remove per second, per ρ (m²/s²)
+    pub force: [f64; 2],
+}
+
+impl Dissipation {
+    /// The variance (m²/s) all the sinks remove per second.
+    pub fn total(&self) -> f64 {
+        self.whitecapping + self.bottom_friction + self.breaking
+    }
+}
+
 /// Which source terms act, and their coefficients.
 #[derive(Clone, Debug)]
 pub struct SourceTerms {
@@ -415,6 +452,94 @@ impl SourceTerms {
                 b.iter_mut().for_each(|x| *x -= rate);
             }
         }
+    }
+
+    /// What the sinks (whitecapping, bottom friction, depth-induced breaking)
+    /// take per second from the variance density `e` at a node of depth
+    /// `depth` with wavenumbers `k[i]`, over a step `dt` (s) with the rates
+    /// frozen, as [`Self::integrate`] steps them: each component loses
+    /// `E (1 − e^{BΔt})` to the sinks' total rate `B`, shared among them in
+    /// proportion to their rates, and per second
+    ///
+    /// ```text
+    /// D_term = (B_term/B) E (1 − e^{BΔt})/Δt,
+    /// ```
+    ///
+    /// integrated over the spectrum, with the momentum they take with it
+    /// (see [`Dissipation`]). `dt = 0` gives the instantaneous `D = −B E`.
+    /// Over a step no sink removes more than the energy there is (`E/Δt`):
+    /// a stiff sink, such as whitecapping on a steep sea in a few
+    /// decimetres of water, takes what the step brings it, not its rate
+    /// times the energy the propagation has just brought.
+    ///
+    /// The rates are those of [`Self::rates`]; the wind input and the DIA
+    /// (which only moves energy) are left out. `rates`, `term` are scratch
+    /// (one value per component).
+    pub fn dissipation(
+        &self,
+        grid: &SpectralGrid,
+        e: &[f64],
+        k: &[f64],
+        depth: f64,
+        dt: f64,
+        rates: &mut [f64],
+        term: &mut [f64],
+    ) -> Dissipation {
+        assert!(dt >= 0.0, "a step of {dt} s");
+        let mut out = Dissipation::default();
+        let Some(means) = Means::of(grid, e, k) else {
+            return out;
+        };
+        let nd = grid.n_dir();
+        let none = Self::none(self.g);
+        let sinks = [
+            Self {
+                whitecapping: self.whitecapping,
+                ..none.clone()
+            },
+            Self {
+                bottom_friction: self.bottom_friction,
+                ..none.clone()
+            },
+            Self {
+                breaking: self.breaking,
+                ..none
+            },
+        ];
+        // Without wind no term has a linear input `A`
+        let calm = Wind::default();
+        // The sinks' total rate, and each component's share of a step's loss
+        // per unit rate: `(1 − e^{BΔt})/(−BΔt)` (1 for an instant)
+        rates.fill(0.0);
+        for sink in &sinks {
+            sink.add_local_rates(grid, e, k, depth, calm, Some(means), &mut [], rates);
+        }
+        for r in rates.iter_mut() {
+            let x = *r * dt;
+            *r = if x < -1e-12 { -(x.exp_m1()) / -x } else { 1.0 };
+        }
+        for (index, sink) in sinks.iter().enumerate() {
+            term.fill(0.0);
+            sink.add_local_rates(grid, e, k, depth, calm, Some(means), &mut [], term);
+            let mut variance = 0.0;
+            for (i, &ki) in k.iter().enumerate().take(grid.n_freq()) {
+                let w = grid.d_sigma[i] * grid.d_theta;
+                let momentum = self.g * ki / grid.sigma[i];
+                for j in 0..nd {
+                    let c = i * nd + j;
+                    let lost = -term[c] * rates[c] * e[c] * w;
+                    variance += lost;
+                    out.force[0] += momentum * grid.cos_theta[j] * lost;
+                    out.force[1] += momentum * grid.sin_theta[j] * lost;
+                }
+            }
+            match index {
+                0 => out.whitecapping = variance,
+                1 => out.bottom_friction = variance,
+                _ => out.breaking = variance,
+            }
+        }
+        out
     }
 
     /// Advance the action density `n` (one node's spectrum) over `dt` by
@@ -1132,6 +1257,131 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The dissipation diagnostic against what the sinks do over a step
+    /// (frozen rates, as `integrate` steps them): the variance each removes
+    /// per second, and with all three the waves' momentum `g Σ (k/σ) e_θ E`
+    /// they remove, to round-off, at a short step and at a long one where
+    /// the instantaneous `−B E` would claim more than there is. A spread sea
+    /// at 30° in 3 m of water, where whitecapping, friction and breaking all
+    /// act.
+    #[test]
+    fn the_dissipation_is_what_the_sinks_remove() {
+        let grid = SpectralGrid::new(0.05, 0.5, 20, 24);
+        let depth = 3.0;
+        let k: Vec<f64> = grid
+            .sigma
+            .iter()
+            .map(|&s| wavenumber(s, depth, G))
+            .collect();
+        let e0 = grid.jonswap(2.0, 7.0, 3.3, 0.5, 4.0);
+        let nd = grid.n_dir();
+        let m = e0.len();
+        let all = SourceTerms::swan_defaults(G);
+        let none = SourceTerms::none(G);
+        let sinks = none
+            .clone()
+            .with_whitecapping(true)
+            .with_bottom_friction(all.bottom_friction)
+            .with_breaking(all.breaking);
+        let (mut e, mut a, mut b) = (vec![0.0; m], vec![0.0; m], vec![0.0; m]);
+        // Variance and momentum (per ρ) of a spectrum
+        let integrals = |e: &[f64]| {
+            let (mut m0, mut momentum) = (0.0, [0.0; 2]);
+            for c in 0..m {
+                let (i, j) = (c / nd, c % nd);
+                let w = e[c] * grid.d_sigma[i] * grid.d_theta;
+                m0 += w;
+                momentum[0] += G * k[i] / grid.sigma[i] * grid.cos_theta[j] * w;
+                momentum[1] += G * k[i] / grid.sigma[i] * grid.sin_theta[j] * w;
+            }
+            (m0, momentum)
+        };
+        let mut removed = |sources: &SourceTerms, dt: f64| {
+            let mut n: Vec<f64> = (0..m).map(|c| e0[c] / grid.sigma[c / nd]).collect();
+            sources.integrate(
+                &grid,
+                &mut n,
+                &k,
+                depth,
+                Wind::default(),
+                dt,
+                &mut e,
+                &mut a,
+                &mut b,
+            );
+            let after: Vec<f64> = (0..m).map(|c| n[c] * grid.sigma[c / nd]).collect();
+            let ((m0, p0), (m1, p1)) = (integrals(&e0), integrals(&after));
+            ((m0 - m1) / dt, [(p0[0] - p1[0]) / dt, (p0[1] - p1[1]) / dt])
+        };
+        let (mut ra, mut rb) = (vec![0.0; m], vec![0.0; m]);
+        let instant = all.dissipation(&grid, &e0, &k, depth, 0.0, &mut ra, &mut rb);
+        assert!(
+            instant.whitecapping > 0.0 && instant.bottom_friction > 0.0 && instant.breaking > 0.0,
+            "{instant:?}"
+        );
+        let m0 = integrals(&e0).0;
+        for dt in [1e-3, 600.0] {
+            let d = all.dissipation(&grid, &e0, &k, depth, dt, &mut ra, &mut rb);
+            // Each sink alone: the diagnostic over the step of that sink alone
+            type Get = fn(&Dissipation) -> f64;
+            for (name, sink, got) in [
+                (
+                    "whitecapping",
+                    none.clone().with_whitecapping(true),
+                    (|d: &Dissipation| d.whitecapping) as Get,
+                ),
+                (
+                    "friction",
+                    none.clone().with_bottom_friction(all.bottom_friction),
+                    |d: &Dissipation| d.bottom_friction,
+                ),
+                (
+                    "breaking",
+                    none.clone().with_breaking(all.breaking),
+                    |d: &Dissipation| d.breaking,
+                ),
+            ] {
+                let (variance, _) = removed(&sink, dt);
+                let alone = got(&sink.dissipation(&grid, &e0, &k, depth, dt, &mut ra, &mut rb));
+                assert!(
+                    (variance - alone).abs() <= 1e-12 * m0 / dt.min(1.0),
+                    "{name} at {dt} s: {variance} against {alone}"
+                );
+            }
+            // All three together, shared among them by their rates
+            let (variance, force) = removed(&sinks, dt);
+            assert!(
+                (variance - d.total()).abs() <= 1e-12 * m0 / dt.min(1.0),
+                "{dt} s: {variance} against {}",
+                d.total()
+            );
+            let size = d.force[0].hypot(d.force[1]);
+            for (x, y) in force.iter().zip(d.force) {
+                assert!(
+                    (x - y).abs() <= 1e-10 * size,
+                    "{dt} s: {force:?} against {:?}",
+                    d.force
+                );
+            }
+            // Along the waves, about 30° off x
+            let angle = d.force[1].atan2(d.force[0]);
+            assert!((angle - 0.5).abs() < 0.05, "{angle}");
+            // Never more than there is
+            assert!(d.total() * dt <= m0, "{dt} s: {} of {m0}", d.total() * dt);
+        }
+        // An instant is the rate times the energy: a short step's limit
+        let short = all.dissipation(&grid, &e0, &k, depth, 1e-3, &mut ra, &mut rb);
+        assert!((short.total() / instant.total() - 1.0).abs() < 1e-4);
+        let long = all.dissipation(&grid, &e0, &k, depth, 600.0, &mut ra, &mut rb);
+        assert!(
+            long.total() < 0.5 * instant.total(),
+            "{long:?} against {instant:?}"
+        );
+        // No energy, no dissipation
+        let calm = all.dissipation(&grid, &vec![0.0; m], &k, depth, 60.0, &mut ra, &mut rb);
+        assert_eq!(calm, Dissipation::default());
     }
 
     #[test]

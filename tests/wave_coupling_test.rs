@@ -985,6 +985,104 @@ fn oblique_breaking_waves_drive_a_longshore_current() {
     assert!((fastest / (largest / cd).sqrt() - 1.0).abs() < 0.05);
 }
 
+/// The force of the waves' dissipation (Dingemans et al. 1987,
+/// `WaveForce2D::from_dissipation`) in place of `−∇·S`, on the beach.
+///
+/// - The oblique swell of `oblique_breaking_waves_drive_a_longshore_current`:
+///   per node its alongshore part is Longuet-Higgins's force
+///   (`longuet_higgins_force`, computed independently) to round-off, so in
+///   the surf zone the current follows `√(F_x/C_d)` to 0.58 % (`−∇·S`:
+///   3.8 %). Seaward of the breakers there is no dissipation and no force;
+///   the current there is 1.3 mm/s at most, carried across the breaker line
+///   by the discretisation, where `−∇·S`'s discrete refraction drove 5 mm/s.
+/// - Swell straight at the beach (one pass on still water each): the
+///   cross-shore part pushes shoreward wherever the waves break, and sets
+///   the water up at the wall by 5.73 cm, within 1.4 % of `−∇·S`'s 5.81 cm.
+///   But there is no set-down seaward of the breakers (`−∇·S`: −0.68 cm),
+///   where the waves shoal without losing energy.
+#[test]
+fn the_dissipation_force_drives_the_longshore_current_and_no_other() {
+    let beach = Beach::new();
+    let direction = std::f64::consts::FRAC_PI_2 - 20f64.to_radians();
+    let waves = beach.waves(direction, Some(20), 72);
+    let mut n = waves.zero_state();
+    Beach::settle(&waves, &mut n);
+    let force = WaveForce2D::from_dissipation(&waves, &n, 0.0);
+    let lh = longuet_higgins_force(&waves, &n);
+    let largest = lh.iter().cloned().fold(0.0, f64::max);
+    let off = force
+        .force()
+        .iter()
+        .zip(&lh)
+        .map(|(f, lh)| (f[0] - lh).abs())
+        .fold(0.0f64, f64::max);
+    assert!(off <= 1e-12 * largest, "{off} off Longuet-Higgins's force");
+    let cd = 2.5e-3;
+    let physics = beach
+        .physics()
+        .with_source(force.clone().with_ramp(300.0))
+        .with_implicit_friction(ChezyFriction2D::new(cd))
+        .build();
+    let mut q = beach.still_water();
+    let result = Simulation::new(physics, SSPRK3).run(&mut q, 0.0, 10_000.0);
+    assert!(result.success, "{result:?}");
+    let expected = |p: usize| (lh[p].max(0.0) / cd).sqrt();
+    let (mut surf, mut offshore, mut fastest) = (0.0f64, 0.0f64, 0.0f64);
+    for (p, &f) in lh.iter().enumerate() {
+        let u = q.hu_data()[p] / q.h_data()[p];
+        fastest = fastest.max(u);
+        if f > 0.1 * largest {
+            surf = surf.max((u / expected(p) - 1.0).abs());
+        } else if f < 1e-3 * largest {
+            offshore = offshore.max(u.abs());
+        }
+    }
+
+    // Straight at the beach: the setup and set-down of either force
+    let waves = beach.waves(std::f64::consts::FRAC_PI_2, None, 36);
+    let mut n = waves.zero_state();
+    Beach::settle(&waves, &mut n);
+    let levels = |force: WaveForce2D| {
+        let physics = beach.physics().with_source(force.with_ramp(300.0)).build();
+        let mut q = beach.still_water();
+        let result = Simulation::new(physics, SSPRK3).run(&mut q, 0.0, 3000.0);
+        assert!(result.success, "{result:?}");
+        let eta = beach.eta(&q);
+        let low = eta.iter().cloned().fold(f64::INFINITY, f64::min);
+        (
+            beach.setup(&q),
+            low - eta[beach.balance(&vec![[0.0; 2]; eta.len()], &q)[0].0],
+        )
+    };
+    let (setup_s, down_s) = levels(WaveForce2D::new(&waves, &n));
+    let (setup_d, down_d) = levels(WaveForce2D::from_dissipation(&waves, &n, 0.0));
+    println!(
+        "dissipation force: longshore current {fastest:.3} m/s (Longuet-Higgins {:.3}), off by \
+         ≤ {:.2} % in the surf zone, |u| ≤ {offshore:.2e} m/s offshore; straight in, setup at the \
+         wall {:.2} cm (−∇·S: {:.2}), set-down {:.2} cm (−∇·S: {:.2})",
+        (largest / cd).sqrt(),
+        100.0 * surf,
+        100.0 * setup_d,
+        100.0 * setup_s,
+        100.0 * down_d,
+        100.0 * down_s,
+    );
+    assert!(surf < 0.05, "the current is {surf} off Longuet-Higgins's");
+    assert!((fastest / (largest / cd).sqrt() - 1.0).abs() < 0.05);
+    assert!(
+        offshore < 3e-3 * fastest,
+        "an offshore current of {offshore} m/s"
+    );
+    assert!(
+        (setup_d / setup_s - 1.0).abs() < 0.03,
+        "setup {setup_d} against {setup_s}"
+    );
+    assert!(
+        down_s < -5e-3 && down_d > -1e-4,
+        "set-down {down_d} against {down_s}"
+    );
+}
+
 /// The oblique swell of `oblique_breaking_waves_drive_a_longshore_current` on
 /// the 3D model (`Hydrostatic3D`, 10 uniform σ-levels, mode splitting, a
 /// constant eddy viscosity ν = 0.01 m²/s and quadratic bottom drag

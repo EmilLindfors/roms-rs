@@ -97,7 +97,7 @@ use crate::types::ElementIndex;
 use super::dispersion::{dsigma_ddepth, group_velocity, wavenumber};
 #[cfg(feature = "simd")]
 use super::nonlinear::LANES;
-use super::sources::{Nodes, SourceScratch, SourceTerms, Wind};
+use super::sources::{Dissipation, Nodes, SourceScratch, SourceTerms, Wind};
 use super::spectrum::{SpectralGrid, WaveParameters};
 use super::state::WaveSolution;
 
@@ -1286,6 +1286,28 @@ impl WaveModel2D {
                 self.energy_spectrum_into(n, p, &mut e);
                 (0..nf).for_each(|i| k[i] = self.k[i * np + p]);
                 self.grid.radiation_stress(&e, &k, self.depth[p])
+            })
+            .collect()
+    }
+
+    /// What the model's sinks take from the wave state `n` per second at
+    /// every node over a step `dt` (s; 0 for the instantaneous rate), by
+    /// term, and the momentum they take with it
+    /// ([`SourceTerms::dissipation`], [`Dissipation`]).
+    pub fn dissipation(&self, n: &WaveSolution, dt: f64) -> Vec<Dissipation> {
+        let (np, nf, nc) = (
+            self.n_points(),
+            self.grid.n_freq(),
+            self.grid.n_components(),
+        );
+        let (mut e, mut a, mut b) = (vec![0.0; nc], vec![0.0; nc], vec![0.0; nc]);
+        let mut k = vec![0.0; nf];
+        (0..np)
+            .map(|p| {
+                self.energy_spectrum_into(n, p, &mut e);
+                (0..nf).for_each(|i| k[i] = self.k[i * np + p]);
+                self.sources
+                    .dissipation(&self.grid, &e, &k, self.depth[p], dt, &mut a, &mut b)
             })
             .collect()
     }
