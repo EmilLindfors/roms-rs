@@ -113,7 +113,6 @@ mod tests {
         // -1x1 + 2x2 = 1
         // Solution: x = [1, 1, 1]
 
-        let n = 3;
         let a = vec![0.0, -1.0, -1.0]; // a[0] ignored
         let b = vec![2.0, 2.0, 2.0];
         let c = vec![-1.0, -1.0, 0.0]; // c[2] ignored

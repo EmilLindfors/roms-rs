@@ -62,7 +62,7 @@ pub const RHO_WATER: f64 = 1025.0;
 pub const LARGE_POND_MAX_WIND: f64 = 25.0;
 
 /// Drag coefficient formulation for wind stress.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum DragCoefficient {
     /// Constant drag coefficient.
     ///
@@ -77,6 +77,7 @@ pub enum DragCoefficient {
     /// Fitted for |U| < 25 m/s; above that the formula is held at its 25 m/s
     /// value (2.1 × 10⁻³) instead of growing without bound: observed drag
     /// saturates in strong winds (Powell et al. 2003).
+    #[default]
     LargePond,
 
     /// Wu (1982) formulation.
@@ -98,12 +99,6 @@ pub enum DragCoefficient {
     /// C_d = (0.50 + 0.071×|U|) × 10⁻³ for |U| > 6 m/s
     /// C_d = 1.1×10⁻³ for |U| ≤ 6 m/s
     YellandTaylor,
-}
-
-impl Default for DragCoefficient {
-    fn default() -> Self {
-        Self::LargePond
-    }
 }
 
 impl DragCoefficient {
@@ -204,7 +199,7 @@ impl WindStress2D {
     /// # Arguments
     /// * `speed` - Wind speed (m/s)
     /// * `direction` - Wind direction in degrees (meteorological convention:
-    ///                 0° = from north, 90° = from east)
+    ///   0° = from north, 90° = from east)
     pub fn from_direction(speed: f64, direction: f64) -> Self {
         // Meteorological convention: direction wind is coming FROM
         // Convert to components: direction 0 = from N means wind blows southward

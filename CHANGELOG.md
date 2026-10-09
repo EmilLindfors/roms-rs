@@ -368,6 +368,17 @@ All notable changes to this project should be documented in this file.
 
 ### Changed
 
+- **No clippy warnings in any feature set, and CI keeps it so (TODO P6).** There were 157 warnings and one error (`froya_real_data` without `parallel`: a loop that never looped) across the feature sets and all targets. Now there are none: no features, `parallel`, `simd`, `parallel,simd`, and the default with NetCDF.
+  - Policy: `needless_range_loop` and `too_many_arguments` are allowed crate-wide (`Cargo.toml` `[lints.clippy]`). Kernels index several arrays by one node or mode and pass their slices explicitly. The 79 per-site allows are gone.
+  - CI's clippy job runs `--all-targets -- -D warnings` (examples included).
+  - Fixed on the way:
+    - `NetCDFWriter::write_timestep` refuses fields whose length is not the mesh's node count (`NetCDFError::InvalidData`; gate `writer_refuses_fields_of_the_wrong_length`). The count was stored and never checked.
+    - `examples/norwegian_fjord.rs` compiled an unused parallel path under `parallel` without `simd`.
+  - API changes:
+    - `ValidationSummary` implements `Display`, replacing its inherent `to_string`; callers are unchanged.
+    - New `UtmProjection::is_northern`.
+    - Six enums derive `Default` (same defaults).
+    - `solver/diagnostics/diagnostics.rs` is now `runtime.rs` (private; the re-exports are unchanged).
 - **Dependency: `fearless_simd` 1.1 replaces `pulp` 0.18 behind the `simd` feature.** The two pulp kernels (`coriolis_source`, `combine_derivatives` in `solver/simd/kernels.rs`) are ported unchanged in behaviour. faer still brings its own `pulp` 0.21. fearless_simd needs Rust 1.89 or later.
 - **Frøya's boundary S2 is calibrated to the gauge by default (TODO P3.1).** `froya_real_data` now defaults to `gauge_gains=K1,O1,S2 gauge_ratios=N2,Q1,P1,K2`: the atlas's S2 is scaled by the gauge over NorKyst at Mausund (× 0.939, +0.1°), and K2 is re-inferred from the corrected S2 with the gauge's ratio. Nesting follows through `nest_tides=corrected`. The 15-day confirmation run (2026-10-06) had S2 at 0.998×, +2.9° at Mausund (was 1.103×, +1.8°) and RSS |ΔZ| 3.37 cm against the gauge (was 4.15). `gauge_gains=K1,O1 gauge_ratios=N2,Q1,P1` gives the previous behaviour.
 - **A fast test tier for pull requests (`.config/nextest.toml`).** Pull requests run nextest's `pr` profile, every test but 25 slow gates: long simulations, convergence ladders and statistical particle runs, each 15 s or more in CI. Pushes to main and manual runs (`workflow_dispatch`) run the whole suite. In the run before this, those gates were 70 % of the test time, and the test job took 12–14 min. Locally the fast tier is 1589 tests in 39 s (`cargo nextest run --profile pr --cargo-profile ci --no-default-features --features parallel,simd`).

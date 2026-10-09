@@ -135,20 +135,15 @@ impl CoupledRhs2D {
 }
 
 /// Type of tracer limiter to use.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum TracerLimiterType {
     /// No limiting (not recommended for production)
+    #[default]
     None,
     /// TVB slope limiter + Zhang-Shu positivity
     Tvb,
     /// Kuzmin vertex-based limiter + Zhang-Shu positivity
     Kuzmin,
-}
-
-impl Default for TracerLimiterType {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Configuration for coupled time integration.
@@ -246,7 +241,6 @@ impl CoupledTimeConfig {
 ///
 /// This computes both the SWE RHS (with optional baroclinic source) and
 /// the tracer RHS (advected by SWE velocity field).
-#[allow(clippy::too_many_arguments)]
 pub fn compute_coupled_rhs<SweBc, TracerBc>(
     state: &CoupledState2D,
     mesh: &Mesh2D,
@@ -284,7 +278,6 @@ where
 /// 2. Computes density from T,S
 /// 3. Adds baroclinic source to SWE
 /// 4. Computes tracer advection
-#[allow(clippy::too_many_arguments)]
 pub fn compute_coupled_rhs_baroclinic<SweBc, TracerBc>(
     state: &CoupledState2D,
     mesh: &Mesh2D,
@@ -355,7 +348,6 @@ where
 /// Perform one step of SSP-RK3 for the coupled system.
 ///
 /// This advances both SWE and tracer solutions together.
-#[allow(clippy::too_many_arguments)]
 pub fn ssp_rk3_coupled_step<F>(state: &mut CoupledState2D, rhs_fn: F, dt: f64)
 where
     F: Fn(&CoupledState2D) -> CoupledRhs2D,
@@ -395,7 +387,6 @@ where
 /// - Stage 1: t
 /// - Stage 2: t + dt
 /// - Stage 3: t + dt/2
-#[allow(clippy::too_many_arguments)]
 pub fn ssp_rk3_coupled_step_timed<F>(state: &mut CoupledState2D, rhs_fn: F, t: f64, dt: f64)
 where
     F: Fn(&CoupledState2D, f64) -> CoupledRhs2D,
@@ -480,7 +471,6 @@ fn apply_configured_limiter(
 /// limiter type is applied:
 /// - `TracerLimiterType::Tvb`: TVB slope limiter + positivity
 /// - `TracerLimiterType::Kuzmin`: Vertex-based Kuzmin limiter + positivity
-#[allow(clippy::too_many_arguments)]
 pub fn ssp_rk3_coupled_step_limited<F>(
     state: &mut CoupledState2D,
     rhs_fn: F,
@@ -580,7 +570,6 @@ pub fn compute_dt_coupled(
 ///
 /// # Returns
 /// Final time reached and number of steps taken.
-#[allow(clippy::too_many_arguments)]
 pub fn run_coupled_simulation<F, D, C>(
     state: &mut CoupledState2D,
     t_end: f64,
@@ -633,7 +622,6 @@ where
 ///
 /// # Returns
 /// Final time reached and number of steps taken.
-#[allow(clippy::too_many_arguments)]
 pub fn run_coupled_simulation_limited<F, D, C>(
     state: &mut CoupledState2D,
     t_end: f64,

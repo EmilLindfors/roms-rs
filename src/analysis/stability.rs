@@ -396,10 +396,10 @@ impl StabilityMonitor {
         }
 
         // Stop if last status had critical warnings
-        if let Some(status) = &self.last_status {
-            if status.has_critical_warnings() {
-                return true;
-            }
+        if let Some(status) = &self.last_status
+            && status.has_critical_warnings()
+        {
+            return true;
         }
 
         false
@@ -454,25 +454,25 @@ impl StabilityMonitor {
 
     /// Print a formatted stability report.
     pub fn print_report(&self, time: f64, step: usize) {
-        if let Some(status) = &self.last_status {
-            if !status.is_stable {
-                eprintln!(
-                    "\nSTABILITY WARNING at t={:.2}h, step {}:",
-                    time / 3600.0,
-                    step
-                );
-                eprintln!("  h: [{:.2}, {:.2}] m", status.h_range.0, status.h_range.1);
-                eprintln!("  max |u|: {:.2} m/s", status.max_velocity);
-                eprintln!("  dt: {:.2e} s", status.dt);
-                eprintln!("  Warnings ({}):", status.warnings.len());
-                for warning in &status.warnings {
-                    eprintln!("    - {}", warning);
-                }
-                if self.should_stop() {
-                    eprintln!("\n  RECOMMENDATION: Stop simulation");
-                    for suggestion in self.suggest_remediation() {
-                        eprintln!("    * {}", suggestion);
-                    }
+        if let Some(status) = &self.last_status
+            && !status.is_stable
+        {
+            eprintln!(
+                "\nSTABILITY WARNING at t={:.2}h, step {}:",
+                time / 3600.0,
+                step
+            );
+            eprintln!("  h: [{:.2}, {:.2}] m", status.h_range.0, status.h_range.1);
+            eprintln!("  max |u|: {:.2} m/s", status.max_velocity);
+            eprintln!("  dt: {:.2e} s", status.dt);
+            eprintln!("  Warnings ({}):", status.warnings.len());
+            for warning in &status.warnings {
+                eprintln!("    - {}", warning);
+            }
+            if self.should_stop() {
+                eprintln!("\n  RECOMMENDATION: Stop simulation");
+                for suggestion in self.suggest_remediation() {
+                    eprintln!("    * {}", suggestion);
                 }
             }
         }

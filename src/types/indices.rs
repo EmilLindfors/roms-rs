@@ -189,7 +189,7 @@ impl ElementIndex {
     /// assert_eq!(indices[0].get(), 0);
     /// assert_eq!(indices[4].get(), 4);
     /// ```
-    pub fn iter(n: usize) -> impl Iterator<Item = ElementIndex> + ExactSizeIterator {
+    pub fn iter(n: usize) -> impl ExactSizeIterator<Item = ElementIndex> {
         (0..n).map(ElementIndex)
     }
 
@@ -197,7 +197,7 @@ impl ElementIndex {
     pub fn range_iter(
         start: ElementIndex,
         end: ElementIndex,
-    ) -> impl Iterator<Item = ElementIndex> + ExactSizeIterator {
+    ) -> impl ExactSizeIterator<Item = ElementIndex> {
         (start.0..end.0).map(ElementIndex)
     }
 }
@@ -215,7 +215,7 @@ impl NodeIndex {
     /// assert_eq!(indices[0].get(), 0);
     /// assert_eq!(indices[8].get(), 8);
     /// ```
-    pub fn iter(n: usize) -> impl Iterator<Item = NodeIndex> + ExactSizeIterator {
+    pub fn iter(n: usize) -> impl ExactSizeIterator<Item = NodeIndex> {
         (0..n).map(NodeIndex)
     }
 }
@@ -233,7 +233,7 @@ impl FaceIndex {
     /// assert_eq!(indices[0].get(), 0);
     /// assert_eq!(indices[2].get(), 2);
     /// ```
-    pub fn iter(n: usize) -> impl Iterator<Item = FaceIndex> + ExactSizeIterator {
+    pub fn iter(n: usize) -> impl ExactSizeIterator<Item = FaceIndex> {
         (0..n).map(FaceIndex)
     }
 }
@@ -251,7 +251,7 @@ impl LevelIndex {
     /// assert_eq!(indices[0].get(), 0);
     /// assert_eq!(indices[9].get(), 9);
     /// ```
-    pub fn iter(n: usize) -> impl Iterator<Item = LevelIndex> + ExactSizeIterator {
+    pub fn iter(n: usize) -> impl ExactSizeIterator<Item = LevelIndex> {
         (0..n).map(LevelIndex)
     }
 }
@@ -284,14 +284,14 @@ mod tests {
 
     #[test]
     fn test_array_indexing() {
-        let data = vec![10, 20, 30, 40, 50];
+        let data = [10, 20, 30, 40, 50];
         let idx = ElementIndex::new(2);
         assert_eq!(data[idx], 30);
     }
 
     #[test]
     fn test_array_indexing_mut() {
-        let mut data = vec![10, 20, 30, 40, 50];
+        let mut data = [10, 20, 30, 40, 50];
         let idx = ElementIndex::new(2);
         data[idx] = 100;
         assert_eq!(data[2], 100);

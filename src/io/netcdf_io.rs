@@ -394,6 +394,15 @@ impl NetCDFWriter {
         v: Option<&[f64]>,
     ) -> Result<(), NetCDFError> {
         let t_idx = self.time_index;
+        for (name, field) in [("h", Some(h)), ("eta", Some(eta)), ("u", u), ("v", v)] {
+            if let Some(field) = field.filter(|f| f.len() != self.n_nodes) {
+                return Err(NetCDFError::InvalidData(format!(
+                    "{name} has {} values for {} nodes",
+                    field.len(),
+                    self.n_nodes
+                )));
+            }
+        }
 
         // Write time
         {
@@ -425,39 +434,39 @@ impl NetCDFWriter {
         }
 
         // Write velocities if provided
-        if self.config.include_velocity {
-            if let (Some(u_data), Some(v_data)) = (u, v) {
-                let u_f32: Vec<f32> = u_data.iter().map(|&x| x as f32).collect();
-                let v_f32: Vec<f32> = v_data.iter().map(|&x| x as f32).collect();
-                let speed_f32: Vec<f32> = u_data
-                    .iter()
-                    .zip(v_data.iter())
-                    .map(|(&u, &v)| (u * u + v * v).sqrt() as f32)
-                    .collect();
+        if self.config.include_velocity
+            && let (Some(u_data), Some(v_data)) = (u, v)
+        {
+            let u_f32: Vec<f32> = u_data.iter().map(|&x| x as f32).collect();
+            let v_f32: Vec<f32> = v_data.iter().map(|&x| x as f32).collect();
+            let speed_f32: Vec<f32> = u_data
+                .iter()
+                .zip(v_data.iter())
+                .map(|(&u, &v)| (u * u + v * v).sqrt() as f32)
+                .collect();
 
-                {
-                    let mut u_var = self
-                        .file
-                        .variable_mut("u")
-                        .ok_or_else(|| NetCDFError::MissingVariable("u".to_string()))?;
-                    u_var.put_values(&u_f32, (t_idx, ..))?;
-                }
+            {
+                let mut u_var = self
+                    .file
+                    .variable_mut("u")
+                    .ok_or_else(|| NetCDFError::MissingVariable("u".to_string()))?;
+                u_var.put_values(&u_f32, (t_idx, ..))?;
+            }
 
-                {
-                    let mut v_var = self
-                        .file
-                        .variable_mut("v")
-                        .ok_or_else(|| NetCDFError::MissingVariable("v".to_string()))?;
-                    v_var.put_values(&v_f32, (t_idx, ..))?;
-                }
+            {
+                let mut v_var = self
+                    .file
+                    .variable_mut("v")
+                    .ok_or_else(|| NetCDFError::MissingVariable("v".to_string()))?;
+                v_var.put_values(&v_f32, (t_idx, ..))?;
+            }
 
-                {
-                    let mut speed_var = self
-                        .file
-                        .variable_mut("speed")
-                        .ok_or_else(|| NetCDFError::MissingVariable("speed".to_string()))?;
-                    speed_var.put_values(&speed_f32, (t_idx, ..))?;
-                }
+            {
+                let mut speed_var = self
+                    .file
+                    .variable_mut("speed")
+                    .ok_or_else(|| NetCDFError::MissingVariable("speed".to_string()))?;
+                speed_var.put_values(&speed_f32, (t_idx, ..))?;
             }
         }
 
@@ -556,6 +565,31 @@ mod tests {
         let (scale, reference) = super::super::datetime::parse_cf_time_units(&units, None).unwrap();
         let t: f64 = time.get_value([0]).unwrap();
         assert_eq!(reference + scale * t, clock.unix(3600.0));
+    }
+
+    /// A field of the wrong length is refused before anything is written.
+    #[test]
+    fn writer_refuses_fields_of_the_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = NetCDFWriterConfig::new(dir.path().join("out.nc").to_string_lossy());
+        let mesh = NetCDFMeshInfo::from_xy(vec![0.0, 1.0], vec![0.0, 0.0]);
+        let mut writer = NetCDFWriter::create(config, &mesh).unwrap();
+        let (two, three) = ([0.0; 2], [0.0; 3]);
+        let error = writer
+            .write_timestep(0.0, &two, &two, Some(&three), Some(&two))
+            .unwrap_err();
+        assert!(
+            matches!(&error, NetCDFError::InvalidData(m) if m == "u has 3 values for 2 nodes"),
+            "{error}"
+        );
+        assert!(
+            writer
+                .write_timestep(0.0, &three, &two, None, None)
+                .is_err()
+        );
+        writer
+            .write_timestep(0.0, &two, &two, Some(&two), Some(&two))
+            .unwrap();
     }
 
     #[test]

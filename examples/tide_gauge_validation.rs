@@ -536,7 +536,7 @@ fn main() {
         }
     }
 
-    println!("\n{}", summary.to_string());
+    println!("\n{}", summary);
 
     // ========================================================================
     // 6. Assess validation status

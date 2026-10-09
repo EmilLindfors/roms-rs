@@ -78,7 +78,6 @@ impl WaveModel2D {
 
     /// [`Self::refract_implicitly`] for the frequencies `i0..i0 + width`.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     fn refract_batch<S: Simd>(
         &self,
         simd: S,
@@ -174,7 +173,6 @@ impl WaveModel2D {
 
     /// [`Self::shift_implicitly`] for the directions `j0..j0 + width`.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     fn shift_batch<S: Simd>(
         &self,
         simd: S,

@@ -28,7 +28,7 @@ use dg_rs::solver::{
 // Parallel imports (only beneficial for meshes with 1000+ elements)
 #[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::compute_rhs_swe_2d_parallel;
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::compute_rhs_tracer_2d_parallel;
 use dg_rs::source::tracer::{
     CombinedTracerSource2D, RiverTracerSource, SurfaceHeatFlux, gaussian_river_localization,
@@ -260,10 +260,8 @@ fn main() {
 
     // RHS function - uses parallel when enabled AND mesh has 1000+ elements
     // (parallel overhead dominates for smaller meshes)
-    #[cfg(feature = "parallel")]
+    #[cfg(all(feature = "parallel", feature = "simd"))]
     let use_parallel = n_elements >= 1000;
-    #[cfg(not(feature = "parallel"))]
-    let _use_parallel = false;
 
     let rhs_fn = |state: &CoupledState2D, time: f64| {
         let swe_config = SWE2DRhsConfig::new(&equation, &swe_bc)

@@ -29,35 +29,25 @@ const ROUND_OFF: f64 = 256.0 * f64::EPSILON;
 /// inside bounds if the inventory-weighted average is outside bounds. The
 /// default keeps conservation and collapses the element/layer to its average;
 /// callers that require hard bounds can opt into bounded average correction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TracerAveragePolicy3D {
     /// Preserve tracer inventory even if the average is outside bounds.
+    #[default]
     PreserveConservation,
     /// Clamp out-of-bounds averages, reporting the resulting inventory change.
     EnforceBounds,
 }
 
-impl Default for TracerAveragePolicy3D {
-    fn default() -> Self {
-        Self::PreserveConservation
-    }
-}
-
 /// 3D tracer limiter selection.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum TracerLimiterType3D {
     /// Do not limit 3D tracers.
+    #[default]
     None,
     /// Apply only physical bounds limiting.
     Bounds,
     /// Apply horizontal vertex-patch Kuzmin limiting, then physical bounds.
     HorizontalKuzmin { relaxation: f64 },
-}
-
-impl Default for TracerLimiterType3D {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Configuration for 3D tracer limiting.
@@ -512,7 +502,6 @@ pub fn apply_tracer_limiters_3d(
     stats
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_horizontal_bounds_field(
     field: &mut [f64],
     eta: &DGSolution2D,
@@ -599,7 +588,6 @@ fn apply_horizontal_bounds_field(
     *stats = stats.merged(block_stats);
 }
 
-#[allow(clippy::too_many_arguments)]
 fn apply_vertical_column_bounds_field(
     field: &mut [f64],
     eta: &DGSolution2D,
@@ -839,7 +827,6 @@ struct KuzminScratch {
 /// before its patches are read: those bounds are within every patch's, so
 /// `α = 1`. This about halves the Kuzmin pass's cost (`profile_3d`: 2.2 →
 /// 1.2 ms for `T` and `S` on 1024 P2 elements × 20 levels).
-#[allow(clippy::too_many_arguments)]
 fn apply_horizontal_kuzmin_field(
     field: &mut [f64],
     reference: Option<ProfileSamples<'_>>,
@@ -1478,10 +1465,8 @@ mod tests {
                 })
                 .fold(0.0, f64::max)
         };
-        let errors =
-            |build: fn(f64, f64, usize, &dyn Fn(f64) -> (f64, f64)) -> TracerReferenceProfile| {
-                [161, 321].map(|n| error(&build(-20.0, 0.0, n, &halocline)))
-            };
+        type Build = fn(f64, f64, usize, &dyn Fn(f64) -> (f64, f64)) -> TracerReferenceProfile;
+        let errors = |build: Build| [161, 321].map(|n| error(&build(-20.0, 0.0, n, &halocline)));
         let cubic = errors(|a, b, n, f| TracerReferenceProfile::from_smooth_fn(a, b, n, f));
         let linear = errors(|a, b, n, f| TracerReferenceProfile::from_fn(a, b, n, f));
         let order = |[coarse, fine]: [f64; 2]| (coarse / fine).log2();

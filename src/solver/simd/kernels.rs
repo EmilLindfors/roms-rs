@@ -261,7 +261,6 @@ mod simd_impl {
     /// `out = −(dfx_dr rx + dfx_ds sx + dfy_dr ry + dfy_ds sy)` for one
     /// variable at the native width.
     #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
     pub fn combine_derivatives_simd<S: Simd>(
         simd: S,
         dfx_dr: &[f64],
@@ -294,6 +293,11 @@ mod simd_impl {
 // Public API with runtime SIMD dispatch
 // ============================================================================
 
+/// Threshold for using faer GEMV (nodes >= this use faer, below uses scalar).
+/// Based on benchmarks: faer overhead is ~150ns, which pays off at P4 (25 nodes).
+#[cfg(feature = "simd")]
+const FAER_GEMV_THRESHOLD: usize = 20;
+
 /// Apply differentiation matrix using faer's optimized GEMV.
 ///
 /// Computes `out = D * flux` for all three SWE variables using faer's
@@ -307,11 +311,6 @@ mod simd_impl {
 ///
 /// Uses faer GEMV for larger matrices (>=20 nodes) where SIMD overhead is amortized,
 /// and scalar for smaller matrices where faer's setup cost dominates.
-
-/// Threshold for using faer GEMV (nodes >= this use faer, below uses scalar).
-/// Based on benchmarks: faer overhead is ~150ns, which pays off at P4 (25 nodes).
-const FAER_GEMV_THRESHOLD: usize = 20;
-
 #[cfg(feature = "simd")]
 pub fn apply_diff_matrix(
     d: &[f64],
@@ -336,9 +335,9 @@ pub fn apply_diff_matrix(
         let mut y_hu = ColMut::from_slice_mut(out_hu);
         let mut y_hv = ColMut::from_slice_mut(out_hv);
 
-        matmul(&mut y_h, Accum::Replace, &d_mat, &x_h, 1.0, Par::Seq);
-        matmul(&mut y_hu, Accum::Replace, &d_mat, &x_hu, 1.0, Par::Seq);
-        matmul(&mut y_hv, Accum::Replace, &d_mat, &x_hv, 1.0, Par::Seq);
+        matmul(&mut y_h, Accum::Replace, d_mat, x_h, 1.0, Par::Seq);
+        matmul(&mut y_hu, Accum::Replace, d_mat, x_hu, 1.0, Par::Seq);
+        matmul(&mut y_hv, Accum::Replace, d_mat, x_hv, 1.0, Par::Seq);
     } else {
         // For small matrices, scalar is faster due to faer's setup overhead
         apply_diff_matrix_scalar(d, flux_h, flux_hu, flux_hv, out_h, out_hu, out_hv, n_nodes);
@@ -403,7 +402,6 @@ pub fn coriolis_source(
 
 /// Combine derivatives with geometric factors using automatic SIMD dispatch.
 #[cfg(feature = "simd")]
-#[allow(clippy::too_many_arguments)]
 pub fn combine_derivatives(
     dfx_dr_h: &[f64],
     dfx_dr_hu: &[f64],

@@ -167,9 +167,7 @@ mod tests {
         let mut u = DGSolution1D::new(n_elem, n_nodes);
 
         // Initial condition
-        for v in &mut u.data {
-            *v = 1.0;
-        }
+        u.data.fill(1.0);
 
         let c = 1.0;
         let dt = 0.01;

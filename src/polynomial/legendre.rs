@@ -45,7 +45,7 @@ pub fn legendre_derivative(n: usize, x: f64) -> f64 {
         return (n * (n + 1)) as f64 / 2.0;
     }
     if (x + 1.0).abs() < 1e-14 {
-        let sign = if n % 2 == 0 { -1.0 } else { 1.0 };
+        let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
         return sign * (n * (n + 1)) as f64 / 2.0;
     }
 
@@ -84,7 +84,7 @@ pub fn legendre_and_derivative(n: usize, x: f64) -> (f64, f64) {
     let dp_n = if (x - 1.0).abs() < 1e-14 {
         (n * (n + 1)) as f64 / 2.0
     } else if (x + 1.0).abs() < 1e-14 {
-        let sign = if n % 2 == 0 { -1.0 } else { 1.0 };
+        let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
         sign * (n * (n + 1)) as f64 / 2.0
     } else {
         n as f64 * (x * p_n - p_n_minus_1) / (x * x - 1.0)

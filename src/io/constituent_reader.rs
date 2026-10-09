@@ -291,15 +291,15 @@ pub fn parse_constituents(content: &str) -> Result<ConstituentData, ConstituentF
 
             if let Some(loc_str) = comment.strip_prefix("location:") {
                 let parts: Vec<&str> = loc_str.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse()) {
-                        data.location = Some((x, y));
-                    }
+                if parts.len() >= 2
+                    && let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse())
+                {
+                    data.location = Some((x, y));
                 }
-            } else if let Some(ref_str) = comment.strip_prefix("reference_level:") {
-                if let Ok(level) = ref_str.trim().parse() {
-                    data.reference_level = level;
-                }
+            } else if let Some(ref_str) = comment.strip_prefix("reference_level:")
+                && let Ok(level) = ref_str.trim().parse()
+            {
+                data.reference_level = level;
             }
             continue;
         }

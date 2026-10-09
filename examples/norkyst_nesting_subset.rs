@@ -316,7 +316,7 @@ mod app {
                 ] {
                     nc.variable_mut(name)
                         .ok_or(format!("no output variable {name}"))?
-                        .put_values(&to_f32(values.into_iter()), volume.clone())?;
+                        .put_values(&to_f32(values.into_iter()), volume)?;
                 }
             }
             println!(

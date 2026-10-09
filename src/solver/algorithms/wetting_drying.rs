@@ -280,7 +280,6 @@ impl ImplicitDamping2D<'_> {
     /// `h`, whose RHS was evaluated at `from`; `cages` are the node's
     /// cage-drag entries.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     fn damp_node(
         &self,
         node: usize,

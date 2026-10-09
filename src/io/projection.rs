@@ -99,8 +99,6 @@ pub struct LocalProjection {
     ref_lat: f64,
     /// Reference longitude in degrees
     ref_lon: f64,
-    /// Precomputed cos(ref_lat) for efficiency
-    cos_lat: f64,
     /// Meters per degree latitude (~111,320 m)
     meters_per_deg_lat: f64,
     /// Meters per degree longitude at reference latitude
@@ -138,7 +136,6 @@ impl LocalProjection {
         Self {
             ref_lat,
             ref_lon,
-            cos_lat,
             meters_per_deg_lat,
             meters_per_deg_lon,
         }
@@ -242,6 +239,11 @@ impl UtmProjection {
     /// Get the zone number.
     pub fn zone(&self) -> u8 {
         self.zone
+    }
+
+    /// Whether the zone is in the northern hemisphere.
+    pub fn is_northern(&self) -> bool {
+        self.northern
     }
 }
 

@@ -477,10 +477,10 @@ impl ProgressReporter {
             steps_per_sec
         );
 
-        if self.print_diagnostics {
-            if let Some(d) = diag {
-                print!(" | {}", d.summary_line());
-            }
+        if self.print_diagnostics
+            && let Some(d) = diag
+        {
+            print!(" | {}", d.summary_line());
         }
 
         println!();

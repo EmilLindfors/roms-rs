@@ -197,7 +197,6 @@ impl SnapshotWriter {
 
     /// Create `path` with any layered fields on `levels`' σ-grid (or none), for
     /// [`Self::write_fields`].
-    #[allow(clippy::too_many_arguments)]
     pub fn create_with(
         path: impl AsRef<Path>,
         mesh: &Mesh2D,

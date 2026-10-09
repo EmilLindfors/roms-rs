@@ -21,16 +21,15 @@
 
 use std::time::Instant;
 
-#[cfg(feature = "parallel")]
-use rayon;
-
 use dg_rs::boundary::{CharacteristicOBC, HarmonicTide, MultiBoundaryCondition2D, Reflective2D};
 use dg_rs::equations::ShallowWater2D;
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
+#[cfg(not(all(feature = "parallel", feature = "simd")))]
+use dg_rs::solver::compute_dt_swe_2d;
 #[cfg(all(feature = "parallel", feature = "simd"))]
 use dg_rs::solver::compute_dt_swe_2d_parallel;
-use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D, compute_dt_swe_2d};
+use dg_rs::solver::{SWE2DRhsConfig, SWESolution2D};
 
 // RHS functions based on enabled features
 #[cfg(not(all(feature = "parallel", feature = "simd")))]
@@ -73,11 +72,13 @@ fn main() {
 
     // Show enabled features
     print!("Features enabled: ");
-    let mut features: Vec<&str> = Vec::new();
-    #[cfg(feature = "parallel")]
-    features.push("parallel");
-    #[cfg(feature = "simd")]
-    features.push("simd");
+    let features: Vec<&str> = [
+        ("parallel", cfg!(feature = "parallel")),
+        ("simd", cfg!(feature = "simd")),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
     if features.is_empty() {
         println!("none (serial baseline)");
     } else {
@@ -176,8 +177,6 @@ struct BenchmarkResult {
     avg_dt: f64,
     total_steps: usize,
     wall_time: f64,
-    max_velocity: f64,
-    stable: bool,
 }
 
 fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
@@ -330,7 +329,5 @@ fn run_benchmark(order: usize) -> Result<BenchmarkResult, String> {
         avg_dt,
         total_steps: step,
         wall_time,
-        max_velocity,
-        stable: true,
     })
 }

@@ -116,13 +116,11 @@ impl EquationOfState for UnescoEOS {
         let s32 = s.powf(1.5);
 
         // Approx coeff for sigma-t (kg/m^3 - 1000)
-        let sigma = 999.842594 + 6.793952e-2 * t - 9.095290e-3 * t2
+        999.842594 + 6.793952e-2 * t - 9.095290e-3 * t2
             + 1.001685e-4 * t2 * t
             + (0.824493 - 4.0899e-3 * t + 7.6438e-5 * t2) * s
             - 5.72466e-3 * s32
-            + 4.8314e-4 * s * s;
-
-        sigma
+            + 4.8314e-4 * s * s
     }
 
     fn update_density(&self, state: &mut Solution3D) {

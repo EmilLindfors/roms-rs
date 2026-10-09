@@ -84,9 +84,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # `--benches` keeps the criterion benches building against the current API
+      # `--all-targets` keeps the benches and examples building against the
+      # current API; `-D warnings` keeps the crate free of warnings (lint
+      # policy in Cargo.toml `[lints.clippy]`)
       - name: cargo clippy
-        run: cargo clippy --no-default-features --features parallel,simd --lib --tests --benches
+        run: cargo clippy --no-default-features --features parallel,simd --all-targets -- -D warnings
 
   fmt:
     name: rustfmt

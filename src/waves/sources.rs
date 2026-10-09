@@ -290,7 +290,6 @@ impl SourceTerms {
     /// The linear input `a[c]` (m²/(rad/s)/rad/s) and rates `b[c]` (1/s) of the
     /// variance density `e` at a node of depth `depth` with wavenumbers `k[i]`,
     /// under `wind`.
-    #[allow(clippy::too_many_arguments)]
     pub fn rates(
         &self,
         grid: &SpectralGrid,
@@ -321,7 +320,6 @@ impl SourceTerms {
 
     /// The terms of [`Self::rates`] besides the DIA, added to `a` and `b`;
     /// `means` are `e`'s.
-    #[allow(clippy::too_many_arguments)]
     fn add_local_rates(
         &self,
         grid: &SpectralGrid,
@@ -396,7 +394,6 @@ impl SourceTerms {
     /// Advance the action density `n` (one node's spectrum) over `dt` by
     /// [`Self::integration`]. `e`, `a`, `b` are scratch (one value per
     /// component).
-    #[allow(clippy::too_many_arguments)]
     pub fn integrate(
         &self,
         grid: &SpectralGrid,
@@ -423,7 +420,6 @@ impl SourceTerms {
     /// whose spectra lie one after the other in `spectra`, with the DIA's
     /// transfer at all of them at once if `lanes` ([`Quadruplets::source_lanes`],
     /// bit for bit as at each alone).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn integrate_at(
         &self,
         grid: &SpectralGrid,
@@ -464,7 +460,6 @@ impl SourceTerms {
     /// The step of [`Self::integrate`] at the nodes of `spectra`; `a`, `b`
     /// hold their rates (one after the other, as `spectra`), `predictor` the
     /// midpoint's half step.
-    #[allow(clippy::too_many_arguments)]
     fn integrate_nodes(
         &self,
         grid: &SpectralGrid,
@@ -503,7 +498,6 @@ impl SourceTerms {
 
     /// [`Self::rates`] of the action densities `spectra` (one node's after
     /// another) into `a`, `b` (the same layout); `e` is scratch.
-    #[allow(clippy::too_many_arguments)]
     fn rates_at(
         &self,
         grid: &SpectralGrid,
@@ -577,7 +571,6 @@ impl SourceTerms {
 
     /// The update of [`Self::integrate`] from the rates `a`, `b` of `n`, then
     /// the tail. `e` is scratch.
-    #[allow(clippy::too_many_arguments)]
     fn advance(
         &self,
         grid: &SpectralGrid,

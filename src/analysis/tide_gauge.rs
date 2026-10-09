@@ -513,10 +513,13 @@ impl ValidationSummary {
             n_passing_strict,
         }
     }
+}
 
-    /// Format summary as a string.
-    pub fn to_string(&self) -> String {
-        format!(
+/// The summary as a table.
+impl std::fmt::Display for ValidationSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
             "Validation Summary ({} stations)\n\
              ================================\n\
              Mean RMSE:        {:.4} m\n\

@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn test_no_enhancement_outside_strait() {
         let width_fn = |x: f64, _y: f64| {
-            if x >= 400.0 && x <= 600.0 {
+            if (400.0..=600.0).contains(&x) {
                 Some(300.0)
             } else {
                 None
@@ -453,7 +453,7 @@ mod tests {
     #[test]
     fn test_enhanced_friction_stronger() {
         let width_fn = |x: f64, _y: f64| {
-            if x >= 0.0 && x <= 20.0 {
+            if (0.0..=20.0).contains(&x) {
                 Some(100.0) // Narrow
             } else {
                 None
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn test_is_in_strait() {
         let width_fn = |x: f64, _y: f64| {
-            if x >= 0.0 && x <= 100.0 {
+            if (0.0..=100.0).contains(&x) {
                 Some(200.0)
             } else {
                 None

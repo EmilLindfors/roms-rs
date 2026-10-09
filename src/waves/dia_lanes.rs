@@ -24,7 +24,6 @@ impl Quadruplets {
     /// `s` (overwritten) its transfer in the same layout; with `diag`, also
     /// [`Self::source_and_diagonal`]'s diagonal.
     #[inline(never)] // keeps its frame out of rayon's recursive split frames
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn source_lanes(
         &self,
         grid: &SpectralGrid,
@@ -62,7 +61,6 @@ impl Quadruplets {
     }
 
     /// The loops of [`Self::source`], lane by lane.
-    #[allow(clippy::too_many_arguments)]
     #[inline(always)]
     fn transfer_lanes<S: Simd>(
         &self,

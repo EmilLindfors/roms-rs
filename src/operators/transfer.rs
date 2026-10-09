@@ -205,10 +205,10 @@ impl MeshTransfer2D {
 /// `target[p] = value(p)` for every `p`, in parallel blocks with the
 /// `parallel` feature.
 fn fill<T: Send>(target: &mut [T], value: impl Fn(usize) -> T + Sync) {
-    const BLOCK: usize = 4096;
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
+        const BLOCK: usize = 4096;
         target
             .par_chunks_mut(BLOCK)
             .enumerate()

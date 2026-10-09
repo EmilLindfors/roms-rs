@@ -96,6 +96,12 @@ name = "wave_step"
 path = "benches/wave_step_bench.rs"
 harness = false
 
+# Numerical kernels index several arrays by the same node or mode, and pass
+# their slices and coefficients explicitly: both are the house style here.
+[lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+
 # Profiling profile: release optimizations with debug symbols for flamegraph
 [profile.profiling]
 inherits = "release"

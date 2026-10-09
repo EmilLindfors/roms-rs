@@ -4,9 +4,10 @@
 //! how boundary conditions are applied.
 
 /// Tag identifying the type of a boundary edge.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum BoundaryTag {
     /// Solid wall (reflective/no-flux boundary)
+    #[default]
     Wall,
 
     /// Open boundary (radiation/absorbing)
@@ -49,12 +50,6 @@ impl BoundaryTag {
             self,
             BoundaryTag::Open | BoundaryTag::TidalForcing | BoundaryTag::River
         )
-    }
-}
-
-impl Default for BoundaryTag {
-    fn default() -> Self {
-        BoundaryTag::Wall
     }
 }
 

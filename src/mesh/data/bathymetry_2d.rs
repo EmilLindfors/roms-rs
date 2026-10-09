@@ -1228,7 +1228,6 @@ impl Bathymetry2D {
     /// 2. Transform to physical derivatives using geometric factors:
     ///    ∂B/∂x = rx * ∂B/∂r + sx * ∂B/∂s
     ///    ∂B/∂y = ry * ∂B/∂r + sy * ∂B/∂s
-    #[allow(clippy::needless_range_loop)]
     pub fn compute_gradients(&mut self, ops: &DGOperators2D, geom: &GeometricFactors2D) {
         let n = self.n_nodes;
 

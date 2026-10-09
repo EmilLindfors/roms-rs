@@ -293,7 +293,6 @@ impl<'a, BC: SWEBoundaryCondition2D> SWE2DRhsConfig<'a, BC> {
 /// boundary face `face` of element `k`: a ghost state for the Riemann solver,
 /// or the state on the boundary whose physical flux is the face flux. Shared
 /// by the standard and split-form kernels and the viscous boundary terms.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn boundary_state<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -658,7 +657,6 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     ///
     /// `volume`: the slot of the workspace's batch holding the element's
     /// split-form volume term, from [`Self::volume_chunk`].
-    #[allow(clippy::too_many_arguments)]
     fn element(
         &self,
         k: usize,
@@ -709,7 +707,6 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SWE2DRhsKernel<'a, 'c, BC> {
     /// `out` (at most [`ELEMENT_CHUNK`] elements; `face_mass` and
     /// `subcell_mass` likewise), their volume terms batched, then
     /// `after(k, ws, hu, hv)` for each.
-    #[allow(clippy::too_many_arguments)]
     fn element_batch(
         &self,
         k0: usize,
@@ -1009,7 +1006,6 @@ pub fn compute_rhs_swe_2d_into<BC: SWEBoundaryCondition2D>(
 /// the two-point flux is the mean of `(hu, hv)`). In `WetDry` elements with a
 /// dry node the volume term is a subcell finite-volume update; there only the
 /// element balance `∫ dh/dt = −∮ F*_h` holds.
-#[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_face_mass_into<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1034,7 +1030,6 @@ pub fn compute_rhs_swe_2d_face_mass_into<BC: SWEBoundaryCondition2D>(
 /// node: `J_i dh_i/dt = −Σ_dir (F̂_{a+½} − F̂_{a−½})/w_a` with the end
 /// interfaces replaced by the face flux `F*` (the 3D layers rely on it). In
 /// every other element all its slots are NaN.
-#[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_mass_fluxes_into<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1072,7 +1067,6 @@ pub fn subcell_mass_len(mesh: &Mesh2D, ops: &DGOperators2D) -> usize {
     mesh.n_elements * subcell_interfaces(ops.n_1d)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rhs_serial<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1134,7 +1128,6 @@ fn rhs_serial<BC: SWEBoundaryCondition2D>(
 
 /// The viscous term of one whole-mesh RHS evaluation with its gradients
 /// (pass 1) over every element at `time`, if `config` has viscosity.
-#[allow(clippy::too_many_arguments)]
 fn viscous_all<'a, 'c, BC: SWEBoundaryCondition2D>(
     q: &'a SWESolution2D,
     mesh: &'a Mesh2D,
@@ -1451,7 +1444,6 @@ pub fn compute_rhs_swe_2d_parallel_into<BC: SWEBoundaryCondition2D + Sync>(
 /// Parallel version of [`compute_rhs_swe_2d_face_mass_into`] (identical
 /// result).
 #[cfg(feature = "parallel")]
-#[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_parallel_face_mass_into<BC: SWEBoundaryCondition2D + Sync>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1468,7 +1460,6 @@ pub fn compute_rhs_swe_2d_parallel_face_mass_into<BC: SWEBoundaryCondition2D + S
 /// Parallel version of [`compute_rhs_swe_2d_mass_fluxes_into`] (identical
 /// result).
 #[cfg(feature = "parallel")]
-#[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_parallel_mass_fluxes_into<BC: SWEBoundaryCondition2D + Sync>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1495,7 +1486,6 @@ pub fn compute_rhs_swe_2d_parallel_mass_fluxes_into<BC: SWEBoundaryCondition2D +
 
 /// `subcell_mass` is only taken together with `face_mass`.
 #[cfg(feature = "parallel")]
-#[allow(clippy::too_many_arguments)]
 fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1593,6 +1583,7 @@ pub type ElementRhsThen<'a> = &'a (dyn Fn(usize, [&mut [f64]; 3], Option<[&mut [
 
 /// Subsets smaller than this run serially: a parallel dispatch costs more
 /// than their work (local time stepping has many tiny subsets).
+#[cfg(feature = "parallel")]
 const SUBSET_PARALLEL_MIN: usize = 64;
 
 /// The distinct edges of a list of elements, in order of first appearance,
@@ -1635,7 +1626,6 @@ thread_local! {
 /// [`compute_rhs_swe_2d_subset_then`] (it collects the element list, a pass
 /// over all elements). With horizontal viscosity, unselected face
 /// neighbours take the time of the first selected element.
-#[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1691,7 +1681,6 @@ pub fn compute_rhs_swe_2d_where_into<BC: SWEBoundaryCondition2D>(
 ///
 /// # Panics
 /// If `extra` has another shape than `out`.
-#[allow(clippy::too_many_arguments)]
 pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1869,7 +1858,6 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
 ///
 /// `f64::INFINITY` where everything the element sees is dry or at rest in
 /// zero depth. Parallel with `parallel`.
-#[allow(clippy::too_many_arguments)]
 pub fn element_dt_swe_2d(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1897,7 +1885,6 @@ pub fn element_dt_swe_2d(
 /// The smallest [`element_dt_swe_2d`]: the global time step of a wet/dry run
 /// whose positivity bound is relaxed per element. Parallel with `parallel`;
 /// the same result either way.
-#[allow(clippy::too_many_arguments)]
 pub fn min_element_dt_swe_2d(
     q: &SWESolution2D,
     mesh: &Mesh2D,
@@ -1924,7 +1911,6 @@ pub fn min_element_dt_swe_2d(
 }
 
 /// One element's [`element_dt_swe_2d`].
-#[allow(clippy::too_many_arguments)]
 #[inline]
 fn element_dt(
     q: &SWESolution2D,

@@ -154,7 +154,6 @@ impl MetricForm {
 /// `hu`, `hv` are the element's nodal values; `face` holds the numerical flux
 /// `F*` out of every face node, `face · n_face_nodes + fi`. The result is
 /// linear in `(hu, hv, face)`, which the layer transports rely on.
-#[allow(clippy::too_many_arguments)]
 pub fn transport_divergence_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
@@ -233,7 +232,6 @@ fn subtract_face_lift(
 /// contravariant vector `m`, which the face term replaces by `F*` (`face`).
 /// Linear in `(hu, hv, interfaces, face)`. With the 2D kernel's interface
 /// mass fluxes and `F*_h` it is that kernel's mass tendency node by node.
-#[allow(clippy::too_many_arguments)]
 pub fn subcell_divergence_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
@@ -315,7 +313,6 @@ const MAX_N_1D: usize = 16;
 /// `hu`, `hv` and `phi` are the element's nodal values, `face` the
 /// numerical flux `F*` of `qφ` out of every face node, `fr`, `fs` scratch
 /// of `n_nodes` values.
-#[allow(clippy::too_many_arguments)]
 pub fn advective_divergence_element(
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
@@ -493,7 +490,6 @@ impl LayerTransport {
     /// force, kept energy exact but was unstable under a pycnocline: a shore
     /// element of the Frøya coastline mesh grew with an e-folding of 38 min
     /// (TODO P1.3).
-    #[allow(clippy::too_many_arguments)]
     pub fn compute(
         &mut self,
         state: &Solution3D,
@@ -953,7 +949,6 @@ pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry
 ///
 /// Converting back with [`to_inventory`] keeps each element's
 /// inventory per level exactly.
-#[allow(clippy::too_many_arguments)]
 pub fn from_inventory(
     q: &[f64],
     eta: &[f64],
@@ -1044,7 +1039,6 @@ pub enum MomentumAdvectionForm {
 /// For constant `C` the tendency is `C·(−∇·Q_l − δΩ_l) = C·Δσ_l ∂η/∂t`, the
 /// change of the layer's thickness: constancy. Both fluxes are single-valued
 /// on each face, so the inventory is conserved.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_tracer_transport_3d(
     rhs: &mut [f64],
     tracer: &[f64],
@@ -1096,7 +1090,6 @@ pub fn apply_tracer_transport_3d(
 /// - Jumps beyond the reference's, or against it, keep `V`'s full limiting
 ///   (fronts).
 /// - The flux is single-valued on every surface: conservative.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_tracer_transport_3d_about(
     rhs: &mut [f64],
     tracer: &[f64],
@@ -1155,7 +1148,6 @@ pub fn apply_tracer_transport_3d_about(
 /// Subtract `δ(Ω φ)`, with `φ` at the σ-surfaces reconstructed by `scheme`,
 /// from `rhs_k` (element `k`'s block, `[node][level]`) in every column of
 /// element `k`.
-#[allow(clippy::too_many_arguments)]
 fn subtract_vertical_flux(
     rhs_k: &mut [f64],
     field: &[f64],
@@ -1498,7 +1490,6 @@ fn akima_surface_values(column: &[f64], d_sigma: &[f64], slope: &mut [f64], surf
 /// [`VerticalAdvection::Centred`] the kinetic energy `½ Σ_l H_z,l |u_l|²`
 /// changes only through open faces and by the upwind faces' dissipation,
 /// `−½ Σ_faces |F_l| |u_l − u_l'|²`.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_momentum_transport_3d(
     rhs_u: &mut [f64],
     rhs_v: &mut [f64],

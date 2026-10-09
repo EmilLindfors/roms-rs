@@ -91,7 +91,6 @@ pub trait ConservationLaw: Clone + Send + Sync {
     /// Used for characteristic decomposition in Roe solver.
     ///
     /// Default implementation returns identity (works for scalar).
-    #[allow(clippy::needless_range_loop)]
     fn right_eigenvectors(&self, q: &[f64]) -> Vec<Vec<f64>> {
         let n = Self::N_VARS;
         let mut r = vec![vec![0.0; n]; n];
@@ -109,7 +108,6 @@ pub trait ConservationLaw: Clone + Send + Sync {
     /// L = R^{-1}, so L * R = I.
     ///
     /// Default implementation returns identity (works for scalar).
-    #[allow(clippy::needless_range_loop)]
     fn left_eigenvectors(&self, q: &[f64]) -> Vec<Vec<f64>> {
         let n = Self::N_VARS;
         let mut l = vec![vec![0.0; n]; n];

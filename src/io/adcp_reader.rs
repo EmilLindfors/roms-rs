@@ -120,8 +120,8 @@ pub fn read_adcp_file(path: &Path) -> Result<ADCPFile, ADCPFileError> {
         }
 
         // Parse comments/metadata
-        if line.starts_with('#') {
-            let content = line[1..].trim();
+        if let Some(content) = line.strip_prefix('#') {
+            let content = content.trim();
             if let Some((key, value)) = content.split_once(':') {
                 metadata.insert(key.trim().to_lowercase(), value.trim().to_string());
             }

@@ -283,10 +283,10 @@ pub fn read_timeseries_file(path: &Path) -> Result<BoundaryTimeSeries, TimeSerie
             let comment = line.trim_start_matches('#').trim();
             if let Some(loc_str) = comment.strip_prefix("location:") {
                 let parts: Vec<&str> = loc_str.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse()) {
-                        location = Some((x, y));
-                    }
+                if parts.len() >= 2
+                    && let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse())
+                {
+                    location = Some((x, y));
                 }
             }
             continue;
@@ -327,10 +327,10 @@ pub fn read_timeseries_file(path: &Path) -> Result<BoundaryTimeSeries, TimeSerie
             })?;
 
         // Check monotonicity
-        if let Some(prev_time) = last_time {
-            if time <= prev_time {
-                return Err(TimeSeriesFileError::NonMonotonic { line: line_num + 1 });
-            }
+        if let Some(prev_time) = last_time
+            && time <= prev_time
+        {
+            return Err(TimeSeriesFileError::NonMonotonic { line: line_num + 1 });
         }
         last_time = Some(time);
 
@@ -366,10 +366,10 @@ pub fn parse_timeseries(content: &str) -> Result<BoundaryTimeSeries, TimeSeriesF
             let comment = line.trim_start_matches('#').trim();
             if let Some(loc_str) = comment.strip_prefix("location:") {
                 let parts: Vec<&str> = loc_str.split_whitespace().collect();
-                if parts.len() >= 2 {
-                    if let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse()) {
-                        location = Some((x, y));
-                    }
+                if parts.len() >= 2
+                    && let (Ok(x), Ok(y)) = (parts[0].parse(), parts[1].parse())
+                {
+                    location = Some((x, y));
                 }
             }
             continue;
@@ -408,10 +408,10 @@ pub fn parse_timeseries(content: &str) -> Result<BoundaryTimeSeries, TimeSeriesF
                 message: "Invalid hv".into(),
             })?;
 
-        if let Some(prev) = last_time {
-            if time <= prev {
-                return Err(TimeSeriesFileError::NonMonotonic { line: line_num + 1 });
-            }
+        if let Some(prev) = last_time
+            && time <= prev
+        {
+            return Err(TimeSeriesFileError::NonMonotonic { line: line_num + 1 });
         }
         last_time = Some(time);
 

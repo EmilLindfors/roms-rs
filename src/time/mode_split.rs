@@ -1296,7 +1296,6 @@ struct PassWeights {
 ///
 /// One pass instead of a serial sweep per operation: the 2D state is
 /// streamed once per stage, on every thread.
-#[allow(clippy::too_many_arguments)]
 fn barotropic_stage(
     stage: RkStage,
     x: &SWESolution2D,

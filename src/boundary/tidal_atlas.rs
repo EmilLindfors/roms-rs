@@ -358,7 +358,6 @@ impl TidalAtlas {
     /// are taken at its middle).
     ///
     /// Every such node must lie within `coverage_radius` (m) of an atlas point.
-    #[allow(clippy::too_many_arguments)]
     pub fn boundary_tides<P: CoordinateProjection>(
         &self,
         mesh: &Mesh2D,

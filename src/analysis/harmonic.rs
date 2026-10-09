@@ -723,7 +723,7 @@ mod tests {
 
         let phase = result.constituents[0].phase;
         assert!(
-            phase >= 0.0 && phase < 2.0 * PI,
+            (0.0..2.0 * PI).contains(&phase),
             "Phase {} not in [0, 2π)",
             phase
         );
