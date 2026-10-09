@@ -923,11 +923,13 @@ impl WaveModel2D {
     }
 
     /// At every node, on its spectrum, what `pass` gives: implicit refraction
-    /// and frequency shifting (in its order), then the sources.
+    /// and frequency shifting (in its order), then the sources; dry land's
+    /// action goes after it, as in [`Self::step`].
     fn node_pass(&self, n: &mut WaveSolution, ws: &mut WaveWorkspace, pass: NodePass) {
         let (np, nc) = (self.n_points(), self.grid.n_components());
         to_node_major(&n.data, np, nc, &mut ws.node.data);
         self.node_pass_node_major(&mut ws.node.data, pass);
+        self.absorb_on_land(&mut ws.node.data);
         from_node_major(&ws.node.data, np, nc, &mut n.data);
     }
 
@@ -1752,6 +1754,80 @@ mod tests {
             assert_eq!(model.absorbs_at(p), 0.5 - b <= 0.01, "node {p}");
         }
         assert!((0..model.n_points()).any(|p| model.absorbs_at(p)));
+    }
+
+    /// The node passes on their own (`apply_sources`, `apply_implicit_*`)
+    /// empty dry land as `step` does, and leave every wet node as on floored
+    /// land, bit for bit (each node's pass is its own).
+    #[test]
+    fn node_passes_absorb_on_land_and_leave_the_water_alone() {
+        // P1 on a beach: the first two columns of elements dry, the third
+        // partly, the rest wet
+        let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, 400.0, 0.0, 100.0, 8, 2));
+        let ops = Arc::new(DGOperators2D::new(1));
+        let geom = Arc::new(GeometricFactors2D::compute(&mesh, &ops));
+        let bed = |x: f64, y: f64| 2.0 - 0.02 * x + 1e-3 * y;
+        let bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        let model = |absorbing: bool| {
+            let grid = SpectralGrid::new(0.08, 0.5, 12, 12);
+            let mut model = WaveModel2D::new(
+                mesh.clone(),
+                ops.clone(),
+                geom.clone(),
+                &bathymetry,
+                grid,
+                9.81,
+            )
+            .with_sources(SourceTerms::swan_defaults(9.81))
+            .with_implicit_refraction(true)
+            .with_implicit_frequency_shift(true)
+            .with_absorbing_land(absorbing);
+            model.set_wind(Wind {
+                u10: 15.0,
+                direction: 0.3,
+            });
+            let np = model.n_points();
+            let u: Vec<f64> = (0..np).map(|p| 0.2 + 0.01 * (p % 7) as f64).collect();
+            let v: Vec<f64> = (0..np).map(|p| -0.1 + 0.02 * (p % 5) as f64).collect();
+            model.set_currents(&u, &v);
+            model
+        };
+        let (absorbing, floored) = (model(true), model(false));
+        let np = absorbing.n_points();
+        let dry = (0..np).filter(|&p| absorbing.absorbs_at(p)).count();
+        assert!(dry > 0 && dry < np / 2, "{dry} of {np} nodes dry");
+        let e = absorbing.grid.jonswap(1.0, 6.0, 3.3, 0.3, 2.0);
+        let mut ws = WaveWorkspace::default();
+        type Pass = fn(&WaveModel2D, &mut WaveSolution, f64, &mut WaveWorkspace);
+        let passes: [(&str, Pass); 3] = [
+            ("sources", WaveModel2D::apply_sources),
+            ("refraction", WaveModel2D::apply_implicit_refraction),
+            ("shift", WaveModel2D::apply_implicit_frequency_shift),
+        ];
+        for (name, pass) in passes {
+            let (mut a, mut f) = (absorbing.uniform_state(&e), floored.uniform_state(&e));
+            pass(&absorbing, &mut a, 30.0, &mut ws);
+            pass(&floored, &mut f, 30.0, &mut ws);
+            assert_ne!(
+                a.data,
+                absorbing.uniform_state(&e).data,
+                "{name} did nothing"
+            );
+            for c in 0..absorbing.grid.n_components() {
+                for p in 0..np {
+                    let expected = if absorbing.absorbs_at(p) {
+                        0.0
+                    } else {
+                        f.component(c)[p]
+                    };
+                    assert_eq!(
+                        a.component(c)[p],
+                        expected,
+                        "{name}: node {p}, component {c}"
+                    );
+                }
+            }
+        }
     }
 
     /// A wind per node: from calm, one step's sea at each node is the one

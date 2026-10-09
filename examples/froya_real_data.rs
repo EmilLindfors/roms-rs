@@ -101,7 +101,7 @@
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
 //!     [wave_sources=swan|wam] [wave_integration=] [wave_limiter=] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
-//!     [wave_land=floored|absorbing] \
+//!     [wave_land=absorbing|floored] \
 //!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
@@ -148,10 +148,10 @@
 //! with its own implicit refraction, shifting and breaking), and `wave_cfl=`
 //! sets the propagation's CFL number (0.5).
 //!
-//! `wave_land=absorbing` lets dry land take the waves, as the coast does
-//! (`WaveModel2D::with_absorbing_land`), instead of treating it as water of
-//! the minimum depth (`floored`), where the waves pile up until the sinks
-//! there remove them.
+//! `wave_land=absorbing` (the default) lets dry land take the waves, as the
+//! coast does (`WaveModel2D::with_absorbing_land`). `wave_land=floored` treats
+//! it as water of the minimum depth instead, where the waves pile up until the
+//! sinks there remove them.
 //!
 //! `wave_spectra=<file>` takes the sea from a parent wave model instead:
 //! MET Norway's MyWave WAM 800 m spectra at its points
@@ -520,8 +520,8 @@ struct Options {
     wave_substeps: usize,
     /// The waves' propagation CFL number (`wave_cfl=`)
     wave_cfl: f64,
-    /// Dry land absorbs the waves (`wave_land=absorbing`) instead of being
-    /// water of the minimum depth (`floored`)
+    /// Dry land absorbs the waves (`wave_land=absorbing`, the default)
+    /// instead of being water of the minimum depth (`floored`)
     wave_absorbing_land: bool,
     /// With `waves=N`, run on after the N timed steps to this many model
     /// hours, the last step landing on it (`wave_hours=`; 0: off)
@@ -703,8 +703,8 @@ impl Options {
             wave_substeps: get("wave_substeps", 1.0)? as usize,
             wave_cfl: get("wave_cfl", 0.5)?,
             wave_absorbing_land: match args.get("wave_land").map(String::as_str) {
-                None | Some("floored") => false,
-                Some("absorbing") => true,
+                Some("floored") => false,
+                None | Some("absorbing") => true,
                 Some(other) => return Err(format!("wave_land=floored|absorbing, not {other}")),
             },
             wave_hours: get("wave_hours", 0.0)?,
