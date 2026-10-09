@@ -23,7 +23,9 @@
 //!   the force `−g ∇·(S/ρg)` keeps its flux form there (its total is the
 //!   boundary integral of `S` on the circulation's mesh), which a force
 //!   interpolated from the coarse mesh would not, and it is exact for the
-//!   interpolated stress. The waves' bed stress and surface roughness, and the
+//!   interpolated stress. Or the force of the dissipation
+//!   ([`WaveCoupling2D::dissipation_force`], [`WaveForceForm::Dissipation`]),
+//!   interpolated as it is. The waves' bed stress and surface roughness, and the
 //!   Stokes drift ([`StokesDriftField::transferred`]), are interpolated as
 //!   they are, the first two kept non-negative.
 //!
@@ -76,6 +78,23 @@ pub const DEFAULT_BREAKER_INDEX: f64 = 0.73;
 /// [`CoupledWaves2D`] ([`WaveModel2D::bed_wave_stress`]): 1 mm, a rippled
 /// sand or gravel bed (a Manning n of 0.025 is z₀ ≈ 2 mm in 10 m of water).
 pub const DEFAULT_BED_ROUGHNESS: f64 = 1e-3;
+
+/// Which force of the waves a [`CoupledWaves2D`] gives the circulation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WaveForceForm {
+    /// The radiation stress's divergence `−∇·S`, capped at the
+    /// circulation's depth ([`WaveCoupling2D::depth_limited_force`]): setup,
+    /// set-down and the wave-driven currents
+    #[default]
+    RadiationStress,
+    /// The momentum the sinks take, `g Σ (k/σ) e_θ D` (Dingemans et al.
+    /// 1987; [`WaveCoupling2D::dissipation_force`]): the wave-driven
+    /// currents and the setup where the waves break, without the set-down
+    /// where they shoal. Where a coarse wave field shoals and refracts
+    /// against a steep coast, `−∇·S` is large and only nearly a gradient,
+    /// and what is left over drives currents the dissipation does not.
+    Dissipation,
+}
 
 /// The exchanges between a wave model and a circulation on different meshes
 /// (see the module docs).
@@ -265,6 +284,21 @@ impl WaveCoupling2D {
         WaveForce2D::from_radiation_stress(&self.mesh, &self.ops, &self.geom, &stress, waves.g())
     }
 
+    /// The force of the wave state `n`'s dissipation on the circulation
+    /// ([`WaveForce2D::from_dissipation`]): `g Σ (k/σ) e_θ D` per wave node,
+    /// interpolated onto the circulation's nodes. No set-down, and none of
+    /// the unresolved shoaling's `−∇·S` (see [`WaveForceForm::Dissipation`]).
+    /// `D` is what the sinks remove over a wave step `dt` (s)
+    /// ([`WaveModel2D::dissipation`]).
+    pub fn dissipation_force(&self, waves: &WaveModel2D, n: &WaveSolution, dt: f64) -> WaveForce2D {
+        let force: Vec<[f64; 2]> = waves.dissipation(n, dt).iter().map(|d| d.force).collect();
+        WaveForce2D::from_force(
+            &self.mesh,
+            &self.ops,
+            self.to_circulation.apply_components(&force),
+        )
+    }
+
     /// The waves' bed stress per ρ (m²/s²) on a bed of roughness length `z0`
     /// (m) at the circulation's nodes ([`WaveModel2D::bed_wave_stress`]), for
     /// [`crate::source::WaveCurrentFriction2D`].
@@ -325,6 +359,7 @@ pub struct CoupledWaves2D {
     cfl: f64,
     z0: f64,
     ramp: Option<f64>,
+    force_form: WaveForceForm,
     stats: CoupledWavesStats,
     /// A parent model's spectra on the open boundary and its wind, set at
     /// every wave step's midpoint
@@ -392,6 +427,7 @@ impl CoupledWaves2D {
             cfl: 0.5,
             z0: DEFAULT_BED_ROUGHNESS,
             ramp: None,
+            force_form: WaveForceForm::default(),
             stats: CoupledWavesStats::default(),
             boundary: None,
             boundary_buffer: Vec::new(),
@@ -422,6 +458,13 @@ impl CoupledWaves2D {
         self
     }
 
+    /// Which force the waves give the circulation (default
+    /// [`WaveForceForm::RadiationStress`]).
+    pub fn with_force_form(mut self, form: WaveForceForm) -> Self {
+        self.force_form = form;
+        self
+    }
+
     /// The wave model (its level and current are the last exchange's).
     pub fn model(&self) -> &WaveModel2D {
         &self.model
@@ -448,8 +491,8 @@ impl CoupledWaves2D {
     }
 
     /// The force of the wave state at [`Self::time`] on the circulation,
-    /// unramped (`−g ∇·(S/ρg)` per circulation node; none before the first
-    /// exchange).
+    /// unramped (per circulation node, in the [`WaveForceForm`] chosen; none
+    /// before the first exchange).
     pub fn force(&self) -> Option<&[[f64; 2]]> {
         self.last.as_ref().map(|(force, _)| force.force())
     }
@@ -585,9 +628,20 @@ impl CoupledWaves2D {
     /// The force (ramped) and the bed stress (unramped; empty without a bed
     /// friction to enhance) of the wave state on the circulation.
     fn forcing(&self, q: &SWESolution2D) -> (WaveForce2D, Vec<f64>) {
-        let mut force =
-            self.coupling
-                .depth_limited_force(&self.model, &self.state, q, DEFAULT_BREAKER_INDEX);
+        let mut force = match self.force_form {
+            WaveForceForm::RadiationStress => self.coupling.depth_limited_force(
+                &self.model,
+                &self.state,
+                q,
+                DEFAULT_BREAKER_INDEX,
+            ),
+            // Over the waves' own step: what their sinks can remove in it
+            WaveForceForm::Dissipation => self.coupling.dissipation_force(
+                &self.model,
+                &self.state,
+                self.model.compute_dt(self.cfl),
+            ),
+        };
         if let Some(seconds) = self.ramp {
             force = force.with_ramp(seconds);
         }
@@ -664,8 +718,8 @@ mod tests {
         n
     }
 
-    /// On the same mesh every exchange is the same-mesh one: the force of
-    /// `WaveForce2D::new`, the stresses, the roughness and the Stokes drift of
+    /// On the same mesh every exchange is the same-mesh one: the forces of
+    /// `WaveForce2D::new` and `from_dissipation`, the stresses, the roughness and the Stokes drift of
     /// the wave model itself, to round-off.
     #[test]
     fn on_the_same_mesh_the_coupling_is_the_direct_one() {
@@ -684,6 +738,27 @@ mod tests {
         assert!(scale > 0.0);
         for (a, b) in coupling
             .force(&waves, &n)
+            .force()
+            .iter()
+            .zip(direct.force())
+        {
+            assert!(
+                close(a[0], b[0], scale) && close(a[1], b[1], scale),
+                "{a:?} {b:?}"
+            );
+        }
+        // The dissipation's force, with sinks to give one
+        let sinks = waves_on(&c, |x, _| -(4.0 + 0.02 * x))
+            .with_sources(crate::waves::SourceTerms::swan_defaults(G));
+        let direct = WaveForce2D::from_dissipation(&sinks, &n, 30.0);
+        let scale = direct
+            .force()
+            .iter()
+            .map(|f| f[0].hypot(f[1]))
+            .fold(0.0, f64::max);
+        assert!(scale > 0.0);
+        for (a, b) in coupling
+            .dissipation_force(&sinks, &n, 30.0)
             .force()
             .iter()
             .zip(direct.force())

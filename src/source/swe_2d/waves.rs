@@ -19,6 +19,18 @@
 //! `−g ∮ S·n` over the boundary, with the momentum the waves give one element
 //! taken from its neighbour. Dry nodes (`h ≤ h_min`) get no force.
 //!
+//! [`WaveForce2D::from_dissipation`] is the alternative of Dingemans et al.
+//! (1987), SWAN's `DISSIPATION` force: `F = g Σ (k/σ) e_θ D`, the momentum
+//! the waves lose where their sinks take energy. `−∇·S` is that plus a part
+//! that is nearly a gradient, from shoaling and refraction without loss,
+//! which the mean level balances. The dissipation's force keeps the currents
+//! and the setup where the waves break, but has no set-down seaward of the
+//! breakers. On a plane beach (`tests/wave_coupling_test.rs`) the longshore
+//! current follows Longuet-Higgins's to 0.6 % against `−∇·S`'s 3.8 %, the
+//! setup at the shore is within 1.4 % of `−∇·S`'s, and the set-down is gone
+//! (−0.68 cm). It also drops the large, nearly cancelling `−∇·S` where a
+//! coarse wave field shoals and refracts unresolved against a steep coast.
+//!
 //! The vortex-force form of McWilliams et al. (2004), which separates the
 //! conservative part into a Bernoulli head and needs the Stokes drift in the
 //! advection, is an alternative for 3D (TODO F.4).
@@ -43,11 +55,13 @@ use crate::source::{BottomFriction2D, ElementSources, SourceContext2D, SourceTer
 use crate::types::ElementIndex;
 use crate::waves::{WaveModel2D, WaveSolution};
 
-/// The radiation-stress force of waves on the 2D flow (see the module docs).
+/// The force of waves on the 2D flow, from the radiation stress or the
+/// dissipation (see the module docs).
 #[derive(Clone, Debug)]
 pub struct WaveForce2D {
     n_nodes: usize,
-    /// `−g ∇·(S/ρg)` per node (m²/s², force per unit area over ρ)
+    /// The force per node (m²/s², force per unit area over ρ): `−g ∇·(S/ρg)`
+    /// or the dissipation's
     force: Vec<[f64; 2]>,
     /// Node positions, for [`SourceTerm2D::evaluate`]
     positions: Vec<[f64; 2]>,
@@ -96,6 +110,29 @@ impl WaveForce2D {
             .into_iter()
             .map(|[x, y]| [-g * x, -g * y])
             .collect();
+        Self::from_force(mesh, ops, force)
+    }
+
+    /// The force of the dissipation of the wave state `n` of `model`, on the
+    /// model's mesh and order: `F = g Σ (k/σ) e_θ D` per node (Dingemans et
+    /// al. 1987; [`crate::waves::Dissipation`]) in place of `−∇·S`: the
+    /// wave-driven currents and the setup where the waves break, without the
+    /// set-down where they shoal (see the module docs). `D` is what the sinks
+    /// remove over a wave step `dt` (s), or at the instant for `dt = 0`
+    /// ([`WaveModel2D::dissipation`]).
+    pub fn from_dissipation(model: &WaveModel2D, n: &WaveSolution, dt: f64) -> Self {
+        let force = model.dissipation(n, dt).iter().map(|d| d.force).collect();
+        Self::from_force(&model.mesh, &model.ops, force)
+    }
+
+    /// The force `force` per node (m²/s², force per unit area over ρ;
+    /// element by element on `mesh` at the order of `ops`), as it is.
+    pub fn from_force(mesh: &Mesh2D, ops: &DGOperators2D, force: Vec<[f64; 2]>) -> Self {
+        assert_eq!(
+            force.len(),
+            mesh.n_elements * ops.n_nodes,
+            "a nodal field element by element"
+        );
         let positions = ElementIndex::iter(mesh.n_elements)
             .flat_map(|k| {
                 (0..ops.n_nodes)
@@ -171,8 +208,8 @@ impl WaveForce2D {
         self
     }
 
-    /// `−g ∇·(S/ρg)` per node (m²/s²), unramped; of a force [`Self::between`]
-    /// two, the first.
+    /// The force per node (m²/s²: `−g ∇·(S/ρg)`, or the dissipation's),
+    /// unramped; of a force [`Self::between`] two, the first.
     pub fn force(&self) -> &[[f64; 2]] {
         &self.force
     }

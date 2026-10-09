@@ -39,7 +39,7 @@ pub mod stokes;
 pub use boundary::{BoundarySpectra, PointSpectra, WindSeries, regrid_spectrum};
 pub use coupling::{
     CoupledWaves2D, CoupledWavesStats, DEFAULT_BED_ROUGHNESS, DEFAULT_COUPLING_H_DRY,
-    WaveCoupling2D,
+    WaveCoupling2D, WaveForceForm,
 };
 pub use dispersion::{dsigma_ddepth, group_velocity, group_velocity_ratio, wavenumber};
 pub use model::{
@@ -48,8 +48,8 @@ pub use model::{
 };
 pub use nonlinear::{Quadruplets, shallow_water_factor};
 pub use sources::{
-    DEFAULT_LIMITER, DEFAULT_RATE_LIMITER, DEFAULT_TAIL_POWER, GrowthLimiter, SourceIntegration,
-    SourceTerms, Wind, breaking_fraction,
+    DEFAULT_LIMITER, DEFAULT_RATE_LIMITER, DEFAULT_TAIL_POWER, Dissipation, GrowthLimiter,
+    SourceIntegration, SourceTerms, Wind, breaking_fraction,
 };
 pub use spectrum::{SpectralGrid, WaveParameters, wrap_angle};
 pub use state::WaveSolution;
