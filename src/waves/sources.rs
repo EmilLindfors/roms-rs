@@ -50,7 +50,12 @@
 //! of a fully developed sea at `f_c`). Under swell the whole spectrum's mean
 //! frequency is the swell's, and would cap the young wind sea's growth by
 //! several times too much. It suits [`SourceIntegration::Implicit`], whose
-//! steps are long.
+//! steps are long. ecWAM caps the losses by the same limit
+//! ([`GrowthLimiter::RateBothSigns`]), which keeps energy where a sink would
+//! remove more than the limit in a step; depth-induced breaking is left out
+//! of that cap ([`super::WaveModel2D`] gives it its own pass), and here the
+//! cap on bottom friction keeps waves on floored land nodes (see the
+//! variant).
 
 use std::f64::consts::{PI, TAU};
 
@@ -81,7 +86,7 @@ pub const DEFAULT_RATE_LIMITER: f64 = 5.0e-7;
 const PM_PEAK: f64 = 5.6e-3;
 
 /// How the sources' growth of the action density over a step is limited
-/// (losses never are).
+/// (losses only by [`Self::RateBothSigns`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum GrowthLimiter {
     /// Ris's (SWAN's): at most a fraction γ of the Phillips level per step,
@@ -90,6 +95,27 @@ pub enum GrowthLimiter {
     /// Hersbach & Janssen's (WAM's): at most `C g ũ* f⁻⁴ f_c Δt` of `F(f, θ)`,
     /// proportional to the step (see the module docs)
     Rate(f64),
+    /// [`Self::Rate`]'s limit on the losses too, `|ΔF| ≤ C g ũ* f⁻⁴ f_c Δt`, as
+    /// ecWAM's `implsch.F90` (`SIGN(MIN(|ΔF|, limit), ΔF)`). Depth-induced
+    /// breaking must stay outside it: [`super::WaveModel2D`] steps breaking on
+    /// a pass of its own under this limiter, but [`SourceTerms::integrate`]
+    /// caps every term it is given.
+    ///
+    /// Not recommended here (measured 2026-10-09, the 24 h Frøya storm at
+    /// a 56 s step): against [`Self::Rate`] it moves H_s at MET's points by
+    /// ≤ 2 cm, but it caps the bottom friction, which is what removes the
+    /// waves on the depth floor of land nodes (0.1 m: a 2 m sea keeps
+    /// 1.8 m over a step, against 0.17 m), so seas of up to 19 m pile up
+    /// against cliff coasts. Also less step-independent: at 900 s steps
+    /// a duration-limited sea is 8 % low at 96 h (60 s: 3.08e-3).
+    RateBothSigns(f64),
+}
+
+impl GrowthLimiter {
+    /// Whether the limit caps the losses as well as the growth.
+    pub fn caps_losses(&self) -> bool {
+        matches!(self, Self::RateBothSigns(_))
+    }
 }
 
 /// Phillips' constant α_PM of the equilibrium range (Pierson & Moskowitz 1964).
@@ -587,7 +613,7 @@ impl SourceTerms {
         // Hersbach & Janssen's limit: `C g ũ* f_c Δt` (the factor of
         // `f⁻⁴` in `F`), from the state at the start
         let rate_limit = match self.limiter {
-            Some(GrowthLimiter::Rate(coefficient)) => {
+            Some(GrowthLimiter::Rate(coefficient) | GrowthLimiter::RateBothSigns(coefficient)) => {
                 variance(grid, n, e);
                 Means::of(grid, e, k).map(|means| {
                     let f_c = limiter_frequency(grid, e, k, wind, means);
@@ -610,10 +636,16 @@ impl SourceTerms {
                     gamma * PHILLIPS / (2.0 * sigma * ki.powi(3) * group_velocity(sigma, ki, depth))
                 }
                 // ΔF(f) per 2πσ: N = E/σ, E(σ) = F(f)/2π
-                Some(GrowthLimiter::Rate(_)) => rate_limit.map_or(f64::INFINITY, |limit| {
-                    limit * (sigma / TAU).powi(-4) / (TAU * sigma)
-                }),
+                Some(GrowthLimiter::Rate(_) | GrowthLimiter::RateBothSigns(_)) => rate_limit
+                    .map_or(f64::INFINITY, |limit| {
+                        limit * (sigma / TAU).powi(-4) / (TAU * sigma)
+                    }),
                 None => f64::INFINITY,
+            };
+            let max_loss = if self.limiter.is_some_and(|l| l.caps_losses()) {
+                max_growth
+            } else {
+                f64::INFINITY
             };
             let row = i * nd..(i + 1) * nd;
             let rows = n[row.clone()]
@@ -630,7 +662,7 @@ impl SourceTerms {
                     (growth - 1.0) / x
                 };
                 let next = *n * growth + a / sigma * dt * phi;
-                *n = next.min(*n + max_growth).max(0.0);
+                *n = next.max(*n - max_loss).min(*n + max_growth).max(0.0);
             }
         }
         if let Some(power) = self.tail {
@@ -886,6 +918,62 @@ mod tests {
             mean(&both)
         );
         assert_eq!(f_c(&swell), mean(&swell));
+    }
+
+    /// [`GrowthLimiter::RateBothSigns`] caps a loss by the growth's limit:
+    /// a steep swell without wind under whitecapping at a 5-minute step,
+    /// where `ũ* = g f*_PM/f_c` makes the limit `C g² f*_PM f⁻⁴ Δt` in
+    /// `F(f, θ)`. [`GrowthLimiter::Rate`] lets the same loss through whole.
+    #[test]
+    fn the_two_sided_limit_caps_the_losses_by_the_growths_limit() {
+        let grid = SpectralGrid::new(0.05, 0.6, 24, 18);
+        let depth = 200.0;
+        let k: Vec<f64> = grid
+            .sigma
+            .iter()
+            .map(|&s| wavenumber(s, depth, G))
+            .collect();
+        let e0 = grid.jonswap(4.0, 5.0, 3.3, 0.0, 4.0);
+        let n0: Vec<f64> = (0..e0.len())
+            .map(|c| e0[c] / grid.sigma[c / grid.n_dir()])
+            .collect();
+        let (m, dt) = (n0.len(), 300.0);
+        let run = |limiter| {
+            let sources = SourceTerms::none(G)
+                .with_whitecapping(true)
+                .with_limiter(Some(limiter));
+            let (mut e, mut a, mut b) = (vec![0.0; m], vec![0.0; m], vec![0.0; m]);
+            let mut n = n0.clone();
+            let wind = Wind::default();
+            sources.integrate(&grid, &mut n, &k, depth, wind, dt, &mut e, &mut a, &mut b);
+            n
+        };
+        let (one, both) = (
+            run(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)),
+            run(GrowthLimiter::RateBothSigns(DEFAULT_RATE_LIMITER)),
+        );
+        let (mut capped, mut free) = (0, 0);
+        for c in 0..m {
+            let sigma = grid.sigma[c / grid.n_dir()];
+            let f = sigma / TAU;
+            let limit = DEFAULT_RATE_LIMITER * G * G * PM_PEAK * f.powi(-4) * dt / (TAU * sigma);
+            // Whitecapping only removes
+            assert!(one[c] <= n0[c] && both[c] <= n0[c]);
+            if n0[c] - one[c] > limit {
+                // The loss beyond the limit is cut to it
+                assert!(
+                    (n0[c] - both[c] - limit).abs() <= 1e-12 * (n0[c] + limit),
+                    "component {c}: loss {:e}, limit {limit:e}",
+                    n0[c] - both[c]
+                );
+                capped += 1;
+            } else {
+                assert_eq!(both[c], one[c]);
+                free += 1;
+            }
+        }
+        println!("{capped} components capped, {free} free");
+        assert!(capped > 0 && free > 0, "{capped} capped, {free} free");
     }
 
     #[test]
