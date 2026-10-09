@@ -53,7 +53,9 @@
 //! that costs accuracy, and frozen rates without the limiter blow up at long
 //! steps; WAM's integration ([`super::SourceIntegration::Implicit`] with
 //! [`super::GrowthLimiter::Rate`]) keeps the growth curves at an outer step of
-//! minutes.
+//! minutes. Under [`super::GrowthLimiter::RateBothSigns`], which caps the
+//! losses too, breaking has its own pass after the other sources even in one
+//! step, so that the cap leaves the surf zone's dissipation whole.
 //!
 //! On steep slopes refraction turns the waves fast, and its explicit Courant
 //! limit `|c_θ| Δt ≤ Δθ` sets a step far below the geographic one (100× at
@@ -760,8 +762,11 @@ impl WaveModel2D {
         );
         let sources = self.sources.any().then_some(dt);
         // With substeps breaking follows every propagation step, and the
-        // other sources the first `⌊m/2⌋`; in one step all follow it
-        let breaking = (substeps > 1 && self.sources.breaking.is_some()).then_some(h);
+        // other sources the first `⌊m/2⌋`; in one step all follow it, but
+        // breaking on a pass of its own when the limiter caps losses
+        let caps_losses = self.sources.limiter.is_some_and(|l| l.caps_losses());
+        let breaking =
+            ((substeps > 1 || caps_losses) && self.sources.breaking.is_some()).then_some(h);
         let with_sources = (substeps / 2).max(1) - 1;
         // The whole step node-major: one transpose in, one out
         let (np, nc) = (self.n_points(), self.grid.n_components());

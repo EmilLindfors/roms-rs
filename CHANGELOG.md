@@ -6,6 +6,12 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **ecWAM's limit on the sources' losses, tried and left opt-in: `GrowthLimiter::RateBothSigns` (TODO F.4).** ecWAM caps the change of each component both ways, `|ΔF| ≤ C g ũ* f⁻⁴ f_c Δt` (`implsch.F90`); `GrowthLimiter::Rate` caps only growth. The question was whether the cap on losses explains why WAM's scheme leaves the lees 6–9 % lower than SWAN's.
+  - **It does not.** In the 24 h Frøya storm at a 56 s step, it moves H_s at MET's points by at most 2 cm (bias in the lee −0.57 → −0.55 m, Frohavet −0.66 → −0.64, north +0.10 → +0.11, reef −1.34 → −1.32). The lee's deficit is the growth cap's.
+  - **And it is harmful here.** The largest H_s rose from 8.8 to 19.5 m against the cliff coast. On the 0.1 m depth floor of land nodes, bottom friction is what removes the arriving waves, since Battjes–Janssen's dissipation saturates at `H_max²`. The cap limits friction's losses: a 2 m sea there keeps 1.8 m over a 56 s step, against 0.17 m. Duration-limited growth also depends more on the step (8 % low at 96 h with 900 s steps).
+  - Depth-induced breaking stays outside the cap: under this limiter `WaveModel2D` steps breaking on a pass of its own, also in one step. `GrowthLimiter::caps_losses` says which variants cap losses.
+  - Options: `froya_real_data wave_limiter=rate2` and `wave_growth limiter=rate2[:C]`. Defaults unchanged, bit for bit.
+  - Gates: `the_two_sided_limit_caps_the_losses_by_the_growths_limit` (unit) and `the_two_sided_limiter_leaves_breaking_whole` (surf-zone H_s within 0.81 % of no limiter; with breaking inside the cap, 5.9× it).
 - **Long wave steps: WAM's source integration and propagation substeps, 3× faster waves at Frøya (TODO F.4 Cost).** All off by default; today's results are unchanged bit for bit.
   - **What limited the step.** Measured on a young 15 m/s sea with swell, relative H_s error after an hour against a converged run:
     - The propagation's own time error is negligible: 8e-5 at the 7 s step without sources.

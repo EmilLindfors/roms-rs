@@ -1091,3 +1091,70 @@ fn substeps_keep_the_surf_zone_and_the_refraction_of_a_single_step() {
     assert!(surf < 0.01, "H_s in the surf zone off by {surf:e}");
     assert!(turn < 0.1, "the mean direction off by {turn}°");
 }
+
+/// The two-sided rate limiter (`GrowthLimiter::RateBothSigns`, ecWAM's cap on
+/// `|ΔF|`) leaves depth-induced breaking whole: the model steps breaking on a
+/// pass of its own under it, also in one step. On the shelf of
+/// `substeps_keep_the_surf_zone_and_the_refraction_of_a_single_step` (a swell
+/// breaking from 10 to 0.5 m, no wind, so the limit is `C g² f*_PM f⁻⁴ Δt`),
+/// the steady H_s in the surf zone is that of no limiter to 0.81 %: 0.24 %
+/// from stepping breaking after the friction instead of with it, the rest
+/// the cap on the bottom friction's losses (ecWAM caps them too). With
+/// breaking inside the cap the surf zone kept up to 5.9× the H_s.
+#[test]
+fn the_two_sided_limiter_leaves_breaking_whole() {
+    const LX: f64 = 100.0;
+    const LY: f64 = 500.0;
+    let depth = |y: f64| 10.0 - 9.5 * y / LY;
+    let grid = SpectralGrid::new(0.08, 0.16, 4, 36);
+    let mut e = grid.jonswap(1.5, 9.0, 3.3, 60f64.to_radians(), 8.0);
+    let hs = grid.parameters(&e).hs;
+    e.iter_mut().for_each(|x| *x *= (1.5 / hs).powi(2));
+    let solve = |limiter: Option<GrowthLimiter>| {
+        let mut mesh = Mesh2D::channel_periodic_x(0.0, LX, 0.0, LY, 1, 10);
+        for edge in mesh.edges.iter_mut().filter(|e| e.right.is_none()) {
+            edge.boundary_tag = Some(if mesh.vertices[edge.vertices.0][1] < 0.5 * LY {
+                BoundaryTag::Open
+            } else {
+                BoundaryTag::Wall
+            });
+        }
+        let m = model(mesh, 2, |_, y| -depth(y), grid.clone())
+            .with_sources(
+                SourceTerms::none(G)
+                    .with_breaking(Some((1.0, 0.73)))
+                    .with_bottom_friction(Some(0.038))
+                    .with_limiter(limiter),
+            )
+            .with_boundary_spectrum(&e)
+            .with_implicit_refraction(true)
+            .with_implicit_frequency_shift(true);
+        let mut n = m.zero_state();
+        let cg_min = group_velocity(m.grid.sigma[0], wavenumber(m.grid.sigma[0], 0.5, G), 0.5);
+        run(&m, &mut n, 4.0 * LY / cg_min, 0.5);
+        let xy = nodes(&m);
+        let params = m.parameters(&n);
+        (0..m.n_points())
+            .map(|p| (depth(xy[p][1]), params[p].hs))
+            .collect::<Vec<_>>()
+    };
+    let free = solve(None);
+    let capped = solve(Some(GrowthLimiter::RateBothSigns(DEFAULT_RATE_LIMITER)));
+    let (mut surf, mut hs_min_ratio): (f64, f64) = (0.0, f64::INFINITY);
+    for (a, b) in free.iter().zip(&capped) {
+        if a.0 < 3.0 {
+            surf = surf.max((b.1 / a.1 - 1.0).abs());
+            hs_min_ratio = hs_min_ratio.min(a.1 / (0.73 * a.0));
+        }
+    }
+    println!(
+        "two-sided limiter against none: H_s in water under 3 m off by up to {:.3} %; \
+         H_s/(γ d) there ≥ {hs_min_ratio:.2}",
+        100.0 * surf
+    );
+    assert!(
+        hs_min_ratio > 0.4,
+        "the surf zone breaks: H_s/(γ d) {hs_min_ratio}"
+    );
+    assert!(surf < 0.012, "H_s in the surf zone off by {surf:e}");
+}
