@@ -488,6 +488,14 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Hersbach & Janssen's growth limiter capped young wind seas under swell several times too tightly (`GrowthLimiter::Rate`; TODO F.4).** The limit `C g ũ* f⁻⁴ f_c Δt` took `f_c` as the whole spectrum's mean frequency. ecWAM (`implsch.F90`: `USFM = u* max(FMEANWS, FMEAN)`) takes the larger of the wind sea's mean frequency and the whole spectrum's.
+  - **The wind sea** is the components with a positive wind input, `28 u*/c cos(θ − θ_w) > 1` (`limiter_frequency`; ecWAM's `XLLWS` marks those of Janssen's input).
+  - **Where swell dominates** the whole spectrum's mean frequency is the swell's: 0.085 Hz against the wind sea's 0.273 Hz in the new unit test, a cap 3.2× too tight on the wind sea's growth.
+  - **Found in the 2025-10-09 storm at Frøya** (24 h, coupled; output in `output/storm_steps/`). Against today's default (SWAN's sources at 7 s), WAM's scheme lowered H_s by 12.5 % in the lee south of Frøya and 9.1 % at Frohavet. Mixing the parts showed that it was all the limiter: SWAN's frozen rates with this limiter gave the same, and WAM's implicit DIA with Ris's limiter gave −0.1 %. With the fix: −9.1 % and −6.3 %, about a third of the gap.
+  - **The step is not the issue.** WAM's scheme at 56 s matches it at 7 s to ≤ 0.2 % at every point, and in the wave-driven level and currents at Mausund. The wall time is 25 min against 37 for the 24 h coupled run.
+  - Gate: `a_swell_does_not_tighten_the_growth_limit_of_the_wind_sea`. The fetch- and duration-limited gates of the implicit sources still pass.
+  - `froya_real_data` takes `wave_integration=frozen|implicit` and `wave_limiter=ris|rate`, each part of `wave_sources=wam` alone.
+
 - **Wave substeps keep refraction and breaking on the short step (`WaveModel2D::with_substeps`; TODO F.4 Cost).** The long wave steps of the previous entry ran implicit refraction, frequency shifting and every source once per outer step. Compared node by node at Frøya (H_s after 6 h against the 7 s step; WAM's sources), that lost accuracy where those terms are fast:
   - **The focusing on the steep coast.** The backward Euler half-steps of 28 s smeared it: the largest H_s was 3.81 m against 3.96 m, and H_s was 1.7 % RMS off in water deeper than 10 m.
   - **The surf zone.** Breaking once per outer step left up to a minute of incoming energy undissipated: +45 % (60 % RMS) in water under 1 m deep, 10 % RMS at 1–3 m.

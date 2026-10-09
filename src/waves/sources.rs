@@ -43,10 +43,14 @@
 //! whole). A cap per step makes the growth depend on the step, so
 //! [`GrowthLimiter::Rate`] caps it per unit time instead, as WAM since cycle 4
 //! (Hersbach & Janssen 1999; ECMWF IFS Part VII §5.2):
-//! `ΔF ≤ C g ũ* f⁻⁴ f_c Δt` in `F(f, θ)`, `C = 5·10⁻⁷` (ecWAM's), `f_c` the mean frequency
-//! `σ̃/2π`, `ũ* = max(u*, g f*_PM/f_c)` with `f*_PM = 5.6·10⁻³` (without wind
-//! the floor of a fully developed sea at `f_c`). It suits
-//! [`SourceIntegration::Implicit`], whose steps are long.
+//! `ΔF ≤ C g ũ* f⁻⁴ f_c Δt` in `F(f, θ)`, `C = 5·10⁻⁷` (ecWAM's), `f_c` the larger
+//! of the mean frequencies `σ̃/2π` of the wind sea and of the whole spectrum
+//! (ecWAM's `implsch.F90`: the wind sea is the components the wind feeds), and
+//! `ũ* = max(u*, g f*_PM/f_c)` with `f*_PM = 5.6·10⁻³` (without wind the floor
+//! of a fully developed sea at `f_c`). Under swell the whole spectrum's mean
+//! frequency is the swell's, and would cap the young wind sea's growth by
+//! several times too much. It suits [`SourceIntegration::Implicit`], whose
+//! steps are long.
 
 use std::f64::consts::{PI, TAU};
 
@@ -593,7 +597,7 @@ impl SourceTerms {
             Some(GrowthLimiter::Rate(coefficient)) => {
                 variance(grid, n, e);
                 Means::of(grid, e, k).map(|means| {
-                    let f_c = means.sigma / TAU;
+                    let f_c = limiter_frequency(grid, e, k, wind, means);
                     let floor = self.g * PM_PEAK / f_c;
                     coefficient * self.g * wind.friction_velocity().max(floor) * f_c * dt
                 })
@@ -682,6 +686,38 @@ fn variance(grid: &SpectralGrid, n: &[f64], e: &mut [f64]) {
     for (c, (e, n)) in e.iter_mut().zip(n).enumerate() {
         *e = grid.sigma[c / nd] * n;
     }
+}
+
+/// The frequency `f_c` (Hz) of Hersbach & Janssen's limit for the variance
+/// density `e` with wavenumbers `k` under `wind`: the larger of the mean
+/// frequencies `m₀/m₋₁` of the wind sea and of the whole spectrum (`means`),
+/// as ecWAM's `implsch.F90` (`USFM = u* max(FMEANWS, FMEAN)`). The wind sea is
+/// the components with a positive wind input, `28 u*/c cos(θ − θ_w) > 1`
+/// (Komen's; ecWAM's `XLLWS` marks those of Janssen's).
+fn limiter_frequency(grid: &SpectralGrid, e: &[f64], k: &[f64], wind: Wind, means: Means) -> f64 {
+    let nd = grid.n_dir();
+    let us = wind.friction_velocity();
+    let (mut m0, mut inv_sigma) = (0.0, 0.0);
+    if us > 0.0 {
+        let mut table = [0.0; MAX_DIRECTIONS];
+        let cosine = |j: usize| (grid.theta[j] - wind.direction).cos();
+        for (j, cos) in table.iter_mut().enumerate().take(nd) {
+            *cos = cosine(j);
+        }
+        for (i, &ki) in k.iter().enumerate().take(grid.n_freq()) {
+            // Fed where cos(θ − θ_w) > c/(28 u*)
+            let threshold = grid.sigma[i] / ki / (28.0 * us);
+            let row: f64 = (0..nd)
+                .filter(|&j| table.get(j).copied().unwrap_or_else(|| cosine(j)) > threshold)
+                .map(|j| e[i * nd + j])
+                .sum::<f64>()
+                * grid.d_sigma[i];
+            m0 += row;
+            inv_sigma += row / grid.sigma[i];
+        }
+    }
+    let wind_sea = if m0 > 0.0 { m0 / inv_sigma } else { 0.0 };
+    wind_sea.max(means.sigma) / TAU
 }
 
 /// The DIA's finite-depth factor at a node of depth `depth` with the
@@ -817,6 +853,47 @@ mod tests {
     use crate::waves::dispersion::wavenumber;
 
     const G: f64 = 9.81;
+
+    /// Hersbach & Janssen's limit takes the wind sea's mean frequency when it
+    /// is above the whole spectrum's (ecWAM's `max(FMEANWS, FMEAN)`): a swell
+    /// against the wind leaves it as the wind sea alone sets it, where the
+    /// whole spectrum's mean frequency would be the swell's.
+    #[test]
+    fn a_swell_does_not_tighten_the_growth_limit_of_the_wind_sea() {
+        let grid = SpectralGrid::new(0.04, 0.6, 25, 36);
+        let depth = 100.0;
+        let k: Vec<f64> = grid
+            .sigma
+            .iter()
+            .map(|&s| wavenumber(s, depth, G))
+            .collect();
+        let wind = Wind {
+            u10: 15.0,
+            direction: 0.0,
+        };
+        let sea = grid.jonswap(1.0, 4.0, 3.3, 0.0, 4.0);
+        let swell = grid.jonswap(3.0, 14.0, 3.3, PI, 20.0);
+        let both: Vec<f64> = sea.iter().zip(&swell).map(|(a, b)| a + b).collect();
+        let f_c =
+            |e: &[f64]| limiter_frequency(&grid, e, &k, wind, Means::of(&grid, e, &k).unwrap());
+        let mean = |e: &[f64]| Means::of(&grid, e, &k).unwrap().sigma / TAU;
+        let (alone, with_swell) = (f_c(&sea), f_c(&both));
+        println!(
+            "f_c: wind sea {alone:.4} Hz, with the swell {with_swell:.4} Hz; the mean frequency \
+             of both {:.4} Hz",
+            mean(&both)
+        );
+        // The swell travels against the wind: not fed, and outside the mean
+        assert!((with_swell / alone - 1.0).abs() < 1e-12);
+        assert!(with_swell > 2.0 * mean(&both));
+        // Without wind, or a sea the wind does not feed: the whole mean
+        let calm = Wind::default();
+        assert_eq!(
+            limiter_frequency(&grid, &both, &k, calm, Means::of(&grid, &both, &k).unwrap()),
+            mean(&both)
+        );
+        assert_eq!(f_c(&swell), mean(&swell));
+    }
 
     #[test]
     fn the_breaking_fraction_solves_battjes_janssen() {
