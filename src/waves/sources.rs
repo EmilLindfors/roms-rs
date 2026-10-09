@@ -1368,8 +1368,12 @@ mod tests {
             // Along the waves, about 30° off x
             let angle = d.force[1].atan2(d.force[0]);
             assert!((angle - 0.5).abs() < 0.05, "{angle}");
-            // Never more than there is
-            assert!(d.total() * dt <= m0, "{dt} s: {} of {m0}", d.total() * dt);
+            // Never more than there is (to round-off: at 600 s it is all of it)
+            assert!(
+                d.total() * dt <= m0 * (1.0 + 1e-12),
+                "{dt} s: {} of {m0}",
+                d.total() * dt
+            );
         }
         // An instant is the rate times the energy: a short step's limit
         let short = all.dissipation(&grid, &e0, &k, depth, 1e-3, &mut ra, &mut rb);
