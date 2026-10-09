@@ -1158,3 +1158,198 @@ fn the_two_sided_limiter_leaves_breaking_whole() {
     );
     assert!(surf < 0.012, "H_s in the surf zone off by {surf:e}");
 }
+
+/// Absorbing land is a coast: on a shelf with an island of whole dry
+/// elements, a stormy sea (wind, the full sources, implicit refraction and
+/// shifting, swell through open boundaries) evolves in the water exactly, bit
+/// for bit, as on the mesh without the island's elements, whose faces there
+/// are walls; the island holds no action. Once the tide covers the island the
+/// model is the one without absorbing land, bit for bit.
+#[test]
+fn absorbing_land_is_the_coast_of_a_mesh_without_it() {
+    const LX: f64 = 6000.0;
+    const LY: f64 = 4000.0;
+    let water = |x: f64, _: f64| -(30.0 - 4e-3 * x);
+    let full = Mesh2D::uniform_rectangle_with_bc(0.0, LX, 0.0, LY, 6, 4, BoundaryTag::Open);
+    let centre = |mesh: &Mesh2D, k: ElementIndex| {
+        let c = mesh.reference_to_physical(k, 0.0, 0.0);
+        (3000.0..5000.0).contains(&c[0]) && (1000.0..3000.0).contains(&c[1])
+    };
+    let island: Vec<bool> = ElementIndex::iter(full.n_elements)
+        .map(|k| centre(&full, k))
+        .collect();
+    let (cut, kept) = full.retain_elements(|k| !island[k.as_usize()], BoundaryTag::Wall);
+    assert_eq!(kept.len(), full.n_elements - 4);
+    let grid = SpectralGrid::new(0.05, 0.4, 10, 18);
+    let mut sea = grid.jonswap(2.5, 9.0, 3.3, 0.3, 4.0);
+    let hs = grid.parameters(&sea).hs;
+    sea.iter_mut().for_each(|x| *x *= (2.5 / hs).powi(2));
+    let build = |mesh: Mesh2D, land: &dyn Fn(usize) -> bool| {
+        let ops = DGOperators2D::new(2);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let mut bathymetry = Bathymetry2D::from_function(&mesh, &ops, &geom, water);
+        let nn = ops.n_nodes;
+        for k in (0..mesh.n_elements).filter(|&k| land(k)) {
+            bathymetry.data[k * nn..(k + 1) * nn].fill(2.0);
+        }
+        WaveModel2D::new(
+            Arc::new(mesh),
+            Arc::new(ops),
+            Arc::new(geom),
+            &bathymetry,
+            grid.clone(),
+            G,
+        )
+        .with_sources(SourceTerms::swan_defaults(G))
+        .with_wind(Wind {
+            u10: 18.0,
+            direction: 0.5,
+        })
+        .with_boundary_spectrum(&sea)
+        .with_implicit_refraction(true)
+        .with_implicit_frequency_shift(true)
+        .with_substeps(2)
+    };
+    let mut with_island = build(full.clone(), &|k| island[k]).with_absorbing_land(true);
+    let without = build(cut, &|_| false);
+    let dt = without.compute_dt(0.5);
+    assert_eq!(with_island.compute_dt(0.5), dt);
+    let steps = |model: &WaveModel2D, n: &mut WaveSolution| {
+        let mut ws = WaveWorkspace::default();
+        for s in 0..6 {
+            model.step(n, s as f64 * dt, dt, &mut ws);
+        }
+    };
+    let (mut a, mut b) = (with_island.uniform_state(&sea), without.uniform_state(&sea));
+    steps(&with_island, &mut a);
+    steps(&without, &mut b);
+    let nn = with_island.ops.n_nodes;
+    for c in 0..grid.n_components() {
+        let (a, b) = (a.component(c), b.component(c));
+        for (new, &old) in kept.iter().enumerate() {
+            assert!(
+                a[old * nn..(old + 1) * nn] == b[new * nn..(new + 1) * nn],
+                "component {c}, element {old}"
+            );
+        }
+        for k in (0..full.n_elements).filter(|&k| island[k]) {
+            assert!(a[k * nn..(k + 1) * nn].iter().all(|&x| x == 0.0));
+        }
+    }
+    let hs_max = with_island
+        .parameters(&a)
+        .iter()
+        .fold(0.0f64, |m, p| m.max(p.hs));
+    assert!(hs_max > 2.0, "a sea ran: H_s ≤ {hs_max}");
+
+    // The tide over the island: nothing is dry
+    let floored = build(full.clone(), &|k| island[k]);
+    let high = vec![3.0; with_island.n_points()];
+    with_island.set_water_level(&high);
+    let mut floored = floored;
+    floored.set_water_level(&high);
+    let (mut a, mut b) = (with_island.uniform_state(&sea), floored.uniform_state(&sea));
+    steps(&with_island, &mut a);
+    steps(&floored, &mut b);
+    assert!(a.data == b.data, "nothing dry, nothing absorbed");
+}
+
+/// Swell running up a beach onto land (the depth from 10 m to 2 m above the
+/// water, the shoreline between two nodes, no breaking). On floored land
+/// (0.1 m, the default) the waves slow to the floor's group velocity and
+/// pile up, as much as the sinks there allow, so H_s on land depends on the
+/// floor and on the sinks. Absorbing land holds nothing, and the sea in the
+/// water hardly depends on either.
+#[test]
+fn absorbing_land_keeps_the_waves_off_it() {
+    const LX: f64 = 100.0;
+    const LY: f64 = 500.0;
+    let depth = |y: f64| 10.0 - 0.024 * y;
+    let grid = SpectralGrid::new(0.08, 0.16, 4, 36);
+    let mut e = grid.jonswap(1.0, 9.0, 3.3, 75f64.to_radians(), 8.0);
+    let hs = grid.parameters(&e).hs;
+    e.iter_mut().for_each(|x| *x *= (1.0 / hs).powi(2));
+    let solve = |absorbing: bool, depth_min: f64, friction: Option<f64>| {
+        let mesh = Mesh2D::channel_periodic_x_with_sides(
+            0.0,
+            LX,
+            0.0,
+            LY,
+            1,
+            10,
+            [BoundaryTag::Open, BoundaryTag::Wall],
+        );
+        let m = model(mesh, 2, |_, y| -depth(y), grid.clone())
+            .with_sources(SourceTerms::none(G).with_bottom_friction(friction))
+            .with_boundary_spectrum(&e)
+            .with_implicit_refraction(true)
+            .with_implicit_frequency_shift(true)
+            .with_depth_min(depth_min)
+            .with_absorbing_land(absorbing);
+        let mut n = m.zero_state();
+        let cg_min = group_velocity(m.grid.sigma[0], wavenumber(m.grid.sigma[0], 0.4, G), 0.4);
+        run(&m, &mut n, 4.0 * LY / cg_min, 0.5);
+        let xy = nodes(&m);
+        let params = m.parameters(&n);
+        (0..m.n_points())
+            .map(|p| (depth(xy[p][1]), params[p].hs))
+            .collect::<Vec<_>>()
+    };
+    // The largest H_s on land and in the water, and the largest relative
+    // difference in the water between two runs
+    let on_land = |r: &[(f64, f64)]| {
+        r.iter()
+            .filter(|x| x.0 <= 0.0)
+            .fold(0.0f64, |m, x| m.max(x.1))
+    };
+    let in_water = |r: &[(f64, f64)]| {
+        r.iter()
+            .filter(|x| x.0 > 0.0)
+            .fold(0.0f64, |m, x| m.max(x.1))
+    };
+    let apart = |a: &[(f64, f64)], b: &[(f64, f64)]| {
+        a.iter()
+            .zip(b)
+            .filter(|(x, _)| x.0 > 0.0)
+            .fold(0.0f64, |m, (x, y)| m.max((y.1 / x.1 - 1.0).abs()))
+    };
+    let mut runs = Vec::new();
+    for absorbing in [false, true] {
+        let base = solve(absorbing, 0.1, None);
+        let thin = solve(absorbing, 0.01, None);
+        let rough = solve(absorbing, 0.1, Some(0.038));
+        println!(
+            "absorbing {absorbing}: H_s ≤ {:.3} m in the water, ≤ {:.3} / {:.3} / {:.3} m on land \
+             (floor 0.1 m, 0.01 m, 0.1 m with friction); in the water the floor changes H_s by up \
+             to {:.2} %",
+            in_water(&base),
+            on_land(&base),
+            on_land(&thin),
+            on_land(&rough),
+            100.0 * apart(&base, &thin),
+        );
+        runs.push((base, thin, rough));
+    }
+    let (floored, absorbing) = (&runs[0], &runs[1]);
+    // Floored land: 2.62 m on land against 1.85 m in the water, 6.86 m on a
+    // 0.01 m floor, 1.77 m with friction; the floor moves the water's H_s
+    // by 12.6 %
+    assert!(on_land(&floored.0) > 1.3 * in_water(&floored.0));
+    assert!(on_land(&floored.1) > 2.0 * on_land(&floored.0));
+    assert!(apart(&floored.0, &floored.1) > 0.1);
+    // Absorbing land: nothing on it, and the floor moves the water's H_s by
+    // 0.79 %, in the shoreline element
+    for run in [&absorbing.0, &absorbing.1, &absorbing.2] {
+        assert_eq!(on_land(run), 0.0);
+    }
+    assert!(apart(&absorbing.0, &absorbing.1) < 0.01);
+    // Offshore of the shoreline element the land does not matter
+    let offshore = floored
+        .0
+        .iter()
+        .zip(&absorbing.0)
+        .filter(|(x, _)| x.0 > 1.0)
+        .fold(0.0f64, |m, (x, y)| m.max((y.1 / x.1 - 1.0).abs()));
+    println!("absorbing against floored land, H_s over 1 m deep: up to {offshore:.2e}");
+    assert!(offshore < 1e-3);
+}

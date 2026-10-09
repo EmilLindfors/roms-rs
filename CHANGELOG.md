@@ -6,6 +6,16 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **Absorbing land for the wave model: `WaveModel2D::with_absorbing_land` (TODO F.4 Wet/dry).** Until now, land inside the wave mesh was water of the minimum depth (0.1 m). Waves running onto it slowed to that depth's group velocity and piled up until the sinks there removed them, so what reached land depended on the floor and on the sinks' details.
+  - **What it does.** A node is dry where the water is shallower than the floor. Dry nodes lose their action at the start of every step and after every propagation step. An element whose nodes are all dry is not stepped, and its faces are coast to its wet neighbours: waves leave through them, none come in. The dry land follows `set_water_level`, so it moves with the tide. Opt-in; without it every result is unchanged, bit for bit.
+  - **Gates.** `absorbing_land_is_the_coast_of_a_mesh_without_it`: on a shelf with an island of dry elements, under wind, the full sources, implicit refraction and shifting and substeps, the water evolves bit for bit as on the mesh with the island's elements removed and walled. Once the tide covers the island, the result is bit for bit the model without the option. `absorbing_land_keeps_the_waves_off_it`: swell running up a beach onto land.
+    - On floored land, H_s on land was 2.62 m against 1.85 m at most in the water; 6.86 m on a 0.01 m floor; 1.77 m with bottom friction. The floor moved H_s in the water by 12.6 %.
+    - On absorbing land, H_s on land is 0, the floor moves the water's H_s by 0.79 % (in the shoreline element), and over 1 m deep the two treatments agree to 2e-6.
+  - **The Frøya storm** (`froya_real_data wave_land=absorbing`, the 2025-10-09 storm command with WAM's sources at a 56 s step and the two-sided cap `wave_limiter=rate2`; the run stopped at hour 20 when the machine ran short of memory, so hours 2–20 are compared). On floored land, that cap had let the waves pile up against the cliff coast. With absorbing land:
+    - The largest H_s is 9.46 m against 20.5 m, and the largest force 1.08 against 7.4 m²/s²: back to the growth-only cap's 9.1 m and 1.24 m²/s².
+    - H_s at MET's five points moves by at most 1.5 cm of bias (the lee −0.481 → −0.484 m, Frohavet −0.620 → −0.623, the reef −1.263 → −1.273).
+    - The remaining 9.5 m maximum is in the water off the cliff coast, at (−13.8, −12.4) km: the focusing on the 1 km grid (TODO F.4), not land.
+  - Option: `froya_real_data wave_land=floored|absorbing` (default `floored`).
 - **ecWAM's limit on the sources' losses, tried and left opt-in: `GrowthLimiter::RateBothSigns` (TODO F.4).** ecWAM caps the change of each component both ways, `|ΔF| ≤ C g ũ* f⁻⁴ f_c Δt` (`implsch.F90`); `GrowthLimiter::Rate` caps only growth. The question was whether the cap on losses explains why WAM's scheme leaves the lees 6–9 % lower than SWAN's.
   - **It does not.** In the 24 h Frøya storm at a 56 s step, it moves H_s at MET's points by at most 2 cm (bias in the lee −0.57 → −0.55 m, Frohavet −0.66 → −0.64, north +0.10 → +0.11, reef −1.34 → −1.32). The lee's deficit is the growth cap's.
   - **And it is harmful here.** The largest H_s rose from 8.8 to 19.5 m against the cliff coast. On the 0.1 m depth floor of land nodes, bottom friction is what removes the arriving waves, since Battjes–Janssen's dissipation saturates at `H_max²`. The cap limits friction's losses: a 2 m sea there keeps 1.8 m over a 56 s step, against 0.17 m. Duration-limited growth also depends more on the step (8 % low at 96 h with 900 s steps).
@@ -505,6 +515,7 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **`WaveModel2D::with_depth_min` raised the water over land to the old floor (TODO F.4).** It rebuilt the water level from the floored depth, `η = max(η − B, d_min) + B`, so land nodes got `d_min + B` of water level and kept the old floor's depth under the new one: on a beach rising 0.2 m above the water, a 0.01 m floor left the land 0.1 m deep. The model now keeps the water level it was given. Gate: `a_new_depth_floor_keeps_the_water_level`.
 - **Hersbach & Janssen's growth limiter capped young wind seas under swell several times too tightly (`GrowthLimiter::Rate`; TODO F.4).** The limit `C g ũ* f⁻⁴ f_c Δt` took `f_c` as the whole spectrum's mean frequency. ecWAM (`implsch.F90`: `USFM = u* max(FMEANWS, FMEAN)`) takes the larger of the wind sea's mean frequency and the whole spectrum's.
   - **The wind sea** is the components with a positive wind input, `28 u*/c cos(θ − θ_w) > 1` (`limiter_frequency`; ecWAM's `XLLWS` marks those of Janssen's input).
   - **Where swell dominates** the whole spectrum's mean frequency is the swell's: 0.085 Hz against the wind sea's 0.273 Hz in the new unit test, a cap 3.2× too tight on the wind sea's growth.
