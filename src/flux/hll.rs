@@ -71,7 +71,6 @@ pub fn hll_flux_swe(q_l: &SWEState, q_r: &SWEState, g: f64, h_min: f64) -> SWESt
 /// Einfeldt wave speed estimates.
 ///
 /// Uses Roe averages for robust wave speed bounds.
-#[allow(clippy::too_many_arguments)]
 fn einfeldt_speeds(
     h_l: f64,
     h_r: f64,

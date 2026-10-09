@@ -293,7 +293,7 @@ mod tests {
         // Conservation is ensured by using the same flux on both sides:
         // contribution to L: +flux, contribution to R: -flux, sum = 0
         let contribution_l = flux.h * 1.0;
-        let contribution_r = flux.h * (-1.0);
+        let contribution_r = -flux.h;
         assert!((contribution_l + contribution_r).abs() < TOL);
     }
 

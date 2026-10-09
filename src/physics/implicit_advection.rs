@@ -168,7 +168,6 @@ impl ImplicitVerticalAdvection {
 /// The turbulence's bed and surface w-points hold the closure's boundary
 /// values: the solve takes them as their interior neighbours' (as the
 /// explicit advection does) and leaves their inventories alone.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_implicit_vertical_advection(
     stage: &mut Solution3D,
     omega_implicit: &[f64],

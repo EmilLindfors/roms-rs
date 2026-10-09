@@ -114,7 +114,6 @@ impl<'a> SWERhsConfig<'a> {
 /// * `ops` - DG operators
 /// * `config` - RHS configuration
 /// * `time` - Current simulation time
-#[allow(clippy::needless_range_loop)]
 pub fn compute_rhs_swe(
     q: &SWESolution,
     mesh: &Mesh1D,

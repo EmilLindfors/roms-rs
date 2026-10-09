@@ -406,7 +406,6 @@ mod tests {
     }
 
     /// Three uniform σ-levels, Coriolis `f`, constant viscosity.
-    #[allow(clippy::too_many_arguments)]
     fn hydrostatic(
         mesh: &Arc<Mesh2D>,
         ops: &Arc<DGOperators2D>,
@@ -2501,7 +2500,8 @@ mod tests {
             (-((x - 500.0) / 40.0).powi(2)).exp() * 0.5 * (1.0 - ((y - 500.0) / 40.0).tanh())
         };
         let shallow_east = |x: f64| -30.0 + 27.0 * 0.5 * (1.0 + ((x - 500.0) / 40.0).tanh());
-        let cases: [(&str, &dyn Fn(f64, f64) -> f64); 4] = [
+        type Bed<'a> = &'a dyn Fn(f64, f64) -> f64;
+        let cases: [(&str, Bed); 4] = [
             ("islet", &|x, y| {
                 -30.0 + 32.0 * (-((x - 500.0).powi(2) + (y - 500.0).powi(2)) / 2500.0).exp()
             }),

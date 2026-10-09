@@ -46,7 +46,6 @@ fn idx(k: ElementIndex, node: usize, n_nodes: usize) -> usize {
 /// The scalars share each node's `value` and `boundary_value` call (e.g. one
 /// division by `h` and one boundary-condition evaluation for both velocity
 /// components); each is computed with the same operations as alone.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn br1_gradient_element<const N: usize>(
     k: ElementIndex,
     mesh: &Mesh2D,
@@ -159,7 +158,6 @@ impl<const N: usize> DiffusionScratch<N> {
 /// e-folding of 1.5 min at ν = 10 m²/s on the Frøya coastline mesh (TODO
 /// P1.3). An inhomogeneous exterior state (`R u + g`, e.g. an open
 /// boundary's external data) adds the forcing of `g` only.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn br1_diffusion_element<const N: usize>(
     k: ElementIndex,
     mesh: &Mesh2D,

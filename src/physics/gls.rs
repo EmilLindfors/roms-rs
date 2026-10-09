@@ -779,7 +779,6 @@ fn work(scratch: &mut Vec<f64>, nw: usize) -> (Fields<'_>, Solver<'_>) {
 /// taken at the new time, and `flux_bottom`, `flux_top` enter the water at
 /// the boundary layers' centres, replacing the diffusion across those
 /// layers (GOTM `diff_face` with Neumann conditions).
-#[allow(clippy::too_many_arguments)]
 fn solve_interior(
     y: &mut [f64],
     h: &[f64],

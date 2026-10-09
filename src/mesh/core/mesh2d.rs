@@ -1327,7 +1327,7 @@ mod tests {
             // physical grid but are connected to elements via periodicity.
             // For a structured periodic mesh, each vertex should have 4 elements.
             assert!(
-                patch_size >= 1 && patch_size <= 4,
+                (1..=4).contains(&patch_size),
                 "Vertex {} has {} elements, expected 1-4",
                 v,
                 patch_size

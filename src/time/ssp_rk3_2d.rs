@@ -207,7 +207,7 @@ mod tests {
 
         // Allow for floating point in step counting (10 or 11 steps)
         assert!(
-            n_steps >= 10 && n_steps <= 11,
+            (10..=11).contains(&n_steps),
             "Expected ~10 steps, got {}",
             n_steps
         );

@@ -458,11 +458,13 @@ mod tests {
         };
 
         let mix = PacanowskiPhilanderMixing::default();
-        let (av, kt) = mix.compute_mixing(&column, &forcing);
+        let (av, _kt) = mix.compute_mixing(&column, &forcing);
 
         let dz = 1.0;
         let shear2 = 1.0;
-        let n2 = -mix.g / mix.rho0 * (-1.0) / dz;
+        // ρ falls by 1 kg/m³ per dz upwards: N² = −(g/ρ₀) ∂ρ/∂z
+        let drho_dz = -1.0 / dz;
+        let n2 = -mix.g / mix.rho0 * drho_dz;
         let ri = n2 / shear2;
         let term = 1.0 + 5.0 * ri;
         let expected_av = mix.v0 / (term * term) + mix.vb;

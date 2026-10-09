@@ -100,7 +100,6 @@ impl Bathymetry1D {
     /// Compute gradients dB/dx using the differentiation matrix.
     ///
     /// dB/dx = (dr/dx) * Dr * B = jacobian_inv * Dr * B
-    #[allow(clippy::needless_range_loop)]
     pub fn compute_gradients(&mut self, mesh: &Mesh1D, ops: &DGOperators1D) {
         let n = self.n_nodes;
 

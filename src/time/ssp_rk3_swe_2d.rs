@@ -34,20 +34,15 @@ use crate::time::{SSPRK3, StageWorkspace, TimeIntegrator};
 use crate::types::Depth;
 
 /// Type of limiter to use for 2D SWE.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum SWELimiterType {
     /// No limiting (not recommended for production)
+    #[default]
     None,
     /// Kuzmin vertex-based limiter + positivity
     Kuzmin,
     /// Positivity only (no slope limiting)
     PositivityOnly,
-}
-
-impl Default for SWELimiterType {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Configuration for 2D SWE time integration with limiters.

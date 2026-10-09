@@ -3476,20 +3476,19 @@ fn profile_phases<P: PhysicsModule<SWESolution2D>>(domain: &Domain, physics: &P,
     };
 
     // One thread, then all of them
-    let all = std::thread::available_parallelism().map_or(1, |n| n.get());
-    for threads in [1, all] {
-        #[cfg(feature = "parallel")]
+    #[cfg(feature = "parallel")]
+    for threads in [
+        1,
+        std::thread::available_parallelism().map_or(1, |n| n.get()),
+    ] {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
             .build()
             .expect("thread pool")
             .install(|| measure(threads));
-        #[cfg(not(feature = "parallel"))]
-        {
-            measure(1);
-            break;
-        }
     }
+    #[cfg(not(feature = "parallel"))]
+    measure(1);
 }
 
 /// The cost of the spectral wave model on this domain (`waves=N`, TODO F.4):

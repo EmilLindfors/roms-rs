@@ -77,24 +77,22 @@ impl CoastlineData {
         for result in reader.iter_shapes_and_records() {
             let (shape, _record) = result?;
 
-            match shape {
-                Shape::Polygon(polygon) => {
-                    for ring in polygon.rings() {
-                        let coords: Vec<Coord<f64>> = ring
-                            .points()
-                            .iter()
-                            .map(|p| Coord { x: p.x, y: p.y })
-                            .collect();
+            // Non-polygon shapes are ignored
+            if let Shape::Polygon(polygon) = shape {
+                for ring in polygon.rings() {
+                    let coords: Vec<Coord<f64>> = ring
+                        .points()
+                        .iter()
+                        .map(|p| Coord { x: p.x, y: p.y })
+                        .collect();
 
-                        // Check if polygon intersects our bbox
-                        if coords_intersect_bbox(&coords, bbox) {
-                            // Filter coords to only those near our bbox (with margin)
-                            let exterior = LineString::from(coords);
-                            polygons.push(Polygon::new(exterior, vec![]));
-                        }
+                    // Check if polygon intersects our bbox
+                    if coords_intersect_bbox(&coords, bbox) {
+                        // Filter coords to only those near our bbox (with margin)
+                        let exterior = LineString::from(coords);
+                        polygons.push(Polygon::new(exterior, vec![]));
                     }
                 }
-                _ => {} // Ignore non-polygon shapes
             }
         }
 
@@ -233,8 +231,10 @@ mod tests {
     #[test]
     fn test_bbox_constants() {
         // Verify Norway bbox is reasonable
-        assert!(NORWAY_BBOX.min_lon < NORWAY_BBOX.max_lon);
-        assert!(NORWAY_BBOX.min_lat < NORWAY_BBOX.max_lat);
+        const {
+            assert!(NORWAY_BBOX.min_lon < NORWAY_BBOX.max_lon);
+            assert!(NORWAY_BBOX.min_lat < NORWAY_BBOX.max_lat);
+        }
 
         // Verify Froya bbox is within Norway
         assert!(NORWAY_BBOX.contains(FROYA_BBOX.min_lat, FROYA_BBOX.min_lon));

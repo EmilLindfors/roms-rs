@@ -482,8 +482,6 @@ mod tests {
 
     #[test]
     fn test_typed_accessors() {
-        use crate::types::{Bounds2D, Resolution2D};
-
         let builder = Mesh2DBuilder::new(0.0, 100.0, 0.0, 50.0).with_resolution(20, 10);
 
         let bounds = builder.get_bounds();

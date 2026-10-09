@@ -276,7 +276,7 @@ fn solve_riemann_swe(h_l: f64, h_r: f64, u_l: f64, u_r: f64, g: f64) -> (f64, f6
 ///
 /// Given the left/right states and the star-region solution (h_m, u_m),
 /// returns (h, u) at the given sampling speed s.
-#[allow(dead_code, clippy::too_many_arguments)]
+#[allow(dead_code)]
 fn sample_riemann_swe(
     s: f64,
     h_l: f64,

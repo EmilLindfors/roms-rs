@@ -174,7 +174,6 @@ pub fn ssp_rk3_swe_step_timed<F>(
 ///
 /// # Returns
 /// Final time reached and number of steps taken.
-#[allow(clippy::too_many_arguments)]
 pub fn run_swe_simulation<F, D, C>(
     q: &mut SWESolution,
     t_end: f64,
@@ -441,7 +440,7 @@ mod tests {
         assert!((t_final - 0.1).abs() < 1e-10);
         // Allow 10 or 11 steps due to floating point
         assert!(
-            n_steps >= 10 && n_steps <= 11,
+            (10..=11).contains(&n_steps),
             "Expected 10-11 steps, got {}",
             n_steps
         );

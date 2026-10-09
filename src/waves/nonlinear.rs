@@ -160,7 +160,6 @@ impl Quadruplets {
     /// constant). Exact for grids whose frequency ratio is below `1 + λ`;
     /// on coarser ones a landing reaches the component's own row, whose
     /// share in its own gather the diagonal leaves out.
-    #[allow(clippy::too_many_arguments)]
     pub fn source_and_diagonal(
         &self,
         grid: &SpectralGrid,
@@ -174,7 +173,6 @@ impl Quadruplets {
         self.source_into(grid, e, tail, g, scale, s, Some(diag));
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn source_into(
         &self,
         grid: &SpectralGrid,

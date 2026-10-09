@@ -272,15 +272,15 @@ pub fn read_tide_gauge_directory(dir: &Path) -> Result<Vec<TideGaugeFile>, TideG
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() {
-            if let Some(ext) = path.extension() {
-                let ext = ext.to_string_lossy().to_lowercase();
-                if ext == "txt" || ext == "csv" || ext == "dat" {
-                    match read_tide_gauge_file(&path) {
-                        Ok(file) => files.push(file),
-                        Err(e) => {
-                            eprintln!("Warning: Failed to read {:?}: {}", path, e);
-                        }
+        if path.is_file()
+            && let Some(ext) = path.extension()
+        {
+            let ext = ext.to_string_lossy().to_lowercase();
+            if ext == "txt" || ext == "csv" || ext == "dat" {
+                match read_tide_gauge_file(&path) {
+                    Ok(file) => files.push(file),
+                    Err(e) => {
+                        eprintln!("Warning: Failed to read {:?}: {}", path, e);
                     }
                 }
             }

@@ -228,7 +228,6 @@ pub struct BalancedReference {
 impl BalancedReference {
     /// The correction of `state` (its `rho` must be current), with the
     /// arguments of [`compute_pressure_gradient`].
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         state: &Solution3D,
         mesh: &Mesh2D,
@@ -283,7 +282,6 @@ impl BalancedReference {
     /// drove 0.6 m/s within half an hour); in motion only the σ-pairs' error
     /// of the departure from the profile remains. The arguments are
     /// [`Self::new`]'s.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_profile(
         state: &Solution3D,
         mesh: &Mesh2D,
@@ -508,7 +506,6 @@ impl Columns {
 
     /// Fill column `c` from `ρ − rho_ref` of the state's column at (`el`,
     /// `node`).
-    #[allow(clippy::too_many_arguments)]
     fn fill(
         &mut self,
         c: usize,
@@ -620,7 +617,6 @@ impl Columns {
 ///   is on general quadrilaterals (see "Curvilinear elements")
 /// * `grad_px` - Output x-component of PGF (m/s²)
 /// * `grad_py` - Output y-component of PGF (m/s²)
-#[allow(clippy::too_many_arguments)]
 pub fn compute_pressure_gradient(
     state: &Solution3D,
     mesh: &Mesh2D,
@@ -705,7 +701,6 @@ impl PressureScratch {
 /// with the columns of its nodes in `own` and of a face's neighbours in
 /// `across`, and one pair's pressure differences in `dp` (see
 /// [`compute_pressure_gradient`]).
-#[allow(clippy::too_many_arguments)]
 fn pressure_gradient_element(
     k: usize,
     state: &Solution3D,
@@ -772,7 +767,6 @@ fn pressure_gradient_element(
 /// The DG volume term of `pressure_gradient_element`: `Σ_j Dx_ij Δp_ij`,
 /// with `Δp_ji = −Δp_ij`, and the metric of the pair in the advection's form
 /// (see "Curvilinear elements").
-#[allow(clippy::too_many_arguments)]
 fn dg_volume_term(
     k: usize,
     ops: &DGOperators2D,
@@ -844,7 +838,6 @@ mod tests {
     }
 
     impl Column3D {
-        #[allow(clippy::too_many_arguments)]
         fn new(
             length: f64,
             nx: usize,

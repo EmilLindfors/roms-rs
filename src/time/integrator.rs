@@ -385,7 +385,6 @@ pub trait TimeIntegrator<S: Integrable>: IntegratorInfo {
     /// The damping term is integrated to first order; the rest keeps the
     /// integrator's order. `stage_hook` then runs on each stage value as in
     /// [`Self::step_with_workspace`].
-    #[allow(clippy::too_many_arguments)]
     fn step_with_relaxation<F, R, H>(
         &self,
         state: &mut S,
@@ -1060,9 +1059,7 @@ mod tests {
         // Test RK3 order with exponential growth: du/dt = u, u(0) = 1
         // Exact: u(t) = exp(t)
         let mut u = DGSolution1D::new(1, 3);
-        for v in &mut u.data {
-            *v = 1.0;
-        }
+        u.data.fill(1.0);
 
         let integrator = SSPRK3;
         let dt = 0.01;
@@ -1328,9 +1325,7 @@ mod tests {
         // Test Euler with exponential decay: du/dt = -u, u(0) = 1
         // Exact: u(t) = exp(-t)
         let mut u = DGSolution1D::new(1, 3);
-        for v in &mut u.data {
-            *v = 1.0;
-        }
+        u.data.fill(1.0);
 
         let integrator = ForwardEuler;
         let dt = 0.001;
@@ -1364,9 +1359,7 @@ mod tests {
     #[test]
     fn test_standard_integrator_dispatch() {
         let mut u = DGSolution1D::new(1, 3);
-        for v in &mut u.data {
-            *v = 1.0;
-        }
+        u.data.fill(1.0);
 
         // Test that enum dispatch works
         let integrator = StandardIntegrator::SSPRK3;

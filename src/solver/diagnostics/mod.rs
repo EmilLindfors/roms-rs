@@ -6,11 +6,11 @@
 //! - [`DiagnosticsTracker`]: Time series tracking
 //! - [`ProgressReporter`]: Progress output utilities
 
-mod diagnostics;
 mod potential_energy_3d;
+mod runtime;
 
-pub use diagnostics::{
+pub use potential_energy_3d::{PotentialEnergy, PotentialEnergy3D};
+pub use runtime::{
     DiagnosticsTracker, ProgressReporter, SWEDiagnostics2D, current_cfl_2d, total_energy_2d,
     total_mass_2d, total_momentum_2d,
 };
-pub use potential_energy_3d::{PotentialEnergy, PotentialEnergy3D};

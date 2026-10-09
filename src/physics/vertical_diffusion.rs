@@ -60,7 +60,6 @@ pub struct SurfaceFields<'a> {
 /// stress plus drag (`g` enters `N²`); the solve then uses the new viscosity
 /// and diffusivity. The turbulence is allocated, at the closure's initial
 /// value, on the first call.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_vertical_diffusion<M: VerticalMixing + ?Sized>(
     state: &mut Solution3D,
     sigma: &SigmaGrid,
@@ -295,7 +294,6 @@ impl ColumnScratch {
 /// drag_bot·φ₀` at the bed (`drag_bot·φ₀` and `λ_l φ` at the new time,
 /// `λ_l` from `drag_layers`, zero without). `work` holds the tridiagonal
 /// system and the solver's buffers.
-#[allow(clippy::too_many_arguments)]
 fn solve_diffusion_column(
     phi: &mut [f64],
     nu: &[f64],

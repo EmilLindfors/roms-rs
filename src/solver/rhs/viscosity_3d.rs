@@ -326,7 +326,6 @@ impl Columns<'_> {
 /// `viscosity` on the vertical shear of `state` to `rhs_u`, `rhs_v`
 /// (`[element][node][level]`; see the [module documentation](self)).
 /// Columns shallower than `min_column_depth` get nothing.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_horizontal_viscosity_3d(
     rhs_u: &mut [f64],
     rhs_v: &mut [f64],
@@ -406,7 +405,6 @@ pub fn apply_horizontal_viscosity_3d(
 /// into `largest` (`[element]`), for the time step: the background, plus
 /// Smagorinsky's from the strain of `state` (thin columns have the
 /// background). Arguments as for [`apply_horizontal_viscosity_3d`].
-#[allow(clippy::too_many_arguments)]
 pub fn largest_horizontal_viscosity_3d(
     largest: &mut [f64],
     state: &Solution3D,

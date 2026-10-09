@@ -1027,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_z_to_sigma_typed_roundtrip() {
-        use crate::types::{Depth, Elevation, PhysicalZ as PhysicalZType};
+        use crate::types::{Depth, Elevation};
 
         let grid = SigmaGrid::uniform(10);
 

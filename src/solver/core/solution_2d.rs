@@ -94,9 +94,7 @@ impl DGSolution2D {
 
     /// Set all values to a constant.
     pub fn fill(&mut self, value: f64) {
-        for v in &mut self.data {
-            *v = value;
-        }
+        self.data.fill(value);
     }
 
     /// Compute the L2 error against an exact solution.
@@ -298,9 +296,7 @@ mod tests {
     #[test]
     fn test_scale() {
         let mut sol = DGSolution2D::new(2, 9);
-        for v in &mut sol.data {
-            *v = 3.0;
-        }
+        sol.data.fill(3.0);
         sol.scale(2.0);
         for &v in &sol.data {
             assert!((v - 6.0).abs() < 1e-14);

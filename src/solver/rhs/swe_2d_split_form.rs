@@ -451,7 +451,6 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// (and, for a subcell element, of `ws.batch_mass` holding its subcell
     /// mass fluxes), if [`Self::volume_chunk`] computed it. Then only the
     /// surface terms are evaluated here; the result is the same bit for bit.
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn element_rhs(
         &self,
         k: ElementIndex,
@@ -782,7 +781,6 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
     /// through each interface of the line, from node `a` to `a + 1`
     /// ([`crate::solver::rhs::subcells`]).
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     fn line_subcells(
         &self,
         ws: &mut SplitFormWorkspace,

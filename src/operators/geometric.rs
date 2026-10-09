@@ -589,22 +589,22 @@ mod tests {
     /// preserve a uniform state on non-affine elements.
     #[test]
     fn test_discrete_metric_identities() {
+        // The metric pair (∂/∂r, ∂/∂s) of a quantity at element k, node i
+        type MetricPair = fn(&GeometricFactors2D, usize, usize) -> ((f64, f64), (f64, f64));
         let mesh = distorted_mesh(3, 0.15);
         for order in 1..=5 {
             let (ops, geom) = setup(&mesh, order);
             let n = ops.n_nodes;
             for k in 0..mesh.n_elements {
-                let comp =
-                    |f: fn(&GeometricFactors2D, usize, usize) -> ((f64, f64), (f64, f64)),
-                     which: usize| {
-                        let (mut ar, mut as_) = (vec![0.0; n], vec![0.0; n]);
-                        for i in 0..n {
-                            let (a_r, a_s) = f(&geom, k, i);
-                            ar[i] = if which == 0 { a_r.0 } else { a_r.1 };
-                            as_[i] = if which == 0 { a_s.0 } else { a_s.1 };
-                        }
-                        (ops.apply_dr(&ar), ops.apply_ds(&as_))
-                    };
+                let comp = |f: MetricPair, which: usize| {
+                    let (mut ar, mut as_) = (vec![0.0; n], vec![0.0; n]);
+                    for i in 0..n {
+                        let (a_r, a_s) = f(&geom, k, i);
+                        ar[i] = if which == 0 { a_r.0 } else { a_r.1 };
+                        as_[i] = if which == 0 { a_s.0 } else { a_s.1 };
+                    }
+                    (ops.apply_dr(&ar), ops.apply_ds(&as_))
+                };
                 for which in 0..2 {
                     let (dr, ds) = comp(GeometricFactors2D::contravariant, which);
                     for i in 0..n {

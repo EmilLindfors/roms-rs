@@ -27,7 +27,7 @@ fn test_m2_recovery() {
 
     // 1000 hours of hourly data (~42 days)
     let times: Vec<f64> = (0..1000).map(|i| i as f64 * 3600.0).collect();
-    let values = generate_tidal_signal(&[m2.clone()], 0.0, &times);
+    let values = generate_tidal_signal(std::slice::from_ref(&m2), 0.0, &times);
 
     let series = TimeSeries::new(&times, &values);
     let analysis = HarmonicAnalysis::standard();
@@ -344,7 +344,7 @@ fn test_phase_wraparound() {
 
     // Phase should be in [0, 2π)
     assert!(
-        fitted_phase >= 0.0 && fitted_phase < 2.0 * PI,
+        (0.0..2.0 * PI).contains(&fitted_phase),
         "Phase {} not in [0, 2π)",
         fitted_phase
     );
