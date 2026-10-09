@@ -15,7 +15,8 @@
 //!
 //! Also `f_min=0.06 f_max=1 cfl=0.5`, `dt=10` (duration), `tail=0` for no tail and
 //! `dia=0` for no quadruplets. The sources' time integration:
-//! `integration=frozen|midpoint|implicit`, `limiter=ris|rate[:C]|none`, and
+//! `integration=frozen|midpoint|implicit`, `limiter=ris|rate[:C]|rate2[:C]|none`
+//! (`rate2` caps the losses too), and
 //! `substeps=N` propagation steps per step (fetch). The gates are in
 //! `tests/wave_model_test.rs`.
 
@@ -70,10 +71,18 @@ fn main() {
         })
         .with_limiter(match text("limiter", "ris").as_str() {
             "none" => None,
-            rate if rate.starts_with("rate") => Some(GrowthLimiter::Rate(
-                rate.strip_prefix("rate:")
-                    .map_or(DEFAULT_RATE_LIMITER, |c| c.parse().expect("limiter=rate:C")),
-            )),
+            rate if rate.starts_with("rate") => {
+                let (kind, coefficient) = rate.split_once(':').unwrap_or((rate, ""));
+                let coefficient = if coefficient.is_empty() {
+                    DEFAULT_RATE_LIMITER
+                } else {
+                    coefficient.parse().expect("limiter=rate[2]:C")
+                };
+                Some(match kind {
+                    "rate2" => GrowthLimiter::RateBothSigns(coefficient),
+                    _ => GrowthLimiter::Rate(coefficient),
+                })
+            }
             _ => Some(GrowthLimiter::PerStep(DEFAULT_LIMITER)),
         });
     let wind = Wind {

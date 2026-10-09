@@ -140,7 +140,8 @@
 //! DIA's diagonal, with Hersbach & Janssen's growth limiter proportional to
 //! the step (`SourceIntegration::Implicit`, `GrowthLimiter::Rate`), in place
 //! of SWAN's frozen rates and per-step limiter; `wave_integration=frozen|implicit`
-//! and `wave_limiter=ris|rate` set either part alone. Its sources tolerate long
+//! and `wave_limiter=ris|rate|rate2` set either part alone (`rate2`: the
+//! limit on the losses too, as ecWAM; breaking stays outside it). Its sources tolerate long
 //! steps, so `wave_substeps=N` runs them once per N propagation steps (each
 //! with its own implicit refraction, shifting and breaking), and `wave_cfl=`
 //! sets the propagation's CFL number (0.5).
@@ -505,8 +506,9 @@ struct Options {
     /// (`frozen`); `wave_sources=wam` sets it with the limiter below
     wave_implicit_sources: bool,
     /// Hersbach & Janssen's growth limiter, proportional to the step
-    /// (`wave_limiter=rate`), instead of Ris's per step (`ris`)
-    wave_rate_limiter: bool,
+    /// (`wave_limiter=rate`; `rate2` caps the losses too, as ecWAM), instead
+    /// of Ris's per step (`ris`, SWAN's sources keep it)
+    wave_limiter: Option<GrowthLimiter>,
     /// Propagation steps per wave step (`wave_substeps=`)
     wave_substeps: usize,
     /// The waves' propagation CFL number (`wave_cfl=`)
@@ -681,11 +683,12 @@ impl Options {
                     return Err(format!("wave_integration=frozen|implicit, not {other}"));
                 }
             },
-            wave_rate_limiter: match args.get("wave_limiter").map(String::as_str) {
-                None => wam_sources,
-                Some("ris") => false,
-                Some("rate") => true,
-                Some(other) => return Err(format!("wave_limiter=ris|rate, not {other}")),
+            wave_limiter: match args.get("wave_limiter").map(String::as_str) {
+                None if wam_sources => Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)),
+                None | Some("ris") => None,
+                Some("rate") => Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)),
+                Some("rate2") => Some(GrowthLimiter::RateBothSigns(DEFAULT_RATE_LIMITER)),
+                Some(other) => return Err(format!("wave_limiter=ris|rate|rate2, not {other}")),
             },
             wave_substeps: get("wave_substeps", 1.0)? as usize,
             wave_cfl: get("wave_cfl", 0.5)?,
@@ -2075,10 +2078,9 @@ fn wave_model(domain: &Domain, opts: &Options, wind: Option<Wind>) -> (WaveModel
         } else {
             sources
         };
-        if opts.wave_rate_limiter {
-            sources.with_limiter(Some(GrowthLimiter::Rate(DEFAULT_RATE_LIMITER)))
-        } else {
-            sources
+        match opts.wave_limiter {
+            Some(limiter) => sources.with_limiter(Some(limiter)),
+            None => sources,
         }
     })
     .with_boundary_spectrum(&sea)
