@@ -158,7 +158,10 @@
 //! (`SourceTerms::with_depth_limit`): on the 1 km wave grid, nodes in a few
 //! decimetres of water next to deep ones otherwise hold metres of H_s, which
 //! Battjes–Janssen's saturated dissipation cannot remove. `wave_depth_limit=0`
-//! leaves them. The waves' line reports the largest `H_s/d`.
+//! leaves them. The waves' line reports the largest `H_s/d` and how many
+//! nodes are at the limit, by depth. At the end of the run the sea at every
+//! wave node goes to `<output>/wave_nodes.txt`, and `wave_reference=<file>`
+//! compares it node by node with an earlier run's, as with `waves=N`.
 //!
 //! `wave_force=dissipation` (the default) drives the circulation by the
 //! momentum the waves' sinks take over a wave step
@@ -2036,6 +2039,19 @@ fn tidal_run(
     if let Some(points) = &wave_points {
         points.summarise(&output_dir, opts.ramp_hours.max(1.0) * 3600.0 * 2.0)?;
     }
+    // The sea at every wave node, and against an earlier run's
+    if let Some(waves) = &waves {
+        let model = waves.model();
+        let params = model.parameters(waves.state());
+        if let Err(e) = write_wave_nodes(model, &params, result.final_time, &output_dir) {
+            eprintln!("  could not write the waves at the nodes: {e}");
+        }
+        if let Some(path) = &opts.wave_reference
+            && let Err(e) = compare_wave_nodes(model, &params, path)
+        {
+            eprintln!("  could not compare with {}: {e}", path.display());
+        }
+    }
     report_stations(&stations, &output_dir, opts, &clock, station_atlas.as_ref())?;
     if let Some(e) = result.error {
         return Err(e.into());
@@ -2456,6 +2472,64 @@ impl WavePoints {
     }
 }
 
+/// The depth bands (m) of [`depth_limit_bands`].
+const LIMIT_BANDS: [(f64, f64); 5] = [
+    (0.0, 0.5),
+    (0.5, 1.0),
+    (1.0, 2.0),
+    (2.0, 5.0),
+    (5.0, f64::INFINITY),
+];
+
+/// The wave nodes at or above breaking's `H_rms = γ d` (to 1e-6), the edge
+/// that `SourceTerms::with_depth_limit` holds them to, per band of
+/// [`LIMIT_BANDS`], and of all the nodes in each band; none without breaking.
+fn depth_limit_bands(
+    model: &WaveModel2D,
+    params: &[dg_rs::waves::WaveParameters],
+) -> Option<[(usize, usize); 5]> {
+    let (_, gamma) = model.sources.breaking?;
+    let mut bands = [(0, 0); 5];
+    for (w, &d) in params.iter().zip(model.depth()) {
+        let Some(b) = LIMIT_BANDS
+            .iter()
+            .position(|&(lo, hi)| (lo..hi).contains(&d))
+        else {
+            continue;
+        };
+        bands[b].1 += 1;
+        if w.hs / 2f64.sqrt() >= (1.0 - 1e-6) * gamma * d {
+            bands[b].0 += 1;
+        }
+    }
+    Some(bands)
+}
+
+/// A line of [`depth_limit_bands`].
+fn report_depth_limit(model: &WaveModel2D, params: &[dg_rs::waves::WaveParameters]) {
+    let Some(bands) = depth_limit_bands(model, params) else {
+        return;
+    };
+    let total: usize = bands.iter().map(|b| b.0).sum();
+    let mut line = format!(
+        "    at breaking's H_rms = γd ({}): {total} nodes;",
+        if model.sources.depth_limit {
+            "the depth limit"
+        } else {
+            "or above, no limit"
+        }
+    );
+    for ((lo, hi), (at, all)) in LIMIT_BANDS.iter().zip(bands) {
+        let band = if hi.is_finite() {
+            format!("{lo}–{hi} m")
+        } else {
+            format!("≥ {lo} m")
+        };
+        line += &format!(" {band} {at} of {all},");
+    }
+    println!("{}", line.trim_end_matches(','));
+}
+
 /// The progress line of the waves at `t`: the largest H_s and where, the
 /// mean over wave nodes at least 3 m deep, and the largest force on the tide
 /// and where.
@@ -2511,6 +2585,7 @@ fn report_waves(
             * (stats.stepping_time + stats.exchange_time - last.stepping_time - last.exchange_time)
             / (t - t_last)
     );
+    report_depth_limit(model, &params);
     // What sets the step in the last exchange's level and currents
     let limits = model.time_step_limits(waves.cfl());
     let (name, limit) = limits.binding();
@@ -3702,11 +3777,12 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
         .output
         .clone()
         .unwrap_or_else(|| Path::new("output").join(circulation.name));
-    if let Err(e) = write_wave_nodes(domain, &model, &params, t, &output_dir) {
+    report_depth_limit(&model, &params);
+    if let Err(e) = write_wave_nodes(&model, &params, t, &output_dir) {
         eprintln!("  could not write the waves at the nodes: {e}");
     }
     if let Some(path) = &opts.wave_reference
-        && let Err(e) = compare_wave_nodes(domain, &params, path)
+        && let Err(e) = compare_wave_nodes(&model, &params, path)
     {
         eprintln!("  could not compare with {}: {e}", path.display());
     }
@@ -3795,7 +3871,6 @@ fn wave_cost(domain: &Domain, circulation: &Domain, opts: &Options) {
 /// `<output_dir>/wave_nodes.txt`: the reference for a later run's
 /// `wave_reference=`.
 fn write_wave_nodes(
-    domain: &Domain,
     model: &WaveModel2D,
     params: &[dg_rs::waves::WaveParameters],
     t: f64,
@@ -3808,7 +3883,7 @@ fn write_wave_nodes(
         "# The waves at every node after {t:.1} s\n# x (m), y (m), depth (m), H_s (m), T_m01 (s), \
          mean direction (deg, travelling to, counter-clockwise from east), spread (deg)\n"
     );
-    for (p, (xy, w)) in wave_node_positions(domain).zip(params).enumerate() {
+    for (p, (xy, w)) in wave_node_positions(model).zip(params).enumerate() {
         let _ = writeln!(
             text,
             "{:.3} {:.3} {:.4} {:.6} {:.5} {:.4} {:.4}",
@@ -3827,8 +3902,8 @@ fn write_wave_nodes(
 }
 
 /// The wave nodes' positions (m), in the model's node order.
-fn wave_node_positions(domain: &Domain) -> impl Iterator<Item = [f64; 2]> + '_ {
-    let (mesh, ops) = (&domain.mesh, &domain.ops);
+fn wave_node_positions(model: &WaveModel2D) -> impl Iterator<Item = [f64; 2]> + '_ {
+    let (mesh, ops) = (&model.mesh, &model.ops);
     (0..mesh.n_elements).flat_map(move |k| {
         (0..ops.n_nodes).map(move |i| {
             mesh.reference_to_physical(ElementIndex::new(k), ops.nodes_r[i], ops.nodes_s[i])
@@ -3841,7 +3916,7 @@ fn wave_node_positions(domain: &Domain) -> impl Iterator<Item = [f64; 2]> + '_ {
 /// nodes off by more than 2, 5 and 10 %, the largest difference and where,
 /// by depth), T_m01 and the mean direction.
 fn compare_wave_nodes(
-    domain: &Domain,
+    model: &WaveModel2D,
     params: &[dg_rs::waves::WaveParameters],
     path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -3860,7 +3935,7 @@ fn compare_wave_nodes(
     if reference.len() != params.len() {
         return Err(format!("{} nodes there, {} here", reference.len(), params.len()).into());
     }
-    for (xy, r) in wave_node_positions(domain).zip(&reference) {
+    for (xy, r) in wave_node_positions(model).zip(&reference) {
         if (xy[0] - r[0]).abs() > 0.01 || (xy[1] - r[1]).abs() > 0.01 {
             return Err(format!("node at ({:.0}, {:.0}) m differs", r[0], r[1]).into());
         }
@@ -3917,7 +3992,9 @@ fn compare_wave_nodes(
     };
     summary("all", &nodes);
     for (low, high) in [
-        (0.0, 10.0),
+        (0.0, 1.0),
+        (1.0, 3.0),
+        (3.0, 10.0),
         (10.0, 30.0),
         (30.0, 100.0),
         (100.0, f64::INFINITY),
