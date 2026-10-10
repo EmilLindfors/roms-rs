@@ -237,6 +237,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Performance (P2) — [notes/performance.md](notes/performance.md)
 
 - [ ] **P2.5** A semi-implicit free surface (θ-method, as TRIM/UnTRIM, SLIM, Thetis), the main cost lever: farm meshes step at ≈ 0.024 s on gravity waves. Needs a global SPD solve and wet/dry care.
+- [ ] **P2.1** The 2D `Simulation` has no check for a blown-up state (as `Simulation3D` gained 2026-10-10): stop at the first non-finite `h`, `hu`, `hv`.
 - [ ] **P2.1** Port `compute_dt_advection_2d`, `compute_dt_tracer_2d`, `compute_dt_viscosity`, `Mesh::compute_dt`, `time/ssp_rk3.rs:110` and 1D `compute_dt_swe` to `compute_dt_swe_2d`'s per-node metric form in one helper (`2/(λ_r+λ_s)` for advection).
 - [ ] **P2.5** LTS oversubscription: under ≈ 40 % external load the farm took 358 s at 24 threads against 3.9 s at 4. Serial cut-off by work, a capped pool for small meshes, or documented thread counts.
 - [ ] **P2.5** Viscous cost (≈ 2× inviscid): a per-stage BR1 gradient cache for subset-RHS neighbours; store `νh` with the gradients in pass 1.
@@ -289,7 +290,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.5** 3D Smagorinsky on a fjord with a sill and tidal shear (may over-damp a tidal mixed layer; else Leith or Ri-dependent ν).
 - [ ] **P4.5** Rotated/geopotential horizontal diffusion of 3D tracers via BR1 (none exists; `viscosity_3d` is momentum only).
 - [ ] **P4.5** Subcell (GLL-cell) finite volumes for shoreline tracers instead of element means per level (needs 2D subcell fluxes in DU_avg2).
-- [ ] **P4.5** Port the 3D advective dt bound to the 2D per-node metric form (`compute_dt_swe_2d`), with a stability measurement (changes what `cfl` means).
+- [ ] **P4.5** Port the 3D advective dt bound to the 2D per-node metric form (`compute_dt_swe_2d`), with a linear stability measurement (changes what `cfl` means). Mausund holds `cfl_3d=2` and blows up at 3 in a 50 m element during the ramp (`froya_real_data` takes 1.5 now); find which term sets that limit (internal waves, the splitting, the implicit vertical advection at outflow Courant 10).
+- [ ] **P4.5** `Simulation3D`'s default `cfl` (0.5, `SimulationConfig`'s, shared with 2D) is 0.17–0.25 of the measured limit: give 3D its own default once the bound is ported.
 - [ ] **P4.5** EOS: delegate to the fixed UNESCO EOS with a linear fast path; TEOS-10 later. In `UnescoEOS::update_density`, `s * s.sqrt()` for `s.powf(1.5)` and a flat parallel loop.
 - [ ] **P4.5** RPE (`PotentialEnergy3D`) in 3D run output (a `Simulation3D` callback or NetCDF attributes).
 - [ ] **P4.5** One in-place Thomas solver for `tridiagonal::solve_tridiagonal`, `implicit_advection::ColumnSolve::solve` and the waves' `thomas`; in `solve_diffusion_column`, one elimination per pair and 8 columns as SIMD lanes.

@@ -221,6 +221,13 @@ where
 
             // Compute time step (3D CFL)
             let mut dt = self.physics.compute_dt(state, self.config.cfl);
+            if dt.is_nan() || dt <= 0.0 {
+                return SimulationResult::failure(
+                    t,
+                    n_steps,
+                    format!("Time step {dt:e} is not positive: the state has blown up"),
+                );
+            }
 
             // Apply dt limits
             if let Some(dt_max) = self.config.dt_max {
@@ -260,6 +267,15 @@ where
             // Post-process
             self.physics.post_process(state);
             self.physics.relax_vertical_reference(state, dt);
+            // A blown-up step leaves NaN or infinities, which every later
+            // step would carry on to `t_end` (the step's bound skips NaN)
+            if let Some(field) = non_finite_field(state) {
+                return SimulationResult::failure(
+                    t,
+                    n_steps,
+                    format!("{field} is not finite at t = {t:.1} s: the state has blown up"),
+                );
+            }
 
             // Callback
             if let Some(interval) = self.config.callback_interval {
@@ -294,6 +310,22 @@ where
             integrator: &self.integrator,
         }
     }
+}
+
+/// The first of `state`'s prognostic fields (η, u, v, T, S) with a value
+/// that is not finite, if any.
+fn non_finite_field(state: &Solution3D) -> Option<&'static str> {
+    let fields: [(&'static str, &[f64]); 5] = [
+        ("η", &state.eta.data),
+        ("u", &state.u),
+        ("v", &state.v),
+        ("T", &state.temp),
+        ("S", &state.salt),
+    ];
+    fields
+        .into_iter()
+        .find(|(_, values)| !values.iter().all(|x| x.is_finite()))
+        .map(|(name, _)| name)
 }
 
 /// What a callback of [`Simulation3D::run_with_context_callback`] sees
@@ -2338,6 +2370,28 @@ mod tests {
         assert!(
             outside < 1e-9,
             "temperature left its range by {outside:.3e}"
+        );
+    }
+
+    /// Regression (Mausund, `cfl_3d=3`, 2026-10-10): a 3D tide whose state
+    /// blew up stepped NaN on to `t_end` and reported success (the step's
+    /// bound skips NaN, so the steps went on). It now stops with a failure
+    /// at the first non-finite state. Here one NaN in the beach's T.
+    #[test]
+    fn a_blown_up_3d_run_fails() {
+        let (physics, mut state, _) = beach_3d(0.3);
+        state.temp[0] = f64::NAN;
+        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
+        let result = sim.run(&mut state, 0.0, 3600.0);
+        assert!(!result.success, "a blown-up run reported success");
+        assert_eq!(result.n_steps, 1, "it should stop after the first step");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("blown up")),
+            "{:?}",
+            result.error
         );
     }
 
