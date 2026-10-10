@@ -477,7 +477,7 @@ All notable changes to this project should be documented in this file.
 
 ### Performance
 
-- **`froya_real_data`'s 3D step 3× longer: `cfl_3d=` (default 1.5, was a fixed 0.5).** The 3D bound (`Hydrostatic3D::compute_dt`) is far below its stability limit (TODO P4.5). On the Mausund tide (3 h, nested), 2 holds and 3 blows up; 2 runs in 148 against 565 s per model hour. Against 0.5 it moves ū by ≤ 3 mm/s RMS and T by ≤ 0.02 °C RMS.
+- **`froya_real_data`'s 3D step twice as long: `cfl_3d=` (default 1, was a fixed 0.5).** The 3D bound (`Hydrostatic3D::compute_dt`) is below its stability limit (TODO P4.5), by how much depends on the mesh. On the Mausund tide (3 h, nested), 2 holds and 3 blows up; 1 runs in 246 and 2 in 148 against 565 s per model hour, and against 0.5 they move ū by 0.3 and ≤ 3 mm/s RMS. The full coastline mesh blows up at 1.5 within 1.3 h, in a cliff element (1.2 m beside 82 m).
 
 - **The waves' quadruplet interactions (DIA) vectorised across nodes: 2.5× faster, bit for bit (TODO F.4).** The DIA was the largest part of the wave sources (127 of 247 ms on one thread in `wave_step_bench`).
   - **Eight nodes per vector** (`waves/dia_lanes.rs`, `Quadruplets::source_lanes`). The DIA's stencil is the same at every node. With eight nodes' spectra interleaved (`[component][node]`), every gather and scatter of the transfer becomes one vector load or store. The node pass takes chunks of eight nodes when the DIA acts (`SourceTerms::integrate_lanes`). It runs the refraction and the shift node by node as before, then the sources of all eight together.

@@ -203,11 +203,14 @@
 //! columns (`GriddedAtmosphere2D::split_for_3d`). The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
 //! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step and
-//! `cfl_3d=` sets its Courant number (`Hydrostatic3D::compute_dt`; 1.5).
-//! Measured on the Mausund tide (3 h, nested, 2026-10-10): 2 holds and 3
+//! `cfl_3d=` sets its Courant number (`Hydrostatic3D::compute_dt`; 1).
+//! Measured 2026-10-10: on the Mausund tide (3 h, nested) 2 holds and 3
 //! blows up within 0.8 h (a 50 m element during the ramp, at 25 s steps);
 //! against 0.5, 1 moves ū by 0.3 mm/s RMS and 2 by ≤ 3 mm/s, T by 0.013
-//! and 0.019 °C RMS (565 → 246 → 148 s per model hour). Use
+//! and 0.019 °C RMS (565 → 246 → 148 s per model hour). The full coastline
+//! mesh blows up at 1.5 within 1.3 h (a cliff element, 1.2 m beside 82 m,
+//! 2 km inside the east boundary); 1 holds through the ramp, slowed by
+//! a cliff element at 1.5 h as 0.5 is (`notes/3d-numerics.md`). Use
 //! `slopes3d=on` for the stratified rest state on steep beds.
 //!
 //! A long 3D tide can stop and resume bit for bit. `restart_hours=H` writes
@@ -587,7 +590,7 @@ struct Options {
     steps_3d: usize,
     dt_3d: Option<f64>,
     /// Courant number of the 3D step (`cfl_3d=`, `Hydrostatic3D::compute_dt`;
-    /// 1.5, see the module docs)
+    /// 1, see the module docs)
     cfl_3d: f64,
     debug_3d: String,
     /// Write a restart of the 3D tide every this many model hours
@@ -686,7 +689,7 @@ impl Options {
                 .map(|v| v.parse::<f64>())
                 .transpose()
                 .map_err(|e| e.to_string())?,
-            cfl_3d: get("cfl_3d", 1.5)?,
+            cfl_3d: get("cfl_3d", 1.0)?,
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
             restart_hours: get("restart_hours", 0.0)?,
             resume: args.get("resume").map(PathBuf::from),
