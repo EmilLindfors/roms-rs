@@ -377,7 +377,7 @@ mod tests {
     use crate::solver::{TracerLimiter3DConfig, TracerLimiterType3D};
     use crate::source::{
         CageDrag2D, CageFootprint, CoriolisSource2D, NetCage, River, RiverProfile, RiverSeries,
-        RiverSources,
+        RiverSources, SourceContext2D, SourceTerm2D,
     };
     use crate::time::{ModeSplitIntegrator, SSPRK3};
     use crate::types::ElementIndex;
@@ -1758,6 +1758,14 @@ mod tests {
     /// depth, which drives a real boundary flow on a slope: Phillips 1970,
     /// Wunsch 1970; 1.9e-4 m/s here within 1000 s).
     fn beach_3d(amplitude: f64) -> (Physics, Solution3D, Arc<Bathymetry2D>) {
+        beach_3d_with_source(amplitude, None)
+    }
+
+    /// [`beach_3d`] with `source` in its 2D module.
+    fn beach_3d_with_source(
+        amplitude: f64,
+        source: Option<Arc<dyn SourceTerm2D>>,
+    ) -> (Physics, Solution3D, Arc<Bathymetry2D>) {
         let length = 1000.0;
         let mesh = Arc::new(Mesh2D::uniform_rectangle(0.0, length, 0.0, 100.0, 10, 1));
         let ops = Arc::new(DGOperators2D::new(2));
@@ -1774,7 +1782,11 @@ mod tests {
         )
         .with_bathymetry(bathymetry.clone())
         .with_formulation(SWEFormulation2D::WetDry)
-        .with_wet_dry_correction(true)
+        .with_wet_dry_correction(true);
+        let swe = match source {
+            Some(source) => swe.with_source_arc(source),
+            None => swe,
+        }
         .build();
         let sigma = SigmaGrid::new(4, UniformStretching);
         let physics = Hydrostatic3D::new(
@@ -2229,6 +2241,103 @@ mod tests {
         assert!(
             overshoot < 8e-3,
             "temperature left its range by {overshoot:.3e}"
+        );
+    }
+
+    /// A mass source of the 2D module that no flux carries, as the nesting
+    /// band's (`NestingRelaxation2D`): `η` relaxes towards `level` at rate
+    /// `rate` (1/s) at the wet nodes (deeper than 5 cm) beyond `x_from`.
+    struct LevelRelaxation {
+        level: f64,
+        rate: f64,
+        x_from: f64,
+    }
+
+    impl SourceTerm2D for LevelRelaxation {
+        fn evaluate(&self, ctx: &SourceContext2D) -> SWEState2D {
+            if ctx.position.0 < self.x_from || ctx.state.h < 0.05 {
+                return SWEState2D::zero();
+            }
+            let dh = (self.level - ctx.bathymetry).max(0.0) - ctx.state.h;
+            SWEState2D::new(self.rate * dh, 0.0, 0.0)
+        }
+
+        fn name(&self) -> &'static str {
+            "level_relaxation"
+        }
+
+        fn changes_mass(&self) -> bool {
+            true
+        }
+    }
+
+    /// The beach of [`beach_3d`] with its shoreward 60 % relaxing towards
+    /// +0.2 m over 10 min.
+    fn relaxed_beach() -> (Physics, Solution3D, Arc<Bathymetry2D>) {
+        let source = LevelRelaxation {
+            level: 0.2,
+            rate: 1.0 / 600.0,
+            x_from: 400.0,
+        };
+        beach_3d_with_source(0.3, Some(Arc::new(source)))
+    }
+
+    /// TODO P1.3 gate (Mausund, 2026-10-10): the 2D module's mass sources
+    /// that no flux carries (the nesting band's relaxation of `η`) reach the
+    /// layers as volume sources of the water's own tracers. Before, the
+    /// layers thickened with `η` but their inventories did not follow: at
+    /// Mausund a uniform 10 °C fell to 8.5 °C within an hour, fastest in
+    /// 5 cm puddles inside the band; with NorKyst's stratification 11.6 →
+    /// 3.1 °C in thin columns at the shore. Here uniform T and S stay
+    /// uniform, and a stratified T stays within its initial range in water
+    /// shallower than 1 m (as in [`a_beach_wets_and_dries_in_3d`]).
+    #[test]
+    fn a_relaxed_level_keeps_the_tracers_constant_and_bounded() {
+        let (physics, mut state, _) = relaxed_beach();
+        let nl = state.n_levels;
+        state.temp.fill(12.3);
+        state.salt.fill(33.1);
+        state.tke = w_point_field(&physics, nl, 0, |_, _| 12.3);
+        state.gls = w_point_field(&physics, nl, 0, |_, _| 1.0);
+        let mut drift = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| {
+            let tke = s.tke.chunks_exact(nl + 1).flat_map(|c| &c[1..nl]);
+            drift = max_or_nan(
+                s.temp
+                    .iter()
+                    .chain(tke)
+                    .map(|t| (t - 12.3).abs())
+                    .chain(s.salt.iter().map(|x| (x - 33.1).abs()))
+                    .chain([drift]),
+            );
+        });
+        // Measured 3.2e-12; 44.6 without the volume sources, 1.1e-4 with
+        // them but the relaxed elements carried as element means, 1.6e-5
+        // with inventories counting `layer_thickness_of`'s floor as water
+        assert!(drift < 5e-10, "uniform tracers drifted by {drift:.3e}");
+        assert_eq!(physics.swe_physics.negative_depth_clips(), 0);
+
+        let (physics, mut state, _) = relaxed_beach();
+        let (t_min, t_max) = (
+            state.temp.iter().copied().fold(f64::MAX, f64::min),
+            state.temp.iter().copied().fold(f64::MIN, f64::max),
+        );
+        let mut outside = 0.0_f64;
+        run_beach(&physics, &mut state, 200, |s| {
+            for (idx, column) in s.temp.chunks_exact(s.n_levels).enumerate() {
+                let depth = s.eta.data[idx] - physics.bathymetry.data[idx];
+                if depth > 0.0 && depth < 1.0 {
+                    for &t in column {
+                        outside = max_or_nan([outside, t_min - t, t - t_max]);
+                    }
+                }
+            }
+        });
+        // Measured: never outside; before, 6.6 °C (films draining at the
+        // shore)
+        assert!(
+            outside < 1e-9,
+            "temperature left its range by {outside:.3e}"
         );
     }
 

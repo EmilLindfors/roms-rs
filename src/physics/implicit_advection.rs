@@ -67,7 +67,7 @@
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::GeometricFactors2D;
 use crate::solver::core::blocks::{Pooled, for_each_block};
-use crate::solver::rhs::transport_3d::layer_thickness_of;
+use crate::solver::rhs::transport_3d::{layer_thickness_of, layer_volume_of};
 use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 
@@ -335,13 +335,15 @@ impl ElementColumns<'_> {
             let mass = self.geom.node_mass(self.k, i);
             self.add_fluxes(i, nc, mass, &mut solve.up, &mut solve.down);
             for l in 0..nc {
-                let volume = layer_thickness_of(depth(i), cells[l]);
+                let volume = layer_volume_of(depth(i), cells[l]);
                 volumes[i * nc + l] = volume;
                 solve.volume[l] += mass * volume;
                 solve.values[l] += mass * field[i * nc + l];
             }
         }
         for l in 0..nc {
+            // The inventories hold the cells' water, none at a dry node
+            solve.volume[l] = solve.volume[l].max(f64::MIN_POSITIVE);
             solve.values[l] /= solve.volume[l];
         }
         starting_values(solve, start);

@@ -1291,6 +1291,25 @@ where
                 ..self.rhs_config()
             };
             compute_transport_rhs_3d(rhs, state, transport, &config);
+            // The water no transport carries (the 2D module's own mass
+            // sources) at the concentrations and velocities it joins
+            let means = barotropic.element_means;
+            for (out, field) in [
+                (&mut rhs.temp, &state.temp),
+                (&mut rhs.salt, &state.salt),
+                (&mut rhs.u, &state.u),
+                (&mut rhs.v, &state.v),
+            ] {
+                transport.add_volume_sources(
+                    out,
+                    field,
+                    self.sigma.d_sigma(),
+                    &state.eta.data,
+                    &self.bathymetry,
+                    &self.geom,
+                    means,
+                );
+            }
             self.turbulence_transport_rhs(state, transport, barotropic, rhs);
         });
         // The river water's tracers, with the volume the layer transports
@@ -1370,10 +1389,19 @@ where
                 scheme,
             );
             // River water brings the column's own turbulence: its volume
-            // source must not dilute it
+            // source must not dilute it; nor the 2D module's
             if let Some(rivers) = barotropic.rivers {
                 rivers.add_w_point_sources_at_own_value(out, advected, state.n_nodes);
             }
+            w_cells.add_volume_sources(
+                out,
+                advected,
+                &w_cells.d_sigma,
+                &state.eta.data,
+                &self.bathymetry,
+                &self.geom,
+                barotropic.element_means,
+            );
         }
     }
 

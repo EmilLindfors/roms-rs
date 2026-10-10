@@ -7,7 +7,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Next up
 
 1. **P3.1** The Mausund error budget: M2's +3 % from NorKyst (`gauge_gains=M2,…`) together with the overtides that are too weak (M4 0.35×). See Validation.
-2. **P1.3** The tracer drift in thin wetting columns in 3D, then a day of the full Frøya coastline mesh in 3D. See Geometry.
+2. **P1.3** A day of the full Frøya coastline mesh in 3D. See Geometry.
 3. **P4.4** Per-column surface heat and freshwater fluxes, the next step for a real 3D run; then **P1.5** a real NorKyst 3D nested run.
 4. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
@@ -174,8 +174,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Geometry and meshes (P1.3) — [notes/geometry-mesh.md](notes/geometry-mesh.md)
 
-- [ ] **P1.3** The tracer drift in thin wetting columns (T 11.6 → 3.1 °C, below NorKyst's 7.50 minimum; likely 2D positivity/wet-dry depth changes with no tracer flux). Gate: a beach flooding over stratified water keeps a uniform T uniform.
-- [ ] **P1.3** Then a day of the full Frøya coastline mesh in 3D (≈ 1.06 s per step at 24 threads): M2 cycle and gauge, η and ū at Mausund against the 2D run.
+- [ ] **P1.3** `froya_real_data tide3d=1`'s progress line reports T only in columns ≥ the thin depth, where the thin-column drift never showed until it spread: add the thin and shore columns' range.
+- [ ] **P1.3** A day of the full Frøya coastline mesh in 3D (≈ 1.06 s per step at 24 threads): M2 cycle and gauge, η and ū at Mausund against the 2D run.
 - [ ] **P1.3** Mass-weight the 2D tracer limiter's element means (`solver/limiters/tracer_2d.rs:238`, `:708`, `ops.weights[i] * h` without J): use `geom.node_mass`.
 - [ ] **P1.3** A jittered-mesh case for `EntropyStable`/`WetDry` in `convergence_test.rs` (the averaged metric loses an order pointwise on such meshes).
 - [ ] **P1.3** Rerun the unsmoothed full-mesh 3-day baseline on current code (without `slopes3d`, ≈ 1–2.5 h) for a like-for-like comparison with the 19 m free depth.
@@ -188,6 +188,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Watch how often the splitter falls back to element-mean tracers (`CONSTANCY_TOLERANCE`) in a tidal run.
 - [ ] **P1.3** Is the GLS creep (1 cm/s after a day at the 1 km grid's shallow slopes) physical slope flow (Phillips 1970; Wunsch 1970)? Compare with K/(slope·L) or run a slice.
 - [ ] **P1.3** Lighten the 3D slope bound now that the vertical reference exists (does r_x0 0.25–0.3 hold Frøya at rest? At 0.2, element 11163 grows, e-folding ≈ 55 min).
+- [ ] **P1.3** Mausund's pinnacle element 291 (a 1.2 m node among 42–55 m, unsmoothed) cools its bed layer from 8.6 to 6.0 °C within 30 min at 2 h of the 3D tide, below NorKyst's 7.50 minimum: the straddle below, seen in T.
 - [ ] **P1.3** The straddle instability over unsmoothed cliffs (smoothing works around it): a per-element Haney rx1 bound, a capped or implicit pair density, or geopotential diffusion; run the spectrum harness (≥ 1800 s, check the residuals) on the slices.
 - [ ] **P1.3** The shipped 3D rest state still grows at terrace vertices beside shore elements: an oscillatory mode, e-folding ≈ 2–2.4 h, period ≈ 3 h, in the bed layers across the pycnocline's foot (LimitedAkima about the reference; any Akima weight). Find its mechanism (a fully wet slice of the same terrace is stable) and fix it; gate `a_terrace_beside_a_shore_element_stays_at_rest_for_twelve_hours`.
 - [ ] **P1.3** Rerun the full coastline mesh at rest with today's defaults for 24–48 h, seeded (`debug_3d=…,perturb=1e-6`): the 12 h round-off runs cannot see a 2 h mode.
@@ -213,6 +214,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.5 / P4.2** Read parent snapshots lazily around the current time, 2D (`OceanModelReader`) and 3D (`from_file_with_profiles`, 46 MB per field for 3 days), for months of forcing or OPeNDAP.
 - [ ] **P1.5** Correct NorKyst's own M2/S2 (0.3–1 cm, 10–20 min lag) in the corrected atlas from another reference (gauges along the boundary, TPXO/FES).
 - [ ] **P1.4** Velocity from z-levels stops at 300 m: extend to full depth.
+- [ ] **P1.5** `NestingRelaxation2D` relaxes the level at every band node ≥ 5 cm deep, puddles cut off by land included (Mausund element 58: a 5 cm puddle filled at 3e-7 m per step towards NorKyst's level): relax only water connected to the open faces, or momentum only in shore elements.
 - [ ] **P1.5** A depth range in `norkyst-client`'s grid mode (`depth = "0:1:0"` today) as a second source of 3D profiles.
 
 ## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)

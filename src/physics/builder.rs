@@ -609,6 +609,36 @@ where
     fn metric_form(&self) -> crate::solver::rhs::MetricForm {
         crate::solver::rhs::MetricForm::of(self.formulation)
     }
+
+    /// `S_h` of the source terms that change the water's volume
+    /// ([`SourceTerm2D::changes_mass`]), element by element as the RHS
+    /// kernels add them.
+    fn mass_sources_into(&self, state: &SWESolution2D, time: f64, out: &mut [f64]) -> bool {
+        let Some(source) = self.source.as_deref().filter(|s| s.changes_mass()) else {
+            return false;
+        };
+        let n_elements = self.mesh.n_elements;
+        crate::solver::core::blocks::for_each_block(
+            n_elements,
+            [&mut out[..n_elements * self.ops.n_nodes]],
+            || (),
+            |_, k, [h]| {
+                h.fill(0.0);
+                let element = crate::source::ElementSources {
+                    element: ElementIndex::new(k),
+                    time,
+                    solution: state,
+                    mesh: &self.mesh,
+                    ops: &self.ops,
+                    bathymetry: self.bathymetry.as_deref(),
+                    g: self.equation.g,
+                    h_min: self.equation.h_min.meters(),
+                };
+                source.add_mass_element(&element, h);
+            },
+        );
+        true
+    }
 }
 
 // =============================================================================

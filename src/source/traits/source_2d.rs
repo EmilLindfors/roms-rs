@@ -195,6 +195,27 @@ pub trait SourceTerm2D: Send + Sync {
     fn includes_bathymetry_slope(&self) -> bool {
         false
     }
+
+    /// Whether this source changes the water's volume (a nonzero `S_h`):
+    /// a relaxation of the level (`NestingRelaxation2D`, `SpongeLayer2D`
+    /// unless momentum-only) or rivers. No face flux carries that water, so
+    /// a 3D model over the 2D module has to give it to its layers as a
+    /// volume source (`crate::time::BarotropicPhysics::mass_sources_into`).
+    fn changes_mass(&self) -> bool {
+        false
+    }
+
+    /// Add `S_h` alone at every node of one element to `h` (nothing where
+    /// [`Self::changes_mass`] is false). The default evaluates the whole
+    /// source per node.
+    fn add_mass_element(&self, element: &ElementSources<'_>, h: &mut [f64]) {
+        if !self.changes_mass() {
+            return;
+        }
+        for (i, h) in h.iter_mut().enumerate().take(element.n_nodes()) {
+            *h += self.evaluate(&element.context(i)).h;
+        }
+    }
 }
 
 /// Combine multiple 2D source terms into one.
@@ -265,6 +286,16 @@ impl<'a> SourceTerm2D for CombinedSource2D<'a> {
     fn includes_bathymetry_slope(&self) -> bool {
         self.sources.iter().any(|s| s.includes_bathymetry_slope())
     }
+
+    fn changes_mass(&self) -> bool {
+        self.sources.iter().any(|s| s.changes_mass())
+    }
+
+    fn add_mass_element(&self, element: &ElementSources<'_>, h: &mut [f64]) {
+        for source in &self.sources {
+            source.add_mass_element(element, h);
+        }
+    }
 }
 
 /// Owned counterpart of [`CombinedSource2D`]: sums source terms held by
@@ -326,6 +357,16 @@ impl SourceTerm2D for SourceTerms2D {
 
     fn includes_bathymetry_slope(&self) -> bool {
         self.sources.iter().any(|s| s.includes_bathymetry_slope())
+    }
+
+    fn changes_mass(&self) -> bool {
+        self.sources.iter().any(|s| s.changes_mass())
+    }
+
+    fn add_mass_element(&self, element: &ElementSources<'_>, h: &mut [f64]) {
+        for source in &self.sources {
+            source.add_mass_element(element, h);
+        }
     }
 }
 
