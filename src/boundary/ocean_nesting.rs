@@ -779,6 +779,30 @@ impl SourceTerm2D for NestingRelaxation2D {
     fn name(&self) -> &'static str {
         "nesting_relaxation_2d"
     }
+
+    fn changes_mass(&self) -> bool {
+        !self.momentum_only
+    }
+
+    fn add_mass_element(&self, element: &ElementSources<'_>, h: &mut [f64]) {
+        let inner = &self.parent.inner;
+        let k = element.element.as_usize();
+        if self.momentum_only || !inner.band_elements[k] {
+            return;
+        }
+        let moment = self.parent.moment(element.time);
+        let base = k * inner.n_nodes;
+        for (i, h) in h.iter_mut().enumerate().take(element.n_nodes()) {
+            let slot = inner.slot_of_node[base + i];
+            if slot == u32::MAX {
+                continue;
+            }
+            let bed = element
+                .bathymetry
+                .map_or(0.0, |b| b.get(element.element, i));
+            *h += self.relax(slot as usize, &moment, &element.state(i), bed).h;
+        }
+    }
 }
 
 #[cfg(test)]

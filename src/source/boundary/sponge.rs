@@ -320,6 +320,10 @@ where
         "sponge_2d"
     }
 
+    fn changes_mass(&self) -> bool {
+        !self.momentum_only
+    }
+
     fn is_stiff(&self) -> bool {
         // Sponge can be stiff for large gamma_max
         self.gamma_max > 1.0

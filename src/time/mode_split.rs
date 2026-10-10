@@ -147,6 +147,15 @@ pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
     /// transport's divergence and the 3D layer continuity must be the same
     /// operator as the 2D module's (they differ on general quadrilaterals).
     fn metric_form(&self) -> MetricForm;
+
+    /// Overwrite `out` (`[element][node]`) with the volume sources `S_h`
+    /// (m/s) that [`Self::compute_rhs_mass_fluxes_into`] adds at `state` and
+    /// `time` besides the fluxes' divergence (a relaxation of the level in a
+    /// nesting band or sponge), and return whether there are any; `false`,
+    /// leaving `out` alone, without such sources.
+    fn mass_sources_into(&self, _state: &SWESolution2D, _time: f64, _out: &mut [f64]) -> bool {
+        false
+    }
 }
 
 /// The barotropic transport of one baroclinic step: the fluxes that moved the
@@ -180,7 +189,9 @@ pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
 /// discharge to every stage and are averaged the same way, into
 /// [`Self::discharge`], so that with them
 /// `η̄ − ηⁿ = −Δt·∇·DU_avg2 + Δt·Σ Q̄/A_k` (see [`crate::source::river`]).
-/// Other mass sources in the 2D module are not part of the transport.
+/// The 2D module's own volume sources (a nesting band relaxing the level,
+/// [`BarotropicPhysics::mass_sources_into`]) are averaged the same way, into
+/// [`Self::mass_source`], and add `Δt·S̄_h` to the identity.
 pub struct BarotropicTransport {
     /// Nodal transport `hu` (m²/s).
     pub hu: DGSolution2D,
@@ -196,6 +207,9 @@ pub struct BarotropicTransport {
     pub subcell: Vec<f64>,
     /// Discharge of every river averaged with the same weights (m³/s).
     pub discharge: Vec<f64>,
+    /// The 2D module's own volume source `S_h` at every node, averaged with
+    /// the same weights (m/s; zero without such sources).
+    pub mass_source: DGSolution2D,
 }
 
 impl BarotropicTransport {
@@ -212,6 +226,7 @@ impl BarotropicTransport {
             face: vec![0.0; n_face_values],
             subcell: vec![0.0; n_subcell_values],
             discharge: vec![0.0; n_rivers],
+            mass_source: DGSolution2D::new(n_elements, n_nodes),
         }
     }
 
@@ -221,6 +236,7 @@ impl BarotropicTransport {
         self.face.fill(0.0);
         self.subcell.fill(0.0);
         self.discharge.fill(0.0);
+        self.mass_source.fill(0.0);
     }
 
     /// The subcell interface fluxes of element `k` if every stage of the pass
@@ -702,6 +718,8 @@ struct Buffers {
     face_mass: Vec<f64>,
     /// Subcell interface mass fluxes of one 2D RHS evaluation.
     subcell_mass: Vec<f64>,
+    /// The 2D module's own volume sources of one 2D RHS evaluation.
+    stage_mass_source: Vec<f64>,
     /// Depth means of the u/v tendency (or of u/v after diffusion).
     mean_u: DGSolution2D,
     mean_v: DGSolution2D,
@@ -743,6 +761,7 @@ impl Buffers {
             transport: BarotropicTransport::new(ne, nn, n_face_values, n_subcell_values, n_rivers),
             face_mass: vec![0.0; n_face_values],
             subcell_mass: vec![0.0; n_subcell_values],
+            stage_mass_source: vec![0.0; ne * nn],
             mean_u: DGSolution2D::new(ne, nn),
             mean_v: DGSolution2D::new(ne, nn),
             rate_eta: DGSolution2D::new(ne, nn),
@@ -875,6 +894,7 @@ impl ModeSplitIntegrator {
             transport,
             face_mass,
             subcell_mass,
+            stage_mass_source,
             mean_u,
             mean_v,
             rate_eta,
@@ -973,6 +993,16 @@ impl ModeSplitIntegrator {
                 };
                 barotropic.compute_rhs_mass_fluxes_into(x, time, k_2d, face_mass, subcell_mass);
                 let c = w_secondary * stage.weight / n_bt as f64;
+                if barotropic.mass_sources_into(x, time, stage_mass_source) {
+                    for (mean, &s) in transport
+                        .mass_source
+                        .data
+                        .iter_mut()
+                        .zip(&*stage_mass_source)
+                    {
+                        *mean += c * s;
+                    }
+                }
                 if let Some(rivers) = rivers {
                     for (i, mean) in transport.discharge.iter_mut().enumerate() {
                         let discharge = rivers.discharge(i, time);
@@ -1030,15 +1060,6 @@ impl ModeSplitIntegrator {
             rivers,
             discharge: &transport.discharge,
         });
-        let barotropic_flux = BarotropicFlux {
-            dt,
-            hu: &transport.hu.data,
-            hv: &transport.hv.data,
-            face: &transport.face,
-            subcell: &transport.subcell,
-            eta_rate: &rate_eta.data,
-            rivers: river_inflow,
-        };
         let geom = barotropic.geometry();
         // Elements where the pass broke the nodal identity ∂η/∂t = −∇·DU_avg2
         // (WetDry subcells, positivity limiter) carry their tracers as element
@@ -1057,14 +1078,19 @@ impl ModeSplitIntegrator {
             // The largest relative change of a column's volume that its layers
             // would not carry (a tracer's constancy error there)
             let mut constancy = 0.0_f64;
-            for ((&rate, &div), (&eta, &b)) in rate_eta.data[nodes.clone()]
+            for (((&rate, &div), &mass), (&eta, &b)) in rate_eta.data[nodes.clone()]
                 .iter()
                 .zip(&transport_divergence.data[nodes.clone()])
+                .zip(&transport.mass_source.data[nodes.clone()])
                 .zip(state.eta.data[nodes].iter().zip(bed))
             {
-                let r = (rate + div - source).abs();
+                let r = (rate + div - source - mass).abs();
                 residual = residual.max(r);
-                scale = scale.max(rate.abs()).max(div.abs()).max(source);
+                scale = scale
+                    .max(rate.abs())
+                    .max(div.abs())
+                    .max(source)
+                    .max(mass.abs());
                 depth = depth.max(eta - b);
                 constancy = constancy.max(r * dt / (eta - b).max(MIN_COLUMN_VOLUME_DEPTH));
             }
@@ -1076,6 +1102,16 @@ impl ModeSplitIntegrator {
                 || constancy > CONSTANCY_TOLERANCE;
         }
         let means: &[bool] = element_means;
+        let barotropic_flux = BarotropicFlux {
+            dt,
+            hu: &transport.hu.data,
+            hv: &transport.hv.data,
+            face: &transport.face,
+            subcell: &transport.subcell,
+            eta_rate: &rate_eta.data,
+            rivers: river_inflow,
+            element_means: means,
+        };
         w_cell_thicknesses(sigma.d_sigma(), d_sigma_w);
         // The σ-thicknesses of the cells of each inventory field
         let cells = [sigma.d_sigma(), &d_sigma_w[..]];

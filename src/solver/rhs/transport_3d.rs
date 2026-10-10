@@ -37,7 +37,18 @@
 //! averaged metric is a different operator from the collocated form's), so
 //! `Σ_l ∇·Q_l = ∇·DU_avg2 = Σ_l s_l − ∂η/∂t`
 //! and `Ω` at the surface vanishes to round-off. That holds wherever the barotropic pass
-//! keeps the nodal identity.
+//! keeps the nodal identity and its 2D module has no mass source of its own.
+//!
+//! **Volume sources.** Whatever `Ω` leaves at the surface is water that no
+//! transport carried: the 2D module's own mass sources (a nesting band or
+//! sponge relaxing the level, `SourceTerm2D::changes_mass`), and in the
+//! elements described below the nodal residual of the pass. The layers take
+//! it as a volume source in proportion to `Δσ_l`, which closes `Ω`
+//! ([`LayerTransport::volume_source`]), and the tracers get that water at
+//! the concentration it joins ([`LayerTransport::add_volume_sources`]), so it
+//! changes no concentration. Without that term a relaxed level thickened the
+//! layers with no tracer in the water: at Mausund a uniform 10 °C fell to
+//! 8.5 °C within an hour (TODO P1.3).
 //!
 //! **Wetting and drying.** `WetDry` elements with a shallow node move their
 //! mass on GLL subcells instead (finite volumes with Audusse et al.'s
@@ -53,11 +64,12 @@
 //! no force between thin columns. Where the pass keeps only element balances
 //! (an element that switched to the subcells during the step, or one the
 //! positivity limiter changed, see `BarotropicTransport`), the surface
-//! residual is spread linearly over the column. It integrates to zero over
-//! the element (the element balance), so every layer's continuity still
-//! holds for the element as a whole, and the mode splitter carries the
-//! tracers of those elements as element means per level
-//! ([`from_inventory`]): constant and conservative there too.
+//! residual is such a volume source too. Besides the element's true source
+//! it integrates to zero over the element (the element balance), so every
+//! layer's continuity still holds for the element as a whole; the mode
+//! splitter carries the tracers of those elements as element means per
+//! level ([`from_inventory`]), and their volume sources bring the element's
+//! mean concentration: constant and conservative there too.
 //!
 //! [`apply_tracer_transport_3d`] then advects a tracer with these fluxes in
 //! inventory form: in split form within the elements
@@ -392,6 +404,11 @@ pub struct BarotropicFlux<'a> {
     /// The rivers of the step, if any: volume sources of the layers, so
     /// that `∂η/∂t = −∇·DU_avg2 + Σ Q̄/A_k` (see [`crate::source::river`]).
     pub rivers: Option<RiverInflow<'a>>,
+    /// The elements whose fields the mode splitter carries as element means
+    /// per level (`[element]`; empty for none): there the volume source of
+    /// [`LayerTransport::volume_source`] brings the element's mean
+    /// concentration per level ([`LayerTransport::add_volume_sources`]).
+    pub element_means: &'a [bool],
 }
 
 /// Layer transports and `Ω` of one 3D stage (see the module docs).
@@ -416,6 +433,14 @@ pub struct LayerTransport {
     pub subcell_elements: Vec<bool>,
     /// `Ω` at the w-points (m/s), `n_levels + 1` per column, bed first.
     pub omega: Vec<f64>,
+    /// The volume source of every column that no transport carries (m/s,
+    /// `[element][node]`): the surface residual of `Ω`, negated, which the
+    /// layers take in proportion to `Δσ_l` (see [`Self::compute`]). Where
+    /// the barotropic pass keeps the nodal identity it is round-off, except
+    /// where its 2D module has a mass source of its own (the nesting band's
+    /// relaxation of `η`, `crate::boundary::NestingRelaxation2D`). The
+    /// tracers get its water through [`Self::add_volume_sources`].
+    pub volume_source: Vec<f64>,
     /// σ-thickness `Δσ_l` of the layers (uniform until the first
     /// [`Self::compute`]).
     pub d_sigma: Vec<f64>,
@@ -440,6 +465,7 @@ impl LayerTransport {
             subcell: vec![0.0; n_elements * subcell_interfaces(ops.n_1d) * n_levels],
             subcell_elements: vec![false; n_elements],
             omega: vec![0.0; n_elements * nn * (n_levels + 1)],
+            volume_source: vec![0.0; n_elements * nn],
             d_sigma: vec![1.0 / n_levels as f64; n_levels],
             surface_residual: 0.0,
             metric: MetricForm::default(),
@@ -517,6 +543,7 @@ impl LayerTransport {
             subcell: layer_subcell,
             subcell_elements,
             omega: layer_omega,
+            volume_source,
             metric,
             ..
         } = self;
@@ -701,14 +728,14 @@ impl LayerTransport {
         let sigma_w = sigma.sigma_w();
         let residual = max_over_blocks(
             n_elements,
-            [&mut layer_omega[..]],
+            [&mut layer_omega[..], &mut volume_source[..]],
             || {
                 Pooled::take(
                     |s: &OmegaScratch| s.fits(nn, nfn, nl, n_sub),
                     || OmegaScratch::new(nn, nfn, nl, n_sub),
                 )
             },
-            |scratch, k, [omega_k]| {
+            |scratch, k, [omega_k, source_k]| {
                 let OmegaScratch {
                     hu,
                     hv,
@@ -755,9 +782,12 @@ impl LayerTransport {
                     }
                     let residual = omega[nl];
                     largest = largest.max(residual.abs());
+                    // The layers take the residual as a volume source in
+                    // proportion to Δσ_l, which closes Ω at the surface
                     for (w, &s) in omega.iter_mut().zip(sigma_w) {
                         *w -= (s + 1.0) * residual;
                     }
+                    source_k[i] = -residual;
                 }
                 largest
             },
@@ -816,7 +846,75 @@ impl LayerTransport {
             w[nw] = 0.0;
         }
         w_cell_thicknesses(&layers.d_sigma, &mut self.d_sigma);
+        // Each w-cell averages its two layers' continuity, sources included
+        self.volume_source.copy_from_slice(&layers.volume_source);
         self.surface_residual = layers.surface_residual;
+    }
+
+    /// Add the inventory tendency of [`Self::volume_source`]'s water to
+    /// `rhs` (`∂(H C)/∂t` of a field `field` over cells of σ-thickness
+    /// `cells`: the layers' `Δσ_l`, or the w-cells' of
+    /// [`w_cell_thicknesses`], whose sources these transports' are, see
+    /// [`Self::stagger_from`]): `Δσ_c s C`, the water at the concentration
+    /// it joins, so the source changes no concentration (constancy) and
+    /// adds exactly what its volume holds (conservation).
+    ///
+    /// `C` is the node's own value, or in the elements of `element_means`
+    /// the element's mean per cell, `Σ w_i J_i H_ic C_ic / Σ w_i J_i H_ic`:
+    /// there the barotropic pass kept only the element balance, and the
+    /// nodal sources hold its nodal residual, which integrates to zero over
+    /// the element, besides the element's true source; at the mean
+    /// concentration the residual moves no tracer, as in
+    /// [`from_inventory`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_volume_sources(
+        &self,
+        rhs: &mut [f64],
+        field: &[f64],
+        cells: &[f64],
+        eta: &[f64],
+        bathymetry: &Bathymetry2D,
+        geom: &GeometricFactors2D,
+        element_means: &[bool],
+    ) {
+        let (nn, nc) = (bathymetry.n_nodes, cells.len());
+        let n_elements = bathymetry.n_elements;
+        for_each_block(
+            n_elements,
+            [&mut rhs[..n_elements * nn * nc]],
+            || (),
+            |_, k, [rhs_k]| {
+                let source = &self.volume_source[k * nn..(k + 1) * nn];
+                let field_k = &field[k * nn * nc..(k + 1) * nn * nc];
+                if !element_means.get(k).copied().unwrap_or(false) {
+                    for (i, &s) in source.iter().enumerate() {
+                        for (c, &dc) in cells.iter().enumerate() {
+                            rhs_k[i * nc + c] += dc * s * field_k[i * nc + c];
+                        }
+                    }
+                    return;
+                }
+                let bed = bathymetry.element(ElementIndex::new(k));
+                let depth = |i: usize| eta[k * nn + i] - bed[i];
+                for (c, &dc) in cells.iter().enumerate() {
+                    let (mut inventory, mut volume) = (0.0, 0.0);
+                    for i in 0..nn {
+                        let weight = geom.node_mass(k, i) * layer_volume_of(depth(i), dc);
+                        inventory += weight * field_k[i * nc + c];
+                        volume += weight;
+                    }
+                    for (i, &s) in source.iter().enumerate() {
+                        // An element without water has no mean: its own values
+                        let value = if volume > 0.0 {
+                            inventory / volume
+                        } else {
+                            field_k[i * nc + c]
+                        };
+                        rhs_k[i * nc + c] += dc * s * value;
+                    }
+                }
+            },
+        );
     }
 }
 
@@ -891,6 +989,17 @@ pub(crate) fn layer_thickness_of(depth: f64, d_sigma: f64) -> f64 {
     (depth * d_sigma).max(crate::solver::rhs::advection_3d::MIN_LAYER_THICKNESS)
 }
 
+/// The volume of a cell of σ-thickness `d_sigma` per unit area, `D·Δσ` (m),
+/// zero where the column has no water. Inventories hold exactly this
+/// volume's content: [`layer_thickness_of`]'s floor guards divisions only,
+/// and as an inventory's volume it gave a node wetting from dry the
+/// concentration of the floor's phantom water (1e-12 m; 2.3e-7 of a 4 μm
+/// film's tracers at a beach's wetting front, TODO P1.3).
+#[inline]
+pub(crate) fn layer_volume_of(depth: f64, d_sigma: f64) -> f64 {
+    (depth * d_sigma).max(0.0)
+}
+
 /// Depth (m) below which a node's (or, as a mean, an element's) tracers are
 /// left as they were: it holds no water to define a concentration.
 const DRY_DEPTH: f64 = 1e-6;
@@ -898,7 +1007,8 @@ const DRY_DEPTH: f64 = 1e-6;
 /// Multiply a field by the thickness of its cells under `η`: concentration
 /// `C` → inventory `H_z C`, with `H_z = D·Δσ` for the σ-thicknesses
 /// `d_sigma` of the cells in a column (the layers' [`SigmaGrid::d_sigma`],
-/// or the w-cells' of [`w_cell_thicknesses`] for a field at the w-points).
+/// or the w-cells' of [`w_cell_thicknesses`] for a field at the w-points),
+/// zero without water ([`layer_volume_of`]).
 pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry: &Bathymetry2D) {
     let (nn, nl) = (bathymetry.n_nodes, d_sigma.len());
     let n_elements = bathymetry.n_elements;
@@ -914,7 +1024,7 @@ pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry
                 .zip(&bathymetry.data[nodes])
             {
                 for (c, &ds) in column.iter_mut().zip(d_sigma) {
-                    *c *= layer_thickness_of(e - b, ds);
+                    *c *= layer_volume_of(e - b, ds);
                 }
             }
         },
@@ -986,7 +1096,7 @@ pub fn from_inventory(
                 // weights: each node keeps its departure from it
                 let (mut inventory, mut last, mut volume) = (0.0, 0.0, 0.0);
                 for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
-                    let weight = geom.node_mass(k, i) * layer_thickness_of(e - b, ds);
+                    let weight = geom.node_mass(k, i) * layer_volume_of(e - b, ds);
                     inventory += geom.node_mass(k, i) * q_k[i * nl + l];
                     last += weight * out_k[i * nl + l];
                     volume += weight;
@@ -1868,6 +1978,7 @@ mod tests {
                 subcell: &self.du_subcell,
                 eta_rate: &self.eta_rate,
                 rivers: None,
+                element_means: &[],
             };
             transport.compute(
                 &self.state,

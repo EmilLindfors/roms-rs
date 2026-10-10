@@ -487,6 +487,18 @@ impl SourceTerm2D for RiverSources {
     fn name(&self) -> &'static str {
         "rivers"
     }
+
+    fn changes_mass(&self) -> bool {
+        true
+    }
+
+    fn add_mass_element(&self, element: &ElementSources<'_>, h: &mut [f64]) {
+        let k = element.element.as_usize();
+        if !self.in_element(k).is_empty() {
+            let rate = self.volume_rate(k, element.time);
+            h.iter_mut().for_each(|h| *h += rate);
+        }
+    }
 }
 
 /// The rivers of one baroclinic step as the 3D layers see them: each
