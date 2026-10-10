@@ -2375,6 +2375,44 @@ mod tests {
         hours: &[f64],
         dt: f64,
     ) -> (Vec<f64>, usize) {
+        let (physics, mut state) = basin_physics(mesh, bed, bound, rho);
+        let nn = state.n_nodes;
+        let mut integrator = ModeSplitIntegrator::new();
+        let mut n = 0;
+        let mut speeds = Vec::with_capacity(hours.len());
+        for &until in hours {
+            while (n as f64) < (until * 3600.0 / dt).round() {
+                physics.update_density(&mut state);
+                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                physics.post_process(&mut state);
+                n += 1;
+            }
+            let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
+            println!("at rest: largest speed {speed:.2e} m/s after {until} h");
+            speeds.push(speed);
+        }
+        let nl = state.n_levels;
+        let at = state
+            .u
+            .iter()
+            .zip(&state.v)
+            .map(|(u, v)| u.hypot(*v))
+            .enumerate()
+            .fold(
+                (0.0_f64, 0),
+                |m, (i, s)| if s > m.0 { (s, i / nl / nn) } else { m },
+            )
+            .1;
+        (speeds, at)
+    }
+
+    /// The physics and the state at rest of [`basin_at_rest`].
+    fn basin_physics(
+        mesh: Mesh2D,
+        bed: impl Fn(f64, f64) -> f64,
+        bound: Option<ElementSlopeBound>,
+        rho: impl Fn(f64) -> f64 + Copy,
+    ) -> (Physics, Solution3D) {
         use crate::physics::EquationOfState;
         use crate::vertical::SongHaidvogelStretching;
         let mesh = Arc::new(mesh);
@@ -2447,33 +2485,7 @@ mod tests {
         } else {
             physics
         };
-        let mut integrator = ModeSplitIntegrator::new();
-        let mut n = 0;
-        let mut speeds = Vec::with_capacity(hours.len());
-        for &until in hours {
-            while (n as f64) < (until * 3600.0 / dt).round() {
-                physics.update_density(&mut state);
-                integrator.step(&mut state, &physics, dt, n as f64 * dt);
-                physics.post_process(&mut state);
-                n += 1;
-            }
-            let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
-            println!("at rest: largest speed {speed:.2e} m/s after {until} h");
-            speeds.push(speed);
-        }
-        let nl = state.n_levels;
-        let at = state
-            .u
-            .iter()
-            .zip(&state.v)
-            .map(|(u, v)| u.hypot(*v))
-            .enumerate()
-            .fold(
-                (0.0_f64, 0),
-                |m, (i, s)| if s > m.0 { (s, i / nl / nn) } else { m },
-            )
-            .1;
-        (speeds, at)
+        (physics, state)
     }
 
     /// [`channel_at_rest`] with a cliff: the bed falls from 15 to 300 m inside
@@ -2681,7 +2693,13 @@ mod tests {
     /// shore element with one dry node, walls around. The mesh, and the bed
     /// with its gradient per element node.
     fn terrace_patch() -> (Mesh2D, Bathymetry2D) {
-        let text = include_str!("../../tests/data/froya_terrace_patch.txt");
+        // DGRS_FIXTURE: another exported patch, for the probes
+        let owned = std::env::var("DGRS_FIXTURE")
+            .ok()
+            .map(|path| std::fs::read_to_string(path).expect("DGRS_FIXTURE"));
+        let text = owned
+            .as_deref()
+            .unwrap_or(include_str!("../../tests/data/froya_terrace_patch.txt"));
         let mut lines = text.lines().filter(|l| !l.starts_with('#'));
         let count = |lines: &mut dyn Iterator<Item = &str>, name: &str| -> usize {
             let line = lines.next().expect("fixture header");
@@ -2731,6 +2749,14 @@ mod tests {
         )
     }
 
+    /// An experiment's setting from the environment (TODO P1.3 probes).
+    fn env_or(key: &str, default: f64) -> f64 {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    }
+
     /// [`terrace_patch`] at rest under [`summer_pycnocline`] as
     /// `froya_real_data` sets it up (20 stretched levels, P2, constant mixing,
     /// no limiter, the profile as the PGF's reference), with the vertical
@@ -2773,14 +2799,16 @@ mod tests {
             bathymetry.clone(),
             Arc::new(f),
             eos,
-            ConstantMixing::new(1e-3, 0.0),
+            // Experiment (TODO P1.3): DGRS_KV, DGRS_KT, DGRS_SMAG vary the
+            // dissipation for the spectrum probe
+            ConstantMixing::new(env_or("DGRS_KV", 1e-3), env_or("DGRS_KT", 0.0)),
             swe,
             no_stress(),
             G,
             RHO0,
         )
         .with_bottom_drag(BottomDrag3D::log_layer(0.003))
-        .with_smagorinsky_viscosity(0.1);
+        .with_smagorinsky_viscosity(env_or("DGRS_SMAG", 0.1));
         let (nn, nl) = (ops.n_nodes, sigma.n_levels());
         let mut state = Solution3D::new(mesh.n_elements, nn, nl);
         for idx in 0..mesh.n_elements * nn {
@@ -2813,7 +2841,17 @@ mod tests {
     /// temperature perturbation of 1e-6 °C: the largest layer speed after
     /// each of `hours`.
     fn terrace_patch_at_rest(about_rest: bool, hours: &[f64]) -> Vec<f64> {
-        let (physics, mut state) = terrace_patch_physics(None, about_rest);
+        terrace_patch_run(None, about_rest, hours)
+    }
+
+    /// [`terrace_patch_at_rest`] with the vertical tracer scheme `scheme`.
+    fn terrace_patch_run(
+        scheme: Option<VerticalAdvection>,
+        about_rest: bool,
+        hours: &[f64],
+    ) -> Vec<f64> {
+        let (physics, mut state) = terrace_patch_physics(scheme, about_rest);
+        let rest = state.clone();
         let (nl, bathymetry) = (state.n_levels, physics.bathymetry.clone());
         // A deterministic perturbation of 1e-6 °C at every wet point
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
@@ -2837,10 +2875,43 @@ mod tests {
                 n += 1;
             }
             let speed = max_or_nan(state.u.iter().zip(&state.v).map(|(u, v)| u.hypot(*v)));
-            println!("terrace patch (about rest: {about_rest}): {speed:.2e} m/s after {until} h");
+            let anomaly = max_or_nan(
+                state
+                    .temp
+                    .iter()
+                    .zip(&rest.temp)
+                    .map(|(a, b)| (a - b).abs()),
+            );
+            println!(
+                "terrace patch (about rest: {about_rest}): {speed:.2e} m/s, |δT| {anomaly:.2e} °C                  after {until} h"
+            );
             speeds.push(speed);
         }
         speeds
+    }
+
+    /// Probe (TODO P1.3): [`terrace_patch_run`] with the scheme from
+    /// `DGRS_VADV` (as [`probe_terrace_spectrum`]), the weight `DGRS_WEIGHT`,
+    /// to the hours `DGRS_HOURS` ("1,2,4,6,8").
+    #[test]
+    #[ignore = "probe: the terrace fixture at rest over hours"]
+    fn probe_terrace_run() {
+        set_curvature_weight();
+        let scheme = match std::env::var("DGRS_VADV").as_deref() {
+            Ok("centred") => Some(VerticalAdvection::Centred),
+            Ok("akima") => Some(VerticalAdvection::Akima),
+            Ok("hermite") => Some(VerticalAdvection::HermiteMean),
+            Ok("upwind") => Some(VerticalAdvection::Upwind),
+            Ok("tvd") => Some(VerticalAdvection::Tvd),
+            _ => None,
+        };
+        let about_rest = std::env::var("DGRS_VREF").is_ok_and(|v| v == "1");
+        let hours: Vec<f64> = std::env::var("DGRS_HOURS")
+            .unwrap_or_else(|_| "1,2,4,6,8".into())
+            .split(',')
+            .map(|h| h.parse().expect("DGRS_HOURS"))
+            .collect();
+        terrace_patch_run(scheme, about_rest, &hours);
     }
 
     /// TODO P1.3 gate: the 36-min mode of the smoothed Frøya coastline mesh
@@ -2849,11 +2920,31 @@ mod tests {
     /// pycnocline at the rate of a perturbation's vertical flow, which drives
     /// the perturbation (`the_default_vertical_scheme_grows_on_the_terrace`).
     /// Reconstructed about the rest state (`with_vertical_reference`), the
-    /// background is advected centred and the patch stays at rest: measured
-    /// 4.0e-7 → 3.6e-7 m/s from 2 to 4 h (the seed's own transient).
+    /// background is advected centred and the 36-min mode is gone: measured
+    /// 4.0e-7 → 3.6e-7 m/s from 2 to 4 h (the seed's own transient). It is not
+    /// at rest for good: a slower mode emerges after ≈ 5 h (the ignored gate
+    /// below).
     #[test]
     fn a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference() {
         let speeds = terrace_patch_at_rest(true, &[1.0, 3.0]);
+        assert!(
+            speeds[1] < 2.0 * speeds[0],
+            "about the rest state the terrace grew: {speeds:?}"
+        );
+    }
+
+    /// TODO P1.3 gate (fails today): the terrace about its reference over
+    /// 12 h. The gate above ends at 3 h, before a slower oscillatory mode
+    /// emerges from the seed's transient: e-folding ≈ 2 h, period ≈ 3.2 h,
+    /// in levels 2–4 of the 22.6–30.6 m terrace element and its deeper
+    /// neighbour (`probe_terrace_spectrum` with `DGRS_VREF=1`; measured
+    /// 3.6e-7 m/s at 4 h, 1.3e-5 m/s at 12 h). The same vertex grows on the
+    /// 95-element patch of the coastline mesh, so it is not the fixture's
+    /// walls.
+    #[test]
+    #[ignore = "known failure, TODO P1.3: the terrace grows about its reference after ≈ 5 h"]
+    fn a_terrace_beside_a_shore_element_stays_at_rest_for_twelve_hours() {
+        let speeds = terrace_patch_at_rest(true, &[3.0, 12.0]);
         assert!(
             speeds[1] < 2.0 * speeds[0],
             "about the rest state the terrace grew: {speeds:?}"
@@ -2903,13 +2994,24 @@ mod tests {
 
     /// Probe (TODO P1.3): the leading eigenvalues of the linearised step map
     /// about rest on the terrace fixture, by Arnoldi on finite differences
-    /// of `DGRS_SPECTRUM_SECONDS` (600 s) of 5 s steps, `DGRS_KRYLOV` (24)
-    /// vectors. The vertical tracer scheme from `DGRS_VADV` (centred,
-    /// akima, hermite, upwind, tvd; default LimitedAkima), about the rest
-    /// state with `DGRS_VREF=1`. Prints the growth rates (e-folding) and
-    /// frequencies of the Ritz values. Upwind-type schemes are only
+    /// of `DGRS_SPECTRUM_SECONDS` (1800 s) of `DGRS_DT` (5 s) steps,
+    /// `DGRS_KRYLOV` (30) vectors. The vertical tracer scheme from
+    /// `DGRS_VADV` (centred, akima, hermite, upwind, tvd; default
+    /// LimitedAkima), `hermite` with Akima's curvature correction at the
+    /// weight `DGRS_WEIGHT` (½), about the rest state with `DGRS_VREF=1`,
+    /// another exported patch from `DGRS_FIXTURE`, the dissipation from
+    /// `DGRS_KV`, `DGRS_KT`, `DGRS_SMAG`. Prints the growth rates
+    /// (e-folding), frequencies and relative residuals of the Ritz values,
+    /// and where the leading modes live. Upwind-type schemes are only
     /// positively homogeneous about rest (`|Ω|`), so their Ritz values are
     /// those of one linearisation, along the Krylov directions.
+    ///
+    /// Trust only Ritz values with a small residual: the weakly damped
+    /// internal waves crowd the unit circle over short horizons. At 600 s
+    /// and 24 vectors (the first settings) the residuals were 0.2–0.4 and
+    /// the leading modes were missed (centred "8.8 h", where it has a 2 h
+    /// pair); from 1800 s the rates agree across horizons and with time
+    /// integration (`probe_terrace_run`).
     #[test]
     #[ignore = "probe: the spectrum of the terrace fixture at rest"]
     fn probe_terrace_spectrum() {
@@ -2922,16 +3024,59 @@ mod tests {
             _ => None,
         };
         let about_rest = std::env::var("DGRS_VREF").is_ok_and(|v| v == "1");
-        let env = |key: &str, default: f64| {
-            std::env::var(key)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(default)
-        };
-        let horizon = env("DGRS_SPECTRUM_SECONDS", 600.0);
-        let m = env("DGRS_KRYLOV", 24.0) as usize;
-        let dt = 5.0;
+        set_curvature_weight();
         let (physics, rest) = terrace_patch_physics(scheme, about_rest);
+        print_spectrum(
+            &physics,
+            &rest,
+            &format!("terrace {scheme:?} about rest {about_rest}"),
+        );
+    }
+
+    /// DGRS_WEIGHT: the weight of Akima's curvature correction in the
+    /// `hermite` scheme (0 centred, ½ the Hermite mean, 1 Akima).
+    fn set_curvature_weight() -> f64 {
+        let weight = env_or("DGRS_WEIGHT", 0.5);
+        crate::solver::rhs::transport_3d::CURVATURE_WEIGHT
+            .store(weight.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        weight
+    }
+
+    /// Probe (TODO P1.3): [`probe_terrace_spectrum`] on a channel of
+    /// `DGRS_SLICE_DX` (200 m) P2 elements, 8 long and 1 wide (walls), with a
+    /// `tanh` step inside element 3 from `DGRS_SLICE` = "left:right" bed
+    /// elevations ("-30.6:-22.6"), under the summer pycnocline in T alone,
+    /// steps of `DGRS_DT` (5 s).
+    #[test]
+    #[ignore = "probe: the spectrum of a slice at rest"]
+    fn probe_slice_spectrum() {
+        set_curvature_weight();
+        let spec = std::env::var("DGRS_SLICE").unwrap_or_else(|_| "-30.6:-22.6".into());
+        let (left, right) = spec.split_once(':').expect("DGRS_SLICE left:right");
+        let (left, right): (f64, f64) = (left.parse().unwrap(), right.parse().unwrap());
+        let dx = env_or("DGRS_SLICE_DX", 200.0);
+        let nx = env_or("DGRS_SLICE_NX", 8.0) as usize;
+        let mesh = Mesh2D::uniform_rectangle(0.0, nx as f64 * dx, 0.0, dx, nx, 1);
+        let eos = LinearEOS::default();
+        let pycnocline = |z: f64| {
+            let (t, s) = summer_pycnocline(&eos, z);
+            eos.rho0 * (1.0 - eos.alpha * (t - eos.t0) + eos.beta * (s - eos.s0))
+        };
+        let step = |x: f64| {
+            let t = (x / dx - 3.0).clamp(0.0, 1.0);
+            right + (left - right) * 0.5 * (1.0 - (8.0 * (t - 0.5)).tanh())
+        };
+        let (physics, rest) = basin_physics(mesh, |x, _| step(x), None, pycnocline);
+        print_spectrum(&physics, &rest, &format!("slice {left}:{right} dx {dx}"));
+    }
+
+    /// The leading eigenvalues of the step map about `rest` (see
+    /// [`probe_terrace_spectrum`]) and where the leading modes live.
+    fn print_spectrum(physics: &Physics, rest: &Solution3D, label: &str) {
+        let weight = env_or("DGRS_WEIGHT", 0.5);
+        let horizon = env_or("DGRS_SPECTRUM_SECONDS", 1800.0);
+        let m = env_or("DGRS_KRYLOV", 30.0) as usize;
+        let dt = env_or("DGRS_DT", 5.0);
         let steps = (horizon / dt).round() as usize;
         // The step map over the horizon, from a fresh integrator each time
         let advance = |x: &[f64]| -> Vec<f64> {
@@ -2940,7 +3085,7 @@ mod tests {
             let mut integrator = ModeSplitIntegrator::new();
             for n in 0..steps {
                 physics.update_density(&mut state);
-                integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                integrator.step(&mut state, physics, dt, n as f64 * dt);
                 physics.post_process(&mut state);
             }
             let mut out = Vec::new();
@@ -2948,7 +3093,7 @@ mod tests {
             out
         };
         let mut x0 = Vec::new();
-        pack(&rest, &mut x0);
+        pack(rest, &mut x0);
         let base = advance(&x0);
         let n = x0.len();
         // Perturbations of 1e-6 in the norm's units (velocities in m/s,
@@ -2998,13 +3143,25 @@ mod tests {
             basis.push(w);
         }
         let hessenberg = faer::Mat::<f64>::from_fn(size, size, |i, j| h[i][j]);
-        let mut ritz = hessenberg.eigenvalues().expect("Hessenberg eigenvalues");
-        ritz.sort_by(|a, b| (b.re.hypot(b.im)).total_cmp(&a.re.hypot(a.im)));
+        let eigen = hessenberg.eigen().expect("Hessenberg eigendecomposition");
+        let values = eigen.S().column_vector();
+        let vectors = eigen.U();
+        let mut order: Vec<usize> = (0..size).collect();
+        order.sort_by(|&a, &b| {
+            (values[b].re.hypot(values[b].im)).total_cmp(&values[a].re.hypot(values[a].im))
+        });
         println!(
-            "SPECTRUM scheme {scheme:?} about rest {about_rest}: {size} Ritz values of the \
-             {horizon} s map ({n} unknowns)"
+            "SPECTRUM {label} weight {weight} KV {} KT {} \
+             SMAG {}: {size} Ritz values of the {horizon} s map ({n} unknowns)",
+            env_or("DGRS_KV", 1e-3),
+            env_or("DGRS_KT", 0.0),
+            env_or("DGRS_SMAG", 0.1)
         );
-        for mu in ritz.iter().take(10) {
+        let (ne, nn, nl) = (rest.n_elements, rest.n_nodes, rest.n_levels);
+        let field = ne * nn * nl;
+        let bathymetry = physics.bathymetry.clone();
+        for (rank, &k) in order.iter().take(10).enumerate() {
+            let mu = values[k];
             let modulus = mu.re.hypot(mu.im);
             let rate = modulus.ln() / horizon;
             let efold = if rate > 0.0 {
@@ -3012,11 +3169,85 @@ mod tests {
             } else {
                 f64::INFINITY
             };
+            // Ritz residual ‖M x − μ x‖ = h_{m+1,m} |y_m| (unit y)
+            let y = vectors.col(k);
+            let y_norm = (0..size)
+                .map(|i| y[i].re * y[i].re + y[i].im * y[i].im)
+                .sum::<f64>()
+                .sqrt();
+            let residual = if size == m {
+                h[m][m - 1] * y[m - 1].re.hypot(y[m - 1].im) / y_norm / modulus
+            } else {
+                0.0
+            };
             println!(
                 "  |μ| {modulus:.6}: growth {rate:+.3e} /s (e-folding {efold:.1} min), \
-                 frequency {:.3e} rad/s",
+                 frequency {:.3e} rad/s, relative residual {residual:.1e}",
                 mu.im.atan2(mu.re) / horizon
             );
+            if rank >= 3 || mu.im < 0.0 {
+                continue;
+            }
+            // Where the Ritz vector lives: |x|² by (element, level), split
+            // into velocity, tracers and the barotropic fields
+            let mut x = vec![(0.0, 0.0); n];
+            for (j, q) in basis.iter().take(size).enumerate() {
+                let (yr, yi) = (y[j].re, y[j].im);
+                for (xi, &qi) in x.iter_mut().zip(q) {
+                    xi.0 += yr * qi;
+                    xi.1 += yi * qi;
+                }
+            }
+            let power = |i: usize| x[i].0 * x[i].0 + x[i].1 * x[i].1;
+            let mut velocity = vec![0.0; ne * nl];
+            let mut tracer = vec![0.0; ne * nl];
+            let mut barotropic = 0.0;
+            for i in 0..n {
+                if i < 4 * field {
+                    let (f, r) = (i / field, i % field);
+                    let (e, l) = (r / (nn * nl), r % nl);
+                    if f < 2 {
+                        velocity[e * nl + l] += power(i);
+                    } else {
+                        tracer[e * nl + l] += power(i);
+                    }
+                } else {
+                    barotropic += power(i);
+                }
+            }
+            let (sv, st): (f64, f64) = (velocity.iter().sum(), tracer.iter().sum());
+            let total = sv + st + barotropic;
+            println!(
+                "    velocity {:.3}, tracers {:.3}, barotropic {:.3} of |x|²",
+                sv / total,
+                st / total,
+                barotropic / total
+            );
+            for (name, part, sum) in [("velocity", &velocity, sv), ("tracers", &tracer, st)] {
+                let mut top: Vec<(f64, usize)> =
+                    part.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+                top.sort_by(|a, b| b.0.total_cmp(&a.0));
+                let mut by_level = vec![0.0; nl];
+                for (i, &p) in part.iter().enumerate() {
+                    by_level[i % nl] += p / sum;
+                }
+                let line: Vec<String> = top
+                    .iter()
+                    .take(5)
+                    .map(|&(p, i)| {
+                        let (e, l) = (i / nl, i % nl);
+                        let depths = (0..nn)
+                            .map(|j| rest.eta.data[e * nn + j] - bathymetry.data[e * nn + j]);
+                        let (lo, hi) = depths.fold((f64::INFINITY, 0.0_f64), |(lo, hi), d| {
+                            (lo.min(d), hi.max(d))
+                        });
+                        format!("e{e} l{l} {:.2} ({lo:.1}–{hi:.1} m)", p / sum)
+                    })
+                    .collect();
+                let levels: Vec<String> = by_level.iter().map(|p| format!("{p:.2}")).collect();
+                println!("    {name}: {}", line.join(", "));
+                println!("    {name} by level (bed first): {}", levels.join(" "));
+            }
         }
     }
 

@@ -145,18 +145,14 @@ From round-off, centred and the Hermite mean show no exponential mode in 8.8 h o
 
 **Why.** At rest `Ω̄ = 0`. To first order a scheme then acts only through the surface value `C̄*` it gives the *background* at each σ-surface, multiplied by the perturbation's `δΩ`. How the perturbation itself is reconstructed is second order. Centred takes the arithmetic mean of the two layers. Upwind takes the upwind layer's value, which is the mean plus `½|δΩ|ΔC̄`: it mixes the background stratification at a rate set by the perturbation's own vertical flow. The mixing makes a density anomaly, its pressure gradient drives flow, and that flow's `|Ω|` mixes more. In the continuum the mixing does not depend on the flow it causes, so this feedback has no physical counterpart. TVD and LimitedAkima clip where the profile curves, at the pycnocline's foot, and so act partly the same way. Akima is linear and non-dissipative, but it moves the surface value off the mean by a curvature term, `h(d_{l−1} − d_l)/6` on uniform levels, and grows as an oscillatory pair.
 
-**Energy is not the edge.** The exact vertical partner of the PGF's Hermite pressure integral is the Hermite mean, `½(C_{l−1} + C_l) + h(d_{l−1} − d_l)/12`: the mean of the pressure integral's cubic between the two layer centres. On uniform levels it is centred plus half of Akima's curvature correction. The spectrum below sweeps that correction's weight `c` (0 centred, ½ the Hermite mean, 1 Akima):
+**Energy is not the edge, and there is no band (corrected 2026-10-10).** The exact vertical partner of the PGF's Hermite pressure integral is the Hermite mean, `½(C_{l−1} + C_l) + h(d_{l−1} − d_l)/12`: the mean of the pressure integral's cubic between the two layer centres. On uniform levels it is centred plus half of Akima's curvature correction. A first sweep of that correction's weight `c` (0 centred, ½ the Hermite mean, 1 Akima) seemed to show a stable band from 0 to 0.75. Its Ritz values were not converged (see the spectrum below). Converged, every `c` grows on the fixture, through two branches that cross near c ≈ 0.3:
 
-| c | leading growth |
-|---|---|
-| −0.5 | oscillatory pair, 91 min |
-| 0 | real, 8.8 h |
-| 0.25 | real, 8.4 h |
-| 0.5 | real, 7.2 h |
-| 0.75 | real, 5.5 h |
-| 1 | oscillatory pair, 66 min |
+| c | −1 | −0.5 | −0.25 | 0 | 0.25 | 0.5 | 0.75 | 1 | 1.5 |
+|---|---|---|---|---|---|---|---|---|---|
+| e-folding (min) | 45 | 60 | 78 | 116 | 158 | 91 | 65 | 52 | 39 |
+| type | pair | pair | pair | pair | pair | real | real | real | real |
 
-A band from below centred to beyond the energy partner holds, and a correction as large as Akima's in either direction grows. Exact energy exchange is neither needed nor the boundary. What the band's edges are set by is open. The candidate is the weighted norm in which the linearised operator is dissipative (Bell, Peixoto & Thuburn 2017), which the harness's Krylov basis could approximate. Upwind and the limiters fail differently, through `|δΩ|`.
+The real branch (bed levels 0–2 of the terrace element and the shore element beside it) is this section's mechanism, fed by the curvature term. The oscillatory branch (levels 2–4 of the terrace element and its deeper neighbour, period ≈ 3 h at c = 0) is damped as c rises but is there at every c tried. A flat column with the same levels, pycnocline, pressure integral and surface values (`scripts/column_modes.py`) is neutral for every c in [−1, 1.5]: its internal modes stay real and distinct, so the modal energy is a conserved norm at every c. A fully wet slice with the same terrace inside one element is stable at c = 0 and 1. So the weighted norm the earlier note asked for exists wherever the scheme acts alone. The growth needs the terrace beside a shore element, and its mechanism is open (TODO P1.3). Upwind and the limiters fail differently, through `|δΩ|`.
 
 **Reconstruction about a reference: `Hydrostatic3D::with_vertical_reference`.** It stores T and S per node and level, at rest (`with_vertical_reference(state)`) or from a z-profile sampled at the levels (`with_vertical_reference_profile`). At every σ-surface the scheme's value is corrected by the share `ψ` of the reference's own departure from the centred value: `C_s = V(C)_s − ψ[V(C_ref)_s − ½(C_ref,l−1 + C_ref,l)]`, with `ψ = clamp(ΔC/ΔC_ref, 0, 1)`. The correction moves the value towards the column's centred one, never past it.
 - **At rest** `ψ = 1`, so the background's flux is centred to first order.
@@ -165,23 +161,23 @@ A band from below centred to beyond the energy partner holds, and a correction a
 - **Fronts:** jumps beyond the reference's keep the limiter.
 - **Moving references:** `set_vertical_reference` refreshes it, and `with_vertical_reference_timescale(τ)` relaxes it towards the state at every step of `Simulation3D`.
 
-On the patch, upwind, TVD, Akima and LimitedAkima about the rest state all give centred's numbers. The gates are `a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference` and the transport unit tests (centred at the reference, constancy, the scaled stratification, a bounded front).
+On the patch, upwind, TVD, Akima and LimitedAkima about the rest state all give centred's numbers, which removes the 36-min mode but not the slower oscillatory one (≈ 2 h, below). The gates are `a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference` and the transport unit tests (centred at the reference, constancy, the scaled stratification, a bounded front).
 
 ### The spectrum
 
-`probe_terrace_spectrum` (ignored test) runs Arnoldi with 24 vectors on finite differences of the 600 s step map, about rest on a 22-element fixture: the elements within 400 m of 11048, which hold the mode on their own (`tests/data/froya_terrace_patch.txt`, 16k unknowns). It reports the leading Ritz values. For upwind and the limited schemes the map is only positively homogeneous (`|Ω|`), so their values describe one linearisation and are indicative.
+`probe_terrace_spectrum` (ignored test) runs Arnoldi on finite differences of the step map, about rest on a 22-element fixture: the elements within 400 m of 11048, which hold the mode on their own (`tests/data/froya_terrace_patch.txt`, 16k unknowns). It reports the leading Ritz values with their relative residuals and where the leading modes live. For upwind and the limited schemes the map is only positively homogeneous (`|Ω|`), so their values describe one linearisation and are indicative.
+
+The first table here used a 600 s map and 24 vectors. Its residuals (printed since 2026-10-10) were 0.2–0.4: over 10 min the weakly damped internal waves crowd the unit circle, and the leading modes were missed. That table gave centred 8.8 h, the Hermite mean 7.2 h, and LimitedAkima about the rest state 8.8 h. From an 1800 s map the rates agree across horizons (600 s with 60 vectors, 1800 s, 3600 s) and with time integration of the seeded fixture. The defaults are now 1800 s and 30 vectors:
 
 | vertical tracer scheme | leading growth (e-folding) |
 |---|---|
-| upwind | 10 min (real; seeded runs: 26–36 min) |
-| TVD | 21 min (real) |
-| LimitedAkima | 30 min (real), then a pair at 74 min |
-| Akima | 66 min (oscillatory pair, period 1.8 h) |
-| Hermite mean | 7.2 h (real) |
-| centred | 8.8 h (real) |
-| LimitedAkima about the rest state | 8.8 h (as centred) |
+| LimitedAkima | 33 min (real; on the 19 m free-depth fixture) |
+| Akima weight 1 (`hermite`, `DGRS_WEIGHT=1`) | 52 min (real) |
+| Hermite mean | 91 min (real), then real modes at 100 and 137 min |
+| centred | 116 min (pair, period 3.2 h) |
+| LimitedAkima about the rest state | 115 min (pair, as centred); 142 min on the 19 m free-depth fixture |
 
-The slow real mode of centred and the Hermite mean (7–9 h) does not depend on the vertical scheme. It is probably the straddle mechanism, weakened by the smoothing.
+The integrated fixture agrees: about the reference it holds at the seed's transient (≈ 4e-7 m/s) for ≈ 5 h, then grows to 1.3e-5 m/s at 12 h. The gate `a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference` ends at 3 h. Its 12 h companion is an ignored known failure. The same vertex grows on the 95-element patch of the coastline mesh when seeded (`froya_real_data … debug_3d=…,perturb=1e-6`), so it is not the fixture's walls. From round-off a 2 h mode needs a day to show, which is why the 8.8 h round-off runs saw nothing.
 
 ### Two mechanisms, not one
 

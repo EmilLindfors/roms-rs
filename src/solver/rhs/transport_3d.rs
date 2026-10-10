@@ -1335,10 +1335,11 @@ impl VerticalAdvection {
             Self::HermiteMean if nl > 1 => {
                 // Akima's slopes are the pressure integral's harmonic means
                 akima_surface_values(column, d_sigma, slope, surface);
+                let weight = curvature_weight();
                 for l in 1..nl {
                     let h = 0.5 * (d_sigma[l - 1] + d_sigma[l]);
-                    surface[l] =
-                        0.5 * (column[l - 1] + column[l]) + h * (slope[l - 1] - slope[l]) / 12.0;
+                    surface[l] = 0.5 * (column[l - 1] + column[l])
+                        + weight * h * (slope[l - 1] - slope[l]) / 6.0;
                 }
             }
             Self::LimitedAkima if nl > 1 => {
@@ -1383,6 +1384,22 @@ impl VerticalAdvection {
             Self::Akima | Self::LimitedAkima | Self::HermiteMean => {}
         }
     }
+}
+
+/// Experiment (TODO P1.3): the weight of Akima's curvature correction in
+/// [`VerticalAdvection::HermiteMean`] (½), settable from tests.
+#[cfg(test)]
+pub(crate) static CURVATURE_WEIGHT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x3FE0_0000_0000_0000);
+
+#[cfg(test)]
+fn curvature_weight() -> f64 {
+    f64::from_bits(CURVATURE_WEIGHT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(not(test))]
+fn curvature_weight() -> f64 {
+    0.5
 }
 
 /// The layers around σ-surface `l` of a column of `nl` for the volume flux
