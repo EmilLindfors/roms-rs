@@ -943,7 +943,7 @@ mod tests {
             .fold(0.0, |m, f| if f.is_nan() || f > m { f } else { m })
     }
 
-    /// The review's fjord (REVIEW.md §3.3): the bed drops from 30 to 400 m
+    /// The review's fjord (notes/review-2026-09-25.md §3.3): the bed drops from 30 to 400 m
     /// over ≈ 1.5 km.
     fn fjord_bed(x: f64, _y: f64) -> f64 {
         -(30.0 + 185.0 * (1.0 + ((x - 1500.0) / 375.0).tanh()))
@@ -957,7 +957,7 @@ mod tests {
     /// TODO P4.3 gate: constant N² at rest over the steep fjord slope, at
     /// every order and for stretched levels, is balanced to round-off in
     /// both forms (the old element-local σ form: 2.6e-6 m/s² for
-    /// N² = 1e-4 s⁻² on a 30→400 m slope at every resolution, REVIEW.md
+    /// N² = 1e-4 s⁻² on a 30→400 m slope at every resolution, notes/review-2026-09-25.md
     /// §3.3(a); σ-pairs integrate a linear profile exactly).
     #[test]
     fn constant_n2_at_rest_is_balanced_over_a_steep_slope() {

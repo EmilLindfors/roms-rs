@@ -37,13 +37,20 @@ This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean 
 
 ### Note Down Opportunities
 The crate is at an early stage, so experimenting is welcome. While working on any task, watch for opportunities: suboptimal code, better approaches, simplifications, in the numerics, performance (e.g. how parallel code is run), API shape or duplicated paths.
-- **Note them in `TODO.md`**: one checkbox each, under the matching priority section (not a separate list), with a measurement or a concrete pointer (file, function) where you have one.
+- **Note them in `TODO.md`**: one checkbox line each, starting with the item's ID, under the matching area (not a separate list). Put the measurement or the concrete pointer (file, function) and the reasoning in that `notes/<area>.md` file when it needs more than the line.
 - **Report them**: list what you noted in the end-of-task summary.
+
+### Roadmap and notes
+- `TODO.md` holds **open items only**, one line each, with an ID (P1.3, F.4, …) and a pointer into `notes/`.
+- `notes/` holds the context, one file per area (index in `notes/README.md`): findings, measurements, decisions, dead ends, finished work. Before starting on an item, read its notes file.
+- When an item is done, delete its `TODO.md` line and record the outcome (date, PR, numbers) under its heading in the notes file; notable changes also go in `CHANGELOG.md`.
 
 ## Architecture Overview
 
-See `OUTLINE.md` for the full annotated module tree and layer-by-layer status,
-and `REVIEW.md` for the current health assessment and prioritized fix plan.
+See `docs/architecture.md` for the full annotated module tree and layer-by-layer
+status, `docs/accuracy.md` for verified convergence and conservation, and
+`TODO.md` + `notes/` for the open work and its context (the 2026-09-25 review
+that set the direction is `notes/review-2026-09-25.md`).
 
 ```
 src/
@@ -63,8 +70,10 @@ src/
 ├── vertical/       # Sigma grid, stretching functions (3D)
 ├── physics/        # PhysicsModule trait, SWEPhysics2D, Hydrostatic3D,
 │                   # vertical mixing/diffusion/velocity
+├── tides/          # Tidal astronomy (V₀, nodal f/u)
 ├── simulation/     # Simulation / Simulation3D runners
-├── particles/      # Lagrangian particle tracking (RK4, random walk, walls)
+├── waves/          # Spectral wave model (action balance on the DG mesh)
+├── particles/      # Lagrangian particle tracking (2D/3D, lice behaviour)
 ├── io/             # NetCDF, VTK, GeoTIFF, coastline, projections, obs readers
 └── analysis/       # Harmonic analysis, skill metrics, tide gauge, ADCP
 ```
@@ -98,11 +107,12 @@ src/
 
 ### Extending the 3D layer
 The 3D solver is ROMS-style: 2D DG horizontal × finite-difference vertical on
-sigma coordinates with mode splitting (see `3D_TODO.md`). When working there:
+sigma coordinates with mode splitting (open work: `TODO.md` P4; context:
+`notes/3d-*.md`). When working there:
 - Depth convention is `h = eta - B` with `B` = bed elevation (negative under water) — everywhere
-- New vertical/3D discretizations need convergence + conservation tests before merge (the layer is currently under-tested; see `REVIEW.md` §6.1)
+- New vertical/3D discretizations need convergence + conservation tests before merge (the existing gates are listed in `notes/3d-validation.md`)
 - Layer-thickness (Hz) weighted fluxes for anything advected; divide back to concentration/velocity after
-- Known open numerics: tracer constancy / consistent 2D–3D transport (`REVIEW.md` §3.1), balanced baroclinic PGF (§3.3), once-per-step forward-backward barotropic subcycling and a `rufrc`-style G-term (§2)
+- Known open numerics: see `TODO.md` P4 (the history is in `notes/3d-*.md`)
 
 ## Norwegian Coast Specifics
 
@@ -132,7 +142,7 @@ Before any PR:
 - [ ] `cargo test` passes (all tests)
 - [ ] `cargo test --features parallel` passes
 - [ ] `cargo clippy` has no warnings
-- [ ] Convergence rates match theory (check ACCURACY.md)
+- [ ] Convergence rates match theory (check `docs/accuracy.md`)
 - [ ] No new allocations in hot paths (check with profiler if unsure)
 - [ ] `CHANGELOG.md` is updated for notable numerical, API, dependency, or documentation changes
 

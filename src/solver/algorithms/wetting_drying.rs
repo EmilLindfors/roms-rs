@@ -31,7 +31,7 @@
 //!    and r = 0 for h ≥ h_dry, discretized as `hu ← hu / (1 + Δt r(h))`. It
 //!    replaces multiplying hu by a blending factor α(h) after every stage,
 //!    whose damping per unit time grew as Δt shrank and which erased currents
-//!    up to 10·h_min deep (REVIEW.md §1.7). Bottom friction laws and net-cage
+//!    up to 10·h_min deep (notes/review-2026-09-25.md §1.7). Bottom friction laws and net-cage
 //!    drag (`CageDrag2D`) are applied in the same implicit update.
 //!
 //! Water at least h_dry deep is never touched by 2. or 3.
@@ -576,7 +576,7 @@ mod tests {
     #[test]
     fn test_correction_keeps_lake_at_rest_shoreline() {
         // The old correction rescaled every depth of an element with a clipped
-        // node, lowering its wet nodes in every stage (REVIEW.md §1.5).
+        // node, lowering its wet nodes in every stage (notes/review-2026-09-25.md §1.5).
         let ops = DGOperators2D::new(3);
         let config = WetDryConfig::default();
         let mut solution = SWESolution2D::new(1, ops.n_nodes);

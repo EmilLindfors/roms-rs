@@ -38,7 +38,7 @@
 //! - **Entropy**: `EntropyConservative` conserves the total energy
 //!   `∫ ½h|u|² + ½gh² + ghB` on periodic domains (up to round-off);
 //!   `EntropyStable` dissipates it at faces. The split form also removes the
-//!   aliasing of the collocated nonlinear flux derivative (REVIEW.md §1.6).
+//!   aliasing of the collocated nonlinear flux derivative (notes/review-2026-09-25.md §1.6).
 //!
 //! # Wetting and drying (`SWEFormulation2D::WetDry`)
 //!
@@ -1074,9 +1074,10 @@ mod tests {
 
     #[test]
     fn test_lake_at_rest_any_nodal_bathymetry() {
-        // REVIEW.md §1.1: the collocated scheme balances only deg B ≤ p/2. The split
-        // form must balance smooth high-degree, cell-averaged and rough nodal beds,
-        // with periodic and reflective-wall boundaries.
+        // notes/review-2026-09-25.md §1.1: the collocated scheme balances only
+        // deg B ≤ p/2. The split form must balance smooth high-degree,
+        // cell-averaged and rough nodal beds, with periodic and reflective-wall
+        // boundaries.
         let equation = ShallowWater2D::new(G);
         let bc = Reflective2D::new();
         for order in 1..=4 {

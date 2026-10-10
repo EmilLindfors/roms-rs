@@ -3,7 +3,7 @@
 Literature and analysis for TODO P1.3's open blocker: a stratified fluid at
 rest does not stay at rest where σ-levels cross the pycnocline inside an
 element (cliffs, steep shores). The experiments and their numbers are in
-TODO.md P1.3; this note collects what the literature says, why each cure
+`notes/geometry-mesh.md` (P1.3); this note collects what the literature says, why each cure
 tried so far fails, and what a research-grade cure would have to do.
 Written 2026-10-04.
 
