@@ -2793,7 +2793,7 @@ mod tests {
 
     #[test]
     fn test_positivity_cfl_values() {
-        // (2N+1)/(2N(N+1)): REVIEW.md §1.7 quotes 0.75 / 0.42 / 0.29 / 0.23.
+        // (2N+1)/(2N(N+1)): notes/review-2026-09-25.md §1.7 quotes 0.75 / 0.42 / 0.29 / 0.23.
         let expected = [0.75, 5.0 / 12.0, 7.0 / 24.0, 9.0 / 40.0];
         for (n, &e) in (1..=4).zip(&expected) {
             assert!((positivity_cfl_swe_2d(n) - e).abs() < 1e-15);
@@ -3352,8 +3352,8 @@ mod tests {
 
     #[test]
     fn test_mass_conservation_hydrostatic_reconstruction_discontinuous_bathymetry() {
-        // Regression (REVIEW.md §1.3): with cell-averaged B the reconstruction is
-        // active at every face. Evaluating the interior flux on the reconstructed
+        // Regression (notes/review-2026-09-25.md §1.3): with cell-averaged B the
+        // reconstruction is active at every face. Evaluating the interior flux on the reconstructed
         // state broke the SBP telescoping and leaked ≈5e-5 of the total mass per
         // second on this configuration.
         use crate::source::BathymetrySource2D;

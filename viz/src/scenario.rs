@@ -9,7 +9,8 @@
 //!   on the coastline-fitted mesh (`mesh=`): the bed from Kartverket's topobathy model,
 //!   projected onto the nodes, and NorKyst-800 boundary tides from the tidal atlas
 //!   (`BoundaryTides`), on a clock starting 2025-06-15. The data files are those of the
-//!   example (untracked, in `data/`; see `TODO.md` P1.6 and P3.1 for how to fetch them).
+//!   example (untracked, in `data/`; see `notes/inputs-forcing.md` and
+//!   `notes/validation.md` for how to fetch them).
 //! - [`Scenario::farm_channel`] is the stratified tidal channel of `examples/farm_3d.rs`,
 //!   run by the 3D model ([`ThreeD`]): 6 km long (periodic along it), 600 m wide and
 //!   40 m deep, 2 °C warmer over the top 10 m, an M2 current of ≈ 0.5 m/s driven by a

@@ -12,7 +12,7 @@
 //!
 //! Positivity is enforced towards h ≥ 0, not towards a minimum depth: raising
 //! nodes to h_min > 0 lowers the wet nodes of a partially dry element (mass is
-//! kept) and so breaks lake at rest at every shoreline (REVIEW.md §1.5).
+//! kept) and so breaks lake at rest at every shoreline (notes/review-2026-09-25.md §1.5).
 //! With a positivity-preserving interface flux (HLL, Rusanov; not Roe) and
 //! `CFL ≤ positivity_cfl_swe_2d(N)`, the cell means stay non-negative, so the
 //! limiter never has to create mass. The limiters return the number of
@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_positivity_keeps_lake_at_rest_shoreline() {
-        // REVIEW.md §1.5: limiting towards h ≥ h_min put a film on the dry
+        // notes/review-2026-09-25.md §1.5: limiting towards h ≥ h_min put a film on the dry
         // nodes of a shoreline element and lowered its wet nodes, in every
         // stage. Towards h ≥ 0, a lake at rest (h = max(0, η − B)) is untouched,
         // also when the element mean is below the dry threshold.
