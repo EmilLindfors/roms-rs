@@ -952,6 +952,7 @@ impl WaveModel2D {
         let breaking = breaking.map(|h| {
             let terms = SourceTerms::none(self.sources.g)
                 .with_breaking(self.sources.breaking)
+                .with_depth_limit(self.sources.depth_limit)
                 .with_integration(self.sources.integration);
             (terms, h)
         });

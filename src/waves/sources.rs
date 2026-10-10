@@ -23,6 +23,13 @@
 //!   `D = −¼ α Q_b (σ̃/2π) H_max²`, `H_max = γ d`, `α = 1`, `γ = 0.73`, with the
 //!   fraction of breaking waves from `(1 − Q_b)/ln Q_b = −(H_rms/H_max)²`, spread
 //!   over the spectrum in proportion to `E`: `B_br = D / m_0` (`σ̃ = m_1/m_0`).
+//!   Its dissipation saturates at `Q_b = 1`, `H_rms = H_max`, where it is
+//!   `¼ α (σ̃/2π) H_max²` whatever the energy, so in a few decimetres of
+//!   water it cannot remove a sea that the propagation brings in (2 m of H_s
+//!   in 0.11 m loses ≈ 6e-4 of its energy per second). The depth limit
+//!   ([`SourceTerms::with_depth_limit`]) scales the spectrum down to that
+//!   state after every step, `m_0 ≤ (γ d)²/8`: no more than every wave
+//!   breaking, the edge of Battjes and Janssen's model.
 //! - **Quadruplets** by the DIA ([`super::nonlinear`]), scaled for finite depth by
 //!   `R(0.75 k̃ d)`. They are not of the form `A + B E`: each component's gain
 //!   joins `A` and its loss `B` (as the rate `S_nl/E`), both frozen over the step.
@@ -194,6 +201,9 @@ pub struct SourceTerms {
     pub bottom_friction: Option<f64>,
     /// Battjes–Janssen breaking: `α`, `γ`
     pub breaking: Option<(f64, f64)>,
+    /// With breaking, the spectrum scaled down to `H_rms ≤ γ d` after every
+    /// step ([`Self::with_depth_limit`])
+    pub depth_limit: bool,
     /// Quadruplet interactions (DIA)
     pub quadruplets: Option<Quadruplets>,
     /// Power `p` of the diagnostic `σ^(−p)` tail, or no tail
@@ -272,6 +282,7 @@ impl SourceTerms {
             whitecapping: None,
             bottom_friction: None,
             breaking: None,
+            depth_limit: false,
             quadruplets: None,
             tail: None,
             limiter: None,
@@ -289,6 +300,7 @@ impl SourceTerms {
             whitecapping: Some((2.36e-5, 1.0, 3.02e-3)),
             bottom_friction: Some(0.038),
             breaking: Some((1.0, 0.73)),
+            depth_limit: false,
             quadruplets: Some(Quadruplets::default()),
             tail: Some(DEFAULT_TAIL_POWER),
             limiter: Some(GrowthLimiter::PerStep(DEFAULT_LIMITER)),
@@ -314,6 +326,40 @@ impl SourceTerms {
     pub fn with_breaking(mut self, alpha_gamma: Option<(f64, f64)>) -> Self {
         self.breaking = alpha_gamma;
         self
+    }
+
+    /// Scale each node's spectrum down after every step where its root-mean-
+    /// square height exceeds breaking's `H_max = γ d`, to `m_0 = (γ d)²/8`
+    /// (its shape kept): off by default, and only with breaking. Battjes–
+    /// Janssen's dissipation stops growing with the energy at `H_rms = H_max`
+    /// (see the module docs), so without the limit a few decimetres of water
+    /// can hold metres of H_s where the propagation brings them, such as a
+    /// node near the shore of a coarse element whose other nodes are deep.
+    /// The energy it removes is not in [`Self::dissipation`].
+    pub fn with_depth_limit(mut self, on: bool) -> Self {
+        self.depth_limit = on;
+        self
+    }
+
+    /// [`Self::with_depth_limit`]'s scaling of the action density `n` at a
+    /// node of depth `depth`, if on and with breaking.
+    fn limit_to_depth(&self, grid: &SpectralGrid, n: &mut [f64], depth: f64) {
+        let Some((_, gamma)) = self.breaking.filter(|_| self.depth_limit) else {
+            return;
+        };
+        let nd = grid.n_dir();
+        let m0 = n
+            .chunks_exact(nd)
+            .enumerate()
+            .map(|(i, row)| row.iter().sum::<f64>() * grid.sigma[i] * grid.d_sigma[i])
+            .sum::<f64>()
+            * grid.d_theta;
+        let h_max = gamma * depth;
+        let m0_max = 0.125 * h_max * h_max;
+        if m0 > m0_max {
+            let scale = m0_max / m0;
+            n.iter_mut().for_each(|x| *x *= scale);
+        }
     }
 
     /// Quadruplet interactions by the DIA with these coefficients, or none.
@@ -793,6 +839,7 @@ impl SourceTerms {
         if let Some(power) = self.tail {
             self.apply_tail(grid, n, k, wind, power, e);
         }
+        self.limit_to_depth(grid, n, depth);
     }
 
     /// Replace the action density above the cut-off `max(2.5 σ̃, 4 σ_PM)` by the
@@ -1431,5 +1478,65 @@ mod tests {
             last > 0.3 * depth,
             "H_s {last}: breaking only removes the excess"
         );
+    }
+
+    #[test]
+    fn the_depth_limit_caps_a_sea_breaking_cannot_remove() {
+        // A 2 m sea in 0.11 m of water: breaking saturates and barely touches
+        // it, the depth limit scales it to `H_rms = γ d` in one step
+        let grid = SpectralGrid::new(0.05, 0.5, 20, 12);
+        let nd = grid.n_dir();
+        let state = |hs: f64, depth: f64| {
+            let e0 = grid.jonswap(hs, 8.0, 3.3, 0.0, 2.0);
+            let n: Vec<f64> = (0..e0.len()).map(|c| e0[c] / grid.sigma[c / nd]).collect();
+            let k: Vec<f64> = grid
+                .sigma
+                .iter()
+                .map(|&s| wavenumber(s, depth, G))
+                .collect();
+            (n, k)
+        };
+        let m0 = |n: &[f64]| {
+            let e: Vec<f64> = (0..n.len()).map(|c| n[c] * grid.sigma[c / nd]).collect();
+            grid.moment(&e, 0)
+        };
+        let breaking = SourceTerms::none(G).with_breaking(Some((1.0, 0.73)));
+        let limited = breaking.clone().with_depth_limit(true);
+        let step = |sources: &SourceTerms, n: &mut [f64], k: &[f64], depth: f64| {
+            let m = n.len();
+            let (mut e, mut a, mut b) = (vec![0.0; m], vec![0.0; m], vec![0.0; m]);
+            let wind = Wind::default();
+            sources.integrate(&grid, n, k, depth, wind, 10.0, &mut e, &mut a, &mut b);
+        };
+        let depth = 0.11;
+        let (n0, k) = state(2.0, depth);
+        let (mut free, mut capped) = (n0.clone(), n0.clone());
+        step(&breaking, &mut free, &k, depth);
+        step(&limited, &mut capped, &k, depth);
+        let bound = (0.73 * depth).powi(2) / 8.0;
+        // Breaking alone keeps 99.4 % of the energy
+        assert!(m0(&free) > 0.99 * m0(&n0), "{} of {}", m0(&free), m0(&n0));
+        assert!(
+            (m0(&capped) / bound - 1.0).abs() < 1e-12,
+            "{} against {bound}",
+            m0(&capped)
+        );
+        // The shape is breaking's (which scales every component alike)
+        let ratio = capped[0] / free[0];
+        for (c, f) in capped.iter().zip(&free) {
+            assert!((c - f * ratio).abs() <= 1e-12 * f);
+        }
+        // No other sink on: the limit without breaking does nothing
+        let mut none = n0.clone();
+        let unbroken = SourceTerms::none(G).with_depth_limit(true);
+        step(&unbroken, &mut none, &k, depth);
+        assert_eq!(none, n0);
+        // Below the limit, bit for bit as without it
+        let depth = 3.0;
+        let (n0, k) = state(1.0, depth);
+        let (mut free, mut capped) = (n0.clone(), n0);
+        step(&breaking, &mut free, &k, depth);
+        step(&limited, &mut capped, &k, depth);
+        assert_eq!(free, capped);
     }
 }
