@@ -1205,3 +1205,80 @@ fn a_longshore_current_in_3d_has_the_viscous_profile_of_a_uniform_force() {
         "off the parabola by {on_faces} m/s"
     );
 }
+
+/// What the depth limit (`SourceTerms::with_depth_limit`) takes from a
+/// resolved surf zone, where breaking alone should do the work. The energy
+/// it removes is not in `dissipation()`, so wherever it binds, the
+/// dissipation's force (and with it the setup and the longshore current)
+/// misses that share. On the plane beach (4 → 0.5 m, 25 m P2 elements), for
+/// the oblique swell of the longshore gate and the swell straight in, it
+/// compares the breaking dissipation over the beach, and the force, with and
+/// without the limit.
+#[test]
+fn the_depth_limit_leaves_a_resolved_surf_zone_to_breaking() {
+    let beach = Beach::new();
+    let oblique = std::f64::consts::FRAC_PI_2 - 20f64.to_radians();
+    let straight = std::f64::consts::FRAC_PI_2;
+    for (name, direction, m, n_dir) in [
+        ("oblique", oblique, Some(20), 72),
+        ("straight", straight, None, 36),
+    ] {
+        let settled = |limit: bool| {
+            let mut waves = beach.waves(direction, m, n_dir);
+            waves.sources = waves.sources.clone().with_depth_limit(limit);
+            let mut n = waves.zero_state();
+            Beach::settle(&waves, &mut n);
+            (waves, n)
+        };
+        let (free, n_free) = settled(false);
+        let (limited, n_limited) = settled(true);
+        // The breaking dissipation over the beach (m⁴/s per metre of width
+        // times the width)
+        let breaking = |waves: &WaveModel2D, n: &WaveSolution| {
+            let d = waves.dissipation(n, 0.0);
+            let nn = waves.ops.n_nodes;
+            let mut total = 0.0;
+            for k in 0..waves.mesh.n_elements {
+                for a in 0..nn {
+                    total +=
+                        waves.ops.weights[a] * waves.geom.jacobian(k, a) * d[k * nn + a].breaking;
+                }
+            }
+            total
+        };
+        // The largest H_rms/(γ d) without the limit
+        let ratio = free
+            .parameters(&n_free)
+            .iter()
+            .zip(free.depth())
+            .map(|(p, &d)| p.hs / 2f64.sqrt() / (0.73 * d))
+            .fold(0.0f64, f64::max);
+        let removed = 1.0 - breaking(&limited, &n_limited) / breaking(&free, &n_free);
+        let (f_free, f_limited) = (
+            WaveForce2D::from_dissipation(&free, &n_free, 0.0),
+            WaveForce2D::from_dissipation(&limited, &n_limited, 0.0),
+        );
+        let largest = f_free
+            .force()
+            .iter()
+            .map(|f| f[0].hypot(f[1]))
+            .fold(0.0f64, f64::max);
+        let apart = f_free
+            .force()
+            .iter()
+            .zip(f_limited.force())
+            .map(|(a, b)| (a[0] - b[0]).hypot(a[1] - b[1]))
+            .fold(0.0f64, f64::max);
+        println!(
+            "{name}: H_rms/(γd) ≤ {ratio:.3} without the limit; it takes {:.2} % of the breaking \
+             dissipation, and moves the dissipation's force by ≤ {:.2} % of its largest",
+            100.0 * removed,
+            100.0 * apart / largest,
+        );
+        // Breaking holds H_rms to 0.68 γd at most (both swells), so the
+        // limit never binds and the force is the same to the bit
+        assert!(ratio < 0.8, "H_rms/(γd) up to {ratio}");
+        assert_eq!(removed, 0.0);
+        assert_eq!(apart, 0.0);
+    }
+}

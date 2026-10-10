@@ -101,7 +101,7 @@
 //!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
 //!     [wave_sources=swan|wam] [wave_integration=] [wave_limiter=] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
-//!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] \
+//!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] [wave_depth_limit=1] \
 //!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
@@ -152,6 +152,13 @@
 //! coast does (`WaveModel2D::with_absorbing_land`). `wave_land=floored` treats
 //! it as water of the minimum depth instead, where the waves pile up until the
 //! sinks there remove them.
+//!
+//! `wave_depth_limit=1` (the default) scales each wave node's spectrum down
+//! after every step to `H_rms ≤ γ d`, breaking's `H_max`
+//! (`SourceTerms::with_depth_limit`): on the 1 km wave grid, nodes in a few
+//! decimetres of water next to deep ones otherwise hold metres of H_s, which
+//! Battjes–Janssen's saturated dissipation cannot remove. `wave_depth_limit=0`
+//! leaves them. The waves' line reports the largest `H_s/d`.
 //!
 //! `wave_force=dissipation` (the default) drives the circulation by the
 //! momentum the waves' sinks take over a wave step
@@ -533,6 +540,9 @@ struct Options {
     wave_absorbing_land: bool,
     /// The waves' force on the circulation (`wave_force=dissipation|stress`)
     wave_force: WaveForceForm,
+    /// Each wave node's sea held to `H_rms ≤ γ d` (`wave_depth_limit=1`, the
+    /// default)
+    wave_depth_limit: bool,
     /// With `waves=N`, run on after the N timed steps to this many model
     /// hours, the last step landing on it (`wave_hours=`; 0: off)
     wave_hours: f64,
@@ -722,6 +732,7 @@ impl Options {
                 None | Some("dissipation") => WaveForceForm::Dissipation,
                 Some(other) => return Err(format!("wave_force=stress|dissipation, not {other}")),
             },
+            wave_depth_limit: get("wave_depth_limit", 1.0)? != 0.0,
             wave_hours: get("wave_hours", 0.0)?,
             wave_reference: args.get("wave_reference").map(PathBuf::from),
             wave_coupling: get("wave_coupling", 0.0)?,
@@ -2102,7 +2113,7 @@ fn wave_model(domain: &Domain, opts: &Options, wind: Option<Wind>) -> (WaveModel
         G,
     )
     .with_sources({
-        let sources = SourceTerms::swan_defaults(G);
+        let sources = SourceTerms::swan_defaults(G).with_depth_limit(opts.wave_depth_limit);
         let sources = if opts.wave_implicit_sources {
             sources.with_integration(SourceIntegration::Implicit)
         } else {
@@ -2468,6 +2479,8 @@ fn report_waves(
         )
     };
     let (highest, hs_max) = largest(&mut params.iter().map(|p| p.hs));
+    let (steepest, ratio_max) =
+        largest(&mut params.iter().zip(model.depth()).map(|(p, &d)| p.hs / d));
     let deep: Vec<f64> = params
         .iter()
         .zip(model.depth())
@@ -2476,15 +2489,20 @@ fn report_waves(
         .collect();
     let hs_mean = deep.iter().sum::<f64>() / deep.len().max(1) as f64;
     let [x, y] = node(&model.mesh, &model.ops, highest);
+    let [rx, ry] = node(&model.mesh, &model.ops, steepest);
     let force = waves.force().unwrap_or(&[]);
     let (strongest, f_max) = largest(&mut force.iter().map(|f| f[0].hypot(f[1])));
     let [fx, fy] = node(&domain.mesh, &domain.ops, strongest);
     println!(
         "  waves at {:6.2} h: H_s ≤ {hs_max:.2} m at ({:6.1}, {:6.1} km), mean {hs_mean:.2} m where \
-         ≥ 3 m deep; force ≤ {:.2e} m²/s² at ({:6.1}, {:6.1} km); step {:.2} s, {:.0} s wall per model hour",
+         ≥ 3 m deep; H_s/d ≤ {ratio_max:.2} at ({:6.1}, {:6.1} km; {:.2} m deep); force ≤ {:.2e} \
+         m²/s² at ({:6.1}, {:6.1} km); step {:.2} s, {:.0} s wall per model hour",
         t / 3600.0,
         x / 1e3,
         y / 1e3,
+        rx / 1e3,
+        ry / 1e3,
+        model.depth()[steepest],
         f_max,
         fx / 1e3,
         fy / 1e3,

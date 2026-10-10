@@ -1353,3 +1353,92 @@ fn absorbing_land_keeps_the_waves_off_it() {
     println!("absorbing against floored land, H_s over 1 m deep: up to {offshore:.2e}");
     assert!(offshore < 1e-3);
 }
+
+/// A coarse P1 element from 20 m of water to 0.15 m at the shore, as the
+/// 1 km wave grid at Frøya has: the shallow node gets the deep node's sea
+/// through the element's polynomial, and Battjes–Janssen breaking, saturated
+/// at `H_rms = γ d`, cannot remove it. The depth limit holds every node to
+/// `H_s ≤ √2 γ d` and leaves the water offshore of the element alone.
+#[test]
+fn the_depth_limit_keeps_metres_of_sea_out_of_decimetres_of_water() {
+    const LX: f64 = 100.0;
+    const LY: f64 = 500.0;
+    const SHORE: f64 = 0.15;
+    // 20 m to the last element, then the shore within it
+    let depth = |y: f64| {
+        if y <= 450.0 {
+            20.0
+        } else {
+            20.0 + (SHORE - 20.0) * (y - 450.0) / 50.0
+        }
+    };
+    let grid = SpectralGrid::new(0.08, 0.16, 4, 36);
+    let mut e = grid.jonswap(1.0, 9.0, 3.3, 75f64.to_radians(), 8.0);
+    let hs = grid.parameters(&e).hs;
+    e.iter_mut().for_each(|x| *x *= (2.0 / hs).powi(2));
+    let solve = |limit: bool| {
+        let mesh = Mesh2D::channel_periodic_x_with_sides(
+            0.0,
+            LX,
+            0.0,
+            LY,
+            1,
+            10,
+            [BoundaryTag::Open, BoundaryTag::Wall],
+        );
+        let sources = SourceTerms::none(G)
+            .with_breaking(Some((1.0, 0.73)))
+            .with_depth_limit(limit);
+        let m = model(mesh, 1, |_, y| -depth(y), grid.clone())
+            .with_sources(sources)
+            .with_boundary_spectrum(&e)
+            .with_implicit_refraction(true)
+            .with_implicit_frequency_shift(true)
+            .with_absorbing_land(true);
+        let mut n = m.zero_state();
+        let cg_min = group_velocity(m.grid.sigma[0], wavenumber(m.grid.sigma[0], 20.0, G), 20.0);
+        run(&m, &mut n, 4.0 * LY / cg_min, 0.5);
+        let xy = nodes(&m);
+        let params = m.parameters(&n);
+        (0..m.n_points())
+            .map(|p| (xy[p][1], m.depth()[p], params[p].hs))
+            .collect::<Vec<_>>()
+    };
+    let (free, limited) = (solve(false), solve(true));
+    let at_shore = |r: &[(f64, f64, f64)]| {
+        r.iter()
+            .filter(|x| x.0 == LY)
+            .fold(0.0f64, |m, x| m.max(x.2))
+    };
+    // Offshore of the shoreline element, the largest relative change
+    let offshore = free
+        .iter()
+        .zip(&limited)
+        .filter(|(x, _)| x.0 < 450.0)
+        .fold(0.0f64, |m, (x, y)| m.max((y.2 / x.2 - 1.0).abs()));
+    let ratio = |r: &[(f64, f64, f64)]| r.iter().fold(0.0f64, |m, x| m.max(x.2 / x.1));
+    // The shoreline element's deep node
+    let inner = |r: &[(f64, f64, f64)]| {
+        r.iter()
+            .filter(|x| x.0 == 450.0)
+            .fold(0.0f64, |m, x| m.max(x.2))
+    };
+    println!(
+        "H_s at the shore ({SHORE} m deep): {:.3} m free, {:.4} m limited; largest H_s/d {:.2} \
+         against {:.3}; the element's deep node {:.4} against {:.4} m; offshore of the \
+         element H_s changes by up to {offshore:.2e}",
+        at_shore(&free),
+        at_shore(&limited),
+        ratio(&free),
+        ratio(&limited),
+        inner(&free),
+        inner(&limited),
+    );
+    // Free: 4.83 m in 0.15 m of water (H_s/d 32); limited: 0.155 m
+    let bound = 2f64.sqrt() * 0.73;
+    assert!(at_shore(&free) > 20.0 * bound * SHORE);
+    assert!(ratio(&limited) <= bound * (1.0 + 1e-12));
+    // Upwind faces: nothing the limit removes at the shore comes back out
+    // (measured 0)
+    assert!(offshore < 1e-12);
+}
