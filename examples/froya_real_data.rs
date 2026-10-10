@@ -235,7 +235,10 @@
 //! a local growth reproduced in minutes), `every=N` (trace every N steps),
 //! `dump=PREFIX` (the state at rest, `gap=N` steps before the end and at the
 //! end, for `scripts/mode3d_dump.py`), `seed=PREFIX:AMP` (start from rest
-//! plus a dumped mode at a largest speed of AMP m/s), `deep=G` (°C/m below
+//! plus a dumped mode at a largest speed of AMP m/s), `perturb=A` (a
+//! deterministic random T perturbation of up to ±A/2 °C at every wet point,
+//! so that modes with e-foldings of hours show within a run rather than
+//! after round-off has grown for a day), `deep=G` (°C/m below
 //! the pycnocline, 0.002), `vadv=centred|akima|tvd|upwind|hermite` (the
 //! vertical tracer scheme), `noref` (that scheme without the reference of
 //! the state at rest, which 3D runs take by default; TODO P1.3),
@@ -4400,6 +4403,25 @@ fn cost_3d(domain: &Domain, opts: &Options) {
         add(&mut state.vbar.data, &b.vbar.data, &a.vbar.data);
         physics.update_density(&mut state);
         println!("  Seeded with {prefix}'s perturbation at {amp:.1e} m/s (scale {scale:.3e})");
+    }
+    // `perturb=A`: a deterministic random temperature perturbation of up to
+    // ±A/2 °C at every point of a column at least 0.1 m deep, as the terrace
+    // fixture's gate seeds it, so slow modes emerge within hours rather than
+    // from round-off
+    if let Some(amp) = dbg_value("perturb") {
+        let amp: f64 = amp.parse().expect("perturb amplitude");
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for (idx, t) in state.temp.iter_mut().enumerate() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let column = idx / nl;
+            if state.eta.data[column] - domain.bathymetry.data[column] > 0.1 {
+                *t += amp * ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5);
+            }
+        }
+        physics.update_density(&mut state);
+        println!("  Perturbed T by up to ±{:.1e} °C", 0.5 * amp);
     }
     if dbg("trace") {
         let mut rhs = state.clone();

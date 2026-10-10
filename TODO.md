@@ -188,8 +188,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Watch how often the splitter falls back to element-mean tracers (`CONSTANCY_TOLERANCE`) in a tidal run.
 - [ ] **P1.3** Is the GLS creep (1 cm/s after a day at the 1 km grid's shallow slopes) physical slope flow (Phillips 1970; Wunsch 1970)? Compare with K/(slope·L) or run a slice.
 - [ ] **P1.3** Lighten the 3D slope bound now that the vertical reference exists (does r_x0 0.25–0.3 hold Frøya at rest? At 0.2, element 11163 grows, e-folding ≈ 55 min).
-- [ ] **P1.3** The straddle instability over unsmoothed cliffs (smoothing works around it): a per-element Haney rx1 bound, a capped or implicit pair density, or geopotential diffusion; run the spectrum harness on the slices for the 7–9 h mode.
-- [ ] **P1.3** Research: what sets the edges of the stable vertical-scheme band (Akima weight 0–0.75)? The weighted norm in which the operator is dissipative (Bell, Peixoto & Thuburn 2017), via `probe_terrace_spectrum`.
+- [ ] **P1.3** The straddle instability over unsmoothed cliffs (smoothing works around it): a per-element Haney rx1 bound, a capped or implicit pair density, or geopotential diffusion; run the spectrum harness (≥ 1800 s, check the residuals) on the slices.
+- [ ] **P1.3** The shipped 3D rest state still grows at terrace vertices beside shore elements: an oscillatory mode, e-folding ≈ 2–2.4 h, period ≈ 3 h, in the bed layers across the pycnocline's foot (LimitedAkima about the reference; any Akima weight). Find its mechanism (a fully wet slice of the same terrace is stable) and fix it; gate `a_terrace_beside_a_shore_element_stays_at_rest_for_twelve_hours`.
+- [ ] **P1.3** Rerun the full coastline mesh at rest with today's defaults for 24–48 h, seeded (`debug_3d=…,perturb=1e-6`): the 12 h round-off runs cannot see a 2 h mode.
 - [ ] **P1.3** Coastline-mesh cost (≈ 4× the 500 m grid; 4.4e4 element-steps against 2.3e4 ideal): multirate level coherence (three-hop stage dependency ≈ 1.9×) and a non-subdividing quad mesher.
 - [ ] **P1.3** `batched` SIMD and the Burn prototype assume parallelograms (`affine_metric`, `compute_volume_terms_batched`, `BurnGeometricFactors2D::from_cpu`).
 - [ ] **P1.3** Triangles or quad-dominant meshes; remove the hardcoded 4 faces (`swe_2d.rs:386,908`).
