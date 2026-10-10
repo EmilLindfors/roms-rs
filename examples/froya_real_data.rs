@@ -202,7 +202,12 @@
 //! in 2D: the pressure gradient on the 2D module, the wind stress on the
 //! columns (`GriddedAtmosphere2D::split_for_3d`). The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
-//! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step. Use
+//! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step and
+//! `cfl_3d=` sets its Courant number (`Hydrostatic3D::compute_dt`; 1.5).
+//! Measured on the Mausund tide (3 h, nested, 2026-10-10): 2 holds and 3
+//! blows up within 0.8 h (a 50 m element during the ramp, at 25 s steps);
+//! against 0.5, 1 moves ū by 0.3 mm/s RMS and 2 by ≤ 3 mm/s, T by 0.013
+//! and 0.019 °C RMS (565 → 246 → 148 s per model hour). Use
 //! `slopes3d=on` for the stratified rest state on steep beds.
 //!
 //! A long 3D tide can stop and resume bit for bit. `restart_hours=H` writes
@@ -581,6 +586,9 @@ struct Options {
     tide_3d: bool,
     steps_3d: usize,
     dt_3d: Option<f64>,
+    /// Courant number of the 3D step (`cfl_3d=`, `Hydrostatic3D::compute_dt`;
+    /// 1.5, see the module docs)
+    cfl_3d: f64,
     debug_3d: String,
     /// Write a restart of the 3D tide every this many model hours
     /// (`restart_hours=`; 0: none), at the first progress line at or after it
@@ -678,6 +686,7 @@ impl Options {
                 .map(|v| v.parse::<f64>())
                 .transpose()
                 .map_err(|e| e.to_string())?,
+            cfl_3d: get("cfl_3d", 1.5)?,
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
             restart_hours: get("restart_hours", 0.0)?,
             resume: args.get("resume").map(PathBuf::from),
@@ -3496,7 +3505,7 @@ fn tidal_run_3d(
                 }
             }
         };
-    let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(0.5);
+    let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(opts.cfl_3d);
     if let Some(dt) = opts.dt_3d {
         sim = sim.with_dt_max(dt);
     }
@@ -4268,7 +4277,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
     // Each element's own step from horizontal advection and internal waves
     // (the bound of `Hydrostatic3D::compute_dt` that sets it here), at rest
     // and with `speed` everywhere
-    let cfl = 0.5;
+    let cfl = opts.cfl_3d;
     let order_factor = (domain.ops.order as f64 + 1.0).powi(2);
     let element_dt = |speed: f64| -> Vec<f64> {
         (0..ne)
