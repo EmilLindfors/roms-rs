@@ -200,3 +200,19 @@
   - [ ] Nodal fields from Gmsh (`$NodeData`, e.g. a bathymetry view interpolated by Gmsh) are skipped; read them if meshing workflows start carrying the bed in the mesh file.
   - [ ] Periodic Gmsh meshes (`$Periodic`) are rejected: pair the faces if a periodic real-geometry case appears.
 - [ ] CSR connectivity. Make `MeshGPUData` the single representation.
+
+### Tidal ponds in the bed (found 2026-10-11, open)
+
+The bed pipeline raises isolated wet nodes at mean sea level only (56 on the Frøya coastline). A flood fill from the deepest node along the elements' grid lines (coincident nodes merged), on the 3D Frøya bed (`slopes3d=on`, thin depth 1 m), leaves nodes that the open water does not reach:
+
+| Level | Ponds | Deeper than 5 m |
+|---|---|---|
+| 0 m | 23 | 11 |
+| −0.6 m | 58 | 23 |
+| −1 m | 85 | 39 |
+
+Many are single P2 nodes of 20–65 m, sampled from a narrow channel of the 50 m raster that the mesh does not resolve.
+- The 2D bed's smoothing (thin depth 0.1 m) deepens some of the sills and connects them; the 3D bed's (1 m) does not.
+- One of these ponds drove a phantom 3.7 m/s jet for 5 h (`notes/2d-numerics.md`, walled wet nodes).
+- Fill each pond to its sill, or connect it, at the lowest water level (LAT, or the run's tidal minimum).
+
