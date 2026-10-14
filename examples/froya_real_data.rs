@@ -282,7 +282,12 @@
 //! between columns that are not thin (`debug_3d=thin=`, 0.1 m) wherever the
 //! deeper one is below `free_depth` (19 m, the pycnocline's bottom).
 //! Shores need none (the 3D wetting and drying moves their layers on the 2D
-//! kernel's subcells) and do not move. Off by default.
+//! kernel's subcells) and do not move. Off by default. With it, `cliffs3d=D`
+//! raises to land (+2 m) the shore nodes of elements with a node deeper than
+//! D m (40 by default; `cliffs3d=off`) that a tide would make resolved
+//! columns beside the deep ones (`Bathymetry2D::raise_cliff_shores`): a
+//! 0.74 m corner among 61–82 m held the 3D step below 0.4 s for hours at
+//! each high water.
 //!
 //! `bbox=west,south,east,north` runs a smaller box, e.g. the 22 × 19 km
 //! around Mausund (a quarter of the cost), with its own mesh and boundary
@@ -387,6 +392,12 @@ const LAND_ELEVATION: f64 = 5.0;
 const WALL_LOW_WATER: f64 = -2.0;
 /// The thin-column depth of a 3D tide (m; `Options::thin_depth`)
 const TIDE_3D_THIN_DEPTH: f64 = 1.0;
+/// Highest water for `cliffs3d=` (m above MSL), above the highest
+/// astronomical tide at Mausund; the shore nodes it raises go to this height
+const CLIFF_HIGH_WATER: f64 = 2.0;
+/// Default depth (m) of `cliffs3d=`: the x–z slices let shallow water beside
+/// 21–40 m hold and beside 60 m grow
+const CLIFF_DEEP: f64 = 40.0;
 /// Default elevation model: Kartverket's topobathy model at 50 m
 /// (`scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif`)
 const DEM: &str = "data/froya_topobathy.tif";
@@ -522,6 +533,10 @@ struct Options {
     /// above which elements are free (1.5 × the summer pycnocline's bottom by
     /// default)
     slopes_3d: Option<ElementSlopeBound>,
+    /// With `slopes3d`, raise the shore nodes of elements deeper than this
+    /// (m) to land (`Bathymetry2D::raise_cliff_shores`): `cliffs3d=D`, 40 m
+    /// by default, `cliffs3d=off`
+    cliffs_3d: Option<f64>,
     /// Domain box `west,south,east,north` (°; `bbox=`). A smaller box needs
     /// its own boundary atlas (`tides=`, from `norkyst_boundary_tides bbox=`)
     bbox: [f64; 4],
@@ -794,6 +809,11 @@ impl Options {
                     }),
                 }
             },
+            cliffs_3d: match args.get("cliffs3d").map(String::as_str) {
+                None => Some(CLIFF_DEEP),
+                Some("off") => None,
+                Some(d) => Some(d.parse().map_err(|_| format!("bad cliffs3d={d}"))?),
+            },
             bbox: match args.get("bbox") {
                 None => FROYA_BBOX,
                 Some(v) => v
@@ -1034,6 +1054,29 @@ impl Domain {
                 report.max_change,
                 report.elements_after
             );
+            // Shore nodes of cliff elements: thin at low water, resolved at
+            // high water beside the deep nodes, outside the bound
+            if let Some(deep) = opts.cliffs_3d {
+                let report = grid_bed.raise_cliff_shores(
+                    &grid,
+                    &ops,
+                    &grid_geom,
+                    deep,
+                    thin,
+                    CLIFF_HIGH_WATER,
+                    CLIFF_HIGH_WATER,
+                );
+                let raised = grid_bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
+                println!(
+                    "  Cliff shores raised to land (+{CLIFF_HIGH_WATER} m) in {} elements deeper \
+                     than {deep} m: {} nodes, by up to {:.1} m, {:.3} km² of water at MSL; \
+                     {raised} isolated wet nodes raised after",
+                    report.elements,
+                    report.nodes,
+                    report.max_raise,
+                    report.area / 1e6
+                );
+            }
         }
         let has_water = |k: ElementIndex| grid_bed.element(k).iter().any(|&b| b < 0.0);
         let (mesh, kept) = grid.retain_elements(has_water, BoundaryTag::Wall);

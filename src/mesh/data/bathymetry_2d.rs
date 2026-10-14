@@ -244,6 +244,19 @@ pub struct Rx0Smoothing {
     pub sweeps: usize,
 }
 
+/// What [`Bathymetry2D::raise_cliff_shores`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CliffShores {
+    /// Cliff elements with a shore node raised
+    pub elements: usize,
+    /// Global nodes (sets of coincident nodes) raised to land
+    pub nodes: usize,
+    /// Largest rise of the bed (m)
+    pub max_raise: f64,
+    /// Area wet at mean sea level that became land, `Σ w J` (m²)
+    pub area: f64,
+}
+
 /// What [`Bathymetry2D::lower_wall_land`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WallLandLowering {
@@ -1112,6 +1125,85 @@ impl Bathymetry2D {
             max_change,
             sweeps,
         }
+    }
+
+    /// Raise the shore nodes of cliff elements to land at `land`, and
+    /// recompute the gradients.
+    ///
+    /// A cliff element has a node deeper than `deep` (m). Its shore nodes are
+    /// those [`Self::smooth_element_slopes`] leaves alone, shallower than
+    /// `min_depth` at mean sea level, that a tide up to `high_water` (m above
+    /// MSL) would make a resolved column at least `min_depth` deep. Such a
+    /// node is a thin column at low water and a resolved one at high water,
+    /// beside the deep nodes and outside any slope bound. On the Frøya
+    /// coastline mesh, a corner 0.74 m deep among 61–82 m (element 5179)
+    /// held the 3D step below 0.4 s for hours of each high water, with the
+    /// deep nodes' surface layers at 24–30 m/s against a depth mean of
+    /// 0.03 m/s (TODO P1.3). Land beside deep water is the stable case
+    /// (an element with a dry node moves its layers on the 2D wet/dry
+    /// kernel's subcells and has no baroclinic exchange); the x–z slices
+    /// let 0.5–5 m of water beside 21–40 m hold and beside 60 m grow
+    /// ([`ElementSlopeBound`]). ROMS-type models mask such cells as land.
+    ///
+    /// Shore nodes too shallow to be resolved below `high_water` stay, and
+    /// so does every node of an element no deeper than `deep`. The coastline
+    /// moves by at most one node at cliffs. Coincident nodes move together.
+    ///
+    /// # Panics
+    /// If `min_depth` is not positive, `deep` is not above it, or `land` is
+    /// not high enough to stay a thin column at `high_water`.
+    pub fn raise_cliff_shores(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        deep: f64,
+        min_depth: f64,
+        high_water: f64,
+        land: f64,
+    ) -> CliffShores {
+        assert!(
+            min_depth > 0.0 && deep > min_depth,
+            "need 0 < min_depth < deep, got {min_depth} and {deep}"
+        );
+        assert!(
+            high_water - land < min_depth,
+            "land at {land} m is a resolved column at high water {high_water} m"
+        );
+        let graph = NodeGraph::new(mesh, ops, geom);
+        let depth = graph.depths(&self.data, geom);
+        let shore = |g: usize| depth[g] < min_depth && depth[g] + high_water >= min_depth;
+        let mut raise = vec![false; depth.len()];
+        let mut report = CliffShores::default();
+        for nodes in graph.global.chunks(ops.n_nodes) {
+            let deepest = nodes
+                .iter()
+                .map(|&g| depth[g])
+                .fold(f64::NEG_INFINITY, f64::max);
+            if deepest <= deep || !nodes.iter().any(|&g| shore(g)) {
+                continue;
+            }
+            report.elements += 1;
+            for &g in nodes.iter().filter(|&&g| shore(g)) {
+                raise[g] = true;
+            }
+        }
+        for g in (0..raise.len()).filter(|&g| raise[g]) {
+            report.nodes += 1;
+            report.max_raise = report.max_raise.max(land + depth[g]);
+            if depth[g] > 0.0 {
+                report.area += graph.area[g];
+            }
+        }
+        if report.nodes > 0 {
+            for (b, &g) in self.data.iter_mut().zip(&graph.global) {
+                if raise[g] {
+                    *b = land;
+                }
+            }
+            self.compute_gradients(ops, geom);
+        }
+        report
     }
 
     /// Bed from a merged elevation raster (bathymetry and land,
@@ -2191,6 +2283,61 @@ mod tests {
             assert_eq!(again.elements_before, 0, "N = {order}: {again:?}");
             assert_eq!(again.changed, 0, "N = {order}: {again:?}");
         }
+    }
+
+    #[test]
+    fn test_raise_cliff_shores_makes_land_of_resolvable_shore_nodes_beside_deep_water() {
+        // 4 × 4 P2 elements, node spacing 1/8. The shore strip x ≤ 1/8 is
+        // 0.7 m deep beside 80 m for y < 1/2 and beside 15 m above, with a
+        // node at +1.5 m (never resolved below +2 m) and a 5 m one (the
+        // slope smoothing's) in the corner y ≤ 1/8.
+        let (mesh, ops, geom) = setup(Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 4, 4), 2);
+        let bed = |x: f64, y: f64| match (x < 0.2, y < 0.2) {
+            (true, true) if x < 0.1 => 1.5,
+            (true, true) => -5.0,
+            (true, false) => -0.7,
+            (false, _) if y < 0.5 => -80.0,
+            (false, _) => -15.0,
+        };
+        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        let original = bathy.clone();
+        let (deep, min_depth, high_water) = (40.0, 1.0, 2.0);
+        let report =
+            bathy.raise_cliff_shores(&mesh, &ops, &geom, deep, min_depth, high_water, high_water);
+        // The shore nodes of the two 80 m elements of the strip: x ∈ {0, 1/8},
+        // y ∈ {1/4, 3/8, 1/2}
+        let raised = |x: f64, y: f64| x < 0.2 && (0.2..0.55).contains(&y);
+        let mut area = 0.0;
+        for e in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                let expected = if raised(x, y) { high_water } else { bed(x, y) };
+                assert_eq!(bathy.get(e, i), expected, "({x}, {y})");
+                if raised(x, y) {
+                    area += geom.mass[e.as_usize() * ops.n_nodes + i];
+                }
+            }
+        }
+        assert_eq!(report.elements, 2, "{report:?}");
+        assert_eq!(report.nodes, 6, "{report:?}");
+        assert!((report.max_raise - 2.7).abs() < 1e-12, "{report:?}");
+        assert!(
+            (report.area - area).abs() < 1e-12 * area,
+            "{report:?} vs {area}"
+        );
+        assert_continuous(&bathy, &mesh, &ops, 2);
+        let mut fresh = bathy.clone();
+        fresh.compute_gradients(&ops, &geom);
+        assert_eq!(fresh.gradient_x, bathy.gradient_x);
+        assert_ne!(bathy.gradient_x, original.gradient_x);
+        // A second pass has nothing to do; a deeper threshold leaves it all
+        let again =
+            bathy.raise_cliff_shores(&mesh, &ops, &geom, deep, min_depth, high_water, high_water);
+        assert_eq!(again, CliffShores::default());
+        let mut untouched = original.clone();
+        let none = untouched.raise_cliff_shores(&mesh, &ops, &geom, 80.5, 1.0, 2.0, 2.0);
+        assert_eq!(none, CliffShores::default());
+        assert_eq!(untouched.data, original.data);
     }
 
     #[test]
