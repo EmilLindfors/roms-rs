@@ -69,3 +69,27 @@
   - `test_parallel_matches_serial` excluded bathymetry, boundaries and limiters: bathymetry and walls were already in (cases 2–3), limiters and wet/dry have their own (`test_parallel_limiters_match_serial`, `test_parallel_correction_matches_serial`); an open tidal boundary with all three formulations is added.
   - Also found: `test_standing_wave_period` timed the peaks of η at one node, 0.9 % off, under a 5 % tolerance, and skipped the check when it found fewer than two peaks. It now times the zero crossings of the cos(kx) mode amplitude: 3e-5, asserted to 1e-4.
   - [ ] `tests/swe_2d_test.rs` has three overlapping long-run conservation tests on the legacy stepper (`test_long_term_stability`, `test_long_time_conservation`, `test_long_run_mass_conservation`); merge them into one on `Simulation` when the examples and tests move off the legacy steppers (P6).
+
+### Walled wet nodes keep their velocity (found 2026-10-11, open)
+
+On the Frøya coastline day in 3D (`froya_real_data mesh=data/froya_coast.msh … tide3d=1 slopes3d=on cfl_3d=1`), element 7790 held a depth-mean ū of 3.3–3.8 m/s (4.2 m/s at the surface) from 5 to 10 h, through the whole ebb. It set the 3D step, at ≈ 1850 s wall per model hour against ≈ 820 without it.
+- **Where.** Node P at (−1.395, −9.278) km, bed −25.5 m, is the middle node of the edge shared by elements 7790 and 7791.
+  - The edge's corners are land (+2.72, +4.76 m).
+  - The two centres are a 0.44 m sill (7790) and land (+2.79 m, 7791).
+  - Below η ≈ −0.44 m, P is a one-node pond, connected to the sound only diagonally.
+- **What happens.** P's two copies split by ≈ 0.6 m in η (7790's at +0.24, 7791's at −0.37, while the sound is at −0.88).
+  - The velocity points almost exactly along the edge (5.6° off), into the dry corner.
+  - η at P stays put for 5 h, so no water moves.
+  - The jet dies at 10–11 h, when the flood reconnects P.
+- **It is the 2D kernel's, not the 3D coupling.** The 2D model alone on the same bed (`slopes3d=on debug_3d=thin=1`, so the same 1 m smoothing threshold) has ū 1.94 m/s at P at 5 h. That run was stopped there (`output/froya_day/2d_thin1`).
+  - The original 2D day (thin depth 0.1 m) has no jet. Its smoothing deepened the 7790 sill from 0.44 to 17.6 m, so P stayed connected.
+- **Mechanism (suspected).** At a wet node beside a higher dry node, `hydrostatic_hll` makes h* = 0 on the wet side. The interface then carries only the pressure correction ½g h², whatever the node's velocity, so a walled node's velocity is never reflected or stopped; only bottom friction acts on it.
+  - At 25 m depth, friction balances 3.7 m/s with a forcing of only ≈ 1.4e-3 m/s².
+  - Two candidate sources of that forcing are still to be identified: an imbalance of the walled interfaces' metrics on a non-affine element, and the copies' η jump through the face.
+- **Most ponds stay still.** Of the 23 ponds deeper than 5 m at η = −0.6 m, only P (and, more weakly, a 2.2 m pond at (−2.15, 6.61) km with 1.15 m/s, and one at (1.35, −0.89) km with 0.6 m/s) carries a current.
+- **Next.**
+  - A gate: a P2 element pair with a deep mid-edge node between dry corners and a dry centre, under a falling tide. Assert ū → 0 in the pond.
+  - Then reflect the walled velocity component (a mirror state instead of h* = 0 at an interface whose other side is higher and dry), or zero it at nodes walled on both sides of a line.
+  - Find the forcing (log the momentum terms at P from the 2 h restart).
+- **Tools.** The temporary snapshot tools `examples/tmp_snap_elem.rs` (one element over time, and the fastest deep nodes) and `examples/tmp_snap_ponds.rs` (ponds at a level, with their speeds) are uncommitted in the working tree.
+

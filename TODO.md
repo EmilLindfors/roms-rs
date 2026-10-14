@@ -165,6 +165,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.2** A roughness map from data (sediment type or calibrated n per region), projected like `Bathymetry2D::project` (Frøya uses n = 0.025 everywhere; a Mausund phase suspect).
 - [ ] **P1.2** Guidance for `h_dry` (≈ 1e-4 of the characteristic depth), derived from the bathymetry or relative (1 mm dominates the 0.1 m Thacker error, 7.4 % against 4.5 %).
 - [ ] **P1.2** Chen–Noelle (2017) reconstruction instead of Audusse, for bed steps larger than the depth.
+- [ ] **P1.2** A wet node walled in by higher dry nodes keeps its velocity (Audusse h* = 0 passes only ½gh², never stops it): on the Frøya coastline bed (`slopes3d=on debug_3d=thin=1`) a 25 m single-node tidal pond at (−1.395, −9.278) km (element 7790/7791) holds ū 1.9 m/s in 2D and 3.7 m/s in 3D for 5 h of the ebb, moving no water but setting the 3D step. A gate on a walled pit, then reflect or zero the walled component (`notes/2d-numerics.md`).
 - [ ] **P1.2** `SWE2DRhsConfig::new` defaults to `Standard` unchecked: warn on an unbalanced sloping bed in `with_bathymetry`, as the builder does.
 - [ ] **P1.2** `outer_nodes` scales by affine element heights: per-node isoparametric factors (P1.3).
 - [ ] **P1.1** Specialise hot paths through the kernel split: a `const N` kernel for fixed-size products; skip `reference_to_physical` + `SourceContext2D` for sources that need neither (P2.2).
@@ -188,8 +189,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Watch how often the splitter falls back to element-mean tracers (`CONSTANCY_TOLERANCE`) in a tidal run.
 - [ ] **P1.3** Is the GLS creep (1 cm/s after a day at the 1 km grid's shallow slopes) physical slope flow (Phillips 1970; Wunsch 1970)? Compare with K/(slope·L) or run a slice.
 - [ ] **P1.3** Lighten the 3D slope bound now that the vertical reference exists (does r_x0 0.25–0.3 hold Frøya at rest? At 0.2, element 11163 grows, e-folding ≈ 55 min).
+- [ ] **P1.3** Tidal ponds in the bed: nodes wet at MSL that the open water does not reach along grid lines at low water (the 56-isolated-node pass works at MSL only). The 3D Frøya bed has 23 ponds at 0 m, 58 at −0.6 m (23 deeper than 5 m), 85 at −1 m; fill or connect them at the lowest level (`notes/geometry-mesh.md`).
 - [ ] **P1.3** Mausund's pinnacle element 291 (a 1.2 m node among 42–55 m, unsmoothed) cools its bed layer from 8.6 to 6.0 °C within 30 min at 2 h of the 3D tide, below NorKyst's 7.50 minimum: the straddle below, seen in T.
-- [ ] **P1.3** The straddle instability over unsmoothed cliffs (smoothing works around it): a per-element Haney rx1 bound, a capped or implicit pair density, or geopotential diffusion; run the spectrum harness (≥ 1800 s, check the residuals) on the slices.
+- [ ] **P1.3** The straddle instability over unsmoothed cliffs (smoothing works around it): a per-element Haney rx1 bound, a capped or implicit pair density, or geopotential diffusion; run the spectrum harness (≥ 1800 s, check the residuals) on the slices. On the coastline day, element 5179 (1.1 m in 62 m) reaches 24 m/s at 1.5 h and holds the step below 0.6 s for half an hour (`notes/3d-numerics.md`, cfl measurements).
 - [ ] **P1.3** The shipped 3D rest state still grows at terrace vertices beside shore elements: an oscillatory mode, e-folding ≈ 2–2.4 h, period ≈ 3 h, in the bed layers across the pycnocline's foot (LimitedAkima about the reference; any Akima weight). Find its mechanism (a fully wet slice of the same terrace is stable) and fix it; gate `a_terrace_beside_a_shore_element_stays_at_rest_for_twelve_hours`.
 - [ ] **P1.3** Rerun the full coastline mesh at rest with today's defaults for 24–48 h, seeded (`debug_3d=…,perturb=1e-6`): the 12 h round-off runs cannot see a 2 h mode.
 - [ ] **P1.3** Coastline-mesh cost (≈ 4× the 500 m grid; 4.4e4 element-steps against 2.3e4 ideal): multirate level coherence (three-hop stage dependency ≈ 1.9×) and a non-subdividing quad mesher.
@@ -237,6 +239,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Performance (P2) — [notes/performance.md](notes/performance.md)
 
 - [ ] **P2.5** A semi-implicit free surface (θ-method, as TRIM/UnTRIM, SLIM, Thetis), the main cost lever: farm meshes step at ≈ 0.024 s on gravity waves. Needs a global SPD solve and wet/dry care.
+- [ ] **P2.1** The 2D `Simulation` has no check for a blown-up state (as `Simulation3D` gained 2026-10-10): stop at the first non-finite `h`, `hu`, `hv`.
 - [ ] **P2.1** Port `compute_dt_advection_2d`, `compute_dt_tracer_2d`, `compute_dt_viscosity`, `Mesh::compute_dt`, `time/ssp_rk3.rs:110` and 1D `compute_dt_swe` to `compute_dt_swe_2d`'s per-node metric form in one helper (`2/(λ_r+λ_s)` for advection).
 - [ ] **P2.5** LTS oversubscription: under ≈ 40 % external load the farm took 358 s at 24 threads against 3.9 s at 4. Serial cut-off by work, a capped pool for small meshes, or documented thread counts.
 - [ ] **P2.5** Viscous cost (≈ 2× inviscid): a per-stage BR1 gradient cache for subset-RHS neighbours; store `νh` with the gradients in pass 1.
@@ -289,7 +292,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.5** 3D Smagorinsky on a fjord with a sill and tidal shear (may over-damp a tidal mixed layer; else Leith or Ri-dependent ν).
 - [ ] **P4.5** Rotated/geopotential horizontal diffusion of 3D tracers via BR1 (none exists; `viscosity_3d` is momentum only).
 - [ ] **P4.5** Subcell (GLL-cell) finite volumes for shoreline tracers instead of element means per level (needs 2D subcell fluxes in DU_avg2).
-- [ ] **P4.5** Port the 3D advective dt bound to the 2D per-node metric form (`compute_dt_swe_2d`), with a stability measurement (changes what `cfl` means).
+- [ ] **P4.5** Port the 3D advective dt bound to the 2D per-node metric form (`compute_dt_swe_2d`), with a linear stability measurement (changes what `cfl` means). Mausund holds `cfl_3d=2` and blows up at 3 in a 50 m element during the ramp; the coastline mesh blows up at 1.5 in a cliff element (1.2 m beside 82 m); `froya_real_data` takes 1 now. Find which term sets the limit (internal waves, the splitting, the shallow node of a cliff element).
+- [ ] **P4.5** `Simulation3D`'s default `cfl` (0.5, `SimulationConfig`'s, shared with 2D) is 0.17–0.25 of the measured limit: give 3D its own default once the bound is ported.
 - [ ] **P4.5** EOS: delegate to the fixed UNESCO EOS with a linear fast path; TEOS-10 later. In `UnescoEOS::update_density`, `s * s.sqrt()` for `s.powf(1.5)` and a flat parallel loop.
 - [ ] **P4.5** RPE (`PotentialEnergy3D`) in 3D run output (a `Simulation3D` callback or NetCDF attributes).
 - [ ] **P4.5** One in-place Thomas solver for `tridiagonal::solve_tridiagonal`, `implicit_advection::ColumnSolve::solve` and the waves' `thomas`; in `solve_diffusion_column`, one elimination per pair and 8 columns as SIMD lanes.
