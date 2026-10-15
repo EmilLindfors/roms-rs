@@ -209,7 +209,7 @@ vertices of a periodic mesh moved by a smooth periodic field (bilinear term
 | Lake at rest across shorelines (`WetDry`) | < 1e-11 of the bed forcing |
 | Mass rate, all formulations; momentum rate on a flat bed | < 1e-12 relative |
 | Entropy rate, `EntropyConservative` / `EntropyStable` | < 1e-11 relative / ≤ 0 |
-| Tracer content hT, hS (advection + diffusion); viscous momentum | < 1e-12 / < 1e-11 relative |
+| Viscous momentum | < 1e-11 relative |
 
 Convergence on the distorted meshes (8 → 16 elements per side):
 

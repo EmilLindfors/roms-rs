@@ -1,179 +1,145 @@
-//! Integration tests for harmonic analysis module.
-//!
-//! Tests the full analysis pipeline including fitting, reconstruction,
-//! and comparison metrics.
+//! Integration tests for the harmonic analysis: fitting reference constants,
+//! prediction, inference, the Rayleigh guard, and comparison metrics.
 
-use dg_rs::{ComparisonMetrics, HarmonicAnalysis, TidalConstituent, TimeSeries, compare_harmonics};
-use std::f64::consts::PI;
+use dg_rs::{
+    AnalysisError, ComparisonMetrics, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
+    TimeSeries, compare_harmonics,
+};
 
-/// Generate a synthetic tidal signal from multiple constituents.
-fn generate_tidal_signal(constituents: &[TidalConstituent], mean: f64, times: &[f64]) -> Vec<f64> {
-    times
-        .iter()
-        .map(|&t| {
-            let mut eta = mean;
-            for c in constituents {
-                eta += c.evaluate(t);
-            }
-            eta
-        })
-        .collect()
+/// 2025-06-01 00:00 UTC
+const T0: f64 = 1_748_736_000.0;
+
+/// `hours` hourly Unix times from `T0`.
+fn hourly(hours: usize) -> Vec<f64> {
+    (0..hours).map(|i| T0 + i as f64 * 3600.0).collect()
+}
+
+/// The tide of reference constants `(name, H, G°)` about `mean` at `times`,
+/// in the fit's own convention (`ReferenceFit::predict`).
+fn tide(times: &[f64], mean: f64, constants: &[(&'static str, f64, f64)]) -> Vec<f64> {
+    ReferenceFit {
+        mean,
+        constants: constants
+            .iter()
+            .map(|&(name, amplitude, lag_deg)| ReferenceConstant {
+                name,
+                amplitude,
+                lag_deg,
+                inferred: false,
+            })
+            .collect(),
+        r_squared: 1.0,
+        residual_rms: 0.0,
+    }
+    .predict(times)
+}
+
+fn lag_error(a: f64, b: f64) -> f64 {
+    ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs()
 }
 
 #[test]
 fn test_m2_recovery() {
-    // Generate M2 tide: A=1.0m, φ=0.5rad
-    let m2 = TidalConstituent::m2(1.0, 0.5);
+    // ~42 days of M2 alone; the other standard constituents fit to nothing
+    let times = hourly(1000);
+    let values = tide(&times, 0.0, &[("M2", 1.0, 28.6)]);
 
-    // 1000 hours of hourly data (~42 days)
-    let times: Vec<f64> = (0..1000).map(|i| i as f64 * 3600.0).collect();
-    let values = generate_tidal_signal(std::slice::from_ref(&m2), 0.0, &times);
-
-    let series = TimeSeries::new(&times, &values);
-    let analysis = HarmonicAnalysis::standard();
-    let result = analysis.fit(&series);
-
-    let m2_result = result.get_constituent("M2").unwrap();
-
-    // Should recover amplitude within 1%
-    assert!(
-        (m2_result.amplitude - 1.0).abs() < 0.01,
-        "M2 amplitude error: expected 1.0, got {:.4}",
-        m2_result.amplitude
-    );
-
-    // Should recover phase within 0.01 radians
-    assert!(
-        (m2_result.phase - 0.5).abs() < 0.01,
-        "M2 phase error: expected 0.5, got {:.4}",
-        m2_result.phase
-    );
-
-    // Other constituents should have near-zero amplitude
-    let s2_result = result.get_constituent("S2").unwrap();
-    assert!(
-        s2_result.amplitude < 0.01,
-        "S2 should be near-zero, got {:.4}",
-        s2_result.amplitude
-    );
+    let fit = HarmonicAnalysis::standard().fit(&times, &values).unwrap();
+    let m2 = fit.get("M2").unwrap();
+    assert!((m2.amplitude - 1.0).abs() < 1e-9, "M2 H {}", m2.amplitude);
+    assert!(lag_error(m2.lag_deg, 28.6) < 1e-6, "M2 G {}", m2.lag_deg);
+    for name in ["S2", "K1", "O1"] {
+        assert!(fit.get(name).unwrap().amplitude < 1e-9, "{name}");
+    }
 }
 
 #[test]
 fn test_m2_s2_separation() {
-    // Test Rayleigh criterion: need ~15 days to separate M2 and S2
-    let m2 = TidalConstituent::m2(1.0, 0.0);
-    let s2 = TidalConstituent::s2(0.5, PI / 4.0);
+    // 400 hours (~17 days) separate M2 and S2 (14.8 days)
+    let times = hourly(400);
+    let values = tide(&times, 2.0, &[("M2", 1.0, 0.0), ("S2", 0.5, 45.0)]);
 
-    // 400 hours (~17 days, enough for M2/S2 separation)
-    let times: Vec<f64> = (0..400).map(|i| i as f64 * 3600.0).collect();
-    let values = generate_tidal_signal(&[m2.clone(), s2.clone()], 2.0, &times);
+    let fit = HarmonicAnalysis::new(&["M2", "S2"])
+        .fit(&times, &values)
+        .unwrap();
+    assert!((fit.mean - 2.0).abs() < 1e-9, "mean {}", fit.mean);
+    let (m2, s2) = (fit.get("M2").unwrap(), fit.get("S2").unwrap());
+    assert!((m2.amplitude - 1.0).abs() < 1e-9);
+    assert!((s2.amplitude - 0.5).abs() < 1e-9);
+    assert!(lag_error(s2.lag_deg, 45.0) < 1e-6, "S2 G {}", s2.lag_deg);
+}
 
-    let series = TimeSeries::new(&times, &values);
-    let analysis = HarmonicAnalysis::new(vec![
-        TidalConstituent::m2(0.0, 0.0),
-        TidalConstituent::s2(0.0, 0.0),
-    ]);
-    let result = analysis.fit(&series);
-
-    // Mean should be recovered
+/// Ten days cannot separate M2 from S2: an error, where the old
+/// record-time fit returned an ill-conditioned answer.
+#[test]
+fn test_short_record_is_an_error() {
+    let times = hourly(240);
+    let values = tide(&times, 0.0, &[("M2", 1.0, 0.0), ("S2", 0.5, 45.0)]);
+    let err = HarmonicAnalysis::standard()
+        .fit(&times, &values)
+        .unwrap_err();
     assert!(
-        (result.mean - 2.0).abs() < 0.01,
-        "Mean error: expected 2.0, got {:.4}",
-        result.mean
+        matches!(
+            err,
+            AnalysisError::NotSeparable {
+                a: "M2",
+                b: "S2",
+                ..
+            }
+        ),
+        "{err}"
     );
-
-    // M2 recovery
-    let m2_result = result.get_constituent("M2").unwrap();
-    assert!(
-        (m2_result.amplitude - 1.0).abs() < 0.02,
-        "M2 amplitude error"
-    );
-
-    // S2 recovery
-    let s2_result = result.get_constituent("S2").unwrap();
-    assert!(
-        (s2_result.amplitude - 0.5).abs() < 0.02,
-        "S2 amplitude error"
-    );
-
-    // Phase recovery for S2
-    assert!(
-        (s2_result.phase - PI / 4.0).abs() < 0.05,
-        "S2 phase error: expected {:.4}, got {:.4}",
-        PI / 4.0,
-        s2_result.phase
-    );
+    // What 10 days do resolve
+    let analysis =
+        HarmonicAnalysis::resolvable(&["M2", "S2", "K1", "O1"], times[239] - times[0], 1.0, &[]);
+    assert_eq!(analysis.names(), ["M2", "K1"]);
 }
 
 #[test]
 fn test_norwegian_coast_constituents() {
-    // Test full Norwegian coast analysis with 6 constituents
-    let constituents = vec![
-        TidalConstituent::m2(1.2, 0.1),  // Dominant
-        TidalConstituent::s2(0.4, 0.3),  // Second
-        TidalConstituent::n2(0.2, 0.5),  // Third
-        TidalConstituent::k1(0.15, 0.7), // Diurnal
-        TidalConstituent::o1(0.1, 0.9),  // Diurnal
-        TidalConstituent::p1(0.05, 1.1), // Diurnal
+    // 33 days: M2, S2, N2, K1, O1 fitted, P1 inferred from K1 at its
+    // equilibrium ratio (separating it needs half a year)
+    let truth = [
+        ("M2", 1.2, 5.7),
+        ("S2", 0.4, 17.2),
+        ("N2", 0.2, 28.6),
+        ("K1", 0.15, 40.1),
+        ("O1", 0.1, 51.6),
+        ("P1", 0.331 * 0.15, 40.1),
     ];
+    let times = hourly(800);
+    let values = tide(&times, 1.5, &truth);
 
-    // Need longer record for diurnal/semidiurnal separation (~30 days)
-    let times: Vec<f64> = (0..800).map(|i| i as f64 * 3600.0).collect();
-    let values = generate_tidal_signal(&constituents, 1.5, &times);
-
-    let series = TimeSeries::new(&times, &values);
-    let analysis = HarmonicAnalysis::norwegian_coast();
-    let result = analysis.fit(&series);
-
-    // Check that all constituents are recovered reasonably
-    for c in &constituents {
-        let fitted = result.get_constituent(c.name).unwrap();
-        let amp_error = (fitted.amplitude - c.amplitude).abs();
+    let fit = HarmonicAnalysis::norwegian_coast()
+        .fit(&times, &values)
+        .unwrap();
+    for (name, h, g) in truth {
+        let c = fit.get(name).unwrap();
         assert!(
-            amp_error < 0.05,
-            "{} amplitude error too large: expected {:.3}, got {:.3}",
-            c.name,
-            c.amplitude,
-            fitted.amplitude
+            (c.amplitude - h).abs() < 1e-8,
+            "{name}: H {} vs {h}",
+            c.amplitude
+        );
+        assert!(
+            lag_error(c.lag_deg, g) < 1e-6,
+            "{name}: G {} vs {g}",
+            c.lag_deg
         );
     }
-
-    // R² should be very high
-    assert!(
-        result.r_squared > 0.99,
-        "R² should be > 0.99, got {:.4}",
-        result.r_squared
-    );
+    assert!(fit.get("P1").unwrap().inferred);
+    assert!(fit.r_squared > 1.0 - 1e-12, "R² {}", fit.r_squared);
 }
 
 #[test]
 fn test_reconstruction() {
-    let m2 = TidalConstituent::m2(1.0, 0.0);
-    let mean_level = 5.0;
+    let times = hourly(500);
+    let original = tide(&times, 5.0, &[("M2", 1.0, 0.0)]);
 
-    let times: Vec<f64> = (0..500).map(|i| i as f64 * 3600.0).collect();
-    let original = generate_tidal_signal(&[m2], mean_level, &times);
-
-    let series = TimeSeries::new(&times, &original);
-    let analysis = HarmonicAnalysis::single(TidalConstituent::m2(0.0, 0.0));
-    let result = analysis.fit(&series);
-
-    // Reconstruct
-    let reconstructed = result.reconstruct(&times);
-
-    // Compare original and reconstructed
-    let metrics = ComparisonMetrics::compute(&reconstructed, &original);
-
-    assert!(
-        metrics.rmse < 0.001,
-        "Reconstruction RMSE too large: {:.6}",
-        metrics.rmse
-    );
-    assert!(
-        (metrics.correlation - 1.0).abs() < 0.0001,
-        "Correlation not perfect: {:.6}",
-        metrics.correlation
-    );
+    let fit = HarmonicAnalysis::new(&["M2"])
+        .fit_series(&TimeSeries::new(&times, &original))
+        .unwrap();
+    let metrics = ComparisonMetrics::compute(&fit.predict(&times), &original);
+    assert!(metrics.rmse < 1e-9, "RMSE {}", metrics.rmse);
 }
 
 #[test]
@@ -194,64 +160,37 @@ fn test_comparison_metrics() {
     assert!((metrics_biased.correlation - 1.0).abs() < 1e-10); // Still perfect correlation
 }
 
+/// Model and observation over different spans compare constituent by
+/// constituent: reference constants do not depend on the record.
 #[test]
 fn test_harmonic_comparison() {
-    // Create "model" and "observation" harmonic results
-    let m2_model = TidalConstituent::m2(1.0, 0.5);
-    let m2_obs = TidalConstituent::m2(1.1, 0.52);
+    let model_times = hourly(500);
+    let obs_times: Vec<f64> = hourly(700)
+        .into_iter()
+        .map(|t| t + 9.0 * 86_400.0)
+        .collect();
+    let model = tide(&model_times, 0.0, &[("M2", 1.0, 30.0)]);
+    let obs = tide(&obs_times, 0.0, &[("M2", 1.1, 31.0)]);
 
-    let times: Vec<f64> = (0..500).map(|i| i as f64 * 3600.0).collect();
-
-    let model_values = generate_tidal_signal(&[m2_model], 0.0, &times);
-    let obs_values = generate_tidal_signal(&[m2_obs], 0.0, &times);
-
-    let model_series = TimeSeries::new(&times, &model_values);
-    let obs_series = TimeSeries::new(&times, &obs_values);
-
-    let analysis = HarmonicAnalysis::single(TidalConstituent::m2(0.0, 0.0));
-    let model_result = analysis.fit(&model_series);
-    let obs_result = analysis.fit(&obs_series);
-
-    let comparisons = compare_harmonics(&model_result, &obs_result);
-
+    let analysis = HarmonicAnalysis::new(&["M2"]);
+    let comparisons = compare_harmonics(
+        &analysis.fit(&model_times, &model).unwrap(),
+        &analysis.fit(&obs_times, &obs).unwrap(),
+    );
     assert_eq!(comparisons.len(), 1);
-    let m2_comp = &comparisons[0];
-
-    // Amplitude error should be ~0.1
-    assert!(
-        (m2_comp.amplitude_error - 0.1).abs() < 0.02,
-        "Amplitude error: expected ~0.1, got {:.4}",
-        m2_comp.amplitude_error
-    );
-
-    // Amplitude ratio should be ~0.91
-    assert!(
-        (m2_comp.amplitude_ratio - 1.0 / 1.1).abs() < 0.02,
-        "Amplitude ratio: expected ~0.91, got {:.4}",
-        m2_comp.amplitude_ratio
-    );
-
-    // Phase error should be ~0.02 radians
-    assert!(
-        m2_comp.phase_error.abs() < 0.05,
-        "Phase error too large: {:.4}",
-        m2_comp.phase_error
-    );
+    let m2 = &comparisons[0];
+    assert!((m2.amplitude_error - 0.1).abs() < 1e-9);
+    assert!((m2.amplitude_ratio - 1.0 / 1.1).abs() < 1e-9);
+    assert!((m2.phase_error_degrees() + 1.0).abs() < 1e-6, "{m2:?}");
 }
 
 #[test]
 fn test_minimum_record_length() {
-    // Standard analysis (M2, S2, K1, O1)
-    let analysis = HarmonicAnalysis::standard();
-    let min_length = analysis.minimum_record_length();
-
-    // M2 vs S2 separation requires ~355 hours
-    // Convert to hours for easier verification
-    let min_hours = min_length / 3600.0;
+    // M2 and S2 set it for the standard four: 354.4 hours
+    let min_hours = HarmonicAnalysis::standard().minimum_record_length() / 3600.0;
     assert!(
-        min_hours > 300.0 && min_hours < 400.0,
-        "Minimum record length should be ~355 hours, got {:.1} hours",
-        min_hours
+        (min_hours - 354.37).abs() < 0.1,
+        "Minimum record length should be ~354 hours, got {min_hours:.1} hours"
     );
 }
 
@@ -269,93 +208,65 @@ fn test_time_series_methods() {
     assert!((series.mean() - 3.0).abs() < 1e-10);
     assert!(series.location.is_some());
     assert_eq!(series.name.as_deref(), Some("Test Station"));
+    assert_eq!(series.times(), times.as_slice());
 
     // Variance of [1,2,3,4,5] = 2.5 (sample variance)
-    let expected_variance = 2.5;
-    assert!(
-        (series.variance() - expected_variance).abs() < 1e-10,
-        "Variance error"
-    );
+    assert!((series.variance() - 2.5).abs() < 1e-10, "Variance error");
+
+    let shifted = series.map_values(|v| v + 0.5);
+    assert!((shifted.mean() - 3.5).abs() < 1e-10);
+    assert_eq!(shifted.name.as_deref(), Some("Test Station"));
 }
 
 #[test]
 fn test_noisy_signal_recovery() {
-    // Add small noise to tidal signal
-    let m2 = TidalConstituent::m2(1.0, 0.0);
-
-    let times: Vec<f64> = (0..1000).map(|i| i as f64 * 3600.0).collect();
-    let mut values = generate_tidal_signal(&[m2], 0.0, &times);
-
-    // Add deterministic "noise" pattern (small amplitude)
+    let times = hourly(1000);
+    let mut values = tide(&times, 0.0, &[("M2", 1.0, 0.0)]);
+    // Deterministic "noise" (small amplitude)
     for (i, v) in values.iter_mut().enumerate() {
         *v += 0.01 * (i as f64 * 0.1).sin();
     }
 
-    let series = TimeSeries::new(&times, &values);
-    let analysis = HarmonicAnalysis::single(TidalConstituent::m2(0.0, 0.0));
-    let result = analysis.fit(&series);
-
-    // Should still recover M2 accurately
-    let m2_result = result.get_constituent("M2").unwrap();
-    assert!(
-        (m2_result.amplitude - 1.0).abs() < 0.02,
-        "M2 amplitude with noise: expected 1.0, got {:.4}",
-        m2_result.amplitude
-    );
-
-    // R² should still be high
-    assert!(
-        result.r_squared > 0.99,
-        "R² with noise: {:.4}",
-        result.r_squared
-    );
-}
-
-#[test]
-fn test_constituent_evaluate() {
-    let result = dg_rs::ConstituentResult {
-        name: "M2",
-        period: 12.42 * 3600.0,
-        amplitude: 1.5,
-        phase: 0.0,
-    };
-
-    // At t=0, should equal amplitude (cos(0) = 1)
-    assert!((result.evaluate(0.0) - 1.5).abs() < 1e-10);
-
-    // At t=half_period, should be -amplitude (cos(π) = -1)
-    let half_period = result.period / 2.0;
-    assert!((result.evaluate(half_period) - (-1.5)).abs() < 1e-10);
+    let fit = HarmonicAnalysis::new(&["M2"]).fit(&times, &values).unwrap();
+    let m2 = fit.get("M2").unwrap();
+    assert!((m2.amplitude - 1.0).abs() < 0.02, "M2 H {}", m2.amplitude);
+    assert!(fit.r_squared > 0.99, "R² {}", fit.r_squared);
 }
 
 #[test]
 fn test_phase_wraparound() {
-    // Test that phases near 2π and 0 are handled correctly
-    let m2 = TidalConstituent::m2(1.0, 2.0 * PI - 0.1);
+    // Lags near 360° and 0° are the same; the fit returns [0, 360)
+    let times = hourly(500);
+    let values = tide(&times, 0.0, &[("M2", 1.0, 354.3)]);
 
-    let times: Vec<f64> = (0..500).map(|i| i as f64 * 3600.0).collect();
-    let values = generate_tidal_signal(&[m2], 0.0, &times);
+    let fit = HarmonicAnalysis::new(&["M2"]).fit(&times, &values).unwrap();
+    let g = fit.get("M2").unwrap().lag_deg;
+    assert!((0.0..360.0).contains(&g), "G {g} not in [0, 360)");
+    assert!(lag_error(g, 354.3) < 1e-6, "G {g}");
+}
 
-    let series = TimeSeries::new(&times, &values);
-    let analysis = HarmonicAnalysis::single(TidalConstituent::m2(0.0, 0.0));
-    let result = analysis.fit(&series);
+/// An inference whose ratio comes from a reference fit (a longer record at
+/// the same place) reproduces that reference's ratio in a short fit.
+#[test]
+fn test_inference_from_a_reference_fit() {
+    let truth = [("M2", 0.74, 301.2), ("N2", 0.154, 279.1)];
+    let year = hourly(24 * 366);
+    let reference = HarmonicAnalysis::new(&["M2", "N2"])
+        .fit(&year, &tide(&year, 0.0, &truth))
+        .unwrap();
 
-    let fitted_phase = result.constituents[0].phase;
-
-    // Phase should be in [0, 2π)
-    assert!(
-        (0.0..2.0 * PI).contains(&fitted_phase),
-        "Phase {} not in [0, 2π)",
-        fitted_phase
-    );
-
-    // Should match original phase (near 2π - 0.1)
-    let phase_diff = (fitted_phase - (2.0 * PI - 0.1)).abs();
-    let phase_diff_wrapped = phase_diff.min(2.0 * PI - phase_diff);
-    assert!(
-        phase_diff_wrapped < 0.01,
-        "Phase recovery error: expected {:.4}, got {:.4}",
-        2.0 * PI - 0.1,
-        fitted_phase
-    );
+    let fortnight = hourly(24 * 15);
+    let values = tide(&fortnight, 0.0, &truth);
+    let fit = HarmonicAnalysis::resolvable(
+        &["M2", "N2"],
+        fortnight[fortnight.len() - 1] - fortnight[0],
+        1.0,
+        &[Inference::N2_FROM_M2.or_from(Some(&reference))],
+    )
+    .fit(&fortnight, &values)
+    .unwrap();
+    let n2 = fit.get("N2").unwrap();
+    assert!(n2.inferred);
+    assert!((n2.amplitude - 0.154).abs() < 1e-8, "N2 H {}", n2.amplitude);
+    assert!(lag_error(n2.lag_deg, 279.1) < 1e-6, "N2 G {}", n2.lag_deg);
 }

@@ -26,8 +26,6 @@
 //! Density gradients drive baroclinic circulation in fjords where fresh
 //! river water meets saline Atlantic water.
 
-use crate::solver::TracerState;
-
 /// Reference density for seawater (kg/m³).
 ///
 /// Used for Boussinesq approximation: ρ = ρ₀(1 + ρ'/ρ₀)
@@ -162,13 +160,6 @@ impl EquationOfState {
 
         // Density at pressure
         rho_0 / (1.0 - p_bar / k)
-    }
-
-    /// Compute density from TracerState.
-    ///
-    /// Convenience method for use with the tracer system.
-    pub fn density_from_tracers(&self, tracers: TracerState) -> f64 {
-        self.density_surface(tracers.temperature, tracers.salinity)
     }
 
     /// Compute density anomaly σ = ρ - 1000 kg/m³.
@@ -475,11 +466,6 @@ impl LinearEquationOfState {
             * (1.0 - self.alpha * (temperature - self.t_0) + self.beta * (salinity - self.s_0))
     }
 
-    /// Compute density from TracerState.
-    pub fn density_from_tracers(&self, tracers: TracerState) -> f64 {
-        self.density(tracers.temperature, tracers.salinity)
-    }
-
     /// Compute density anomaly ρ' = ρ - ρ₀.
     pub fn density_anomaly(&self, temperature: f64, salinity: f64) -> f64 {
         self.rho_0 * (-self.alpha * (temperature - self.t_0) + self.beta * (salinity - self.s_0))
@@ -629,16 +615,6 @@ mod tests {
         // Both should show density decrease with warming
         assert!(rho_full_warm < rho_full);
         assert!(rho_lin_warm < rho_lin);
-    }
-
-    #[test]
-    fn test_density_from_tracers() {
-        let eos = EquationOfState::new();
-
-        let tracers = TracerState::norwegian_coastal();
-        let rho = eos.density_from_tracers(tracers);
-
-        assert!(rho > 1020.0 && rho < 1030.0);
     }
 
     #[test]

@@ -12,18 +12,9 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::io::write_vtk_coupled;
+//! use dg_rs::io::write_vtk_swe;
 //!
-//! write_vtk_coupled(
-//!     "output.vtu",
-//!     &mesh,
-//!     &ops,
-//!     &swe_solution,
-//!     &tracer_solution,
-//!     Some(&bathymetry),
-//!     time,
-//!     h_min,
-//! )?;
+//! write_vtk_swe("output.vtu", &mesh, &ops, &swe_solution, Some(&bathymetry), time, h_min)?;
 //! ```
 
 use std::fs::File;
@@ -34,7 +25,7 @@ use thiserror::Error;
 
 use crate::mesh::{Bathymetry2D, Mesh2D};
 use crate::operators::DGOperators2D;
-use crate::solver::{SWESolution2D, SWEState2D, TracerSolution2D};
+use crate::solver::{SWESolution2D, SWEState2D};
 use crate::types::{Depth, ElementIndex};
 
 /// Error type for VTK operations.
@@ -442,122 +433,6 @@ pub fn write_vtk_swe(
     Ok(())
 }
 
-/// Write coupled SWE + tracer solution to VTK file.
-///
-/// Outputs all SWE fields plus temperature and salinity.
-pub fn write_vtk_coupled(
-    path: impl AsRef<Path>,
-    mesh: &Mesh2D,
-    ops: &DGOperators2D,
-    swe: &SWESolution2D,
-    tracers: &TracerSolution2D,
-    bathymetry: Option<&Bathymetry2D>,
-    time: f64,
-    h_min: f64,
-) -> Result<(), VtkError> {
-    let vtk_mesh = build_vtk_mesh(mesh, ops);
-    let file = File::create(path)?;
-    let mut writer = VtkWriter::new(file);
-    let h_min = Depth::new(h_min);
-
-    let n_points = vtk_mesh.points.len();
-    let n_cells = vtk_mesh.cells.len();
-
-    writer.write_header()?;
-    writer.start_element("UnstructuredGrid", &[])?;
-    writer.start_element(
-        "Piece",
-        &[
-            ("NumberOfPoints", &n_points.to_string()),
-            ("NumberOfCells", &n_cells.to_string()),
-        ],
-    )?;
-
-    // Write geometry
-    writer.write_points(&vtk_mesh.points)?;
-    writer.write_cells(&vtk_mesh.cells)?;
-
-    // Write point data
-    writer.start_element("PointData", &[("Scalars", "h")])?;
-
-    // Extract all solution fields
-    let mut h_data = Vec::with_capacity(n_points);
-    let mut u_data = Vec::with_capacity(n_points);
-    let mut v_data = Vec::with_capacity(n_points);
-    let mut speed_data = Vec::with_capacity(n_points);
-    let mut temp_data = Vec::with_capacity(n_points);
-    let mut sal_data = Vec::with_capacity(n_points);
-    let mut eta_data = if bathymetry.is_some() {
-        Vec::with_capacity(n_points)
-    } else {
-        Vec::new()
-    };
-    let mut bathy_data = if bathymetry.is_some() {
-        Vec::with_capacity(n_points)
-    } else {
-        Vec::new()
-    };
-
-    for k in ElementIndex::iter(mesh.n_elements) {
-        for i in 0..ops.n_nodes {
-            // SWE state
-            let h = swe.get_var(k, i, 0);
-            let hu = swe.get_var(k, i, 1);
-            let hv = swe.get_var(k, i, 2);
-
-            let state = SWEState2D { h, hu, hv };
-            let (u, v) = state.velocity(h_min);
-            let speed = state.velocity_magnitude(h_min);
-
-            h_data.push(h);
-            u_data.push(u);
-            v_data.push(v);
-            speed_data.push(speed);
-
-            // Tracer state (convert from conservative to concentrations)
-            let tracer_state = tracers.get_concentrations(k, i, h, h_min.meters());
-            temp_data.push(tracer_state.temperature);
-            sal_data.push(tracer_state.salinity);
-
-            if let Some(bathy) = bathymetry {
-                let b = bathy.data[k.as_usize() * ops.n_nodes + i];
-                bathy_data.push(b);
-                eta_data.push(h + b);
-            }
-        }
-    }
-
-    writer.write_data_array_f64("h", &h_data, 1)?;
-    writer.write_data_array_f64("u", &u_data, 1)?;
-    writer.write_data_array_f64("v", &v_data, 1)?;
-    writer.write_data_array_f64("velocity_magnitude", &speed_data, 1)?;
-    writer.write_data_array_f64("temperature", &temp_data, 1)?;
-    writer.write_data_array_f64("salinity", &sal_data, 1)?;
-
-    if bathymetry.is_some() {
-        writer.write_data_array_f64("eta", &eta_data, 1)?;
-        writer.write_data_array_f64("bathymetry", &bathy_data, 1)?;
-    }
-
-    writer.end_element("PointData")?;
-
-    // Cell data
-    writer.start_element("CellData", &[("Scalars", "element_id")])?;
-    let element_ids: Vec<i32> = vtk_mesh.element_ids.iter().map(|&id| id as i32).collect();
-    writer.write_data_array_i32("element_id", &element_ids)?;
-    writer.end_element("CellData")?;
-
-    writer.end_element("Piece")?;
-
-    // Write time as field data (outside Piece, inside UnstructuredGrid)
-    writer.write_field_data("TimeValue", time)?;
-
-    writer.end_element("UnstructuredGrid")?;
-    writer.write_footer()?;
-
-    Ok(())
-}
-
 /// Write VTK file with automatic frame numbering.
 ///
 /// Creates filename like `base_0001.vtu` for frame 1.
@@ -568,7 +443,6 @@ pub fn write_vtk_series(
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     swe: &SWESolution2D,
-    tracers: Option<&TracerSolution2D>,
     bathymetry: Option<&Bathymetry2D>,
     time: f64,
     h_min: f64,
@@ -580,11 +454,7 @@ pub fn write_vtk_series(
     let filename = format!("{}_{:04}.vtu", stem, frame);
     let path = parent.join(filename);
 
-    if let Some(tracers) = tracers {
-        write_vtk_coupled(&path, mesh, ops, swe, tracers, bathymetry, time, h_min)?;
-    } else {
-        write_vtk_swe(&path, mesh, ops, swe, bathymetry, time, h_min)?;
-    }
+    write_vtk_swe(&path, mesh, ops, swe, bathymetry, time, h_min)?;
 
     Ok(path)
 }
@@ -679,8 +549,7 @@ mod tests {
         let ops = DGOperators2D::new(1);
         let solution = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
 
-        let path =
-            write_vtk_series(&base, 42, &mesh, &ops, &solution, None, None, 0.0, 1e-6).unwrap();
+        let path = write_vtk_series(&base, 42, &mesh, &ops, &solution, None, 0.0, 1e-6).unwrap();
 
         assert!(path.to_string_lossy().contains("output_0042.vtu"));
         assert!(path.exists());

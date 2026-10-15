@@ -41,7 +41,7 @@ src/
 │   ├── data/         # Bathymetry, land mask, boundary tags
 │   ├── io/           # Gmsh MSH 4.1 (ASCII/binary) + 2.2 reader, 2.2 writer
 │   └── traits/       # Mesh traits, Point; MeshGPUData (unimplemented)
-├── flux/             # Upwind, Lax-Friedrichs, Roe, HLL; 2D SWE + tracer fluxes;
+├── flux/             # Upwind, Lax-Friedrichs, Roe, HLL; 2D SWE fluxes;
 │                     # entropy-conservative/-stable SWE fluxes (Wintermeyer)
 │
 │  # ---- Equations & physics ----
@@ -65,7 +65,7 @@ src/
 │   │                 # kernels (blocks.rs: parallel with `parallel`, bit-
 │   │                 # identical to serial; thread-local scratch pool)
 │   ├── rhs/          # RHS kernels: scalar/SWE 1D/2D (collocated or entropy-stable
-│   │                 # split form), tracer, diffusion (BR1), 3D advection,
+│   │                 # split form), diffusion (BR1), 3D advection,
 │   │                 # 3D layer transports (Ω and inventory-form tracers,
 │   │                 # corrected to the barotropic DU_avg2; vertical
 │   │                 # advection upwind/centred/Akima/TVD/limited Akima,
@@ -76,7 +76,7 @@ src/
 │   │                 # 3D horizontal viscosity of the shear
 │   │                 # (BR1 per layer, constant + Smagorinsky),
 │   │                 # 3D RHS assembly (momentum / transport parts)
-│   ├── limiters/     # Zhang-Shu positivity, Kuzmin/TVB slope limiters
+│   ├── limiters/     # Zhang-Shu positivity, Kuzmin/TVB slope limiters (SWE, 3D tracers)
 │   ├── algorithms/   # Wetting/drying, tridiagonal (Thomas) solve
 │   ├── simd/         # fearless_simd kernels of the Standard kernel + batched faer paths
 │   ├── diagnostics/  # Runtime diagnostics (2D conservation); 3D potential

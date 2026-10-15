@@ -3,6 +3,7 @@
 use super::super::state::SWESolution2D;
 // Serial and parallel limiters run the same element kernels and agree bitwise,
 // so use the parallel ones whenever they are compiled in.
+use super::swe_2d::KuzminParameter2D;
 #[cfg(not(feature = "parallel"))]
 use super::swe_2d::{
     apply_swe_limiters_kuzmin_2d as kuzmin_with_positivity, swe_kuzmin_limiter_2d as kuzmin,
@@ -14,7 +15,6 @@ use super::swe_2d::{
     swe_kuzmin_limiter_2d_parallel as kuzmin, swe_positivity_limiter_2d_parallel as positivity,
 };
 use super::swe_2d::{element_mass, element_mean, positivity_limit_element};
-use super::tracer_2d::KuzminParameter2D;
 use super::traits::{BoxedLimiter2D, Limiter2D, LimiterContext2D};
 use crate::operators::GeometricFactors2D;
 

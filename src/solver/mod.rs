@@ -3,7 +3,7 @@
 //! # Submodules
 //!
 //! - [`core`]: Core solution containers (DGSolution1D, DGSolution2D, SystemSolution)
-//! - [`state`]: Physical state types (SWEState, TracerState, etc.)
+//! - [`state`]: Physical state types (SWEState, etc.)
 //! - [`rhs`]: Right-hand side computation for various equations
 //! - [`limiters`]: Slope limiters for oscillation control
 //! - [`algorithms`]: Specialized algorithms (wetting/drying)
@@ -39,10 +39,7 @@ pub use core::{DGSolution1D, DGSolution2D, SystemSolution, SystemSolution2D};
 pub use probe::{Probe2D, SWEPointSample};
 
 // Re-export state types
-pub use state::{
-    ConservativeTracerState, SWESolution, SWESolution2D, SWEState, SWEState2D, TracerSolution2D,
-    TracerState,
-};
+pub use state::{SWESolution, SWESolution2D, SWEState, SWEState2D};
 
 // Re-export RHS types and functions
 pub use rhs::{
@@ -54,10 +51,8 @@ pub use rhs::{
     ConstantBC2D,
     DirichletBC2D,
     // 2D Tracer
-    ExtrapolationTracerBC,
     // 3D RHS
     ExtrapolationTracerBC3D,
-    FixedTracerBC,
     FixedTracerBC3D,
     LINEAR_CFL_SAFETY,
     POSITIVITY_RELAXATION_SAFETY,
@@ -70,18 +65,12 @@ pub use rhs::{
     SWEFluxType,
     SWEFormulation2D,
     SWERhsConfig,
-    Tracer2DRhsConfig,
-    TracerBCContext2D,
     TracerBCContext3D,
-    TracerBoundaryCondition2D,
     TracerBoundaryCondition3D,
-    TracerSourceTerm2D,
-    UpwindTracerBC,
     UpwindTracerBC3D,
     compute_dt_advection_2d,
     compute_dt_swe,
     compute_dt_swe_2d,
-    compute_dt_tracer_2d,
     compute_dt_viscosity,
     compute_momentum_rhs_3d,
     compute_rhs,
@@ -93,7 +82,6 @@ pub use rhs::{
     compute_rhs_swe_2d_mass_fluxes_into,
     compute_rhs_swe_2d_subset_then,
     compute_rhs_swe_2d_where_into,
-    compute_rhs_tracer_2d,
     compute_transport_rhs_3d,
     element_dt_swe_2d,
     element_dt_viscous_swe_2d,
@@ -112,7 +100,6 @@ pub use limiters::{
     BoxedLimiter2D,
     // 2D SWE limiters
     KuzminLimiter2D,
-    // 2D Tracer limiters
     KuzminParameter2D,
     Limiter2D,
     LimiterChain2D,
@@ -122,7 +109,6 @@ pub use limiters::{
     StandardLimiter2D,
     // 1D limiters
     TVBParameter,
-    TVBParameter2D,
     TracerAveragePolicy3D,
     TracerBounds,
     TracerLimiter3DConfig,
@@ -131,18 +117,12 @@ pub use limiters::{
     TracerReferenceProfile,
     apply_swe_limiters,
     apply_swe_limiters_kuzmin_2d,
-    apply_tracer_limiters_2d,
     apply_tracer_limiters_3d,
-    apply_tracer_limiters_kuzmin_2d,
     create_limiter,
     positivity_limiter,
     swe_cell_averages_2d,
     swe_kuzmin_limiter_2d,
     swe_positivity_limiter_2d,
-    tracer_cell_averages_2d,
-    tracer_kuzmin_limiter_2d,
-    tracer_positivity_limiter_2d,
-    tracer_tvb_limiter_2d,
     tvb_limiter,
 };
 
@@ -172,7 +152,7 @@ pub use simd::{
 pub use simd::{apply_diff_matrix, apply_lift, combine_derivatives, coriolis_source};
 
 #[cfg(feature = "parallel")]
-pub use rhs::{compute_rhs_parallel, compute_rhs_tracer_2d_parallel};
+pub use rhs::compute_rhs_parallel;
 
 #[cfg(feature = "parallel")]
 pub use limiters::{

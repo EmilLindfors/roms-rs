@@ -14,7 +14,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use dg_rs::analysis::{TideGaugeStation, TideGaugeValidation, StationValidationResult};
+//! use dg_rs::analysis::{TideGaugeStation, StationValidationResult};
 //! use dg_rs::analysis::TimeSeries;
 //!
 //! // Define stations
@@ -30,14 +30,14 @@
 //!     .with_name("Bergen");
 //!
 //! // Validate
-//! let result = StationValidationResult::compute(&bergen, &model, &obs);
+//! let result = StationValidationResult::compute(&bergen, &model, &obs)?;
 //! println!("RMSE: {:.3} m", result.metrics.rmse);
 //! println!("Skill: {:.2}", result.metrics.skill_score);
 //! ```
 
 use super::{
-    ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary, HarmonicAnalysis,
-    HarmonicResult, TimeSeries, compare_harmonics,
+    AnalysisError, ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary,
+    HarmonicAnalysis, ReferenceFit, TimeSeries, compare_harmonics,
 };
 
 /// Metadata for a tide gauge station.
@@ -227,10 +227,10 @@ pub struct StationValidationResult {
     pub station: TideGaugeStation,
     /// Time series comparison metrics
     pub metrics: ComparisonMetrics,
-    /// Harmonic analysis of model time series
-    pub model_harmonics: Option<HarmonicResult>,
-    /// Harmonic analysis of observed time series
-    pub obs_harmonics: Option<HarmonicResult>,
+    /// Reference constants of the model series
+    pub model_harmonics: Option<ReferenceFit>,
+    /// Reference constants of the observed series (datum offset applied)
+    pub obs_harmonics: Option<ReferenceFit>,
     /// Constituent-by-constituent comparison
     pub constituent_comparisons: Vec<ConstituentComparison>,
     /// Summary of constituent comparisons
@@ -260,15 +260,21 @@ impl StationValidationResult {
     /// * `obs` - Observed water level time series (increasing times; will have
     ///   datum_offset applied)
     ///
-    /// # Panics
-    /// Panics if fewer than two observations fall inside the model's time span.
-    pub fn compute(station: &TideGaugeStation, model: &TimeSeries, obs: &TimeSeries) -> Self {
+    /// # Errors
+    /// [`AnalysisError::TooFewPairedSamples`] if fewer than two observations
+    /// fall inside the model's time span (a run shorter than the gauge's
+    /// sampling interval after its spin-up, or a record that misses the run).
+    pub fn compute(
+        station: &TideGaugeStation,
+        model: &TimeSeries,
+        obs: &TimeSeries,
+    ) -> Result<Self, AnalysisError> {
         let (model_values, obs_values) = paired_by_time(model, obs);
-        assert!(
-            model_values.len() >= 2,
-            "{}: fewer than two observations inside the model's time span",
-            station.name
-        );
+        if model_values.len() < 2 {
+            return Err(AnalysisError::TooFewPairedSamples {
+                station: station.name.clone(),
+            });
+        }
 
         // Apply datum offset to observations
         let obs_adjusted: Vec<f64> = obs_values
@@ -287,7 +293,7 @@ impl StationValidationResult {
         let (model_mean, model_std) = mean_std(&model_values);
         let (obs_mean, obs_std) = mean_std(&obs_adjusted);
 
-        Self {
+        Ok(Self {
             station: station.clone(),
             metrics,
             model_harmonics: None,
@@ -298,31 +304,25 @@ impl StationValidationResult {
             obs_mean,
             model_std,
             obs_std,
-        }
+        })
     }
 
-    /// Compute validation with harmonic analysis.
+    /// [`Self::compute`] and the reference constants of both series (on
+    /// the same absolute time axis, so they compare whatever the records'
+    /// spans), compared constituent by constituent.
     ///
-    /// Performs harmonic analysis on both time series and compares constituents.
+    /// # Errors
+    /// As [`Self::compute`] and [`HarmonicAnalysis::fit`] (e.g. a record too
+    /// short to separate the analysis's constituents).
     pub fn compute_with_harmonics(
         station: &TideGaugeStation,
         model: &TimeSeries,
         obs: &TimeSeries,
         analysis: &HarmonicAnalysis,
-    ) -> Self {
-        let mut result = Self::compute(station, model, obs);
-
-        // Perform harmonic analysis
-        let model_harmonics = analysis.fit(model);
-
-        // Create adjusted observation time series
-        let obs_adjusted_values: Vec<f64> = obs
-            .values()
-            .iter()
-            .map(|&v| v + station.datum_offset)
-            .collect();
-        let obs_adjusted = TimeSeries::new(&obs.times(), &obs_adjusted_values);
-        let obs_harmonics = analysis.fit(&obs_adjusted);
+    ) -> Result<Self, AnalysisError> {
+        let mut result = Self::compute(station, model, obs)?;
+        let model_harmonics = analysis.fit_series(model)?;
+        let obs_harmonics = analysis.fit_series(&obs.map_values(|v| v + station.datum_offset))?;
 
         // Compare constituents
         let comparisons = compare_harmonics(&model_harmonics, &obs_harmonics);
@@ -333,7 +333,7 @@ impl StationValidationResult {
         result.constituent_comparisons = comparisons;
         result.constituent_summary = Some(summary);
 
-        result
+        Ok(result)
     }
 
     /// Check if model passes basic validation criteria.
@@ -613,66 +613,57 @@ impl ModelExtractor for PrecomputedExtractor {
     }
 }
 
-/// Run validation for multiple stations.
+/// Validate the model at several stations.
 ///
 /// # Arguments
 /// * `stations` - List of tide gauge stations
 /// * `model_extractor` - Model output extractor
 /// * `observations` - Map from station name to observed time series
 /// * `times` - Common time vector for model extraction
-/// * `analysis` - Optional harmonic analysis configuration
+/// * `analysis` - Optional harmonic analysis
 ///
 /// # Returns
-/// Validation results for each station and overall summary.
+/// Each station's result or why it could not be validated (no model series,
+/// no observations, a record too short), in the order of `stations`, and
+/// the summary over the stations validated.
 pub fn validate_stations(
     stations: &[TideGaugeStation],
     model_extractor: &dyn ModelExtractor,
     observations: &std::collections::HashMap<String, TimeSeries>,
     times: &[f64],
     analysis: Option<&HarmonicAnalysis>,
-) -> (Vec<StationValidationResult>, ValidationSummary) {
-    let mut results = Vec::new();
-
-    for station in stations {
-        // Get model time series
-        let model_ts = match model_extractor.extract_at_station(station, times) {
-            Some(ts) => ts,
-            None => {
-                eprintln!(
-                    "Warning: Could not extract model data for station {}",
-                    station.name
-                );
-                continue;
+) -> (
+    Vec<Result<StationValidationResult, AnalysisError>>,
+    ValidationSummary,
+) {
+    let results: Vec<_> = stations
+        .iter()
+        .map(|station| {
+            let model = model_extractor
+                .extract_at_station(station, times)
+                .ok_or_else(|| AnalysisError::NoModelSeries(station.name.clone()))?;
+            let obs = observations
+                .get(&station.name)
+                .ok_or_else(|| AnalysisError::NoObservations(station.name.clone()))?;
+            match analysis {
+                Some(ha) => {
+                    StationValidationResult::compute_with_harmonics(station, &model, obs, ha)
+                }
+                None => StationValidationResult::compute(station, &model, obs),
             }
-        };
-
-        // Get observation time series
-        let obs_ts = match observations.get(&station.name) {
-            Some(ts) => ts,
-            None => {
-                eprintln!("Warning: No observations for station {}", station.name);
-                continue;
-            }
-        };
-
-        // Compute validation
-        let result = if let Some(ha) = analysis {
-            StationValidationResult::compute_with_harmonics(station, &model_ts, obs_ts, ha)
-        } else {
-            StationValidationResult::compute(station, &model_ts, obs_ts)
-        };
-
-        results.push(result);
-    }
-
-    let summary = ValidationSummary::from_results(&results);
+        })
+        .collect();
+    let validated: Vec<StationValidationResult> = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok().cloned())
+        .collect();
+    let summary = ValidationSummary::from_results(&validated);
     (results, summary)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f64::consts::PI;
 
     const TOL: f64 = 1e-10;
 
@@ -708,7 +699,7 @@ mod tests {
         let model = TimeSeries::new(&times, &values);
         let obs = TimeSeries::new(&times, &values);
 
-        let result = StationValidationResult::compute(&station, &model, &obs);
+        let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
         assert!(result.metrics.rmse.abs() < TOL);
         assert!(result.metrics.correlation > 0.99);
@@ -737,11 +728,37 @@ mod tests {
             &obs_t.iter().map(|&t| signal(t)).collect::<Vec<_>>(),
         );
 
-        let result = StationValidationResult::compute(&station, &model, &obs);
+        let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
         assert!(result.metrics.rmse < 1e-9, "rmse {}", result.metrics.rmse);
         // Observations after the model's last output are not compared
         let paired = paired_by_time(&model, &obs).0.len();
         assert_eq!(paired, 1 + (99 - 10) * 2);
+    }
+
+    /// A run that ends before the gauge's second sample after its spin-up
+    /// has nothing to compare (`froya_real_data` panicked on a 4 h run with
+    /// a 3 h spin-up and hourly observations).
+    #[test]
+    fn too_few_paired_observations_are_an_error() {
+        let station = TideGaugeStation::new("Test", 0.0, 0.0);
+        let model_t: Vec<f64> = (0..7).map(|i| i as f64 * 600.0).collect();
+        let model = TimeSeries::new(&model_t, &vec![0.1; model_t.len()]);
+        let obs_t: Vec<f64> = (0..10).map(|i| i as f64 * 3600.0).collect();
+        let obs = TimeSeries::new(&obs_t, &vec![0.2; obs_t.len()]);
+
+        // One hourly observation inside a 0–3000 s run…
+        let one = TimeSeries::new(&model_t[..6], &[0.1; 6]);
+        assert_eq!(
+            StationValidationResult::compute(&station, &one, &obs).unwrap_err(),
+            AnalysisError::TooFewPairedSamples {
+                station: "Test".into()
+            }
+        );
+        // …but two inside 0–3600 s are enough
+        let two = StationValidationResult::compute(&station, &model, &obs)
+            .expect("two paired observations");
+        assert_eq!(two.metrics.n_points, 2);
+        assert!((two.metrics.bias + 0.1).abs() < TOL);
     }
 
     #[test]
@@ -754,7 +771,7 @@ mod tests {
         let model = TimeSeries::new(&times, &biased);
         let obs = TimeSeries::new(&times, &values);
 
-        let result = StationValidationResult::compute(&station, &model, &obs);
+        let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
         assert!((result.metrics.bias - 0.5).abs() < TOL);
         assert!(result.metrics.correlation > 0.99); // High correlation despite bias
@@ -770,7 +787,7 @@ mod tests {
         let model = TimeSeries::new(&times, &model_values);
         let obs = TimeSeries::new(&times, &obs_values);
 
-        let result = StationValidationResult::compute(&station, &model, &obs);
+        let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
         // After applying datum offset, model and adjusted obs should match
         assert!(result.metrics.rmse.abs() < TOL);
@@ -790,8 +807,8 @@ mod tests {
         let model2 = TimeSeries::new(&times, &bad_model);
         let obs2 = TimeSeries::new(&times, &good_values);
 
-        let result1 = StationValidationResult::compute(&station1, &model1, &obs1);
-        let result2 = StationValidationResult::compute(&station2, &model2, &obs2);
+        let result1 = StationValidationResult::compute(&station1, &model1, &obs1).unwrap();
+        let result2 = StationValidationResult::compute(&station2, &model2, &obs2).unwrap();
 
         let summary = ValidationSummary::from_results(&[result1, result2]);
 
@@ -817,36 +834,57 @@ mod tests {
         assert_eq!(extracted.unwrap().len(), 3);
     }
 
+    /// Two days separate M2 from K1: the model's 10 % larger M2 shows in
+    /// the comparison. The four standard constituents need 15 days, so the
+    /// same records with them are an error (the old record-time fit gave
+    /// numbers for them anyway).
     #[test]
     fn test_validation_with_harmonics() {
         let station = TideGaugeStation::new("Test", 0.0, 0.0);
+        let t0 = 1.75e9;
+        let times: Vec<f64> = (0..288).map(|i| t0 + i as f64 * 600.0).collect();
+        let tide = |scale: f64| -> Vec<f64> {
+            let constants = ReferenceFit {
+                mean: 0.0,
+                constants: vec![
+                    crate::analysis::ReferenceConstant {
+                        name: "M2",
+                        amplitude: 0.5 * scale,
+                        lag_deg: 300.0,
+                        inferred: false,
+                    },
+                    crate::analysis::ReferenceConstant {
+                        name: "K1",
+                        amplitude: 0.07,
+                        lag_deg: 165.0,
+                        inferred: false,
+                    },
+                ],
+                r_squared: 1.0,
+                residual_rms: 0.0,
+            };
+            constants.predict(&times)
+        };
+        let model = TimeSeries::new(&times, &tide(1.1));
+        let obs = TimeSeries::new(&times, &tide(1.0));
 
-        // Create synthetic M2 tidal signal
-        let m2_period = 12.42 * 3600.0; // seconds
-        let m2_omega = 2.0 * PI / m2_period;
-        let amplitude = 0.5;
-        let phase = 0.3;
-
-        // 48 hours of data at 10-minute intervals
-        let n_points = 288;
-        let dt = 600.0; // 10 minutes
-        let times: Vec<f64> = (0..n_points).map(|i| i as f64 * dt).collect();
-        let values: Vec<f64> = times
-            .iter()
-            .map(|&t| amplitude * (m2_omega * t + phase).cos())
-            .collect();
-
-        let model = TimeSeries::new(&times, &values);
-        let obs = TimeSeries::new(&times, &values);
-
-        let analysis = HarmonicAnalysis::standard();
+        let analysis = HarmonicAnalysis::new(&["M2", "K1"]);
         let result =
-            StationValidationResult::compute_with_harmonics(&station, &model, &obs, &analysis);
-
-        assert!(result.model_harmonics.is_some());
-        assert!(result.obs_harmonics.is_some());
-        assert!(!result.constituent_comparisons.is_empty());
+            StationValidationResult::compute_with_harmonics(&station, &model, &obs, &analysis)
+                .unwrap();
+        let m2 = result.constituent_comparisons[0];
+        assert_eq!(m2.name, "M2");
+        assert!((m2.amplitude_ratio - 1.1).abs() < 1e-9, "{m2:?}");
+        assert!(m2.phase_error.abs() < 1e-9, "{m2:?}");
         assert!(result.constituent_summary.is_some());
+
+        let standard = StationValidationResult::compute_with_harmonics(
+            &station,
+            &model,
+            &obs,
+            &HarmonicAnalysis::standard(),
+        );
+        assert!(matches!(standard, Err(AnalysisError::NotSeparable { .. })));
     }
 
     #[test]
@@ -858,7 +896,7 @@ mod tests {
         let model = TimeSeries::new(&times, &values);
         let obs = TimeSeries::new(&times, &values);
 
-        let result = StationValidationResult::compute(&station, &model, &obs);
+        let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
         let summary = result.summary();
 
         assert!(summary.contains("Test"));

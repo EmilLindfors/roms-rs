@@ -10,6 +10,7 @@ This is a high-performance Discontinuous Galerkin (DG) solver for coastal ocean 
 - **Operational oceanography**: Results must be accurate enough for real-world decision support
 
 ### Design Philosophy
+- **Long-term architecture over short-term patches**: the crate is an early-stage experiment with no external users. Breaking the public API is fine (rename, merge, delete, re-shape types and functions) whenever it gives a better design or better performance; do not keep compatibility shims, deprecated paths or duplicate APIs, and port the callers (examples, tests) instead. Fix the cause, not the symptom.
 - **Correctness first**: Numerical methods must converge at theoretical rates
 - **Performance matters**: Will scale to millions of elements; every unnecessary allocation counts
 - **GPU-ready architecture**: Design data structures for future GPU port (cudarc)

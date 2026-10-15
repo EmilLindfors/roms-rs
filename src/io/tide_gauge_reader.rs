@@ -350,8 +350,9 @@ pub fn write_tide_gauge_file(path: &Path, data: &TideGaugeFile) -> Result<(), Ti
     writeln!(file, "# columns: time(s) water_level(m)")?;
 
     // Write data
-    for point in &data.time_series.data {
-        writeln!(file, "{:.1} {:.6}", point.time, point.value)?;
+    let series = &data.time_series;
+    for (time, value) in series.times().iter().zip(series.values()) {
+        writeln!(file, "{time:.1} {value:.6}")?;
     }
 
     Ok(())
@@ -410,8 +411,8 @@ mod tests {
         assert!((station.latitude - 60.39).abs() < 1e-10);
 
         assert_eq!(result.time_series.len(), 3);
-        assert!((result.time_series.data[0].value - 0.15).abs() < 1e-10);
-        assert!((result.time_series.data[1].time - 3600.0).abs() < 1e-10);
+        assert!((result.time_series.values()[0] - 0.15).abs() < 1e-10);
+        assert!((result.time_series.times()[1] - 3600.0).abs() < 1e-10);
     }
 
     #[test]
@@ -425,7 +426,7 @@ mod tests {
         let result = read_tide_gauge_file(file.path()).unwrap();
 
         assert_eq!(result.time_series.len(), 3);
-        assert!((result.time_series.data[2].value - 0.58).abs() < 1e-10);
+        assert!((result.time_series.values()[2] - 0.58).abs() < 1e-10);
     }
 
     #[test]

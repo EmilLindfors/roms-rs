@@ -14,7 +14,6 @@ mod swe_1d;
 mod swe_2d;
 mod swe_2d_split_form;
 mod swe_2d_viscosity;
-mod tracer_2d;
 
 // 1D scalar
 #[cfg(feature = "parallel")]
@@ -47,15 +46,6 @@ pub use swe_2d::{
     compute_rhs_swe_2d_parallel_mass_fluxes_into,
 };
 pub use swe_2d_viscosity::largest_viscosity_swe_2d;
-
-// 2D Tracer
-#[cfg(feature = "parallel")]
-pub use tracer_2d::compute_rhs_tracer_2d_parallel;
-pub use tracer_2d::{
-    ExtrapolationTracerBC, FixedTracerBC, Tracer2DRhsConfig, TracerBCContext2D,
-    TracerBoundaryCondition2D, TracerSourceTerm2D, UpwindTracerBC, compute_dt_tracer_2d,
-    compute_rhs_tracer_2d,
-};
 
 // 3D Baroclinic
 pub use baroclinic::{BalancedReference, PressureGradientForm, compute_pressure_gradient};
