@@ -82,6 +82,7 @@
 use crate::mesh::data::Bathymetry2D;
 use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
+use crate::profiling;
 use crate::solver::core::blocks::{for_each_block, update_values, update_with};
 use crate::solver::rhs::subcells::subcell_interfaces;
 use crate::solver::rhs::{
@@ -782,6 +783,8 @@ pub struct ModeSplitIntegrator {
     /// Coupling method.
     pub split_method: SplitMethod,
     barotropic_cfl: f64,
+    /// The SSP scheme of the barotropic substeps.
+    barotropic_scheme: SspScheme,
     min_substeps: usize,
     filter: Option<BarotropicFilter>,
     buffers: Option<Buffers>,
@@ -807,6 +810,7 @@ impl ModeSplitIntegrator {
         Self {
             split_method: SplitMethod::GTerm,
             barotropic_cfl: Self::DEFAULT_BAROTROPIC_CFL,
+            barotropic_scheme: SspScheme::Rk3,
             min_substeps: MIN_BAROTROPIC_SUBSTEPS,
             filter: None,
             buffers: None,
@@ -821,6 +825,17 @@ impl ModeSplitIntegrator {
     pub fn with_barotropic_cfl(mut self, cfl: f64) -> Self {
         assert!(cfl > 0.0, "barotropic CFL must be positive, got {cfl}");
         self.barotropic_cfl = cfl;
+        self
+    }
+
+    /// Step the barotropic substeps with `scheme` (SSP-RK3 by default).
+    ///
+    /// Where the 2D module's forward-Euler bounds set the substep (the
+    /// wet/dry positivity bound of shoreline elements, see
+    /// [`PhysicsModule::compute_dt_ssp`]), [`SspScheme::Rk43`]'s SSP
+    /// coefficient of 2 doubles it for 4/3 of the RHS work per substep.
+    pub fn with_barotropic_scheme(mut self, scheme: SspScheme) -> Self {
+        self.barotropic_scheme = scheme;
         self
     }
 
@@ -945,13 +960,16 @@ impl ModeSplitIntegrator {
             layers: layer_drag.then_some(&layer_drag_rate[..]),
         };
         let column_drag = layer_drag.then_some(&column_drag_rate[..]);
-        physics.momentum_rhs_into(state, t, rhs_n);
-        physics.slow_forcing_into(state, rhs_n, t, history.push(t, dt));
+        profiling::scope("split: slow forcing", || {
+            physics.momentum_rhs_into(state, t, rhs_n);
+            physics.slow_forcing_into(state, rhs_n, t, history.push(t, dt));
+        });
         history.step_average(dt, g_term);
         to_transport(state, bathymetry, q);
 
         // 2. One filtered barotropic pass
-        let dt_bt_max = barotropic.compute_dt_ssp(q, self.barotropic_cfl, Some(SspScheme::Rk3));
+        let dt_bt_max =
+            barotropic.compute_dt_ssp(q, self.barotropic_cfl, Some(self.barotropic_scheme));
         assert!(
             dt_bt_max > 0.0,
             "barotropic time step {dt_bt_max} is not positive"
@@ -971,6 +989,7 @@ impl ModeSplitIntegrator {
         let filter = self.filter.as_ref().expect("filter was just set");
         let dt_bt = dt / n_bt as f64;
 
+        let pass = profiling::start();
         q_avg.fill(0.0);
         transport.clear();
         let stage_drag = StageDrag {
@@ -981,16 +1000,12 @@ impl ModeSplitIntegrator {
         let mut pending_weight = None;
         for (m, &w_secondary) in filter.secondary_weights().iter().enumerate() {
             let t_m = t + m as f64 * dt_bt;
-            for stage in SSP_RK3_STAGES {
+            for &stage in barotropic_stages(self.barotropic_scheme) {
                 let time = t_m + stage.time * dt_bt;
                 // The stage's start value `x`, the value it writes, and `qⁿ`
-                // for the second stage's combination. The third stage writes
-                // `qⁿ⁺¹` in place, reading each node's `qⁿ` before
-                let (x, target, start) = match stage.input {
-                    StageInput::Start => (&*q, &mut *u1, None),
-                    StageInput::First => (&*u1, &mut *u2, Some(&*q)),
-                    StageInput::Second => (&*u2, &mut *q, None),
-                };
+                // for the combinations that read it. SSP-RK3's third stage
+                // writes `qⁿ⁺¹` in place, reading each node's `qⁿ` before
+                let (x, target, start) = stage_buffers(&stage, q, u1, u2);
                 barotropic.compute_rhs_mass_fluxes_into(x, time, k_2d, face_mass, subcell_mass);
                 let c = w_secondary * stage.weight / n_bt as f64;
                 if barotropic.mass_sources_into(x, time, stage_mass_source) {
@@ -1038,6 +1053,7 @@ impl ModeSplitIntegrator {
         }
         // The early weights are negative: restore positivity of the average
         barotropic.post_process(q_avg);
+        profiling::stop("split: barotropic pass", pass);
 
         // Constant barotropic rates over the step
         for k in 0..state.n_elements {
@@ -1149,6 +1165,7 @@ impl ModeSplitIntegrator {
         let last_values = &last_values_cell;
         to_inventories(state);
         let mut first_stage = true;
+        let stages = profiling::start();
         SSPRK3.step_with_relaxation(
             state,
             dt,
@@ -1198,6 +1215,7 @@ impl ModeSplitIntegrator {
             },
             &mut self.stages_3d,
         );
+        profiling::stop("split: 3D stages", stages);
 
         // The RK combination of the constant rates reproduces the filtered
         // state only up to round-off, which can leave a dry node a hair below
@@ -1224,7 +1242,9 @@ impl ModeSplitIntegrator {
         // 4. The implicit vertical terms change the depth mean through the
         // surface and bottom stresses, which G has already given to the
         // barotropic mode: reset it to ū.
-        physics.vertical_implicit(state, t, dt, drag);
+        profiling::scope("split: vertical implicit", || {
+            physics.vertical_implicit(state, t, dt, drag)
+        });
         depth_average(sigma, &state.u, mean_u);
         depth_average(sigma, &state.v, mean_v);
         shift_columns(&mut state.u, state.n_levels, mean_u, &state.ubar);
@@ -1232,34 +1252,60 @@ impl ModeSplitIntegrator {
     }
 }
 
-/// The start value of an SSP-RK3 stage of a barotropic substep.
+/// A buffer of the barotropic pass: the substep's start `qⁿ` (and its end
+/// `qⁿ⁺¹`, written in place), or one of the two stage values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StageInput {
-    /// `qⁿ`, the substep's start.
-    Start,
-    /// The first stage value `u₁`.
-    First,
-    /// The second stage value `u₂`.
-    Second,
+enum Slot {
+    Q,
+    U1,
+    U2,
 }
 
-/// An SSP-RK3 stage of a barotropic substep (Shu–Osher form):
+/// How a barotropic stage combines its rate `L(x)` with the substep's
+/// values (Shu–Osher form), each in the order of operations of its scheme's
+/// [`TimeIntegrator`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Combination {
+    /// `x + β·Δt·L(x)`.
+    Advance,
+    /// SSP-RK3's second stage, `¾qⁿ + ¼x + ¼Δt·L(x)`.
+    Rk3Second,
+    /// SSP-RK3's third stage, `⅓qⁿ + ⅔x + ⅔Δt·L(x)`, written over `qⁿ`.
+    Rk3Third,
+    /// SSP-RK(4,3)'s third stage, `⅔qⁿ + ⅓x + ⅙Δt·L(x)`.
+    Rk43Third,
+}
+
+/// A stage of a barotropic substep: SSP-RK3
 ///
 /// ```text
 /// u₁   = qⁿ + Δt·L(qⁿ)
 /// u₂   = ¾qⁿ + ¼u₁ + ¼Δt·L(u₁)
 /// qⁿ⁺¹ = ⅓qⁿ + ⅔u₂ + ⅔Δt·L(u₂)
 /// ```
+///
+/// or SSP-RK(4,3) ([`SspScheme::Rk43`], the third stage value kept in `u₁`)
+///
+/// ```text
+/// u₁   = qⁿ + ½Δt·L(qⁿ)
+/// u₂   = u₁ + ½Δt·L(u₁)
+/// u₁  ← ⅔qⁿ + ⅓u₂ + ⅙Δt·L(u₂)
+/// qⁿ⁺¹ = u₁ + ½Δt·L(u₁)
+/// ```
 #[derive(Clone, Copy, Debug)]
 struct RkStage {
-    input: StageInput,
+    /// The value the stage's rate is evaluated at.
+    x: Slot,
+    /// The value it writes.
+    target: Slot,
+    combination: Combination,
     /// Stage time, as a fraction of the substep.
     time: f64,
-    /// Weight of the stage's RHS in the substep (Butcher form,
-    /// `qⁿ⁺¹ = qⁿ + Δt(k₁ + k₂ + 4k₃)/6`): the weight of its fluxes in the
-    /// transport.
+    /// Weight of the stage's RHS in the substep (Butcher form, e.g.
+    /// `qⁿ⁺¹ = qⁿ + Δt(k₁ + k₂ + 4k₃)/6` for SSP-RK3): the weight of its
+    /// fluxes in the transport.
     weight: f64,
-    /// Length of the stage's forward-Euler step, as a fraction of the
+    /// Length of the stage's forward-Euler step `β`, as a fraction of the
     /// substep: the step of its point-implicit damping.
     dt_fraction: f64,
 }
@@ -1267,24 +1313,96 @@ struct RkStage {
 /// The three stages of [`SSPRK3`], in order.
 const SSP_RK3_STAGES: [RkStage; 3] = [
     RkStage {
-        input: StageInput::Start,
+        x: Slot::Q,
+        target: Slot::U1,
+        combination: Combination::Advance,
         time: 0.0,
         weight: 1.0 / 6.0,
         dt_fraction: 1.0,
     },
     RkStage {
-        input: StageInput::First,
+        x: Slot::U1,
+        target: Slot::U2,
+        combination: Combination::Rk3Second,
         time: 1.0,
         weight: 1.0 / 6.0,
         dt_fraction: 0.25,
     },
     RkStage {
-        input: StageInput::Second,
+        x: Slot::U2,
+        target: Slot::Q,
+        combination: Combination::Rk3Third,
         time: 0.5,
         weight: 2.0 / 3.0,
         dt_fraction: 2.0 / 3.0,
     },
 ];
+
+/// The four stages of [`SSPRK43`], in order.
+const SSP_RK43_STAGES: [RkStage; 4] = [
+    RkStage {
+        x: Slot::Q,
+        target: Slot::U1,
+        combination: Combination::Advance,
+        time: 0.0,
+        weight: 1.0 / 6.0,
+        dt_fraction: 0.5,
+    },
+    RkStage {
+        x: Slot::U1,
+        target: Slot::U2,
+        combination: Combination::Advance,
+        time: 0.5,
+        weight: 1.0 / 6.0,
+        dt_fraction: 0.5,
+    },
+    RkStage {
+        x: Slot::U2,
+        target: Slot::U1,
+        combination: Combination::Rk43Third,
+        time: 1.0,
+        weight: 1.0 / 6.0,
+        dt_fraction: 1.0 / 6.0,
+    },
+    RkStage {
+        x: Slot::U1,
+        target: Slot::Q,
+        combination: Combination::Advance,
+        time: 0.5,
+        weight: 0.5,
+        dt_fraction: 0.5,
+    },
+];
+
+/// The barotropic stages of `scheme`.
+fn barotropic_stages(scheme: SspScheme) -> &'static [RkStage] {
+    match scheme {
+        SspScheme::Rk3 => &SSP_RK3_STAGES,
+        SspScheme::Rk43 => &SSP_RK43_STAGES,
+    }
+}
+
+/// The stage's input `x`, its target and `qⁿ` (for the combinations that
+/// read it) among the pass's buffers.
+fn stage_buffers<'a>(
+    stage: &RkStage,
+    q: &'a mut SWESolution2D,
+    u1: &'a mut SWESolution2D,
+    u2: &'a mut SWESolution2D,
+) -> (
+    &'a SWESolution2D,
+    &'a mut SWESolution2D,
+    Option<&'a SWESolution2D>,
+) {
+    match (stage.x, stage.target) {
+        (Slot::Q, Slot::U1) => (&*q, u1, None),
+        (Slot::U1, Slot::U2) => (&*u1, u2, Some(&*q)),
+        (Slot::U2, Slot::Q) => (&*u2, q, None),
+        (Slot::U2, Slot::U1) => (&*u2, u1, Some(&*q)),
+        (Slot::U1, Slot::Q) => (&*u1, q, None),
+        (x, target) => unreachable!("no barotropic stage writes {target:?} from {x:?}"),
+    }
+}
 
 /// The depth-mean part of the 3D model's drags, frozen over the step:
 /// `bottom` holds the bottom-drag rate `r` (m/s), `column` the column mean
@@ -1385,13 +1503,14 @@ fn barotropic_stage(
                 let rhs = &rates.rhs.data[var][nodes.clone()];
                 let forcing = &rates.forcing.data[var][nodes.clone()];
                 let rate = |i: usize| rhs[i] + forcing[i];
-                match stage.input {
-                    StageInput::Start => {
+                match stage.combination {
+                    Combination::Advance => {
+                        let step = stage.dt_fraction * dt;
                         for (i, (new, &x)) in new.iter_mut().zip(x).enumerate() {
-                            *new = x + dt * rate(i);
+                            *new = x + step * rate(i);
                         }
                     }
-                    StageInput::First => {
+                    Combination::Rk3Second => {
                         let start = start.expect("the second stage combines with qⁿ");
                         let start = &start.data[var][nodes.clone()];
                         for (i, (new, (&x, &q))) in
@@ -1400,9 +1519,19 @@ fn barotropic_stage(
                             *new = q * 0.75 + 0.25 * x + 0.25 * dt * rate(i);
                         }
                     }
-                    StageInput::Second => {
+                    Combination::Rk3Third => {
                         for (i, (new, &x)) in new.iter_mut().zip(x).enumerate() {
                             *new = *new * (1.0 / 3.0) + 2.0 / 3.0 * x + 2.0 / 3.0 * dt * rate(i);
+                        }
+                    }
+                    Combination::Rk43Third => {
+                        let start = start.expect("the third stage combines with qⁿ");
+                        let start = &start.data[var][nodes.clone()];
+                        let step = stage.dt_fraction * dt;
+                        for (i, (new, (&x, &q))) in
+                            new.iter_mut().zip(x.iter().zip(start)).enumerate()
+                        {
+                            *new = q * (2.0 / 3.0) + 1.0 / 3.0 * x + step * rate(i);
                         }
                     }
                 }
@@ -1797,6 +1926,20 @@ mod tests {
     /// of a nonlinear rate, with a bottom and a layer drag and a dry node.
     #[test]
     fn fused_barotropic_stages_match_ssp_rk3_bit_for_bit() {
+        fused_stages_match_the_integrator(SspScheme::Rk3, &SSPRK3);
+    }
+
+    /// The same for SSP-RK(4,3) ([`SSPRK43`], `with_barotropic_scheme`).
+    #[test]
+    fn fused_barotropic_stages_match_ssp_rk43_bit_for_bit() {
+        fused_stages_match_the_integrator(SspScheme::Rk43, &crate::time::SSPRK43);
+    }
+
+    fn fused_stages_match_the_integrator(
+        scheme: SspScheme,
+        integrator: &impl TimeIntegrator<SWESolution2D>,
+    ) {
+        let stages = barotropic_stages(scheme);
         let (ne, nn, n_face) = (3, 4, 8);
         let value = |seed: usize| ((seed as f64 * 0.618_034).fract() - 0.3) * 2.0;
         let mut q0 = SWESolution2D::new(ne, nn);
@@ -1850,14 +1993,14 @@ mod tests {
         };
         for m in 0..2 {
             let mut stage = 0;
-            SSPRK3.step_with_relaxation(
+            integrator.step_with_relaxation(
                 &mut q,
                 dt,
                 m as f64 * dt,
                 |s, time, out| {
                     rhs(s, time, out, &mut face);
                     out.axpy(1.0, &g);
-                    let c = w_secondary[m] * SSP_RK3_STAGES[stage].weight;
+                    let c = w_secondary[m] * stages[stage].weight;
                     let sums = [
                         (&mut transport.hu.data[..], &s.data[SWE_VAR_HU][..]),
                         (&mut transport.hv.data[..], &s.data[SWE_VAR_HV][..]),
@@ -1884,12 +2027,8 @@ mod tests {
         let mut transport_fused = BarotropicTransport::new(ne, nn, ne * n_face, 0, 0);
         let mut pending = None;
         for m in 0..2 {
-            for stage in SSP_RK3_STAGES {
-                let (x, target, start) = match stage.input {
-                    StageInput::Start => (&q_fused, &mut u1, None),
-                    StageInput::First => (&u1, &mut u2, Some(&q_fused)),
-                    StageInput::Second => (&u2, &mut q_fused, None),
-                };
+            for &stage in stages {
+                let (x, target, start) = stage_buffers(&stage, &mut q_fused, &mut u1, &mut u2);
                 rhs(x, m as f64 * dt + stage.time * dt, &mut k, &mut face);
                 let rates = StageRates {
                     rhs: &k,

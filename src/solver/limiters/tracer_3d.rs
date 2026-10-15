@@ -838,12 +838,28 @@ fn apply_horizontal_kuzmin_field(
     stats: &mut TracerLimiter3DStats,
 ) {
     let (n_elements, n_nodes, n_levels) = (columns.n_elements, columns.n_nodes, columns.n_levels);
-    // The reference at a node's layer centre
-    let reference_at = |k: usize, i: usize, level: usize| {
-        reference.map_or(0.0, |profile| {
-            profile.at(columns.centre_height(ElementIndex::new(k), i, level))
-        })
-    };
+    // The reference at every node's layer centre, looked up once (each value
+    // is read three times below)
+    let n_values = n_elements * n_nodes * n_levels;
+    let mut references = Pooled::take(|a: &Vec<f64>| a.len() == n_values, || vec![0.0; n_values]);
+    if let Some(profile) = reference {
+        for_each_block(
+            n_elements,
+            [&mut references[..]],
+            || (),
+            |_, k, [references]| {
+                let offset = k * n_nodes * n_levels;
+                for (j, r) in references.iter_mut().enumerate() {
+                    *r = profile.at(columns.centres[offset + j]);
+                }
+            },
+        );
+    } else {
+        references.fill(0.0);
+    }
+    let references: &[f64] = &references;
+    let reference_at =
+        |k: usize, i: usize, level: usize| references[index(k, i, level, n_nodes, n_levels)];
     let mut averages = Pooled::take(
         |a: &Vec<f64>| a.len() == n_elements * n_levels,
         || vec![f64::NAN; n_elements * n_levels],

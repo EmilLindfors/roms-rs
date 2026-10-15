@@ -75,7 +75,7 @@ use crate::physics::traits::PhysicsModule; // For SWEPhysics2D
 use crate::physics::vertical_diffusion::{SurfaceFields, apply_vertical_diffusion};
 use crate::physics::vertical_mixing::{Forcing, VerticalMixing};
 use crate::solver::SWESolution2D;
-use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks};
+use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks, update_with};
 use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
     BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
@@ -89,7 +89,7 @@ use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
 use crate::source::{CageDrag2D, CageNode, CoriolisSource2D, RiverSources};
-use crate::time::{Integrable, ModeSplitPhysics, StepDrag};
+use crate::time::{ModeSplitPhysics, StepDrag};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -1051,6 +1051,8 @@ where
     /// velocity: the momentum advection sees them at rest (their momentum is
     /// the 2D module's; a film at the 2D velocity cap would otherwise carry
     /// its speed into the 3D shear), consistently in the stages and in `G`.
+    /// The copy holds η, ū, v̄, u, v, T, S, k and ψ only: `f` must not read
+    /// `w`, `rho` or the eddy coefficients.
     fn with_thin_columns_at_rest<R>(
         &self,
         state: &Solution3D,
@@ -1068,7 +1070,24 @@ where
         let masked = guard.get_or_insert_with(|| {
             Solution3D::new(state.n_elements, state.n_nodes, state.n_levels)
         });
-        masked.copy_from(state);
+        // Only the fields the callers read under the mask (the layer
+        // transports η, u, v; the advection T, S; the turbulence k, ψ; the
+        // slow forcing ū, v̄): w, ρ and the eddy coefficients stay stale, a
+        // third of the copy
+        masked.eta.copy_from(&state.eta);
+        masked.ubar.copy_from(&state.ubar);
+        masked.vbar.copy_from(&state.vbar);
+        for (x, y) in [
+            (&mut masked.u, &state.u),
+            (&mut masked.v, &state.v),
+            (&mut masked.temp, &state.temp),
+            (&mut masked.salt, &state.salt),
+            (&mut masked.tke, &state.tke),
+            (&mut masked.gls, &state.gls),
+        ] {
+            x.resize(y.len(), 0.0);
+            update_with(x, y, |x, y| *x = y);
+        }
         for idx in 0..n_columns {
             if self.is_thin(state, idx) {
                 masked.u[idx * nl..(idx + 1) * nl].fill(0.0);

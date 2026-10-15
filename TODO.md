@@ -7,9 +7,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Next up
 
 1. **P3.1** The Mausund error budget: M2's +3 % from NorKyst (`gauge_gains=M2,…`) together with the overtides that are too weak (M4 0.35×). See Validation.
-2. **P1.3** A day of the full Frøya coastline mesh in 3D. See Geometry.
-3. **P4.4** Per-column surface heat and freshwater fluxes, the next step for a real 3D run; then **P1.5** a real NorKyst 3D nested run.
-4. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
+2. **P4.4** Per-column surface heat and freshwater fluxes, the next step for a real 3D run; then **P1.5** a real NorKyst 3D nested run.
+3. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -176,13 +175,14 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Geometry and meshes (P1.3) — [notes/geometry-mesh.md](notes/geometry-mesh.md)
 
 - [ ] **P1.3** `froya_real_data tide3d=1`'s progress line reports T only in columns ≥ the thin depth, where the thin-column drift never showed until it spread: add the thin and shore columns' range.
-- [ ] **P1.3** A day of the full Frøya coastline mesh in 3D (≈ 1.06 s per step at 24 threads): M2 cycle and gauge, η and ū at Mausund against the 2D run.
+- [ ] **P1.3** The coastline day's depth-mean M2 current at Mausund's NorKyst point is 0.076 m/s in 3D against 0.10–0.15 in 2D (NorKyst 0.25; the point is 23 m deep in our bed, 49 m in NorKyst's): the 3D bottom drag against 2D Manning? Rerun the 2D day for 24 h on today's bed first (`notes/geometry-mesh.md` "The coastline day in 3D").
+- [ ] **P1.3** Shore films still set the 3D step: element 7507 at (4.2, −13.5) km, 1.0 m deep, ran its surface layer at 3.1 m/s at 13.5 h of the coastline day and the step fell to 0.24 s (209 steps for the half hour against ≈ 110).
 - [ ] **P1.3** Mass-weight the 2D tracer limiter's element means (`solver/limiters/tracer_2d.rs:238`, `:708`, `ops.weights[i] * h` without J): use `geom.node_mass`.
 - [ ] **P1.3** A jittered-mesh case for `EntropyStable`/`WetDry` in `convergence_test.rs` (the averaged metric loses an order pointwise on such meshes).
 - [ ] **P1.3** Rerun the unsmoothed full-mesh 3-day baseline on current code (without `slopes3d`, ≈ 1–2.5 h) for a like-for-like comparison with the 19 m free depth.
 - [ ] **P1.3** Decide the 2D `rx0` default, after the map-wide NorKyst current comparison (`output_minutes=60`, `scripts/norkyst_current_comparison.py`).
 - [ ] **P1.3** Make implicit vertical advection (`Hydrostatic3D::with_implicit_vertical_advection`) the library default once the full Frøya mesh has run with it.
-- [ ] **P1.3 / P2.5 / P4.5** Local time stepping in 3D: the step is bound by 2.5–3 m sound elements (0.79 s), and the farm's 40 m quads set the fjord's. Run the barotropic pass on `MultirateStepper` with hooks for the filter/DU_avg2 sums (per-element stage weights). Blockers: the filter's uniform substep grid, DU_avg2, the nodal identity, AB3 history.
+- [ ] **P1.3 / P2.5 / P4.5** Local time stepping in 3D: the step is bound by 2.5–3 m sound elements (0.79 s), and the farm's 40 m quads set the fjord's. Run the barotropic pass on `MultirateStepper` with hooks for the filter/DU_avg2 sums (per-element stage weights). Blockers: the filter's uniform substep grid, DU_avg2, the nodal identity, AB3 history. On the coastline day the barotropic pass is half the step and its substep is set by shoreline elements with a dry node (ideal LTS gain 5.5–6×, `notes/3d-numerics.md` 2026-10-15).
 - [ ] **P1.3** Cap or ramp the first 3D steps from rest (`compute_dt` sees no Ω at rest; thin layers need |Ω|Δt/H_z ≤ 1).
 - [ ] **P1.3** The 3D viscous step bound (`element_dt_viscous_swe_2d`) is harsh (ν = 50 m²/s: 0.54 s against 5 s): implicit shear viscosity, or the bound from the operator's spectrum.
 - [ ] **P1.3** What dropping baroclinic pressure in thin-column elements (a one-element coastal band) does to estuarine and wind-driven shore currents, once tides and rivers run in 3D.
@@ -194,6 +194,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** `froya_real_data`'s gauge comparison panics on runs with fewer than two observations after the spin-up (`tide_gauge.rs:267`, a 4 h run with `spinup_hours=3`): skip it with a message instead.
 - [ ] **P1.3** Mausund's pinnacle element 291 (a 1.2 m node among 42–55 m, unsmoothed) cools its bed layer from 8.6 to 6.0 °C within 30 min at 2 h of the 3D tide, below NorKyst's 7.50 minimum: the straddle below, seen in T.
 - [ ] **P1.3** The straddle instability over unsmoothed cliffs (smoothing works around it): a per-element Haney rx1 bound, a capped or implicit pair density, or geopotential diffusion; run the spectrum harness (≥ 1800 s, check the residuals) on the slices. The coastline day's cliff shores (element 5179: 0.74 m among 61–82 m, 24–30 m/s at the surface) are land now (`cliffs3d`, `notes/geometry-mesh.md` "Cliff shores raised to land").
+- [ ] **P1.3** The coastline day cools a 41–56 m basin's bed layer below NorKyst's minimum through the ebb: element 5143 at (−1.6, −8.1) km (r_x0 0.15, at the 3D bound; shore elements 4122/4123/6171 rise to land beside it) goes from 8.4 to 7.0 °C between 5 and 6 h, with 0.2–0.33 m/s in the bed layer under a depth mean of 0.01–0.04 m/s (`output/froya_day/3d_ponds`, and 7.05 °C at 6.5 h on the bed before `ponds3d`). The straddle or terrace mode below, at the bound?
 - [ ] **P1.3** The shipped 3D rest state still grows at terrace vertices beside shore elements: an oscillatory mode, e-folding ≈ 2–2.4 h, period ≈ 3 h, in the bed layers across the pycnocline's foot (LimitedAkima about the reference; any Akima weight). Find its mechanism (a fully wet slice of the same terrace is stable) and fix it; gate `a_terrace_beside_a_shore_element_stays_at_rest_for_twelve_hours`.
 - [ ] **P1.3** Rerun the full coastline mesh at rest with today's defaults for 24–48 h, seeded (`debug_3d=…,perturb=1e-6`): the 12 h round-off runs cannot see a 2 h mode.
 - [ ] **P1.3** Coastline-mesh cost (≈ 4× the 500 m grid; 4.4e4 element-steps against 2.3e4 ideal): multirate level coherence (three-hop stage dependency ≈ 1.9×) and a non-subdividing quad mesher.
@@ -281,6 +282,10 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **P4.5** The splitter's fixed per-stage data movement (≈ 60 field passes, 27 % of the step at dt 4 s, 12k elements): kernels read `H_z φ` and divide on load, the post-stage hook converts in place.
 - [ ] **P4.5** The forward-backward (AB3-AM4) barotropic fast mode, fewer RHS per substep.
+- [ ] **P4.5** Make SSP-RK(4,3) at the caps `ModeSplitIntegrator`'s own default for wet/dry runs (changes every 3D gate's bits); the coastline day ran a full day on it (387 s per model hour, `notes/geometry-mesh.md` "The coastline day in 3D").
+- [ ] **P4.5** The coastline day's Kuzmin limiter changes about half of all element-layers at every stage (116k of 241k for T, 101k for S; 67k/58k again after each step): find what it cuts (round-off-level bounds over smooth stratification, or real overshoots) before it is taken as harmless; it also costs ≈ 45 ms per call, four calls per step.
+- [ ] **P4.5** The thin-column copies (`with_thin_columns_at_rest`, 5 per 3D step, bandwidth-bound; nine of thirteen fields since 2026-10-15): a mask the readers take instead.
+- [ ] **P4.5** The barotropic filter integrates 1.3 n_bt substeps (30 % past tⁿ⁺¹); the fused stage costs half a 2D RHS (0.56 ms, 10 streamed arrays): a shorter window or fewer streams.
 - [ ] **P4.5** Fewer parallel regions per barotropic stage: the fused `barotropic_stage` as the RHS's per-element continuation (≈ 4 of 85 ms at 1024 elements).
 - [ ] **P4.2** Replace `with_thin_columns_at_rest`'s whole-`Solution3D` copy each stage with a thin-column mask read by the kernels.
 - [ ] **P4.2** Skip `w` and `rho` in `Solution3D`'s stage combination, or a splitter-own stage state (changes the bits of `w`).
@@ -294,7 +299,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.5** 3D Smagorinsky on a fjord with a sill and tidal shear (may over-damp a tidal mixed layer; else Leith or Ri-dependent ν).
 - [ ] **P4.5** Rotated/geopotential horizontal diffusion of 3D tracers via BR1 (none exists; `viscosity_3d` is momentum only).
 - [ ] **P4.5** Subcell (GLL-cell) finite volumes for shoreline tracers instead of element means per level (needs 2D subcell fluxes in DU_avg2).
-- [ ] **P4.5** Port the 3D advective dt bound to the 2D per-node metric form (`compute_dt_swe_2d`), with a linear stability measurement (changes what `cfl` means). Mausund holds `cfl_3d=2` and blows up at 3 in a 50 m element during the ramp; the coastline mesh blows up at 1.5 in a cliff element (1.2 m beside 82 m); `froya_real_data` takes 1 now. Remeasure with `cliffs3d` (on by default since 2026-10-14), which makes that shore land: the limit may rise to Mausund's 2. Find which term sets the limit (internal waves, the splitting, the shallow node of a cliff element).
+- [ ] **P4.5** Port the 3D advective dt bound to the 2D per-node metric form (`compute_dt_swe_2d`), with a linear stability measurement (changes what `cfl` means). Mausund holds `cfl_3d=2` and blows up at 3 in a 50 m element during the ramp; the coastline mesh blows up at 1.5 in a cliff element (1.2 m beside 82 m); `froya_real_data` takes 2 since 2026-10-15 (the coastline day holds it on hours 0–2 and 6–8). Remeasure with `cliffs3d` (on by default since 2026-10-14), which makes that shore land: the limit may rise to Mausund's 2. Find which term sets the limit (internal waves, the splitting, the shallow node of a cliff element).
 - [ ] **P4.5** `Simulation3D`'s default `cfl` (0.5, `SimulationConfig`'s, shared with 2D) is 0.17–0.25 of the measured limit: give 3D its own default once the bound is ported.
 - [ ] **P4.5** EOS: delegate to the fixed UNESCO EOS with a linear fast path; TEOS-10 later. In `UnescoEOS::update_density`, `s * s.sqrt()` for `s.powf(1.5)` and a flat parallel loop.
 - [ ] **P4.5** RPE (`PotentialEnergy3D`) in 3D run output (a `Simulation3D` callback or NetCDF attributes).

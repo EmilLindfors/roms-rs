@@ -309,33 +309,60 @@ impl Nesting3D {
                 salt,
             } = &mut *columns;
             *time = t;
-            for (slot, (&flat, &position)) in self.nodes.iter().zip(&self.positions).enumerate() {
-                eta[slot] = state.eta.data[flat];
-                let values = slot * nl..(slot + 1) * nl;
+            // Each band node's column on its own (a parent evaluation is a
+            // few µs, ≈ 10⁴ band nodes on a coastline mesh)
+            let column_of = |(slot, (eta, (u, (v, (temp, salt))))): BandColumn<'_>| {
+                let flat = self.nodes[slot];
+                *eta = state.eta.data[flat];
                 let covered = self.parent.column(
                     &ColumnContext3D {
                         time: t,
                         node: flat,
-                        position,
+                        position: self.positions[slot],
                         bed: bathymetry.data[flat],
-                        eta: eta[slot],
+                        eta: *eta,
                     },
                     sigma,
                     ParentColumn {
-                        u: &mut u[values.clone()],
-                        v: &mut v[values.clone()],
-                        temp: &mut temp[values.clone()],
-                        salt: &mut salt[values.clone()],
+                        u: &mut *u,
+                        v: &mut *v,
+                        temp: &mut *temp,
+                        salt: &mut *salt,
                     },
                 );
                 if !covered {
                     let column = flat * nl..(flat + 1) * nl;
-                    u[values.clone()].copy_from_slice(&state.u[column.clone()]);
-                    v[values.clone()].copy_from_slice(&state.v[column.clone()]);
-                    temp[values.clone()].copy_from_slice(&state.temp[column.clone()]);
-                    salt[values].copy_from_slice(&state.salt[column]);
+                    u.copy_from_slice(&state.u[column.clone()]);
+                    v.copy_from_slice(&state.v[column.clone()]);
+                    temp.copy_from_slice(&state.temp[column.clone()]);
+                    salt.copy_from_slice(&state.salt[column]);
                 }
+            };
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                eta.par_iter_mut()
+                    .zip(
+                        u.par_chunks_exact_mut(nl).zip(
+                            v.par_chunks_exact_mut(nl).zip(
+                                temp.par_chunks_exact_mut(nl)
+                                    .zip(salt.par_chunks_exact_mut(nl)),
+                            ),
+                        ),
+                    )
+                    .enumerate()
+                    .for_each(column_of);
             }
+            #[cfg(not(feature = "parallel"))]
+            eta.iter_mut()
+                .zip(
+                    u.chunks_exact_mut(nl).zip(
+                        v.chunks_exact_mut(nl)
+                            .zip(temp.chunks_exact_mut(nl).zip(salt.chunks_exact_mut(nl))),
+                    ),
+                )
+                .enumerate()
+                .for_each(column_of);
         }
         NestingColumns {
             nesting: self,
@@ -343,6 +370,19 @@ impl Nesting3D {
         }
     }
 }
+
+/// A band node's slot and its cached `η` and `u`, `v`, `T`, `S` columns, as
+/// [`Nesting3D::columns`] fills them.
+type BandColumn<'a> = (
+    usize,
+    (
+        &'a mut f64,
+        (
+            &'a mut [f64],
+            (&'a mut [f64], (&'a mut [f64], &'a mut [f64])),
+        ),
+    ),
+);
 
 /// The parent's columns of a [`Nesting3D`] for one child state.
 pub struct NestingColumns<'a> {
