@@ -944,6 +944,7 @@ fn hydrostatic_hll<S: Simd>(
     let zero = f64x8::<S>::splat(simd, 0.0);
     let half = f64x8::<S>::splat(simd, 0.5);
     let two = f64x8::<S>::splat(simd, 2.0);
+    let one = f64x8::<S>::splat(simd, 1.0);
     let g_v = f64x8::<S>::splat(simd, g);
     let half_g = f64x8::<S>::splat(simd, 0.5 * g);
     let h_min_v = f64x8::<S>::splat(simd, h_min);
@@ -994,10 +995,19 @@ fn hydrostatic_hll<S: Simd>(
         hu: norm * (hll.hu * nx - hll.hv * ny),
         hv: norm * (hll.hu * ny + hll.hv * nx),
     };
-    // + g/2 (h^2 - h*^2)(0, m), all of g h^2 / 2 where HLL is dry
+    // + g/2 (h^2 - h*^2)(0, m), all of g h^2 / 2 where HLL is dry, and a
+    // wet side's wall_ram_pressure there (the wall along +m from a, −m from b)
     let (h_star_a, h_star_b) = (hll_dry.select(zero, h_l), hll_dry.select(zero, h_r));
-    let dp_a = half_g * (q_a.h * q_a.h - h_star_a * h_star_a);
-    let dp_b = half_g * (q_b.h * q_b.h - h_star_b * h_star_b);
+    let wall = |q: Side<S>, towards: f64| {
+        let un = f64x8::<S>::splat(simd, towards) * (q.u * nx + q.v * ny);
+        let un = max(un, zero);
+        let head = un * un / (two * g_v);
+        let sill = b_face - (q.h + q.b);
+        let ram = (one - head / sill) * q.h * un * (two * un + (g_v * q.h).sqrt());
+        (hll_dry & q.h.simd_gt(h_min_v) & sill.simd_gt(head)).select(ram, zero)
+    };
+    let dp_a = half_g * (q_a.h * q_a.h - h_star_a * h_star_a) + wall(q_a, 1.0);
+    let dp_b = half_g * (q_b.h * q_b.h - h_star_b * h_star_b) + wall(q_b, -1.0);
     (
         Flux {
             h: flux.h + zero,

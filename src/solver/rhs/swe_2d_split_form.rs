@@ -51,7 +51,11 @@
 //! - uses HLL on Audusse et al. (2004) hydrostatically reconstructed states at
 //!   every face, `F* = F_HLL(q*⁻, q*⁺)·n + ½g(h⁻² − h*⁻²)(0, n)` with
 //!   `h* = max(0, η − max(B⁻, B⁺))`. At lake at rest `F* = F(q⁻)·n`, wet or
-//!   dry, and its mass part is positivity preserving (h* ≤ h);
+//!   dry, and its mass part is positivity preserving (h* ≤ h). Where both
+//!   `h*` are dry, a wet side's flow into the dry bank meets a wall's ram
+//!   pressure (Brufau et al. 2002), unless its velocity head reaches over
+//!   the bank (see [`wall_ram_pressure`]): without it a node walled in by
+//!   higher dry nodes kept its velocity forever;
 //! - replaces the volume term of every element that has a node shallower than
 //!   `h_dry` by a second-order finite-volume update on the GLL subcells
 //!   (Hennemann et al. 2021; Rueda-Ramírez et al. 2021 for the reconstruction),
@@ -109,6 +113,45 @@ pub(super) const VOLUME_BATCH: usize = 8;
 /// flux-differencing and the subcell kind before they are batched, so both
 /// kinds fill their lanes.
 pub(super) const ELEMENT_CHUNK: usize = 64;
+
+/// The momentum a dry sill `δ = B_face − η` above a wet side of depth `h`
+/// takes from its flow `uₙ` towards it, beyond the hydrostatic `½g h²`:
+/// `w h uₙ(2uₙ + c)` for `uₙ > 0`, `c = √(g h)`, with
+/// `w = max(0, 1 − (uₙ²/2g)/δ)`.
+///
+/// Where both hydrostatically reconstructed depths are dry (`h* ≤ h_min`) no
+/// water passes, but the Audusse flux still returns only `½g h²`, whatever
+/// the velocity: a node walled in by higher dry nodes keeps its velocity
+/// forever (on the Frøya coastline, a 25 m single-node tidal pond held a
+/// 3.7 m/s jet through a 5 h ebb). Following Brufau, Vázquez-Cendón &
+/// García-Navarro (2002), such an interface is a solid wall: the HLL flux
+/// against the mirror state `(h, −uₙ, u_t)`, whose speeds are `∓(|uₙ| + c)`,
+/// has no mass or tangential part and the normal momentum flux
+/// `½g h² + h uₙ² + (|uₙ| + c) h uₙ`, which is `½g h² + h uₙ(2uₙ + c)`
+/// against the flow.
+///
+/// Two restrictions keep shorelines moving:
+/// - **Only against the flow** (`uₙ > 0`). Flow away from the wall gets the
+///   mirror's rarefaction, `½g h² + c h uₙ < ½g h²`, which would hold a
+///   receding shoreline back.
+/// - **Only a sill the flow cannot climb.** An advancing shoreline's front
+///   node lies a little below its dry neighbour, within the velocity head
+///   `uₙ²/2g` (Thacker's 0.7 m/s: 2.5 cm), and runs up; a pond lies metres
+///   below its walls. `w` is 0 where the head reaches the sill and → 1 for a
+///   sill far above it, and the flux stays continuous where `h*` crosses
+///   `h_min` (`δ ≤ 0`).
+///
+/// At rest the term vanishes, so lake at rest is kept.
+#[inline]
+fn wall_ram_pressure(h: f64, un: f64, sill: f64, g: f64) -> f64 {
+    let un = un.max(0.0);
+    let head = un * un / (2.0 * g);
+    if sill > head {
+        (1.0 - head / sill) * h * un * (2.0 * un + (g * h).sqrt())
+    } else {
+        0.0
+    }
+}
 
 /// Limited slope of one variable at node `ξ` of a subcell spanning
 /// `[x_l, x_r]`, from the values at the neighbouring nodes `ξ_m < ξ < ξ_p`:
@@ -727,15 +770,21 @@ impl<'a, 'c, BC: SWEBoundaryCondition2D> SplitFormSWE2D<'a, 'c, BC> {
         // below h_min (thin reconstructed subcell faces at a shoreline): the
         // correction then restores all of ½g h²
         let hll_dry = a_star.h <= h_min && b_star.h <= h_min;
-        // Pressure as in F(q)·m = F#(q, q)·m (no dry cutoff)
-        let correction = |h: f64, h_star: f64| {
-            let h_star = if hll_dry { 0.0 } else { h_star };
-            let dp = 0.5 * g * (h * h - h_star * h_star);
+        // Pressure as in F(q)·m = F#(q, q)·m (no dry cutoff); where no water
+        // passes, a wet side faces a wall (see `wall_ram_pressure`), which
+        // lies along +m from side a and along −m from side b
+        let correction = |q: &SWENodeState2D, h_star: f64, towards: f64| {
+            let h = q.h;
+            let mut dp = 0.5 * g * (h * h - if hll_dry { 0.0 } else { h_star * h_star });
+            if hll_dry && h > h_min {
+                let (un, sill) = (towards * (q.u * nx + q.v * ny), b_face - (h + q.b));
+                dp += wall_ram_pressure(h, un, sill, g);
+            }
             SWEState2D::new(0.0, dp * m.0, dp * m.1)
         };
         (
-            flux + correction(q_a.h, a_star.h),
-            flux + correction(q_b.h, b_star.h),
+            flux + correction(q_a, a_star.h, 1.0),
+            flux + correction(q_b, b_star.h, -1.0),
         )
     }
 
