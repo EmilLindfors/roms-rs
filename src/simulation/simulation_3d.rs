@@ -220,7 +220,9 @@ where
             }
 
             // Compute time step (3D CFL)
-            let mut dt = self.physics.compute_dt(state, self.config.cfl);
+            let mut dt = crate::profiling::scope("step: compute_dt", || {
+                self.physics.compute_dt(state, self.config.cfl)
+            });
             if dt.is_nan() || dt <= 0.0 {
                 return SimulationResult::failure(
                     t,
@@ -259,13 +261,15 @@ where
             self.physics.update_density(state);
 
             // One barotropic pass and one 3D SSP-RK3 step
-            self.integrator.step(state, &self.physics, dt, t);
+            crate::profiling::scope("step: mode split", || {
+                self.integrator.step(state, &self.physics, dt, t)
+            });
 
             t = if landed { t_end } else { t + dt };
             n_steps += 1;
 
             // Post-process
-            self.physics.post_process(state);
+            crate::profiling::scope("step: post_process", || self.physics.post_process(state));
             self.physics.relax_vertical_reference(state, dt);
             // A blown-up step leaves NaN or infinities, which every later
             // step would carry on to `t_end` (the step's bound skips NaN)
@@ -411,7 +415,7 @@ mod tests {
         CageDrag2D, CageFootprint, CoriolisSource2D, NetCage, River, RiverProfile, RiverSeries,
         RiverSources, SourceContext2D, SourceTerm2D,
     };
-    use crate::time::{ModeSplitIntegrator, SSPRK3};
+    use crate::time::{ModeSplitIntegrator, SSPRK3, SspScheme};
     use crate::types::ElementIndex;
     use crate::vertical::{SigmaGrid, UniformStretching};
     use std::sync::Arc;
@@ -656,6 +660,32 @@ mod tests {
     /// (≈ 1e-12 relative).
     #[test]
     fn seiche_amplitude_is_kept_by_the_mode_split() {
+        seiche_amplitude_is_kept_with(ModeSplitIntegrator::new(), 20, 5e-4);
+    }
+
+    /// The same with SSP-RK(4,3) substeps at twice SSP-RK3's barotropic
+    /// CFL (as wet/dry runs take them, where the positivity bound doubles
+    /// with the SSP coefficient): half the substeps (n_bt = 12).
+    ///
+    /// Measured 2026-10-15: 0.054 % per period. At SSP-RK3's CFL (n_bt =
+    /// 23) SSP-RK(4,3) loses the same 0.035 % as SSP-RK3, so the rest is the
+    /// filter's own damping with fewer substeps, not the scheme's.
+    #[test]
+    fn seiche_amplitude_is_kept_with_an_ssp_rk43_pass() {
+        let integrator = ModeSplitIntegrator::new()
+            .with_barotropic_scheme(SspScheme::Rk43)
+            .with_barotropic_cfl(2.0 * ModeSplitIntegrator::DEFAULT_BAROTROPIC_CFL);
+        seiche_amplitude_is_kept_with(integrator, 10, 7e-4);
+    }
+
+    /// The seiche of [`seiche_amplitude_is_kept_by_the_mode_split`] with
+    /// `integrator`, at least `min_substeps` barotropic substeps per step,
+    /// losing less than `max_loss` of its amplitude per period more than 2D.
+    fn seiche_amplitude_is_kept_with(
+        integrator: ModeSplitIntegrator,
+        min_substeps: usize,
+        max_loss: f64,
+    ) {
         // A narrow basin: the cross-basin CFL makes the barotropic step small,
         // so a few elements give a realistic n_bt cheaply.
         let seiche = Seiche::new(10, 2, 10.0);
@@ -677,7 +707,7 @@ mod tests {
         let mut state = seiche.state_3d(&physics);
         let e0 = seiche.energy_3d(&state);
         let volume0 = state.eta.integrate(&seiche.ops, &seiche.geom);
-        let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new())
+        let mut sim = Simulation3D::new(physics, integrator)
             .with_cfl(10.0)
             .with_dt_max(dt);
         let result = sim.run(&mut state, 0.0, t_end);
@@ -688,14 +718,14 @@ mod tests {
         sim.run(&mut probe, t_end, t_end + dt);
         let n_bt = sim.integrator().last_substeps();
         assert!(
-            n_bt >= 20,
-            "test regime: expected ≥ 20 substeps, got {n_bt}"
+            n_bt >= min_substeps,
+            "test regime: expected ≥ {min_substeps} substeps, got {n_bt}"
         );
 
         let decay_split = (seiche.energy_3d(&state) / e0).sqrt();
         let loss_per_period = 1.0 - (decay_split / decay_2d).powf(1.0 / periods);
         assert!(
-            loss_per_period.abs() < 5e-4,
+            loss_per_period.abs() < max_loss,
             "mode split loses {:.4} % of the amplitude per period more than 2D \
              (2D keeps {decay_2d:.6}, split {decay_split:.6} after {periods} periods, n_bt = {n_bt})",
             100.0 * loss_per_period
@@ -880,10 +910,14 @@ mod tests {
     /// TODO P4.1 gate (PR 3): the barotropic transport of each step (DU_avg2)
     /// is exactly the transport that moved the free surface,
     /// `η̄ − ηⁿ = −Δt ∇·DU_avg2` at every node, for the collocated and the
-    /// entropy-stable split form (nonlinear seiche, walls).
+    /// entropy-stable split form (nonlinear seiche, walls), with SSP-RK3 and
+    /// SSP-RK(4,3) substeps (whose stage weights DU_avg2 takes).
     #[test]
     fn barotropic_transport_moves_the_free_surface() {
-        for formulation in [SWEFormulation2D::Standard, SWEFormulation2D::EntropyStable] {
+        let cases = [SWEFormulation2D::Standard, SWEFormulation2D::EntropyStable]
+            .into_iter()
+            .flat_map(|f| [SspScheme::Rk3, SspScheme::Rk43].map(|s| (f, s)));
+        for (formulation, scheme) in cases {
             let mut seiche = Seiche::new(10, 2, 10.0);
             seiche.amplitude = 0.5;
             let physics = hydrostatic(
@@ -897,7 +931,7 @@ mod tests {
                 0.0,
             );
             let mut state = seiche.state_3d(&physics);
-            let mut integrator = ModeSplitIntegrator::new();
+            let mut integrator = ModeSplitIntegrator::new().with_barotropic_scheme(scheme);
             let dt = seiche.period() / 50.0;
             let mut div = DGSolution2D::new(seiche.mesh.n_elements, seiche.ops.n_nodes);
 
@@ -919,8 +953,8 @@ mod tests {
                 }
                 assert!(
                     residual < 1e-11 * change,
-                    "{formulation:?}, step {n}: η̄ − ηⁿ + Δt∇·DU_avg2 = {residual:.2e} \
-                     (η change {change:.2e})"
+                    "{formulation:?}, {scheme:?}, step {n}: η̄ − ηⁿ + Δt∇·DU_avg2 = \
+                     {residual:.2e} (η change {change:.2e})"
                 );
             }
         }

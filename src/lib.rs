@@ -39,6 +39,7 @@ pub mod operators;
 pub mod particles;
 pub mod physics;
 pub mod polynomial;
+pub mod profiling;
 pub mod simulation;
 pub mod solver;
 pub mod source;

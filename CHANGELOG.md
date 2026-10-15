@@ -477,6 +477,13 @@ All notable changes to this project should be documented in this file.
 
 ### Performance
 
+- **The Frøya coastline 3D day at half the wall time: 773 → 388 s per model hour (TODO P4.5, P1.3).** Profiled on the real run first (`DG_PROFILE=1`, below): at `cfl_3d=1` a step was ≈ 55 % 3D stages and ≈ 28 % barotropic pass, and the pass's substep was set not by its CFL but by shoreline elements with a dry node at the wet/dry positivity cap.
+  - **SSP-RK(4,3) barotropic substeps: `ModeSplitIntegrator::with_barotropic_scheme(SspScheme::Rk43)`.** Its SSP coefficient of 2 doubles the positivity-capped substep for 4/3 of the work: 2.1× fewer substeps on the coastline day, the pass 1.5× cheaper. The fused stages equal `SSPRK43` bit for bit; DU_avg2 takes its stage weights (the identity η̄ − ηⁿ = −Δt∇·DU_avg2 holds to round-off); a seiche loses what SSP-RK3 loses at the same substep. SSP-RK3 stays the library default.
+  - **`froya_real_data` defaults `cfl_3d=2 rk_bt=43 cfl_bt=2`** (`rk_bt=` and `cfl_bt=` are new). Against `cfl_3d=1` with SSP-RK3 substeps over hours 6–8: η 0.1 mm and ū 0.2 mm/s RMS apart at nodes ≥ 10 m deep, 0.3 mm and 0.4 mm/s at Mausund; T spreads by 0.01 °C RMS, as much as the barotropic change alone gives (the run's sensitivity, not the step); 0 negative-depth clips. The summary line now reports the clips.
+  - **Bit for bit**: `Nesting3D::columns` evaluates the parent's band columns in parallel (27 → 2.6 ms, three times per step); the 3D Kuzmin limiter looks the tracer reference up once per node and level (56 → 45 ms per call, four calls per step); `with_thin_columns_at_rest` copies only the nine fields its callers read (five copies per step).
+  - **`dg_rs::profiling`**: wall-clock phase timers, off unless `DG_PROFILE` is set (one atomic load per timer). `Simulation3D` and `ModeSplitIntegrator::step` time their phases; `froya_real_data` prints the report at the end of a 3D tide.
+  - Measurements and what is left: `notes/3d-numerics.md` (P4.5, 2026-10-15).
+
 - **`froya_real_data`'s 3D step twice as long: `cfl_3d=` (default 1, was a fixed 0.5).** The 3D bound (`Hydrostatic3D::compute_dt`) is below its stability limit (TODO P4.5), by how much depends on the mesh. On the Mausund tide (3 h, nested), 2 holds and 3 blows up; 1 runs in 246 and 2 in 148 against 565 s per model hour, and against 0.5 they move ū by 0.3 and ≤ 3 mm/s RMS. The full coastline mesh blows up at 1.5 within 1.3 h, in a cliff element (1.2 m beside 82 m).
 
 - **The waves' quadruplet interactions (DIA) vectorised across nodes: 2.5× faster, bit for bit (TODO F.4).** The DIA was the largest part of the wave sources (127 of 247 ms on one thread in `wave_step_bench`).

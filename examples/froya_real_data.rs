@@ -105,7 +105,7 @@
 //!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
-//!     [levels=0] [tide3d=0] [restart_hours=0] [resume=<file>]
+//!     [levels=0] [tide3d=0] [cfl_3d=2] [rk_bt=43|3] [cfl_bt=2] [restart_hours=0] [resume=<file>]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
@@ -203,15 +203,24 @@
 //! columns (`GriddedAtmosphere2D::split_for_3d`). The stations, the progress
 //! lines and a 3D snapshot file (`snapshot_minutes=`,
 //! `SnapshotWriter::create_3d`) as in 2D; `dt_3d=` caps the step and
-//! `cfl_3d=` sets its Courant number (`Hydrostatic3D::compute_dt`; 1).
+//! `cfl_3d=` sets its Courant number (`Hydrostatic3D::compute_dt`; 2).
 //! Measured 2026-10-10: on the Mausund tide (3 h, nested) 2 holds and 3
 //! blows up within 0.8 h (a 50 m element during the ramp, at 25 s steps);
 //! against 0.5, 1 moves ū by 0.3 mm/s RMS and 2 by ≤ 3 mm/s, T by 0.013
 //! and 0.019 °C RMS (565 → 246 → 148 s per model hour). The full coastline
-//! mesh blows up at 1.5 within 1.3 h (a cliff element, 1.2 m beside 82 m,
-//! 2 km inside the east boundary); 1 holds through the ramp, slowed by
-//! a cliff element at 1.5 h as 0.5 is (`notes/3d-numerics.md`). Use
-//! `slopes3d=on` for the stratified rest state on steep beds.
+//! mesh blew up at 1.5 within 1.3 h in a cliff element (1.2 m beside 82 m),
+//! now land (`cliffs3d`). Measured 2026-10-15 on the coastline day (hours
+//! 6–8, `notes/3d-numerics.md`): 2 holds, with 0.1 mm RMS of η, 0.2 mm/s of
+//! ū and 2 mm/s of the surface velocity against 1 (0.3 mm and 0.4 mm/s at
+//! Mausund), and T spreads by 0.01 °C RMS as it does under any perturbation
+//! (the barotropic pass alone gives the same). The barotropic substeps are
+//! SSP-RK(4,3) (`rk_bt=43`; `ModeSplitIntegrator::with_barotropic_scheme`)
+//! at `cfl_bt=` (2), above P2's capped linear limit (1.36), so the 2D
+//! module's per-element positivity and linear bounds set them: shoreline
+//! elements with a dry node take twice SSP-RK3's step there, half the
+//! substeps for 4/3 of the work each. Together 773 → 388 s per model hour
+//! on hours 6–8 (24 threads), 0 negative-depth clips. Use `slopes3d=on`
+//! for the stratified rest state on steep beds.
 //!
 //! A long 3D tide can stop and resume bit for bit. `restart_hours=H` writes
 //! `<output>/<domain>.restart` (`Restart3D`, replaced in one rename, so a
@@ -618,8 +627,13 @@ struct Options {
     steps_3d: usize,
     dt_3d: Option<f64>,
     /// Courant number of the 3D step (`cfl_3d=`, `Hydrostatic3D::compute_dt`;
-    /// 1, see the module docs)
+    /// 2, see the module docs)
     cfl_3d: f64,
+    /// Courant number of the 3D tide's barotropic substeps (`cfl_bt=`,
+    /// `ModeSplitIntegrator::with_barotropic_cfl`)
+    cfl_bt: f64,
+    /// SSP scheme of the barotropic substeps (`rk_bt=3|43`)
+    rk_bt: dg_rs::time::SspScheme,
     debug_3d: String,
     /// Write a restart of the 3D tide every this many model hours
     /// (`restart_hours=`; 0: none), at the first progress line at or after it
@@ -717,7 +731,13 @@ impl Options {
                 .map(|v| v.parse::<f64>())
                 .transpose()
                 .map_err(|e| e.to_string())?,
-            cfl_3d: get("cfl_3d", 1.0)?,
+            cfl_3d: get("cfl_3d", 2.0)?,
+            cfl_bt: get("cfl_bt", 2.0)?,
+            rk_bt: match args.get("rk_bt").map_or("43", String::as_str) {
+                "3" => dg_rs::time::SspScheme::Rk3,
+                "43" => dg_rs::time::SspScheme::Rk43,
+                other => return Err(format!("rk_bt={other}: expected 3 or 43")),
+            },
             debug_3d: args.get("debug_3d").cloned().unwrap_or_default(),
             restart_hours: get("restart_hours", 0.0)?,
             resume: args.get("resume").map(PathBuf::from),
@@ -3592,7 +3612,10 @@ fn tidal_run_3d(
                 }
             }
         };
-    let mut sim = Simulation3D::new(physics, ModeSplitIntegrator::new()).with_cfl(opts.cfl_3d);
+    let integrator = ModeSplitIntegrator::new()
+        .with_barotropic_cfl(opts.cfl_bt)
+        .with_barotropic_scheme(opts.rk_bt);
+    let mut sim = Simulation3D::new(physics, integrator).with_cfl(opts.cfl_3d);
     if let Some(dt) = opts.dt_3d {
         sim = sim.with_dt_max(dt);
     }
@@ -3601,6 +3624,14 @@ fn tidal_run_3d(
         state = restart.state;
     }
     let result = sim.run_with_context_callback(&mut state, t_start, t_end, callback);
+    if dg_rs::profiling::enabled() {
+        println!(
+            "
+Phase profile:
+{}",
+            dg_rs::profiling::report()
+        );
+    }
     if let Some(e) = write_error {
         return Err(e.into());
     }
@@ -3608,7 +3639,7 @@ fn tidal_run_3d(
     let wall = start.elapsed().as_secs_f64();
     let run_time = result.final_time - t_start;
     println!(
-        "\n{} after {:.2} h: {} steps (mean dt {:.2} s, {:.2}–{:.2} s), {:.1} s wall ({:.0} ms/step, {:.0} s per model hour), {} barotropic substeps",
+        "\n{} after {:.2} h: {} steps (mean dt {:.2} s, {:.2}–{:.2} s), {:.1} s wall ({:.0} ms/step, {:.0} s per model hour), {} barotropic substeps, {} negative-depth clips",
         if result.success { "Done" } else { "FAILED" },
         result.final_time / 3600.0,
         result.n_steps,
@@ -3618,7 +3649,8 @@ fn tidal_run_3d(
         wall,
         1e3 * wall / steps as f64,
         3600.0 * wall / run_time.max(1.0),
-        sim.integrator().last_substeps()
+        sim.integrator().last_substeps(),
+        sim.physics().swe_physics.negative_depth_clips()
     );
     report_stations(&stations, &output_dir, opts, &clock, station_atlas.as_ref())?;
     if let Some(e) = result.error {
