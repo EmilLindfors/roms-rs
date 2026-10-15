@@ -7,9 +7,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Next up
 
 1. **P3.1** The Mausund error budget: M2's +3 % from NorKyst (`gauge_gains=M2,…`) together with the overtides that are too weak (M4 0.35×). See Validation.
-2. **P1.3** A day of the full Frøya coastline mesh in 3D. See Geometry.
-3. **P4.4** Per-column surface heat and freshwater fluxes, the next step for a real 3D run; then **P1.5** a real NorKyst 3D nested run.
-4. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
+2. **P4.4** Per-column surface heat and freshwater fluxes, the next step for a real 3D run; then **P1.5** a real NorKyst 3D nested run.
+3. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -176,7 +175,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Geometry and meshes (P1.3) — [notes/geometry-mesh.md](notes/geometry-mesh.md)
 
 - [ ] **P1.3** `froya_real_data tide3d=1`'s progress line reports T only in columns ≥ the thin depth, where the thin-column drift never showed until it spread: add the thin and shore columns' range.
-- [ ] **P1.3** A day of the full Frøya coastline mesh in 3D (≈ 1.06 s per step at 24 threads): M2 cycle and gauge, η and ū at Mausund against the 2D run.
+- [ ] **P1.3** The coastline day's depth-mean M2 current at Mausund's NorKyst point is 0.076 m/s in 3D against 0.10–0.15 in 2D (NorKyst 0.25; the point is 23 m deep in our bed, 49 m in NorKyst's): the 3D bottom drag against 2D Manning? Rerun the 2D day for 24 h on today's bed first (`notes/geometry-mesh.md` "The coastline day in 3D").
+- [ ] **P1.3** Shore films still set the 3D step: element 7507 at (4.2, −13.5) km, 1.0 m deep, ran its surface layer at 3.1 m/s at 13.5 h of the coastline day and the step fell to 0.24 s (209 steps for the half hour against ≈ 110).
 - [ ] **P1.3** Mass-weight the 2D tracer limiter's element means (`solver/limiters/tracer_2d.rs:238`, `:708`, `ops.weights[i] * h` without J): use `geom.node_mass`.
 - [ ] **P1.3** A jittered-mesh case for `EntropyStable`/`WetDry` in `convergence_test.rs` (the averaged metric loses an order pointwise on such meshes).
 - [ ] **P1.3** Rerun the unsmoothed full-mesh 3-day baseline on current code (without `slopes3d`, ≈ 1–2.5 h) for a like-for-like comparison with the 19 m free depth.
@@ -282,7 +282,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **P4.5** The splitter's fixed per-stage data movement (≈ 60 field passes, 27 % of the step at dt 4 s, 12k elements): kernels read `H_z φ` and divide on load, the post-stage hook converts in place.
 - [ ] **P4.5** The forward-backward (AB3-AM4) barotropic fast mode, fewer RHS per substep.
-- [ ] **P4.5** Run the coastline day on the new defaults (`cfl_3d=2 rk_bt=43 cfl_bt=2`, checked on hours 0–2 and 6–8 only) and make SSP-RK(4,3) at the caps `ModeSplitIntegrator`'s own default for wet/dry runs (changes every 3D gate's bits).
+- [ ] **P4.5** Make SSP-RK(4,3) at the caps `ModeSplitIntegrator`'s own default for wet/dry runs (changes every 3D gate's bits); the coastline day ran a full day on it (387 s per model hour, `notes/geometry-mesh.md` "The coastline day in 3D").
 - [ ] **P4.5** The coastline day's Kuzmin limiter changes about half of all element-layers at every stage (116k of 241k for T, 101k for S; 67k/58k again after each step): find what it cuts (round-off-level bounds over smooth stratification, or real overshoots) before it is taken as harmless; it also costs ≈ 45 ms per call, four calls per step.
 - [ ] **P4.5** The thin-column copies (`with_thin_columns_at_rest`, 5 per 3D step, bandwidth-bound; nine of thirteen fields since 2026-10-15): a mask the readers take instead.
 - [ ] **P4.5** The barotropic filter integrates 1.3 n_bt substeps (30 % past tⁿ⁺¹); the fused stage costs half a 2D RHS (0.56 ms, 10 streamed arrays): a shorter window or fewer streams.

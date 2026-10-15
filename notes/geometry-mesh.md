@@ -231,3 +231,21 @@ The coastline day's step collapses (TODO P1.3, P4.5) came from shore nodes the 3
 - **Measured** (the day's command, 0–4 h, against the old run): 2749 s against 7590 s of wall time (0–2 h 1349 against 4923); steps 5.5–9.3 s throughout, set by deep elements (10178, 10582); the fastest surface layer 0.52–0.71 m/s against 24 m/s; the T minimum 7.47 °C against 6.00 (NorKyst's minimum 7.51: the cliffs' spurious cooling is gone too).
 - **What it moves** at nodes ≥ 10 m deep, both beds the same there (77.5k nodes; `tmp_snap_diff`-style comparison at 1–4 h): η 2.5–5.7 mm RMS (max 0.44 m at one node), ū 2–5 mm/s RMS (max 0.15 m/s) of 20–50 mm/s. Within 5 km of Mausund (4868 nodes): η 1.4–2.4 mm RMS (max 5 cm), ū 2–4 mm/s RMS (max 7 cm/s) of 15–71 mm/s.
 - Gate: `test_raise_cliff_shores_makes_land_of_resolvable_shore_nodes_beside_deep_water`.
+
+### The coastline day in 3D (2026-10-15)
+
+The first full day of the Frøya coastline mesh in 3D (TODO P1.3), on the cliff, wall and pond beds (PRs #140–#142) and the 2× defaults of PR #143 (`cfl_3d=2 rk_bt=43 cfl_bt=2`): `froya_real_data mesh=data/froya_coast.msh norkyst=data/mausund_norkyst_3d.nc levels=20 tide3d=1 slopes3d=on hours=24 ramp_hours=3 spinup_hours=3`, 12,059 P2 elements × 20 levels, GLS, 24 threads, `output/froya_day/3d_fast`.
+
+- **Cost**: 9288 s of wall time for 24 h, 387 s per model hour (5472 steps, mean 15.8 s, 1.70 s per step), on a laptop shared with other work: 9.5 → 10 h alone took 1242 s for a normal 123 steps (≈ 10 s each; the other work), ≈ 335 s per model hour without it. The previous run on the same bed at the old defaults (`3d_ponds`) took 5277 s to 7 h, this one 2604 s. 0 negative-depth clips; restarts every 2 h.
+- **Stable throughout**: T 6.8–14.7 °C (NorKyst's minimum 7.51; the dips below it at 6–7 h and 12–15 h are not traced yet, cf. element 5143, TODO P1.3), the fastest surface layer 0.5–0.9 m/s except two shore films: element 5749 at (0.1, −8.6) km, 1.2 m deep, 1.9 m/s at 10 h (dt 7.2 s), and element 7507 at (4.2, −13.5) km, 1.0 m deep, 3.1 m/s at 13.5 h, where the step fell to 0.24 s and 13 → 13.5 h took 209 steps; both recovered within the half hour.
+- **Mausund** against the 24 h 2D day (`output/froya_day/2d`, the bed before the cliff, wall and pond fixes, sampled 71 m from the station where the 3D is sampled 198 m away; the 10 h 2D runs on today's bed, `2d_thin1_*`, are too short to separate M2 from N2):
+
+  | | 3D | 2D | gauge | NorKyst |
+  |---|---|---|---|---|
+  | M2 H (m), G (°) | 0.791, 290.2 | 0.783, 290.0 | 0.737, 301.2 | 0.759, 300.7 |
+  | M4 H (m), G (°) | 0.025, 20.5 | 0.024, 22.5 | 0.015, 192.4 | 0.003, 203.8 |
+  | RSS \|ΔZ\| vs the gauge (m) | 0.166 | 0.165 | | |
+  | RMSE vs observations (m; centred) | 0.024 (0.021) | 0.023 (0.018) | | |
+  | M2 depth-mean current at the NorKyst point (m/s, G °) | 0.076, 338 | 0.147, 346 | | 0.246, 62 |
+
+  The water level is the 2D model's: M2 1 % higher, the same 11° early, the same overtides (the error budget is P3.1's). The depth-mean current at the NorKyst point (23 m deep in our bed, 49 m in NorKyst's) is half the 2D day's; the 10 h 2D runs on today's bed give 0.103–0.109 m/s there, so the bed explains part and the 3D model ≈ 30 % (TODO P1.3). At the station's own sample point the current is ≈ 1.5 mm/s in both (a sheltered spot on both beds).
