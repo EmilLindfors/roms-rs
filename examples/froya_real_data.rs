@@ -287,7 +287,12 @@
 //! D m (40 by default; `cliffs3d=off`) that a tide would make resolved
 //! columns beside the deep ones (`Bathymetry2D::raise_cliff_shores`): a
 //! 0.74 m corner among 61–82 m held the 3D step below 0.4 s for hours at
-//! each high water.
+//! each high water. And `ponds3d=L` fills to their sills the tidal ponds
+//! of at most one element's nodes at water levels between L m (the lowest
+//! astronomical tide, −1.43 m, by default; `ponds3d=off`) and +2 m: nodes
+//! the open water does not reach along the grid lines
+//! (`Bathymetry2D::fill_tidal_ponds`), where a 25 m single-node pond held a
+//! 3.7 m/s jet through an ebb and a 2.2 m one set the 3D step.
 //!
 //! `bbox=west,south,east,north` runs a smaller box, e.g. the 22 × 19 km
 //! around Mausund (a quarter of the cost), with its own mesh and boundary
@@ -398,6 +403,9 @@ const CLIFF_HIGH_WATER: f64 = 2.0;
 /// Default depth (m) of `cliffs3d=`: the x–z slices let shallow water beside
 /// 21–40 m hold and beside 60 m grow
 const CLIFF_DEEP: f64 = 40.0;
+/// Default level of `ponds3d=` (m above MSL): the lowest astronomical tide at
+/// Mausund (chart datum), the lowest water any run sees
+const POND_LOW_WATER: f64 = -1.43;
 /// Default elevation model: Kartverket's topobathy model at 50 m
 /// (`scripts/kartverket_topobathy.sh 8.0 63.6 9.2 64.0 50 data/froya_topobathy.tif`)
 const DEM: &str = "data/froya_topobathy.tif";
@@ -537,6 +545,11 @@ struct Options {
     /// (m) to land (`Bathymetry2D::raise_cliff_shores`): `cliffs3d=D`, 40 m
     /// by default, `cliffs3d=off`
     cliffs_3d: Option<f64>,
+    /// With `slopes3d`, fill to their sills the tidal ponds of at most one
+    /// element's nodes at water levels from this one (m above MSL) to +2 m
+    /// (`Bathymetry2D::fill_tidal_ponds`): `ponds3d=L`, the lowest
+    /// astronomical tide (−1.43 m) by default, `ponds3d=off`
+    ponds_3d: Option<f64>,
     /// Domain box `west,south,east,north` (°; `bbox=`). A smaller box needs
     /// its own boundary atlas (`tides=`, from `norkyst_boundary_tides bbox=`)
     bbox: [f64; 4],
@@ -814,6 +827,11 @@ impl Options {
                 Some("off") => None,
                 Some(d) => Some(d.parse().map_err(|_| format!("bad cliffs3d={d}"))?),
             },
+            ponds_3d: match args.get("ponds3d").map(String::as_str) {
+                None => Some(POND_LOW_WATER),
+                Some("off") => None,
+                Some(l) => Some(l.parse().map_err(|_| format!("bad ponds3d={l}"))?),
+            },
             bbox: match args.get("bbox") {
                 None => FROYA_BBOX,
                 Some(v) => v
@@ -1075,6 +1093,29 @@ impl Domain {
                     report.nodes,
                     report.max_raise,
                     report.area / 1e6
+                );
+            }
+            // Ponds below the lowest water: a node the open water does not
+            // reach held a phantom current and set the 3D step
+            if let Some(low_water) = opts.ponds_3d {
+                let report = grid_bed.fill_tidal_ponds(
+                    &grid,
+                    &ops,
+                    &grid_geom,
+                    low_water,
+                    CLIFF_HIGH_WATER,
+                    ops.n_nodes,
+                );
+                let raised = grid_bed.raise_isolated_wet_nodes(&grid, &ops, &grid_geom, 0.0);
+                println!(
+                    "  Tidal ponds between {low_water} and +{CLIFF_HIGH_WATER} m filled to their sills: {} ponds, {} nodes, \
+                     by up to {:.1} m, {:.3} km², {:.2e} m³; {} larger ponds left; {raised} isolated wet nodes raised after",
+                    report.ponds,
+                    report.nodes,
+                    report.max_raise,
+                    report.area / 1e6,
+                    report.volume,
+                    report.left
                 );
             }
         }

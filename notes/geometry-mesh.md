@@ -201,7 +201,7 @@
   - [ ] Periodic Gmsh meshes (`$Periodic`) are rejected: pair the faces if a periodic real-geometry case appears.
 - [ ] CSR connectivity. Make `MeshGPUData` the single representation.
 
-### Tidal ponds in the bed (found 2026-10-11, open)
+### Tidal ponds in the bed (found 2026-10-11, filled 2026-10-15)
 
 The bed pipeline raises isolated wet nodes at mean sea level only (56 on the Frøya coastline). A flood fill from the deepest node along the elements' grid lines (coincident nodes merged), on the 3D Frøya bed (`slopes3d=on`, thin depth 1 m), leaves nodes that the open water does not reach:
 
@@ -215,6 +215,11 @@ Many are single P2 nodes of 20–65 m, sampled from a narrow channel of the 50 m
 - The 2D bed's smoothing (thin depth 0.1 m) deepens some of the sills and connects them; the 3D bed's (1 m) does not.
 - One of these ponds drove a phantom 3.7 m/s jet for 5 h (`notes/2d-numerics.md`, walled wet nodes).
 - Fill each pond to its sill, or connect it, at the lowest water level (LAT, or the run's tidal minimum).
+- **Done 2026-10-15: `Bathymetry2D::fill_tidal_ponds(low_water, high_water, max_nodes)`** (`froya_real_data ponds3d=L`, on by default with `slopes3d`, L = −1.43 m, Mausund's chart datum; `ponds3d=off`). A priority flood (Barnes, Lehman & Mulla 2014) from the open boundary's nodes along the grid lines gives every node its spill level, the lowest water level that joins it to the open water. A node is cut off between its bed and its spill level, so it is a pond within the tide where `bed < spill`, `spill ≥ low_water` and `bed < high_water` (+2 m); ponds of at most one element's nodes (9 at P2) are raised to their spill level.
+  - **One level is not enough.** Filling only the nodes below −1.43 m (96 ponds; 79 with the size cap) left nodes of ≈ 1 m beside the filled ones, dry at −1.43 m but cut off at −0.6 m: two held 0.7 and 1.4 m/s. The condition over the whole tidal range fills 266 ponds (517 nodes, by up to 52.6 m, 1.71 km², 4.5e6 m³), most of them shallow intertidal pools.
+  - **The size cap.** Without it the rule also filled 17 basins of 13–63 nodes, e.g. a 35 m lagoon of 52 nodes at (−0.27, −9.28) km: water bodies the mesh resolves behind inlets it does not (1.45e7 m³ in all). They were still in the runs (≤ 0.2 m/s), so they are left; 25 such ponds are left over the tidal range. Connecting their inlets (lowering the sill along the lowest path) would be the better fix for them.
+  - **Frøya, 2D on the 3D bed** (`slopes3d=on debug_3d=thin=1`, with the cliff rule and the wall; `output/froya_day/2d_thin1_ponds2`, 10 h): at −0.6 m 11 ponds remain (58), all larger basins, only one over 0.2 m/s (0.21). Node P and the 2.2 m pond at (−2.153, 6.606) km are filled. The domain's fastest currents are unchanged (2.9 m/s at (−0.1, 7.5) km, 0.3 m deep, as in the original 2D day), as are the water-level range and the mass balance.
+  - Gate: `test_fill_tidal_ponds_raises_a_pond_to_its_lowest_sill` (a basin behind two sills takes the lower; a basin open below the lowest water stays; ponds cut off only on the way down are filled; the size cap).
 
 
 ### Cliff shores raised to land for 3D (2026-10-14)
