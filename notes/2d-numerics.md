@@ -70,7 +70,7 @@
   - Also found: `test_standing_wave_period` timed the peaks of η at one node, 0.9 % off, under a 5 % tolerance, and skipped the check when it found fewer than two peaks. It now times the zero crossings of the cos(kx) mode amplitude: 3e-5, asserted to 1e-4.
   - [ ] `tests/swe_2d_test.rs` has three overlapping long-run conservation tests on the legacy stepper (`test_long_term_stability`, `test_long_time_conservation`, `test_long_run_mass_conservation`); merge them into one on `Simulation` when the examples and tests move off the legacy steppers (P6).
 
-### Walled wet nodes keep their velocity (found 2026-10-11, open)
+### Walled wet nodes keep their velocity (found 2026-10-11; the wall fixed 2026-10-15)
 
 On the Frøya coastline day in 3D (`froya_real_data mesh=data/froya_coast.msh … tide3d=1 slopes3d=on cfl_3d=1`), element 7790 held a depth-mean ū of 3.3–3.8 m/s (4.2 m/s at the surface) from 5 to 10 h, through the whole ebb. It set the 3D step, at ≈ 1850 s wall per model hour against ≈ 820 without it.
 - **Where.** Node P at (−1.395, −9.278) km, bed −25.5 m, is the middle node of the edge shared by elements 7790 and 7791.
@@ -87,9 +87,17 @@ On the Frøya coastline day in 3D (`froya_real_data mesh=data/froya_coast.msh �
   - At 25 m depth, friction balances 3.7 m/s with a forcing of only ≈ 1.4e-3 m/s².
   - Two candidate sources of that forcing are still to be identified: an imbalance of the walled interfaces' metrics on a non-affine element, and the copies' η jump through the face.
 - **Most ponds stay still.** Of the 23 ponds deeper than 5 m at η = −0.6 m, only P (and, more weakly, a 2.2 m pond at (−2.15, 6.61) km with 1.15 m/s, and one at (1.35, −0.89) km with 0.6 m/s) carries a current.
-- **Next.**
-  - A gate: a P2 element pair with a deep mid-edge node between dry corners and a dry centre, under a falling tide. Assert ū → 0 in the pond.
-  - Then reflect the walled velocity component (a mirror state instead of h* = 0 at an interface whose other side is higher and dry), or zero it at nodes walled on both sides of a line.
-  - Find the forcing (log the momentum terms at P from the 2 h restart).
+- **Fixed (2026-10-15): a wall where no water passes** (`wall_ram_pressure` in `solver/rhs/swe_2d_split_form.rs`, scalar and SIMD). The suspected mechanism was right: where both reconstructed depths are dry, Audusse's flux gives a wet side `½g h²` whatever its velocity.
+  - Gate `a_walled_pond_stops_its_current` (`tests/wet_dry_2d_test.rs`): one 25 m node walled in by +2 m land, 1 m/s, no friction. Before, a pond at an element's centre or at a mid-edge node kept exactly 1.000 m/s for 600 s (a vertex pond already stopped); now all three are at round-off.
+  - Brufau, Vázquez-Cendón & García-Navarro (2002): such an interface is a solid wall, and the HLL flux against the mirror state adds `h uₙ(2uₙ + c)` to the normal momentum flux (`uₙ` towards the wall). The sign matters per side: both fluxes are along m, so the wall lies along +m from side a and −m from side b; with one sign the two walls of a subcell cancelled and a vertex pond accelerated to 11 m/s.
+  - The full mirror cost Thacker accuracy (WetDry P2 L1 depth error 5.67 % / 1.75 % at 16² / 32² before, 6.01 % / 1.98 % with it). Two restrictions take it back to 5.68 % / 1.71 %, with the ponds still stopped:
+    - only against the flow (`uₙ > 0`): flow away from the wall would get the mirror's rarefaction `½g h² + c h uₙ`, holding a receding shoreline back (alone: 5.89 % / 1.98 %);
+    - only a sill the flow cannot climb, weighted `w = max(0, 1 − (uₙ²/2g)/δ)` with `δ = B_face − η` the sill above the water: an advancing front lies within the velocity head of its dry neighbour (Thacker: 2.5 cm), a pond metres below its walls. It also keeps the flux continuous where `h*` crosses `h_min`.
+  - Lake at rest, the dam break and the shoreline lake are unchanged; SIMD and scalar bit for bit (`test_batched_kernels_are_bit_for_bit`, whose rough shoreline has wet nodes moving against dry ones).
+  - **Frøya, 2D on the 3D bed** (`slopes3d=on cliffs3d=off debug_3d=thin=1`, as `output/froya_day/2d_thin1`; `output/froya_day/2d_thin1_wall`): P carries 0.38 m/s at 5–7 h against 1.94 m/s at 5 h; the fastest current over 3 m deep is a real one (0.66 m/s at 37 m). The coastline at rest stays at 2.3e-11 m/s.
+- **Still open: ponds that hold a current the wall does not stop.**
+  - **P's copies stay apart.** In 7790 P stands at η = +0.16…+0.18 m (rising), in 7791 at −0.43, with the sound at −0.8. Its 0.38 m/s is almost normal to the shared face (−0.37 m/s into 7790): a steady exchange in which the copies' HLL jump term (−½λ[[h]], 0.6 m) balances the advective flux. 7790's copy lies 0.62 m above its interior sill node (bed −0.44 m, h 0.00–0.01), which should drain it within minutes and does not. Log the face and subcell mass fluxes at P from a snapshot state.
+  - **A 2.2 m pond at (−2.153, 6.606) km** (elements 7586/9322, a mid-edge node, its copies within 1 cm) keeps 1.23 m/s at 5–7 h, unchanged by the wall: it flows south over a sill only 6 cm under its water (node 8 of 7586, bed −0.44 m), so it is not walled. A pond at (1.347, −0.887) km (8309–8312) went from 0.35 to 0.68 m/s. Whether these drain a perched flat for hours (physical) or circulate (not) is still to be seen.
+  - The bed side (TODO P1.3, `notes/geometry-mesh.md` "Tidal ponds"): filling ponds to their sill at the lowest level would remove all of them.
 - **Tools.** The temporary snapshot tools `examples/tmp_snap_elem.rs` (one element over time, and the fastest deep nodes) and `examples/tmp_snap_ponds.rs` (ponds at a level, with their speeds) are uncommitted in the working tree.
 

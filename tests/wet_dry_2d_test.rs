@@ -403,6 +403,53 @@ fn lake_at_rest_with_shoreline_is_exact() {
 }
 
 // ---------------------------------------------------------------------------
+// A pond walled in by land
+// ---------------------------------------------------------------------------
+
+/// One wet node 25 m deep at `pond`, land at +2 m everywhere else, on a 3 × 3
+/// P2 mesh of 100 m elements; the pond starts at rest level with 1 m/s along
+/// x and no friction. Returns the largest speed where h > 1 cm after `t_end`.
+fn walled_pond_speed(pond: (f64, f64), t_end: f64) -> f64 {
+    let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 300.0, 0.0, 300.0, 3, 3), 2);
+    let bed = move |x: f64, y: f64| {
+        if (x - pond.0).hypot(y - pond.1) < 1.0 {
+            -25.0
+        } else {
+            2.0
+        }
+    };
+    let physics = setup
+        .wet_dry_over(SWEFormulation2D::WetDry, WetDryConfig::DEFAULT_H_DRY, bed)
+        .build();
+    let mut q = setup.fill(|x, y| {
+        let h = (-bed(x, y)).max(0.0);
+        SWEState2D::from_primitives(h, if h > 0.0 { 1.0 } else { 0.0 }, 0.0)
+    });
+    let mass0 = setup.mass(&q);
+    let sim = Simulation::new(physics, SSPRK3).with_cfl(1.0);
+    assert!(sim.run(&mut q, 0.0, t_end).success);
+    assert_eq!(sim.physics().negative_depth_clips(), 0);
+    let drift = (setup.mass(&q) - mass0).abs() / mass0;
+    assert!(drift < 1e-12, "mass drift {drift:e}");
+    max_speed(&q, 1e-2)
+}
+
+#[test]
+fn a_walled_pond_stops_its_current() {
+    // A node walled in by higher dry nodes moves no water, so the land must
+    // stop its velocity. The pond at an element's centre, at a mid-edge node
+    // (two copies) and at a vertex (four)
+    let speeds = [(150.0, 150.0), (150.0, 200.0), (200.0, 200.0)].map(|pond| {
+        let speed = walled_pond_speed(pond, 600.0);
+        println!("pond at {pond:?}: |u| {speed:.3e} m/s after 600 s");
+        (pond, speed)
+    });
+    for (pond, speed) in speeds {
+        assert!(speed < 1e-2, "pond at {pond:?}: |u| = {speed:.3e} m/s");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bottom friction
 // ---------------------------------------------------------------------------
 
