@@ -17,7 +17,6 @@
 //! The [`Integrable`] trait marks solution types that can be time-stepped.
 
 mod clock;
-mod coupled_swe_tracer;
 pub mod integrator;
 pub mod mode_split;
 pub mod multirate;
@@ -30,12 +29,6 @@ mod ssp_rk3_swe_2d;
 mod burn_ssp_rk3;
 
 pub use clock::ModelClock;
-pub use coupled_swe_tracer::{
-    CoupledRhs2D, CoupledState2D, CoupledTimeConfig, TracerLimiterType, compute_coupled_rhs,
-    compute_coupled_rhs_baroclinic, compute_dt_coupled, run_coupled_simulation,
-    run_coupled_simulation_limited, ssp_rk3_coupled_step, ssp_rk3_coupled_step_limited,
-    ssp_rk3_coupled_step_timed, total_mass as total_mass_coupled, total_tracer,
-};
 pub use mode_split::{
     BarotropicFilter, BarotropicPhysics, BarotropicTransport, MIN_BAROTROPIC_SUBSTEPS,
     ModeSplitIntegrator, ModeSplitPhysics, SlowForcingRecord, SplitMethod, StepDrag,

@@ -3,7 +3,7 @@
 //! Provides statistical metrics for comparing model results against observations,
 //! including constituent-level comparisons for harmonic analysis results.
 
-use super::{HarmonicResult, phase_difference};
+use super::{ReferenceConstant, ReferenceFit, phase_difference};
 
 /// Statistical comparison metrics between two time series.
 ///
@@ -134,9 +134,9 @@ pub struct ConstituentComparison {
     pub model_amplitude: f64,
     /// Observation amplitude
     pub obs_amplitude: f64,
-    /// Model phase
+    /// Model phase (radians; a Greenwich lag for reference constants)
     pub model_phase: f64,
-    /// Observation phase
+    /// Observation phase (radians)
     pub obs_phase: f64,
 }
 
@@ -197,28 +197,28 @@ impl ConstituentComparison {
     }
 }
 
-/// Compare harmonic analysis results from model and observation.
-///
-/// Matches constituents by name and computes comparison metrics.
-pub fn compare_harmonics(
-    model: &HarmonicResult,
-    obs: &HarmonicResult,
-) -> Vec<ConstituentComparison> {
-    let mut comparisons = Vec::new();
-
-    for model_c in &model.constituents {
-        if let Some(obs_c) = obs.get_constituent(model_c.name) {
-            comparisons.push(ConstituentComparison::new(
-                model_c.name,
-                model_c.amplitude,
-                model_c.phase,
-                obs_c.amplitude,
-                obs_c.phase,
-            ));
-        }
+impl ConstituentComparison {
+    /// The comparison of two reference constants of the same constituent
+    /// (phases: the Greenwich lags).
+    pub fn of(model: &ReferenceConstant, obs: &ReferenceConstant) -> Self {
+        Self::new(
+            model.name,
+            model.amplitude,
+            model.lag_deg.to_radians(),
+            obs.amplitude,
+            obs.lag_deg.to_radians(),
+        )
     }
+}
 
-    comparisons
+/// Compare the reference constants of a model fit with an observed one,
+/// constituent by constituent (those in both, in the model's order).
+pub fn compare_harmonics(model: &ReferenceFit, obs: &ReferenceFit) -> Vec<ConstituentComparison> {
+    model
+        .constants
+        .iter()
+        .filter_map(|m| Some(ConstituentComparison::of(m, obs.get(m.name)?)))
+        .collect()
 }
 
 /// Summary statistics for a set of constituent comparisons.

@@ -15,7 +15,53 @@ use crate::solver::state::Solution3D;
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
-use super::tracer_2d::TracerBounds;
+/// Physical bounds for tracer concentrations.
+///
+/// The range the 3D tracer limiter keeps T and S in.
+#[derive(Clone, Copy, Debug)]
+pub struct TracerBounds {
+    /// Minimum temperature (°C), typically -2.0 for seawater
+    pub t_min: f64,
+    /// Maximum temperature (°C), typically 40.0
+    pub t_max: f64,
+    /// Minimum salinity (PSU), typically 0.0
+    pub s_min: f64,
+    /// Maximum salinity (PSU), typically 42.0
+    pub s_max: f64,
+}
+
+impl Default for TracerBounds {
+    fn default() -> Self {
+        Self {
+            t_min: -2.0,
+            t_max: 40.0,
+            s_min: 0.0,
+            s_max: 42.0,
+        }
+    }
+}
+
+impl TracerBounds {
+    /// Create new tracer bounds.
+    pub fn new(t_min: f64, t_max: f64, s_min: f64, s_max: f64) -> Self {
+        Self {
+            t_min,
+            t_max,
+            s_min,
+            s_max,
+        }
+    }
+
+    /// Norwegian coastal water bounds (slightly relaxed for numerical margin).
+    pub fn norwegian_coast() -> Self {
+        Self {
+            t_min: -2.0,
+            t_max: 25.0,
+            s_min: 0.0,
+            s_max: 36.0,
+        }
+    }
+}
 
 const MIN_LAYER_THICKNESS: f64 = 1.0e-12;
 const MIN_INTEGRAL_WEIGHT: f64 = 1.0e-14;

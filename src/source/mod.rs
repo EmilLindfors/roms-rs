@@ -15,7 +15,6 @@
 //! - [`traits`]: Abstract source term traits (SourceTerm, SourceTerm2D)
 //! - [`swe_1d`]: 1D shallow water source terms
 //! - [`swe_2d`]: 2D shallow water source terms
-//! - [`tracer`]: Tracer-related source terms (baroclinic, heat flux)
 //! - [`boundary`]: Boundary treatment sources (sponge, strait friction)
 //! - [`river`]: Rivers as volume sources (2D and 3D)
 //! - [`wellbalanced`]: Well-balanced scheme components
@@ -24,7 +23,6 @@ pub mod boundary;
 pub mod river;
 pub mod swe_1d;
 pub mod swe_2d;
-pub mod tracer;
 pub mod traits;
 pub mod wellbalanced;
 
@@ -43,14 +41,8 @@ pub use swe_2d::{
     CageNode, ChezyFriction2D, CoriolisSource2D, DragCoefficient, GriddedAtmosphere2D,
     GriddedWindStress, HorizontalViscosity2D, ManningFriction2D, NetCage, P_STANDARD, RHO_AIR,
     RHO_WATER, RHO_WATER_PRESSURE, SpatiallyVaryingManning2D, TidalPotential,
-    TidalPotentialConstituent, WaveCurrentFriction2D, WaveForce2D, WindStress2D,
-    loland_drag_coefficient,
-};
-
-// Re-export tracer source terms
-pub use tracer::{
-    BaroclinicSource2D, LinearBaroclinicSource2D, TracerSourceContext2D, TracerSourceTerm2D,
-    compute_tracer_gradients,
+    TidalPotentialConstituent, WaveCurrentFriction2D, WaveForce2D, WindStress2D, coriolis_beta,
+    coriolis_parameter, loland_drag_coefficient,
 };
 
 // Re-export boundary sources

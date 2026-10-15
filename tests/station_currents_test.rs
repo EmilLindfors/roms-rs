@@ -1,7 +1,7 @@
 //! Gate for station sampling and current validation (P3.1): an M2 tide
 //! travelling through a channel, sampled at stations between the nodes
 //! (`PointLocator2D` + `Probe2D`), fitted for reference constants of η and
-//! tidal ellipses of the depth-averaged current (`fit_tidal_ellipses`), and
+//! tidal ellipses of the depth-averaged current (`HarmonicAnalysis::fit_ellipses`), and
 //! compared with the linear progressive wave
 //!
 //! ```text
@@ -17,7 +17,7 @@
 
 use std::f64::consts::PI;
 
-use dg_rs::analysis::{fit_reference_constants, fit_tidal_ellipses};
+use dg_rs::analysis::HarmonicAnalysis;
 use dg_rs::boundary::{CharacteristicOBC, ExternalState, MultiBoundaryCondition2D, Reflective2D};
 use dg_rs::mesh::{Bathymetry2D, BoundaryTag, PointLocator2D};
 use dg_rs::solver::Probe2D;
@@ -126,9 +126,10 @@ fn stations_recover_the_progressive_tide_and_its_current_ellipse() {
         let expected_lag = (LAG_WEST + (omega * x / celerity).to_degrees()).rem_euclid(360.0);
         let lag_error = |g: f64| ((g - expected_lag + 180.0).rem_euclid(360.0) - 180.0).abs();
 
-        let surface = fit_reference_constants(times, eta, &["M2", "M4"], &[]).unwrap();
+        let analysis = HarmonicAnalysis::new(&["M2", "M4"]);
+        let surface = analysis.fit(times, eta).unwrap();
         let m2 = surface.get("M2").unwrap();
-        let ellipses = fit_tidal_ellipses(times, u, v, &["M2", "M4"], &[]).unwrap();
+        let ellipses = analysis.fit_ellipses(times, u, v).unwrap();
         let e = ellipses.get("M2").unwrap();
         let major = AMPLITUDE * (G / DEPTH).sqrt();
         println!(

@@ -21,7 +21,7 @@ use std::f64::consts::PI;
 
 use dg_rs::SWEFluxType2D;
 use dg_rs::analysis::{
-    HarmonicAnalysis, PrecomputedExtractor, StabilityMonitor, StabilityThresholds,
+    HarmonicAnalysis, Inference, PrecomputedExtractor, StabilityMonitor, StabilityThresholds,
     TideGaugeStation, TimeSeries,
 };
 use dg_rs::boundary::{
@@ -481,7 +481,7 @@ fn main() {
             println!("  WARNING: No model data for obs {}", name);
             continue;
         }
-        let values: Vec<f64> = ts.values().into_iter().take(model_len).collect();
+        let values: Vec<f64> = ts.values().iter().take(model_len).copied().collect();
         let times_trimmed: Vec<f64> = times.iter().take(model_len).copied().collect();
         obs_trimmed.insert(name.clone(), TimeSeries::new(&times_trimmed, &values));
     }
@@ -496,8 +496,15 @@ fn main() {
         return;
     }
 
-    // Run validation with harmonic analysis
-    let analysis = HarmonicAnalysis::standard();
+    // Run validation with harmonic analysis: the constituents the run
+    // resolves, the equilibrium inferences for the rest
+    let analysis = HarmonicAnalysis::resolvable(
+        &["M2", "S2", "K1", "O1", "N2", "M4"],
+        times[model_len - 1] - times[0],
+        1.0,
+        &Inference::EQUILIBRIUM,
+    );
+    println!("  Harmonic analysis: {:?}", analysis.names());
     let (results, summary) = dg_rs::validate_stations(
         &stations,
         &extractor,
@@ -520,6 +527,13 @@ fn main() {
     println!("----------------------------");
 
     for result in &results {
+        let result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                println!("\n  not validated: {e}");
+                continue;
+            }
+        };
         println!("\n{}", result.summary());
 
         // Print constituent comparison if available

@@ -4,17 +4,18 @@
 //!
 //! 1. Read `norkyst-client --format text` point output with
 //!    [`dg_rs::io::read_norkyst_text_file`] → a sea-surface-height (`zeta`) series.
-//! 2. Fit tidal constituents with [`HarmonicAnalysis`].
-//! 3. Strip the nodal modulation with [`HarmonicResult::reference_constants`] so the
-//!    fitted *apparent* constants become catalogue-comparable *reference* constants.
-//! 4. Compare `(H, G)` against a published harmonic catalogue and print skill numbers.
+//! 2. Fit reference constants `(H, G)` with [`HarmonicAnalysis`] (the
+//!    astronomy and nodal corrections are in its basis, so they compare
+//!    directly with a catalogue): the constituents the record resolves, the
+//!    equilibrium inferences for the rest.
+//! 3. Compare `(H, G)` against a published harmonic catalogue and print skill numbers.
 //!
 //! ## Run
 //!
 //! Synthetic self-check (no data needed) — synthesizes a tide from a known
-//! catalogue, applies the forward Schureman nodal correction at a chosen epoch,
-//! writes it as a NorKyst text file, reads it back through the real reader, and
-//! confirms the inference recovers the catalogue:
+//! catalogue (with the nodal corrections), writes it as a NorKyst text file,
+//! reads it back through the real reader, and confirms the fit recovers the
+//! catalogue:
 //!
 //! ```bash
 //! cargo run --example norkyst_tidal_validation --no-default-features --features parallel,simd
@@ -37,19 +38,17 @@
 //!   --features parquet -- dataset/ 5.32 60.39
 //! ```
 //!
-//! In real-data mode the record's first sample time is taken as the analysis
-//! epoch, so the reference constants it prints are directly comparable to a
-//! catalogue (Kartverket / ROMS / NorKyst harmonic constants).
+//! The reference constants it prints are directly comparable to a catalogue
+//! (Kartverket / ROMS / NorKyst harmonic constants).
 
-use std::f64::consts::PI;
-
-use dg_rs::analysis::{HarmonicAnalysis, HarmonicResult, TimeSeries};
-use dg_rs::boundary::TidalConstituent;
+use dg_rs::analysis::{HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit, TimeSeries};
 use dg_rs::io::read_norkyst_text_file;
-use dg_rs::tides::{AstronomicalArguments, correct_amplitude_phase, julian_date, nodal_correction};
+use dg_rs::time::ModelClock;
 
-/// Julian Date of the Unix epoch (1970-01-01 00:00:00 UTC).
-const UNIX_EPOCH_JD: f64 = 2_440_587.5;
+/// Constituents to fit in priority order: a short record keeps the first.
+const CANDIDATES: [&str; 11] = [
+    "M2", "S2", "K1", "O1", "N2", "Q1", "K2", "P1", "M4", "MS4", "M6",
+];
 
 /// A published harmonic constant: amplitude `h` (m) and Greenwich phase lag `g` (deg).
 struct Catalogue {
@@ -86,10 +85,11 @@ const BERGEN_LIKE: &[Catalogue] = &[
         h: 0.055,
         g_deg: 330.0,
     },
+    // At K1's equilibrium ratio, as a month's fit infers it
     Catalogue {
         name: "P1",
-        h: 0.020,
-        g_deg: 95.0,
+        h: 0.331 * 0.065,
+        g_deg: 100.0,
     },
 ];
 
@@ -122,32 +122,30 @@ fn real_data_mode(path: &str, lon: f64, lat: f64) {
         None => std::process::exit(1),
     };
 
-    let analysis = HarmonicAnalysis::norwegian_coast();
-    let (rel, epoch) = match to_relative_series_and_epoch(&zeta, &analysis) {
-        Some(x) => x,
-        None => std::process::exit(1),
+    let analysis =
+        HarmonicAnalysis::resolvable(&CANDIDATES, zeta.duration(), 1.0, &Inference::EQUILIBRIUM);
+    let fit = match analysis.fit_series(&zeta) {
+        Ok(fit) => fit,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
     };
 
-    let fit = analysis.fit(&rel);
-    let refs = fit.reference_constants(&epoch);
-
-    println!("\nInferred reference constants (nodal correction removed):");
+    println!("\nReference constants:");
     println!(
         "  fit R² = {:.4}, record length = {:.1} days",
         fit.r_squared,
-        rel.duration() / 86_400.0
+        zeta.duration() / 86_400.0
     );
-    println!(
-        "  {:<4} {:>10} {:>10} {:>12}",
-        "name", "H (m)", "G (deg)", "period (h)"
-    );
-    for c in &refs {
+    println!("  {:<4} {:>10} {:>10}", "name", "H (m)", "G (deg)");
+    for c in &fit.constants {
         println!(
-            "  {:<4} {:>10.4} {:>10.1} {:>12.3}",
+            "  {:<4} {:>10.4} {:>10.1}{}",
             c.name,
             c.amplitude,
-            greenwich_lag_deg(c.phase),
-            c.period / 3600.0,
+            c.lag_deg,
+            if c.inferred { "  (inferred)" } else { "" }
         );
     }
     println!(
@@ -255,35 +253,31 @@ fn load_zeta(path: &str, lon: f64, lat: f64) -> Option<TimeSeries> {
 fn synthetic_self_check() {
     println!("Synthetic round-trip self-check (no external data)\n");
 
-    // Analysis epoch = the record's first-sample instant.
-    let (year, month, day) = (2024, 6, 1);
-    let epoch_jd = julian_date(year, month, day, 0, 0, 0.0);
-    let epoch = AstronomicalArguments::at_julian_date(epoch_jd);
-    let epoch_unix = ((epoch_jd - UNIX_EPOCH_JD) * 86_400.0).round() as i64;
-
-    // Forward-correct each catalogue constituent to the *apparent* constants a
-    // finite record starting at `epoch` would actually show.
-    let mean = 0.30_f64; // arbitrary datum offset; harmonic inference ignores the mean
-    let apparent: Vec<TidalConstituent> = BERGEN_LIKE
-        .iter()
-        .map(|c| {
-            let phi_ref = internal_phase(c.g_deg);
-            let (h_app, phi_app) = match nodal_correction(c.name, &epoch) {
-                Some(corr) => correct_amplitude_phase(c.h, phi_ref, &corr),
-                None => (c.h, phi_ref),
-            };
-            named_constituent(c.name, h_app, phi_app)
-        })
-        .collect();
-
-    // Synthesize 30 days of hourly zeta and write it in the norkyst-client text
-    // format, so the real reader (not a shortcut) parses it back.
+    // 30 days of hourly zeta from the catalogue, written in the
+    // norkyst-client text format, so the real reader (not a shortcut) parses
+    // it back
+    let epoch_unix = ModelClock::at_datetime(2024, 6, 1, 0, 0).epoch_unix;
     let n_hours = 30 * 24;
+    let times: Vec<f64> = (0..n_hours)
+        .map(|i| epoch_unix + i as f64 * 3600.0)
+        .collect();
+    let catalogue = ReferenceFit {
+        mean: 0.30,
+        constants: BERGEN_LIKE
+            .iter()
+            .map(|c| ReferenceConstant {
+                name: c.name,
+                amplitude: c.h,
+                lag_deg: c.g_deg,
+                inferred: false,
+            })
+            .collect(),
+        r_squared: 1.0,
+        residual_rms: 0.0,
+    };
     let mut text = String::new();
-    for i in 0..n_hours {
-        let t_rel = i as f64 * 3600.0;
-        let zeta: f64 = mean + apparent.iter().map(|c| c.evaluate(t_rel)).sum::<f64>();
-        let stamp = format_utc(epoch_unix + i as i64 * 3600);
+    for (&t, zeta) in times.iter().zip(catalogue.predict(&times)) {
+        let stamp = format_utc(t as i64);
         text.push_str("site_id: 999\n");
         text.push_str(&format!("time={stamp} lat=60.39 lon=5.32\n"));
         text.push_str(&format!(
@@ -305,34 +299,31 @@ fn synthetic_self_check() {
         zeta_series.len()
     );
 
-    // Fit and infer reference constants at the epoch.
-    let analysis = HarmonicAnalysis::norwegian_coast();
-    let (rel, epoch2) =
-        to_relative_series_and_epoch(&zeta_series, &analysis).expect("record long enough");
-    let fit = analysis.fit(&rel);
-    let refs = fit.reference_constants(&epoch2);
-
-    print_comparison(&fit, &refs);
+    // A month resolves M2, S2, N2, K1 and O1; P1 is inferred from K1
+    let fit = HarmonicAnalysis::norwegian_coast()
+        .fit_series(&zeta_series)
+        .expect("a month of hourly samples");
+    print_comparison(&fit);
     let _ = std::fs::remove_file(&file);
 }
 
 /// Print the inferred reference constants next to the catalogue they came from.
-fn print_comparison(fit: &HarmonicResult, refs: &[dg_rs::analysis::ConstituentResult]) {
+fn print_comparison(fit: &ReferenceFit) {
     println!("Recovered catalogue (fit R² = {:.6}):", fit.r_squared);
     println!(
         "  {:<4} {:>8} {:>8} {:>8}   {:>8} {:>8} {:>8}",
         "name", "H_cat", "H_fit", "ΔH", "G_cat", "G_fit", "ΔG"
     );
 
-    let mut sum_dh2 = 0.0;
-    let mut sum_dg2 = 0.0;
+    let mut sum_dh2 = 0.0_f64;
+    let mut sum_dg2 = 0.0_f64;
     let mut n = 0.0;
     for cat in BERGEN_LIKE {
-        let Some(c) = refs.iter().find(|r| r.name == cat.name) else {
+        let Some(c) = fit.get(cat.name) else {
             continue;
         };
         let h_fit = c.amplitude;
-        let g_fit = greenwich_lag_deg(c.phase);
+        let g_fit = c.lag_deg;
         let dh = h_fit - cat.h;
         let dg = wrap_deg_signed(g_fit - cat.g_deg);
         sum_dh2 += dh * dh;
@@ -351,8 +342,8 @@ fn print_comparison(fit: &HarmonicResult, refs: &[dg_rs::analysis::ConstituentRe
             (sum_dg2 / n).sqrt()
         );
         println!(
-            "  (Both should be ~0: the reader + harmonic inference reproduce the catalogue \
-             the synthetic tide was built from.)"
+            "  (Both should be ~0: the reader and the fit reproduce the catalogue the \
+             synthetic tide was built from.)"
         );
     }
 }
@@ -361,55 +352,6 @@ fn print_comparison(fit: &HarmonicResult, refs: &[dg_rs::analysis::ConstituentRe
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-/// Shift an absolute-time (Unix-second) series to start at `t = 0` and return the
-/// astronomical epoch for that origin, so `reference_constants` is self-consistent.
-///
-/// Returns `None` (after printing why) if the record is too short to fit.
-fn to_relative_series_and_epoch(
-    series: &TimeSeries,
-    analysis: &HarmonicAnalysis,
-) -> Option<(TimeSeries, AstronomicalArguments)> {
-    let n_unknowns = 1 + 2 * analysis.names().len();
-    if series.len() < n_unknowns {
-        eprintln!(
-            "error: need ≥{} samples to fit {} constituents, got {}",
-            n_unknowns,
-            analysis.names().len(),
-            series.len()
-        );
-        return None;
-    }
-
-    let times = series.times();
-    let values = series.values();
-    let t0 = times[0];
-    let rel_times: Vec<f64> = times.iter().map(|&t| t - t0).collect();
-    let rel = TimeSeries::new(&rel_times, &values);
-
-    let min_len = analysis.minimum_record_length();
-    if rel.duration() < min_len {
-        eprintln!(
-            "warning: record spans {:.1} days but Rayleigh separation of these constituents \
-             needs {:.1} days — constituents may be aliased.",
-            rel.duration() / 86_400.0,
-            min_len / 86_400.0
-        );
-    }
-
-    let epoch = AstronomicalArguments::at_julian_date(t0 / 86_400.0 + UNIX_EPOCH_JD);
-    Some((rel, epoch))
-}
-
-/// Internal phase convention `φ = −G` (radians), wrapped to `[0, 2π)`.
-fn internal_phase(g_deg: f64) -> f64 {
-    (-g_deg.to_radians()).rem_euclid(2.0 * PI)
-}
-
-/// Greenwich phase lag `G = −φ` in degrees, wrapped to `[0, 360)`.
-fn greenwich_lag_deg(phase_rad: f64) -> f64 {
-    (-phase_rad.to_degrees()).rem_euclid(360.0)
-}
-
 /// Wrap a degree difference to `(−180, 180]`.
 fn wrap_deg_signed(d: f64) -> f64 {
     let mut x = d.rem_euclid(360.0);
@@ -417,19 +359,6 @@ fn wrap_deg_signed(d: f64) -> f64 {
         x -= 360.0;
     }
     x
-}
-
-/// Build a named tidal constituent from `(amplitude, internal_phase)`.
-fn named_constituent(name: &str, amplitude: f64, phase: f64) -> TidalConstituent {
-    match name {
-        "M2" => TidalConstituent::m2(amplitude, phase),
-        "S2" => TidalConstituent::s2(amplitude, phase),
-        "N2" => TidalConstituent::n2(amplitude, phase),
-        "K1" => TidalConstituent::k1(amplitude, phase),
-        "O1" => TidalConstituent::o1(amplitude, phase),
-        "P1" => TidalConstituent::p1(amplitude, phase),
-        other => panic!("unhandled constituent {other}"),
-    }
 }
 
 /// Format Unix seconds as `YYYY-MM-DDTHH:MM:SSZ` (the reader accepts RFC3339).

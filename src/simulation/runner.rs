@@ -401,6 +401,16 @@ where
             t = if landed { target } else { t + dt };
             n_steps += 1;
 
+            // A blown-up step leaves NaN or infinities, which every later
+            // step would carry on to `t_end` (the step's bound skips NaN)
+            if !state.is_finite() {
+                return SimulationResult::failure(
+                    t,
+                    n_steps,
+                    format!("The state is not finite at t = {t:.1} s: it has blown up"),
+                );
+            }
+
             // Callback at the configured interval, or every step
             match next_callback(callbacks_done) {
                 Some(c) if t >= c => {
@@ -762,6 +772,38 @@ mod tests {
         let min_h = *physics.min_h_seen.lock().unwrap();
         assert!(min_h >= 0.0, "an RHS evaluation saw h = {min_h}");
         assert!(state.h_data().iter().all(|&h| h >= 0.0));
+    }
+
+    /// Regression (P2.1): a blown-up 2D state stepped NaN on to `t_end` and
+    /// reported success, as `Simulation3D` did before 2026-10-10. It now
+    /// stops at the first step that leaves a non-finite value.
+    #[test]
+    fn a_blown_up_2d_run_fails() {
+        let mesh = Mesh2D::uniform_rectangle(0.0, 1.0, 0.0, 1.0, 1, 1);
+        let ops = DGOperators2D::new(1);
+        let geom = GeometricFactors2D::compute(&mesh, &ops);
+        let mut state = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+        state.h_data_mut().fill(5.0);
+        state.hu_data_mut()[0] = f64::NAN;
+        let physics = DrainingPhysics {
+            mesh,
+            ops,
+            geom,
+            min_h_seen: std::sync::Mutex::new(f64::INFINITY),
+            post_process_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let result = Simulation::new(physics, SSPRK3).run(&mut state, 0.0, 4.0);
+        assert!(!result.success, "a blown-up run reported success");
+        assert_eq!(result.n_steps, 1, "it should stop after the first step");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("blown up")),
+            "{:?}",
+            result.error
+        );
     }
 
     /// A run in coupling intervals whose exchange leaves the physics alone is

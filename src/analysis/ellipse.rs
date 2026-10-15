@@ -2,7 +2,7 @@
 //!
 //! Each constituent of a current `(u, v)` traces an ellipse. With the
 //! reference constants of the components (amplitude `H`, Greenwich lag `G`,
-//! as fitted by [`fit_reference_constants`]) and the astronomical argument
+//! as fitted by [`HarmonicAnalysis::fit`]) and the astronomical argument
 //! `χ = ω(t − t₀) + V₀ + u_nodal`,
 //!
 //! ```text
@@ -39,7 +39,7 @@
 //! the two tidal currents times √2. It weighs errors in axes, inclination and
 //! phase by their effect on the velocity.
 
-use super::reference_fit::{Inference, ReferenceFit, fit_reference_constants};
+use super::{AnalysisError, HarmonicAnalysis, Inference, ReferenceFit};
 
 /// A complex number `(re, im)`.
 type Complex = (f64, f64);
@@ -168,7 +168,7 @@ impl TidalEllipse {
     }
 }
 
-/// Result of [`fit_tidal_ellipses`].
+/// Result of [`HarmonicAnalysis::fit_ellipses`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct EllipseFit {
     /// Mean current `(ū, v̄)` over the record (residual flow).
@@ -208,44 +208,71 @@ impl EllipseFit {
     }
 }
 
-/// Fit tidal ellipses of `names` (plus `inferred`, applied to both
-/// components with the same ratio and lag offset) to the current
-/// `(u[i], v[i])` at `times_unix[i]`: the reference constants of each
-/// component, converted to ellipses. Errors as [`fit_reference_constants`].
-pub fn fit_tidal_ellipses(
-    times_unix: &[f64],
-    u: &[f64],
-    v: &[f64],
-    names: &[&'static str],
-    inferred: &[Inference],
-) -> Result<EllipseFit, String> {
-    assert_eq!(u.len(), v.len(), "u and v differ in length");
-    let fit_u = fit_reference_constants(times_unix, u, names, inferred)?;
-    let fit_v = fit_reference_constants(times_unix, v, names, inferred)?;
-    let ellipses = fit_u
-        .constants
-        .iter()
-        .zip(&fit_v.constants)
-        .map(|(cu, cv)| TidalEllipse {
-            inferred: cu.inferred,
-            ..TidalEllipse::from_components(
-                cu.name,
-                (cu.amplitude, cu.lag_deg),
-                (cv.amplitude, cv.lag_deg),
-            )
-        })
-        .collect();
-    Ok(EllipseFit {
-        mean: (fit_u.mean, fit_v.mean),
-        ellipses,
-        u: fit_u,
-        v: fit_v,
-    })
+impl HarmonicAnalysis {
+    /// Fit tidal ellipses to the current `(u[i], v[i])` at `times_unix[i]`:
+    /// the reference constants of each component (inferences applied to
+    /// both with the same ratio and lag offset), converted to ellipses.
+    /// Errors as [`Self::fit`].
+    pub fn fit_ellipses(
+        &self,
+        times_unix: &[f64],
+        u: &[f64],
+        v: &[f64],
+    ) -> Result<EllipseFit, AnalysisError> {
+        let fit_u = self.fit(times_unix, u)?;
+        let fit_v = self.fit(times_unix, v)?;
+        Ok(EllipseFit::from_components(fit_u, fit_v))
+    }
+}
+
+impl Inference {
+    /// This inference with the major-axis ratio and lag difference of
+    /// `reference`'s ellipses (a longer current record at the same place)
+    /// where it has both constituents, else unchanged; applied to both
+    /// components alike by [`HarmonicAnalysis::fit_ellipses`].
+    pub fn or_from_ellipses(self, reference: Option<&EllipseFit>) -> Self {
+        reference
+            .and_then(|r| {
+                let (a, b) = (r.get(self.name)?, r.get(self.from)?);
+                (b.major > 0.0).then(|| Self {
+                    amplitude_ratio: a.major / b.major,
+                    lag_offset_deg: a.lag_deg - b.lag_deg,
+                    ..self
+                })
+            })
+            .unwrap_or(self)
+    }
+}
+
+impl EllipseFit {
+    /// The ellipses of two component fits of the same analysis.
+    fn from_components(fit_u: ReferenceFit, fit_v: ReferenceFit) -> Self {
+        let ellipses = fit_u
+            .constants
+            .iter()
+            .zip(&fit_v.constants)
+            .map(|(cu, cv)| TidalEllipse {
+                inferred: cu.inferred,
+                ..TidalEllipse::from_components(
+                    cu.name,
+                    (cu.amplitude, cu.lag_deg),
+                    (cv.amplitude, cv.lag_deg),
+                )
+            })
+            .collect();
+        Self {
+            mean: (fit_u.mean, fit_v.mean),
+            ellipses,
+            u: fit_u,
+            v: fit_v,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::Inference;
     use crate::tides::constituent_period;
     use crate::time::ModelClock;
 
@@ -467,14 +494,10 @@ mod tests {
                 v[i] += n.f * hv * (chi - gv.to_radians()).cos();
             }
         }
-        let fit = fit_tidal_ellipses(
-            &times,
-            &u,
-            &v,
-            &["M2", "S2", "K1", "O1"],
-            &[Inference::P1_FROM_K1],
-        )
-        .unwrap();
+        let fit = HarmonicAnalysis::new(&["M2", "S2", "K1", "O1"])
+            .with_inferences(&[Inference::P1_FROM_K1])
+            .fit_ellipses(&times, &u, &v)
+            .unwrap();
         assert!((fit.mean.0 - 0.07).abs() < 1e-10 && (fit.mean.1 + 0.02).abs() < 1e-10);
         assert!(fit.r_squared(&u, &v) > 1.0 - 1e-12);
         for e in truth.iter().chain([&p1]) {

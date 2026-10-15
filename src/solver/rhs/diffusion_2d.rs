@@ -9,8 +9,7 @@
 //! [`br1_diffusion_element`]) and read the other elements through closures,
 //! so kernels can run them in their own element loops (in parallel, or on a
 //! subset of the elements for local time stepping) without whole-mesh
-//! temporaries. [`compute_br1_gradient_2d`] and
-//! [`compute_br1_diffusion_rhs_2d`] run them over the whole mesh.
+//! temporaries.
 //!
 //! The GLL LIFT of a face is nonzero only in the rows of the face's own
 //! nodes (`LIFT_f[i, fi] = δ(i, node(fi))/w_i`: diagonal mass, and the face
@@ -27,6 +26,7 @@ pub(super) struct ScalarGradient2D {
     pub dy: f64,
 }
 
+#[cfg(test)]
 #[inline]
 fn idx(k: ElementIndex, node: usize, n_nodes: usize) -> usize {
     k.as_usize() * n_nodes + node
@@ -241,7 +241,9 @@ pub(super) fn br1_diffusion_element<const N: usize>(
 }
 
 /// [`br1_gradient_element`] of every element, for `values` given at every
-/// mesh node.
+/// mesh node (whole-mesh arrays: the reference the kernels are tested
+/// against).
+#[cfg(test)]
 pub(super) fn compute_br1_gradient_2d<F>(
     values: &[f64],
     mesh: &Mesh2D,
@@ -270,50 +272,6 @@ where
         );
     }
     gradients
-}
-
-/// Compute `div(coeff * grad(value))` with conservative central face fluxes:
-/// [`br1_diffusion_element`] of every element, negative coefficients taken
-/// as zero.
-///
-/// The returned array is a scalar RHS contribution for every element node.
-/// Boundary faces take the interior flux, which matches an exterior state
-/// that is a (shifted) mirror of the interior, `2u_b − u` (see
-/// [`br1_diffusion_element`]); for a zero-gradient exterior it is not
-/// dissipative (TODO P1.3: the 2D tracer diffusion's walls).
-pub(super) fn compute_br1_diffusion_rhs_2d(
-    values: &[f64],
-    coefficients: &[f64],
-    gradients: &[ScalarGradient2D],
-    mesh: &Mesh2D,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-) -> Vec<f64> {
-    let n_nodes = ops.n_nodes;
-    debug_assert_eq!(values.len(), mesh.n_elements * n_nodes);
-    debug_assert_eq!(coefficients.len(), values.len());
-    debug_assert_eq!(gradients.len(), values.len());
-
-    let flux = |j: ElementIndex, node: usize| {
-        let n = idx(j, node, n_nodes);
-        let coeff = coefficients[n].max(0.0);
-        [(coeff * gradients[n].dx, coeff * gradients[n].dy)]
-    };
-    let mut rhs = vec![0.0; values.len()];
-    let mut scratch = DiffusionScratch::<1>::new(n_nodes);
-    for (k, out) in ElementIndex::iter(mesh.n_elements).zip(rhs.chunks_exact_mut(n_nodes)) {
-        br1_diffusion_element(
-            k,
-            mesh,
-            ops,
-            geom,
-            flux,
-            |_, _, _, _, f| f,
-            &mut scratch,
-            [out],
-        );
-    }
-    rhs
 }
 
 #[cfg(test)]

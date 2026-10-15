@@ -11,7 +11,7 @@
 //! 3. Depth-average the velocities over the water column
 //!    ([`depth_average_z`](dg_rs::io::depth_average_z)).
 //! 4. Fit reference constants `(H, G)` of η, ū and v̄ with
-//!    [`fit_reference_constants`] (V₀ at the first sample, f and u at the
+//!    [`HarmonicAnalysis::fit`](dg_rs::analysis::HarmonicAnalysis::fit) (V₀ at the first sample, f and u at the
 //!    record midpoint), inferring P1 from K1 and K2 from S2.
 //! 5. Write the atlas (text format of `dg_rs::boundary::TidalAtlas`).
 //!
@@ -56,7 +56,7 @@ mod app {
     use std::path::PathBuf;
     use std::time::Instant;
 
-    use dg_rs::analysis::{Inference, ReferenceFit, fit_reference_constants};
+    use dg_rs::analysis::{AnalysisError, HarmonicAnalysis, Inference, ReferenceFit};
     use dg_rs::boundary::{AtlasConstituent, AtlasPoint, TidalAtlas};
     use dg_rs::io::depth_average_z;
     use dg_rs::time::ModelClock;
@@ -356,15 +356,16 @@ mod app {
             header,
         };
         let (mut r2, mut r2_stations) = (Vec::new(), Vec::new());
+        let analysis = HarmonicAnalysis::new(&NAMES).with_inferences(&INFERRED);
         for cell in &cells {
-            let fit = |values: &[f64]| -> Result<ReferenceFit, String> {
+            let fit = |values: &[f64]| -> Result<ReferenceFit, AnalysisError> {
                 let (t, x): (Vec<f64>, Vec<f64>) = times
                     .iter()
                     .zip(values)
                     .filter(|(_, v)| v.is_finite())
                     .map(|(&t, &v)| (t, v))
                     .unzip();
-                fit_reference_constants(&t, &x, &NAMES, &INFERRED)
+                analysis.fit(&t, &x)
             };
             let (eta, u, v) = match (fit(&cell.eta), fit(&cell.u), fit(&cell.v)) {
                 (Ok(e), Ok(u), Ok(v)) => (e, u, v),
@@ -374,7 +375,7 @@ mod app {
                         "  skipping cell ({:.4}, {:.4}): {}",
                         cell.lon,
                         cell.lat,
-                        error.unwrap_or_default()
+                        error.map_or(String::new(), |e| e.to_string())
                     );
                     continue;
                 }

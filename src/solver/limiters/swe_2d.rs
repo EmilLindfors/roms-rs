@@ -29,8 +29,43 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::solver::state::SWESolution2D;
 use crate::types::ElementIndex;
 
-// Re-use TVBParameter2D from tracer limiters (same algorithm)
-pub use crate::solver::limiters::tracer_2d::KuzminParameter2D;
+/// Configuration for the Kuzmin vertex-based slope limiter.
+///
+/// The Kuzmin limiter uses vertex-patch stencils (all elements sharing a vertex)
+/// to compute local bounds, providing better oscillation control than face-neighbor
+/// based limiters while preserving accuracy in smooth regions.
+///
+/// # Reference
+/// Kuzmin (2010), "A vertex-based hierarchical slope limiter for p-adaptive DG methods"
+#[derive(Clone, Copy, Debug)]
+pub struct KuzminParameter2D {
+    /// Relaxation factor for bounds (1.0 = strict, >1.0 = relaxed).
+    /// Values > 1.0 widen the bounds slightly to prevent over-limiting.
+    pub relaxation: f64,
+}
+
+impl Default for KuzminParameter2D {
+    fn default() -> Self {
+        Self { relaxation: 1.0 }
+    }
+}
+
+impl KuzminParameter2D {
+    /// Create a new Kuzmin parameter with strict bounds.
+    pub fn strict() -> Self {
+        Self { relaxation: 1.0 }
+    }
+
+    /// Create a Kuzmin parameter with relaxed bounds.
+    ///
+    /// # Arguments
+    /// * `relaxation` - Relaxation factor (1.0 = strict, 1.1 = 10% wider bounds)
+    pub fn relaxed(relaxation: f64) -> Self {
+        Self {
+            relaxation: relaxation.max(1.0),
+        }
+    }
+}
 
 /// Compute cell averages for SWE variables in 2D.
 ///

@@ -3,8 +3,8 @@
 //!
 //! 1. Read a gauge file (`dg_rs::io::read_tide_gauge_file`, ISO times, e.g.
 //!    from `scripts/kartverket_gauge.sh`), keep `[from, to)`.
-//! 2. Fit reference constants (`fit_reference_constants`) of every constituent
-//!    the record resolves (`resolvable_constituents`, Rayleigh factor
+//! 2. Fit reference constants (`HarmonicAnalysis::fit`) of every constituent
+//!    the record resolves (`HarmonicAnalysis::resolvable`, Rayleigh factor
 //!    `rayleigh`); unresolved P1, K2, N2 and Q1 are inferred at their
 //!    equilibrium ratios.
 //! 3. With `atlas=<file>`: the atlas point nearest the gauge and, per
@@ -22,10 +22,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use dg_rs::analysis::{
-    ConstituentComparison, Inference, ReferenceFit, fit_reference_constants,
-    resolvable_constituents,
-};
+use dg_rs::analysis::{ConstituentComparison, HarmonicAnalysis, Inference};
 use dg_rs::boundary::TidalAtlas;
 use dg_rs::io::read_tide_gauge_file;
 use dg_rs::time::ModelClock;
@@ -60,8 +57,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (times, values): (Vec<f64>, Vec<f64>) = gauge
         .time_series
         .times()
-        .into_iter()
-        .zip(gauge.time_series.values())
+        .iter()
+        .copied()
+        .zip(gauge.time_series.values().iter().copied())
         .filter(|&(t, v)| v.is_finite() && from.is_none_or(|f| t >= f) && to.is_none_or(|e| t < e))
         .unzip();
     let (Some(&t0), Some(&t1)) = (times.first(), times.last()) else {
@@ -79,7 +77,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (t1 - t0) / 86_400.0
     );
 
-    let fit = fit_gauge(&times, &values, rayleigh)?;
+    // Every constituent the record resolves, the equilibrium inferences for
+    // the rest
+    let fit = HarmonicAnalysis::resolvable(&CANDIDATES, t1 - t0, rayleigh, &Inference::EQUILIBRIUM)
+        .fit(&times, &values)?;
     println!(
         "  Z0 {:+.3} m, R² {:.4}, residual RMS {:.3} m\n",
         fit.mean, fit.r_squared, fit.residual_rms
@@ -134,16 +135,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  root sum of squares of |ΔZ|: {:.4} m", rss.sqrt());
     }
     Ok(())
-}
-
-/// Reference constants of every constituent the record resolves, with the
-/// equilibrium inferences for the rest.
-fn fit_gauge(times: &[f64], values: &[f64], rayleigh: f64) -> Result<ReferenceFit, String> {
-    let length = times.last().unwrap_or(&0.0) - times.first().unwrap_or(&0.0);
-    let names = resolvable_constituents(&CANDIDATES, length, rayleigh);
-    let inferred: Vec<Inference> = Inference::EQUILIBRIUM
-        .into_iter()
-        .filter(|i| !names.contains(&i.name) && names.contains(&i.from))
-        .collect();
-    fit_reference_constants(times, values, &names, &inferred)
 }

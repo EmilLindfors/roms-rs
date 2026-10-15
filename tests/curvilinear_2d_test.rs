@@ -22,8 +22,7 @@ use dg_rs::flux::{SWENodeState2D, swe_entropy_variables_2d};
 use dg_rs::mesh::{Bathymetry2D, Mesh2D};
 use dg_rs::operators::{DGOperators2D, GeometricFactors2D};
 use dg_rs::solver::{
-    ExtrapolationTracerBC, SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, SWEState2D,
-    Tracer2DRhsConfig, TracerSolution2D, TracerState, compute_rhs_swe_2d, compute_rhs_tracer_2d,
+    SWE2DRhsConfig, SWEFormulation2D, SWESolution2D, SWEState2D, compute_rhs_swe_2d,
 };
 use dg_rs::source::HorizontalViscosity2D;
 use dg_rs::types::ElementIndex;
@@ -335,73 +334,6 @@ fn entropy_is_conserved_or_dissipated_on_distorted_elements() {
             rate < 1e-11 * scale,
             "P{order} EntropyStable: entropy rate {rate:.3e} of {scale:.3e} should be ≤ 0"
         );
-    }
-}
-
-/// Tracer transport with diffusion on distorted elements: a uniform
-/// concentration in a uniform flow is steady, and the tracer content hT, hS is
-/// conserved for any flow.
-#[test]
-fn tracer_transport_on_distorted_elements() {
-    let tau = 2.0 * PI / L;
-    let bc = ExtrapolationTracerBC; // never called on a periodic mesh
-    let config = Tracer2DRhsConfig::new(&bc, G, 1e-3).with_diffusivity(5.0);
-    for order in 1..=4 {
-        let s = Setup::new(5, order);
-        let mut tracers = TracerSolution2D::new(s.mesh.n_elements, s.ops.n_nodes);
-
-        // Uniform
-        let swe = s.state(|_, _| SWEState2D::from_primitives(20.0, 0.7, -0.4));
-        for (k, i) in s.nodes() {
-            tracers.set_from_concentrations(k, i, 20.0, TracerState::new(8.0, 34.0));
-        }
-        let rhs = compute_rhs_tracer_2d(&tracers, &swe, &s.mesh, &s.ops, &s.geom, &config, 0.0);
-        let err = s
-            .nodes()
-            .map(|(k, i)| {
-                let r = rhs.get_conservative(k, i);
-                r.h_t.abs().max(r.h_s.abs())
-            })
-            .fold(0.0_f64, f64::max);
-        let scale = 20.0 * 34.0 * 0.7 / (L / 5.0);
-        assert!(
-            err < 1e-12 * scale,
-            "P{order}: uniform tracer drifts at {err:.3e}"
-        );
-
-        // Varying flow and concentrations: content is conserved
-        let swe = s.state(|x, y| {
-            SWEState2D::from_primitives(
-                20.0 + 2.0 * (tau * x).sin(),
-                0.5 * (tau * y).cos(),
-                0.3 * (tau * x).sin(),
-            )
-        });
-        for (k, i) in s.nodes() {
-            let (x, y) = s.xy(k, i);
-            let h = swe.get_state(k, i).h;
-            let t = 8.0 + 2.0 * (tau * x).cos() * (tau * y).sin();
-            tracers.set_from_concentrations(k, i, h, TracerState::new(t, 34.0 - 0.1 * t));
-        }
-        let rhs = compute_rhs_tracer_2d(&tracers, &swe, &s.mesh, &s.ops, &s.geom, &config, 0.0);
-        for (label, f) in [
-            (
-                "hT",
-                (|r: TracerState| r.temperature) as fn(TracerState) -> f64,
-            ),
-            ("hS", |r: TracerState| r.salinity),
-        ] {
-            let value = |k: ElementIndex, i: usize| {
-                let c = rhs.get_conservative(k, i);
-                f(TracerState::new(c.h_t, c.h_s))
-            };
-            let rate = s.integrate(value);
-            let scale = s.integrate(|k, i| value(k, i).abs());
-            assert!(
-                rate.abs() < 1e-12 * scale,
-                "P{order}: {label} content rate {rate:.3e} of {scale:.3e}"
-            );
-        }
     }
 }
 

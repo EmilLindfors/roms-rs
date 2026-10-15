@@ -57,7 +57,7 @@ fn test_perfect_model_validation() {
     let model = TimeSeries::new(&times, &values);
     let obs = TimeSeries::new(&times, &values);
 
-    let result = StationValidationResult::compute(&station, &model, &obs);
+    let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
     assert!(result.metrics.rmse < 1e-10, "RMSE should be ~0");
     assert!(
@@ -81,7 +81,7 @@ fn test_model_with_bias() {
     let model = TimeSeries::new(&times, &model_values);
     let obs = TimeSeries::new(&times, &obs_values);
 
-    let result = StationValidationResult::compute(&station, &model, &obs);
+    let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
     assert!(
         (result.metrics.bias - 0.1).abs() < 1e-10,
@@ -111,7 +111,7 @@ fn test_model_with_amplitude_error() {
     let model = TimeSeries::new(&times, &model_values);
     let obs = TimeSeries::new(&times, &obs_values);
 
-    let result = StationValidationResult::compute(&station, &model, &obs);
+    let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
     assert!(
         result.metrics.correlation > 0.999,
@@ -139,7 +139,7 @@ fn test_model_with_phase_error() {
     let model = TimeSeries::new(&times, &model_values);
     let obs = TimeSeries::new(&times, &obs_values);
 
-    let result = StationValidationResult::compute(&station, &model, &obs);
+    let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
     // Phase error reduces correlation
     assert!(
@@ -154,10 +154,11 @@ fn test_model_with_phase_error() {
 
 #[test]
 fn test_harmonic_comparison() {
-    // Need longer time series for accurate harmonic analysis (at least 2 M2 periods)
+    // 16 days at 10 minutes, on a Unix time axis: M2 and S2 need 14.8 days
+    // to separate (the standard analysis refuses shorter records)
     let dt = 600.0;
-    let n_points = 576; // 4 days
-    let times: Vec<f64> = (0..n_points).map(|i| i as f64 * dt).collect();
+    let n_points = 16 * 144;
+    let times: Vec<f64> = (0..n_points).map(|i| 1.75e9 + i as f64 * dt).collect();
 
     let m2_amp = 0.5;
     let m2_phase = 0.5;
@@ -179,7 +180,8 @@ fn test_harmonic_comparison() {
     let obs = TimeSeries::new(&times, &obs_values);
 
     let analysis = HarmonicAnalysis::standard();
-    let result = StationValidationResult::compute_with_harmonics(&station, &model, &obs, &analysis);
+    let result =
+        StationValidationResult::compute_with_harmonics(&station, &model, &obs, &analysis).unwrap();
 
     assert!(result.model_harmonics.is_some());
     assert!(result.obs_harmonics.is_some());
@@ -264,6 +266,9 @@ fn test_multi_station_validation() {
 
     // Check that results can be retrieved for each station
     for result in &results {
+        let result = result
+            .as_ref()
+            .expect("every station has a model and observations");
         assert!(result.metrics.rmse >= 0.0);
         assert!(result.metrics.correlation.abs() <= 1.0);
     }
@@ -295,9 +300,9 @@ fn test_validation_summary_statistics() {
     let model3 = TimeSeries::new(&times, &poor_values);
     let obs3 = TimeSeries::new(&times, &good_values);
 
-    let result1 = StationValidationResult::compute(&station1, &model1, &obs1);
-    let result2 = StationValidationResult::compute(&station2, &model2, &obs2);
-    let result3 = StationValidationResult::compute(&station3, &model3, &obs3);
+    let result1 = StationValidationResult::compute(&station1, &model1, &obs1).unwrap();
+    let result2 = StationValidationResult::compute(&station2, &model2, &obs2).unwrap();
+    let result3 = StationValidationResult::compute(&station3, &model3, &obs3).unwrap();
 
     let summary = ValidationSummary::from_results(&[result1, result2, result3]);
 
@@ -322,7 +327,7 @@ fn test_datum_offset_correction() {
     let model = TimeSeries::new(&times, &model_values);
     let obs = TimeSeries::new(&times, &obs_values);
 
-    let result = StationValidationResult::compute(&station, &model, &obs);
+    let result = StationValidationResult::compute(&station, &model, &obs).unwrap();
 
     // After applying 0.15 m offset, obs becomes 1.0 m, matching model
     assert!(

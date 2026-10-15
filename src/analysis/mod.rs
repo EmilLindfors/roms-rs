@@ -5,36 +5,33 @@
 //! - Comparing model results against observations
 //! - Validating model output against tide gauge observations
 //!
-//! # Mathematical Background
+//! # Harmonic analysis
 //!
-//! Tidal signal decomposition:
+//! [`HarmonicAnalysis`] fits tidal reference constants (amplitude `H`,
+//! Greenwich phase lag `G`) by least squares on an absolute (Unix) time
+//! axis, the astronomical arguments and nodal corrections in the basis:
+//!
 //! ```text
-//! η(t) = η₀ + Σᵢ [Aᵢ cos(ωᵢt) + Bᵢ sin(ωᵢt)]
+//! η(t) = Z₀ + Σⱼ fⱼ Hⱼ cos(ωⱼ (t − t₀) + V₀ⱼ + uⱼ − Gⱼ)
 //! ```
 //!
-//! Where:
-//! - ωᵢ = 2π/Tᵢ (angular frequency from constituent period)
-//! - Amplitude: Hᵢ = √(Aᵢ² + Bᵢ²)
-//! - Phase: φᵢ = atan2(-Bᵢ, Aᵢ)
-//!
-//! This is a linear least-squares problem.
-//!
-//! # Example - Harmonic Analysis
+//! Pairs the record cannot separate (Rayleigh criterion) are an error;
+//! [`HarmonicAnalysis::resolvable`] picks what a record resolves and infers
+//! the rest ([`Inference`]). Failures are [`AnalysisError`]s.
 //!
 //! ```ignore
-//! use dg_rs::analysis::{HarmonicAnalysis, TimeSeries};
+//! use dg_rs::analysis::{HarmonicAnalysis, Inference};
 //!
-//! // Create time series from observations
-//! let times: Vec<f64> = (0..1000).map(|i| i as f64 * 3600.0).collect();
-//! let values: Vec<f64> = times.iter().map(|&t| /* your data */).collect();
-//! let series = TimeSeries::new(&times, &values);
-//!
-//! // Fit tidal constituents
-//! let analysis = HarmonicAnalysis::standard();
-//! let result = analysis.fit(&series);
-//!
-//! println!("M2 amplitude: {:.3} m", result.constituents[0].amplitude);
-//! println!("M2 phase: {:.1} deg", result.constituents[0].phase.to_degrees());
+//! // Hourly water levels at Unix times
+//! let analysis = HarmonicAnalysis::resolvable(
+//!     &["M2", "S2", "N2", "K1", "O1", "M4"],
+//!     times[times.len() - 1] - times[0],
+//!     1.0,
+//!     &Inference::EQUILIBRIUM,
+//! );
+//! let fit = analysis.fit(&times, &values)?;
+//! let m2 = fit.get("M2").unwrap();
+//! println!("M2: H {:.3} m, G {:.1}°", m2.amplitude, m2.lag_deg);
 //! ```
 //!
 //! # Example - Tide Gauge Validation
@@ -46,16 +43,16 @@
 //! let model = TimeSeries::new(&times, &model_values);
 //! let obs = TimeSeries::new(&times, &obs_values);
 //!
-//! let result = StationValidationResult::compute(&station, &model, &obs);
+//! let result = StationValidationResult::compute(&station, &model, &obs)?;
 //! println!("RMSE: {:.3} m", result.metrics.rmse);
 //! println!("Skill: {:.2}", result.metrics.skill_score);
 //! ```
 
 mod adcp;
 mod ellipse;
+mod error;
 mod harmonic;
 mod metrics;
-mod reference_fit;
 mod stability;
 mod tide_gauge;
 
@@ -63,13 +60,11 @@ pub use adcp::{
     ADCPStation, ADCPValidationResult, ADCPValidationSummary, CurrentPoint, CurrentTimeSeries,
     CurrentValidationMetrics, norwegian_stations as adcp_norwegian_stations,
 };
-pub use ellipse::{EllipseFit, TidalEllipse, fit_tidal_ellipses};
-pub use harmonic::{ConstituentResult, HarmonicAnalysis, HarmonicResult};
+pub use ellipse::{EllipseFit, TidalEllipse};
+pub use error::AnalysisError;
+pub use harmonic::{HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit};
 pub use metrics::{
     ComparisonMetrics, ConstituentComparison, ConstituentComparisonSummary, compare_harmonics,
-};
-pub use reference_fit::{
-    Inference, ReferenceConstant, ReferenceFit, fit_reference_constants, resolvable_constituents,
 };
 pub use stability::{StabilityMonitor, StabilityStatus, StabilityThresholds, StabilityWarning};
 pub use tide_gauge::{
@@ -79,23 +74,12 @@ pub use tide_gauge::{
 
 use std::f64::consts::PI;
 
-/// A single time series data point.
-#[derive(Clone, Copy, Debug)]
-pub struct TimeSeriesPoint {
-    /// Time in seconds
-    pub time: f64,
-    /// Value (elevation in m, velocity in m/s, etc.)
-    pub value: f64,
-}
-
-/// Time series with optional metadata.
-///
-/// Stores a sequence of (time, value) pairs along with optional
-/// location and name information.
-#[derive(Clone, Debug)]
+/// A time series: times (s, often Unix) and values, as two arrays, with an
+/// optional location and name.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct TimeSeries {
-    /// The time series data points
-    pub data: Vec<TimeSeriesPoint>,
+    times: Vec<f64>,
+    values: Vec<f64>,
     /// Optional (x, y) location coordinates
     pub location: Option<(f64, f64)>,
     /// Optional name/identifier
@@ -103,26 +87,29 @@ pub struct TimeSeries {
 }
 
 impl TimeSeries {
-    /// Create a new time series from parallel arrays of times and values.
+    /// A time series from parallel arrays of times and values.
     ///
     /// # Panics
     ///
     /// Panics if `times` and `values` have different lengths.
     pub fn new(times: &[f64], values: &[f64]) -> Self {
+        Self::from_vecs(times.to_vec(), values.to_vec())
+    }
+
+    /// A time series that takes ownership of its arrays.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `times` and `values` have different lengths.
+    pub fn from_vecs(times: Vec<f64>, values: Vec<f64>) -> Self {
         assert_eq!(
             times.len(),
             values.len(),
             "times and values must have same length"
         );
-
-        let data = times
-            .iter()
-            .zip(values.iter())
-            .map(|(&time, &value)| TimeSeriesPoint { time, value })
-            .collect();
-
         Self {
-            data,
+            times,
+            values,
             location: None,
             name: None,
         }
@@ -142,48 +129,58 @@ impl TimeSeries {
 
     /// Number of data points.
     pub fn len(&self) -> usize {
-        self.data.len()
+        self.times.len()
     }
 
     /// Check if the time series is empty.
     pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+        self.times.is_empty()
     }
 
     /// Duration of the time series (last time - first time).
     pub fn duration(&self) -> f64 {
-        if self.data.is_empty() {
-            return 0.0;
+        match (self.times.first(), self.times.last()) {
+            (Some(first), Some(last)) => last - first,
+            _ => 0.0,
         }
-        self.data.last().unwrap().time - self.data.first().unwrap().time
     }
 
-    /// Get times as a vector.
-    pub fn times(&self) -> Vec<f64> {
-        self.data.iter().map(|p| p.time).collect()
+    /// The times.
+    pub fn times(&self) -> &[f64] {
+        &self.times
     }
 
-    /// Get values as a vector.
-    pub fn values(&self) -> Vec<f64> {
-        self.data.iter().map(|p| p.value).collect()
+    /// The values.
+    pub fn values(&self) -> &[f64] {
+        &self.values
+    }
+
+    /// The same times with each value mapped by `f`.
+    pub fn map_values(&self, f: impl Fn(f64) -> f64) -> Self {
+        Self {
+            times: self.times.clone(),
+            values: self.values.iter().map(|&v| f(v)).collect(),
+            location: self.location,
+            name: self.name.clone(),
+        }
     }
 
     /// Compute the mean value.
     pub fn mean(&self) -> f64 {
-        if self.data.is_empty() {
+        if self.values.is_empty() {
             return 0.0;
         }
-        self.data.iter().map(|p| p.value).sum::<f64>() / self.data.len() as f64
+        self.values.iter().sum::<f64>() / self.values.len() as f64
     }
 
     /// Compute the variance.
     pub fn variance(&self) -> f64 {
-        if self.data.len() < 2 {
+        if self.values.len() < 2 {
             return 0.0;
         }
         let mean = self.mean();
-        let sum_sq: f64 = self.data.iter().map(|p| (p.value - mean).powi(2)).sum();
-        sum_sq / (self.data.len() - 1) as f64
+        let sum_sq: f64 = self.values.iter().map(|v| (v - mean).powi(2)).sum();
+        sum_sq / (self.values.len() - 1) as f64
     }
 
     /// Compute the standard deviation.

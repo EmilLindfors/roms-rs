@@ -94,7 +94,7 @@
 //!     [gauges=data/tide_gauges/mausund_obs.txt] [currents=<file,…>] \
 //!     [station_atlas=data/froya_station_tides.txt] \
 //!     [station_minutes=10] [spinup_hours=24] [gauge_gains=K1,O1,S2] \
-//!     [gauge_ratios=N2,Q1,P1,K2] [land_elevation=5] \
+//!     [gauge_ratios=N2,Q1,P1,K2] [land_elevation=5] [manning=0.025] \
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
@@ -341,10 +341,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use dg_rs::analysis::{
-    ADCPStation, ADCPValidationResult, ConstituentComparison, CurrentTimeSeries, EllipseFit,
-    Inference, ReferenceConstant, ReferenceFit, StationValidationResult, TidalEllipse,
-    TideGaugeStation, TimeSeries, fit_reference_constants, fit_tidal_ellipses,
-    resolvable_constituents,
+    ADCPStation, ADCPValidationResult, AnalysisError, ConstituentComparison, CurrentTimeSeries,
+    EllipseFit, HarmonicAnalysis, Inference, ReferenceConstant, ReferenceFit,
+    StationValidationResult, TidalEllipse, TideGaugeStation, TimeSeries,
 };
 #[cfg(feature = "netcdf")]
 use dg_rs::boundary::NestingOptions;
@@ -395,7 +394,7 @@ use dg_rs::waves::{
 const G: f64 = 9.81;
 /// Coriolis parameter at 63.8°N (s⁻¹)
 const F_CORIOLIS: f64 = 1.31e-4;
-/// Manning roughness (s/m^{1/3})
+/// Manning roughness (s/m^{1/3}; `manning=`)
 const MANNING_N: f64 = 0.025;
 /// Default bed elevation given to land nodes of shoreline elements (m above
 /// MSL; `land_elevation=`)
@@ -513,6 +512,8 @@ struct Options {
     /// ratio (`gauge_ratios=N2,Q1,P1,K2`)
     gauge_ratios: Vec<&'static str>,
     land_elevation: f64,
+    /// Manning roughness of the 2D bed friction (`manning=`, s/m^{1/3})
+    manning: f64,
     /// Elevation model with land heights (`dem=`, used if the file exists;
     /// `dem=none` for the GeoTIFF bathymetry and GSHHS coastline)
     dem: Option<String>,
@@ -707,6 +708,7 @@ impl Options {
             output_minutes: get("output_minutes", 60.0)?,
             snapshot_minutes: get("snapshot_minutes", 0.0)?,
             land_elevation: get("land_elevation", LAND_ELEVATION)?,
+            manning: get("manning", MANNING_N)?,
             dem: match args.get("dem").map_or(DEM, String::as_str) {
                 "none" => None,
                 path => Some(path.to_string()),
@@ -947,14 +949,14 @@ struct Stats {
 struct Gauge {
     station: TideGaugeStation,
     observed: TimeSeries,
-    observed_fit: Result<ReferenceFit, String>,
+    observed_fit: Result<ReferenceFit, AnalysisError>,
 }
 
 /// A current record (Unix times, east/north) and its tidal ellipses.
 struct CurrentRecord {
     station: ADCPStation,
     observed: CurrentTimeSeries,
-    observed_fit: Result<EllipseFit, String>,
+    observed_fit: Result<EllipseFit, AnalysisError>,
 }
 
 /// A station, the point that samples the model there, what it is compared
@@ -1004,6 +1006,8 @@ struct Domain {
     bathymetry: Arc<Bathymetry2D>,
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     projection: Option<LocalProjection>,
+    /// Manning roughness of the 2D bed friction (s/m^{1/3})
+    manning: f64,
 }
 
 impl Domain {
@@ -1151,6 +1155,7 @@ impl Domain {
             geom: Arc::new(geom),
             bathymetry: Arc::new(bathymetry),
             projection,
+            manning: opts.manning,
         }
     }
 
@@ -1439,7 +1444,7 @@ impl Domain {
 
     fn builder<BC: SWEBoundaryCondition2D>(&self, bc: BC) -> SWEPhysics2DBuilder<BC> {
         self.builder_without_friction(bc)
-            .with_implicit_friction(ManningFriction2D::new(G, MANNING_N))
+            .with_implicit_friction(ManningFriction2D::new(G, self.manning))
     }
 
     /// The 2D module without its bed friction: the 3D model's, whose bottom
@@ -1544,8 +1549,9 @@ impl Domain {
             let (times, values): (Vec<f64>, Vec<f64>) = gauge
                 .time_series
                 .times()
-                .into_iter()
-                .zip(gauge.time_series.values())
+                .iter()
+                .copied()
+                .zip(gauge.time_series.values().iter().copied())
                 .filter(|(_, v)| v.is_finite())
                 .unzip();
             let observed_fit = fit_record(&times, &values, &GAUGE_CONSTITUENTS, None);
@@ -1838,6 +1844,9 @@ fn tide_setup(
     let stations = domain.stations(&opts.gauges, &opts.currents, station_atlas.as_ref());
     let clock = ModelClock::parse(&opts.start)?;
     println!("  Clock: t = 0 at {} UTC", clock.format(0.0));
+    if opts.levels == 0 {
+        println!("  Bed friction: Manning n = {}", domain.manning);
+    }
     let weather = weather(domain, opts, &clock, t_end)?;
     // A 3D model's columns take the wind, its 2D module the pressure
     // (split before the level's clone shares the fields)
@@ -3405,7 +3414,7 @@ fn tidal_run_3d(
         None => None,
     };
     println!(
-        "  time  |  η range (m)     | max |ū| (m/s) at (x, y km; h m) | max |u| (m/s), level at (x, y km; h m, element) | T range (°C)  | wall"
+        "  time  |  η range (m)     | max |ū| (m/s) at (x, y km; h m) | max |u| (m/s), level at (x, y km; h m, element) | T range (°C), in thin columns | wall"
     );
 
     let mut q = domain.at_rest();
@@ -3550,8 +3559,15 @@ fn tidal_run_3d(
             // The fastest layer of a column at least the thin depth deep
             let (mut fastest, mut level, mut column) = (0.0_f64, 0, 0);
             let (mut t_lo, mut t_hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            // T in the thin (shore) columns too, where a drift is held at
+            // first and shows in the deeper columns only once it spreads
+            let (mut thin_lo, mut thin_hi) = (f64::INFINITY, f64::NEG_INFINITY);
             for (idx, &b) in bed.iter().enumerate() {
                 if s.eta.data[idx] - b < opts.thin_depth() {
+                    for &temp in &s.temp[idx * nl..(idx + 1) * nl] {
+                        thin_lo = thin_lo.min(temp);
+                        thin_hi = thin_hi.max(temp);
+                    }
                     continue;
                 }
                 for l in 0..nl {
@@ -3569,8 +3585,13 @@ fn tidal_run_3d(
                 domain.ops.nodes_r[column % nn],
                 domain.ops.nodes_s[column % nn],
             );
+            let thin = if thin_lo <= thin_hi {
+                format!("{thin_lo:5.2}–{thin_hi:5.2}")
+            } else {
+                "none".to_string()
+            };
             println!(
-                "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {fastest:5.2}, level {level:2} at ({:6.1}, {:6.1}; {:5.1} m, element {}) | {t_lo:5.2}–{t_hi:5.2} | {:.0} s",
+                "{:6.2} h | [{:+.3}, {:+.3}] | {:5.2} at ({:6.1}, {:6.1}; {h:6.1}) | {fastest:5.2}, level {level:2} at ({:6.1}, {:6.1}; {:5.1} m, element {}) | {t_lo:5.2}–{t_hi:5.2}, {thin} | {:.0} s",
                 t / 3600.0,
                 stats.eta.0,
                 stats.eta.1,
@@ -4254,6 +4275,7 @@ fn cost_3d(domain: &Domain, opts: &Options) {
                 geom: Arc::new(geom),
                 bathymetry: Arc::new(bathymetry),
                 projection: domain.projection,
+                manning: domain.manning,
             };
             &patch
         }
@@ -4857,21 +4879,18 @@ fn fit_record(
     values: &[f64],
     candidates: &[&'static str],
     reference: Option<&ReferenceFit>,
-) -> Result<ReferenceFit, String> {
-    let (Some(&t0), Some(&t1)) = (times.first(), times.last()) else {
-        return Err("empty record".into());
-    };
-    let names = resolvable_constituents(candidates, t1 - t0, 1.0);
-    let inferred: Vec<Inference> = Inference::EQUILIBRIUM
-        .into_iter()
-        .filter(|i| !names.contains(&i.name) && names.contains(&i.from))
-        .map(|i| {
-            reference
-                .and_then(|r| Inference::from_reference(i.name, i.from, r))
-                .unwrap_or(i)
-        })
-        .collect();
-    fit_reference_constants(times, values, &names, &inferred)
+) -> Result<ReferenceFit, AnalysisError> {
+    let inferences = Inference::EQUILIBRIUM.map(|i| i.or_from(reference));
+    HarmonicAnalysis::resolvable(candidates, record_length(times), 1.0, &inferences)
+        .fit(times, values)
+}
+
+/// Last minus first time (s); 0 for an empty record.
+fn record_length(times: &[f64]) -> f64 {
+    times
+        .first()
+        .zip(times.last())
+        .map_or(0.0, |(t0, t1)| t1 - t0)
 }
 
 /// Tidal ellipses of the constituents a current record resolves; the others
@@ -4884,27 +4903,10 @@ fn fit_current_record(
     v: &[f64],
     candidates: &[&'static str],
     reference: Option<&EllipseFit>,
-) -> Result<EllipseFit, String> {
-    let (Some(&t0), Some(&t1)) = (times.first(), times.last()) else {
-        return Err("empty record".into());
-    };
-    let names = resolvable_constituents(candidates, t1 - t0, 1.0);
-    let inferred: Vec<Inference> = Inference::EQUILIBRIUM
-        .into_iter()
-        .filter(|i| !names.contains(&i.name) && names.contains(&i.from))
-        .map(|i| {
-            let from_reference = reference.and_then(|r| {
-                let (a, b) = (r.get(i.name)?, r.get(i.from)?);
-                (b.major > 0.0).then(|| Inference {
-                    amplitude_ratio: a.major / b.major,
-                    lag_offset_deg: a.lag_deg - b.lag_deg,
-                    ..i
-                })
-            });
-            from_reference.unwrap_or(i)
-        })
-        .collect();
-    fit_tidal_ellipses(times, u, v, &names, &inferred)
+) -> Result<EllipseFit, AnalysisError> {
+    let inferences = Inference::EQUILIBRIUM.map(|i| i.or_from_ellipses(reference));
+    HarmonicAnalysis::resolvable(candidates, record_length(times), 1.0, &inferences)
+        .fit_ellipses(times, u, v)
 }
 
 /// The model's reference constants at a station after spin-up (from
@@ -4916,7 +4918,7 @@ fn report_station(
     gauge_record: &Gauge,
     analysis_start: f64,
     norkyst: Option<&AtlasPoint>,
-) -> Result<(), String> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let first = s.times.partition_point(|&t| t < analysis_start);
     let (times, eta) = (&s.times[first..], &s.eta[first..]);
     let gauge_times = gauge_record.observed.times();
@@ -4931,7 +4933,7 @@ fn report_station(
         "  Surface: model {:.1} days after spin-up (R² {:.4}), gauge {:.1} days (R² {:.4})",
         days(times),
         model.r_squared,
-        days(&gauge_times),
+        days(gauge_times),
         gauge.r_squared
     );
     println!(
@@ -4993,7 +4995,15 @@ fn report_station(
         ("observations", &gauge_record.observed),
         ("gauge tidal prediction", &prediction),
     ] {
-        let v = StationValidationResult::compute(&gauge_record.station, &model_series, reference);
+        let v =
+            match StationValidationResult::compute(&gauge_record.station, &model_series, reference)
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("  vs {what}: not compared ({e})");
+                    continue;
+                }
+            };
         let centred = (v.metrics.rmse.powi(2) - v.metrics.bias.powi(2))
             .max(0.0)
             .sqrt();
@@ -5019,7 +5029,7 @@ fn report_currents(
     s: &Station,
     analysis_start: f64,
     norkyst: Option<&AtlasPoint>,
-) -> Result<(), String> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let first = s.times.partition_point(|&t| t < analysis_start);
     let (times, u, v) = (&s.times[first..], &s.u_east[first..], &s.v_north[first..]);
     let observed = s

@@ -11,13 +11,30 @@
 //!
 //! # Norwegian Coast Context
 //!
-//! At 60°N latitude (Norwegian coast):
-//! - f ≈ 1.2×10⁻⁴ s⁻¹
+//! At latitude φ, f = 2Ω sin φ and β = 2Ω cos φ / R (Earth's rotation rate Ω,
+//! mean radius R). At 60°N (Norwegian coast):
+//! - f ≈ 1.26×10⁻⁴ s⁻¹
 //! - Coriolis effects are significant for mesoscale circulation
-//! - β ≈ 1.6×10⁻¹¹ m⁻¹ s⁻¹
+//! - β ≈ 1.14×10⁻¹¹ m⁻¹ s⁻¹
 
 use crate::solver::SWEState2D;
 use crate::source::{ElementSources, SourceContext2D, SourceTerm2D};
+
+/// Earth's rotation rate, one turn per sidereal day (rad/s)
+pub const EARTH_ROTATION_RATE: f64 = 7.292_115e-5;
+/// Earth's mean radius (m)
+pub const EARTH_MEAN_RADIUS: f64 = 6_371_000.0;
+
+/// Coriolis parameter f = 2Ω sin φ at a latitude in degrees (s⁻¹).
+pub fn coriolis_parameter(latitude_deg: f64) -> f64 {
+    2.0 * EARTH_ROTATION_RATE * latitude_deg.to_radians().sin()
+}
+
+/// Its northward gradient β = 2Ω cos φ / R at a latitude in degrees
+/// (m⁻¹ s⁻¹).
+pub fn coriolis_beta(latitude_deg: f64) -> f64 {
+    2.0 * EARTH_ROTATION_RATE * latitude_deg.to_radians().cos() / EARTH_MEAN_RADIUS
+}
 
 /// Coriolis source term implementing SourceTerm2D trait.
 ///
@@ -91,11 +108,20 @@ impl CoriolisSource2D {
         Self::f_plane(1.2e-4)
     }
 
-    /// Norwegian coast with beta-plane.
-    ///
-    /// Uses f₀ ≈ 1.2×10⁻⁴ s⁻¹ and β ≈ 1.6×10⁻¹¹ m⁻¹ s⁻¹.
+    /// β-plane tangent at a latitude (degrees) at `y = y0`: f₀ = 2Ω sin φ,
+    /// β = 2Ω cos φ / R.
+    pub fn beta_plane_at_latitude(latitude_deg: f64, y0: f64) -> Self {
+        Self::beta_plane(
+            coriolis_parameter(latitude_deg),
+            coriolis_beta(latitude_deg),
+            y0,
+        )
+    }
+
+    /// Norwegian coast with beta-plane: tangent at 60°N at `y = 0`
+    /// (f₀ ≈ 1.26×10⁻⁴ s⁻¹, β ≈ 1.14×10⁻¹¹ m⁻¹ s⁻¹).
     pub fn norwegian_coast_beta() -> Self {
-        Self::beta_plane(1.2e-4, 1.6e-11, 0.0)
+        Self::beta_plane_at_latitude(60.0, 0.0)
     }
 
     /// Compute Coriolis parameter at given y-coordinate.
@@ -163,6 +189,25 @@ mod tests {
     use super::*;
 
     const TOL: f64 = 1e-14;
+
+    /// f and β from the latitude; `norwegian_coast_beta` had β = 1.6e-11,
+    /// the 45°N value, for 60°N.
+    #[test]
+    fn the_coriolis_parameter_and_beta_follow_the_latitude() {
+        assert!((coriolis_parameter(60.0) - 1.2630e-4).abs() < 1e-8);
+        assert!((coriolis_beta(60.0) - 1.1445e-11).abs() < 1e-14);
+        assert!((coriolis_beta(45.0) - 1.6187e-11).abs() < 1e-14);
+        assert!(coriolis_parameter(0.0).abs() < TOL);
+        assert!(coriolis_parameter(-30.0) < 0.0);
+
+        let c = CoriolisSource2D::norwegian_coast_beta();
+        assert_eq!(c.f0, coriolis_parameter(60.0));
+        assert_eq!(c.beta, coriolis_beta(60.0));
+        // One degree of latitude north (111 km) changes f by ≈ β · 111 km
+        let dy = EARTH_MEAN_RADIUS * 1f64.to_radians();
+        let exact = coriolis_parameter(61.0) - coriolis_parameter(60.0);
+        assert!((c.f_at(dy) - c.f0 - exact).abs() < 0.02 * exact);
+    }
 
     fn make_context(h: f64, hu: f64, hv: f64, y: f64) -> SourceContext2D {
         SourceContext2D::new(

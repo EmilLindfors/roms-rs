@@ -95,6 +95,14 @@ pub trait Integrable: Clone + Send + Sized {
             self.axpy(c, x);
         }
     }
+
+    /// Whether every value is finite. [`crate::simulation::Simulation`]
+    /// stops at the first step that leaves a NaN or an infinity, which the
+    /// steps after it would otherwise carry on to the end (the step bounds
+    /// skip NaN). The default, for types without an override, is `true`.
+    fn is_finite(&self) -> bool {
+        true
+    }
 }
 
 /// Reusable stage storage for [`TimeIntegrator::step_with_workspace`].
@@ -765,9 +773,15 @@ pub fn create_integrator_info(integrator: StandardIntegrator) -> BoxedIntegrator
 // =============================================================================
 
 use crate::solver::core::blocks::{combine_values, update_values, update_with};
-use crate::solver::{
-    DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, TracerSolution2D, state::Solution3D,
-};
+
+/// Whether every value is finite, checked in branch-free chunks that
+/// vectorise (an early-exit loop does not): a pass per step must stay cheap.
+fn all_finite(values: &[f64]) -> bool {
+    values
+        .chunks(64)
+        .all(|chunk| chunk.iter().fold(true, |ok, x| ok & x.is_finite()))
+}
+use crate::solver::{DGSolution1D, DGSolution2D, SWESolution, SWESolution2D, state::Solution3D};
 
 impl Integrable for DGSolution1D {
     fn scale(&mut self, c: f64) {
@@ -776,6 +790,10 @@ impl Integrable for DGSolution1D {
 
     fn axpy(&mut self, c: f64, other: &Self) {
         self.axpy(c, other);
+    }
+
+    fn is_finite(&self) -> bool {
+        all_finite(&self.data)
     }
 }
 
@@ -787,6 +805,10 @@ impl Integrable for DGSolution2D {
     fn axpy(&mut self, c: f64, other: &Self) {
         self.axpy(c, other);
     }
+
+    fn is_finite(&self) -> bool {
+        all_finite(&self.data)
+    }
 }
 
 impl Integrable for SWESolution {
@@ -796,6 +818,10 @@ impl Integrable for SWESolution {
 
     fn axpy(&mut self, c: f64, other: &Self) {
         self.axpy(c, other);
+    }
+
+    fn is_finite(&self) -> bool {
+        all_finite(&self.data)
     }
 }
 
@@ -807,15 +833,9 @@ impl Integrable for SWESolution2D {
     fn axpy(&mut self, c: f64, other: &Self) {
         self.axpy(c, other);
     }
-}
 
-impl Integrable for TracerSolution2D {
-    fn scale(&mut self, c: f64) {
-        self.scale(c);
-    }
-
-    fn axpy(&mut self, c: f64, other: &Self) {
-        self.axpy(c, other);
+    fn is_finite(&self) -> bool {
+        self.data.iter().all(|values| all_finite(values))
     }
 }
 

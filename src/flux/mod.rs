@@ -24,7 +24,6 @@ mod hll;
 mod roe;
 mod swe_2d;
 mod swe_2d_entropy;
-mod tracer_2d;
 pub mod traits;
 mod upwind;
 
@@ -37,10 +36,6 @@ pub use swe_2d::{
 pub use swe_2d_entropy::{
     SWENodeState2D, entropy_stable_dissipation_2d, swe_entropy_2d, swe_entropy_variables_2d,
     wintermeyer_bed_interface_term_2d, wintermeyer_flux_2d,
-};
-pub use tracer_2d::{
-    TracerFluxType, lax_friedrichs_tracer_flux, roe_tracer_flux, tracer_numerical_flux,
-    upwind_tracer_flux,
 };
 pub use upwind::{lax_friedrichs_flux, upwind_flux};
 

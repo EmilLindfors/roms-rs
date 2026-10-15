@@ -86,20 +86,15 @@ pub use boundary::{NestingOptions, NestingRelaxation2D, OceanModelState};
 pub use equations::Advection2D;
 pub use mesh::{BoundaryConfig, BoundaryTag, Mesh2D, Mesh2DBuilder};
 pub use operators::{DGOperators2D, GeometricFactors2D, MeshTransfer2D};
-#[cfg(feature = "parallel")]
-pub use solver::compute_rhs_tracer_2d_parallel;
 pub use solver::{
     AdvectionBoundaryCondition2D,
     AdvectionFluxType,
-    ConservativeTracerState,
     ConstantBC2D,
     DGSolution2D,
     // Diagnostics
     DiagnosticsTracker,
     DirichletBC2D,
-    ExtrapolationTracerBC,
     ExtrapolationTracerBC3D,
-    FixedTracerBC,
     FixedTracerBC3D,
     PeriodicBC2D,
     ProgressReporter,
@@ -110,15 +105,8 @@ pub use solver::{
     SWESolution2D,
     SWEState2D,
     SystemSolution2D,
-    Tracer2DRhsConfig,
-    TracerBCContext2D,
     TracerBCContext3D,
-    TracerBoundaryCondition2D,
     TracerBoundaryCondition3D,
-    TracerSolution2D,
-    TracerSourceTerm2D,
-    TracerState,
-    UpwindTracerBC,
     UpwindTracerBC3D,
     // Wetting/drying
     WetDryConfig,
@@ -129,14 +117,12 @@ pub use solver::{
     compute_dt_advection_2d,
     compute_dt_swe_2d,
     // Tracer transport
-    compute_dt_tracer_2d,
     compute_dt_viscosity,
     // 3D RHS
     compute_momentum_rhs_3d,
     compute_rhs_advection_2d,
     compute_rhs_swe_2d,
     compute_rhs_swe_2d_into,
-    compute_rhs_tracer_2d,
     compute_transport_rhs_3d,
     current_cfl_2d,
     positivity_cfl_swe_2d,
@@ -168,31 +154,25 @@ pub use source::{
 #[cfg(feature = "burn")]
 pub use time::{BurnTimeConfig, compute_dt_burn, run_swe_2d_burn, ssp_rk3_step_burn};
 pub use time::{
-    CoupledRhs2D,
-    CoupledState2D,
-    CoupledTimeConfig,
     // Coupled SWE + tracer integration
-    compute_coupled_rhs,
-    compute_dt_coupled,
     run_advection_2d,
-    run_coupled_simulation,
-    ssp_rk3_coupled_step,
-    ssp_rk3_coupled_step_timed,
     ssp_rk3_step_2d,
     ssp_rk3_step_2d_timed,
 };
 
 // Analysis types
 pub use analysis::{
+    AnalysisError,
     ComparisonMetrics,
     ConstituentComparison,
     ConstituentComparisonSummary,
-    ConstituentResult,
     HarmonicAnalysis,
-    HarmonicResult,
+    Inference,
     // Tide gauge validation
     ModelExtractor,
     PrecomputedExtractor,
+    ReferenceConstant,
+    ReferenceFit,
     // Stability monitoring
     StabilityMonitor,
     StabilityStatus,
@@ -201,7 +181,6 @@ pub use analysis::{
     StationValidationResult,
     TideGaugeStation,
     TimeSeries,
-    TimeSeriesPoint,
     ValidationSummary,
     compare_harmonics,
     norwegian_stations,
@@ -250,7 +229,6 @@ pub use io::{
     read_tide_gauge_file,
     read_timeseries_file,
     write_tide_gauge_file,
-    write_vtk_coupled,
     write_vtk_series,
     write_vtk_swe,
 };

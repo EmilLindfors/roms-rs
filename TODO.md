@@ -13,7 +13,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
 - [ ] **P3.1** Remove M2's +3 % at Mausund (2.6 cm |ΔZ|, the largest error, NorKyst's own) with `froya_real_data gauge_gains=M2,…` so N2 follows; run it with the overtide work, since M4 scales with M2².
-- [ ] **P3.1** Find why the overtides are too weak (M4 0.35×, MS4 0.34×, M6 0.28×): suspects are friction (Manning 0.025 everywhere) and the 5.3 m station node.
+- [ ] **P3.1** Find why the overtides are too weak (M4 0.35×, MS4 0.34×, M6 0.28×): not the station node (2026-10-15); suspects are friction (`manning=` sweep) and the island lee closing the skerry sounds.
 - [ ] **P3.1 / P3.3** The month-long real-domain run (`froya_real_data … hours=720`, or 30+ days on the coastline mesh): resolves N2/Q1, checks long-run stability, mass and no residual currents at rest.
 - [ ] **P3.1** Settle whether the model's island lee near the skerries (M2 current 0.01–0.07 m/s against NorKyst's 0.246) is right, from observed currents (farm-site surveys, IMR/NIVA moorings near Frøya).
 - [ ] **P3.1** Re-run P3 at 1 km against P2 at 500 m with the relaxed positivity CFL (dt ratio now ≈ 1.3–1.4) and stations interpolated at the gauge.
@@ -22,7 +22,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P3.1** Report NorKyst-800's missing N2 to MET (0.027 m against 0.156 m observed at Mausund); re-run the Bergen NorKyst fit with the P0.15 period fix and check it for the same deficit.
 - [ ] **P3.1** Run the model against NorKyst-800 barotropic tides for a test period.
 - [ ] **P3.1** Document skill scores (RMSE, bias, correlation) per station.
-- [ ] **P3.1** Give `HarmonicAnalysis::fit` the guards of `fit_reference_constants` (Rayleigh check, inference, `resolvable_constituents`) or port its callers; an `AnalysisError` in place of asserts and `String` errors.
+- [ ] **P3.1** `HarmonicAnalysis::fit` solves the normal equations (AᵀA, condition number squared) with a dense n × m design matrix: a QR (or the 2m × 2m Gram matrix accumulated row by row, no A) for year-long 10-min records and pairs near the Rayleigh limit.
 - [ ] **P3.2** The Pareto benchmark on the same hardware: M2/S2/K1/O1 gauge error against core-hours, ROMS 2D at 800/400/200 m against DG P1–P4.
 - [ ] **P3.1** Low priority (≤ 4 mm left): whether the interior amplifies the diurnals (shelf waves).
 - [ ] **P3.1** On hold: η-based limiting; revisit only if a real run shows oscillations.
@@ -156,8 +156,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 - [ ] **P1.2** Limit η (and velocities or characteristic variables), not h, with a troubled-cell indicator (TVB-M/KXRCF); limit h only in partially dry cells (Vater et al. 2019). Strict Kuzmin on h collapses sloping elements to P0 every half-cycle.
 - [ ] **P1.7** Nonlinear SWE convergence with bathymetry on curved meshes, asserting N+1 in `tests/convergence_test.rs` (thresholds 1.5/2.5 today).
-- [ ] **P1.1** Port the 2D tracer's BR1 diffusion (`tracer_2d.rs`) onto `br1_gradient_element`/`br1_diffusion_element` (it allocates whole-mesh arrays every RHS and runs serially). Its walls take the interior flux, non-dissipative with a zero-gradient ghost: no flux through walls, plus the eigenvalue test (P1.3).
-- [ ] **P1.1** Remaining stage allocations: a buffer-reusing `clone_from` for `DGSolution1D`/`DGSolution2D`/`TracerSolution2D`/`Solution3D`; limiter `Vec`s (P2.3); `Simulation3D` off the stage workspace (P4.1).
+- [ ] **P1.1** Remaining stage allocations: a buffer-reusing `clone_from` for `DGSolution1D`/`DGSolution2D`/`Solution3D`; limiter `Vec`s (P2.3); `Simulation3D` off the stage workspace (P4.1).
 - [ ] **P1.2** End subcells on physical boundaries stay first order: the outer slope neighbour from the BC, or one-sided slopes where both nodes are wet.
 - [ ] **P1.2** Dry fronts lag (Ritter 1 mm front at 71.5 m against 79.8 m): suspects strict Kuzmin at the front and zeroed momentum below h_dry; revisit with η-based limiting.
 - [ ] **P1.2** Retire the `Standard` wet/dry path and the cell-average/`linearize` workarounds once the legacy `ssp_rk3_swe_2d` users are on `Simulation` (P6).
@@ -174,10 +173,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Geometry and meshes (P1.3) — [notes/geometry-mesh.md](notes/geometry-mesh.md)
 
-- [ ] **P1.3** `froya_real_data tide3d=1`'s progress line reports T only in columns ≥ the thin depth, where the thin-column drift never showed until it spread: add the thin and shore columns' range.
 - [ ] **P1.3** The coastline day's depth-mean M2 current at Mausund's NorKyst point is 0.076 m/s in 3D against 0.10–0.15 in 2D (NorKyst 0.25; the point is 23 m deep in our bed, 49 m in NorKyst's): the 3D bottom drag against 2D Manning? Rerun the 2D day for 24 h on today's bed first (`notes/geometry-mesh.md` "The coastline day in 3D").
 - [ ] **P1.3** Shore films still set the 3D step: element 7507 at (4.2, −13.5) km, 1.0 m deep, ran its surface layer at 3.1 m/s at 13.5 h of the coastline day and the step fell to 0.24 s (209 steps for the half hour against ≈ 110).
-- [ ] **P1.3** Mass-weight the 2D tracer limiter's element means (`solver/limiters/tracer_2d.rs:238`, `:708`, `ops.weights[i] * h` without J): use `geom.node_mass`.
 - [ ] **P1.3** A jittered-mesh case for `EntropyStable`/`WetDry` in `convergence_test.rs` (the averaged metric loses an order pointwise on such meshes).
 - [ ] **P1.3** Rerun the unsmoothed full-mesh 3-day baseline on current code (without `slopes3d`, ≈ 1–2.5 h) for a like-for-like comparison with the 19 m free depth.
 - [ ] **P1.3** Decide the 2D `rx0` default, after the map-wide NorKyst current comparison (`output_minutes=60`, `scripts/norkyst_current_comparison.py`).
@@ -191,7 +188,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Lighten the 3D slope bound now that the vertical reference exists (does r_x0 0.25–0.3 hold Frøya at rest? At 0.2, element 11163 grows, e-folding ≈ 55 min).
 - [ ] **P1.3** Connect the larger tidal ponds `fill_tidal_ponds` leaves (basins of more than one element's nodes behind an inlet the mesh does not resolve, 25 on the Frøya coastline bed, e.g. a 35 m lagoon of 52 nodes at (−0.27, −9.28) km): lower the sill along the lowest path to the open water (`notes/geometry-mesh.md` "Tidal ponds").
 - [ ] **P1.3** Why only a handful of the coastline mesh's ≈ 1400 cliff elements (a resolved column under 1.5 m beside one over 19 m) ran fast before `cliffs3d` (5179, 4897, 3434): snapshots every few minutes around 1.5 h of the old bed (`cliffs3d=off`). Then whether D = 40 m can rise, giving back shore (`notes/geometry-mesh.md`).
-- [ ] **P1.3** `froya_real_data`'s gauge comparison panics on runs with fewer than two observations after the spin-up (`tide_gauge.rs:267`, a 4 h run with `spinup_hours=3`): skip it with a message instead.
 - [ ] **P1.3** Mausund's pinnacle element 291 (a 1.2 m node among 42–55 m, unsmoothed) cools its bed layer from 8.6 to 6.0 °C within 30 min at 2 h of the 3D tide, below NorKyst's 7.50 minimum: the straddle below, seen in T.
 - [ ] **P1.3** The straddle instability over unsmoothed cliffs (smoothing works around it): a per-element Haney rx1 bound, a capped or implicit pair density, or geopotential diffusion; run the spectrum harness (≥ 1800 s, check the residuals) on the slices. The coastline day's cliff shores (element 5179: 0.74 m among 61–82 m, 24–30 m/s at the surface) are land now (`cliffs3d`, `notes/geometry-mesh.md` "Cliff shores raised to land").
 - [ ] **P1.3** The coastline day cools a 41–56 m basin's bed layer below NorKyst's minimum through the ebb: element 5143 at (−1.6, −8.1) km (r_x0 0.15, at the 3D bound; shore elements 4122/4123/6171 rise to land beside it) goes from 8.4 to 7.0 °C between 5 and 6 h, with 0.2–0.33 m/s in the bed layer under a depth mean of 0.01–0.04 m/s (`output/froya_day/3d_ponds`, and 7.05 °C at 6.5 h on the bed before `ponds3d`). The straddle or terrace mode below, at the bound?
@@ -229,12 +225,12 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.6** Put the coastline mesh's walls in the water in `scripts/gmsh_coastline_mesh.py` (dilate the opened land back, or the projected bed's 0 contour), never closing a sound.
 - [ ] **P1.6** A farm-scale bed: tile the 1 m topobathy level over the 50 m model using the "Dybdedata - dekning" coverage layer; Kattholmen needs another source (dybdedata WFS or a survey).
 - [ ] **P1.6** Pass the last step's `RiverInflow` to `Hydrostatic3D::update_vertical_velocity` (output Ω spreads river volume over the column).
-- [ ] **P1.6** Fix `norwegian_coast_beta()` (1.6e-11 is 45°N; 60°N ≈ 1.14e-11); f(latitude)/β helpers, UTM33/Lambert for coast-scale domains.
+- [ ] **P1.6** UTM33/Lambert projections for coast-scale domains (the local projection's error grows with the domain).
 - [ ] **P1.6** A spatial index for point-in-polygon and GSHHS inner rings in `coastline.rs:81-95` (the land mask costs ≈ 20 s of setup at Frøya).
 - [ ] **P1.6** Fix or delete the unused `LandMask2D::from_coastline_and_bathymetry`.
 - [ ] **P1.6** Count wet as h > 1 cm in the example's η statistics, so mm films don't set "η max".
 - [ ] **P1.6** Cut the atmosphere forcing's memory (≈ 210 MB at 10⁶ nodes): share stencils per element, or drop them after regridding.
-- [ ] **P1.6** River details: a fixed-depth profile (top d metres) for deep fjords; river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show; the river T/S source in the legacy `CoupledState2D` path, or drop it with P6.
+- [ ] **P1.6** River details: a fixed-depth profile (top d metres) for deep fjords; river momentum `Q/(width·depth)` for jets at narrow mouths; spreading over elements within a radius if one-element plumes show.
 - [ ] **P1.6** If the wind-driven residual matters at farms: stress from the wind relative to the current, with a stability-dependent COARE drag.
 - [ ] **P1.6** Low priority (< 5 mm): the tidal-potential sign against its docs (`source/swe_2d/tidal.rs:299-305`) and the diurnal Love factor.
 - [ ] **P1.6** Not worth it now: a constrained bed projection at walls (median −0.2 m, 1st percentile −12 m).
@@ -242,7 +238,6 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Performance (P2) — [notes/performance.md](notes/performance.md)
 
 - [ ] **P2.5** A semi-implicit free surface (θ-method, as TRIM/UnTRIM, SLIM, Thetis), the main cost lever: farm meshes step at ≈ 0.024 s on gravity waves. Needs a global SPD solve and wet/dry care.
-- [ ] **P2.1** The 2D `Simulation` has no check for a blown-up state (as `Simulation3D` gained 2026-10-10): stop at the first non-finite `h`, `hu`, `hv`.
 - [ ] **P2.1** Port `compute_dt_advection_2d`, `compute_dt_tracer_2d`, `compute_dt_viscosity`, `Mesh::compute_dt`, `time/ssp_rk3.rs:110` and 1D `compute_dt_swe` to `compute_dt_swe_2d`'s per-node metric form in one helper (`2/(λ_r+λ_s)` for advection).
 - [ ] **P2.5** LTS oversubscription: under ≈ 40 % external load the farm took 358 s at 24 threads against 3.9 s at 4. Serial cut-off by work, a capped pool for small meshes, or documented thread counts.
 - [ ] **P2.5** Viscous cost (≈ 2× inviscid): a per-stage BR1 gradient cache for subset-RHS neighbours; store `νh` with the gradients in pass 1.
@@ -345,7 +340,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Operational (P5) — [notes/operational.md](notes/operational.md)
 
-- [ ] **P5.1** River forcing: NVE database (1,760 NorKyst rivers) and a ROMS river-file reader (`river_transport`, `river_temp`, `river_salt`) onto `source::RiverSources`; delete the superseded `Discharge2D`/`ConstantDischarge2D`/`RiverTracerSource` with P6.
+- [ ] **P5.1** River forcing: NVE database (1,760 NorKyst rivers) and a ROMS river-file reader (`river_transport`, `river_temp`, `river_salt`) onto `source::RiverSources`; delete the superseded `Discharge2D`/`ConstantDischarge2D` with P6.
 - [ ] **P5.3** Refuse a restart resumed with different physics options (compare them, or a configuration hash).
 - [ ] **P5.3** Numbered restart copies (`restart_keep=`) or per-time names, for spin-up branching.
 - [ ] **P5.2** A ROMS variable-name mapping for `NetCDFWriter` (CF-1.8 today).
@@ -356,7 +351,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Tech debt (P6) — [notes/tech-debt.md](notes/tech-debt.md)
 
 - [ ] **P6** Move `profile_cpu`, `quick_profile` and `high_res_benchmark` off `ssp_rk3_swe_2d`/`SWE2DTimeConfig` onto `Simulation` + `SWEPhysics2D` (precondition for the next item).
-- [ ] **P6** Delete the legacy integrators (`ssp_rk3*.rs`, three `coupled_swe_tracer` variants, `burn_ssp_rk3.rs`; ~2.4k lines); `CoupledState2D` implements `Integrable`; one time loop with `Simulation3D::run_with_callback` folded in, landing callbacks exactly (they drift today: 300 s asked, 316 s apart).
+- [ ] **P6** Delete the legacy integrators (`ssp_rk3*.rs`, `burn_ssp_rk3.rs`; the `coupled_swe_tracer` ones went with the 2D tracers, 2026-10-15); one time loop with `Simulation3D::run_with_callback` folded in, landing callbacks exactly (they drift today: 300 s asked, 316 s apart).
 - [ ] **P6** Build the `netcdf` feature in CI with `--features netcdf/static` (~5.5 min cold); consider it the documented alternative to conda.
 - [ ] **P6** Collapse duplicate config types: `SWEFluxType2D`/`StandardFlux2D`, the three limiter enums, `HorizontalViscosity2D`/`3D` (differ only by `h_min`).
 - [ ] **P6** Error handling: `SimulationResult` → `Result<SimulationStats, SimulationError>`; reachable panics (`timeseries_reader.rs:198`, `geotiff.rs:239-245`); library `eprintln!` in `tide_gauge.rs`.
