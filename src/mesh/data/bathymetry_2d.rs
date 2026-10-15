@@ -257,6 +257,23 @@ pub struct CliffShores {
     pub area: f64,
 }
 
+/// What [`Bathymetry2D::fill_tidal_ponds`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TidalPonds {
+    /// Ponds filled (connected sets of pond nodes)
+    pub ponds: usize,
+    /// Global nodes (sets of coincident nodes) raised to their sill
+    pub nodes: usize,
+    /// Largest rise of the bed (m)
+    pub max_raise: f64,
+    /// Area of the raised nodes, `Σ w J` (m²)
+    pub area: f64,
+    /// Volume the beds rose by, `Σ w J ΔB` (m³)
+    pub volume: f64,
+    /// Ponds of more than `max_nodes` nodes, left alone
+    pub left: usize,
+}
+
 /// What [`Bathymetry2D::lower_wall_land`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct WallLandLowering {
@@ -1199,6 +1216,163 @@ impl Bathymetry2D {
             for (b, &g) in self.data.iter_mut().zip(&graph.global) {
                 if raise[g] {
                     *b = land;
+                }
+            }
+            self.compute_gradients(ops, geom);
+        }
+        report
+    }
+
+    /// Fill the tidal ponds of at most `max_nodes` nodes to their sills:
+    /// every node that the open water does not reach along the elements'
+    /// grid lines (through wet nodes, coincident nodes together) at some
+    /// water level between `low_water` and `high_water` takes the bed of the
+    /// lowest sill between it and the open water, and the gradients are
+    /// recomputed. The open water is the nodes on the mesh's boundary faces
+    /// that are not walls (on a mesh with none, its deepest node).
+    ///
+    /// The sills come from a priority flood (Barnes, Lehman & Mulla 2014):
+    /// a node's spill level is the lowest water level at which a path of
+    /// wet nodes joins it to the open water, the smallest over the paths of
+    /// the highest bed along each. A node is cut off at the levels between
+    /// its bed and its spill level, so it is a pond within the tide where
+    /// its bed is below its spill level, its spill level is at or above
+    /// `low_water` (below, it is open water at every level) and its bed is
+    /// below `high_water` (above, the water never reaches it).
+    ///
+    /// Many such nodes are single P2 nodes of 20–65 m, sampled from a
+    /// channel of the elevation model that the mesh does not resolve. Below
+    /// its sill a pond moves no water, but the wet/dry kernel let one hold a
+    /// current: on the Frøya coastline bed (3D smoothing, 1 m thin depth),
+    /// 58 ponds at −0.6 m, a 25 m single-node pond held a 3.7 m/s jet
+    /// through a 5 h ebb in 3D, and a 2.2 m pond held 1.2 m/s and set the 3D
+    /// step after the wall at dry banks stopped the first
+    /// (`notes/2d-numerics.md`). Filled, a pond is a flat at its sill: dry
+    /// below it, and joined to the open water above it. Ponds cut off only
+    /// above the lowest water count too: filled below −1.43 m alone, 1 m
+    /// nodes beside the filled ones were cut off at −0.6 m and held
+    /// 0.7–1.4 m/s.
+    ///
+    /// A larger pond is a basin the mesh resolves behind an inlet it does
+    /// not (a 35 m lagoon of 52 nodes at Frøya), still in the runs: it is
+    /// left alone (`TidalPonds::left`); one element's nodes
+    /// (`ops.n_nodes`) is a natural `max_nodes`.
+    ///
+    /// Take `low_water` as the lowest water level the runs see, not lower: a
+    /// node whose sill lies below the lowest water is open water all the
+    /// time, and filling it would turn a resolved channel into a flat.
+    pub fn fill_tidal_ponds(
+        &mut self,
+        mesh: &Mesh2D,
+        ops: &DGOperators2D,
+        geom: &GeometricFactors2D,
+        low_water: f64,
+        high_water: f64,
+        max_nodes: usize,
+    ) -> TidalPonds {
+        let graph = NodeGraph::new(mesh, ops, geom);
+        let n_global = graph.area.len();
+        let bed: Vec<f64> = graph.depths(&self.data, geom).iter().map(|d| -d).collect();
+        let mut neighbours = vec![Vec::new(); n_global];
+        for &[p, q] in &graph.pairs {
+            neighbours[p].push(q);
+            neighbours[q].push(p);
+        }
+        // The open water: the nodes of the open boundary faces
+        let mut open = Vec::new();
+        for k in 0..mesh.n_elements {
+            for face in 0..ops.face_nodes.len() {
+                let tag = mesh.boundary_tag(ElementIndex::new(k), face);
+                if tag.is_some_and(|tag| tag != BoundaryTag::Wall) {
+                    open.extend(
+                        ops.face_nodes[face]
+                            .iter()
+                            .map(|&i| graph.global[k * ops.n_nodes + i]),
+                    );
+                }
+            }
+        }
+        if open.is_empty() {
+            open.extend((0..n_global).min_by(|&a, &b| bed[a].total_cmp(&bed[b])));
+        }
+        // Priority flood: the spill level of every node
+        #[derive(PartialEq)]
+        struct Level(f64, usize);
+        impl Eq for Level {}
+        impl PartialOrd for Level {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for Level {
+            // Reversed: the heap pops the lowest level first
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other.0.total_cmp(&self.0).then(other.1.cmp(&self.1))
+            }
+        }
+        let mut spill = vec![f64::INFINITY; n_global];
+        let mut heap = std::collections::BinaryHeap::new();
+        for g in open {
+            if bed[g] < spill[g] {
+                spill[g] = bed[g];
+                heap.push(Level(bed[g], g));
+            }
+        }
+        while let Some(Level(level, g)) = heap.pop() {
+            if level > spill[g] {
+                continue;
+            }
+            for &n in &neighbours[g] {
+                let reach = level.max(bed[n]);
+                if reach < spill[n] {
+                    spill[n] = reach;
+                    heap.push(Level(reach, n));
+                }
+            }
+        }
+        let pond = |g: usize| bed[g] < spill[g] && spill[g] >= low_water && bed[g] < high_water;
+        let mut report = TidalPonds::default();
+        // Ponds: connected sets of pond nodes
+        let mut parent: Vec<usize> = (0..n_global).collect();
+        fn root(parent: &mut [usize], mut a: usize) -> usize {
+            while parent[a] != a {
+                parent[a] = parent[parent[a]];
+                a = parent[a];
+            }
+            a
+        }
+        for &[p, q] in &graph.pairs {
+            if pond(p) && pond(q) {
+                let (rp, rq) = (root(&mut parent, p), root(&mut parent, q));
+                parent[rp.max(rq)] = rp.min(rq);
+            }
+        }
+        let mut size = vec![0usize; n_global];
+        for g in (0..n_global).filter(|&g| pond(g)) {
+            size[root(&mut parent, g)] += 1;
+        }
+        let mut fill = vec![false; n_global];
+        for g in (0..n_global).filter(|&g| pond(g)) {
+            let r = root(&mut parent, g);
+            if size[r] > max_nodes {
+                if r == g {
+                    report.left += 1;
+                }
+                continue;
+            }
+            if r == g {
+                report.ponds += 1;
+            }
+            fill[g] = true;
+            report.nodes += 1;
+            report.max_raise = report.max_raise.max(spill[g] - bed[g]);
+            report.area += graph.area[g];
+            report.volume += graph.area[g] * (spill[g] - bed[g]);
+        }
+        if report.nodes > 0 {
+            for (b, &g) in self.data.iter_mut().zip(&graph.global) {
+                if fill[g] {
+                    *b = spill[g];
                 }
             }
             self.compute_gradients(ops, geom);
@@ -2338,6 +2512,101 @@ mod tests {
         let none = untouched.raise_cliff_shores(&mesh, &ops, &geom, 80.5, 1.0, 2.0, 2.0);
         assert_eq!(none, CliffShores::default());
         assert_eq!(untouched.data, original.data);
+    }
+
+    #[test]
+    fn test_fill_tidal_ponds_raises_a_pond_to_its_lowest_sill() {
+        // 4 × 2 unit squares, P2 (node spacing 1/2), open to the south. Sea
+        // (−10 m) for y ≤ 1/2, a ridge (+3 m) along y = 1, and behind it
+        // basin A (−20 m, x ≤ 3/2) and basin B (−15 m, x ≥ 5/2), parted by
+        // land at x = 2. A joins the sea over sills at −0.5 m (x = 1) and
+        // +0.4 m (x = 0), B over one at −2 m (x = 3).
+        let mesh = Mesh2D::uniform_rectangle_with_sides(
+            0.0,
+            4.0,
+            0.0,
+            2.0,
+            4,
+            2,
+            [
+                BoundaryTag::Open,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+                BoundaryTag::Wall,
+            ],
+        );
+        let (mesh, ops, geom) = setup(mesh, 2);
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        let in_a = |x: f64, y: f64| y > 1.2 && x < 1.7;
+        let bed = move |x: f64, y: f64| match () {
+            _ if y < 0.7 => -10.0,
+            _ if near(y, 1.0) && near(x, 0.0) => 0.4,
+            _ if near(y, 1.0) && near(x, 1.0) => -0.5,
+            _ if near(y, 1.0) && near(x, 3.0) => -2.0,
+            _ if near(y, 1.0) || near(x, 2.0) => 3.0,
+            _ if in_a(x, y) => -20.0,
+            _ => -15.0,
+        };
+        let mut bathy = Bathymetry2D::from_function(&mesh, &ops, &geom, bed);
+        let original = bathy.clone();
+        let report = bathy.fill_tidal_ponds(&mesh, &ops, &geom, -1.0, 2.0, 9);
+        // A's eight nodes take the lower sill; nothing else moves
+        let mut area = 0.0;
+        for e in ElementIndex::iter(mesh.n_elements) {
+            for i in 0..ops.n_nodes {
+                let [x, y] = mesh.reference_to_physical(e, ops.nodes_r[i], ops.nodes_s[i]);
+                let expected = if in_a(x, y) { -0.5 } else { bed(x, y) };
+                assert_eq!(bathy.get(e, i), expected, "({x}, {y})");
+                if in_a(x, y) {
+                    area += geom.mass[e.as_usize() * ops.n_nodes + i];
+                }
+            }
+        }
+        assert_eq!(report.ponds, 1, "{report:?}");
+        assert_eq!(report.nodes, 8, "{report:?}");
+        assert!((report.max_raise - 19.5).abs() < 1e-12, "{report:?}");
+        assert!((report.area - area).abs() < 1e-12 * area, "{report:?}");
+        assert!(
+            (report.volume - 19.5 * area).abs() < 1e-12 * area,
+            "{report:?}"
+        );
+        assert_continuous(&bathy, &mesh, &ops, 2);
+        let mut fresh = bathy.clone();
+        fresh.compute_gradients(&ops, &geom);
+        assert_eq!(fresh.gradient_x, bathy.gradient_x);
+        // A second pass has nothing to do
+        let again = bathy.fill_tidal_ponds(&mesh, &ops, &geom, -1.0, 2.0, 9);
+        assert_eq!(again, TidalPonds::default());
+        // Below B's sill both basins are ponds, also with the lowest water
+        // below their beds (they are cut off on the way down); above A's
+        // sill neither, and neither with the highest water below their beds
+        for low_water in [-3.0, -30.0] {
+            let mut low = original.clone();
+            let report = low.fill_tidal_ponds(&mesh, &ops, &geom, low_water, 2.0, 9);
+            assert_eq!((report.ponds, report.nodes), (2, 16), "{report:?}");
+        }
+        let mut never = original.clone();
+        assert_eq!(
+            never.fill_tidal_ponds(&mesh, &ops, &geom, -30.0, -25.0, 9),
+            TidalPonds::default()
+        );
+        let mut high = original.clone();
+        assert_eq!(
+            high.fill_tidal_ponds(&mesh, &ops, &geom, 0.0, 2.0, 9),
+            TidalPonds::default()
+        );
+        assert_eq!(high.data, original.data);
+        // A pond of more nodes than `max_nodes` is left alone
+        let mut capped = original.clone();
+        let report = capped.fill_tidal_ponds(&mesh, &ops, &geom, -1.0, 2.0, 7);
+        assert_eq!(
+            report,
+            TidalPonds {
+                left: 1,
+                ..TidalPonds::default()
+            }
+        );
+        assert_eq!(capped.data, original.data);
     }
 
     #[test]
