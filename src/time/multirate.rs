@@ -791,7 +791,12 @@ mod tests {
         at_or_above(&key, 3, &mut lists);
         assert_eq!(
             lists,
-            [vec![0, 1, 2, 3, 4, 5], vec![1, 2, 3, 5], vec![1, 3, 5], vec![5]]
+            [
+                vec![0, 1, 2, 3, 4, 5],
+                vec![1, 2, 3, 5],
+                vec![1, 3, 5],
+                vec![5]
+            ]
         );
         at_or_above(&key[..2], 1, &mut lists);
         assert_eq!(lists, [vec![0, 1], vec![1]]);

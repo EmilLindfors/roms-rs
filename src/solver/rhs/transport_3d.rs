@@ -1065,7 +1065,11 @@ pub(crate) fn dry_inventories(
         let depth = e - b;
         if depth < DRY_DEPTH {
             let column = idx * nl..(idx + 1) * nl;
-            for ((q, &c), &ds) in q[column.clone()].iter_mut().zip(&values[column]).zip(d_sigma) {
+            for ((q, &c), &ds) in q[column.clone()]
+                .iter_mut()
+                .zip(&values[column])
+                .zip(d_sigma)
+            {
                 *q = c * layer_volume_of(depth, ds);
             }
         }

@@ -983,7 +983,9 @@ mod tests {
                 .with_barotropic_scheme(scheme)
                 .with_barotropic_levels(3);
             let (a, b) = (run(&mut global), run(&mut local));
-            let stats = local.barotropic_multirate_stats().expect("local time steps");
+            let stats = local
+                .barotropic_multirate_stats()
+                .expect("local time steps");
             assert_eq!(stats.finest_level, 0, "{scheme:?}: test regime");
             let bits = |x: &[f64]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
             for (name, x, y) in [
@@ -1093,7 +1095,9 @@ mod tests {
                     "{case}: face fluxes differ across a face by {mismatch:.2e} ({largest:.2e})"
                 );
             }
-            let stats = local.barotropic_multirate_stats().expect("local time steps");
+            let stats = local
+                .barotropic_multirate_stats()
+                .expect("local time steps");
             assert!(stats.finest_level >= 2, "{scheme:?}: {stats:?}");
             assert!(stats.speedup() > 1.5, "{scheme:?}: {stats:?}");
             let largest = |x: &[f64]| x.iter().fold(0.0_f64, |m, v| m.max(v.abs()));

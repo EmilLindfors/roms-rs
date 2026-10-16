@@ -1818,7 +1818,8 @@ mod tests {
                                 .copy_from_slice(mass.subcell);
                         },
                     );
-                    let (face, subcell) = (face.into_inner().unwrap(), subcell.into_inner().unwrap());
+                    let (face, subcell) =
+                        (face.into_inner().unwrap(), subcell.into_inner().unwrap());
                     let n_rhs = 3 * mesh.n_elements * n;
                     let (ref_face, ref_subcell) =
                         reference_fluxes[n_rhs..].split_at(face_mass_len(&mesh, &ops));

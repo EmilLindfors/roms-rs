@@ -1258,7 +1258,13 @@ where
         crate::profiling::stop("3d: viscosity", viscosity);
         if let Some(nesting) = &self.nesting {
             nesting
-                .columns(state, &self.bathymetry, &self.sigma, t, self.min_column_depth)
+                .columns(
+                    state,
+                    &self.bathymetry,
+                    &self.sigma,
+                    t,
+                    self.min_column_depth,
+                )
                 .relax_shear(state, &self.sigma, rhs, |idx| self.is_thin(state, idx));
         }
         self.zero_thin_momentum(state, rhs);
@@ -1284,12 +1290,15 @@ where
         let transport = &mut *guard;
         self.open_boundary_check
             .call_once(|| self.warn_if_stratified_open_boundaries(state));
-        let columns = self
-            .nesting
-            .as_ref()
-            .map(|nesting| {
-                nesting.columns(state, &self.bathymetry, &self.sigma, t, self.min_column_depth)
-            });
+        let columns = self.nesting.as_ref().map(|nesting| {
+            nesting.columns(
+                state,
+                &self.bathymetry,
+                &self.sigma,
+                t,
+                self.min_column_depth,
+            )
+        });
         let exterior = columns
             .as_ref()
             .map_or_else(Exterior3D::default, |c| c.exterior());
@@ -1415,15 +1424,20 @@ where
         for (out, field) in [(&mut rhs.tke, &state.tke), (&mut rhs.gls, &state.gls)] {
             let n_elements = self.mesh.n_elements;
             let len = field.len() / n_elements;
-            for_each_block(n_elements, [&mut advected[..]], || (), |_, k, [advected]| {
-                advected.copy_from_slice(&field[k * len..(k + 1) * len]);
-                if nl >= 2 {
-                    for column in advected.chunks_exact_mut(nl + 1) {
-                        column[0] = column[1];
-                        column[nl] = column[nl - 1];
+            for_each_block(
+                n_elements,
+                [&mut advected[..]],
+                || (),
+                |_, k, [advected]| {
+                    advected.copy_from_slice(&field[k * len..(k + 1) * len]);
+                    if nl >= 2 {
+                        for column in advected.chunks_exact_mut(nl + 1) {
+                            column[0] = column[1];
+                            column[nl] = column[nl - 1];
+                        }
                     }
-                }
-            });
+                },
+            );
             apply_tracer_transport_3d(
                 out,
                 advected,

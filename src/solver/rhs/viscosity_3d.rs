@@ -393,8 +393,7 @@ pub fn apply_horizontal_viscosity_3d(
                         // The fluxes that match the gradients' exterior
                         // states: at a wall (mirrored velocity) the normal
                         // stress only, at an open face (extrapolated) none
-                        |k, face, _fi, (nx, ny), [fu, fv]| match boundaries
-                            .exterior(mesh, k, face)
+                        |k, face, _fi, (nx, ny), [fu, fv]| match boundaries.exterior(mesh, k, face)
                         {
                             FaceExterior::Wall => {
                                 let normal = nx * fu + ny * fv;

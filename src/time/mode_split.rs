@@ -84,26 +84,25 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
 use crate::profiling;
 use crate::solver::core::blocks::{for_each_block, reduce_blocks, update_values, update_with};
+use crate::solver::core::disjoint::DisjointChunks;
+use crate::solver::rhs::ElementMassFluxes;
 use crate::solver::rhs::ElementRhsMassThen;
 use crate::solver::rhs::subcells::subcell_interfaces;
 use crate::solver::rhs::{
     BarotropicFlux, MetricForm, from_inventory, subcell_divergence_element, to_inventory,
-    transport_3d::dry_inventories,
-    transport_divergence_element, w_cell_thicknesses,
+    transport_3d::dry_inventories, transport_divergence_element, w_cell_thicknesses,
 };
 use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::source::{RiverInflow, RiverSources};
-use crate::solver::core::disjoint::DisjointChunks;
-use crate::solver::rhs::ElementMassFluxes;
 use crate::time::multirate::{Multirate, MultiratePass, MultirateStats, MultirateStepper};
 use crate::time::{IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 use std::cell::RefCell;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Fewest barotropic substeps per baroclinic step. Below four the filter
 /// weights cannot be centred on `tⁿ⁺¹`.
@@ -893,7 +892,8 @@ impl BarotropicMultirate {
                     DisjointChunks::new(&mut transport.hv.data, nn),
                     DisjointChunks::new(&mut transport.mass_source.data, nn),
                 ];
-                let face_sums = (n_face > 0).then(|| DisjointChunks::new(&mut transport.face, n_face));
+                let face_sums =
+                    (n_face > 0).then(|| DisjointChunks::new(&mut transport.face, n_face));
                 let subcell_sums =
                     (n_sub > 0).then(|| DisjointChunks::new(&mut transport.subcell, n_sub));
                 river_terms
@@ -922,7 +922,11 @@ impl BarotropicMultirate {
                         let forcing = &step.forcing.data[var][nodes.clone()];
                         for i in 0..nn {
                             let f = row[i] + forcing[i];
-                            let mut v = if stage.a != 0.0 { stage.a * start[i] } else { 0.0 };
+                            let mut v = if stage.a != 0.0 {
+                                stage.a * start[i]
+                            } else {
+                                0.0
+                            };
                             if stage.b != 0.0 {
                                 v += stage.b * x[i];
                             }
@@ -963,17 +967,27 @@ impl BarotropicMultirate {
                     let from = [0, 1, 2].map(|var| &input.data[var][nodes.clone()]);
                     match stage.accumulate {
                         None => {
-                            let clipped = barotropic.finish_stage_element(k, [h, hu, hv], from, stage.c);
+                            let clipped =
+                                barotropic.finish_stage_element(k, [h, hu, hv], from, stage.c);
                             if clipped > 0 {
                                 clips.fetch_add(clipped, Ordering::Relaxed);
                             }
                         }
                         Some((w, keep)) => {
-                            barotropic.damp_element(k, [&mut *h, &mut *hu, &mut *hv], from, stage.c);
+                            barotropic.damp_element(
+                                k,
+                                [&mut *h, &mut *hu, &mut *hv],
+                                from,
+                                stage.c,
+                            );
                             let sum = acc_rows.each_ref().map(|r| unsafe { r.chunk(k) });
                             for (sum, row) in sum.into_iter().zip([&*h, &*hu, &*hv]) {
                                 for (s, &v) in sum.iter_mut().zip(row.iter()) {
-                                    *s = if keep != 0.0 { w * v + keep * *s } else { w * v };
+                                    *s = if keep != 0.0 {
+                                        w * v + keep * *s
+                                    } else {
+                                        w * v
+                                    };
                                 }
                             }
                         }
@@ -1343,7 +1357,9 @@ impl ModeSplitIntegrator {
         };
         let column_drag = layer_drag.then_some(&column_drag_rate[..]);
         profiling::scope("split: slow forcing", || {
-            profiling::scope("3d: momentum rhs", || physics.momentum_rhs_into(state, t, rhs_n));
+            profiling::scope("3d: momentum rhs", || {
+                physics.momentum_rhs_into(state, t, rhs_n)
+            });
             profiling::scope("split: G", || {
                 physics.slow_forcing_into(state, rhs_n, t, history.push(t, dt))
             });
@@ -1435,7 +1451,13 @@ impl ModeSplitIntegrator {
                     // writes `qⁿ⁺¹` in place, reading each node's `qⁿ` before
                     let (x, target, start) = stage_buffers(&stage, q, u1, u2);
                     profiling::scope("bt: rhs", || {
-                        barotropic.compute_rhs_mass_fluxes_into(x, time, k_2d, face_mass, subcell_mass)
+                        barotropic.compute_rhs_mass_fluxes_into(
+                            x,
+                            time,
+                            k_2d,
+                            face_mass,
+                            subcell_mass,
+                        )
                     });
                     let c = w_secondary * stage.weight / n_bt as f64;
                     if barotropic.mass_sources_into(x, time, stage_mass_source) {
@@ -1587,7 +1609,9 @@ impl ModeSplitIntegrator {
         // no water)
         let to_values = |s: &Solution3D, out: &mut Solution3D| {
             let eta = &s.eta.data;
-            let fields = inventory_fields(s).into_iter().zip(inventory_fields_mut(out));
+            let fields = inventory_fields(s)
+                .into_iter()
+                .zip(inventory_fields_mut(out));
             for (field, (q, out)) in fields.enumerate() {
                 if !q.is_empty() {
                     from_inventory(q, eta, cells_of(field), bathymetry, geom, means, out);
@@ -1709,7 +1733,12 @@ impl ModeSplitIntegrator {
                 // one: its inventory is that value's, as for T and S, so
                 // that it wets from it
                 let Solution3D {
-                    eta, u, v, tke, gls, ..
+                    eta,
+                    u,
+                    v,
+                    tke,
+                    gls,
+                    ..
                 } = &mut *s;
                 for (field, q, c) in [
                     (0, u, &concentrations.u),
@@ -1951,7 +1980,8 @@ impl StageDrag<'_> {
                 continue;
             }
             let idx = k * nn + i;
-            let rate = self.bottom.map_or(0.0, |r| r[idx] / h) + self.column.map_or(0.0, |c| c[idx]);
+            let rate =
+                self.bottom.map_or(0.0, |r| r[idx] / h) + self.column.map_or(0.0, |c| c[idx]);
             if rate > 0.0 {
                 let factor = 1.0 / (1.0 + dt * rate);
                 *hu *= factor;
@@ -2861,7 +2891,9 @@ mod tests {
         );
         assert_eq!(physics.swe.negative_depth_clips(), 0, "{levels} levels");
         if levels > 0 {
-            let stats = integrator.barotropic_multirate_stats().expect("local time steps");
+            let stats = integrator
+                .barotropic_multirate_stats()
+                .expect("local time steps");
             assert!(stats.finest_level >= 1, "test regime: {stats:?}");
         }
     }

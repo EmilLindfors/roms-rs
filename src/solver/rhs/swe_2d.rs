@@ -1772,8 +1772,10 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
     out: &mut SWESolution2D,
     extra: Option<&mut SWESolution2D>,
     mass_fluxes: bool,
-    then: &(dyn Fn(usize, [&mut [f64]; 3], Option<[&mut [f64]; 3]>, Option<ElementMassFluxes<'_>>)
-          + Sync),
+    then: &(
+         dyn Fn(usize, [&mut [f64]; 3], Option<[&mut [f64]; 3]>, Option<ElementMassFluxes<'_>>)
+             + Sync
+     ),
 ) {
     check_rhs_output(out, mesh, ops);
     let (n_face_mass, n_subcell_mass) = (4 * ops.n_face_nodes, subcell_interfaces(ops.n_1d));
@@ -1902,10 +1904,7 @@ fn subset_then<BC: SWEBoundaryCondition2D>(
         if let Some((term, grads)) = &viscous {
             term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
         }
-        let mass = mass_fluxes.then_some(ElementMassFluxes {
-            face,
-            subcell,
-        });
+        let mass = mass_fluxes.then_some(ElementMassFluxes { face, subcell });
         then(k, [h, hu, hv], extra, mass);
     };
     // The volume terms (independent of time) ELEMENT_CHUNK elements at a time
