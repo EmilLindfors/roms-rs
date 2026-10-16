@@ -251,6 +251,8 @@ The first full day of the Frøya coastline mesh in 3D (TODO P1.3), on the cliff,
 
   The water level is the 2D model's: M2 1 % higher, the same 11° early, the same overtides (the error budget is P3.1's). The depth-mean current at the NorKyst point (23 m deep in our bed, 49 m in NorKyst's) is half the 2D day's; the 10 h 2D runs on today's bed give 0.103–0.109 m/s there, so the bed explains part and the 3D model ≈ 30 % (TODO P1.3). At the station's own sample point the current is ≈ 1.5 mm/s in both (a sheltered spot on both beds).
 
+- **The halved 3D current is a flattened M2 phase (2026-10-16).** 2D on exactly the 3D bed (`slopes3d=on debug_3d=thin=1`, nested, `output/froya_overtides/nested_bed3d_thin1`) against this day, node by node over hours 3–24: the 3D depth-mean M2 current is 0.46 of 2D's in every depth band down to 500 m (at the NorKyst point 0.080 against 0.178 m/s, NorKyst 0.246; at Frohavet 0.29 against 0.42, NorKyst 0.32), while the M2 η amplitude is 0.974 of 2D's and its phase spread over the domain 2.6° against 6.4° (NorKyst 7.5°). Bed drag cannot do that at 300 m; the suspects are the 3D barotropic pass and its time filter, and the 3D nesting band (TODO P1.3).
+
 ### Small fixes to `froya_real_data` (2026-10-15)
 
 - The 3D tide's progress line now reports T in the thin columns (shallower than the thin depth, dry ones included) beside the range in the deeper columns: a thin-column drift showed only once it had spread into the deep columns.
