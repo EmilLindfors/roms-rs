@@ -7,9 +7,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Next up
 
 1. **P3.1** The Mausund error budget: M2's +3 % from NorKyst (`gauge_gains=M2,…`) together with the overtides that are too weak (M4 0.35×). See Validation.
-2. **P4.5** The coastline 3D day under 200 s per model hour: 214 on the 6 h window since barotropic LTS (2026-10-16; 318 before the depth pass); the rest is in the 3D stages. See 3D numerics.
-3. **P4.6 / P1.5** Then the 72 h nested 3D day against NorKyst-800 per depth (T, S, u, v at the NorKyst point, Kattholmen and mid-domain); add the **P4.4** heat fluxes only if the drift points to them. See 3D validation.
-4. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
+2. **P4.6 / P1.5** The 72 h nested 3D day against NorKyst-800 per depth (T, S, u, v at the NorKyst point, Kattholmen and mid-domain); add the **P4.4** heat fluxes only if the drift points to them. See 3D validation.
+3. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -202,7 +201,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Mass-weight `Bathymetry2D::to_cell_average`/`linearize` node means, unless retired first (P1.2).
 - [ ] **P1.3** Profile the remaining curvilinear RHS overhead with AMD uProf (+2–3 % at 1 thread, +4–5 % at 24 on Frøya).
 - [ ] **P1.3** If suite time matters: shorten `a_terrace_beside_a_shore_element_stays_at_rest_about_its_reference` (1–4 min, slow tier).
-- [ ] **P1.3** Only if needed: implicit vertical advection's upwind flux about the vertical reference (`apply_tracer_transport_3d_about`); decaying the parent's bottom velocity below its bed in `OceanModelColumns`.
+- [ ] **P1.3** Only if needed: implicit vertical advection's upwind flux about the vertical reference (`apply_tracer_transport_3d` with a `reference`); decaying the parent's bottom velocity below its bed in `OceanModelColumns`.
 - [ ] **P1.3** Low priority: `raise_isolated_wet_nodes` on the rx0 functions' `NodeGraph`; `max_rx0` rebuilds the graph each call.
 - [ ] **P1.3** When needed: Gmsh `$NodeData` (a bed in the mesh file) and `$Periodic` faces.
 
@@ -221,6 +220,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)
 
+- [ ] **P1.6** `OceanModelReader` has public mutable fields, and `is_wet` reads every snapshot of SSH, u and v at each call (219 reads per point on the 73-snapshot Frøya file): make the fields private behind its `with_*` builders and keep the wet mask in the reader (`OceanModelColumns` and `OceanModelState` each take their own copy of `wet_mask()` today).
 - [ ] **P1.6** Settle the topobathy sea part's vertical datum (NN2000 or chart datum, 1.43 m too shallow at Mausund): check against WFS `wfs.dybdedata` points; add the 8 cm NN2000 → MSL offset if it matters.
 - [ ] **P1.6** Measure `lower_wall_land` in 3D (stratified rest, and a tide with `levels=20 slopes3d=on`) before making it the default, then in `viz/src/scenario.rs`.
 - [ ] **P1.6** Put the coastline mesh's walls in the water in `scripts/gmsh_coastline_mesh.py` (dilate the opened land back, or the projected bed's 0 contour), never closing a sound.
@@ -276,15 +276,19 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: numerics (P4.2, P4.3, P4.5) — [notes/3d-numerics.md](notes/3d-numerics.md)
 
-- [ ] **P4.5** The coastline 3D day under 200 s per model hour: 214 on the 6 h window since barotropic LTS (962 ms per 16 s step; `notes/3d-numerics.md` "Depth pass", "Barotropic local time stepping"): 3D stages ≈ 523 (transport RHS 256, Kuzmin limiter 127, momentum RHS 66), barotropic pass 236, G + its momentum RHS 73, post_process 64. ≈ 70 ms more reach 200: the turbulence's advection, the limiter's post-step call, `G` and Ω sharing their layer transports (lines below). Gate: 6–8 h from the 6 h restart, accuracy as in "The coastline day at half the cost". Comes before the P4.6 NorKyst comparison.
+- [ ] **P4.5** Low priority after P4.6: the coastline 3D day at 150 s per model hour (182 on the 6 h window since 2026-10-16, 818 ms per 16 s step; `notes/3d-numerics.md` "Second depth pass"): barotropic pass 232, transport RHS 180 (T/S/u/v kernels 65, turbulence 65, layer transports 28), Kuzmin limiter 123 (3 calls), momentum RHS 95 (Smagorinsky ≈ 52), post_process 64, hook conversions 41, G 38. The levers are the lines below.
 - [ ] **P4.5** The splitter's per-stage data movement is ≈ 15 field passes since 2026-10-15 (from ≈ 60): what is left is one inventory → value conversion and two copies per stage, which kernels reading `H_z φ` would remove.
 - [ ] **P4.5** The forward-backward (AB3-AM4) barotropic fast mode, fewer RHS per substep.
 - [ ] **P4.5** Make SSP-RK(4,3) at the caps `ModeSplitIntegrator`'s own default for wet/dry runs (changes every 3D gate's bits); the coastline day ran a full day on it (387 s per model hour, `notes/geometry-mesh.md` "The coastline day in 3D").
-- [ ] **P4.5** The coastline day's Kuzmin limiter changes about 40 % of all element-layers at every stage, by 1e-5 to 1e-3 (°C or PSU; 22 steps from 6 h: 17.2 M of 42.4 M, 98 % of them by more than 1e-8; 21 by more than 1), so real if mostly small cuts, not round-off; and 95 % of the element-layers fail the own-column test, so the patch bounds (≈ 60 column interpolations each) are computed nearly everywhere (≈ 42 ms per call, four per step). Find whether P2's horizontal variation within an element is what it cuts, and whether the post-step call is needed after the last stage's.
-- [ ] **P4.5** The thin-column copies (`with_thin_columns_at_rest`): the stages skip theirs since 2026-10-15 (their values hold the thin columns at rest, `ModeSplitPhysics::mask_stage`); `G` and `update_vertical_velocity` still copy (2 × 8 ms per step). The two compute the same layer transports of the same state, one step apart: compute them once.
+- [ ] **P4.5** The coastline day's Kuzmin limiter changes about 40 % of all element-layers at every stage, by 1e-5 to 1e-3 (°C or PSU; 22 steps from 6 h: 17.2 M of 42.4 M, 98 % of them by more than 1e-8; 21 by more than 1), so real if mostly small cuts, not round-off; and 95 % of the element-layers fail the own-column test, so the patch bounds (≈ 60 column interpolations each) are computed nearly everywhere (≈ 42 ms per call, four per step). Find whether P2's horizontal variation within an element is what it cuts. (The last stage's call is gone since 2026-10-16: the post-step call does its work after the vertical diffusion.)
+- [ ] **P4.5** The Kuzmin limiter's T and S in one pass: the column search at each node's height (`column_at`, 36 of the limiter's 82 CPU-s in uProf), the patches, heights and weights are the same for both (bit for bit; ≈ 25 ms per step).
 - [ ] **P4.5** The barotropic filter integrates 1.3 n_bt substeps (30 % past tⁿ⁺¹); the fused stage costs half a 2D RHS (0.56 ms, 10 streamed arrays): a shorter window or fewer streams.
 - [ ] **P4.5** Fewer parallel regions per barotropic stage: the damping and wet/dry correction run in the fused stage's pass since 2026-10-15; the fused stage as the RHS's per-element continuation is left (it streams ≈ 24 MB per stage at ≈ 44 GB/s, DRAM speed: the pass's 2D arrays, ≈ 31 MB, do not fit the 24 MB L3).
-- [ ] **P4.5** The turbulence's advection costs as much as T, S, u and v together (29 ms per call, three per step): `k` and `ψ` on 21 w-levels through the tracer kernel, with the w-cell transports re-staggered each call. Average the layer transports on the fly; or advect the turbulence once per step, as ROMS's GLS does in its own predictor/corrector.
+- [ ] **P4.5** The turbulence's advection still costs as much as T, S, u and v together (22 ms per call, three per step, since the all-levels kernels: the pair's kernel 12, re-staggering the w-cell transports 5.5, copies and sources 4). Average the layer transports on the fly; or advect the turbulence once per step, as ROMS's GLS does in its own predictor/corrector.
+- [ ] **P4.5** The vertical reconstruction is ≈ 35 % of the tracer kernels since the horizontal part runs on whole levels (`subtract_vertical_flux`: limited Akima per column, T and S twice with their reference): run it on an element's columns as SIMD lanes, or share the reference's surface values between stages (Ω changes, the reference does not).
+- [ ] **P4.5** The other 3D kernels still loop level by level at a stride of the level count (Smagorinsky viscosity `viscosity_3d.rs`, PGF, the layer transports' face fluxes and correction): put them on `[node][level]` blocks as `transport_divergence_levels`/`advective_divergence_levels` (2026-10-16: 1.6–2× on the advection; the layout is also the GPU port's).
+- [ ] **P4.5** `LayerTransport::stagger_from` averages the subcell fluxes of every element (≈ a third of its 5.5 ms); only subcell elements read them (zeros elsewhere would keep `LayerTransport::subcell`'s contract).
+- [ ] **P4.5** `Simulation3D` refreshes ρ at every step's start, which `Hydrostatic3D::post_process` now leaves current (it refreshes it after the limiter since 2026-10-16): only the first step and states changed between steps need it.
 - [ ] **P4.5** A depth-aware coastline mesh (OceanMesh2D's CFL bound, element size ≥ c·Δt/CFL): 1 % of the coastline mesh's elements lie within 1.66× of the smallest barotropic step and 5 % within 2.35×, cliff-shore elements 65–100 m across in 50–80 m of water; the positivity cap alone is only 1.29× (2026-10-15). Coarsening them would raise the global substep without LTS, at the cost of the validated bed.
 - [ ] **P4.2** A cheaper band parent-column evaluation (`OceanModelColumns` searches per node, stage and layer): precompute vertical weights, or time-interpolate once per baroclinic step.
 - [ ] **P4.2** The parent's shear dispersion in G's depth mean at nested faces.
@@ -363,6 +367,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P6** Decide crate vs repo name and a `dg-core`/`roms-rs` split.
 - [ ] **P6** Characteristic-based limiting for 2D SWE (likely subsumed by P1.2).
 - [ ] **P6** Low priority: faer 0.23 → 0.24 (setup-time solves only).
+- [ ] **P6** `Hydrostatic3D`'s configuration is 20 public fields and 23 consuming `with_*` builders, so it can change between steps while caches assume it fixed (the kept advection of `G` since 2026-10-16, keyed on the state only): make it private once built, or invalidate the caches on change.
+- [ ] **P6** One test-support constructor for a distorted quadrilateral mesh: eight test modules have their own `distorted_mesh` (`operators/geometric.rs`, `bathymetry_2d.rs`, `point_locator.rs`, `particles/walk.rs`, `solver/probe.rs`, `tests/cage_drag_test.rs`, `tests/curvilinear_3d_test.rs`, `tests/particle_tracking_test.rs`), and `transport_3d.rs`'s kernel gate a ninth inline.
+- [ ] **P6** The coastline-day bench as a script (`scripts/`): alternating A/B pairs from the 6 h restart with `DG_PROFILE=1`, and the byte comparison of two runs' restart files for bit-for-bit claims; each perf pass rebuilds it in a scratchpad.
 
 ## Future (P7) — [notes/operational.md](notes/operational.md)
 

@@ -456,12 +456,22 @@ pub trait ModeSplitPhysics {
     ) {
     }
 
-    /// Runs on every 3D stage value (with the tracers as concentrations),
-    /// including the last: limiters, density. It may change `temp`, `salt`
-    /// and `rho` only: the splitter writes back the tracers' inventories,
-    /// and the next RHS reads the density from the values, but the other
-    /// fields' inventories stay as the stage combination made them.
+    /// Runs on the 3D stage values a later stage's RHS reads (with the
+    /// tracers as concentrations): limiters, density. Not on the last
+    /// stage's, the step's end state, which the vertical terms change
+    /// after it: the caller post-processes that (`Hydrostatic3D::
+    /// post_process` limits it), and the splitter takes only its density
+    /// ([`Self::end_density`]). It may change `temp`, `salt` and `rho`
+    /// only: the splitter writes back the tracers' inventories, and the next
+    /// RHS reads the density from the values, but the other fields'
+    /// inventories stay as the stage combination made them.
     fn post_stage(&self, state: &mut Solution3D);
+
+    /// The density of the last stage's values (the step's end state, with
+    /// the tracers as concentrations), unlimited: the vertical terms read
+    /// it ([`Self::vertical_implicit`]: the mixing's buoyancy frequency). It
+    /// may change `rho` only.
+    fn end_density(&self, state: &mut Solution3D);
 
     /// Change a stage's values (velocities and concentrations) where no
     /// stage RHS would see the difference, to spare the RHS work (thin
@@ -1657,6 +1667,7 @@ impl ModeSplitIntegrator {
         let values = &values_cell;
         to_inventories(state);
         let mut first_stage = true;
+        let mut hooks_left = SSPRK3.n_stages();
         let stages = profiling::start();
         SSPRK3.step_with_relaxation(
             state,
@@ -1711,7 +1722,15 @@ impl ModeSplitIntegrator {
             // element means, those means are the inventories' own). Then the
             // values the RHS need not see changed are masked
             // (`ModeSplitPhysics::mask_stage`), and restored before the next
-            // conversion, which keeps them where there is no water
+            // conversion, which keeps them where there is no water.
+            //
+            // The last stage's values are the step's end state, which no RHS
+            // of this step reads: they go through the vertical terms, which
+            // change them again, and the caller's post-processing limits
+            // them once after those (the RKDG limiter belongs on each RHS's
+            // input; limited here as well, the vertical diffusion still left
+            // 67k of 241k element layers' T for that call to change on the
+            // coastline day). Their density is the vertical terms'
             |s| {
                 let mut values = values.borrow_mut();
                 let (concentrations, stash) = &mut *values;
@@ -1720,7 +1739,12 @@ impl ModeSplitIntegrator {
                 copy_non_inventory_fields(s, concentrations);
                 to_values(s, concentrations);
                 profiling::stop("3d: hook conversions", convert);
-                profiling::scope("3d: post_stage", || physics.post_stage(concentrations));
+                hooks_left -= 1;
+                if hooks_left > 0 {
+                    profiling::scope("3d: post_stage", || physics.post_stage(concentrations));
+                } else {
+                    profiling::scope("3d: density", || physics.end_density(concentrations));
+                }
                 let convert = profiling::start();
                 for (q, c) in [
                     (&mut s.temp, &concentrations.temp),
@@ -1757,7 +1781,7 @@ impl ModeSplitIntegrator {
         );
         profiling::stop("split: 3D stages", stages);
         physics.unmask_stage(concentrations, stash);
-        // The diagnostics back, with the last hook's density
+        // The diagnostics back, with the last stage's density
         let [w, rho, eddy_viscosity, eddy_diffusivity] = lent;
         state.w = w;
         state.rho = std::mem::replace(&mut concentrations.rho, rho);
@@ -2784,6 +2808,7 @@ mod tests {
         }
 
         fn post_stage(&self, _state: &mut Solution3D) {}
+        fn end_density(&self, _state: &mut Solution3D) {}
     }
 
     /// TODO P4.1 gate: the slow forcing is integrated to second order. The

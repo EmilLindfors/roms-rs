@@ -78,12 +78,13 @@ use crate::solver::SWESolution2D;
 use crate::solver::core::blocks::{Pooled, for_each_block, reduce_blocks, update_with};
 use crate::solver::rhs::transport_3d::layer_thickness_of;
 use crate::solver::rhs::{
-    BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D, ExtrapolationTracerBC3D,
-    HorizontalViscosity3D, LayerTransport, MetricForm, MomentumAdvectionForm, PressureGradientForm,
-    Rhs3DConfig, TracerBoundaryCondition3D, VerticalAdvection, ViscosityScratch3D,
-    apply_coriolis_3d, apply_horizontal_viscosity_3d, apply_momentum_transport_3d,
-    apply_tracer_transport_3d, compute_momentum_rhs_3d, compute_transport_rhs_3d,
-    element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d, w_cell_thicknesses,
+    AdvectedTracer, BalancedReference, BarotropicFlux, Boundaries3D, Exterior3D,
+    ExtrapolationTracerBC3D, HorizontalViscosity3D, LayerTransport, MetricForm,
+    MomentumAdvectionForm, PressureGradientForm, Rhs3DConfig, TracerBoundaryCondition3D,
+    VerticalAdvection, ViscosityScratch3D, apply_coriolis_3d, apply_horizontal_viscosity_3d,
+    apply_momentum_transport_3d, apply_tracer_transport_3d, compute_momentum_rhs_3d,
+    compute_transport_rhs_3d, element_dt_viscous_swe_2d, largest_horizontal_viscosity_3d,
+    w_cell_thicknesses,
 };
 use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
@@ -357,7 +358,7 @@ where
     /// vertical scheme ([`Self::with_vertical_advection`]) keeps its limiting
     /// for departures from it, while the stratification itself is advected
     /// with the centred value (see
-    /// [`crate::solver::rhs::apply_tracer_transport_3d_about`]).
+    /// [`crate::solver::rhs::apply_tracer_transport_3d`]).
     ///
     /// Use it for stratified runs: about a stratified rest state, a
     /// dissipative or higher-order vertical scheme mixes the background at a
@@ -1051,13 +1052,14 @@ where
     /// velocity: the momentum advection sees them at rest (their momentum is
     /// the 2D module's; a film at the 2D velocity cap would otherwise carry
     /// its speed into the 3D shear), consistently in the stages and in `G`.
-    /// The copy holds η, ū, v̄, u, v, T, S, k and ψ only: `f` must not read
-    /// `w`, `rho` or the eddy coefficients. No copy where the thin columns
+    /// The copy holds η, ū, v̄, u, v, and T, S, k and ψ if `tracers`: `f`
+    /// must not read the others. No copy where the thin columns
     /// are at rest already (the mode splitter's stage values, see
     /// [`ModeSplitPhysics::mask_stage`]).
     fn with_thin_columns_at_rest<R>(
         &self,
         state: &Solution3D,
+        tracers: bool,
         f: impl FnOnce(&Solution3D) -> R,
     ) -> R {
         let nl = state.n_levels;
@@ -1081,20 +1083,21 @@ where
             Solution3D::new(state.n_elements, state.n_nodes, state.n_levels)
         });
         // Only the fields the callers read under the mask (the layer
-        // transports η, u, v; the advection T, S; the turbulence k, ψ; the
-        // slow forcing ū, v̄): w, ρ and the eddy coefficients stay stale, a
-        // third of the copy
+        // transports η, u, v; the advection T, S; the turbulence k, ψ):
+        // w, ρ and the eddy coefficients stay stale, and the tracers unless
+        // asked for
         masked.eta.copy_from(&state.eta);
         masked.ubar.copy_from(&state.ubar);
         masked.vbar.copy_from(&state.vbar);
-        for (x, y) in [
+        let fields = [
             (&mut masked.u, &state.u),
             (&mut masked.v, &state.v),
             (&mut masked.temp, &state.temp),
             (&mut masked.salt, &state.salt),
             (&mut masked.tke, &state.tke),
             (&mut masked.gls, &state.gls),
-        ] {
+        ];
+        for (x, y) in fields.into_iter().take(if tracers { 6 } else { 2 }) {
             x.resize(y.len(), 0.0);
             update_with(x, y, |x, y| *x = y);
         }
@@ -1304,7 +1307,7 @@ where
             .map_or_else(Exterior3D::default, |c| c.exterior());
         // Thin columns at rest change no layer transport: theirs are uniform
         // in σ, which the correction to the barotropic transport replaces
-        self.with_thin_columns_at_rest(state, |state| {
+        self.with_thin_columns_at_rest(state, true, |state| {
             let layer = crate::profiling::start();
             transport.metric = self.metric_form();
             transport.compute(
@@ -1417,18 +1420,20 @@ where
             guard.get_or_insert_with(|| TurbulenceScratch {
                 w_cells: LayerTransport::new(self.mesh.n_elements, &self.ops, state.n_levels + 1)
                     .with_metric(self.metric_form()),
-                advected: vec![0.0; state.tke.len()],
+                advected: [vec![0.0; state.tke.len()], vec![0.0; state.tke.len()]],
             });
-        w_cells.stagger_from(transport);
+        crate::profiling::scope("turb: stagger", || w_cells.stagger_from(transport));
         let nl = state.n_levels;
-        for (out, field) in [(&mut rhs.tke, &state.tke), (&mut rhs.gls, &state.gls)] {
-            let n_elements = self.mesh.n_elements;
-            let len = field.len() / n_elements;
-            for_each_block(
-                n_elements,
-                [&mut advected[..]],
-                || (),
-                |_, k, [advected]| {
+        let n_elements = self.mesh.n_elements;
+        let len = state.tke.len() / n_elements;
+        let [tke, gls] = advected;
+        let copy = crate::profiling::start();
+        for_each_block(
+            n_elements,
+            [&mut tke[..], &mut gls[..]],
+            || (),
+            |_, k, advected| {
+                for (advected, field) in advected.into_iter().zip([&state.tke, &state.gls]) {
                     advected.copy_from_slice(&field[k * len..(k + 1) * len]);
                     if nl >= 2 {
                         for column in advected.chunks_exact_mut(nl + 1) {
@@ -1436,20 +1441,26 @@ where
                             column[nl] = column[nl - 1];
                         }
                     }
-                },
-            );
+                }
+            },
+        );
+        crate::profiling::stop("turb: copy", copy);
+        crate::profiling::scope("turb: kernel", || {
             apply_tracer_transport_3d(
-                out,
-                advected,
+                [
+                    AdvectedTracer::new(&mut rhs.tke, tke, &ExtrapolationTracerBC3D),
+                    AdvectedTracer::new(&mut rhs.gls, gls, &ExtrapolationTracerBC3D),
+                ],
                 w_cells,
                 &self.mesh,
                 &self.ops,
                 &self.geom,
-                &ExtrapolationTracerBC3D,
-                None,
                 &self.boundaries,
                 scheme,
-            );
+            )
+        });
+        let sources = crate::profiling::start();
+        for (out, advected) in [(&mut rhs.tke, &*tke), (&mut rhs.gls, &*gls)] {
             // River water brings the column's own turbulence: its volume
             // source must not dilute it; nor the 2D module's
             if let Some(rivers) = barotropic.rivers {
@@ -1465,6 +1476,7 @@ where
                 barotropic.element_means,
             );
         }
+        crate::profiling::stop("turb: volume sources", sources);
     }
 
     /// Warn if `state` is stratified and has open 3D faces that no nesting
@@ -1685,8 +1697,13 @@ where
         }
     }
 
+    /// The end state of a step: its tracers limited (the mode splitter's
+    /// last stage leaves them to this, after the vertical terms), their
+    /// density, and `Ω` for output ([`Self::update_vertical_velocity`]).
     pub fn post_process(&self, state: &mut Solution3D) {
-        self.apply_tracer_limiters(state);
+        if !self.apply_tracer_limiters(state).changed() {
+            self.update_density(state);
+        }
 
         crate::profiling::scope("post: omega", || self.update_vertical_velocity(state));
     }
@@ -1697,13 +1714,55 @@ where
     /// columns at rest as in the stages). Their column sum is `Dū`, which
     /// after a mode-split step is the filtered barotropic transport, and `Ω`
     /// closes with the free-surface rate its divergence implies.
+    ///
+    /// The same transports advect the momentum of `G` at the start of the
+    /// next step ([`ModeSplitPhysics::slow_forcing_into`]): that advection is
+    /// kept for it, and taken again only if the state's velocities or
+    /// free surface have changed in between. The physics' configuration
+    /// (bed, minimum column depth, boundaries, advection forms) must not
+    /// change between the two.
     pub fn update_vertical_velocity(&self, state: &mut Solution3D) {
         let mut guard = self
+            .slow_forcing_scratch
+            .lock()
+            .expect("Failed to lock slow_forcing_scratch");
+        let scratch = guard.get_or_insert_with(|| {
+            SlowForcingScratch::new(state.n_elements, &self.ops, state.n_levels)
+        });
+        let mut transport_guard = self
             .transport_scratch
             .lock()
             .expect("Failed to lock transport_scratch");
-        let transport = &mut *guard;
-        self.with_thin_columns_at_rest(state, |state| {
+        let transport = &mut *transport_guard;
+        self.layer_advection(state, transport, scratch);
+        let nl = state.n_levels;
+        for (w_col, omega_col) in state
+            .w
+            .chunks_exact_mut(nl)
+            .zip(transport.omega.chunks_exact(nl + 1))
+        {
+            for (l, w) in w_col.iter_mut().enumerate() {
+                *w = 0.5 * (omega_col[l] + omega_col[l + 1]);
+            }
+        }
+    }
+
+    /// `Σ_l A_l(u)` of `state` into `scratch` (the columns advected with
+    /// their own layer transports, thin columns at rest as in the stages),
+    /// and the transports, without a barotropic flux, into `transport`.
+    fn layer_advection(
+        &self,
+        state: &Solution3D,
+        transport: &mut LayerTransport,
+        scratch: &mut SlowForcingScratch,
+    ) {
+        let SlowForcingScratch {
+            advection_u,
+            advection_v,
+            advection_of,
+            ..
+        } = scratch;
+        self.with_thin_columns_at_rest(state, false, |state| {
             transport.metric = self.metric_form();
             transport.compute(
                 state,
@@ -1717,17 +1776,24 @@ where
                 &Exterior3D::default(),
                 self.min_column_depth,
             );
+            advection_u.fill(0.0);
+            advection_v.fill(0.0);
+            apply_momentum_transport_3d(
+                advection_u,
+                advection_v,
+                &state.u,
+                &state.v,
+                transport,
+                &self.mesh,
+                &self.ops,
+                &self.geom,
+                &self.boundaries,
+                None,
+                self.momentum_advection_form,
+                self.momentum_vertical_advection,
+            );
         });
-        let nl = state.n_levels;
-        for (w_col, omega_col) in state
-            .w
-            .chunks_exact_mut(nl)
-            .zip(transport.omega.chunks_exact(nl + 1))
-        {
-            for (l, w) in w_col.iter_mut().enumerate() {
-                *w = 0.5 * (omega_col[l] + omega_col[l + 1]);
-            }
-        }
+        *advection_of = Some(flow_fingerprint(state));
     }
 }
 
@@ -1791,6 +1857,11 @@ where
             .lock()
             .expect("Failed to lock transport_scratch");
         let transport = &mut *transport_guard;
+        // Σ_l A_l(u), unless the last `update_vertical_velocity` left this
+        // state's
+        if scratch.advection_of != Some(flow_fingerprint(state)) {
+            self.layer_advection(state, transport, scratch);
+        }
         let SlowForcingScratch {
             advection_u,
             advection_v,
@@ -1798,84 +1869,57 @@ where
             bar_rhs,
             bar_transport,
             bar_sigma,
+            ..
         } = scratch;
 
-        self.with_thin_columns_at_rest(state, |state| {
-            // Σ_l A_l(u): the columns advected with their own layer transports
-            transport.metric = self.metric_form();
-            transport.compute(
-                state,
-                None,
-                &self.mesh,
-                &self.ops,
-                &self.geom,
-                &self.sigma,
-                &self.bathymetry,
-                &self.boundaries,
-                &Exterior3D::default(),
-                self.min_column_depth,
-            );
-            advection_u.fill(0.0);
-            advection_v.fill(0.0);
-            apply_momentum_transport_3d(
-                advection_u,
-                advection_v,
-                &state.u,
-                &state.v,
-                transport,
-                &self.mesh,
-                &self.ops,
-                &self.geom,
-                &self.boundaries,
-                None,
-                self.momentum_advection_form,
-                self.momentum_vertical_advection,
-            );
-
-            // A(ū) + D·R_Cor(ū): the mean flow as one layer
-            bar.eta.copy_from(&state.eta);
-            bar.u.copy_from_slice(&state.ubar.data);
-            bar.v.copy_from_slice(&state.vbar.data);
-            bar_transport.metric = self.metric_form();
-            bar_transport.compute(
-                bar,
-                None,
-                &self.mesh,
-                &self.ops,
-                &self.geom,
-                bar_sigma,
-                &self.bathymetry,
-                &self.boundaries,
-                &Exterior3D::default(),
-                self.min_column_depth,
-            );
-            bar_rhs.u.fill(0.0);
-            bar_rhs.v.fill(0.0);
-            apply_coriolis_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.coriolis);
-            for ((u, v), (&eta, &b)) in bar_rhs
-                .u
-                .iter_mut()
-                .zip(&mut bar_rhs.v)
-                .zip(state.eta.data.iter().zip(&self.bathymetry.data))
-            {
-                *u *= eta - b;
-                *v *= eta - b;
-            }
-            apply_momentum_transport_3d(
-                &mut bar_rhs.u,
-                &mut bar_rhs.v,
-                &bar.u,
-                &bar.v,
-                bar_transport,
-                &self.mesh,
-                &self.ops,
-                &self.geom,
-                &self.boundaries,
-                None,
-                self.momentum_advection_form,
-                self.momentum_vertical_advection,
-            );
-        });
+        // A(ū) + D·R_Cor(ū): the mean flow as one layer, thin columns at rest
+        bar.eta.copy_from(&state.eta);
+        for (idx, (u, v)) in bar.u.iter_mut().zip(&mut bar.v).enumerate() {
+            (*u, *v) = if self.is_thin(state, idx) {
+                (0.0, 0.0)
+            } else {
+                (state.ubar.data[idx], state.vbar.data[idx])
+            };
+        }
+        bar_transport.metric = self.metric_form();
+        bar_transport.compute(
+            bar,
+            None,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            bar_sigma,
+            &self.bathymetry,
+            &self.boundaries,
+            &Exterior3D::default(),
+            self.min_column_depth,
+        );
+        bar_rhs.u.fill(0.0);
+        bar_rhs.v.fill(0.0);
+        apply_coriolis_3d(bar_rhs, bar, &self.mesh, &self.ops, &self.coriolis);
+        for ((u, v), (&eta, &b)) in bar_rhs
+            .u
+            .iter_mut()
+            .zip(&mut bar_rhs.v)
+            .zip(state.eta.data.iter().zip(&self.bathymetry.data))
+        {
+            *u *= eta - b;
+            *v *= eta - b;
+        }
+        apply_momentum_transport_3d(
+            &mut bar_rhs.u,
+            &mut bar_rhs.v,
+            &bar.u,
+            &bar.v,
+            bar_transport,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &self.boundaries,
+            None,
+            self.momentum_advection_form,
+            self.momentum_vertical_advection,
+        );
 
         let [tau_sx, tau_sy] = self.forcing.surface_stress;
         let [tau_bx, tau_by] = self.forcing.bottom_stress;
@@ -2034,6 +2078,10 @@ where
         }
     }
 
+    fn end_density(&self, state: &mut Solution3D) {
+        self.update_density(state);
+    }
+
     /// Tracer limiters, then the density of the limited tracers.
     fn post_stage(&self, state: &mut Solution3D) {
         if !self.apply_tracer_limiters(state).changed() {
@@ -2069,8 +2117,8 @@ where
 struct TurbulenceScratch {
     /// The w-cells of the layer transports.
     w_cells: LayerTransport,
-    /// `k` or `ψ` as advected: the end w-points at their neighbours' values.
-    advected: Vec<f64>,
+    /// `k` and `ψ` as advected: the end w-points at their neighbours' values.
+    advected: [Vec<f64>; 2],
 }
 
 /// Buffers of [`Hydrostatic3D`]'s slow forcing.
@@ -2078,6 +2126,8 @@ struct SlowForcingScratch {
     /// `A_l(u)` of every layer, `[element][node][level]`.
     advection_u: Vec<f64>,
     advection_v: Vec<f64>,
+    /// The [`flow_fingerprint`] of the state they are of, if any.
+    advection_of: Option<u64>,
     /// One layer carrying `ū`, and its advection + Coriolis tendency
     /// (inventory form).
     bar: Solution3D,
@@ -2092,10 +2142,46 @@ impl SlowForcingScratch {
         Self {
             advection_u: vec![0.0; n_elements * nn * n_levels],
             advection_v: vec![0.0; n_elements * nn * n_levels],
+            advection_of: None,
             bar: Solution3D::new(n_elements, nn, 1),
             bar_rhs: Solution3D::new(n_elements, nn, 1),
             bar_transport: LayerTransport::new(n_elements, ops, 1),
             bar_sigma: SigmaGrid::uniform(1),
         }
     }
+}
+
+/// A fingerprint of what the layer transports and the momentum advection
+/// of `state` read: `η`, `ū`, `v̄`, `u` and `v`. Each element's values are
+/// hashed in a chain of bijections, so a change of one value always changes
+/// it (other changes collide with a chance of about 2⁻⁶⁴); the elements'
+/// hashes are summed, so it does not depend on the thread count.
+fn flow_fingerprint(state: &Solution3D) -> u64 {
+    let (nn, nl) = (state.n_nodes, state.n_levels);
+    let [hash] = reduce_blocks::<u64, _, _, 0>(
+        state.n_elements,
+        [],
+        || (),
+        |_, k, []| {
+            let nodes = k * nn..(k + 1) * nn;
+            let levels = k * nn * nl..(k + 1) * nn * nl;
+            let mut h = (k as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            for &x in [
+                &state.eta.data[nodes.clone()],
+                &state.ubar.data[nodes.clone()],
+                &state.vbar.data[nodes],
+                &state.u[levels.clone()],
+                &state.v[levels],
+            ]
+            .into_iter()
+            .flatten()
+            {
+                h = (h.rotate_left(5) ^ x.to_bits()).wrapping_mul(0x517c_c1b7_2722_0a95);
+            }
+            [h]
+        },
+        || [0],
+        |[a], [b]| [a.wrapping_add(b)],
+    );
+    hash
 }

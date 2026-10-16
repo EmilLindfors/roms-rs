@@ -25,8 +25,8 @@ use crate::solver::rhs::baroclinic::{
 use crate::solver::rhs::boundary_3d::{Boundaries3D, Exterior3D};
 use crate::solver::rhs::coriolis_3d::apply_coriolis_3d;
 use crate::solver::rhs::transport_3d::{
-    LayerTransport, MetricForm, MomentumAdvectionForm, VerticalAdvection,
-    apply_momentum_transport_3d, apply_tracer_transport_3d_about,
+    AdvectedTracer, LayerTransport, MetricForm, MomentumAdvectionForm, VerticalAdvection,
+    apply_momentum_transport_3d, apply_tracer_transport_3d,
 };
 use crate::solver::state::Solution3D;
 use crate::source::CoriolisSource2D;
@@ -133,34 +133,28 @@ pub fn compute_transport_rhs_3d(
         config.momentum_vertical_advection,
     );
     let tracers = [
-        (
-            &mut rhs.temp,
-            &state.temp,
-            config.temp_bc,
-            config.exterior.temp,
-            config.tracer_reference[0],
-        ),
-        (
-            &mut rhs.salt,
-            &state.salt,
-            config.salt_bc,
-            config.exterior.salt,
-            config.tracer_reference[1],
-        ),
+        AdvectedTracer {
+            rhs: &mut rhs.temp,
+            tracer: &state.temp,
+            bc: config.temp_bc,
+            exterior: config.exterior.temp,
+            reference: config.tracer_reference[0],
+        },
+        AdvectedTracer {
+            rhs: &mut rhs.salt,
+            tracer: &state.salt,
+            bc: config.salt_bc,
+            exterior: config.exterior.salt,
+            reference: config.tracer_reference[1],
+        },
     ];
-    for (out, tracer, bc, exterior, reference) in tracers {
-        apply_tracer_transport_3d_about(
-            out,
-            tracer,
-            reference,
-            transport,
-            config.mesh,
-            config.ops,
-            config.geom,
-            bc,
-            exterior,
-            config.boundaries,
-            config.vertical_advection,
-        );
-    }
+    apply_tracer_transport_3d(
+        tracers,
+        transport,
+        config.mesh,
+        config.ops,
+        config.geom,
+        config.boundaries,
+        config.vertical_advection,
+    );
 }

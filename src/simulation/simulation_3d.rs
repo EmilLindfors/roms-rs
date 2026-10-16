@@ -603,6 +603,50 @@ mod tests {
         }
     }
 
+    /// `G` from the momentum advection that `post_process` kept for it (the
+    /// end state's layer transports, which `Ω` takes) is `G` from scratch,
+    /// to the bit; and when the state changes in between, it is taken anew.
+    #[test]
+    fn slow_forcing_from_the_kept_advection_is_the_slow_forcing_from_scratch() {
+        use crate::time::ModeSplitPhysics;
+        let seiche = Seiche::new(4, 2, 250.0);
+        let physics = seiche.hydrostatic();
+        let mut state = seiche.state_3d(&physics);
+        let nl = state.n_levels;
+        for (idx, (u, v)) in state
+            .u
+            .chunks_exact_mut(nl)
+            .zip(state.v.chunks_exact_mut(nl))
+            .enumerate()
+        {
+            for l in 0..nl {
+                u[l] = 0.05 * (l as f64 + 1.0) * (0.7 * idx as f64).sin();
+                v[l] = 0.02 * (2.0 - l as f64) * (0.3 * idx as f64).cos();
+            }
+            state.ubar.data[idx] = u.iter().sum::<f64>() / nl as f64;
+            state.vbar.data[idx] = v.iter().sum::<f64>() / nl as f64;
+        }
+        let forcing = |physics: &Physics, state: &Solution3D| {
+            let mut rhs = Solution3D::new(state.n_elements, state.n_nodes, nl);
+            physics.momentum_rhs_into(state, 0.0, &mut rhs);
+            let mut g = SWESolution2D::new(state.n_elements, state.n_nodes);
+            physics.slow_forcing_into(state, &rhs, 0.0, &mut g);
+            g.data
+                .iter()
+                .flatten()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        };
+        physics.post_process(&mut state);
+        let kept = forcing(&physics, &state);
+        assert_eq!(kept, forcing(&seiche.hydrostatic(), &state));
+        // One node's velocity changes after the advection was kept
+        state.u[5 * nl + 1] += 0.01;
+        let changed = forcing(&physics, &state);
+        assert_ne!(changed, kept, "the change reaches G");
+        assert_eq!(changed, forcing(&seiche.hydrostatic(), &state));
+    }
+
     #[test]
     fn seiche_period_matches_analytic() {
         // Regression (TODO P0.6): a barotropic seiche in a closed basin must

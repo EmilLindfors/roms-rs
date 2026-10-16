@@ -134,6 +134,10 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
         self.time("post_stage", || self.inner.post_stage(state))
     }
 
+    fn end_density(&self, state: &mut Solution3D) {
+        self.time("end_density", || self.inner.end_density(state))
+    }
+
     fn mask_stage(&self, state: &mut Solution3D, stash: &mut dg_rs::time::StageStash) {
         self.inner.mask_stage(state, stash)
     }
