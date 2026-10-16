@@ -7,7 +7,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Next up
 
 1. **P3.1** The Mausund error budget: M2's +3 % from NorKyst (`gauge_gains=M2,…`) together with the overtides that are too weak (M4 0.35×). See Validation.
-2. **P4.6 / P1.5** The 72 h nested 3D day against NorKyst-800 per depth (T, S, u, v at the NorKyst point, Kattholmen and mid-domain); add the **P4.4** heat fluxes only if the drift points to them. See 3D validation.
+2. **P4.6 / P1.5** Finish the 72 h nested 3D day with MET wind (stopped at 32.5 h; resume from its 32 h restart) and answer the day-2 question with `norkyst_profiles_3d`; the first 32 h already point at **P4.4** (surface 0.6–0.7 °C cold, no diurnal heating). See 3D validation.
 3. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
@@ -15,7 +15,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P3.1** Remove M2's +3 % at Mausund (2.6 cm |ΔZ|, the largest error, NorKyst's own) with `froya_real_data gauge_gains=M2,…` so N2 follows; run it with the overtide work, since M4 scales with M2².
 - [ ] **P3.1** Find why the overtides are too weak (M4 0.35×, MS4 0.34×, M6 0.28×): not the station node (2026-10-15); suspects are friction (`manning=` sweep) and the island lee closing the skerry sounds.
 - [ ] **P3.1 / P3.3** The month-long real-domain run (`froya_real_data … hours=720`, or 30+ days on the coastline mesh): resolves N2/Q1, checks long-run stability, mass and no residual currents at rest.
-- [ ] **P3.1** Settle whether the model's island lee near the skerries (M2 current 0.01–0.07 m/s against NorKyst's 0.246) is right, from observed currents (farm-site surveys, IMR/NIVA moorings near Frøya).
+- [ ] **P3.1** Settle whether the model's island lee near the skerries (M2 current 0.01–0.07 m/s against NorKyst's 0.246, ≈ 80° early; our bed 19–26 m at Kattholmen against NorKyst's ≈ 50 m) is right, from observed currents (farm-site surveys, IMR/NIVA moorings near Frøya).
 - [ ] **P3.1** Re-run P3 at 1 km against P2 at 500 m with the relaxed positivity CFL (dt ratio now ≈ 1.3–1.4) and stations interpolated at the gauge.
 - [ ] **P3.1** The 500 m, 15-day harmonic run (≈ 2.5 h) for the constituents at resolution.
 - [ ] **P3.1** Fetch real Kartverket (H, G) for Bergen, Stavanger, Trondheim, Kristiansund (`scripts/kartverket_gauge.sh`); fix the approximate `norwegian_stations` positions (Heimsjø is at 63.425, 9.102).
@@ -180,6 +180,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Decide the 2D `rx0` default, after the map-wide NorKyst current comparison (`output_minutes=60`, `scripts/norkyst_current_comparison.py`).
 - [ ] **P1.3** Make implicit vertical advection (`Hydrostatic3D::with_implicit_vertical_advection`) the library default once the full Frøya mesh has run with it.
 - [ ] **P1.3 / P2.5 / P4.5** Barotropic LTS runs (`ModeSplitIntegrator::with_barotropic_levels`, `froya_real_data bt_levels=2`, 2026-10-16): 2.3× less RHS work against the ideal 3.2× at two levels, from the rate spreading one ring per stage around the thin cliff-shore bands; each element evaluation ≈ 0.19 µs against 0.15 in the global pass (per-pass edge lists collected serially, scattered rows). Also on refined farm meshes (P2.5), where the 20 m elements set `n_bt` for the fjord.
+- [ ] **P1.3** The depth-mean M2 at the NorKyst point grows with depth in 3D (0.045 m/s at the surface, 0.081 at 15 m) where NorKyst's falls (0.27 → 0.24): the surface layers held back (GLS, surface roughness) or the island lee's 3D structure (`notes/3d-validation.md`).
+- [ ] **P1.3** The MET-wind 3D run's step fell from 16–18 s to ≈ 12 s after ≈ 24 h, set by advection and internal waves at (18.8, −21.5) km in 14–22 m water (elements 229, 11912, 5107): what drives it (wind-driven shore currents, a front) and whether it lasts.
 - [ ] **P1.3** Cap or ramp the first 3D steps from rest (`compute_dt` sees no Ω at rest; thin layers need |Ω|Δt/H_z ≤ 1).
 - [ ] **P1.3** The 3D viscous step bound (`element_dt_viscous_swe_2d`) is harsh (ν = 50 m²/s: 0.54 s against 5 s): implicit shear viscosity, or the bound from the operator's spectrum.
 - [ ] **P1.3** What dropping baroclinic pressure in thin-column elements (a one-element coastal band) does to estuarine and wind-driven shore currents, once tides and rivers run in 3D.
@@ -207,7 +209,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Boundaries and nesting (P1.4, P1.5) — [notes/boundaries-nesting.md](notes/boundaries-nesting.md)
 
-- [ ] **P1.5** The real NorKyst 3D nested run exists (the coastline day nests T/S/u/v in `data/mausund_norkyst_3d.nc`); what is missing is the per-depth comparison with the parent (P4.6) and parent files longer than 3 days.
+- [ ] **P1.5** Parent files longer than 3 days for the nested 3D runs (the per-depth comparison is `norkyst_profiles_3d`, P4.6).
 - [ ] **P1.5** A datum for the parent ζ in the library default (NorKyst sits 0.28 m below MSL at Frøya); check whether NorKyst v3 is forced with sea-level pressure (`ib=1` would count the barometer twice).
 - [ ] **P1.4** `BoundaryTides::with_transport_scaling` (`tide_transport=3`) as the default for atlas tides (Mausund sub-domain 8.1 → 4.2 cm); check the full mesh with it.
 - [ ] **P1.4** Blend the bed towards the atlas depths near the open boundary for `BoundaryTides`, as `OceanModelState::blend_bathymetry` does.
@@ -318,7 +320,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: mixing (P4.4) — [notes/3d-mixing.md](notes/3d-mixing.md)
 
-- [ ] **P4.4** Per-column surface heat and freshwater fluxes, Q_net/(ρ₀c_p), from bulk formulae on `AtmosphereReader` fields (one domain buoyancy flux today). Only if the P4.6 NorKyst comparison shows surface-flux drift: over the 3 days of `mausund_norkyst_3d.nc` NorKyst's top 20 m changes 0.01 K net (`notes/3d-mixing.md`). Needs 2 m air temperature, humidity and radiation (`froya_met.nc` has wind and pressure only); SST relaxation to the parent is the cheap alternative.
+- [ ] **P4.4** Per-column surface heat and freshwater fluxes, Q_net/(ρ₀c_p), from bulk formulae on `AtmosphereReader` fields (one domain buoyancy flux today). The P4.6 comparison points to it (2026-10-16): with MET wind the model's domain-mean surface cools 12.16 → 11.73 °C over day 1 while NorKyst's cycles diurnally by ≈ 0.5 °C (11.88 → 12.38 → 12.09), and the top 3 m sit 0.6–0.7 °C cold at all three points (0.4 without wind); over 3 days NorKyst's top 20 m changes only 0.01 K net (`notes/3d-mixing.md`). Needs 2 m air temperature, humidity and radiation (`froya_met.nc` has wind and pressure only); SST relaxation to the parent is the cheap alternative.
 - [ ] **P4.4** Surface stress in thin columns (`with_min_column_depth`) through `G` as τ/ρ₀ (tidal flats get no wind in 3D today).
 - [ ] **P4.4** Wave height for the surface roughness, z₀ₛ ≈ 0.6 H_s per column, from a MyWaveWAM reader or fetch-limited H_s(U₁₀, fetch).
 - [ ] **P4.4** Positivity-safe advected `k`/`ψ` (Zhang–Shu scaling toward the element mean, or a length cap); check on a real run with fronts.
@@ -342,7 +344,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.6** Exact section budgets from the model's own face fluxes, RK-weighted (salt budget off 1–3 % from nodal `H_z u S`); needed for P5.2 farm exchange output.
 - [ ] **P4.6** Periodic meshes: `Mesh2D::elements_at_vertex` has no periodic images, so Kuzmin bounds there are one-sided (also `limiters/swe_2d.rs:260`, `tracer_2d.rs:593`).
 - [ ] **P4.6** The 3D limiter's remaining cost (1.6 ms/call): one buffer of inventory weights per call, T and S in one pass.
-- [ ] **P4.6** Compare the nested coastline 3D run with NorKyst-800 per depth, after the P4.5 pass: hourly T/S/u/v profile output at named points in `froya_real_data` (the NorKyst point, Kattholmen, one mid-domain), a script that interpolates `data/mausund_norkyst_3d.nc` to the same points and depths and writes a per-depth skill table, then 72 h overnight. Does the model reproduce NorKyst's day-2 mixing event (surface −1.2 K, +0.2 PSU) and its current profile, and explain the halved 3D M2 current (P1.3)? Backtest it on the 24 h `output/froya_day/3d_fast` first, as far as that run's output allows.
+- [ ] **P4.6** Finish the 72 h MET-wind run (`output/froya_3day/3d_met`, stopped at 32.5 h by low system memory: `resume=output/froya_3day/3d_met/froya.restart`) and run `norkyst_profiles_3d` on it: does the model reproduce NorKyst's day-2 mixing event (surface −1.2 K, +0.2 PSU, after 30 h)? The harness and the first 32 h are in `notes/3d-validation.md`.
+- [ ] **P4.6** Surface S at Frohavet diverges on day 2 of the MET run: NorKyst freshens 33.44 → 33.21, the model gets saltier 33.52 → 33.59 (bias +0.19): NorKyst's rivers or the boundary S, against the model's mixing?
+- [ ] **P4.6** The lowest S in the MET run fell from 9.4 to 7.8 after ≈ 24 h: find the node (a river source, a pond or a thin column) and whether it is bounded.
 
 ## Operational (P5) — [notes/operational.md](notes/operational.md)
 
