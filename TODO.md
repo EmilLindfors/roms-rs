@@ -7,7 +7,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Next up
 
 1. **P3.1** The Mausund error budget: M2's +3 % from NorKyst (`gauge_gains=M2,…`) together with the overtides that are too weak (M4 0.35×). See Validation.
-2. **P4.5** The coastline 3D day under 200 s per model hour (272 on the 6 h window since the 2026-10-15 depth pass, from 318); the rest needs barotropic LTS, so that multi-day nested 3D runs fit overnight. See 3D numerics.
+2. **P4.5** The coastline 3D day under 200 s per model hour: 214 on the 6 h window since barotropic LTS (2026-10-16; 318 before the depth pass); the rest is in the 3D stages. See 3D numerics.
 3. **P4.6 / P1.5** Then the 72 h nested 3D day against NorKyst-800 per depth (T, S, u, v at the NorKyst point, Kattholmen and mid-domain); add the **P4.4** heat fluxes only if the drift points to them. See 3D validation.
 4. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
@@ -180,7 +180,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Rerun the unsmoothed full-mesh 3-day baseline on current code (without `slopes3d`, ≈ 1–2.5 h) for a like-for-like comparison with the 19 m free depth.
 - [ ] **P1.3** Decide the 2D `rx0` default, after the map-wide NorKyst current comparison (`output_minutes=60`, `scripts/norkyst_current_comparison.py`).
 - [ ] **P1.3** Make implicit vertical advection (`Hydrostatic3D::with_implicit_vertical_advection`) the library default once the full Frøya mesh has run with it.
-- [ ] **P1.3 / P2.5 / P4.5** Local time stepping in 3D: the step is bound by 2.5–3 m sound elements (0.79 s), and the farm's 40 m quads set the fjord's. Run the barotropic pass on `MultirateStepper` with hooks for the filter/DU_avg2 sums (per-element stage weights). On the coastline day the pass is 39 % of the step; measured per element (2026-10-15): power-of-two levels give 3.2× (L = 2), 3.95× (L = 3), 4.1× (L ≥ 4), not the 5.5–6× first estimated, and L ≤ 3 still leaves the filter 6–12 coarse substeps per 16 s step, so its uniform grid is no blocker; DU_avg2 must weight each element's (p, s) contributions by the finest substeps it stands for (`notes/3d-numerics.md` "Depth pass").
+- [ ] **P1.3 / P2.5 / P4.5** Barotropic LTS runs (`ModeSplitIntegrator::with_barotropic_levels`, `froya_real_data bt_levels=2`, 2026-10-16): 2.3× less RHS work against the ideal 3.2× at two levels, from the rate spreading one ring per stage around the thin cliff-shore bands; each element evaluation ≈ 0.19 µs against 0.15 in the global pass (per-pass edge lists collected serially, scattered rows). Also on refined farm meshes (P2.5), where the 20 m elements set `n_bt` for the fjord.
 - [ ] **P1.3** Cap or ramp the first 3D steps from rest (`compute_dt` sees no Ω at rest; thin layers need |Ω|Δt/H_z ≤ 1).
 - [ ] **P1.3** The 3D viscous step bound (`element_dt_viscous_swe_2d`) is harsh (ν = 50 m²/s: 0.54 s against 5 s): implicit shear viscosity, or the bound from the operator's spectrum.
 - [ ] **P1.3** What dropping baroclinic pressure in thin-column elements (a one-element coastal band) does to estuarine and wind-driven shore currents, once tides and rivers run in 3D.
@@ -276,7 +276,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: numerics (P4.2, P4.3, P4.5) — [notes/3d-numerics.md](notes/3d-numerics.md)
 
-- [ ] **P4.5** The coastline 3D day under 200 s per model hour. After the 2026-10-15 depth pass 272 on the 6 h window (1222 ms per 16 s step, from 1430; `notes/3d-numerics.md` "Depth pass"): barotropic pass 472, 3D stages 523 (transport RHS 256, Kuzmin limiter 127, momentum RHS 66), G + its momentum RHS 73, post_process 64. 200 needs ≈ 890 ms: barotropic LTS (the line above) is the one lever of that size; the rest below are 10–90 ms each. Gate: 6–8 h from the 6 h restart, accuracy as in "The coastline day at half the cost". Comes before the P4.6 NorKyst comparison.
+- [ ] **P4.5** The coastline 3D day under 200 s per model hour: 214 on the 6 h window since barotropic LTS (962 ms per 16 s step; `notes/3d-numerics.md` "Depth pass", "Barotropic local time stepping"): 3D stages ≈ 523 (transport RHS 256, Kuzmin limiter 127, momentum RHS 66), barotropic pass 236, G + its momentum RHS 73, post_process 64. ≈ 70 ms more reach 200: the turbulence's advection, the limiter's post-step call, `G` and Ω sharing their layer transports (lines below). Gate: 6–8 h from the 6 h restart, accuracy as in "The coastline day at half the cost". Comes before the P4.6 NorKyst comparison.
 - [ ] **P4.5** The splitter's per-stage data movement is ≈ 15 field passes since 2026-10-15 (from ≈ 60): what is left is one inventory → value conversion and two copies per stage, which kernels reading `H_z φ` would remove.
 - [ ] **P4.5** The forward-backward (AB3-AM4) barotropic fast mode, fewer RHS per substep.
 - [ ] **P4.5** Make SSP-RK(4,3) at the caps `ModeSplitIntegrator`'s own default for wet/dry runs (changes every 3D gate's bits); the coastline day ran a full day on it (387 s per model hour, `notes/geometry-mesh.md` "The coastline day in 3D").

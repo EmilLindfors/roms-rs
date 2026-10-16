@@ -425,25 +425,19 @@ fn limit_level_jumps(mesh: &Mesh2D, level: &mut Vec<u8>, scratch: &mut Vec<u8>) 
     }
 }
 
-/// Elements in decreasing order of `key` (increasing index within a key)
-/// into `order`, and `count[d]` = the number with `key ≥ d` for `d` in
-/// `0..=max_key + 1`: the elements with `key ≥ d` are `order[..count[d]]`.
-fn sort_descending(key: &[u8], max_key: usize, order: &mut Vec<u32>, count: &mut Vec<usize>) {
-    count.clear();
-    count.resize(max_key + 2, 0);
-    for &k in key {
-        count[k as usize] += 1;
-    }
-    // count[d] ← Σ_{r ≥ d} hist[r]; the elements of key r start at count[r + 1]
-    for d in (0..=max_key).rev() {
-        count[d] += count[d + 1];
-    }
-    let mut next: Vec<usize> = (0..=max_key).map(|r| count[r + 1]).collect();
-    order.clear();
-    order.resize(key.len(), 0);
-    for (k, &r) in key.iter().enumerate() {
-        order[next[r as usize]] = k as u32;
-        next[r as usize] += 1;
+/// `lists[d]` = the elements with `key ≥ d`, in increasing order, for `d`
+/// in `0..=max_key`.
+fn at_or_above(key: &[u8], max_key: usize, lists: &mut Vec<Vec<u32>>) {
+    lists.resize_with(max_key + 1, Vec::new);
+    lists.truncate(max_key + 1);
+    for (d, list) in lists.iter_mut().enumerate() {
+        list.clear();
+        list.extend(
+            key.iter()
+                .enumerate()
+                .filter(|&(_, &r)| r as usize >= d)
+                .map(|(k, _)| k as u32),
+        );
     }
 }
 
@@ -496,13 +490,12 @@ pub struct MultirateStepper<S> {
     /// follows, the finest level within s + 1 steps of the RHS stencil (one
     /// per stage)
     rate: Vec<Vec<u8>>,
-    /// Elements by decreasing `rate[s]` and by decreasing level, with the
-    /// counts at or above each depth (see [`sort_descending`]): the active
-    /// elements of a pass are a prefix
-    rate_order: Vec<Vec<u32>>,
-    rate_count: Vec<Vec<usize>>,
-    level_order: Vec<u32>,
-    level_count: Vec<usize>,
+    /// `active[s][d]`: the elements with `rate[s] ≥ d`, the active elements of
+    /// stage s at a finest substep of depth d; `ending[d]`: those with a
+    /// level ≥ d, whose substeps end at depth d. In increasing order, so the
+    /// passes over most of the mesh read it in memory order
+    active: Vec<Vec<Vec<u32>>>,
+    ending: Vec<Vec<u32>>,
     /// Element RHS evaluations of one coarse step with the current levels
     evaluations_per_step: u64,
     /// Stage values 1 to s − 1 (the RHS arguments of stages 2 to s)
@@ -526,10 +519,8 @@ impl<S: Integrable> MultirateStepper<S> {
             element_dt: Vec::new(),
             level: Vec::new(),
             rate: vec![Vec::new(); n_stages],
-            rate_order: vec![Vec::new(); n_stages],
-            rate_count: vec![Vec::new(); n_stages],
-            level_order: Vec::new(),
-            level_count: Vec::new(),
+            active: vec![Vec::new(); n_stages],
+            ending: Vec::new(),
             evaluations_per_step: 0,
             values: Vec::new(),
             last: None,
@@ -590,20 +581,14 @@ impl<S: Integrable> MultirateStepper<S> {
     fn sort_by_rates(&mut self) {
         let finest = self.finest;
         self.evaluations_per_step = self.rate.iter().flatten().map(|&r| 1u64 << r).sum();
-        for s in 0..self.rate.len() {
-            sort_descending(
-                &self.rate[s],
-                finest,
-                &mut self.rate_order[s],
-                &mut self.rate_count[s],
-            );
+        for (lists, key) in self
+            .active
+            .iter_mut()
+            .chain(std::iter::once(&mut self.ending))
+            .zip(self.rate.iter().chain(std::iter::once(&self.level)))
+        {
+            at_or_above(key, finest, lists);
         }
-        sort_descending(
-            &self.level,
-            finest,
-            &mut self.level_order,
-            &mut self.level_count,
-        );
     }
 
     /// Level of every element from the last [`Self::assign_levels`].
@@ -621,23 +606,31 @@ impl<S: Integrable> MultirateStepper<S> {
         self.stats
     }
 
-    /// One coarse step of `dt` from time `t`, with the levels of the last
-    /// [`Self::assign_levels`]. `dt` may be shorter than the step it returned
-    /// (all levels shrink with it).
-    pub fn step(&mut self, local: &dyn LocalTimeStepping<S>, state: &mut S, t: f64, dt: f64) {
+    /// The finest level whose substeps the stage-`stage` RHS of every element
+    /// follows (0-based stages): its own level, refined by its RHS stencil's
+    /// within `stage + 1` steps. An evaluation of element k's stage `stage`
+    /// stands for `2^(L − rates(stage)[k])` of the `2^L` finest substeps.
+    pub fn rates(&self, stage: usize) -> &[u8] {
+        &self.rate[stage]
+    }
+
+    /// The passes of one coarse step of `dt` from time `t`, with the levels
+    /// of the last [`Self::assign_levels`], in order, to `pass`: for every
+    /// finest substep, each stage of the elements whose RHS changes there,
+    /// then the end of the substeps that end there.
+    ///
+    /// A stage writes its value into the buffer of its stage (the RHS
+    /// argument of the next stage; stage 0 reads the substep start), the
+    /// last into a buffer of its own, summed into the substep's result as
+    /// its [`ElementStage::accumulate`] says. [`MultiratePass::Finish`] then
+    /// makes the result the elements' state. [`Self::step`] is this schedule
+    /// on a [`LocalTimeStepping`] module; the mode splitter's barotropic pass
+    /// runs it with its own element stages.
+    pub fn schedule(&self, t: f64, dt: f64, mut pass: impl FnMut(MultiratePass<'_>)) {
         let finest = self.finest;
         let stages = self.scheme.stages();
         let n_stages = stages.len();
         let (level, rate) = (&self.level, &self.rate);
-        let (rate_order, rate_count) = (&self.rate_order, &self.rate_count);
-        let (level_order, level_count) = (&self.level_order, &self.level_count);
-        if self.values.len() != n_stages - 1 {
-            self.values = vec![state.clone(); n_stages - 1];
-        }
-        let values = &mut self.values;
-        let last = self.last.get_or_insert_with(|| state.clone());
-        let acc = self.acc.get_or_insert_with(|| state.clone());
-
         let step_of = |l: u8| dt / (1u64 << l) as f64;
         for p in 0..1usize << finest {
             let d = depth(p, finest);
@@ -648,7 +641,6 @@ impl<S: Integrable> MultirateStepper<S> {
                 let q = p >> (finest - l as usize);
                 (t + q as f64 * dt_l, dt_l)
             };
-
             for (s, stage) in stages.iter().enumerate() {
                 // Stage s + 1 = start·S + input·Yₛ + βΔt_ℓ F(Yₛ), with Y₀ = S
                 let plan = |k: usize| {
@@ -662,21 +654,22 @@ impl<S: Integrable> MultirateStepper<S> {
                     }
                 };
                 // The elements whose stage-(s + 1) RHS follows a level ≥ d
-                let active = &rate_order[s][..rate_count[s][d]];
-                let (done, rest) = values.split_at_mut(s);
-                let input: &S = if s == 0 { &*state } else { &done[s - 1] };
+                let elements = &self.active[s][d];
                 if s + 1 < n_stages {
-                    local.stage_where(state, input, active, &plan, &mut rest[0], None);
+                    pass(MultiratePass::Stage {
+                        stage: s,
+                        elements,
+                        plan: &plan,
+                    });
                     continue;
                 }
                 // The last stage, H: the substep result is the mean of H over
                 // its 2^(r − ℓ) blocks; a block starting with the substep
                 // restarts the sum
-                local.stage_where(
-                    state,
-                    input,
-                    active,
-                    &|k| {
+                pass(MultiratePass::Stage {
+                    stage: s,
+                    elements,
+                    plan: &|k| {
                         let blocks = 1u64 << (rate[s][k] - level[k]);
                         let first = level[k] as usize >= d;
                         ElementStage {
@@ -684,21 +677,69 @@ impl<S: Integrable> MultirateStepper<S> {
                             ..plan(k)
                         }
                     },
-                    last,
-                    Some(&mut *acc),
-                );
+                });
             }
-
             // Substeps ending here
             let next = depth(p + 1, finest);
-            local.finish_where(state, acc, &level_order[..level_count[next]]);
+            pass(MultiratePass::Finish {
+                elements: &self.ending[next],
+            });
         }
+    }
 
+    /// One coarse step of `dt` from time `t`, with the levels of the last
+    /// [`Self::assign_levels`]. `dt` may be shorter than the step it returned
+    /// (all levels shrink with it).
+    pub fn step(&mut self, local: &dyn LocalTimeStepping<S>, state: &mut S, t: f64, dt: f64) {
+        let n_stages = self.scheme.n_stages();
+        if self.values.len() != n_stages - 1 {
+            self.values = vec![state.clone(); n_stages - 1];
+        }
+        let mut values = std::mem::take(&mut self.values);
+        let mut last = self.last.take().unwrap_or_else(|| state.clone());
+        let mut acc = self.acc.take().unwrap_or_else(|| state.clone());
+        self.schedule(t, dt, |pass| match pass {
+            MultiratePass::Stage {
+                stage: s,
+                elements,
+                plan,
+            } => {
+                let (done, rest) = values.split_at_mut(s);
+                let input: &S = if s == 0 { &*state } else { &done[s - 1] };
+                if s + 1 < n_stages {
+                    local.stage_where(state, input, elements, plan, &mut rest[0], None);
+                } else {
+                    local.stage_where(state, input, elements, plan, &mut last, Some(&mut acc));
+                }
+            }
+            MultiratePass::Finish { elements } => local.finish_where(state, &acc, elements),
+        });
+        (self.values, self.last, self.acc) = (values, Some(last), Some(acc));
+        self.count_step();
+    }
+
+    /// Count one coarse step of a [`Self::schedule`] run by the caller.
+    pub fn count_step(&mut self) {
+        let n_stages = self.scheme.n_stages() as u64;
         self.stats.steps += 1;
         self.stats.element_evaluations += self.evaluations_per_step;
-        self.stats.global_evaluations += (n_stages * self.level.len()) as u64 * (1u64 << finest);
-        self.stats.finest_level = self.stats.finest_level.max(finest);
+        self.stats.global_evaluations += n_stages * self.level.len() as u64 * (1u64 << self.finest);
+        self.stats.finest_level = self.stats.finest_level.max(self.finest);
     }
+}
+
+/// One pass of [`MultirateStepper::schedule`].
+pub enum MultiratePass<'a> {
+    /// Stage `stage` (0-based) of the listed (distinct) elements, element k
+    /// as `plan(k)` says (its time, its Shu–Osher weights, and for the last
+    /// stage how it is summed into the substep's result).
+    Stage {
+        stage: usize,
+        elements: &'a [u32],
+        plan: &'a (dyn Fn(usize) -> ElementStage + Sync),
+    },
+    /// The substeps of the listed elements end: their result is their state.
+    Finish { elements: &'a [u32] },
 }
 
 #[cfg(test)]
@@ -744,21 +785,16 @@ mod tests {
     }
 
     #[test]
-    fn descending_sort_gives_prefixes_by_key() {
+    fn lists_hold_the_elements_at_or_above_each_key_in_order() {
         let key = [0u8, 2, 1, 2, 0, 3];
-        let (mut order, mut count) = (Vec::new(), Vec::new());
-        sort_descending(&key, 3, &mut order, &mut count);
-        assert_eq!(order, [5, 1, 3, 2, 0, 4]);
-        assert_eq!(count, [6, 4, 3, 1, 0]);
-        for d in 0..=4 {
-            let mut prefix: Vec<u32> = order[..count[d]].to_vec();
-            prefix.sort();
-            let expected: Vec<u32> = (0..6)
-                .filter(|&k| key[k] as usize >= d)
-                .map(|k| k as u32)
-                .collect();
-            assert_eq!(prefix, expected, "d = {d}");
-        }
+        let mut lists = Vec::new();
+        at_or_above(&key, 3, &mut lists);
+        assert_eq!(
+            lists,
+            [vec![0, 1, 2, 3, 4, 5], vec![1, 2, 3, 5], vec![1, 3, 5], vec![5]]
+        );
+        at_or_above(&key[..2], 1, &mut lists);
+        assert_eq!(lists, [vec![0, 1], vec![1]]);
     }
 
     #[test]

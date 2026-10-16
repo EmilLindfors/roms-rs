@@ -960,6 +960,163 @@ mod tests {
         }
     }
 
+    /// The barotropic pass on local time steps
+    /// (`ModeSplitIntegrator::with_barotropic_levels`) at one level (a uniform
+    /// mesh: every element has the same step) is the global pass bit for
+    /// bit, with both substep schemes.
+    #[test]
+    fn one_barotropic_level_is_the_global_pass_bit_for_bit() {
+        for scheme in [SspScheme::Rk3, SspScheme::Rk43] {
+            let mut seiche = Seiche::new(10, 2, 10.0);
+            seiche.amplitude = 0.5;
+            let physics = seiche.hydrostatic();
+            let dt = seiche.period() / 50.0;
+            let run = |integrator: &mut ModeSplitIntegrator| {
+                let mut state = seiche.state_3d(&physics);
+                for n in 0..5 {
+                    integrator.step(&mut state, &physics, dt, n as f64 * dt);
+                }
+                state
+            };
+            let mut global = ModeSplitIntegrator::new().with_barotropic_scheme(scheme);
+            let mut local = ModeSplitIntegrator::new()
+                .with_barotropic_scheme(scheme)
+                .with_barotropic_levels(3);
+            let (a, b) = (run(&mut global), run(&mut local));
+            let stats = local.barotropic_multirate_stats().expect("local time steps");
+            assert_eq!(stats.finest_level, 0, "{scheme:?}: test regime");
+            let bits = |x: &[f64]| x.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            for (name, x, y) in [
+                ("eta", &a.eta.data, &b.eta.data),
+                ("ubar", &a.ubar.data, &b.ubar.data),
+                ("u", &a.u, &b.u),
+                ("temp", &a.temp, &b.temp),
+            ] {
+                assert_eq!(bits(x), bits(y), "{scheme:?}: {name}");
+            }
+        }
+    }
+
+    /// On a mesh graded 16:1 the barotropic pass takes local time steps on
+    /// several levels, and its DU_avg2 is still exactly the transport that
+    /// moved the free surface (`η̄ − ηⁿ = −Δt ∇·DU_avg2` at every node), the
+    /// volume is conserved, and the seiche is the global pass's to the
+    /// accuracy of the filter on the coarse substeps and of the multirate
+    /// scheme.
+    #[test]
+    fn barotropic_transport_moves_the_free_surface_on_local_time_steps() {
+        let cases = [SWEFormulation2D::Standard, SWEFormulation2D::EntropyStable]
+            .into_iter()
+            .flat_map(|f| [SspScheme::Rk3, SspScheme::Rk43].map(|s| (f, s)));
+        for (formulation, scheme) in cases {
+            // Wide enough that the elements' lengths set their steps
+            let mut seiche = Seiche::new(16, 2, 200.0);
+            seiche.amplitude = 0.5;
+            // Element lengths from 1 to 16 (geometric)
+            let (n, length) = (16, seiche.length);
+            let ratio = 16.0_f64.powf(1.0 / (n - 1) as f64);
+            let mut mesh = (*seiche.mesh).clone();
+            for v in &mut mesh.vertices {
+                let i = v[0] / length * n as f64;
+                v[0] = length * (ratio.powf(i) - 1.0) / (ratio.powi(n) - 1.0);
+            }
+            seiche.mesh = Arc::new(mesh);
+            seiche.geom = Arc::new(GeometricFactors2D::compute(&seiche.mesh, &seiche.ops));
+            let physics = hydrostatic(
+                &seiche.mesh,
+                &seiche.ops,
+                &seiche.geom,
+                &seiche.bathymetry,
+                seiche.swe_with(formulation),
+                no_stress(),
+                1e-4,
+                0.0,
+            );
+            let dt = seiche.period() / 20.0;
+            let mut div = DGSolution2D::new(seiche.mesh.n_elements, seiche.ops.n_nodes);
+            let volume = |eta: &[f64]| {
+                let mut field = DGSolution2D::new(seiche.mesh.n_elements, seiche.ops.n_nodes);
+                field.data.copy_from_slice(eta);
+                field.integrate(&seiche.ops, &seiche.geom)
+            };
+            let mut global = ModeSplitIntegrator::new().with_barotropic_scheme(scheme);
+            let mut local = ModeSplitIntegrator::new()
+                .with_barotropic_scheme(scheme)
+                .with_barotropic_levels(4);
+            let mut reference = seiche.state_3d(&physics);
+            let mut state = seiche.state_3d(&physics);
+            let volume0 = volume(&state.eta.data);
+            // The round-off scale of the volume (∫η is near zero)
+            let scale = volume(&state.eta.data.iter().map(|e| e.abs()).collect::<Vec<_>>());
+            for n in 0..10 {
+                let eta0 = state.eta.data.clone();
+                local.step(&mut state, &physics, dt, n as f64 * dt);
+                global.step(&mut reference, &physics, dt, n as f64 * dt);
+                let transport = local.barotropic_transport().expect("after a step");
+                transport.divergence_into(
+                    &seiche.ops,
+                    &seiche.geom,
+                    physics.metric_form(),
+                    &mut div,
+                );
+                let (mut change, mut residual) = (0.0_f64, 0.0_f64);
+                for ((eta, eta0), d) in state.eta.data.iter().zip(&eta0).zip(&div.data) {
+                    change = change.max((eta - eta0).abs());
+                    residual = residual.max((eta - eta0 + dt * d).abs());
+                }
+                let case = format!("{formulation:?}, {scheme:?}, step {n}");
+                assert!(
+                    residual < 1e-11 * change,
+                    "{case}: η̄ − ηⁿ + Δt∇·DU_avg2 = {residual:.2e} (η change {change:.2e})"
+                );
+                let lost = (volume(&state.eta.data) - volume0).abs() / scale;
+                assert!(lost < 1e-12, "{case}: volume changed by {lost:.2e}");
+                // Both sides of every interior face moved the same water
+                // (the 3D layer fluxes take it from both)
+                let nfn = seiche.ops.n_face_nodes;
+                let at = |k: usize, f: usize, i: usize| transport.face[(k * 4 + f) * nfn + i];
+                let (mut mismatch, mut largest) = (0.0_f64, 0.0_f64);
+                for k in 0..seiche.mesh.n_elements {
+                    for f in 0..4 {
+                        let Some(nb) = seiche.mesh.neighbor(ElementIndex::new(k), f) else {
+                            continue;
+                        };
+                        for i in 0..nfn {
+                            let (a, b) = (at(k, f, i), at(nb.element, nb.face, nfn - 1 - i));
+                            mismatch = mismatch.max((a + b).abs());
+                            largest = largest.max(a.abs());
+                        }
+                    }
+                }
+                assert!(
+                    mismatch < 1e-12 * largest,
+                    "{case}: face fluxes differ across a face by {mismatch:.2e} ({largest:.2e})"
+                );
+            }
+            let stats = local.barotropic_multirate_stats().expect("local time steps");
+            assert!(stats.finest_level >= 2, "{scheme:?}: {stats:?}");
+            assert!(stats.speedup() > 1.5, "{scheme:?}: {stats:?}");
+            let largest = |x: &[f64]| x.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            let difference: Vec<f64> = state
+                .eta
+                .data
+                .iter()
+                .zip(&reference.eta.data)
+                .map(|(a, b)| a - b)
+                .collect();
+            let relative = largest(&difference) / largest(&reference.eta.data);
+            // 2.0e-3 after half a period (the global pass with twice its
+            // substeps moves 3.5e-5). About half is the filter on 6 coarse
+            // substeps against 47 (amplitude lost per step at ωΔt = 0.31:
+            // 1.4e-4 against 3.2e-5; for a tide ω²-times smaller), the rest
+            // the multirate scheme's error across levels (`time::multirate`)
+            assert!(
+                relative < 3e-3,
+                "{formulation:?}, {scheme:?}: η off the global pass by {relative:.2e}"
+            );
+        }
+    }
+
     /// A closed channel over a bed rising from 12 m to 4 m, a 0.5 m seiche
     /// (so the layers thin and thicken by up to an eighth), sheared columns,
     /// and the T/S-dependent linear EOS.

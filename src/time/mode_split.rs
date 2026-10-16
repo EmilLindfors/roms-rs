@@ -84,6 +84,7 @@ use crate::operators::{DGOperators2D, GeometricFactors2D};
 use crate::physics::PhysicsModule;
 use crate::profiling;
 use crate::solver::core::blocks::{for_each_block, reduce_blocks, update_values, update_with};
+use crate::solver::rhs::ElementRhsMassThen;
 use crate::solver::rhs::subcells::subcell_interfaces;
 use crate::solver::rhs::{
     BarotropicFlux, MetricForm, from_inventory, subcell_divergence_element, to_inventory,
@@ -94,7 +95,12 @@ use crate::solver::state::Solution3D;
 use crate::solver::state::{SWE_VAR_H, SWE_VAR_HU, SWE_VAR_HV};
 use crate::solver::{DGSolution2D, SWESolution2D};
 use crate::source::{RiverInflow, RiverSources};
+use crate::solver::core::disjoint::DisjointChunks;
+use crate::solver::rhs::ElementMassFluxes;
+use crate::time::multirate::{Multirate, MultiratePass, MultirateStats, MultirateStepper};
 use crate::time::{IntegratorInfo, SSPRK3, SspScheme, StageWorkspace, TimeIntegrator};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 use std::cell::RefCell;
@@ -164,17 +170,55 @@ pub trait BarotropicPhysics: PhysicsModule<SWESolution2D> {
     fn finishes_by_element(&self) -> bool;
 
     /// [`PhysicsModule::implicit_damping`] of a stage value over `dt` with
-    /// rates frozen at the stage's input `from`, then
-    /// [`PhysicsModule::post_process`], of element `k` alone (its rows), bit
-    /// for bit what the whole-state operations give it. Returns the
+    /// rates frozen at the stage's input `from`, of element `k` alone (its
+    /// rows), bit for bit what the whole-state operation gives it.
+    fn damp_element(&self, k: usize, stage: [&mut [f64]; 3], from: [&[f64]; 3], dt: f64);
+
+    /// [`PhysicsModule::post_process`] of element `k` alone (its rows), bit
+    /// for bit what the whole-state operation gives it. Returns the
     /// negative-depth clips, for [`Self::record_clips`].
+    fn post_process_element(&self, k: usize, rows: [&mut [f64]; 3]) -> usize;
+
+    /// [`Self::damp_element`], then [`Self::post_process_element`].
     fn finish_stage_element(
         &self,
         k: usize,
-        stage: [&mut [f64]; 3],
+        mut stage: [&mut [f64]; 3],
         from: [&[f64]; 3],
         dt: f64,
-    ) -> usize;
+    ) -> usize {
+        let [h, hu, hv] = &mut stage;
+        self.damp_element(k, [&mut **h, &mut **hu, &mut **hv], from, dt);
+        self.post_process_element(k, stage)
+    }
+
+    /// [`Self::compute_rhs_mass_fluxes_into`] for the listed (distinct)
+    /// elements only, element k at `time_of(k)`, each followed in the same
+    /// pass by `then(k, its rows of out, its mass fluxes)`: the barotropic
+    /// pass with local time stepping
+    /// ([`ModeSplitIntegrator::with_barotropic_levels`]). Needs
+    /// [`PhysicsModule::local_time_stepping`].
+    fn stage_subset_then(
+        &self,
+        input: &SWESolution2D,
+        elements: &[u32],
+        time_of: &(dyn Fn(usize) -> f64 + Sync),
+        out: &mut SWESolution2D,
+        then: ElementRhsMassThen,
+    );
+
+    /// [`Self::mass_sources_into`] of element `k` alone: its sources into
+    /// `out` (its `n_nodes` values), and whether there are any (`false` may
+    /// also mean that the element's are all zero).
+    fn mass_source_element(
+        &self,
+        _state: &SWESolution2D,
+        _k: usize,
+        _time: f64,
+        _out: &mut [f64],
+    ) -> bool {
+        false
+    }
 
     /// Count `clips` from [`Self::finish_stage_element`] as
     /// [`PhysicsModule::post_process`] counts its own.
@@ -737,6 +781,250 @@ impl BarotropicFilter {
     }
 }
 
+/// The barotropic pass on local time steps
+/// ([`ModeSplitIntegrator::with_barotropic_levels`]): the levels and the
+/// stage buffers of [`MultirateStepper::schedule`].
+struct BarotropicMultirate {
+    stepper: MultirateStepper<SWESolution2D>,
+    /// The stage values the next stages read (all stages but the last)
+    values: Vec<SWESolution2D>,
+    /// The last stage's value, and the substeps' results
+    last: SWESolution2D,
+    acc: SWESolution2D,
+    /// Each river's DU_avg2 term of one stage pass (its element's)
+    river_terms: Mutex<Vec<f64>>,
+}
+
+/// One coarse substep of the barotropic pass on local time steps.
+#[derive(Clone, Copy)]
+struct CoarseStep<'a> {
+    t: f64,
+    dt: f64,
+    /// The filter's secondary weight `W_m` of the substep.
+    w_secondary: f64,
+    n_bt: usize,
+    scheme: SspScheme,
+    forcing: &'a SWESolution2D,
+    drag: StageDrag<'a>,
+    rivers: Option<&'a RiverSources>,
+}
+
+/// Phase timers of the multirate pass's stages.
+const STAGE_SCOPES: [&str; 4] = [
+    "bt lts: stage 1",
+    "bt lts: stage 2",
+    "bt lts: stage 3",
+    "bt lts: stage 4",
+];
+
+/// Most nodes of an element ([`BarotropicPhysics::mass_source_element`]'s
+/// buffer): order 8.
+const MAX_ELEMENT_NODES: usize = 81;
+
+impl BarotropicMultirate {
+    fn new(max_levels: usize, scheme: SspScheme, like: &SWESolution2D, n_rivers: usize) -> Self {
+        Self {
+            stepper: MultirateStepper::new(max_levels, scheme),
+            values: vec![like.clone(); scheme.n_stages() - 1],
+            last: like.clone(),
+            acc: like.clone(),
+            river_terms: Mutex::new(vec![0.0; n_rivers]),
+        }
+    }
+
+    /// One coarse substep of `q`, with its stages' terms summed into
+    /// `transport`; returns the negative-depth clips.
+    ///
+    /// Element k's stage s, evaluated at finest substeps whose RHS rate is
+    /// `r = rates(s)[k]`, stands for `2^(L − r)` of the `2^L` finest
+    /// substeps: its transport enters DU_avg2 with `W_m b_s / (n_bt 2^r)`,
+    /// the share of the baroclinic step it moves the element's water over
+    /// (`b_s` the base scheme's weight). An element's change over the coarse
+    /// substep is `Δt Σ_s b_s 2^(−r) Σ F_s` over its evaluations, so the sums
+    /// keep the nodal identity; and a face's flux at a finest substep is the
+    /// same from both sides (see [`crate::time::multirate`]), so the sums
+    /// agree across every face.
+    fn coarse_step<B: BarotropicPhysics>(
+        &mut self,
+        barotropic: &B,
+        q: &mut SWESolution2D,
+        step: CoarseStep<'_>,
+        transport: &mut BarotropicTransport,
+    ) -> usize {
+        let stages = barotropic_stages(step.scheme);
+        let n_stages = stages.len();
+        let (ne, nn) = (q.n_elements, q.n_nodes);
+        assert!(nn <= MAX_ELEMENT_NODES, "{nn} nodes per element");
+        let n_face = transport.face.len() / ne.max(1);
+        let n_sub = transport.subcell.len() / ne.max(1);
+        let clips = AtomicUsize::new(0);
+        let Self {
+            stepper,
+            values,
+            last,
+            acc,
+            river_terms,
+        } = self;
+        let schedule: &MultirateStepper<SWESolution2D> = stepper;
+        let n_rivers = step.rivers.map_or(0, RiverSources::len);
+        schedule.schedule(step.t, step.dt, |pass| match pass {
+            MultiratePass::Stage {
+                stage: s,
+                elements,
+                plan,
+            } => {
+                let base: &SWESolution2D = q;
+                let (done, rest) = values.split_at_mut(s);
+                let input: &SWESolution2D = if s == 0 { base } else { &done[s - 1] };
+                let out: &mut SWESolution2D = if s + 1 < n_stages {
+                    &mut rest[0]
+                } else {
+                    &mut *last
+                };
+                let (b_s, rates) = (stages[s].weight, schedule.rates(s));
+                let [acc_h, acc_hu, acc_hv] = &mut acc.data;
+                let acc_rows = [
+                    DisjointChunks::new(acc_h, nn),
+                    DisjointChunks::new(acc_hu, nn),
+                    DisjointChunks::new(acc_hv, nn),
+                ];
+                let sums = [
+                    DisjointChunks::new(&mut transport.hu.data, nn),
+                    DisjointChunks::new(&mut transport.hv.data, nn),
+                    DisjointChunks::new(&mut transport.mass_source.data, nn),
+                ];
+                let face_sums = (n_face > 0).then(|| DisjointChunks::new(&mut transport.face, n_face));
+                let subcell_sums =
+                    (n_sub > 0).then(|| DisjointChunks::new(&mut transport.subcell, n_sub));
+                river_terms
+                    .get_mut()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .fill(0.0);
+                let shared_terms: &Mutex<Vec<f64>> = river_terms;
+                let then = |k: usize, [h, hu, hv]: [&mut [f64]; 3], mass: ElementMassFluxes<'_>| {
+                    let stage = plan(k);
+                    let nodes = k * nn..(k + 1) * nn;
+                    let c = step.w_secondary * b_s / (step.n_bt as f64 * (1u64 << rates[k]) as f64);
+                    if let Some(rivers) = step.rivers {
+                        for i in (0..n_rivers).filter(|&i| rivers.element(i).as_usize() == k) {
+                            let discharge = rivers.discharge(i, stage.time);
+                            let rate = discharge * rivers.inv_area(i);
+                            h.iter_mut().for_each(|h| *h += rate);
+                            shared_terms.lock().unwrap_or_else(|e| e.into_inner())[i] =
+                                c * discharge;
+                        }
+                    }
+                    // The stage value, as `SSPRK3`/`SSPRK43` combine it, from
+                    // the rate RHS + G (in the rows, which become the value)
+                    for (var, row) in [&mut *h, &mut *hu, &mut *hv].into_iter().enumerate() {
+                        let start = &base.data[var][nodes.clone()];
+                        let x = &input.data[var][nodes.clone()];
+                        let forcing = &step.forcing.data[var][nodes.clone()];
+                        for i in 0..nn {
+                            let f = row[i] + forcing[i];
+                            let mut v = if stage.a != 0.0 { stage.a * start[i] } else { 0.0 };
+                            if stage.b != 0.0 {
+                                v += stage.b * x[i];
+                            }
+                            if stage.c != 0.0 {
+                                v += stage.c * f;
+                            }
+                            row[i] = v;
+                        }
+                    }
+                    step.drag.damp(k, nn, h, hu, hv, stage.c);
+                    // SAFETY: the elements of a pass are distinct, so each
+                    // element's rows once
+                    let [sum_hu, sum_hv, sum_mass] = sums.each_ref().map(|s| unsafe { s.chunk(k) });
+                    for (sum, var) in [(sum_hu, SWE_VAR_HU), (sum_hv, SWE_VAR_HV)] {
+                        for (a, &b) in sum.iter_mut().zip(&input.data[var][nodes.clone()]) {
+                            *a += c * b;
+                        }
+                    }
+                    if let Some(face_sums) = &face_sums {
+                        let sum = unsafe { face_sums.chunk(k) };
+                        for (a, &b) in sum.iter_mut().zip(mass.face) {
+                            *a += c * b;
+                        }
+                    }
+                    if let Some(subcell_sums) = &subcell_sums {
+                        // NaN (a stage without subcells) stays NaN
+                        let sum = unsafe { subcell_sums.chunk(k) };
+                        for (a, &b) in sum.iter_mut().zip(mass.subcell) {
+                            *a += c * b;
+                        }
+                    }
+                    let mut source = [0.0; MAX_ELEMENT_NODES];
+                    if barotropic.mass_source_element(input, k, stage.time, &mut source[..nn]) {
+                        for (a, &b) in sum_mass.iter_mut().zip(&source[..nn]) {
+                            *a += c * b;
+                        }
+                    }
+                    let from = [0, 1, 2].map(|var| &input.data[var][nodes.clone()]);
+                    match stage.accumulate {
+                        None => {
+                            let clipped = barotropic.finish_stage_element(k, [h, hu, hv], from, stage.c);
+                            if clipped > 0 {
+                                clips.fetch_add(clipped, Ordering::Relaxed);
+                            }
+                        }
+                        Some((w, keep)) => {
+                            barotropic.damp_element(k, [&mut *h, &mut *hu, &mut *hv], from, stage.c);
+                            let sum = acc_rows.each_ref().map(|r| unsafe { r.chunk(k) });
+                            for (sum, row) in sum.into_iter().zip([&*h, &*hu, &*hv]) {
+                                for (s, &v) in sum.iter_mut().zip(row.iter()) {
+                                    *s = if keep != 0.0 { w * v + keep * *s } else { w * v };
+                                }
+                            }
+                        }
+                    }
+                };
+                profiling::scope(STAGE_SCOPES[s.min(3)], || {
+                    barotropic.stage_subset_then(input, elements, &|k| plan(k).time, out, &then)
+                });
+                let terms = river_terms.get_mut().unwrap_or_else(|e| e.into_inner());
+                for (mean, &term) in transport.discharge.iter_mut().zip(terms.iter()) {
+                    *mean += term;
+                }
+            }
+            MultiratePass::Finish { elements } => {
+                let finish_scope = profiling::start();
+                let [h, hu, hv] = &mut q.data;
+                let rows = [
+                    DisjointChunks::new(h, nn),
+                    DisjointChunks::new(hu, nn),
+                    DisjointChunks::new(hv, nn),
+                ];
+                let acc: &SWESolution2D = acc;
+                let finish = |&k: &u32| {
+                    let k = k as usize;
+                    // SAFETY: the listed elements are distinct
+                    let mut rows = rows.each_ref().map(|r| unsafe { r.chunk(k) });
+                    for (var, row) in rows.iter_mut().enumerate() {
+                        row.copy_from_slice(&acc.data[var][k * nn..(k + 1) * nn]);
+                    }
+                    barotropic.post_process_element(k, rows)
+                };
+                #[cfg(feature = "parallel")]
+                let clipped: usize = if elements.len() >= 64 {
+                    use rayon::prelude::*;
+                    elements.par_iter().map(finish).sum()
+                } else {
+                    elements.iter().map(finish).sum()
+                };
+                #[cfg(not(feature = "parallel"))]
+                let clipped: usize = elements.iter().map(finish).sum();
+                if clipped > 0 {
+                    clips.fetch_add(clipped, Ordering::Relaxed);
+                }
+                profiling::stop("bt lts: finish", finish_scope);
+            }
+        });
+        stepper.count_step();
+        clips.into_inner()
+    }
+}
+
 /// Field buffers sized on the first step and reused afterwards.
 struct Buffers {
     /// Horizontal momentum tendency `R₃D` at `tⁿ`, reused as the first 3D stage.
@@ -840,6 +1128,10 @@ pub struct ModeSplitIntegrator {
     /// The SSP scheme of the barotropic substeps.
     barotropic_scheme: SspScheme,
     min_substeps: usize,
+    /// Most levels of local time stepping in the barotropic pass (0: global
+    /// substeps), see [`Self::with_barotropic_levels`].
+    barotropic_levels: usize,
+    multirate: Option<BarotropicMultirate>,
     filter: Option<BarotropicFilter>,
     buffers: Option<Buffers>,
     stages_3d: StageWorkspace<Solution3D>,
@@ -866,6 +1158,8 @@ impl ModeSplitIntegrator {
             barotropic_cfl: Self::DEFAULT_BAROTROPIC_CFL,
             barotropic_scheme: SspScheme::Rk3,
             min_substeps: MIN_BAROTROPIC_SUBSTEPS,
+            barotropic_levels: 0,
+            multirate: None,
             filter: None,
             buffers: None,
             stages_3d: StageWorkspace::new(),
@@ -891,6 +1185,40 @@ impl ModeSplitIntegrator {
     pub fn with_barotropic_scheme(mut self, scheme: SspScheme) -> Self {
         self.barotropic_scheme = scheme;
         self
+    }
+
+    /// Step the barotropic pass with local time stepping
+    /// ([`MultirateStepper`], on the barotropic scheme): every element takes
+    /// `2^ℓ` substeps of its own per substep of the pass, `ℓ ≤ max_levels`,
+    /// so the few elements with the smallest stable step (steep shores, a
+    /// farm's small elements) no longer set the substep of all. 0 (the
+    /// default) takes global substeps.
+    ///
+    /// The filter and DU_avg2 work on the coarse substeps, at least
+    /// [`Self::with_min_substeps`] of them per baroclinic step (fewer levels
+    /// are used where the coarse substep would be longer). Each element's
+    /// RHS evaluations enter DU_avg2 with the share of the coarse substep
+    /// they stand for, so the barotropic transport moves the free surface
+    /// as the pass did, node by node, and is the same on both sides of every
+    /// face (see [`BarotropicTransport`]). One level is the global pass, bit
+    /// for bit. Needs a 2D module with element-local operations
+    /// ([`PhysicsModule::local_time_stepping`]); without them the pass takes
+    /// global substeps.
+    pub fn with_barotropic_levels(mut self, max_levels: usize) -> Self {
+        assert!(
+            max_levels <= Multirate::<SSPRK3>::MAX_LEVELS,
+            "at most {} levels",
+            Multirate::<SSPRK3>::MAX_LEVELS
+        );
+        self.barotropic_levels = max_levels;
+        self.multirate = None;
+        self
+    }
+
+    /// Work counts of the barotropic pass's local time stepping so far
+    /// (`None` before its first step, or without it).
+    pub fn barotropic_multirate_stats(&self) -> Option<MultirateStats> {
+        self.multirate.as_ref().map(|m| m.stepper.stats())
     }
 
     /// Use at least `n` barotropic substeps per baroclinic step, even when the
@@ -1023,9 +1351,33 @@ impl ModeSplitIntegrator {
         history.step_average(dt, g_term);
         to_transport(state, bathymetry, q);
 
-        // 2. One filtered barotropic pass
-        let dt_bt_max =
-            barotropic.compute_dt_ssp(q, self.barotropic_cfl, Some(self.barotropic_scheme));
+        // 2. One filtered barotropic pass, on local time steps if asked for
+        // (the levels of the step's start state, as the global substep is)
+        let local = (self.barotropic_levels > 0)
+            .then(|| barotropic.local_time_stepping())
+            .flatten()
+            .filter(|local| local.is_element_local());
+        let (multirate, dt_bt_max) = match local {
+            Some(local) => {
+                let (levels, scheme) = (self.barotropic_levels, self.barotropic_scheme);
+                let multirate = self
+                    .multirate
+                    .get_or_insert_with(|| BarotropicMultirate::new(levels, scheme, q, n_rivers));
+                // Its coarse step
+                let dt_coarse = multirate.stepper.assign_levels(
+                    local,
+                    barotropic.mesh(),
+                    q,
+                    self.barotropic_cfl,
+                    Some(dt / self.min_substeps as f64),
+                );
+                (Some(multirate), dt_coarse)
+            }
+            None => (
+                None,
+                barotropic.compute_dt_ssp(q, self.barotropic_cfl, Some(self.barotropic_scheme)),
+            ),
+        };
         assert!(
             dt_bt_max > 0.0,
             "barotropic time step {dt_bt_max} is not positive"
@@ -1052,81 +1404,102 @@ impl ModeSplitIntegrator {
             bottom: drag.bottom,
             column: column_drag,
         };
-        // The filter's weight of the state the next substep starts from
-        let mut pending_weight = None;
-        for (m, &w_secondary) in filter.secondary_weights().iter().enumerate() {
-            let t_m = t + m as f64 * dt_bt;
-            for &stage in barotropic_stages(self.barotropic_scheme) {
-                let time = t_m + stage.time * dt_bt;
-                // The stage's start value `x`, the value it writes, and `qⁿ`
-                // for the combinations that read it. SSP-RK3's third stage
-                // writes `qⁿ⁺¹` in place, reading each node's `qⁿ` before
-                let (x, target, start) = stage_buffers(&stage, q, u1, u2);
-                profiling::scope("bt: rhs", || {
-                    barotropic.compute_rhs_mass_fluxes_into(x, time, k_2d, face_mass, subcell_mass)
-                });
-                let c = w_secondary * stage.weight / n_bt as f64;
-                if barotropic.mass_sources_into(x, time, stage_mass_source) {
-                    for (mean, &s) in transport
-                        .mass_source
-                        .data
-                        .iter_mut()
-                        .zip(&*stage_mass_source)
-                    {
-                        *mean += c * s;
-                    }
-                }
-                if let Some(rivers) = rivers {
-                    for (i, mean) in transport.discharge.iter_mut().enumerate() {
-                        let discharge = rivers.discharge(i, time);
-                        let rate = discharge * rivers.inv_area(i);
-                        let k = rivers.element(i).as_usize();
-                        k_2d.data[SWE_VAR_H][k * nn..(k + 1) * nn]
-                            .iter_mut()
-                            .for_each(|h| *h += rate);
-                        *mean += c * discharge;
-                    }
-                }
-                let rates = StageRates {
-                    rhs: k_2d,
+        if let Some(multirate) = multirate {
+            let mut clips = 0;
+            for (m, &w_secondary) in filter.secondary_weights().iter().enumerate() {
+                let step = CoarseStep {
+                    t: t + m as f64 * dt_bt,
+                    dt: dt_bt,
+                    w_secondary,
+                    n_bt,
+                    scheme: self.barotropic_scheme,
                     forcing: g_term,
-                    face_mass,
-                    subcell_mass,
                     drag: stage_drag,
+                    rivers,
                 };
-                let weights = PassWeights {
-                    transport: c,
-                    average: pending_weight.take(),
-                };
-                let finish = |k: usize, rows: [&mut [f64]; 3], from: [&[f64]; 3], dt: f64| {
-                    barotropic.finish_stage_element(k, rows, from, dt)
-                };
-                let by_element = barotropic.finishes_by_element();
-                let clips = profiling::scope("bt: fused stage", || {
-                    barotropic_stage(
-                        stage,
-                        x,
-                        start,
-                        rates,
-                        dt_bt,
-                        weights,
-                        target,
-                        transport,
-                        q_avg,
-                        by_element.then_some(&finish as _),
-                    )
+                clips += profiling::scope("bt: multirate substep", || {
+                    multirate.coarse_step(barotropic, q, step, transport)
                 });
-                if by_element {
-                    barotropic.record_clips(clips);
-                } else {
-                    barotropic.implicit_damping(target, x, stage.dt_fraction * dt_bt);
-                    barotropic.post_process(target);
-                }
+                q_avg.axpy(filter.weights()[m], q);
             }
-            pending_weight = Some(filter.weights()[m]);
-        }
-        if let Some(w) = pending_weight {
-            q_avg.axpy(w, q);
+            barotropic.record_clips(clips);
+        } else {
+            // The filter's weight of the state the next substep starts from
+            let mut pending_weight = None;
+            for (m, &w_secondary) in filter.secondary_weights().iter().enumerate() {
+                let t_m = t + m as f64 * dt_bt;
+                for &stage in barotropic_stages(self.barotropic_scheme) {
+                    let time = t_m + stage.time * dt_bt;
+                    // The stage's start value `x`, the value it writes, and `qⁿ`
+                    // for the combinations that read it. SSP-RK3's third stage
+                    // writes `qⁿ⁺¹` in place, reading each node's `qⁿ` before
+                    let (x, target, start) = stage_buffers(&stage, q, u1, u2);
+                    profiling::scope("bt: rhs", || {
+                        barotropic.compute_rhs_mass_fluxes_into(x, time, k_2d, face_mass, subcell_mass)
+                    });
+                    let c = w_secondary * stage.weight / n_bt as f64;
+                    if barotropic.mass_sources_into(x, time, stage_mass_source) {
+                        for (mean, &s) in transport
+                            .mass_source
+                            .data
+                            .iter_mut()
+                            .zip(&*stage_mass_source)
+                        {
+                            *mean += c * s;
+                        }
+                    }
+                    if let Some(rivers) = rivers {
+                        for (i, mean) in transport.discharge.iter_mut().enumerate() {
+                            let discharge = rivers.discharge(i, time);
+                            let rate = discharge * rivers.inv_area(i);
+                            let k = rivers.element(i).as_usize();
+                            k_2d.data[SWE_VAR_H][k * nn..(k + 1) * nn]
+                                .iter_mut()
+                                .for_each(|h| *h += rate);
+                            *mean += c * discharge;
+                        }
+                    }
+                    let rates = StageRates {
+                        rhs: k_2d,
+                        forcing: g_term,
+                        face_mass,
+                        subcell_mass,
+                        drag: stage_drag,
+                    };
+                    let weights = PassWeights {
+                        transport: c,
+                        average: pending_weight.take(),
+                    };
+                    let finish = |k: usize, rows: [&mut [f64]; 3], from: [&[f64]; 3], dt: f64| {
+                        barotropic.finish_stage_element(k, rows, from, dt)
+                    };
+                    let by_element = barotropic.finishes_by_element();
+                    let clips = profiling::scope("bt: fused stage", || {
+                        barotropic_stage(
+                            stage,
+                            x,
+                            start,
+                            rates,
+                            dt_bt,
+                            weights,
+                            target,
+                            transport,
+                            q_avg,
+                            by_element.then_some(&finish as _),
+                        )
+                    });
+                    if by_element {
+                        barotropic.record_clips(clips);
+                    } else {
+                        barotropic.implicit_damping(target, x, stage.dt_fraction * dt_bt);
+                        barotropic.post_process(target);
+                    }
+                }
+                pending_weight = Some(filter.weights()[m]);
+            }
+            if let Some(w) = pending_weight {
+                q_avg.axpy(w, q);
+            }
         }
         // The early weights are negative: restore positivity of the average
         barotropic.post_process(q_avg);
@@ -1562,6 +1935,32 @@ struct StageDrag<'a> {
     column: Option<&'a [f64]>,
 }
 
+impl StageDrag<'_> {
+    /// `∂(hu, hv)/∂t = −ρ·(hu, hv)` with `ρ = r/h + Λ̄` over `dt`,
+    /// point-implicitly with the new depth, on element `k`'s rows (`nn`
+    /// nodes): `(hu, hv) ← (hu, hv)/(1 + dt·ρ)`, which only ever shrinks the
+    /// transport.
+    #[inline]
+    fn damp(&self, k: usize, nn: usize, h: &[f64], hu: &mut [f64], hv: &mut [f64], dt: f64) {
+        if self.bottom.is_none() && self.column.is_none() {
+            return;
+        }
+        let columns = h.iter().zip(hu.iter_mut()).zip(hv.iter_mut());
+        for (i, ((&h, hu), hv)) in columns.enumerate() {
+            if h <= 0.0 {
+                continue;
+            }
+            let idx = k * nn + i;
+            let rate = self.bottom.map_or(0.0, |r| r[idx] / h) + self.column.map_or(0.0, |c| c[idx]);
+            if rate > 0.0 {
+                let factor = 1.0 / (1.0 + dt * rate);
+                *hu *= factor;
+                *hv *= factor;
+            }
+        }
+    }
+}
+
 /// The rates of a barotropic stage: the 2D module's RHS (with the rivers),
 /// the slow forcing `G` added to it, the face mass fluxes of the RHS, and
 /// the drag.
@@ -1690,23 +2089,7 @@ fn barotropic_stage(
                     }
                 }
             }
-            let drag = rates.drag;
-            if drag.bottom.is_some() || drag.column.is_some() {
-                let columns = h.iter().zip(hu.iter_mut()).zip(hv.iter_mut());
-                for (i, ((&h, hu), hv)) in columns.enumerate() {
-                    if h <= 0.0 {
-                        continue;
-                    }
-                    let idx = k * nn + i;
-                    let rate = drag.bottom.map_or(0.0, |r| r[idx] / h)
-                        + drag.column.map_or(0.0, |c| c[idx]);
-                    if rate > 0.0 {
-                        let factor = 1.0 / (1.0 + dt_stage * rate);
-                        *hu *= factor;
-                        *hv *= factor;
-                    }
-                }
-            }
+            rates.drag.damp(k, nn, h, hu, hv, dt_stage);
             let c = weights.transport;
             for (sum, var) in [(tr_hu, SWE_VAR_HU), (tr_hv, SWE_VAR_HV)] {
                 for (a, &b) in sum.iter_mut().zip(&x.data[var][nodes.clone()]) {
@@ -2415,15 +2798,25 @@ mod tests {
     /// balances every element, `∫_K (η̄ − ηⁿ) = −Δt ∮_K F*_h`, although dry
     /// elements use subcell finite volumes and the positivity limiter and
     /// wet/dry correction change nodal depths (they keep element means).
+    /// With global substeps and on local time steps (several levels: the
+    /// beach's depth sets them).
     #[test]
     fn barotropic_transport_balances_every_element_with_wetting_and_drying() {
+        for levels in [0, 3] {
+            barotropic_transport_balances_every_element_on(levels);
+        }
+    }
+
+    fn barotropic_transport_balances_every_element_on(levels: usize) {
         let (physics, mut state) = Forced::beach();
         let ops = physics.swe.operators().clone();
         let geom = physics.swe.geometry().clone();
         let h_dry = crate::solver::WetDryConfig::DEFAULT_H_DRY;
-        let mut integrator = ModeSplitIntegrator::new();
+        let mut integrator = ModeSplitIntegrator::new().with_barotropic_levels(levels);
         let mut div = DGSolution2D::new(state.n_elements, state.n_nodes);
-        let dt = 10.0;
+        // Longer with levels: the coarse substep, at most Δt/4, must leave room
+        // for them
+        let dt = if levels > 0 { 40.0 } else { 10.0 };
 
         let element_integral = |field: &[f64], k: usize| -> f64 {
             geom.integrate_element(k, &field[k * ops.n_nodes..(k + 1) * ops.n_nodes])
@@ -2451,7 +2844,7 @@ mod tests {
                 let residual = element_integral(&change, k) + dt * element_integral(&div.data, k);
                 assert!(
                     residual.abs() < 1e-12 * scale,
-                    "step {n}, element {k}: ∫(η̄ − ηⁿ) + Δt∮F* = {residual:.2e} (scale {scale:.2e})"
+                    "{levels} levels, step {n}, element {k}: ∫(η̄ − ηⁿ) + Δt∮F* = {residual:.2e}                      (scale {scale:.2e})"
                 );
                 let bed = physics.bathymetry.element(ElementIndex::new(k));
                 let eta = &state.eta.data[k * ops.n_nodes..(k + 1) * ops.n_nodes];
@@ -2466,6 +2859,10 @@ mod tests {
             shoreline_elements > 0,
             "test regime: no element straddled the shoreline"
         );
-        assert_eq!(physics.swe.negative_depth_clips(), 0);
+        assert_eq!(physics.swe.negative_depth_clips(), 0, "{levels} levels");
+        if levels > 0 {
+            let stats = integrator.barotropic_multirate_stats().expect("local time steps");
+            assert!(stats.finest_level >= 1, "test regime: {stats:?}");
+        }
     }
 }

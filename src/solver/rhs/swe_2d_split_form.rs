@@ -1647,8 +1647,8 @@ mod tests {
         #[cfg(feature = "parallel")]
         use crate::solver::rhs::swe_2d::compute_rhs_swe_2d_parallel_mass_fluxes_into;
         use crate::solver::rhs::swe_2d::{
-            compute_rhs_swe_2d_mass_fluxes_into, compute_rhs_swe_2d_subset_then, face_mass_len,
-            subcell_mass_len,
+            compute_rhs_swe_2d_mass_fluxes_into, compute_rhs_swe_2d_subset_mass_fluxes_then,
+            compute_rhs_swe_2d_subset_then, face_mass_len, subcell_mass_len,
         };
 
         let equation = ShallowWater2D::new(G);
@@ -1791,6 +1791,55 @@ mod tests {
                                 "{case}, subset element {k}"
                             );
                         }
+                    }
+
+                    // And its elements' mass fluxes
+                    let (n_face, n_sub) = (
+                        face_mass_len(&mesh, &ops) / mesh.n_elements,
+                        subcell_mass_len(&mesh, &ops) / mesh.n_elements,
+                    );
+                    let face = std::sync::Mutex::new(vec![f64::NAN; face_mass_len(&mesh, &ops)]);
+                    let subcell =
+                        std::sync::Mutex::new(vec![f64::NAN; subcell_mass_len(&mesh, &ops)]);
+                    let mut subset = SWESolution2D::new(mesh.n_elements, ops.n_nodes);
+                    compute_rhs_swe_2d_subset_mass_fluxes_then(
+                        q,
+                        &mesh,
+                        &ops,
+                        &geom,
+                        &config,
+                        &elements,
+                        &|_| 0.0,
+                        &mut subset,
+                        &|k, _, mass| {
+                            face.lock().unwrap()[k * n_face..(k + 1) * n_face]
+                                .copy_from_slice(mass.face);
+                            subcell.lock().unwrap()[k * n_sub..(k + 1) * n_sub]
+                                .copy_from_slice(mass.subcell);
+                        },
+                    );
+                    let (face, subcell) = (face.into_inner().unwrap(), subcell.into_inner().unwrap());
+                    let n_rhs = 3 * mesh.n_elements * n;
+                    let (ref_face, ref_subcell) =
+                        reference_fluxes[n_rhs..].split_at(face_mass_len(&mesh, &ops));
+                    for &k in &elements {
+                        let k = k as usize;
+                        let faces = k * n_face..(k + 1) * n_face;
+                        let subs = k * n_sub..(k + 1) * n_sub;
+                        assert!(
+                            face[faces.clone()]
+                                .iter()
+                                .zip(&ref_face[faces])
+                                .all(|(a, &b)| a.to_bits() == b),
+                            "{case}, subset face mass fluxes of element {k}"
+                        );
+                        assert!(
+                            subcell[subs.clone()]
+                                .iter()
+                                .zip(&ref_subcell[subs])
+                                .all(|(a, &b)| a.to_bits() == b),
+                            "{case}, subset subcell mass fluxes of element {k}"
+                        );
                     }
                 }
             }
