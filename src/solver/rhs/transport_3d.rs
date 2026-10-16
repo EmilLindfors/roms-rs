@@ -1443,9 +1443,15 @@ pub fn from_inventory(
                     volume += weight;
                 }
                 if volume > area * ds * DRY_DEPTH {
+                    // Not at a dry node: it has no weight in the mean, so
+                    // the shifts summed there step by step (a dry shore node
+                    // of the Frøya day drifted to 33 °C, and wetting brought
+                    // the drift back into the water, 2026-10-16)
                     let shift = (inventory - last) / volume;
-                    for i in 0..nn {
-                        out_k[i * nl + l] += shift;
+                    for (i, (&e, &b)) in eta_k.iter().zip(bed).enumerate() {
+                        if e - b >= DRY_DEPTH {
+                            out_k[i * nl + l] += shift;
+                        }
                     }
                 }
             }
@@ -3904,13 +3910,16 @@ mod tests {
         let case = Case::closed();
         let (nn, nl) = (case.ops.n_nodes, case.sigma.n_levels());
         let n_el = case.mesh.n_elements;
-        // Element 0 dry at one node, element 1 dry everywhere, element 2 marked
+        // Element 0 dry at one node, element 1 dry everywhere, element 2
+        // marked, element 3 marked and dry at one node
         let mut eta = case.state.eta.data.clone();
         eta[0] = case.bathymetry.data[0];
         eta[nn..2 * nn].copy_from_slice(&case.bathymetry.data[nn..2 * nn]);
+        eta[3 * nn] = case.bathymetry.data[3 * nn];
         let mut marked = vec![false; n_el];
         marked[1] = true;
         marked[2] = true;
+        marked[3] = true;
         let concentration = case.state.temp.clone();
         let mut inventory = concentration.clone();
         to_inventory(&mut inventory, &eta, case.sigma.d_sigma(), &case.bathymetry);
@@ -3932,9 +3941,14 @@ mod tests {
                 for l in 0..nl {
                     let (c, got) = (concentration[idx * nl + l], out[idx * nl + l]);
                     match (k, dry) {
-                        // Dry: the last value; the other nodes nodal
-                        (0, true) | (1, _) => assert_eq!(got, -1.0, "element {k} node {i}"),
-                        (2, _) => {}
+                        // Dry: the last value; the other nodes nodal.
+                        // Regression (Frøya, 2026-10-16): a marked element's
+                        // dry node took every step's shift of the level mean
+                        // and drifted (33 °C on a dry shore)
+                        (0 | 3, true) | (1, _) => {
+                            assert_eq!(got, -1.0, "element {k} node {i}")
+                        }
+                        (2 | 3, _) => {}
                         _ => assert!((got - c).abs() < 1e-12 * c.abs(), "{got} vs {c}"),
                     }
                 }
@@ -3957,6 +3971,17 @@ mod tests {
             assert!(
                 (before - after).abs() < 1e-13 * before.abs(),
                 "level {l}: {before} vs {after}"
+            );
+            // Element 3 too, with its dry node
+            let level_3 = |field: &[f64]| -> f64 {
+                (0..nn)
+                    .map(|i| case.geom.node_mass(3, i) * field[(3 * nn + i) * nl + l])
+                    .sum()
+            };
+            let (before, after) = (level_3(&inventory), level_3(&back));
+            assert!(
+                (before - after).abs() < 1e-13 * before.abs(),
+                "element 3, level {l}: {before} vs {after}"
             );
         }
 

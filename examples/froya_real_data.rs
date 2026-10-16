@@ -3571,13 +3571,17 @@ fn tidal_run_3d(
             let (mut fastest, mut level, mut column) = (0.0_f64, 0, 0);
             let (mut t_lo, mut t_hi) = (f64::INFINITY, f64::NEG_INFINITY);
             // T in the thin (shore) columns too, where a drift is held at
-            // first and shows in the deeper columns only once it spreads
+            // first and shows in the deeper columns only once it spreads; not
+            // the dry ones (under 1 μm), which keep their last value
             let (mut thin_lo, mut thin_hi) = (f64::INFINITY, f64::NEG_INFINITY);
             for (idx, &b) in bed.iter().enumerate() {
-                if s.eta.data[idx] - b < opts.thin_depth() {
-                    for &temp in &s.temp[idx * nl..(idx + 1) * nl] {
-                        thin_lo = thin_lo.min(temp);
-                        thin_hi = thin_hi.max(temp);
+                let depth = s.eta.data[idx] - b;
+                if depth < opts.thin_depth() {
+                    if depth >= 1e-6 {
+                        for &temp in &s.temp[idx * nl..(idx + 1) * nl] {
+                            thin_lo = thin_lo.min(temp);
+                            thin_hi = thin_hi.max(temp);
+                        }
                     }
                     continue;
                 }
