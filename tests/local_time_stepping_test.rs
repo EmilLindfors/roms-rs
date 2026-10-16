@@ -850,3 +850,66 @@ fn viscous_run_converges_to_the_global_solution() {
         assert!(order > 1.8, "temporal order {order:.2} (errors {errors:?})");
     }
 }
+
+/// The mode splitter finishes each barotropic stage element by element in
+/// its fused pass (`BarotropicPhysics::finish_stage_element`): the implicit
+/// damping and the post-processing of every element alone are the
+/// whole-state operations bit for bit, and count the same clips.
+#[test]
+fn finishing_a_stage_by_element_matches_the_whole_state() {
+    use dg_rs::time::BarotropicPhysics;
+
+    let setup = Setup::new(Mesh2D::uniform_rectangle(0.0, 1000.0, 0.0, 500.0, 8, 4), 2);
+    let physics = shoreline_physics(&setup);
+    assert!(physics.finishes_by_element());
+    let mut from = shoreline_state(&setup);
+    let [h, hu, hv] = &mut from.data;
+    for ((hu, hv), &h) in hu.iter_mut().zip(hv.iter_mut()).zip(h.iter()) {
+        *hu = 0.4 * h;
+        *hv = -0.1 * h;
+    }
+    // A stage value that drains the shore below its bed in places
+    let mut stage = from.clone();
+    stage.data[0].iter_mut().for_each(|h| *h -= 0.02);
+    let dt = 0.7;
+
+    let mut whole = stage.clone();
+    physics.implicit_damping(&mut whole, &from, dt);
+    physics.post_process(&mut whole);
+    let whole_clips = physics.negative_depth_clips();
+
+    let mut by_element = stage.clone();
+    let nn = setup.ops.n_nodes;
+    let [h, hu, hv] = &mut by_element.data;
+    let mut clips = 0;
+    for k in 0..setup.mesh.n_elements {
+        let rows = k * nn..(k + 1) * nn;
+        let from = [0, 1, 2].map(|var| &from.data[var][rows.clone()]);
+        clips += physics.finish_stage_element(
+            k,
+            [
+                &mut h[rows.clone()],
+                &mut hu[rows.clone()],
+                &mut hv[rows.clone()],
+            ],
+            from,
+            dt,
+        );
+    }
+    physics.record_clips(clips);
+
+    let bits = |s: &[f64]| s.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for var in 0..3 {
+        assert_ne!(
+            bits(&whole.data[var]),
+            bits(&stage.data[var]),
+            "test regime: var {var} unchanged"
+        );
+        assert_eq!(
+            bits(&whole.data[var]),
+            bits(&by_element.data[var]),
+            "var {var}"
+        );
+    }
+    assert_eq!(physics.negative_depth_clips(), 2 * whole_clips, "clips");
+}

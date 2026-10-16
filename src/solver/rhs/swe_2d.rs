@@ -1581,6 +1581,25 @@ fn rhs_parallel<BC: SWEBoundaryCondition2D + Sync>(
 /// k's rows of `out` (holding its RHS) and of the extra buffer, if any.
 pub type ElementRhsThen<'a> = &'a (dyn Fn(usize, [&mut [f64]; 3], Option<[&mut [f64]; 3]>) + Sync);
 
+/// One element's mass fluxes of an RHS evaluation, in the layouts of
+/// [`compute_rhs_swe_2d_mass_fluxes_into`] restricted to the element: its
+/// `4 · n_face_nodes` face values and its subcell interfaces (NaN unless its
+/// volume term was the subcell update).
+#[derive(Clone, Copy, Debug)]
+pub struct ElementMassFluxes<'a> {
+    pub face: &'a [f64],
+    pub subcell: &'a [f64],
+}
+
+/// Per-element continuation of
+/// [`compute_rhs_swe_2d_subset_mass_fluxes_then`]: element k's rows of
+/// `out` (holding its RHS) and its mass fluxes.
+pub type ElementRhsMassThen<'a> =
+    &'a (dyn Fn(usize, [&mut [f64]; 3], ElementMassFluxes<'_>) + Sync);
+
+/// Most face plus subcell mass flux values of one element (order 8).
+const MAX_ELEMENT_MASS_FLUXES: usize = 4 * 9 + 2 * 9 * 8;
+
 /// Subsets smaller than this run serially: a parallel dispatch costs more
 /// than their work (local time stepping has many tiny subsets).
 #[cfg(feature = "parallel")]
@@ -1693,7 +1712,78 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
     extra: Option<&mut SWESolution2D>,
     then: ElementRhsThen,
 ) {
+    subset_then(
+        q,
+        mesh,
+        ops,
+        geom,
+        config,
+        elements,
+        time_of,
+        out,
+        extra,
+        false,
+        &|k, rows, extra, _| then(k, rows, extra),
+    );
+}
+
+/// [`compute_rhs_swe_2d_subset_then`] that also hands each element's mass
+/// fluxes to `then` (bit for bit what
+/// [`compute_rhs_swe_2d_mass_fluxes_into`] writes for it): the mode
+/// splitter's barotropic pass with local time stepping sums them into
+/// DU_avg2.
+pub fn compute_rhs_swe_2d_subset_mass_fluxes_then<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    elements: &[u32],
+    time_of: &(dyn Fn(usize) -> f64 + Sync),
+    out: &mut SWESolution2D,
+    then: ElementRhsMassThen,
+) {
+    subset_then(
+        q,
+        mesh,
+        ops,
+        geom,
+        config,
+        elements,
+        time_of,
+        out,
+        None,
+        true,
+        &|k, rows, _, mass| then(k, rows, mass.expect("mass fluxes were asked for")),
+    );
+}
+
+/// The subset RHS of [`compute_rhs_swe_2d_subset_then`], with the elements'
+/// mass fluxes if `mass_fluxes`.
+#[allow(clippy::type_complexity)]
+fn subset_then<BC: SWEBoundaryCondition2D>(
+    q: &SWESolution2D,
+    mesh: &Mesh2D,
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    config: &SWE2DRhsConfig<BC>,
+    elements: &[u32],
+    time_of: &(dyn Fn(usize) -> f64 + Sync),
+    out: &mut SWESolution2D,
+    extra: Option<&mut SWESolution2D>,
+    mass_fluxes: bool,
+    then: &(
+         dyn Fn(usize, [&mut [f64]; 3], Option<[&mut [f64]; 3]>, Option<ElementMassFluxes<'_>>)
+             + Sync
+     ),
+) {
     check_rhs_output(out, mesh, ops);
+    let (n_face_mass, n_subcell_mass) = (4 * ops.n_face_nodes, subcell_interfaces(ops.n_1d));
+    assert!(
+        n_face_mass + n_subcell_mass <= MAX_ELEMENT_MASS_FLUXES,
+        "order {} has more mass fluxes per element than the subset RHS holds",
+        ops.order
+    );
     if let Some(extra) = &extra {
         check_rhs_output(extra, mesh, ops);
     }
@@ -1800,19 +1890,22 @@ pub fn compute_rhs_swe_2d_subset_then<BC: SWEBoundaryCondition2D>(
         let extra = extra_rows
             .as_ref()
             .map(|x| x.each_ref().map(|rows| unsafe { rows.chunk(k) }));
+        let mut mass = [0.0; MAX_ELEMENT_MASS_FLUXES];
+        let (face, subcell) = mass[..n_face_mass + n_subcell_mass].split_at_mut(n_face_mass);
         SWE2DRhsKernel::new(q, mesh, ops, geom, config, time_of(k)).element(
             k,
             ws,
             faces,
             [&mut *h, &mut *hu, &mut *hv],
-            None,
-            None,
+            mass_fluxes.then_some(&mut *face),
+            mass_fluxes.then_some(&mut *subcell),
             volume,
         );
         if let Some((term, grads)) = &viscous {
             term.add(k, grads.gradients(), &mut ws.viscous, hu, hv);
         }
-        then(k, [h, hu, hv], extra);
+        let mass = mass_fluxes.then_some(ElementMassFluxes { face, subcell });
+        then(k, [h, hu, hv], extra, mass);
     };
     // The volume terms (independent of time) ELEMENT_CHUNK elements at a time
     let chunk = |ws: &mut WorkspaceGuard, ks: &[u32]| {

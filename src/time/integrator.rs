@@ -132,6 +132,13 @@ impl<S: Integrable> StageWorkspace<S> {
         Self::default()
     }
 
+    /// The buffers made so far (the stage values and the RHS).
+    pub(crate) fn buffers_mut(&mut self) -> impl Iterator<Item = &mut S> {
+        [&mut self.u1, &mut self.u2, &mut self.k]
+            .into_iter()
+            .flatten()
+    }
+
     /// Two stage buffers and one RHS buffer shaped like `like`.
     fn buffers(&mut self, like: &S) -> (&mut S, &mut S, &mut S) {
         let u1 = self.u1.get_or_insert_with(|| like.clone());
@@ -924,6 +931,12 @@ impl Integrable for Solution3D {
     /// `copy_from`, `scale`, `axpy` sequence): the fields `scale` and `axpy`
     /// change are combined, the eddy coefficients are copied from `base`.
     fn combine(&mut self, base: Option<&Self>, a: f64, terms: &[(f64, &Self)]) {
+        crate::profiling::scope("3d: rk combination", || self.combine_fields(base, a, terms));
+    }
+}
+
+impl Solution3D {
+    fn combine_fields(&mut self, base: Option<&Self>, a: f64, terms: &[(f64, &Self)]) {
         const MAX_TERMS: usize = 4;
         let shape = |s: &Self| {
             (

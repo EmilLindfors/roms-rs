@@ -382,6 +382,279 @@ pub fn advective_divergence_element(
     }
 }
 
+/// Buffers of the all-levels kernels ([`transport_divergence_levels`],
+/// [`advective_divergence_levels`]) for one element.
+pub struct LevelScratch {
+    /// The contravariant transports `J∇r·q`, `J∇s·q`, `[node][level]`.
+    fr: Vec<f64>,
+    fs: Vec<f64>,
+    /// One value per level.
+    acc: Vec<f64>,
+}
+
+impl LevelScratch {
+    /// Buffers for elements of `n_nodes` nodes and `n_levels` levels.
+    pub fn new(n_nodes: usize, n_levels: usize) -> Self {
+        Self {
+            fr: vec![0.0; n_nodes * n_levels],
+            fs: vec![0.0; n_nodes * n_levels],
+            acc: vec![0.0; n_levels],
+        }
+    }
+
+    fn fits(&self, n_nodes: usize, n_levels: usize) -> bool {
+        self.fr.len() == n_nodes * n_levels && self.acc.len() == n_levels
+    }
+}
+
+/// [`transport_divergence_element`] of every level of element `k` at once:
+/// `hu`, `hv` and `div` are the element's `[node][level]` blocks (the layout
+/// of [`Solution3D`]) and `face` its `[face node][level]` block (that of
+/// [`LayerTransport::face`]).
+///
+/// Level by level the operations and their order are those of
+/// [`transport_divergence_element`], so the result is the same to the bit;
+/// the levels are the innermost loop, contiguous, which vectorises, and the
+/// metric of each node pair is read once for all levels instead of once per
+/// level (the 3D kernels' per-level loops gathered every value at a stride
+/// of the level count).
+#[allow(clippy::too_many_arguments)]
+pub fn transport_divergence_levels(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    metric: MetricForm,
+    k: usize,
+    hu: &[f64],
+    hv: &[f64],
+    face: &[f64],
+    div: &mut [f64],
+    scratch: &mut LevelScratch,
+) {
+    let nn = ops.n_nodes;
+    let nl = hu.len() / nn;
+    debug_assert!(scratch.fits(nn, nl));
+    let LevelScratch { fr, fs, acc } = scratch;
+    let acc = &mut acc[..nl];
+    if metric.averaged_on(geom, k) {
+        for i in 0..nn {
+            let (ar_i, as_i) = geom.contravariant(k, i);
+            let (hu_i, hv_i) = (level_row(hu, i, nl), level_row(hv, i, nl));
+            let d = &mut div[i * nl..(i + 1) * nl];
+            d.fill(0.0);
+            acc.fill(0.0);
+            for j in 0..nn {
+                let (ar_j, as_j) = geom.contravariant(k, j);
+                let (rx, ry) = (ar_i.0 + ar_j.0, ar_i.1 + ar_j.1);
+                let (sx, sy) = (as_i.0 + as_j.0, as_i.1 + as_j.1);
+                let (dr, ds) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+                let (hu_j, hv_j) = (level_row(hu, j, nl), level_row(hv, j, nl));
+                let (hu_i, hv_i, d, acc) = (&hu_i[..nl], &hv_i[..nl], &mut d[..nl], &mut acc[..nl]);
+                for l in 0..nl {
+                    let (qx, qy) = (hu_i[l] + hu_j[l], hv_i[l] + hv_j[l]);
+                    d[l] += dr * (rx * qx + ry * qy);
+                    acc[l] += ds * (sx * qx + sy * qy);
+                }
+            }
+            let scale = 0.5 * geom.jacobian_inv(k, i);
+            for (d, &a) in d.iter_mut().zip(acc.iter()) {
+                *d = scale * (*d + a);
+            }
+        }
+    } else {
+        contravariant_levels(geom, k, nl, hu, hv, fr, fs);
+        for i in 0..nn {
+            let d = &mut div[i * nl..(i + 1) * nl];
+            d.fill(0.0);
+            acc.fill(0.0);
+            for j in 0..nn {
+                let (dr, ds) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+                let (fr_j, fs_j) = (level_row(fr, j, nl), level_row(fs, j, nl));
+                let (d, acc) = (&mut d[..nl], &mut acc[..nl]);
+                for l in 0..nl {
+                    d[l] += dr * fr_j[l];
+                    acc[l] += ds * fs_j[l];
+                }
+            }
+            let scale = geom.jacobian_inv(k, i);
+            for (d, &a) in d.iter_mut().zip(acc.iter()) {
+                *d = scale * (*d + a);
+            }
+        }
+    }
+    subtract_face_lift_levels(ops, geom, k, hu, hv, None, face, div, acc);
+}
+
+/// [`advective_divergence_element`] of every level of element `k` at once,
+/// for `N` fields carried by the same transport (u and v, T and S, k and ψ),
+/// with the blocks of [`transport_divergence_levels`] (each `phi[t]` as `hu`,
+/// each `face[t]` as its `face`, each `div[t]` as its `div`): for each field
+/// the same to the bit, level by level. The fields share the metric of each
+/// node pair and its transport flux.
+#[allow(clippy::too_many_arguments)]
+pub fn advective_divergence_levels<const N: usize>(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    metric: MetricForm,
+    k: usize,
+    hu: &[f64],
+    hv: &[f64],
+    phi: [&[f64]; N],
+    face: [&[f64]; N],
+    mut div: [&mut [f64]; N],
+    scratch: &mut LevelScratch,
+) {
+    let nn = ops.n_nodes;
+    let nl = hu.len() / nn;
+    debug_assert!(scratch.fits(nn, nl));
+    let LevelScratch { fr, fs, acc } = scratch;
+    if metric.averaged_on(geom, k) {
+        // 2{{Ja}}·{{q}} = ½(Ja_i + Ja_j)·(q_i + q_j)
+        for i in 0..nn {
+            let (ar_i, as_i) = geom.contravariant(k, i);
+            let (hu_i, hv_i) = (level_row(hu, i, nl), level_row(hv, i, nl));
+            let phi_i = phi.map(|phi| level_row(phi, i, nl));
+            let mut d = div.each_mut().map(|div| &mut div[i * nl..][..nl]);
+            d.iter_mut().for_each(|d| d.fill(0.0));
+            for j in 0..nn {
+                let (ar_j, as_j) = geom.contravariant(k, j);
+                let (rx, ry) = (ar_i.0 + ar_j.0, ar_i.1 + ar_j.1);
+                let (sx, sy) = (as_i.0 + as_j.0, as_i.1 + as_j.1);
+                let (dr, ds) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+                let (hu_j, hv_j) = (level_row(hu, j, nl), level_row(hv, j, nl));
+                let phi_j = phi.map(|phi| level_row(phi, j, nl));
+                for l in 0..nl {
+                    let (qx, qy) = (hu_i[l] + hu_j[l], hv_i[l] + hv_j[l]);
+                    let flux = 0.5 * (dr * (rx * qx + ry * qy) + ds * (sx * qx + sy * qy));
+                    for t in 0..N {
+                        d[t][l] += flux * (phi_i[t][l] + phi_j[t][l]);
+                    }
+                }
+            }
+            let scale = 0.5 * geom.jacobian_inv(k, i);
+            d.iter_mut()
+                .flat_map(|d| d.iter_mut())
+                .for_each(|d| *d *= scale);
+        }
+    } else {
+        contravariant_levels(geom, k, nl, hu, hv, fr, fs);
+        for i in 0..nn {
+            let (fr_i, fs_i) = (level_row(fr, i, nl), level_row(fs, i, nl));
+            let phi_i = phi.map(|phi| level_row(phi, i, nl));
+            let mut d = div.each_mut().map(|div| &mut div[i * nl..][..nl]);
+            d.iter_mut().for_each(|d| d.fill(0.0));
+            for j in 0..nn {
+                let (dr, ds) = (ops.dr[(i, j)], ops.ds[(i, j)]);
+                let (fr_j, fs_j) = (level_row(fr, j, nl), level_row(fs, j, nl));
+                let phi_j = phi.map(|phi| level_row(phi, j, nl));
+                for l in 0..nl {
+                    let flux = dr * (fr_i[l] + fr_j[l]) + ds * (fs_i[l] + fs_j[l]);
+                    for t in 0..N {
+                        d[t][l] += flux * (phi_i[t][l] + phi_j[t][l]);
+                    }
+                }
+            }
+            let scale = 0.5 * geom.jacobian_inv(k, i);
+            d.iter_mut()
+                .flat_map(|d| d.iter_mut())
+                .for_each(|d| *d *= scale);
+        }
+    }
+    for t in 0..N {
+        subtract_face_lift_levels(
+            ops,
+            geom,
+            k,
+            hu,
+            hv,
+            Some(phi[t]),
+            face[t],
+            div[t],
+            &mut acc[..nl],
+        );
+    }
+}
+
+/// Node `i`'s levels of an element's `[node][level]` block.
+#[inline]
+fn level_row(values: &[f64], i: usize, nl: usize) -> &[f64] {
+    &values[i * nl..][..nl]
+}
+
+/// The contravariant transports `J∇r·q`, `J∇s·q` of element `k`'s
+/// `[node][level]` blocks `hu`, `hv` into `fr`, `fs`.
+fn contravariant_levels(
+    geom: &GeometricFactors2D,
+    k: usize,
+    nl: usize,
+    hu: &[f64],
+    hv: &[f64],
+    fr: &mut [f64],
+    fs: &mut [f64],
+) {
+    for (j, (((fr, fs), hu), hv)) in fr
+        .chunks_exact_mut(nl)
+        .zip(fs.chunks_exact_mut(nl))
+        .zip(hu.chunks_exact(nl))
+        .zip(hv.chunks_exact(nl))
+        .enumerate()
+    {
+        let ((ar_x, ar_y), (as_x, as_y)) = geom.contravariant(k, j);
+        for l in 0..nl {
+            fr[l] = ar_x * hu[l] + ar_y * hv[l];
+            fs[l] = as_x * hu[l] + as_y * hv[l];
+        }
+    }
+}
+
+/// [`subtract_face_lift`] of every level (of the advective flux `q φ` if
+/// `phi`), with the blocks of [`transport_divergence_levels`]; `jump` holds
+/// one value per level.
+#[allow(clippy::too_many_arguments)]
+fn subtract_face_lift_levels(
+    ops: &DGOperators2D,
+    geom: &GeometricFactors2D,
+    k: usize,
+    hu: &[f64],
+    hv: &[f64],
+    phi: Option<&[f64]>,
+    face: &[f64],
+    div: &mut [f64],
+    jump: &mut [f64],
+) {
+    let nfn = ops.n_face_nodes;
+    let nl = jump.len();
+    for f in 0..4 {
+        for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
+            let (nx, ny) = geom.normal(k, f, fi);
+            let scale = geom.lift_scale(k, f, fi, node);
+            let f_star = &face[(f * nfn + fi) * nl..(f * nfn + fi + 1) * nl];
+            let (hu, hv) = (
+                &hu[node * nl..(node + 1) * nl],
+                &hv[node * nl..(node + 1) * nl],
+            );
+            match phi {
+                None => {
+                    for l in 0..nl {
+                        jump[l] = nx * hu[l] + ny * hv[l] - f_star[l];
+                    }
+                }
+                Some(phi) => {
+                    let phi = &phi[node * nl..(node + 1) * nl];
+                    for l in 0..nl {
+                        jump[l] = (nx * hu[l] + ny * hv[l]) * phi[l] - f_star[l];
+                    }
+                }
+            }
+            for (i, d) in div.chunks_exact_mut(nl).enumerate() {
+                let lift = scale * ops.lift[f][(i, fi)];
+                for (d, &jump) in d.iter_mut().zip(jump.iter()) {
+                    *d -= lift * jump;
+                }
+            }
+        }
+    }
+}
+
 /// The barotropic side of one baroclinic step, as the layer transports need
 /// it: `DU_avg2` and the rate of the free surface over the step.
 #[derive(Clone, Copy)]
@@ -741,8 +1014,10 @@ impl LayerTransport {
                     hv,
                     face,
                     sub,
+                    layer_div,
                     div,
                     source,
+                    levels,
                 } = &mut **scratch;
                 // The rivers' volume sources of the layers, the same at
                 // every node of the element
@@ -750,35 +1025,50 @@ impl LayerTransport {
                 if let Some(rivers) = barotropic.and_then(|b| b.rivers) {
                     rivers.add_layer_rates(k, source);
                 }
-                for l in 0..nl {
-                    for i in 0..nn {
-                        hu[i] = layer_hu[(k * nn + i) * nl + l];
-                        hv[i] = layer_hv[(k * nn + i) * nl + l];
-                    }
-                    for (slot, flux) in face.iter_mut().enumerate() {
-                        *flux = layer_face[((k * 4 * nfn) + slot) * nl + l];
-                    }
-                    let div = &mut div[l * nn..(l + 1) * nn];
-                    if subcell_elements[k] {
+                // Every layer's divergence, `[node][level]`
+                if subcell_elements[k] {
+                    for l in 0..nl {
+                        for i in 0..nn {
+                            hu[i] = layer_hu[(k * nn + i) * nl + l];
+                            hv[i] = layer_hv[(k * nn + i) * nl + l];
+                        }
+                        for (slot, flux) in face.iter_mut().enumerate() {
+                            *flux = layer_face[((k * 4 * nfn) + slot) * nl + l];
+                        }
                         for (slot, flux) in sub.iter_mut().enumerate() {
                             *flux = layer_subcell[(k * n_sub + slot) * nl + l];
                         }
-                        subcell_divergence_element(ops, geom, k, hu, hv, sub, face, div);
-                    } else {
-                        transport_divergence_element(ops, geom, metric, k, hu, hv, face, div);
+                        subcell_divergence_element(ops, geom, k, hu, hv, sub, face, layer_div);
+                        for (i, &d) in layer_div.iter().enumerate() {
+                            div[i * nl + l] = d;
+                        }
                     }
+                } else {
+                    let block = k * nn * nl..(k + 1) * nn * nl;
+                    transport_divergence_levels(
+                        ops,
+                        geom,
+                        metric,
+                        k,
+                        &layer_hu[block.clone()],
+                        &layer_hv[block],
+                        &layer_face[k * 4 * nfn * nl..(k + 1) * 4 * nfn * nl],
+                        div,
+                        levels,
+                    );
                 }
                 let mut largest = 0.0_f64;
                 for i in 0..nn {
                     let idx = k * nn + i;
+                    let div = &div[i * nl..(i + 1) * nl];
                     let rate = match barotropic {
                         Some(barotropic) => barotropic.eta_rate[idx],
-                        None => -(0..nl).map(|l| div[l * nn + i]).sum::<f64>(),
+                        None => -div.iter().sum::<f64>(),
                     };
                     let omega = &mut omega_k[i * (nl + 1)..(i + 1) * (nl + 1)];
                     omega[0] = 0.0;
                     for l in 0..nl {
-                        omega[l + 1] = omega[l] - div[l * nn + i] - d_sigma[l] * rate + source[l];
+                        omega[l + 1] = omega[l] - div[l] - d_sigma[l] * rate + source[l];
                     }
                     let residual = omega[nl];
                     largest = largest.max(residual.abs());
@@ -817,34 +1107,53 @@ impl LayerTransport {
         self.metric = layers.metric;
         self.subcell_elements
             .copy_from_slice(&layers.subcell_elements);
-        for (w_cells, layer_values) in [
-            (&mut self.hu, &layers.hu),
-            (&mut self.hv, &layers.hv),
-            (&mut self.face, &layers.face),
-            (&mut self.subcell, &layers.subcell),
-        ] {
-            for (w, l) in w_cells
-                .chunks_exact_mut(nw)
-                .zip(layer_values.chunks_exact(nl))
-            {
-                w[0] = 0.5 * l[0];
-                for j in 1..nl {
-                    w[j] = 0.5 * (l[j - 1] + l[j]);
+        let n_elements = self.subcell_elements.len();
+        // Every field is `[element][…][level]`: element `k`'s block of the
+        // w-cells' is made from its block of the layers'
+        fn block(values: &[f64], k: usize, n_elements: usize) -> &[f64] {
+            let len = values.len() / n_elements;
+            &values[k * len..(k + 1) * len]
+        }
+        for_each_block(
+            n_elements,
+            [
+                &mut self.hu[..],
+                &mut self.hv[..],
+                &mut self.face[..],
+                &mut self.subcell[..],
+                &mut self.omega[..],
+            ],
+            || (),
+            |_, k, [hu, hv, face, subcell, omega]| {
+                for (w_cells, layer_values) in [
+                    (hu, &layers.hu),
+                    (hv, &layers.hv),
+                    (face, &layers.face),
+                    (subcell, &layers.subcell),
+                ] {
+                    for (w, l) in w_cells
+                        .chunks_exact_mut(nw)
+                        .zip(block(layer_values, k, n_elements).chunks_exact(nl))
+                    {
+                        w[0] = 0.5 * l[0];
+                        for j in 1..nl {
+                            w[j] = 0.5 * (l[j - 1] + l[j]);
+                        }
+                        w[nl] = 0.5 * l[nl - 1];
+                    }
                 }
-                w[nl] = 0.5 * l[nl - 1];
-            }
-        }
-        for (w, omega) in self
-            .omega
-            .chunks_exact_mut(nw + 1)
-            .zip(layers.omega.chunks_exact(nl + 1))
-        {
-            w[0] = 0.0;
-            for l in 0..nl {
-                w[l + 1] = 0.5 * (omega[l] + omega[l + 1]);
-            }
-            w[nw] = 0.0;
-        }
+                for (w, omega) in omega
+                    .chunks_exact_mut(nw + 1)
+                    .zip(block(&layers.omega, k, n_elements).chunks_exact(nl + 1))
+                {
+                    w[0] = 0.0;
+                    for l in 0..nl {
+                        w[l + 1] = 0.5 * (omega[l] + omega[l + 1]);
+                    }
+                    w[nw] = 0.0;
+                }
+            },
+        );
         w_cell_thicknesses(&layers.d_sigma, &mut self.d_sigma);
         // Each w-cell averages its two layers' continuity, sources included
         self.volume_source.copy_from_slice(&layers.volume_source);
@@ -941,8 +1250,12 @@ struct OmegaScratch {
     face: Vec<f64>,
     /// A layer's subcell interface fluxes
     sub: Vec<f64>,
+    /// A layer's divergence (subcell elements)
+    layer_div: Vec<f64>,
+    /// Every layer's divergence, `[node][level]`
     div: Vec<f64>,
     source: Vec<f64>,
+    levels: LevelScratch,
 }
 
 impl OmegaScratch {
@@ -952,8 +1265,10 @@ impl OmegaScratch {
             hv: vec![0.0; nn],
             face: vec![0.0; 4 * nfn],
             sub: vec![0.0; n_sub],
+            layer_div: vec![0.0; nn],
             div: vec![0.0; nn * nl],
             source: vec![0.0; nl],
+            levels: LevelScratch::new(nn, nl),
         }
     }
 
@@ -1029,6 +1344,32 @@ pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry
             }
         },
     );
+}
+
+/// [`to_inventory`] of `values` into `q` at the nodes with (almost) no water
+/// only, shallower than `DRY_DEPTH`, where [`from_inventory`] keeps the last
+/// value: their inventories become that value's, the rest are left alone.
+pub(crate) fn dry_inventories(
+    q: &mut [f64],
+    values: &[f64],
+    eta: &[f64],
+    d_sigma: &[f64],
+    bathymetry: &Bathymetry2D,
+) {
+    let nl = d_sigma.len();
+    for (idx, (&e, &b)) in eta.iter().zip(&bathymetry.data).enumerate() {
+        let depth = e - b;
+        if depth < DRY_DEPTH {
+            let column = idx * nl..(idx + 1) * nl;
+            for ((q, &c), &ds) in q[column.clone()]
+                .iter_mut()
+                .zip(&values[column])
+                .zip(d_sigma)
+            {
+                *q = c * layer_volume_of(depth, ds);
+            }
+        }
+    }
 }
 
 /// Inventory `q = H_z C` → concentration, written to `out`, for cells of
@@ -1132,8 +1473,44 @@ pub enum MomentumAdvectionForm {
     Conservative,
 }
 
-/// Overwrite `rhs` with the inventory tendency `∂(H_z C)/∂t` of the tracer
-/// concentration `tracer`, advected by the layer transports `transport`:
+/// A tracer for [`apply_tracer_transport_3d`]: its concentration and
+/// where its inventory tendency goes, its exterior values, and the
+/// reference stratification its vertical reconstruction is taken about, if
+/// any (`[element][node][level]`, e.g. its values at rest).
+pub struct AdvectedTracer<'a> {
+    /// Overwritten with the inventory tendency (layout of [`Solution3D`]).
+    pub rhs: &'a mut [f64],
+    /// The concentration (layout of [`Solution3D`]).
+    pub tracer: &'a [f64],
+    /// The exterior value on inflow through a physical boundary.
+    pub bc: &'a dyn TracerBoundaryCondition3D,
+    /// A nesting parent's values outside its open faces, which take the
+    /// place of `bc`'s where they have one.
+    pub exterior: Option<ExteriorField<'a>>,
+    /// The reference stratification of the vertical reconstruction.
+    pub reference: Option<&'a [f64]>,
+}
+
+impl<'a> AdvectedTracer<'a> {
+    /// `tracer` into `rhs` with `bc`'s exterior values, no parent and no
+    /// reference.
+    pub fn new(
+        rhs: &'a mut [f64],
+        tracer: &'a [f64],
+        bc: &'a dyn TracerBoundaryCondition3D,
+    ) -> Self {
+        Self {
+            rhs,
+            tracer,
+            bc,
+            exterior: None,
+            reference: None,
+        }
+    }
+}
+
+/// Overwrite each tracer's `rhs` with the inventory tendency `∂(H_z C)/∂t`
+/// of its concentration `C`, advected by the layer transports `transport`:
 ///
 /// ```text
 ///     ∂(H_z C)_l/∂t = −∇·(Q_l C_l) − (Ω_{l+1/2} C_{l+1/2} − Ω_{l−1/2} C_{l−1/2})
@@ -1141,37 +1518,18 @@ pub enum MomentumAdvectionForm {
 ///
 /// Horizontally the nodal flux is `Q_l C_l` and the face flux `F_l C↑`, with
 /// `C↑` the concentration upwind of the layer's face flux `F_l`: the element's
-/// own on outflow, the neighbour's on inflow, and `bc`'s exterior value on
-/// inflow through a physical boundary (a nesting parent's value, from
-/// `exterior`, where it has one). Vertically `C_{l±1/2}` is reconstructed
+/// own on outflow, the neighbour's on inflow, and the tracer's `bc` exterior
+/// value on inflow through a physical boundary (a nesting parent's value, from
+/// its `exterior`, where it has one). Vertically `C_{l±1/2}` is reconstructed
 /// by `vertical` ([`VerticalAdvection`]).
 ///
 /// For constant `C` the tendency is `C·(−∇·Q_l − δΩ_l) = C·Δσ_l ∂η/∂t`, the
 /// change of the layer's thickness: constancy. Both fluxes are single-valued
 /// on each face, so the inventory is conserved.
-pub fn apply_tracer_transport_3d(
-    rhs: &mut [f64],
-    tracer: &[f64],
-    transport: &LayerTransport,
-    mesh: &Mesh2D,
-    ops: &DGOperators2D,
-    geom: &GeometricFactors2D,
-    bc: &dyn TracerBoundaryCondition3D,
-    exterior: Option<ExteriorField>,
-    boundaries: &Boundaries3D,
-    vertical: VerticalAdvection,
-) {
-    apply_tracer_transport_3d_about(
-        rhs, tracer, None, transport, mesh, ops, geom, bc, exterior, boundaries, vertical,
-    );
-}
-
-/// [`apply_tracer_transport_3d`] with the vertical reconstruction about a
-/// reference stratification `reference` of the tracer (`[element][node][level]`,
-/// e.g. its values at rest), if any.
 ///
-/// At every σ-surface the surface value is `vertical`'s, less the share `ψ`
-/// of the reference's own departure from the centred value:
+/// With a `reference`, at every σ-surface the surface value is `vertical`'s,
+/// less the share `ψ` of the reference's own departure from the centred
+/// value:
 ///
 /// ```text
 ///     C_s = V(C)_s − ψ_s [V(C_ref)_s − ½(C_ref,l−1 + C_ref,l)],
@@ -1200,16 +1558,16 @@ pub fn apply_tracer_transport_3d(
 /// - Jumps beyond the reference's, or against it, keep `V`'s full limiting
 ///   (fronts).
 /// - The flux is single-valued on every surface: conservative.
-pub fn apply_tracer_transport_3d_about(
-    rhs: &mut [f64],
-    tracer: &[f64],
-    reference: Option<&[f64]>,
+///
+/// Up to two tracers go through each element together, sharing
+/// its transports; each tracer's tendency is what it would be alone, to the
+/// bit.
+pub fn apply_tracer_transport_3d<const N: usize>(
+    tracers: [AdvectedTracer; N],
     transport: &LayerTransport,
     mesh: &Mesh2D,
     ops: &DGOperators2D,
     geom: &GeometricFactors2D,
-    bc: &dyn TracerBoundaryCondition3D,
-    exterior: Option<ExteriorField>,
     boundaries: &Boundaries3D,
     vertical: VerticalAdvection,
 ) {
@@ -1221,36 +1579,62 @@ pub fn apply_tracer_transport_3d_about(
         geom,
         boundaries,
     };
+    let fields = tracers
+        .each_ref()
+        .map(|t| (t.tracer, t.reference, t.bc, t.exterior));
+    let n = mesh.n_elements * nn * nl;
     for_each_block(
         mesh.n_elements,
-        [&mut rhs[..mesh.n_elements * nn * nl]],
+        tracers.map(|t| &mut t.rhs[..n]),
         || TransportScratch::take(ops, nl),
-        |scratch, k, [rhs_k]| {
-            for l in 0..nl {
-                let inflow = |f, fi, node, tag, interior, flux| {
-                    exterior
-                        .and_then(|e| e.at(tag, node, l))
-                        .unwrap_or_else(|| {
-                            bc.exterior_value(&TracerBCContext3D {
-                                element: k,
-                                face: f,
-                                level: l,
-                                face_node: fi,
-                                boundary_tag: Some(tag),
-                                interior_value: interior,
-                                normal_velocity: flux,
-                            })
+        |scratch, k, mut rhs_k| {
+            let inflow = |t: usize, f, fi, node, tag, interior, flux, l| {
+                let (_, _, bc, exterior) = fields[t];
+                exterior
+                    .and_then(|e: ExteriorField| e.at(tag, node, l))
+                    .unwrap_or_else(|| {
+                        bc.exterior_value(&TracerBCContext3D {
+                            element: k,
+                            face: f,
+                            level: l,
+                            face_node: fi,
+                            boundary_tag: Some(tag),
+                            interior_value: interior,
+                            normal_velocity: flux,
                         })
-                };
-                let div = context.flux_divergence(k, l, tracer, true, inflow, scratch);
-                for (i, &d) in div.iter().enumerate() {
-                    rhs_k[i * nl + l] = -d;
+                    })
+            };
+            if context.levels_at_once(k, true) {
+                let div = context.flux_divergence_levels(
+                    k,
+                    fields.map(|(tracer, ..)| tracer),
+                    inflow,
+                    scratch,
+                );
+                for (rhs_k, div) in rhs_k.iter_mut().zip(div.chunks_exact(nn * nl)) {
+                    for (r, &d) in rhs_k.iter_mut().zip(div) {
+                        *r = -d;
+                    }
+                }
+            } else {
+                for (t, rhs_k) in rhs_k.iter_mut().enumerate() {
+                    for l in 0..nl {
+                        let inflow = |f, fi, node, tag, interior, flux| {
+                            inflow(t, f, fi, node, tag, interior, flux, l)
+                        };
+                        let div = context.flux_divergence(k, l, fields[t].0, true, inflow, scratch);
+                        for (i, &d) in div.iter().enumerate() {
+                            rhs_k[i * nl + l] = -d;
+                        }
+                    }
                 }
             }
 
-            subtract_vertical_flux(
-                rhs_k, tracer, reference, transport, k, nn, vertical, scratch,
-            );
+            for (rhs_k, &(tracer, reference, ..)) in rhs_k.iter_mut().zip(&fields) {
+                subtract_vertical_flux(
+                    rhs_k, tracer, reference, transport, k, nn, vertical, scratch,
+                );
+            }
         },
     );
 }
@@ -1647,19 +2031,34 @@ pub fn apply_momentum_transport_3d(
         [&mut rhs_u[..n], &mut rhs_v[..n]],
         || TransportScratch::take(ops, nl),
         |scratch, k, [rhs_u, rhs_v]| {
-            for (rhs_k, field, exterior) in [(rhs_u, u, exterior_u), (rhs_v, v, exterior_v)] {
-                for l in 0..nl {
-                    let inflow = |_, _, node, tag, interior, _| {
-                        exterior
-                            .and_then(|e| e.at(tag, node, l))
-                            .unwrap_or(interior)
-                    };
-                    let div = context.flux_divergence(k, l, field, split, inflow, scratch);
-                    for (i, &d) in div.iter().enumerate() {
-                        rhs_k[i * nl + l] -= d;
+            let exterior = [exterior_u, exterior_v];
+            let inflow = |t: usize, _, _, node, tag, interior, _, l| {
+                exterior[t]
+                    .and_then(|e: ExteriorField| e.at(tag, node, l))
+                    .unwrap_or(interior)
+            };
+            let mut rhs_k = [rhs_u, rhs_v];
+            if context.levels_at_once(k, split) {
+                let div = context.flux_divergence_levels(k, [u, v], inflow, scratch);
+                for (rhs_k, div) in rhs_k.iter_mut().zip(div.chunks_exact(nn * nl)) {
+                    for (r, &d) in rhs_k.iter_mut().zip(div) {
+                        *r -= d;
                     }
                 }
-
+            } else {
+                for (t, (rhs_k, field)) in rhs_k.iter_mut().zip([u, v]).enumerate() {
+                    for l in 0..nl {
+                        let inflow = |f, fi, node, tag, interior, flux| {
+                            inflow(t, f, fi, node, tag, interior, flux, l)
+                        };
+                        let div = context.flux_divergence(k, l, field, split, inflow, scratch);
+                        for (i, &d) in div.iter().enumerate() {
+                            rhs_k[i * nl + l] -= d;
+                        }
+                    }
+                }
+            }
+            for (rhs_k, field) in rhs_k.iter_mut().zip([u, v]) {
                 subtract_vertical_flux(rhs_k, field, None, transport, k, nn, vertical, scratch);
             }
         },
@@ -1767,7 +2166,99 @@ impl LayerContext<'_> {
         }
         div
     }
+
+    /// Whether [`Self::flux_divergence_levels`] takes element `k` (in split
+    /// form, unless its layers move through the subcell interfaces).
+    fn levels_at_once(&self, k: usize, split: bool) -> bool {
+        split && !self.transport.subcell_elements[k]
+    }
+
+    /// [`Self::flux_divergence`] in split form of every layer of element `k`
+    /// at once, for `N` (at most [`MAX_FIELDS`]) fields
+    /// ([`advective_divergence_levels`], the same to the bit), into (and
+    /// returned from) `scratch.div_levels`: field `t`'s `[node][level]` block
+    /// at `t · n_nodes · n_levels`. `inflow` takes the field's index first and
+    /// the level last. Only where [`Self::levels_at_once`].
+    fn flux_divergence_levels<'s, const N: usize>(
+        &self,
+        k: usize,
+        fields: [&[f64]; N],
+        inflow: impl Fn(usize, usize, usize, usize, BoundaryTag, f64, f64, usize) -> f64,
+        scratch: &'s mut TransportScratch,
+    ) -> &'s [f64] {
+        const { assert!(N <= MAX_FIELDS, "the scratch holds MAX_FIELDS fields") };
+        let (ops, transport) = (self.ops, self.transport);
+        let (nn, nfn, nl) = (ops.n_nodes, ops.n_face_nodes, transport.n_levels);
+        let TransportScratch {
+            face_levels,
+            div_levels,
+            levels,
+            ..
+        } = scratch;
+        let (face_len, div_len) = (4 * nfn * nl, nn * nl);
+        let block = k * nn * nl..(k + 1) * nn * nl;
+        let el = ElementIndex::new(k);
+        for f in 0..4 {
+            let exterior = self.boundaries.exterior(self.mesh, el, f);
+            for (fi, &node) in ops.face_nodes[f].iter().enumerate() {
+                let slot = (k * 4 + f) * nfn + fi;
+                let fluxes = &transport.face[slot * nl..(slot + 1) * nl];
+                for (t, field) in fields.iter().enumerate() {
+                    let interior = &field[(k * nn + node) * nl..(k * nn + node + 1) * nl];
+                    let start = t * face_len + (f * nfn + fi) * nl;
+                    let out = &mut face_levels[start..start + nl];
+                    match exterior {
+                        FaceExterior::Element(nb) => {
+                            let nb_node = ops.face_nodes[nb.face][nfn - 1 - fi];
+                            let start = (nb.element * nn + nb_node) * nl;
+                            let outside = &field[start..start + nl];
+                            for l in 0..nl {
+                                let flux = fluxes[l];
+                                out[l] = flux * if flux >= 0.0 { interior[l] } else { outside[l] };
+                            }
+                        }
+                        FaceExterior::Open(tag) => {
+                            for l in 0..nl {
+                                let (flux, interior) = (fluxes[l], interior[l]);
+                                out[l] = flux
+                                    * if flux >= 0.0 {
+                                        interior
+                                    } else {
+                                        inflow(t, f, fi, k * nn + node, tag, interior, flux, l)
+                                    };
+                            }
+                        }
+                        // A wall passes no volume: only a round-off flux
+                        FaceExterior::Wall => {
+                            for l in 0..nl {
+                                out[l] = fluxes[l] * interior[l];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut faces = face_levels.chunks_exact(face_len);
+        let mut divs = div_levels.chunks_exact_mut(div_len);
+        advective_divergence_levels(
+            ops,
+            self.geom,
+            transport.metric,
+            k,
+            &transport.hu[block.clone()],
+            &transport.hv[block.clone()],
+            fields.map(|field| &field[block.clone()]),
+            [(); N].map(|()| faces.next().expect("a face block per field")),
+            [(); N].map(|()| divs.next().expect("a divergence block per field")),
+            levels,
+        );
+        &div_levels[..N * div_len]
+    }
 }
+
+/// The most fields one call of the all-levels kernels takes (a pair: u
+/// and v, T and S, k and ψ).
+const MAX_FIELDS: usize = 2;
 
 /// Buffers of the transport kernels ([`apply_tracer_transport_3d`],
 /// [`apply_momentum_transport_3d`]), sized for one element.
@@ -1785,6 +2276,12 @@ struct TransportScratch {
     slope: Vec<f64>,
     /// The surface values of a column's reference (`[level]`, bed first)
     reference_surface: Vec<f64>,
+    /// Every level's face fluxes, `[face node][level]`, and divergence,
+    /// `[node][level]`, of up to [`MAX_FIELDS`] fields
+    /// ([`LayerContext::flux_divergence_levels`])
+    face_levels: Vec<f64>,
+    div_levels: Vec<f64>,
+    levels: LevelScratch,
 }
 
 impl TransportScratch {
@@ -1815,6 +2312,9 @@ impl TransportScratch {
             vertical: vec![0.0; n_levels + 1],
             slope: vec![0.0; n_levels],
             reference_surface: vec![0.0; n_levels + 1],
+            face_levels: vec![0.0; MAX_FIELDS * 4 * ops.n_face_nodes * n_levels],
+            div_levels: vec![0.0; MAX_FIELDS * ops.n_nodes * n_levels],
+            levels: LevelScratch::new(ops.n_nodes, n_levels),
         }
     }
 }
@@ -2003,14 +2503,17 @@ mod tests {
         ) -> Vec<f64> {
             let mut rhs = vec![f64::NAN; tracer.len()];
             apply_tracer_transport_3d(
-                &mut rhs,
-                tracer,
+                [AdvectedTracer {
+                    rhs: &mut rhs,
+                    tracer,
+                    bc,
+                    exterior: None,
+                    reference: None,
+                }],
                 transport,
                 &self.mesh,
                 &self.ops,
                 &self.geom,
-                bc,
-                None,
                 &self.boundaries,
                 VerticalAdvection::default(),
             );
@@ -2287,14 +2790,17 @@ mod tests {
             }
             let mut rhs = vec![0.0; tracer.len()];
             apply_tracer_transport_3d(
-                &mut rhs,
-                &tracer,
+                [AdvectedTracer {
+                    rhs: &mut rhs,
+                    tracer: &tracer,
+                    bc: &ExtrapolationTracerBC3D,
+                    exterior: None,
+                    reference: None,
+                }],
                 &transport,
                 &mesh,
                 &ops,
                 &geom,
-                &ExtrapolationTracerBC3D,
-                None,
                 &Boundaries3D::default(),
                 VerticalAdvection::Upwind,
             );
@@ -2333,16 +2839,18 @@ mod tests {
             column.copy_from_slice(&omega);
         }
         let mut rhs = vec![0.0; tracer.len()];
-        apply_tracer_transport_3d_about(
-            &mut rhs,
-            tracer,
-            reference,
+        apply_tracer_transport_3d(
+            [AdvectedTracer {
+                rhs: &mut rhs,
+                tracer,
+                bc: &ExtrapolationTracerBC3D,
+                exterior: None,
+                reference,
+            }],
             &transport,
             &mesh,
             &ops,
             &geom,
-            &ExtrapolationTracerBC3D,
-            None,
             &Boundaries3D::default(),
             scheme,
         );
@@ -3273,14 +3781,17 @@ mod tests {
         // Tracer: a boundary condition that would give nonsense
         let mut rhs_t = vec![0.0; case.state.temp.len()];
         apply_tracer_transport_3d(
-            &mut rhs_t,
-            &case.state.temp,
+            [AdvectedTracer {
+                rhs: &mut rhs_t,
+                tracer: &case.state.temp,
+                bc: &FixedTracerBC3D::new(-1e6),
+                exterior: exterior.temp,
+                reference: None,
+            }],
             &transport,
             &case.mesh,
             &case.ops,
             &case.geom,
-            &FixedTracerBC3D::new(-1e6),
-            exterior.temp,
             &case.boundaries,
             VerticalAdvection::default(),
         );
@@ -3357,14 +3868,17 @@ mod tests {
         let tracer = vec![c; case.state.temp.len()];
         let mut rhs = vec![0.0; tracer.len()];
         apply_tracer_transport_3d(
-            &mut rhs,
-            &tracer,
+            [AdvectedTracer {
+                rhs: &mut rhs,
+                tracer: &tracer,
+                bc: &ExtrapolationTracerBC3D,
+                exterior: exterior.temp,
+                reference: None,
+            }],
             &transport,
             &case.mesh,
             &case.ops,
             &case.geom,
-            &ExtrapolationTracerBC3D,
-            exterior.temp,
             &case.boundaries,
             VerticalAdvection::default(),
         );
@@ -3577,5 +4091,107 @@ mod tests {
                 "inventory tendency {tendency:.3e} (advective scale {scale:.3e})"
             );
         }
+    }
+
+    /// The all-levels kernels are the per-level ones to the bit, on a general
+    /// quadrilateral (the averaged metric's pair terms) and a parallelogram,
+    /// in both metric forms, the advective one for each field of a pair.
+    #[test]
+    fn all_levels_kernels_are_the_per_level_kernels_bit_for_bit() {
+        let mut distorted = Mesh2D::uniform_rectangle(0.0, LX, 0.0, LY, 3, 2);
+        for v in &mut distorted.vertices {
+            let [x, y] = *v;
+            let bump = 60.0 * (PI * x / LX).sin() * (PI * y / LY).sin();
+            *v = [x + bump, y - 0.7 * bump];
+        }
+        let affine = Mesh2D::uniform_rectangle(0.0, LX, 0.0, LY, 3, 2);
+        let (nl, order) = (7, 2);
+        let ops = DGOperators2D::new(order);
+        let (nn, nfn) = (ops.n_nodes, ops.n_face_nodes);
+        // Values of no pattern, of either sign
+        let values = |n: usize, seed: f64| -> Vec<f64> {
+            (0..n)
+                .map(|j| ((j as f64 + seed) * 12.9898).sin() * 43.758_5 % 3.0)
+                .collect()
+        };
+        let (hu, hv) = (values(nn * nl, 0.1), values(nn * nl, 0.2));
+        // A pair of fields, as the kernels take u and v, T and S
+        let phi = [values(nn * nl, 0.3), values(nn * nl, 0.5)];
+        let face = [values(4 * nfn * nl, 0.4), values(4 * nfn * nl, 0.6)];
+        // One level's values out of a `[node][level]` block
+        let level = |block: &[f64], l: usize| -> Vec<f64> {
+            block.iter().skip(l).step_by(nl).copied().collect()
+        };
+        let mut scratch = LevelScratch::new(nn, nl);
+        let mut checked_averaged = false;
+        for mesh in [&distorted, &affine] {
+            let geom = GeometricFactors2D::compute(mesh, &ops);
+            for metric in [MetricForm::Conservative, MetricForm::Averaged] {
+                for k in 0..mesh.n_elements {
+                    checked_averaged |= metric.averaged_on(&geom, k);
+                    let mut transport = vec![0.0; nn * nl];
+                    let mut advective = [vec![0.0; nn * nl], vec![0.0; nn * nl]];
+                    transport_divergence_levels(
+                        &ops,
+                        &geom,
+                        metric,
+                        k,
+                        &hu,
+                        &hv,
+                        &face[0],
+                        &mut transport,
+                        &mut scratch,
+                    );
+                    advective_divergence_levels(
+                        &ops,
+                        &geom,
+                        metric,
+                        k,
+                        &hu,
+                        &hv,
+                        phi.each_ref().map(|phi| &phi[..]),
+                        face.each_ref().map(|face| &face[..]),
+                        advective.each_mut().map(|div| &mut div[..]),
+                        &mut scratch,
+                    );
+                    for l in 0..nl {
+                        let (hu_l, hv_l) = (level(&hu, l), level(&hv, l));
+                        let face_l = level(&face[0], l);
+                        let (mut div, mut fr, mut fs) =
+                            (vec![0.0; nn], vec![0.0; nn], vec![0.0; nn]);
+                        transport_divergence_element(
+                            &ops, &geom, metric, k, &hu_l, &hv_l, &face_l, &mut div,
+                        );
+                        assert_eq!(
+                            level(&transport, l)
+                                .iter()
+                                .map(|x| x.to_bits())
+                                .collect::<Vec<_>>(),
+                            div.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                            "transport divergence, element {k}, level {l}, {metric:?}"
+                        );
+                        for t in 0..2 {
+                            let (phi_l, face_l) = (level(&phi[t], l), level(&face[t], l));
+                            advective_divergence_element(
+                                &ops, &geom, metric, k, &hu_l, &hv_l, &phi_l, &face_l, &mut fr,
+                                &mut fs, &mut div,
+                            );
+                            assert_eq!(
+                                level(&advective[t], l)
+                                    .iter()
+                                    .map(|x| x.to_bits())
+                                    .collect::<Vec<_>>(),
+                                div.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                                "advective divergence of field {t}, element {k}, level {l}, {metric:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked_averaged,
+            "the distorted mesh takes the averaged pair terms"
+        );
     }
 }

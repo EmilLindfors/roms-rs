@@ -283,13 +283,18 @@ impl Nesting3D {
     }
 
     /// The parent's columns for `state` at time `t`, evaluated unless the
-    /// last evaluation was for the same time and free surface.
+    /// last evaluation was for the same time and free surface. A node the
+    /// parent does not cover keeps the child's own column, its velocity at
+    /// rest where the column is thinner than `min_column_depth` (as every 3D
+    /// kernel sees a thin column; then it does not matter whether `state`
+    /// holds the thin columns' velocities or has them masked).
     pub fn columns(
         &self,
         state: &Solution3D,
         bathymetry: &Bathymetry2D,
         sigma: &SigmaGrid,
         t: f64,
+        min_column_depth: f64,
     ) -> NestingColumns<'_> {
         let mut columns = self.columns.lock().expect("Failed to lock nesting columns");
         let current = columns.time == t
@@ -332,8 +337,13 @@ impl Nesting3D {
                 );
                 if !covered {
                     let column = flat * nl..(flat + 1) * nl;
-                    u.copy_from_slice(&state.u[column.clone()]);
-                    v.copy_from_slice(&state.v[column.clone()]);
+                    if *eta - bathymetry.data[flat] < min_column_depth {
+                        u.fill(0.0);
+                        v.fill(0.0);
+                    } else {
+                        u.copy_from_slice(&state.u[column.clone()]);
+                        v.copy_from_slice(&state.v[column.clone()]);
+                    }
                     temp.copy_from_slice(&state.temp[column.clone()]);
                     salt.copy_from_slice(&state.salt[column]);
                 }
@@ -586,7 +596,7 @@ mod tests {
         state.temp.fill(12.0);
         state.salt.fill(33.0);
         state.eta.fill(0.5);
-        let columns = nesting.columns(&state, &bathymetry, &sigma, 100.0);
+        let columns = nesting.columns(&state, &bathymetry, &sigma, 100.0, 0.0);
         let mut rhs = Solution3D::new(mesh.n_elements, ops.n_nodes, 4);
         columns.relax_shear(&state, &sigma, &mut rhs, |_| false);
         columns.relax_tracers(&state, &bathymetry, &sigma, &mut rhs, |_| false);
@@ -640,7 +650,7 @@ mod tests {
         let bathymetry = Bathymetry2D::constant(mesh.n_elements, ops.n_nodes, -20.0);
         let mut state = Solution3D::new(mesh.n_elements, ops.n_nodes, 4);
         let at = |state: &Solution3D, t: f64| {
-            let columns = nesting.columns(state, &bathymetry, &sigma, t);
+            let columns = nesting.columns(state, &bathymetry, &sigma, t, 0.0);
             let [u, v] = columns.exterior().velocity.unwrap();
             (
                 u.at(BoundaryTag::Open, 0, 0).unwrap(),

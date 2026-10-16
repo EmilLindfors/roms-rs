@@ -95,6 +95,11 @@ pub struct OceanModelColumns<P> {
     /// Horizontal stencil and east axis of every mesh node (`[element][node]`),
     /// `None` if the parent does not cover it; computed on first use.
     nodes: Vec<OnceLock<Option<NodeStencil>>>,
+    /// The parent's wet points ([`OceanModelReader::wet_mask`]), for the
+    /// nearest wet point of a node outside its wet cells (each test reads
+    /// every snapshot: the coastline day's band searched the whole grid
+    /// through them for 50 CPU-s at its first step).
+    wet: Vec<bool>,
 }
 
 /// Where a child node samples the parent.
@@ -125,6 +130,7 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
             "OceanModelColumns: the parent has no profiles (read it with \
              OceanModelReader::from_file_with_profiles)"
         );
+        let wet = reader.wet_mask();
         Self {
             reader,
             projection,
@@ -134,6 +140,7 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
             nodes: (0..mesh.n_elements * ops.n_nodes)
                 .map(|_| OnceLock::new())
                 .collect(),
+            wet,
         }
     }
 
@@ -157,7 +164,7 @@ impl<P: CoordinateProjection> OceanModelColumns<P> {
                 let stencil = match self.reader.stencil(lon, lat) {
                     Some((_, s)) => s,
                     None => {
-                        let wet = |k: usize| self.reader.is_wet(k);
+                        let wet = |k: usize| self.wet[k];
                         let (k, _) =
                             self.reader
                                 .grid

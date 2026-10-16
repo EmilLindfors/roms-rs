@@ -613,6 +613,68 @@ where
     /// `S_h` of the source terms that change the water's volume
     /// ([`SourceTerm2D::changes_mass`]), element by element as the RHS
     /// kernels add them.
+    fn finishes_by_element(&self) -> bool {
+        self.limiter.is_element_local()
+    }
+
+    fn damp_element(&self, k: usize, stage: [&mut [f64]; 3], from: [&[f64]; 3], dt: f64) {
+        self.damping().damp_element(k, stage, from, dt);
+    }
+
+    fn post_process_element(&self, k: usize, rows: [&mut [f64]; 3]) -> usize {
+        SWEPhysics2D::post_process_element(self, k, rows)
+    }
+
+    fn stage_subset_then(
+        &self,
+        input: &SWESolution2D,
+        elements: &[u32],
+        time_of: &(dyn Fn(usize) -> f64 + Sync),
+        out: &mut SWESolution2D,
+        then: crate::solver::rhs::ElementRhsMassThen,
+    ) {
+        crate::solver::rhs::compute_rhs_swe_2d_subset_mass_fluxes_then(
+            input,
+            &self.mesh,
+            &self.ops,
+            &self.geom,
+            &self.rhs_config(),
+            elements,
+            time_of,
+            out,
+            then,
+        );
+    }
+
+    fn mass_source_element(
+        &self,
+        state: &SWESolution2D,
+        k: usize,
+        time: f64,
+        out: &mut [f64],
+    ) -> bool {
+        let Some(source) = self.source.as_deref().filter(|s| s.changes_mass()) else {
+            return false;
+        };
+        out.fill(0.0);
+        let element = crate::source::ElementSources {
+            element: ElementIndex::new(k),
+            time,
+            solution: state,
+            mesh: &self.mesh,
+            ops: &self.ops,
+            bathymetry: self.bathymetry.as_deref(),
+            g: self.equation.g,
+            h_min: self.equation.h_min.meters(),
+        };
+        source.add_mass_element(&element, out);
+        out.iter().any(|&s| s != 0.0)
+    }
+
+    fn record_clips(&self, clips: usize) {
+        self.count_clips(clips);
+    }
+
     fn mass_sources_into(&self, state: &SWESolution2D, time: f64, out: &mut [f64]) -> bool {
         let Some(source) = self.source.as_deref().filter(|s| s.changes_mass()) else {
             return false;

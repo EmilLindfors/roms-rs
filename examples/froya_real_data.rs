@@ -105,7 +105,7 @@
 //!     [wave_reference=<file>] \
 //!     [wave_mesh=NX,NY[,ORDER]] [wave_coupling=0] [wave_sea=2.5,10,285] \
 //!     [wave_spectra=data/froya_wave_spectra.nc] [wave_neighbours=2] \
-//!     [levels=0] [tide3d=0] [cfl_3d=2] [rk_bt=43|3] [cfl_bt=2] [restart_hours=0] [resume=<file>]
+//!     [levels=0] [tide3d=0] [cfl_3d=2] [rk_bt=43|3] [cfl_bt=2] [bt_levels=2] [restart_hours=0] [resume=<file>]
 //! ```
 //!
 //! `waves=N` (N > 0) times N steps of the spectral wave model on the domain
@@ -219,8 +219,15 @@
 //! module's per-element positivity and linear bounds set them: shoreline
 //! elements with a dry node take twice SSP-RK3's step there, half the
 //! substeps for 4/3 of the work each. Together 773 → 388 s per model hour
-//! on hours 6–8 (24 threads), 0 negative-depth clips. Use `slopes3d=on`
-//! for the stratified rest state on steep beds.
+//! on hours 6–8 (24 threads), 0 negative-depth clips. The barotropic pass
+//! takes local time steps of up to `bt_levels=` (2) levels
+//! (`ModeSplitIntegrator::with_barotropic_levels`; 0 for global substeps):
+//! the cliff-shore elements that set the substep take it alone, the rest 2
+//! or 4 times longer ones, and the run reports the RHS work saved. On hours
+//! 6–8 against global substeps (2026-10-16): η 0.07 mm, ū 0.16 mm/s, T
+//! 0.011 °C RMS at the nodes ≥ 10 m deep (the run's sensitivity), the pass
+//! 472 → 236 ms per step. Use `slopes3d=on` for the stratified rest state on
+//! steep beds.
 //!
 //! A long 3D tide can stop and resume bit for bit. `restart_hours=H` writes
 //! `<output>/<domain>.restart` (`Restart3D`, replaced in one rename, so a
@@ -635,6 +642,9 @@ struct Options {
     cfl_bt: f64,
     /// SSP scheme of the barotropic substeps (`rk_bt=3|43`)
     rk_bt: dg_rs::time::SspScheme,
+    /// Most levels of local time stepping in the barotropic pass
+    /// (`bt_levels=`, 2; 0: global substeps)
+    bt_levels: usize,
     debug_3d: String,
     /// Write a restart of the 3D tide every this many model hours
     /// (`restart_hours=`; 0: none), at the first progress line at or after it
@@ -735,6 +745,7 @@ impl Options {
                 .map_err(|e| e.to_string())?,
             cfl_3d: get("cfl_3d", 2.0)?,
             cfl_bt: get("cfl_bt", 2.0)?,
+            bt_levels: get("bt_levels", 2.0)? as usize,
             rk_bt: match args.get("rk_bt").map_or("43", String::as_str) {
                 "3" => dg_rs::time::SspScheme::Rk3,
                 "43" => dg_rs::time::SspScheme::Rk43,
@@ -3635,7 +3646,8 @@ fn tidal_run_3d(
         };
     let integrator = ModeSplitIntegrator::new()
         .with_barotropic_cfl(opts.cfl_bt)
-        .with_barotropic_scheme(opts.rk_bt);
+        .with_barotropic_scheme(opts.rk_bt)
+        .with_barotropic_levels(opts.bt_levels);
     let mut sim = Simulation3D::new(physics, integrator).with_cfl(opts.cfl_3d);
     if let Some(dt) = opts.dt_3d {
         sim = sim.with_dt_max(dt);
@@ -3673,6 +3685,14 @@ Phase profile:
         sim.integrator().last_substeps(),
         sim.physics().swe_physics.negative_depth_clips()
     );
+    if let Some(stats) = sim.integrator().barotropic_multirate_stats() {
+        println!(
+            "Barotropic local time steps: up to {} levels, {:.2}× less RHS work than global substeps at the finest step ({} coarse substeps)",
+            stats.finest_level,
+            stats.speedup(),
+            stats.steps
+        );
+    }
     report_stations(&stations, &output_dir, opts, &clock, station_atlas.as_ref())?;
     if let Some(e) = result.error {
         return Err(e.into());
