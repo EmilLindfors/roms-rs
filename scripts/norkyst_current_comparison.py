@@ -25,11 +25,16 @@ The run needs hourly VTU output over the window, e.g.
     cargo run --release --example froya_real_data -- nx=60 ny=45 hours=72 \\
         ramp_hours=3 output_minutes=60 output=output/m2
     uv run scripts/norkyst_current_comparison.py output/m2 [norkyst=data/froya_norkyst.nc] \\
-        [start=24] [end=72] [lat0=63.8] [lon0=8.6] [station=8.665231,63.869331]
+        [start=24] [end=72] [lat0=63.8] [lon0=8.6] [station=8.665231,63.869331] \
+        [points=<file.csv>] [nodes=<file.csv>]
 
 `norkyst=` is a subset from examples/norkyst_nesting_subset.rs starting at
 the run's `start`; `lat0`/`lon0` are the centre of the example's local
-projection; `station` (lon,lat) adds the statistics within 3 km of it.
+projection; `station` (lon,lat) adds the statistics within 3 km of it. `points=` writes
+every compared NorKyst point (position, both depths, both M2 current
+semi-major axes and η amplitudes, both M4 η amplitudes); `nodes=` the
+model's M2 current and M2/M4 η amplitudes at every wet node, for maps of
+where the overtides are made.
 Hours are counted from the run's start (the frame number).
 """
 
@@ -44,10 +49,11 @@ from scipy.spatial import cKDTree
 PERIODS_H = {"M2": 12.4206012, "K1": 23.93447213, "M4": 6.210300601}
 
 
-def m2_amplitude(series, pinv):
-    """Complex M2 amplitude of `series` [time, ...]: a cos ωt + b sin ωt → a − ib."""
+def m2_amplitude(series, pinv, constituent=0):
+    """Complex amplitude of `series` [time, ...] of the `constituent`-th of
+    PERIODS_H (M2 by default): a cos ωt + b sin ωt → a − ib."""
     c = np.tensordot(pinv, series, axes=(1, 0))
-    return c[1] - 1j * c[2]
+    return c[1 + 2 * constituent] - 1j * c[2 + 2 * constituent]
 
 
 def semi_major(u, v):
@@ -95,7 +101,9 @@ def main():
         m2_amplitude(fill(nk["ubar_eastward"][idx]), pinv),
         m2_amplitude(fill(nk["vbar_northward"][idx]), pinv),
     ).ravel()
-    nk_eta = np.abs(m2_amplitude(fill(nk["zeta"][idx]), pinv)).ravel()
+    nk_zeta = fill(nk["zeta"][idx])
+    nk_eta = np.abs(m2_amplitude(nk_zeta, pinv)).ravel()
+    nk_m4 = np.abs(m2_amplitude(nk_zeta, pinv, 2)).ravel()
     x, y = to_xy(nk["lon"][:], nk["lat"][:])
     x, y, h = np.asarray(x).ravel(), np.asarray(y).ravel(), np.asarray(nk["h"][:]).ravel()
 
@@ -107,7 +115,9 @@ def main():
         m2_amplitude(np.array([f["u"] for f in frames]), pinv),
         m2_amplitude(np.array([f["v"] for f in frames]), pinv),
     )
-    eta = np.abs(m2_amplitude(np.array([f["eta"] for f in frames]), pinv))
+    model_eta = np.array([f["eta"] for f in frames])
+    eta = np.abs(m2_amplitude(model_eta, pinv))
+    m4 = np.abs(m2_amplitude(model_eta, pinv, 2))
     distance, nearest = cKDTree(points[wet]).query(np.c_[x, y])
     nearest = wet[nearest]
     ok = (distance < 300) & ~land & (h > 3) & (nk_major > 0.02)
@@ -125,6 +135,25 @@ def main():
                 f"  NorKyst h {lo:3}-{hi:3} m: {sel.sum():5} points, current {np.median(ratio[sel]):.2f}, "
                 f"depth {np.median(depth_ratio[sel]):.2f}, transport {np.median(ratio[sel] * depth_ratio[sel]):.2f}"
             )
+    if "points" in opts:
+        lon, lat = np.asarray(nk["lon"][:]).ravel(), np.asarray(nk["lat"][:]).ravel()
+        n = nearest[ok]
+        np.savetxt(
+            opts["points"],
+            np.c_[lon[ok], lat[ok], x[ok], y[ok], h[ok], depth[n], nk_major[ok], major[n],
+                  nk_eta[ok], eta[n], nk_m4[ok], m4[n]],
+            fmt="%.6f", delimiter=",",
+            header="lon,lat,x,y,h_norkyst,depth_model,m2_major_norkyst,m2_major_model,"
+            "m2_eta_norkyst,m2_eta_model,m4_eta_norkyst,m4_eta_model",
+            comments="",
+        )
+    if "nodes" in opts:
+        np.savetxt(
+            opts["nodes"],
+            np.c_[points[wet], depth[wet], major[wet], eta[wet], m4[wet]],
+            fmt="%.6f", delimiter=",",
+            header="x,y,depth,m2_major,m2_eta,m4_eta", comments="",
+        )
     if "station" in opts:
         sx, sy = to_xy(*map(float, opts["station"].split(",")))
         sel = np.hypot(x[ok] - sx, y[ok] - sy) < 3000
