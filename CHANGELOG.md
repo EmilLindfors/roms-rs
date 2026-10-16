@@ -564,6 +564,8 @@ All notable changes to this project should be documented in this file.
 
 ### Fixed
 
+- **Dry nodes of 3D shoreline elements no longer drift.** `from_inventory` moves a marked element's level (one the barotropic pass balances only as a whole) to its new mean by shifting its nodes; the shift went to the dry nodes too, which have no weight in the mean, so they summed every step's shift. On the Frøya day with MET wind, dry shore nodes reached 33 °C (the water held 7.5–14.4 °C), and wetting brought the drift back into the water. Dry nodes keep their last value, as documented; wet results are unchanged until a node wets. `froya_real_data`'s "thin columns" T range leaves out dry columns. Regression case in `inventory_conversion_keeps_element_inventories`.
+
 - **A blown-up 2D run stopped reporting success (TODO P2.1).** `Simulation` stepped a NaN on to `t_end` and reported success, as `Simulation3D` did before 2026-10-10 (the step bounds skip NaN). `Integrable::is_finite` (default `true`; the 1D/2D solution types check every value, in branch-free chunks) is checked after every step, and the run fails at the first non-finite state. Gate: `a_blown_up_2d_run_fails`.
 
 - **`CoriolisSource2D::norwegian_coast_beta()` had the 45°N β (TODO P1.6).** It used β = 1.6e-11 m⁻¹ s⁻¹ for 60°N, where β = 2Ω cos φ / R = 1.14e-11. It is now the tangent β-plane at 60°N (f₀ 1.263e-4 s⁻¹), from the new `source::coriolis_parameter(φ)` / `coriolis_beta(φ)` and `CoriolisSource2D::beta_plane_at_latitude(φ, y0)`. Nothing in the crate called it. Gate: `the_coriolis_parameter_and_beta_follow_the_latitude`.
