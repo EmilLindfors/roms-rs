@@ -613,6 +613,27 @@ where
     /// `S_h` of the source terms that change the water's volume
     /// ([`SourceTerm2D::changes_mass`]), element by element as the RHS
     /// kernels add them.
+    fn finishes_by_element(&self) -> bool {
+        self.limiter.is_element_local()
+    }
+
+    fn finish_stage_element(
+        &self,
+        k: usize,
+        mut stage: [&mut [f64]; 3],
+        from: [&[f64]; 3],
+        dt: f64,
+    ) -> usize {
+        let [h, hu, hv] = &mut stage;
+        self.damping()
+            .damp_element(k, [&mut **h, &mut **hu, &mut **hv], from, dt);
+        self.post_process_element(k, stage)
+    }
+
+    fn record_clips(&self, clips: usize) {
+        self.count_clips(clips);
+    }
+
     fn mass_sources_into(&self, state: &SWESolution2D, time: f64, out: &mut [f64]) -> bool {
         let Some(source) = self.source.as_deref().filter(|s| s.changes_mass()) else {
             return false;

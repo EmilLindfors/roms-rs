@@ -7,8 +7,9 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 ## Next up
 
 1. **P3.1** The Mausund error budget: M2's +3 % from NorKyst (`gauge_gains=M2,…`) together with the overtides that are too weak (M4 0.35×). See Validation.
-2. **P4.4** Per-column surface heat and freshwater fluxes, the next step for a real 3D run; then **P1.5** a real NorKyst 3D nested run.
-3. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
+2. **P4.5** The coastline 3D day under 200 s per model hour (272 on the 6 h window since the 2026-10-15 depth pass, from 318); the rest needs barotropic LTS, so that multi-day nested 3D runs fit overnight. See 3D numerics.
+3. **P4.6 / P1.5** Then the 72 h nested 3D day against NorKyst-800 per depth (T, S, u, v at the NorKyst point, Kattholmen and mid-domain); add the **P4.4** heat fluxes only if the drift points to them. See 3D validation.
+4. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -179,7 +180,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.3** Rerun the unsmoothed full-mesh 3-day baseline on current code (without `slopes3d`, ≈ 1–2.5 h) for a like-for-like comparison with the 19 m free depth.
 - [ ] **P1.3** Decide the 2D `rx0` default, after the map-wide NorKyst current comparison (`output_minutes=60`, `scripts/norkyst_current_comparison.py`).
 - [ ] **P1.3** Make implicit vertical advection (`Hydrostatic3D::with_implicit_vertical_advection`) the library default once the full Frøya mesh has run with it.
-- [ ] **P1.3 / P2.5 / P4.5** Local time stepping in 3D: the step is bound by 2.5–3 m sound elements (0.79 s), and the farm's 40 m quads set the fjord's. Run the barotropic pass on `MultirateStepper` with hooks for the filter/DU_avg2 sums (per-element stage weights). Blockers: the filter's uniform substep grid, DU_avg2, the nodal identity, AB3 history. On the coastline day the barotropic pass is half the step and its substep is set by shoreline elements with a dry node (ideal LTS gain 5.5–6×, `notes/3d-numerics.md` 2026-10-15).
+- [ ] **P1.3 / P2.5 / P4.5** Local time stepping in 3D: the step is bound by 2.5–3 m sound elements (0.79 s), and the farm's 40 m quads set the fjord's. Run the barotropic pass on `MultirateStepper` with hooks for the filter/DU_avg2 sums (per-element stage weights). On the coastline day the pass is 39 % of the step; measured per element (2026-10-15): power-of-two levels give 3.2× (L = 2), 3.95× (L = 3), 4.1× (L ≥ 4), not the 5.5–6× first estimated, and L ≤ 3 still leaves the filter 6–12 coarse substeps per 16 s step, so its uniform grid is no blocker; DU_avg2 must weight each element's (p, s) contributions by the finest substeps it stands for (`notes/3d-numerics.md` "Depth pass").
 - [ ] **P1.3** Cap or ramp the first 3D steps from rest (`compute_dt` sees no Ω at rest; thin layers need |Ω|Δt/H_z ≤ 1).
 - [ ] **P1.3** The 3D viscous step bound (`element_dt_viscous_swe_2d`) is harsh (ν = 50 m²/s: 0.54 s against 5 s): implicit shear viscosity, or the bound from the operator's spectrum.
 - [ ] **P1.3** What dropping baroclinic pressure in thin-column elements (a one-element coastal band) does to estuarine and wind-driven shore currents, once tides and rivers run in 3D.
@@ -207,7 +208,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Boundaries and nesting (P1.4, P1.5) — [notes/boundaries-nesting.md](notes/boundaries-nesting.md)
 
-- [ ] **P1.5** A real NorKyst 3D nested run (T/S, baroclinic velocity): `Nesting3D` and `norkyst_nesting_subset profiles=1` exist.
+- [ ] **P1.5** The real NorKyst 3D nested run exists (the coastline day nests T/S/u/v in `data/mausund_norkyst_3d.nc`); what is missing is the per-depth comparison with the parent (P4.6) and parent files longer than 3 days.
 - [ ] **P1.5** A datum for the parent ζ in the library default (NorKyst sits 0.28 m below MSL at Frøya); check whether NorKyst v3 is forced with sea-level pressure (`ib=1` would count the barometer twice).
 - [ ] **P1.4** `BoundaryTides::with_transport_scaling` (`tide_transport=3`) as the default for atlas tides (Mausund sub-domain 8.1 → 4.2 cm); check the full mesh with it.
 - [ ] **P1.4** Blend the bed towards the atlas depths near the open boundary for `BoundaryTides`, as `OceanModelState::blend_bathymetry` does.
@@ -275,15 +276,16 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: numerics (P4.2, P4.3, P4.5) — [notes/3d-numerics.md](notes/3d-numerics.md)
 
-- [ ] **P4.5** The splitter's fixed per-stage data movement (≈ 60 field passes, 27 % of the step at dt 4 s, 12k elements): kernels read `H_z φ` and divide on load, the post-stage hook converts in place.
+- [ ] **P4.5** The coastline 3D day under 200 s per model hour. After the 2026-10-15 depth pass 272 on the 6 h window (1222 ms per 16 s step, from 1430; `notes/3d-numerics.md` "Depth pass"): barotropic pass 472, 3D stages 523 (transport RHS 256, Kuzmin limiter 127, momentum RHS 66), G + its momentum RHS 73, post_process 64. 200 needs ≈ 890 ms: barotropic LTS (the line above) is the one lever of that size; the rest below are 10–90 ms each. Gate: 6–8 h from the 6 h restart, accuracy as in "The coastline day at half the cost". Comes before the P4.6 NorKyst comparison.
+- [ ] **P4.5** The splitter's per-stage data movement is ≈ 15 field passes since 2026-10-15 (from ≈ 60): what is left is one inventory → value conversion and two copies per stage, which kernels reading `H_z φ` would remove.
 - [ ] **P4.5** The forward-backward (AB3-AM4) barotropic fast mode, fewer RHS per substep.
 - [ ] **P4.5** Make SSP-RK(4,3) at the caps `ModeSplitIntegrator`'s own default for wet/dry runs (changes every 3D gate's bits); the coastline day ran a full day on it (387 s per model hour, `notes/geometry-mesh.md` "The coastline day in 3D").
-- [ ] **P4.5** The coastline day's Kuzmin limiter changes about half of all element-layers at every stage (116k of 241k for T, 101k for S; 67k/58k again after each step): find what it cuts (round-off-level bounds over smooth stratification, or real overshoots) before it is taken as harmless; it also costs ≈ 45 ms per call, four calls per step.
-- [ ] **P4.5** The thin-column copies (`with_thin_columns_at_rest`, 5 per 3D step, bandwidth-bound; nine of thirteen fields since 2026-10-15): a mask the readers take instead.
+- [ ] **P4.5** The coastline day's Kuzmin limiter changes about 40 % of all element-layers at every stage, by 1e-5 to 1e-3 (°C or PSU; 22 steps from 6 h: 17.2 M of 42.4 M, 98 % of them by more than 1e-8; 21 by more than 1), so real if mostly small cuts, not round-off; and 95 % of the element-layers fail the own-column test, so the patch bounds (≈ 60 column interpolations each) are computed nearly everywhere (≈ 42 ms per call, four per step). Find whether P2's horizontal variation within an element is what it cuts, and whether the post-step call is needed after the last stage's.
+- [ ] **P4.5** The thin-column copies (`with_thin_columns_at_rest`): the stages skip theirs since 2026-10-15 (their values hold the thin columns at rest, `ModeSplitPhysics::mask_stage`); `G` and `update_vertical_velocity` still copy (2 × 8 ms per step). The two compute the same layer transports of the same state, one step apart: compute them once.
 - [ ] **P4.5** The barotropic filter integrates 1.3 n_bt substeps (30 % past tⁿ⁺¹); the fused stage costs half a 2D RHS (0.56 ms, 10 streamed arrays): a shorter window or fewer streams.
-- [ ] **P4.5** Fewer parallel regions per barotropic stage: the fused `barotropic_stage` as the RHS's per-element continuation (≈ 4 of 85 ms at 1024 elements).
-- [ ] **P4.2** Replace `with_thin_columns_at_rest`'s whole-`Solution3D` copy each stage with a thin-column mask read by the kernels.
-- [ ] **P4.2** Skip `w` and `rho` in `Solution3D`'s stage combination, or a splitter-own stage state (changes the bits of `w`).
+- [ ] **P4.5** Fewer parallel regions per barotropic stage: the damping and wet/dry correction run in the fused stage's pass since 2026-10-15; the fused stage as the RHS's per-element continuation is left (it streams ≈ 24 MB per stage at ≈ 44 GB/s, DRAM speed: the pass's 2D arrays, ≈ 31 MB, do not fit the 24 MB L3).
+- [ ] **P4.5** The turbulence's advection costs as much as T, S, u and v together (29 ms per call, three per step): `k` and `ψ` on 21 w-levels through the tracer kernel, with the w-cell transports re-staggered each call. Average the layer transports on the fly; or advect the turbulence once per step, as ROMS's GLS does in its own predictor/corrector.
+- [ ] **P4.5** A depth-aware coastline mesh (OceanMesh2D's CFL bound, element size ≥ c·Δt/CFL): 1 % of the coastline mesh's elements lie within 1.66× of the smallest barotropic step and 5 % within 2.35×, cliff-shore elements 65–100 m across in 50–80 m of water; the positivity cap alone is only 1.29× (2026-10-15). Coarsening them would raise the global substep without LTS, at the cost of the validated bed.
 - [ ] **P4.2** A cheaper band parent-column evaluation (`OceanModelColumns` searches per node, stage and layer): precompute vertical weights, or time-interpolate once per baroclinic step.
 - [ ] **P4.2** The parent's shear dispersion in G's depth mean at nested faces.
 - [ ] **P4.3 / P1.3** ROMS `Vtransform=2` and the true Vstretching 4 (`ROMSVstretching4` is not ROMS Vs4; `SongHaidvogelStretching::hc` is unused in `vertical/sigma.rs` `z_at_levels_into`); Ω must use ∇·(H_z u) once H_z varies horizontally.
@@ -312,7 +314,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## 3D: mixing (P4.4) — [notes/3d-mixing.md](notes/3d-mixing.md)
 
-- [ ] **P4.4** Per-column surface heat and freshwater fluxes, Q_net/(ρ₀c_p), from bulk formulae on `AtmosphereReader` fields (one domain buoyancy flux today).
+- [ ] **P4.4** Per-column surface heat and freshwater fluxes, Q_net/(ρ₀c_p), from bulk formulae on `AtmosphereReader` fields (one domain buoyancy flux today). Only if the P4.6 NorKyst comparison shows surface-flux drift: over the 3 days of `mausund_norkyst_3d.nc` NorKyst's top 20 m changes 0.01 K net (`notes/3d-mixing.md`). Needs 2 m air temperature, humidity and radiation (`froya_met.nc` has wind and pressure only); SST relaxation to the parent is the cheap alternative.
 - [ ] **P4.4** Surface stress in thin columns (`with_min_column_depth`) through `G` as τ/ρ₀ (tidal flats get no wind in 3D today).
 - [ ] **P4.4** Wave height for the surface roughness, z₀ₛ ≈ 0.6 H_s per column, from a MyWaveWAM reader or fetch-limited H_s(U₁₀, fetch).
 - [ ] **P4.4** Positivity-safe advected `k`/`ψ` (Zhang–Shu scaling toward the element mean, or a length cap); check on a real run with fronts.
@@ -336,7 +338,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P4.6** Exact section budgets from the model's own face fluxes, RK-weighted (salt budget off 1–3 % from nodal `H_z u S`); needed for P5.2 farm exchange output.
 - [ ] **P4.6** Periodic meshes: `Mesh2D::elements_at_vertex` has no periodic images, so Kuzmin bounds there are one-sided (also `limiters/swe_2d.rs:260`, `tracer_2d.rs:593`).
 - [ ] **P4.6** The 3D limiter's remaining cost (1.6 ms/call): one buffer of inventory weights per call, T and S in one pass.
-- [ ] **P4.6** Then compare with NorKyst-800 3D fields.
+- [ ] **P4.6** Compare the nested coastline 3D run with NorKyst-800 per depth, after the P4.5 pass: hourly T/S/u/v profile output at named points in `froya_real_data` (the NorKyst point, Kattholmen, one mid-domain), a script that interpolates `data/mausund_norkyst_3d.nc` to the same points and depths and writes a per-depth skill table, then 72 h overnight. Does the model reproduce NorKyst's day-2 mixing event (surface −1.2 K, +0.2 PSU) and its current profile, and explain the halved 3D M2 current (P1.3)? Backtest it on the 24 h `output/froya_day/3d_fast` first, as far as that run's output allows.
 
 ## Operational (P5) — [notes/operational.md](notes/operational.md)
 

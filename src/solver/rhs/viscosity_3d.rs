@@ -100,9 +100,16 @@ pub struct ViscosityScratch3D {
     mean: Vec<[f64; 2]>,
     /// Their BR1 gradients (with Smagorinsky only).
     mean_gradient: Vec<[ScalarGradient2D; 2]>,
-    /// One layer's shear gradients and `ν_l D`, `[element][node]`.
+    /// A block of layers' shear gradients and `ν_l D`,
+    /// `[element][node][level in the block]`.
     layer: Vec<LayerNode>,
 }
+
+/// Levels per pass of [`apply_horizontal_viscosity_3d`]: each pass reads the
+/// velocities and writes the tendencies once for its block of levels (the
+/// fields are `[element][node][level]`, so a pass per level strode through
+/// all of them for every level).
+const LEVEL_BLOCK: usize = 5;
 
 /// The BR1 gradients of a layer's shear `(u′, v′)` at a node, and `ν_l D`
 /// there.
@@ -121,7 +128,7 @@ impl ViscosityScratch3D {
             smagorinsky_area: vec![0.0; n_elements],
             mean: vec![[0.0; 2]; n_total],
             mean_gradient: vec![[ScalarGradient2D::default(); 2]; n_total],
-            layer: vec![LayerNode::default(); n_total],
+            layer: vec![LayerNode::default(); n_total * LEVEL_BLOCK],
         }
     }
 }
@@ -268,8 +275,9 @@ impl Columns<'_> {
         }
     }
 
-    /// Layer `level`'s shear gradients and `ν_l D` into `scratch.layer`.
-    fn layer(&self, level: usize, scratch: &mut ViscosityScratch3D) {
+    /// The shear gradients and `ν_l D` of the layers `levels` into
+    /// `scratch.layer`.
+    fn layers(&self, levels: std::ops::Range<usize>, scratch: &mut ViscosityScratch3D) {
         let (state, nn, nl) = (self.state, self.ops.n_nodes, self.state.n_levels);
         let ViscosityScratch3D {
             depth,
@@ -278,7 +286,8 @@ impl Columns<'_> {
             mean_gradient,
             layer,
         } = scratch;
-        let shear = |idx: usize| {
+        let block = levels.len();
+        let shear = |idx: usize, level: usize| {
             if depth[idx] == 0.0 {
                 [0.0; 2]
             } else {
@@ -291,31 +300,34 @@ impl Columns<'_> {
         };
         let background = self.viscosity.background;
         let smagorinsky = self.viscosity.smagorinsky > 0.0;
+        let n = self.mesh.n_elements * nn * block;
         for_each_block(
             self.mesh.n_elements,
-            [&mut layer[..]],
+            [&mut layer[..n]],
             || ElementScratch::take(nn),
             |scratch, k, [layer_k]| {
-                self.element_gradients(k, shear, scratch);
-                for (i, node) in layer_k.iter_mut().enumerate() {
-                    let idx = k * nn + i;
-                    let (gu, gv) = (scratch.gradient[0][i], scratch.gradient[1][i]);
-                    let nu = if smagorinsky {
-                        let [mu, mv] = mean_gradient[idx];
-                        let strain = strain_rate_magnitude(
-                            gu.dx + mu.dx,
-                            gu.dy + mu.dy,
-                            gv.dx + mv.dx,
-                            gv.dy + mv.dy,
-                        );
-                        background + smagorinsky_area[k] * strain
-                    } else {
-                        background
-                    };
-                    *node = LayerNode {
-                        gradient: [gu, gv],
-                        coefficient: nu * depth[idx],
-                    };
+                for (b, level) in levels.clone().enumerate() {
+                    self.element_gradients(k, |idx| shear(idx, level), scratch);
+                    for i in 0..nn {
+                        let idx = k * nn + i;
+                        let (gu, gv) = (scratch.gradient[0][i], scratch.gradient[1][i]);
+                        let nu = if smagorinsky {
+                            let [mu, mv] = mean_gradient[idx];
+                            let strain = strain_rate_magnitude(
+                                gu.dx + mu.dx,
+                                gu.dy + mu.dy,
+                                gv.dx + mv.dx,
+                                gv.dy + mv.dy,
+                            );
+                            background + smagorinsky_area[k] * strain
+                        } else {
+                            background
+                        };
+                        layer_k[i * block + b] = LayerNode {
+                            gradient: [gu, gv],
+                            coefficient: nu * depth[idx],
+                        };
+                    }
                 }
             },
         );
@@ -355,44 +367,50 @@ pub fn apply_horizontal_viscosity_3d(
     let n = mesh.n_elements * nn * nl;
     columns.prepare(bathymetry, sigma, min_column_depth, scratch);
 
-    for level in 0..nl {
-        columns.layer(level, scratch);
+    for first in (0..nl).step_by(LEVEL_BLOCK) {
+        let levels = first..(first + LEVEL_BLOCK).min(nl);
+        let block = levels.len();
+        columns.layers(levels.clone(), scratch);
         let (depth, layer) = (&scratch.depth, &scratch.layer);
         for_each_block(
             mesh.n_elements,
             [&mut rhs_u[..n], &mut rhs_v[..n]],
             || ElementScratch::take(nn),
-            |scratch, k, rhs| {
+            |scratch, k, [rhs_u, rhs_v]| {
                 let ElementScratch { diffusion, out, .. } = &mut **scratch;
-                let [out_u, out_v] = out;
-                br1_diffusion_element(
-                    ElementIndex::new(k),
-                    mesh,
-                    ops,
-                    geom,
-                    |j, node| {
-                        let node = layer[j.as_usize() * nn + node];
-                        node.gradient
-                            .map(|g| (node.coefficient * g.dx, node.coefficient * g.dy))
-                    },
-                    // The fluxes that match the gradients' exterior states:
-                    // at a wall (mirrored velocity) the normal stress only,
-                    // at an open face (extrapolated) none
-                    |k, face, _fi, (nx, ny), [fu, fv]| match boundaries.exterior(mesh, k, face) {
-                        FaceExterior::Wall => {
-                            let normal = nx * fu + ny * fv;
-                            [nx * normal, ny * normal]
-                        }
-                        _ => [0.0; 2],
-                    },
-                    diffusion,
-                    [out_u, out_v],
-                );
-                for (rhs_k, out) in rhs.into_iter().zip(out.iter()) {
-                    for (i, &d) in out.iter().enumerate() {
-                        let idx = k * nn + i;
-                        if depth[idx] > 0.0 {
-                            rhs_k[i * nl + level] += d / depth[idx];
+                for (b, level) in levels.clone().enumerate() {
+                    let [out_u, out_v] = &mut *out;
+                    br1_diffusion_element(
+                        ElementIndex::new(k),
+                        mesh,
+                        ops,
+                        geom,
+                        |j, node| {
+                            let node = layer[(j.as_usize() * nn + node) * block + b];
+                            node.gradient
+                                .map(|g| (node.coefficient * g.dx, node.coefficient * g.dy))
+                        },
+                        // The fluxes that match the gradients' exterior
+                        // states: at a wall (mirrored velocity) the normal
+                        // stress only, at an open face (extrapolated) none
+                        |k, face, _fi, (nx, ny), [fu, fv]| match boundaries
+                            .exterior(mesh, k, face)
+                        {
+                            FaceExterior::Wall => {
+                                let normal = nx * fu + ny * fv;
+                                [nx * normal, ny * normal]
+                            }
+                            _ => [0.0; 2],
+                        },
+                        diffusion,
+                        [out_u, out_v],
+                    );
+                    for (rhs_k, out) in [&mut *rhs_u, &mut *rhs_v].into_iter().zip(out.iter()) {
+                        for (i, &d) in out.iter().enumerate() {
+                            let idx = k * nn + i;
+                            if depth[idx] > 0.0 {
+                                rhs_k[i * nl + level] += d / depth[idx];
+                            }
                         }
                     }
                 }
@@ -432,12 +450,17 @@ pub fn largest_horizontal_viscosity_3d(
     };
     let nn = ops.n_nodes;
     columns.prepare(bathymetry, sigma, min_column_depth, scratch);
-    for level in 0..state.n_levels {
-        columns.layer(level, scratch);
-        for (idx, (node, &d)) in scratch.layer.iter().zip(&scratch.depth).enumerate() {
+    let nl = state.n_levels;
+    for first in (0..nl).step_by(LEVEL_BLOCK) {
+        let levels = first..(first + LEVEL_BLOCK).min(nl);
+        let block = levels.len();
+        columns.layers(levels, scratch);
+        for (idx, &d) in scratch.depth.iter().enumerate() {
             if d > 0.0 {
                 let nu = &mut largest[idx / nn];
-                *nu = nu.max(node.coefficient / d);
+                for node in &scratch.layer[idx * block..(idx + 1) * block] {
+                    *nu = nu.max(node.coefficient / d);
+                }
             }
         }
     }

@@ -133,6 +133,14 @@ impl<P: ModeSplitPhysics> ModeSplitPhysics for Timed<'_, P> {
     fn post_stage(&self, state: &mut Solution3D) {
         self.time("post_stage", || self.inner.post_stage(state))
     }
+
+    fn mask_stage(&self, state: &mut Solution3D, stash: &mut dg_rs::time::StageStash) {
+        self.inner.mask_stage(state, stash)
+    }
+
+    fn unmask_stage(&self, state: &mut Solution3D, stash: &dg_rs::time::StageStash) {
+        self.inner.unmask_stage(state, stash)
+    }
 }
 
 fn arg<T: std::str::FromStr>(name: &str, default: T) -> T {

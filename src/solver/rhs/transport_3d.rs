@@ -817,34 +817,53 @@ impl LayerTransport {
         self.metric = layers.metric;
         self.subcell_elements
             .copy_from_slice(&layers.subcell_elements);
-        for (w_cells, layer_values) in [
-            (&mut self.hu, &layers.hu),
-            (&mut self.hv, &layers.hv),
-            (&mut self.face, &layers.face),
-            (&mut self.subcell, &layers.subcell),
-        ] {
-            for (w, l) in w_cells
-                .chunks_exact_mut(nw)
-                .zip(layer_values.chunks_exact(nl))
-            {
-                w[0] = 0.5 * l[0];
-                for j in 1..nl {
-                    w[j] = 0.5 * (l[j - 1] + l[j]);
+        let n_elements = self.subcell_elements.len();
+        // Every field is `[element][…][level]`: element `k`'s block of the
+        // w-cells' is made from its block of the layers'
+        fn block(values: &[f64], k: usize, n_elements: usize) -> &[f64] {
+            let len = values.len() / n_elements;
+            &values[k * len..(k + 1) * len]
+        }
+        for_each_block(
+            n_elements,
+            [
+                &mut self.hu[..],
+                &mut self.hv[..],
+                &mut self.face[..],
+                &mut self.subcell[..],
+                &mut self.omega[..],
+            ],
+            || (),
+            |_, k, [hu, hv, face, subcell, omega]| {
+                for (w_cells, layer_values) in [
+                    (hu, &layers.hu),
+                    (hv, &layers.hv),
+                    (face, &layers.face),
+                    (subcell, &layers.subcell),
+                ] {
+                    for (w, l) in w_cells
+                        .chunks_exact_mut(nw)
+                        .zip(block(layer_values, k, n_elements).chunks_exact(nl))
+                    {
+                        w[0] = 0.5 * l[0];
+                        for j in 1..nl {
+                            w[j] = 0.5 * (l[j - 1] + l[j]);
+                        }
+                        w[nl] = 0.5 * l[nl - 1];
+                    }
                 }
-                w[nl] = 0.5 * l[nl - 1];
-            }
-        }
-        for (w, omega) in self
-            .omega
-            .chunks_exact_mut(nw + 1)
-            .zip(layers.omega.chunks_exact(nl + 1))
-        {
-            w[0] = 0.0;
-            for l in 0..nl {
-                w[l + 1] = 0.5 * (omega[l] + omega[l + 1]);
-            }
-            w[nw] = 0.0;
-        }
+                for (w, omega) in omega
+                    .chunks_exact_mut(nw + 1)
+                    .zip(block(&layers.omega, k, n_elements).chunks_exact(nl + 1))
+                {
+                    w[0] = 0.0;
+                    for l in 0..nl {
+                        w[l + 1] = 0.5 * (omega[l] + omega[l + 1]);
+                    }
+                    w[nw] = 0.0;
+                }
+            },
+        );
         w_cell_thicknesses(&layers.d_sigma, &mut self.d_sigma);
         // Each w-cell averages its two layers' continuity, sources included
         self.volume_source.copy_from_slice(&layers.volume_source);
@@ -1029,6 +1048,28 @@ pub fn to_inventory(tracer: &mut [f64], eta: &[f64], d_sigma: &[f64], bathymetry
             }
         },
     );
+}
+
+/// [`to_inventory`] of `values` into `q` at the nodes with (almost) no water
+/// only, shallower than `DRY_DEPTH`, where [`from_inventory`] keeps the last
+/// value: their inventories become that value's, the rest are left alone.
+pub(crate) fn dry_inventories(
+    q: &mut [f64],
+    values: &[f64],
+    eta: &[f64],
+    d_sigma: &[f64],
+    bathymetry: &Bathymetry2D,
+) {
+    let nl = d_sigma.len();
+    for (idx, (&e, &b)) in eta.iter().zip(&bathymetry.data).enumerate() {
+        let depth = e - b;
+        if depth < DRY_DEPTH {
+            let column = idx * nl..(idx + 1) * nl;
+            for ((q, &c), &ds) in q[column.clone()].iter_mut().zip(&values[column]).zip(d_sigma) {
+                *q = c * layer_volume_of(depth, ds);
+            }
+        }
+    }
 }
 
 /// Inventory `q = H_z C` → concentration, written to `out`, for cells of

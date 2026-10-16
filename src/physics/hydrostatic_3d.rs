@@ -89,7 +89,7 @@ use crate::solver::state::SWE_VAR_H;
 use crate::solver::state::Solution3D;
 use crate::solver::{TracerLimiter3DConfig, TracerLimiter3DStats, apply_tracer_limiters_3d};
 use crate::source::{CageDrag2D, CageNode, CoriolisSource2D, RiverSources};
-use crate::time::{ModeSplitPhysics, StepDrag};
+use crate::time::{ModeSplitPhysics, StageStash, StepDrag};
 use crate::types::ElementIndex;
 use crate::vertical::SigmaGrid;
 
@@ -1052,7 +1052,9 @@ where
     /// the 2D module's; a film at the 2D velocity cap would otherwise carry
     /// its speed into the 3D shear), consistently in the stages and in `G`.
     /// The copy holds η, ū, v̄, u, v, T, S, k and ψ only: `f` must not read
-    /// `w`, `rho` or the eddy coefficients.
+    /// `w`, `rho` or the eddy coefficients. No copy where the thin columns
+    /// are at rest already (the mode splitter's stage values, see
+    /// [`ModeSplitPhysics::mask_stage`]).
     fn with_thin_columns_at_rest<R>(
         &self,
         state: &Solution3D,
@@ -1060,13 +1062,21 @@ where
     ) -> R {
         let nl = state.n_levels;
         let n_columns = state.eta.data.len();
-        if !(0..n_columns).any(|idx| self.is_thin(state, idx)) {
+        let moving = |idx: usize| {
+            self.is_thin(state, idx)
+                && (state.ubar.data[idx] != 0.0
+                    || state.vbar.data[idx] != 0.0
+                    || state.u[idx * nl..(idx + 1) * nl].iter().any(|&u| u != 0.0)
+                    || state.v[idx * nl..(idx + 1) * nl].iter().any(|&v| v != 0.0))
+        };
+        if !(0..n_columns).any(moving) {
             return f(state);
         }
         let mut guard = self
             .masked_scratch
             .lock()
             .expect("Failed to lock masked_scratch");
+        let copy = crate::profiling::start();
         let masked = guard.get_or_insert_with(|| {
             Solution3D::new(state.n_elements, state.n_nodes, state.n_levels)
         });
@@ -1096,6 +1106,7 @@ where
                 masked.vbar.data[idx] = 0.0;
             }
         }
+        crate::profiling::stop("3d: thin-column copy", copy);
         f(masked)
     }
 
@@ -1163,6 +1174,7 @@ where
 
     /// Apply configured 3D tracer limiters and refresh density if tracers changed.
     pub fn apply_tracer_limiters(&self, state: &mut Solution3D) -> TracerLimiter3DStats {
+        let limiter = crate::profiling::start();
         let stats = apply_tracer_limiters_3d(
             state,
             &self.mesh,
@@ -1172,9 +1184,10 @@ where
             &self.sigma,
             &self.tracer_limiter,
         );
+        crate::profiling::stop("3d: tracer limiter", limiter);
 
         if stats.changed() {
-            self.eos.update_density(state);
+            crate::profiling::scope("3d: density", || self.eos.update_density(state));
         }
 
         stats
@@ -1216,7 +1229,10 @@ where
     /// the shear, which has no depth mean), zero in thin columns.
     /// `state.rho` must be current.
     pub fn compute_momentum_rhs_into(&self, state: &Solution3D, t: f64, rhs: &mut Solution3D) {
-        compute_momentum_rhs_3d(rhs, state, &self.rhs_config());
+        crate::profiling::scope("3d: pgf, coriolis", || {
+            compute_momentum_rhs_3d(rhs, state, &self.rhs_config())
+        });
+        let viscosity = crate::profiling::start();
         if !self.horizontal_viscosity.is_zero() {
             let mut guard = self
                 .viscosity_scratch
@@ -1239,9 +1255,10 @@ where
                 scratch,
             );
         }
+        crate::profiling::stop("3d: viscosity", viscosity);
         if let Some(nesting) = &self.nesting {
             nesting
-                .columns(state, &self.bathymetry, &self.sigma, t)
+                .columns(state, &self.bathymetry, &self.sigma, t, self.min_column_depth)
                 .relax_shear(state, &self.sigma, rhs, |idx| self.is_thin(state, idx));
         }
         self.zero_thin_momentum(state, rhs);
@@ -1270,13 +1287,16 @@ where
         let columns = self
             .nesting
             .as_ref()
-            .map(|nesting| nesting.columns(state, &self.bathymetry, &self.sigma, t));
+            .map(|nesting| {
+                nesting.columns(state, &self.bathymetry, &self.sigma, t, self.min_column_depth)
+            });
         let exterior = columns
             .as_ref()
             .map_or_else(Exterior3D::default, |c| c.exterior());
         // Thin columns at rest change no layer transport: theirs are uniform
         // in σ, which the correction to the barotropic transport replaces
         self.with_thin_columns_at_rest(state, |state| {
+            let layer = crate::profiling::start();
             transport.metric = self.metric_form();
             transport.compute(
                 state,
@@ -1295,6 +1315,7 @@ where
             if let Some(split) = &self.implicit_vertical_advection {
                 self.split_vertical_velocity(split, state, transport, barotropic.dt);
             }
+            crate::profiling::stop("3d: layer transports", layer);
             let reference = self.vertical_reference.as_ref().map(|reference| {
                 reference
                     .fields
@@ -1309,7 +1330,9 @@ where
                 },
                 ..self.rhs_config()
             };
-            compute_transport_rhs_3d(rhs, state, transport, &config);
+            crate::profiling::scope("3d: advection kernels", || {
+                compute_transport_rhs_3d(rhs, state, transport, &config)
+            });
             // The water no transport carries (the 2D module's own mass
             // sources) at the concentrations and velocities it joins
             let means = barotropic.element_means;
@@ -1329,7 +1352,9 @@ where
                     means,
                 );
             }
-            self.turbulence_transport_rhs(state, transport, barotropic, rhs);
+            crate::profiling::scope("3d: turbulence advection", || {
+                self.turbulence_transport_rhs(state, transport, barotropic, rhs)
+            });
         });
         // The river water's tracers, with the volume the layer transports
         // gave the layers
@@ -1388,13 +1413,17 @@ where
         w_cells.stagger_from(transport);
         let nl = state.n_levels;
         for (out, field) in [(&mut rhs.tke, &state.tke), (&mut rhs.gls, &state.gls)] {
-            advected.copy_from_slice(field);
-            if nl >= 2 {
-                for column in advected.chunks_exact_mut(nl + 1) {
-                    column[0] = column[1];
-                    column[nl] = column[nl - 1];
+            let n_elements = self.mesh.n_elements;
+            let len = field.len() / n_elements;
+            for_each_block(n_elements, [&mut advected[..]], || (), |_, k, [advected]| {
+                advected.copy_from_slice(&field[k * len..(k + 1) * len]);
+                if nl >= 2 {
+                    for column in advected.chunks_exact_mut(nl + 1) {
+                        column[0] = column[1];
+                        column[nl] = column[nl - 1];
+                    }
                 }
-            }
+            });
             apply_tracer_transport_3d(
                 out,
                 advected,
@@ -1645,7 +1674,7 @@ where
     pub fn post_process(&self, state: &mut Solution3D) {
         self.apply_tracer_limiters(state);
 
-        self.update_vertical_velocity(state);
+        crate::profiling::scope("post: omega", || self.update_vertical_velocity(state));
     }
 
     /// Write `Ω` (m/s) at the layer centres to `state.w`, for output: the
@@ -1995,6 +2024,29 @@ where
     fn post_stage(&self, state: &mut Solution3D) {
         if !self.apply_tracer_limiters(state).changed() {
             self.update_density(state);
+        }
+    }
+
+    /// The thin columns at rest, as every 3D kernel sees them (so the
+    /// stage's RHS need not copy the state to mask them,
+    /// [`Self::with_thin_columns_at_rest`]); their values into `stash`.
+    fn mask_stage(&self, state: &mut Solution3D, stash: &mut StageStash) {
+        let nl = state.n_levels;
+        stash.columns.clear();
+        stash.values.clear();
+        for idx in 0..state.eta.data.len() {
+            if self.is_thin(state, idx) {
+                let column = idx * nl..(idx + 1) * nl;
+                stash.columns.push(idx);
+                stash.values.extend_from_slice(&state.u[column.clone()]);
+                stash.values.extend_from_slice(&state.v[column.clone()]);
+                stash.values.push(state.ubar.data[idx]);
+                stash.values.push(state.vbar.data[idx]);
+                state.u[column.clone()].fill(0.0);
+                state.v[column].fill(0.0);
+                state.ubar.data[idx] = 0.0;
+                state.vbar.data[idx] = 0.0;
+            }
         }
     }
 }
