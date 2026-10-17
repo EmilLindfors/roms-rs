@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! cargo run --release --example norkyst_profiles_3d -- <run.dgsnap> <norkyst.nc> \
-//!     [points=name:lon,lat;name:xy:x_km,y_km;…] [spinup_hours=3] [out=<dir>]
+//!     [points=name:lon,lat;name:xy:x_km,y_km;…] //!     [section=name:lon0,lat0:lon1,lat1:n] [spinup_hours=3] [out=<dir>]
 //! ```
 //!
 //! The snapshot carries the mesh, the bed, the σ-grid, the clock and the
@@ -31,6 +31,11 @@
 //!
 //! Written to `out` (default: the snapshot's directory): `profiles_<point>.txt`
 //! (every frame and depth, both models) and `domain_mean.txt`.
+//!
+//! `section=` adds `n` points evenly spaced in longitude and latitude from
+//! the first end to the second, named `<name>_00` … (`;` between sections);
+//! `scripts/norkyst_section_3d.py` draws them as depth sections. With a
+//! section and no `points=`, only the section is compared.
 //!
 //! The default points are the Mausund NorKyst point (the station atlas's
 //! point next to the gauge), the Kattholmen farm (site 14042) and a deep
@@ -96,6 +101,38 @@ mod app {
         parent: [f64; 4],
     }
 
+    /// The points of a section `name:lon0,lat0:lon1,lat1:n` as a `points=`
+    /// list (`;name_00:lon,lat;name_01:…`).
+    fn section_points(section: &str) -> Result<String, Box<dyn Error>> {
+        let parts: Vec<&str> = section.split(':').collect();
+        let [name, start, end, n] = parts[..] else {
+            return Err(format!("section {section:?}: name:lon0,lat0:lon1,lat1:n").into());
+        };
+        let end_point = |p: &str| -> Result<(f64, f64), Box<dyn Error>> {
+            let (lon, lat) = p
+                .split_once(',')
+                .ok_or(format!("section {section:?}: lon,lat ends"))?;
+            Ok((lon.trim().parse()?, lat.trim().parse()?))
+        };
+        let ((lon0, lat0), (lon1, lat1)) = (end_point(start)?, end_point(end)?);
+        let n: usize = n.trim().parse()?;
+        if n < 2 {
+            return Err(format!("section {section:?}: at least two points").into());
+        }
+        let mut list = String::new();
+        for i in 0..n {
+            let f = i as f64 / (n - 1) as f64;
+            write!(
+                list,
+                ";{}_{i:02}:{:.6},{:.6}",
+                name.trim(),
+                lon0 + f * (lon1 - lon0),
+                lat0 + f * (lat1 - lat0)
+            )?;
+        }
+        Ok(list)
+    }
+
     /// One frame at one point.
     struct Sample {
         /// Model time (s)
@@ -114,7 +151,7 @@ mod app {
     pub fn run() -> Result<(), Box<dyn Error>> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let usage = "usage: norkyst_profiles_3d <run.dgsnap> <norkyst.nc> \
-                     [points=name:lon,lat;…] [spinup_hours=3] [out=<dir>]";
+                     [points=name:lon,lat;…] [section=name:lon0,lat0:lon1,lat1:n]                      [spinup_hours=3] [out=<dir>]";
         let positional: Vec<&String> = args.iter().filter(|a| !a.contains('=')).collect();
         let [snapshot_path, parent_path] = [positional.first(), positional.get(1)]
             .map(|a| a.map(|s| PathBuf::from(s.as_str())).ok_or(usage));
@@ -171,7 +208,12 @@ mod app {
         let wet = parent.wet_mask();
 
         // The points
-        let spec = options.get("points").copied().unwrap_or(DEFAULT_POINTS);
+        let sections = options.get("section").copied().unwrap_or("");
+        let default_points = if sections.is_empty() { DEFAULT_POINTS } else { "" };
+        let mut spec = options.get("points").copied().unwrap_or(default_points).to_string();
+        for section in sections.split(';').filter(|s| !s.trim().is_empty()) {
+            spec.push_str(&section_points(section)?);
+        }
         let mut points = Vec::new();
         for item in spec.split(';').filter(|s| !s.trim().is_empty()) {
             let (name, place) = item

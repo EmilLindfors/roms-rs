@@ -6,9 +6,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Next up
 
-1. **P1.3** The 3D tide flattens the M2 phase across the domain (2.6° against 6.4° in 2D and 7.5° in NorKyst on the same bed), so its depth-mean currents are 0.46 of 2D's at every depth (the NorKyst point 0.08 against 0.18 m/s, NorKyst 0.25): find where (the 3D barotropic mode, its filter, the 3D nesting). See Geometry and meshes, then Validation (farm-site currents, P3.1).
-2. **P4.6 / P1.5** Finish the 72 h nested 3D day with MET wind (stopped at 32.5 h; resume from its 32 h restart) and answer the day-2 question with `norkyst_profiles_3d`; the first 32 h already point at **P4.4** (surface 0.6–0.7 °C cold, no diurnal heating). See 3D validation.
-3. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
+1. **P4.6 / P1.5** Rerun the 72 h nested 3D day with MET wind from the start in `data/froya_norkyst_3d.nc` (the 32.5 h run was nested in `mausund_norkyst_3d.nc`, which walls 120 of the 223 open faces: its currents and circulation are void) and answer the day-2 question with `norkyst_profiles_3d`; the surface was 0.6–0.7 °C cold there too (**P4.4**, no diurnal heating), and the open-boundary day without wind is 0.4–1.1 °C cold in the top 3 m. See 3D validation.
+2. **F.4** The wave model's RK propagation cost (≈ 80 of 141 ms per step), and choosing WAM's or SWAN's source scheme from observations. See Waves.
 
 ## Validation (P3) — [notes/validation.md](notes/validation.md)
 
@@ -16,7 +15,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P3.1** Find why the overtides are too weak: on the 3D bed (`slopes3d=on debug_3d=thin=1`) the model's M4 is a uniform 0.36 cm within 10 km of Mausund, 0.12× the gauge (0.7 cm, 0.34×, on the unsmoothed 2D bed, whose shoals and pinnacles make more; NorKyst 0.17 cm). Compare M4 at other gauges (Kristiansund, Heimsjø, Trondheim) with NorKyst's to tell a local harbour effect from a regional one; `notes/validation.md` 2026-10-16.
 - [ ] **P3.1** Measured currents at a Frøya farm (NS 9415 site surveys, IMR/NIVA moorings): the only way to settle the island lee and which current to trust at farm sites; NorKyst cannot (its bed is 50 m at Kattholmen, the real 25 m).
 - [ ] **P3.1 / P3.3** The month-long real-domain run (`froya_real_data … hours=720`, or 30+ days on the coastline mesh): resolves N2/Q1, checks long-run stability, mass and no residual currents at rest.
-- [ ] **P3.1** The "island lee" at the NorKyst point and Kattholmen (M2 0.02–0.07 m/s against NorKyst's 0.25) was mostly the unsmoothed 2D bed (0.19 m/s on the 3D bed, 2026-10-16) and the 3D phase flattening (P1.3): once P1.3 is fixed, check the 3D current there against observed currents (the measured-currents item below).
+- [ ] **P3.1** The "island lee" at the NorKyst point and Kattholmen: on the 3D bed with the whole boundary open the depth-mean M2 is 0.18–0.19 m/s in 2D and 0.12 in 3D against NorKyst's 0.255, and ≈ 40° early (G 26° against 65°; our bed 22 m, NorKyst's 49 m). Map-wide, both models are 0.56–0.61 of NorKyst where NorKyst is under 50 m deep and the beds agree, 0.93–1.03 deeper. Settle which is right with observed currents (the measured-currents item below).
+- [ ] **P3.1** Mausund's centred RMSE over hours 3–24 of 2025-06-15 is 4.5 cm with the whole boundary open (2D and 3D alike), 1.9–2.1 cm in the runs whose parent file walled 120 of its 223 faces (NorKyst itself 7.5 cm): the closed box was right at the gauge for the wrong reason. The open runs' one-day M2 is 1.11×, 14° early: look at the boundary's M2 phase (NorKyst's 10–20 min lag, P1.5) before tuning anything at Mausund.
 - [ ] **P3.1** Re-run P3 at 1 km against P2 at 500 m with the relaxed positivity CFL (dt ratio now ≈ 1.3–1.4) and stations interpolated at the gauge.
 - [ ] **P3.1** The 500 m, 15-day harmonic run (≈ 2.5 h) for the constituents at resolution.
 - [ ] **P3.1** Fetch real Kartverket (H, G) for Bergen, Stavanger, Trondheim, Kristiansund (`scripts/kartverket_gauge.sh`); fix the approximate `norwegian_stations` positions (Heimsjø is at 63.425, 9.102).
@@ -26,6 +26,8 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P3.1** `HarmonicAnalysis::fit` solves the normal equations (AᵀA, condition number squared) with a dense n × m design matrix: a QR (or the 2m × 2m Gram matrix accumulated row by row, no A) for year-long 10-min records and pairs near the Rayleigh limit.
 - [ ] **P3.2** The Pareto benchmark on the same hardware: M2/S2/K1/O1 gauge error against core-hours, ROMS 2D at 800/400/200 m against DG P1–P4.
 - [ ] **P3.1** Low priority (≤ 4 mm left): whether the interior amplifies the diurnals (shelf waves).
+- [ ] **P3.4** Score Bodø's gauge again on a day after 2026-03, when NorKyst's N2 is right (same frozen config, `nest_tides=raw`): on 2025-06-15 the raw score failed (11.4 cm centred against ≤ 5) and the gauge-corrected boundary tide alone brought it to 3.4 cm, so the failure is the parent's N2; a post-fix day tests the model with no gauge in the forcing.
+- [ ] **P3.4** A second out-of-sample domain in a fjord (Saltstraumen's tidal jet, or a deep sill fjord) where the shallow-water drag gap (P1.3, 3D/2D 0.79 in 3–50 m on both Frøya and Bodø) and stratification matter more than at Bodø's open skerries.
 - [ ] **P3.1** On hold: η-based limiting; revisit only if a real run shows oscillations.
 
 ## Salmon farm and cage drag (F.1) — [notes/farm.md](notes/farm.md)
@@ -174,14 +176,14 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 
 ## Geometry and meshes (P1.3) — [notes/geometry-mesh.md](notes/geometry-mesh.md)
 
-- [ ] **P1.3** The 3D tide's M2 phase spread over the domain is 2.6° against 6.4° in 2D on the same bed (both nested in NorKyst, whose own is 7.5°; η amplitude 0.97 of 2D's), so the 3D depth-mean M2 current is 0.46 of 2D's at every depth, 200–500 m included (not bed drag): the 3D barotropic pass, its time filter (DU_avg2) or the 3D nesting band. 2D on the 3D bed gives 0.18 m/s at the NorKyst point, 3D 0.08, NorKyst 0.25 (hours 3–24, `output/froya_overtides/nested_bed3d_thin1` against `output/froya_day/3d_fast`; `notes/geometry-mesh.md` "The coastline day in 3D").
+- [ ] **P1.3** The 3D depth-mean M2 current is 0.78 of 2D's in 3–20 m, 0.85 in 20–50 m and 1.00 below 200 m on the same bed and parent (2026-10-16, `output/froya_p13`; Bodø the same: 0.80 in 3–20 m, 0.79 in 20–50 m, 1.00 below 200 m): the 3D log-layer drag (z₀ = 3 mm) against 2D's Manning 0.025. Choose the 3D bed roughness from observed currents in shallow water (with P3.1's measured currents), not from the 2D model.
 - [ ] **P1.3** Shore films still set the 3D step: element 7507 at (4.2, −13.5) km, 1.0 m deep, ran its surface layer at 3.1 m/s at 13.5 h of the coastline day and the step fell to 0.24 s (209 steps for the half hour against ≈ 110).
 - [ ] **P1.3** A jittered-mesh case for `EntropyStable`/`WetDry` in `convergence_test.rs` (the averaged metric loses an order pointwise on such meshes).
 - [ ] **P1.3** Rerun the unsmoothed full-mesh 3-day baseline on current code (without `slopes3d`, ≈ 1–2.5 h) for a like-for-like comparison with the 19 m free depth.
 - [ ] **P1.3** Decide the 2D `rx0` default, after the map-wide NorKyst current comparison (`output_minutes=60`, `scripts/norkyst_current_comparison.py`).
 - [ ] **P1.3** Make implicit vertical advection (`Hydrostatic3D::with_implicit_vertical_advection`) the library default once the full Frøya mesh has run with it.
 - [ ] **P1.3 / P2.5 / P4.5** Barotropic LTS runs (`ModeSplitIntegrator::with_barotropic_levels`, `froya_real_data bt_levels=2`, 2026-10-16): 2.3× less RHS work against the ideal 3.2× at two levels, from the rate spreading one ring per stage around the thin cliff-shore bands; each element evaluation ≈ 0.19 µs against 0.15 in the global pass (per-pass edge lists collected serially, scattered rows). Also on refined farm meshes (P2.5), where the 20 m elements set `n_bt` for the fjord.
-- [ ] **P1.3** The depth-mean M2 at the NorKyst point grows with depth in 3D (0.045 m/s at the surface, 0.081 at 15 m) where NorKyst's falls (0.27 → 0.24): the surface layers held back (GLS, surface roughness) or the island lee's 3D structure (`notes/3d-validation.md`).
+- [ ] **P1.3** The M2 current at the NorKyst point grows with depth in 3D (0.082 m/s at the surface, 0.144 at 10 m, with the whole boundary open) where NorKyst's falls (0.27 → 0.25): the surface layers held back (GLS, surface roughness) or the island lee's 3D structure (`notes/3d-validation.md`).
 - [ ] **P1.3** The MET-wind 3D run's step fell from 16–18 s to ≈ 12 s after ≈ 24 h, set by advection and internal waves at (18.8, −21.5) km in 14–22 m water (elements 229, 11912, 5107): what drives it (wind-driven shore currents, a front) and whether it lasts.
 - [ ] **P1.3** Cap or ramp the first 3D steps from rest (`compute_dt` sees no Ω at rest; thin layers need |Ω|Δt/H_z ≤ 1).
 - [ ] **P1.3** The 3D viscous step bound (`element_dt_viscous_swe_2d`) is harsh (ν = 50 m²/s: 0.54 s against 5 s): implicit shear viscosity, or the bound from the operator's spectrum.
@@ -222,6 +224,7 @@ Direction (from the 2026-09-25 review, `notes/review-2026-09-25.md`): the salmon
 - [ ] **P1.5** A depth range in `norkyst-client`'s grid mode (`depth = "0:1:0"` today) as a second source of 3D profiles.
 
 ## Inputs and forcing (P1.6) — [notes/inputs-forcing.md](notes/inputs-forcing.md)
+- [ ] **P1.5** The parent-coverage guard (`max_closed`, 2026-10-16) lives in `froya_real_data`'s `close_open_faces`, so no test runs it (checked by hand: `mausund_norkyst_3d.nc` on the Frøya mesh is refused at 120 of 223 faces, `froya_norkyst_3d.nc` accepted). Move the coverage check into the library next to `OceanModelState` / `BoundaryTides` (one function: which open faces a parent or atlas covers) with a unit test on a parent grid that misses a corner.
 
 - [ ] **P1.6** `OceanModelReader` has public mutable fields, and `is_wet` reads every snapshot of SSH, u and v at each call (219 reads per point on the 73-snapshot Frøya file): make the fields private behind its `with_*` builders and keep the wet mask in the reader (`OceanModelColumns` and `OceanModelState` each take their own copy of `wet_mask()` today).
 - [ ] **P1.6** Settle the topobathy sea part's vertical datum (NN2000 or chart datum, 1.43 m too shallow at Mausund): check against WFS `wfs.dybdedata` points; add the 8 cm NN2000 → MSL offset if it matters.
