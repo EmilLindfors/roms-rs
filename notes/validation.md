@@ -136,6 +136,36 @@ The tidal-comparison code path is complete: `HarmonicAnalysis::fit` gives refere
 - [x] Station series are η only. Add depth-averaged velocity, which the ADCP comparison and the tidal-ellipse fit need. Sample at the gauge position by interpolating in the element, not at the nearest node ≥ 3 m deep (Mausund's node is 199 m away, and 7.6 m deep). Done 2026-09-27 (`Probe2D`): η, ū, v̄ at the station itself, or at the nearest point ≥ 3 m deep where the model is too shallow or dry there; velocities rotated to east/north.
 
 ### P3.2 Cost-vs-accuracy benchmark against ROMS
+### P3.4 Out-of-sample domain: Bodø (pre-registered 2026-10-16, before any run)
+
+Frøya's settings were tuned on Frøya (the gauge-corrected boundary tides, the bed fixes, the 3D slope, cliff and pond rules), so its scores flatter the model. Bodø is run with every setting frozen at Frøya's and scored as below; nothing is retuned on Bodø's results.
+
+- **Domain** `bbox=13.7,67.05,14.55,67.5` (≈ 37 × 50 km, 67.25°N): Bodø, Landegode, the Helligvær and Givær skerries, the Saltfjord mouth; it stops 3 km west of Saltstraumen. Inputs made as Frøya's: `kartverket_topobathy.sh 13.7 67.05 14.55 67.5 50 data/bodo_topobathy.tif`; `gmsh_coastline_mesh.py dem=data/bodo_topobathy.tif bbox=… out=data/bodo_coast.msh` (defaults: 11,344 quads, 1428 km² of sea, 15 islands); `kartverket_gauge.sh Bodo 67.288 14.391 2024-07-01 2025-07-01` (station BOO); `norkyst_nesting_subset bbox=… start=2025-06-15 hours=72 wind=1 profiles=1 out=data/bodo_norkyst_3d.nc`; `norkyst_boundary_tides bbox=… start=2025-06-01 days=30 points=14.391,67.288` (boundary and station atlases).
+- **Runs** (the Frøya day's options, the inputs swapped): `froya_real_data mesh=data/bodo_coast.msh bbox=13.7,67.05,14.55,67.5 dem=data/bodo_topobathy.tif tides=data/bodo_boundary_tides.txt station_atlas=data/bodo_station_tides.txt gauges=data/tide_gauges/bodo_obs.txt norkyst=data/bodo_norkyst_3d.nc slopes3d=on start=2025-06-15T00:00:00Z hours=24 ramp_hours=3 spinup_hours=3 snapshot_minutes=60`, in 2D (`debug_3d=thin=1 lts=8`) and 3D (`levels=20 tide3d=1`), each with `nest_tides=raw` (the primary score: no gauge information in the forcing) and the default `corrected`.
+- **Scores and the pass marks set now** (Frøya's value in brackets):
+  1. Bodø gauge, η against the observations over hours 3–24, centred RMSE: pass ≤ 5 cm, twice Frøya's (2.1–2.4 cm at Mausund on the 3D day).
+  2. The M2 depth-mean current against NorKyst map-wide where the two beds agree within 20 % (hours 3–24, `tmp_m2map`-style fit of both): median ratio 0.85–1.15 (2D 0.97, hours 12–40).
+  3. 3D against 2D on the same bed, the M2 current node by node: median ratio 0.9–1.1 (the P1.3 check on a fully covered boundary).
+  4. A section across the Saltfjord mouth and one through the skerries (`norkyst_profiles_3d section=`, `scripts/norkyst_section_3d.py`; fixed before the 3D run finished: `saltfjord:14.31,67.195:14.31,67.28:25` and `sound:13.72,67.34:14.25,67.34:30`, the gap between the Helligvær and Givær groups toward Landegode): T RMSE below 10 m ≤ 0.4 °C (Frøya 0.3–0.4 at three points); surface T expected cold (no heat flux, P4.4), reported, not scored.
+  5. Mass: the lake at rest ≤ 1e-10 m/s, no NaN, no negative-depth clips.
+
+**Outcome (2026-10-17): 4 of 5 pass; the gauge fails, and the cause is the parent's tide.** Runs in `output/bodo_day/` (2D raw 6272 s wall, 2D corrected 6093 s, 3D raw 13617 s = 567 s per model hour; all 24 h, 0 negative-depth clips, no NaN).
+
+| Score | Mark | 2D raw | 3D raw | Verdict |
+|---|---|---|---|---|
+| 1. Bodø gauge, centred RMSE h 3–24 | ≤ 5 cm | 11.4 cm (bias +4.8, r 0.982) | 11.8 cm (bias +7.3, r 0.980) | **fail** |
+| 2. M2 current / NorKyst, beds within 20 % (1200 points) | 0.85–1.15 | 0.957 | 0.939 | pass |
+| 3. 3D / 2D M2 current, node by node | 0.9–1.1 | — | 0.957 | pass |
+| 4. Section T RMSE below 10 m | ≤ 0.4 °C | — | saltfjord 0.17, sound 0.16 | pass |
+| 5. Lake at rest; NaN; clips | ≤ 1e-10 | 2.0e-11; none; 0 | none; 0 | pass |
+
+- **The gauge (score 1).** NorKyst itself scores 12.0 cm centred there (bias −21.9 cm: its datum). The diagnosis run, `nest_tides=corrected` (the gauge-corrected boundary atlas, largest correction 0.166 m in N2), scores **3.4 cm** (bias +3.3, r 0.9987): swapping only the boundary tide removes 70 % of the error, so the failure is NorKyst's N2 (0.19× until 2026-02, `notes/norkyst-issues.md`), not the model. The corrected run uses the gauge and does not count; the score stays a fail. Rescoring on a day after 2026-03 is TODO P3.4.
+- **The mark was set on a contaminated reference.** "Twice Frøya's 2.1–2.4 cm" came from runs whose parent file walled 120 of the 223 open faces (`notes/geometry-mesh.md`, 2026-10-16); Mausund's honest open-boundary figure is 4.5 cm. The mark is not moved after the fact.
+- **Currents (scores 2, 3).** Against NorKyst by NorKyst depth (2D / 3D): 50–100 m 0.85 / 0.85, 100–200 m 0.97 / 0.92, 200–600 m 0.96 / 0.96 (0–50 m has 4 points). 3D / 2D by our depth: 3–20 m 0.80, 20–50 m 0.79, 50–100 m 0.95, 100–200 m 0.96, 200–500 m 1.00, the same pattern as Frøya's (the drag line, TODO P1.3). η: amplitude ratio 1.001, phase difference −0.01° (5–95 %: −0.30…+0.24°), phase spread 3.0° in both: no flattening.
+- **Sections (score 4).** Saltfjord mouth (9.4 km, 24 points, model bed 27–238 m, NorKyst's 48–164): T bias +0.11, RMSE 0.17 °C below 10 m; S RMSE 0.32; mean normal current pattern correlation 0.92 (model 0.029 m/s, NorKyst 0.047); M2 normal current 0.051 against 0.047 m/s, RMSE 0.016 below 10 m. Skerry gap (22.7 km, 30 points, beds 71–454 / 95–354 m): T bias −0.05, RMSE 0.16 °C below 10 m; S RMSE 0.06; mean current 0.105 against 0.112 m/s, correlation 0.77; M2 0.041 against 0.046 m/s. The whole-column T RMSE is 0.34 and 0.31 (the surface cool, P4.4). Caveat: in a 24 h run started from NorKyst's T and S, score 4 shows the 3D model keeps the water masses; it is not a test of their evolution. Plots: `output/bodo_day/3d_raw/profiles/section_*.png`.
+- **The surface water is fresher than Frøya's** (30.7 against 33.6 at 0.5 m, S down to 13.9 at the fjord heads): the frozen 3D settings ran it without change.
+- **Frozen-config caveat.** `WALL_LOW_WATER` and the ponds use Mausund's −1.43 m low water; on this day the model's η at the Bodø gauge went down to −1.12 m, inside it, but Bodø's springs go lower. Not changed, by the rules above.
+
 - [ ] Pareto benchmark on the same hardware: M2/S2/K1/O1 error at tide gauges vs core-hours, ROMS 2D at 800/400/200 m vs DG P1–P4. This is what settles "faster than ROMS" (`review-2026-09-25.md` §5.5).
 
 ### P3.3 Long-run stability

@@ -35,7 +35,11 @@
 //!    transport, a relaxation band `band_km` wide with timescale
 //!    `band_minutes` at the boundary, and the bed blended to NorKyst's across
 //!    the band (`blend=0` to keep it), ramped up from rest over `ramp_hours`.
-//!    Open faces NorKyst does not cover become walls. NorKyst's ζ is shifted
+//!    Open faces NorKyst does not cover become walls; more than `max_closed`
+//!    (default 0.05) of them is an error, since a parent file cut for a
+//!    smaller domain turns the open boundary into a closed box (the 3D
+//!    coastline day in `mausund_norkyst_3d.nc`, cut for Mausund, closed 120
+//!    faces and halved the M2 current, TODO P1.3). NorKyst's ζ is shifted
 //!    by minus the mean level `Z0` of the boundary atlas (its datum sits
 //!    0.28 m below mean sea level here), or by `nest_level=`. NorKyst's
 //!    `gauge_gains` and `gauge_ratios` constituents are replaced by the
@@ -98,7 +102,7 @@
 //!     [bed=projected|point] [dem=data/froya_topobathy.tif|none] [rx0=] [rx0_min_depth=3] \
 //!     [wall_land=keep|lower] \
 //!     [bbox=8.0,63.6,9.2,64.0] [lts=0] [rk=43|3] [cfl=] [output=output/froya] \
-//!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [ib=0] [nest_level=] \
+//!     [met=<file,…>] [band_km=3] [band_minutes=30] [blend=1] [max_closed=0.05] [ib=0] [nest_level=] \
 //!     [nest_tides=corrected|raw] [waves=0] [wave_grid=25,36] [turning=] [implicit=0] \
 //!     [wave_sources=swan|wam] [wave_integration=] [wave_limiter=] [wave_substeps=1] [wave_cfl=0.5] [wave_hours=0] \
 //!     [wave_land=absorbing|floored] [wave_force=dissipation|stress] [wave_depth_limit=1] \
@@ -496,6 +500,9 @@ struct Options {
     band_minutes: f64,
     #[cfg_attr(not(feature = "netcdf"), allow(dead_code))]
     blend_bed: bool,
+    /// The largest share of the open faces the atlas or the parent may
+    /// leave uncovered (they become walls)
+    max_closed: f64,
     nesting_ib: bool,
     /// Nesting: replace NorKyst's `gauge_gains` and `gauge_ratios`
     /// constituents by the gauge-corrected ones (`nest_tides=corrected`, the
@@ -899,6 +906,7 @@ impl Options {
             band_km: get("band_km", 3.0)?,
             band_minutes: get("band_minutes", 30.0)?,
             blend_bed: get("blend", 1.0)? != 0.0,
+            max_closed: get("max_closed", 0.05)?,
             nesting_ib: get("ib", 0.0)? != 0.0,
             correct_nested_tides: match args.get("nest_tides").map_or("corrected", String::as_str) {
                 "corrected" => true,
@@ -1314,11 +1322,11 @@ impl Domain {
             return Ok(());
         }
         let atlas = TidalAtlas::read(atlas_path)?;
-        let closed = self.close_open_faces(|lon, lat| {
+        let closed = self.close_open_faces(&opts.tides, opts.max_closed, |lon, lat| {
             atlas
                 .nearest(lon, lat)
                 .is_some_and(|(_, d)| d <= ATLAS_COVERAGE)
-        });
+        })?;
         if closed > 0 {
             println!(
                 "  {closed} open-boundary faces lie farther than {:.0} km from the tidal atlas: walls",
@@ -1329,21 +1337,31 @@ impl Domain {
     }
 
     /// Make walls of the open-boundary faces with a node where `covered(lon,
-    /// lat)` is false; returns how many.
-    fn close_open_faces(&mut self, covered: impl Fn(f64, f64) -> bool) -> usize {
+    /// lat)` is false; returns how many. More than `max_closed` of the open
+    /// faces is an error: a forcing file cut for a smaller domain would turn
+    /// the open boundary into a closed box (the 3D coastline day in
+    /// `mausund_norkyst_3d.nc`, cut for Mausund, closed 120 open faces and
+    /// halved the M2 current, TODO P1.3).
+    fn close_open_faces(
+        &mut self,
+        source: &str,
+        max_closed: f64,
+        covered: impl Fn(f64, f64) -> bool,
+    ) -> Result<usize, String> {
         let Some(projection) = self.projection else {
-            return 0;
+            return Ok(0);
         };
         let (mesh, ops) = (
             Arc::get_mut(&mut self.mesh).expect("mesh not shared yet"),
             &self.ops,
         );
-        let mut closed = 0;
+        let (mut closed, mut open) = (0, 0);
         for e in 0..mesh.edges.len() {
             let edge = &mesh.edges[e];
             if edge.right.is_some() || edge.boundary_tag != Some(BoundaryTag::Open) {
                 continue;
             }
+            open += 1;
             let (k, face) = (ElementIndex::new(edge.left.element), edge.left.face);
             let uncovered = ops.face_nodes[face].iter().any(|&i| {
                 let [x, y] = mesh.reference_to_physical(k, ops.nodes_r[i], ops.nodes_s[i]);
@@ -1355,7 +1373,14 @@ impl Domain {
                 closed += 1;
             }
         }
-        closed
+        if closed as f64 > max_closed * open as f64 {
+            return Err(format!(
+                "{source} leaves {closed} of {open} open-boundary faces uncovered (more than \
+                 max_closed={max_closed}): cut one for this domain (`norkyst_nesting_subset \
+                 bbox=…`) or raise max_closed"
+            ));
+        }
+        Ok(closed)
     }
 
     /// NorKyst nesting (`norkyst=`): read the parent, close the open faces it
@@ -1402,13 +1427,13 @@ impl Domain {
             .with_ramp_up(3600.0 * opts.ramp_hours)
             .with_reference_level(level);
         let wet = reader.wet_mask();
-        let closed = self.close_open_faces(|lon, lat| {
+        let closed = self.close_open_faces(path, opts.max_closed, |lon, lat| {
             reader.stencil(lon, lat).is_some()
                 || reader
                     .grid
                     .nearest(lon, lat, options.max_snap, |k| wet[k])
                     .is_some()
-        });
+        })?;
         if closed > 0 {
             println!("  {closed} open-boundary faces have no wet NorKyst point nearby: walls");
         }

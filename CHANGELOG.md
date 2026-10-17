@@ -6,6 +6,9 @@ All notable changes to this project should be documented in this file.
 
 ### Added
 
+- **An out-of-sample domain, Bodø (P3.4, `notes/validation.md`):** a 24 h day at Bodø (67.25°N) with every setting frozen at Frøya's and the pass marks set before the runs. 4 of 5 pass: M2 currents 0.957 (2D) and 0.939 (3D) of NorKyst's, 3D/2D 0.957, T RMSE below 10 m 0.17 and 0.16 °C on two sections, no NaN or clips. The gauge fails (11.4 cm centred against ≤ 5; NorKyst's own 12.0); the gauge-corrected boundary tide alone gives 3.4 cm, so the failure is the parent's N2.
+- **Depth sections against NorKyst-800 (TODO P4.6, P3.4):** `norkyst_profiles_3d section=name:lon0,lat0:lon1,lat1:n` probes `n` points along a line, and `scripts/norkyst_section_3d.py` draws model, NorKyst and their difference against distance and depth (mean T, S, the cross-section velocity and its M2 amplitude) with the section's bias, RMSE and pattern correlation, overall and below 10 m.
+
 - **`examples/norkyst_profiles_3d.rs`: a 3D run against NorKyst-800 per depth (TODO P4.6).** Reads a 3D run's snapshot file (also one still being written) and the parent's profiles, and at named points (default: Mausund's NorKyst point, Kattholmen, Frohavet) prints per NorKyst level the T and S bias, RMSE and correlation, the mean currents and the M2 ellipses of both; then the depth-mean M2, the bed layer's T against the parent's deepest level, daily means and the domain-mean surface T and S; writes every frame's profiles. First results (`notes/3d-validation.md`): the depth-mean M2 at Frohavet within 10 % and 7° of NorKyst; at the NorKyst point and Kattholmen 0.06 against 0.24 m/s, as in 2D (the bed and the island lee); with MET wind the top 3 m 0.6–0.7 °C colder than NorKyst after a day (no surface heating), below 10 m within 0.15 °C.
 
 - **The coastline 3D day under 200 s per model hour (TODO P4.5):** 967 → 818 ms per 16 s step, 215 → 182 s per model hour from the 6 h restart (three alternating pairs, no overlap).
@@ -567,6 +570,8 @@ All notable changes to this project should be documented in this file.
 ### Fixed
 
 - **Dry nodes of 3D shoreline elements no longer drift.** `from_inventory` moves a marked element's level (one the barotropic pass balances only as a whole) to its new mean by shifting its nodes; the shift went to the dry nodes too, which have no weight in the mean, so they summed every step's shift. On the Frøya day with MET wind, dry shore nodes reached 33 °C (the water held 7.5–14.4 °C), and wetting brought the drift back into the water. Dry nodes keep their last value, as documented; wet results are unchanged until a node wets. `froya_real_data`'s "thin columns" T range leaves out dry columns. Regression case in `inventory_conversion_keeps_element_inventories`.
+
+- **The 3D coastline day's halved tidal currents were its parent file, not the 3D model (TODO P1.3).** `data/mausund_norkyst_3d.nc`, cut for the Mausund sub-domain, turned 120 open faces of the Frøya box into walls; a 2D run in the same file shows the same 0.48 and the same flattened M2 phase. Nested in a parent over the whole box (`data/froya_norkyst_3d.nc`), the 3D M2 current is 0.946 of NorKyst's where the beds agree (2D 0.958; before 0.463). `froya_real_data` now refuses a NorKyst file or tidal atlas that leaves more than `max_closed` (default 0.05) of the open faces uncovered.
 
 - **A blown-up 2D run stopped reporting success (TODO P2.1).** `Simulation` stepped a NaN on to `t_end` and reported success, as `Simulation3D` did before 2026-10-10 (the step bounds skip NaN). `Integrable::is_finite` (default `true`; the 1D/2D solution types check every value, in branch-free chunks) is checked after every step, and the run fails at the first non-finite state. Gate: `a_blown_up_2d_run_fails`.
 
