@@ -209,8 +209,16 @@ mod app {
 
         // The points
         let sections = options.get("section").copied().unwrap_or("");
-        let default_points = if sections.is_empty() { DEFAULT_POINTS } else { "" };
-        let mut spec = options.get("points").copied().unwrap_or(default_points).to_string();
+        let default_points = if sections.is_empty() {
+            DEFAULT_POINTS
+        } else {
+            ""
+        };
+        let mut spec = options
+            .get("points")
+            .copied()
+            .unwrap_or(default_points)
+            .to_string();
         for section in sections.split(';').filter(|s| !s.trim().is_empty()) {
             spec.push_str(&section_points(section)?);
         }
